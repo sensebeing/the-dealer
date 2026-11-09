@@ -1,0 +1,215 @@
+import { existsSync, mkdirSync, readFileSync, rmSync, chmodSync } from 'node:fs';
+import { join, resolve, basename } from 'node:path';
+import { homedir, hostname } from 'node:os';
+import { createServer } from 'node:http';
+import type { Server } from 'node:http';
+import { generateNodeKeyPair } from '../core-types/index.ts';
+import type { AdmissionMode, Disposable, ExecutorPlugin, NetworkMountConfig, SourcePlugin } from '../core-types/index.ts';
+import { Kernel } from '../kernel/index.ts';
+import type { Plugin } from '../kernel/index.ts';
+import { createTransportPlugin, P2PTransportService } from '../transport/index.ts';
+import type { TransportPluginOptions } from '../transport/index.ts';
+import { createNodePlugin, PeerDirectoryService } from '../node/index.ts';
+import { createRouterPlugin } from '../router/index.ts';
+import { createGatePlugin } from '../gate/index.ts';
+import type { NetworkGateService } from '../gate/index.ts';
+import { createDispatcherPlugin } from '../dispatcher/index.ts';
+import { createEmitterPlugin } from '../emitter/index.ts';
+import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin } from '../plugins-policy/index.ts';
+import type { WaveCoalescerPolicy } from '../plugins-policy/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, checkedCommand, runCommand } from '../plugins-executor/index.ts';
+import type { CommandRunner } from '../plugins-executor/index.ts';
+import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
+import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
+import { getBuiltInProfile, saveJson, validateConfig, admissionMode } from './config.ts';
+import type { RuntimeConfig, PluginSpec } from './config.ts';
+
+export interface DealerRuntimeOptions {
+  stateDir?: string; profile?: string; member?: string; name?: string; skills?: string[]; port?: number;
+  patch?: Partial<RuntimeConfig>; transport?: TransportPluginOptions;
+  commandRunner?: CommandRunner; executorOverrides?: ExecutorPlugin[];
+}
+export function defaultStateDir(): string { return resolve(process.env.DEALER_STATE_DIR ?? join(homedir(), '.dealer')); }
+export class DealerNodeRuntime {
+  readonly stateDir: string;
+  readonly kernel = new Kernel();
+  readonly options: DealerRuntimeOptions;
+  config!: RuntimeConfig;
+  wave?: WaveCoalescerPolicy;
+  private streams = new Set<string>();
+  private server?: Server;
+  private started = false;
+  private ownsLock = false;
+  private timer?: ReturnType<typeof setInterval>;
+  private flushing?: Promise<void>;
+  lastError?: string;
+  constructor(options: DealerRuntimeOptions = {}) { this.options = options; this.stateDir = resolve(options.stateDir ?? defaultStateDir()); }
+  get transport(): P2PTransportService { return this.kernel.getService('transport') as P2PTransportService; }
+  get node(): PeerDirectoryService { return this.kernel.getService('node') as PeerDirectoryService; }
+  get gate(): NetworkGateService { return this.kernel.getService('gate') as NetworkGateService; }
+  get emitter() { return this.kernel.getService('emitter'); }
+  get socketPath(): string { return join(this.stateDir, 'control.sock'); }
+  persist(): void { validateConfig(this.config); saveJson(join(this.stateDir, 'config.json'), this.config); }
+  async start(): Promise<this> {
+    if (this.started) return this;
+    mkdirSync(this.stateDir, { recursive: true, mode: 0o700 }); chmodSync(this.stateDir, 0o700);
+    try { mkdirSync(join(this.stateDir, 'runtime.lock')); this.ownsLock = true; }
+    catch { throw new Error('State directory already owned; use the running daemon (remove runtime.lock only after verifying its process stopped)'); }
+    try {
+      saveJson(join(this.stateDir, 'runtime.lock', 'owner.json'), { pid: process.pid });
+      const path = join(this.stateDir, 'config.json');
+      const saved = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
+      const profile = getBuiltInProfile(this.options.profile ?? saved.profile ?? 'personal-dev');
+      this.config = { profile: profile.name, member: process.env.USER ?? 'local', name: hostname(), skills: [], gateMode: profile.gateMode,
+        networks: [], defaultExecutor: profile.defaultExecutor, executors: profile.executors, policies: profile.policies, executorConfig: {}, routes: [], sources: [], wave: {}, ...saved,
+        ...(this.options.profile ? { profile: profile.name, gateMode: profile.gateMode, defaultExecutor: profile.defaultExecutor, executors: profile.executors, policies: profile.policies } : {}),
+        ...Object.fromEntries(['member', 'name', 'skills', 'port'].filter(k => this.options[k] !== undefined).map(k => [k, this.options[k]])), ...this.options.patch };
+      validateConfig(this.config);
+      const keyPath = join(this.stateDir, 'identity.json');
+      const keyPair = existsSync(keyPath) ? JSON.parse(readFileSync(keyPath, 'utf8')) : generateNodeKeyPair();
+      if (!existsSync(keyPath)) saveJson(keyPath, keyPair);
+      await this.kernel.use(createTransportPlugin({ ...this.options.transport, listenPort: this.config.port, localNodeId: keyPair.nodeId }));
+      await this.kernel.use(createNodePlugin({ keyPair, member: this.config.member, nodeName: this.config.name, admissionMode: this.config.gateMode,
+        capabilities: { summary: this.config.name, skills: this.config.skills.map(id => ({ id, description: id })) } }));
+      await this.kernel.use(createRouterPlugin());
+      await this.kernel.use(createGatePlugin({ mode: this.config.gateMode, networkModes: Object.fromEntries(this.config.networks.filter(n => n.admissionMode).map(n => [n.networkId, n.admissionMode!])) }));
+      await this.kernel.use(createDispatcherPlugin({ ledgerPath: join(this.stateDir, 'deliveries.json'), defaultExecutor: this.config.defaultExecutor }));
+      await this.kernel.use(createEmitterPlugin({ onSourceError: error => { this.lastError = String(error); } }));
+      await this.kernel.use(this.integrationPlugin());
+      for (const network of this.config.networks) await this.transport.mountNetwork(network);
+      for (const route of this.config.routes) this.installRoute(route);
+      for (const source of this.config.sources) await this.installSource(source);
+      this.persist(); this.started = true;
+      return this;
+    } catch (error) { await this.stop(); throw error; }
+  }
+  private integrationPlugin(): Plugin {
+    return { name: 'runtime-plugins', inject: ['dispatcher', 'transport', 'emitter', 'router'], apply: ctx => {
+      const runner = this.options.commandRunner ?? runCommand;
+      const executors: Record<string, ExecutorPlugin> = {
+        'orca-spawn': createOrcaSpawnExecutorPlugin({ ...this.config.executorConfig['orca-spawn'], commandRunner: runner }),
+        'orca-wave': createOrcaWaveExecutorPlugin({ ...this.config.executorConfig['orca-wave'], commandRunner: runner }),
+        'agent-pty': createAgentPtyExecutorPlugin({ ...this.config.executorConfig['agent-pty'], commandRunner: runner }),
+        notify: createNotifyExecutorPlugin({ inboxPath: join(this.stateDir, 'notifications.jsonl'), ...this.config.executorConfig.notify, commandRunner: runner }),
+      };
+      for (const executor of this.options.executorOverrides ?? []) executors[executor.name] = executor;
+      for (const name of this.config.executors) {
+        const executor = executors[name];
+        const wrapped: ExecutorPlugin = { ...executor, execute: async (batch, context, config) => {
+          const local = [];
+          for (const envelope of batch) {
+            const directory = join(this.stateDir, 'attachments', encodeURIComponent(envelope.id));
+            const files: string[] = [];
+            for (const [index, attachment] of envelope.attachments.entries()) {
+              mkdirSync(directory, { recursive: true, mode: 0o700 });
+              const destination = join(directory, `${index}-${basename(attachment.name)}`);
+              await this.transport.fetchBlobToPath(attachment.ticket, destination); files.push(destination);
+            }
+            local.push({ ...envelope, payload: { ...envelope.payload, localAttachments: files } });
+          }
+          return executor.execute(local, context, config);
+        } };
+        const registration = ctx.services.dispatcher.registerExecutor(wrapped, this.config.executorConfig[name] ?? {});
+        ctx.effect(() => () => registration.dispose());
+      }
+      if (this.config.policies.includes('dedup-cas')) {
+        const registration = ctx.services.dispatcher.registerPolicy(createDedupCasPolicyPlugin()); ctx.effect(() => () => registration.dispose());
+      }
+      if (this.config.policies.includes('wave-coalescer')) {
+        const streamKey = envelope => JSON.stringify([envelope.networkId, envelope.payload?.streamKey ?? envelope.kind, 'orca-wave']);
+        this.wave = createWaveCoalescerPolicyPlugin({ executor: executors['orca-wave'], executorConfig: {}, streamKey,
+          maxWaves: this.config.wave.rotateAfterWaves, minAgeMs: this.config.wave.minAgeMs,
+          rotateSession: async () => {
+            const config = this.config.executorConfig['orca-wave'] ?? {};
+            if (!config.terminalHandle) throw new Error('Session rotation requires terminalHandle');
+            const result = await checkedCommand(runner, { command: config.orcaCommand ?? 'orca', args: ['terminal', 'send', '--terminal', config.terminalHandle, '--text', '/new', '--enter', '--json'], cwd: config.cwd });
+            if (JSON.parse(result.stdout).ok === false) throw new Error('Session rotation failed');
+          },
+        });
+        const registration = ctx.services.dispatcher.registerPolicy({ name: 'wave-coalescer', process: (envelope, next) => {
+          if ((envelope.payload?.executor ?? this.config.defaultExecutor) !== 'orca-wave') return next([envelope]);
+          this.streams.add(streamKey(envelope)); return this.wave!.process(envelope, next);
+        } });
+        ctx.effect(() => () => registration.dispose());
+        this.timer = setInterval(() => {
+          if (!this.flushing) this.flushing = this.flushWaves().catch(error => { this.lastError = String(error); }).finally(() => { this.flushing = undefined; });
+        }, this.config.wave.flushIntervalMs ?? 1000); this.timer.unref();
+        ctx.effect(() => async () => { clearInterval(this.timer); await this.flushing; });
+      }
+    } };
+  }
+  async flushWaves(): Promise<void> { for (const key of this.streams) await this.wave?.flushWave(key); }
+  async mountNetwork(network: NetworkMountConfig & { role?: string }): Promise<void> {
+    if (!network.networkId || !network.passphrase) throw new Error('Network and passphrase required');
+    if (network.admissionMode) admissionMode(network.admissionMode);
+    await this.transport.mountNetwork(network);
+    if (network.admissionMode) await this.gate.setNetworkMode(network.networkId, network.admissionMode);
+    this.config.networks.push(structuredClone(network)); this.persist();
+  }
+  async unmountNetwork(id: string): Promise<void> { await this.transport.unmountNetwork(id); this.config.networks = this.config.networks.filter(n => n.networkId !== id); this.persist(); }
+  async setGateMode(mode: AdmissionMode, networkId?: string): Promise<void> {
+    admissionMode(mode);
+    if (networkId) {
+      const network = this.config.networks.find(n => n.networkId === networkId); if (!network) throw new Error('Network not mounted');
+      await this.gate.setNetworkMode(networkId, mode); network.admissionMode = mode;
+      await this.node.updateNetworkAdmissionMode(networkId, mode);
+    } else {
+      await this.gate.setMode(mode); this.config.gateMode = mode;
+      for (const network of this.config.networks) await this.node.updateNetworkAdmissionMode(network.networkId, this.gate.getNetworkMode(network.networkId));
+    }
+    this.persist();
+  }
+  installRoute(spec: PluginSpec): Disposable {
+    let judge;
+    if (spec.type === 'local-agent') judge = createLocalAgentRouterPlugin({ ...spec.config, commandRunner: this.options.commandRunner });
+    else if (spec.type === 'llm-api') { if (!spec.config.endpoint || !spec.config.model) throw new Error('llm-api requires endpoint and model'); judge = createLlmApiRouterPlugin(spec.config as any); }
+    else throw new Error(`Unknown route type: ${spec.type}`);
+    const registration = this.kernel.getService('router').registerJudge(judge);
+    this.kernel.ctx.effect(() => () => registration.dispose()); return registration;
+  }
+  async installSource(spec: PluginSpec): Promise<Disposable> {
+    let source: SourcePlugin;
+    if (spec.type === 'webhook') source = createWebhookSourcePlugin(spec.config);
+    else if (spec.type === 'script') { if (!spec.config.command) throw new Error('script requires command'); source = createScriptSourcePlugin({ ...spec.config, commandRunner: this.options.commandRunner } as any); }
+    else if (spec.type === 'poll-watermark') {
+      if (!spec.config.url) throw new Error('poll-watermark requires url returning {items,cursor}');
+      const cursorPath = join(this.stateDir, `cursor-${encodeURIComponent(spec.config.name ?? spec.config.url)}.json`);
+      source = createPollWatermarkSourcePlugin({ initialCursor: existsSync(cursorPath) ? JSON.parse(readFileSync(cursorPath, 'utf8')) : spec.config.initialCursor ?? null,
+        intervalMs: spec.config.intervalMs ?? 10000,
+        poll: async cursor => { const url = new URL(spec.config.url); if (cursor !== null) url.searchParams.set('cursor', JSON.stringify(cursor)); const response = await fetch(url, { signal: AbortSignal.timeout(30000) }); if (!response.ok) throw new Error(`Poll HTTP ${response.status}`); return response.json(); },
+        toInput: item => item as any, saveCursor: async cursor => saveJson(cursorPath, cursor), onError: error => { this.lastError = String(error); },
+      });
+    } else throw new Error(`Unknown source type: ${spec.type}`);
+    let started: Promise<void> = Promise.resolve();
+    const registration = this.emitter.registerSource({ name: source.name,
+      start: emitter => { started = Promise.resolve(source.start(emitter)); return started; },
+      stop: () => source.stop(),
+    });
+    try { await started; return registration; }
+    catch (error) { try { await registration.dispose(); } catch {} throw error; }
+  }
+  status() { return { running: this.started, nodeId: this.transport.localNodeId, profile: this.config.profile, member: this.config.member, name: this.config.name, endpoint: this.transport.endpointAddr, networks: this.transport.listMountedNetworks(), gateMode: this.gate.getMode(), lastError: this.lastError }; }
+  async serveControl(handler: (argv: string[]) => Promise<{ code: number; stdout: string[]; stderr: string[] }>): Promise<void> {
+    if (this.server) throw new Error('Control server already started');
+    // Only the stateDir lock owner may remove a stale socket.
+    rmSync(this.socketPath, { force: true });
+    const server = createServer(async (request, response) => {
+      if (request.method !== 'POST' || request.url !== '/cli') { response.writeHead(404).end(); return; }
+      try {
+        let body = ''; for await (const chunk of request) { body += chunk; if (body.length > 1_048_576) throw new Error('Control request too large'); }
+        const argv = JSON.parse(body);
+        if (!Array.isArray(argv) || argv.some(x => typeof x !== 'string')) throw new Error('Expected argv array');
+        const result = await handler(argv); response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
+      } catch (error) { response.writeHead(400).end(JSON.stringify({ error: String(error) })); }
+    });
+    this.server = server;
+    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(this.socketPath, () => { server.off('error', reject); resolve(); }); });
+    chmodSync(this.socketPath, 0o600);
+  }
+  async stop(): Promise<void> {
+    if (this.server?.listening) await new Promise<void>((resolve, reject) => this.server!.close(error => error ? reject(error) : resolve()));
+    this.server = undefined;
+    try { await this.kernel.stop(); }
+    finally { if (this.ownsLock) { rmSync(this.socketPath, { force: true }); rmSync(join(this.stateDir, 'runtime.lock'), { recursive: true, force: true }); this.ownsLock = false; } this.started = false; }
+  }
+}

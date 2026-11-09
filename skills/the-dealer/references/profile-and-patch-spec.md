@@ -1,0 +1,98 @@
+# Profiles and patch overlays
+
+| Profile | Default gate | Policies | Executors | Default executor |
+| --- | --- | --- | --- | --- |
+| personal-dev | approval_required | dedup-cas, wave-coalescer | orca-spawn, orca-wave, notify | orca-spawn |
+| dedicated-worker | open | dedup-cas, wave-coalescer | orca-spawn, orca-wave, agent-pty | orca-spawn |
+| headless-relay | open | none | notify | notify |
+
+The headless profile receives into a private notification inbox and can route
+outbound messages; it does not automatically forward inbound traffic.
+The runtime always loads transport, node, router, gate, dispatcher and emitter.
+Built-ins are available through `BUILT_IN_PROFILES` / `getBuiltInProfile(name)`.
+`DealerNodeRuntime({stateDir, profile, patch})` embeds the same stack in-process.
+
+## Configuration
+
+On fresh startup, profile defaults are overlaid with saved configuration,
+explicit startup flags, then the patch. An explicitly selected profile
+replaces its gate/policy/executor defaults. `dealer node up --patch patch.json`
+applies the overlay when starting a daemon. Stop an existing daemon before
+changing its startup profile or patch. Fields replace whole values; objects
+and arrays are not recursively merged. Use only trusted patch files.
+
+```json
+{
+  "gateMode": "approval_required",
+  "skills": ["ios-crash", "runtime"],
+  "defaultExecutor": "orca-wave",
+  "executorConfig": {
+    "orca-wave": {
+      "runId": "run_example",
+      "terminalHandle": "term_example",
+      "cwd": "/path/to/resident/workspace"
+    }
+  },
+  "wave": {"rotateAfterWaves": 6, "flushIntervalMs": 1000},
+  "routes": [{"type": "local-agent", "config": {"command": "codex"}}]
+}
+```
+
+Allowed node fields: `profile`, `member`, `name`, `skills`, `port`, `gateMode`,
+`networks`, `defaultExecutor`, `policies`, `executors`, `executorConfig`,
+`routes`, `sources`, `wave`. Mount entries use `networkId`, `passphrase`,
+optional `bootstrapPeers`, `admissionMode`, `exposedSkills`, and local `role`.
+Avoid selecting `orca-wave` until its target and authoritative idle check are
+configured. The default check inspects the workspace and descendants.
+
+The wave policy applies only to envelopes selecting `orca-wave`; other
+executors dispatch immediately after dedup. Stream identity includes network,
+`payload.streamKey` (or message kind), and executor. Busy work is buffered;
+a timer retries flushing. Before the next wave, rotation sends `/new` to the
+configured terminal after `rotateAfterWaves` waves **or** `minAgeMs` elapsed
+(the underlying policy uses OR, not AND). A terminal handle is required for
+rotation even when deliveries target a run. Configure only a terminal whose
+rotation you own. `payload.executor` can select any enabled executor, so
+expose only executors permitted for admitted peers.
+
+## Dependency-free YAML subset
+
+JSON is preferred. `.yaml` overlays support indentation-based mappings,
+plain word/path values, JSON double-quoted strings, and inline JSON arrays or
+objects. Block lists, anchors, tags, multiline strings, and implicit YAML
+coercions are unsupported and rejected.
+
+```yaml
+gateMode: approval_required
+skills: ["ios-crash", "runtime"]
+defaultExecutor: orca-wave
+executorConfig:
+  orca-wave:
+    runId: run_example
+    terminalHandle: term_example
+    cwd: /path/to/workspace
+wave:
+  rotateAfterWaves: 6
+  flushIntervalMs: 1000
+```
+
+`route add` / `source add` register immediately and persist definitions for
+restart. A source's startup must succeed before registration is reported.
+A script source emits one full `EmitMessageInput` JSON object per stdout line.
+The poll endpoint returns `{"items":[EmitMessageInput],"cursor":nextCursor}`;
+subsequent requests include a JSON-encoded `cursor` query parameter. A cursor
+advances only after all item deliveries succeed. Use stable `idempotencyKey`
+and monotonically increasing `payload.revision` for event claims. Cursor state
+is saved privately in stateDir. Webhooks accept the same full input via POST.
+
+```json
+{
+  "networkId": "sensebeing",
+  "routing": {"mode": "unicast", "targets": ["member:bob"]},
+  "kind": "alert.feedback.v1",
+  "subject": "Runtime feedback",
+  "body": "Investigate this report",
+  "payload": {"executor": "orca-wave", "streamKey": "runtime", "revision": 1},
+  "idempotencyKey": "feedback:123"
+}
+```
