@@ -5,60 +5,216 @@ import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
 import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite } from './config.ts';
+
 export * from './runtime.ts';
 export * from './config.ts';
 
 const booleanFlags = ['json', 'auto-route', 'trust-sender'];
-const stringFlags = ['profile', 'patch', 'member', 'name', 'skills', 'port', 'network', 'passphrase', 'role', 'gate', 'seed', 'ttl', 'skill', 'status', 'reason', 'to', 'topic', 'body', 'urgency', 'type', 'config', 'command', 'endpoint', 'model', 'url', 'cwd', 'args', 'interval-ms', 'token', 'path'];
+const stringFlags = [
+  'profile',
+  'patch',
+  'member',
+  'name',
+  'skills',
+  'port',
+  'network',
+  'passphrase',
+  'role',
+  'gate',
+  'seed',
+  'ttl',
+  'skill',
+  'status',
+  'reason',
+  'to',
+  'topic',
+  'body',
+  'urgency',
+  'Urgency',
+  'type',
+  'config',
+  'command',
+  'endpoint',
+  'model',
+  'url',
+  'cwd',
+  'args',
+  'interval-ms',
+  'token',
+  'path',
+];
+
 function parse(argv: string[]) {
-  return parseArgs({ args: argv, allowPositionals: true, strict: true, options: {
-    ...Object.fromEntries(booleanFlags.map(k => [k, { type: 'boolean' as const }])),
-    ...Object.fromEntries(stringFlags.map(k => [k, { type: 'string' as const }])),
-    attach: { type: 'string', multiple: true },
-  } });
-}
-function required(value: unknown, name: string): string { if (typeof value !== 'string' || !value) throw new Error(`Required: ${name}`); return value; }
-function duration(value = '24h'): number { const match = /^(\d+)(ms|s|m|h|d)$/.exec(value); if (!match) throw new Error('TTL must be a positive duration such as 30m or 24h'); return Number(match[1]) * ({ ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000 }[match[2]]!); }
-function runtimeOptions(values: Record<string, any>, stateDir: string) {
-  return { stateDir, profile: values.profile, member: values.member, name: values.name, skills: values.skills?.split(',').filter(Boolean), port: values.port === undefined ? undefined : Number(values.port), patch: values.patch ? readPatch(values.patch) : undefined };
-}
-export interface DealerCliOptions { stateDir?: string; runtime?: DealerNodeRuntime; stdout?: (line: string) => void; stderr?: (line: string) => void }
-async function rpc(socketPath: string, argv: string[]): Promise<{ code: number; stdout: string[]; stderr: string[] }> {
-  return new Promise((resolve, reject) => {
-    const req = request({ socketPath, path: '/cli', method: 'POST', headers: { 'content-type': 'application/json' } }, res => {
-      let body = ''; res.setEncoding('utf8'); res.on('data', chunk => { body += chunk; }); res.on('end', () => { try { if (res.statusCode !== 200) throw new Error(body); resolve(JSON.parse(body)); } catch (error) { reject(error); } });
-    });
-    req.setTimeout(60000, () => req.destroy(new Error('Daemon control request timed out'))); req.on('error', reject); req.end(JSON.stringify(argv));
+  return parseArgs({
+    args: argv,
+    allowPositionals: true,
+    strict: true,
+    options: {
+      ...Object.fromEntries(booleanFlags.map(k => [k, { type: 'boolean' as const }])),
+      ...Object.fromEntries(stringFlags.map(k => [k, { type: 'string' as const }])),
+      attach: { type: 'string', multiple: true },
+    },
   });
 }
+
+function required(value: unknown, name: string): string {
+  if (typeof value !== 'string' || !value) {
+    throw new Error(`Required: ${name}`);
+  }
+  return value;
+}
+
+function duration(value = '24h'): number {
+  const match = /^(\d+)(ms|s|m|h|d)$/.exec(value);
+  if (!match) {
+    throw new Error('TTL must be a positive duration such as 30m or 24h');
+  }
+  const units: Record<string, number> = {
+    ms: 1,
+    s: 1000,
+    m: 60000,
+    h: 3600000,
+    d: 86400000,
+  };
+  return Number(match[1]) * units[match[2]]!;
+}
+
+function runtimeOptions(values: Record<string, any>, stateDir: string) {
+  return {
+    stateDir,
+    profile: values.profile,
+    member: values.member,
+    name: values.name,
+    skills: values.skills?.split(',').filter(Boolean),
+    port: values.port === undefined ? undefined : Number(values.port),
+    patch: values.patch ? readPatch(values.patch) : undefined,
+  };
+}
+
+export interface DealerCliOptions {
+  stateDir?: string;
+  runtime?: DealerNodeRuntime;
+  stdout?: (line: string) => void;
+  stderr?: (line: string) => void;
+}
+
+async function rpc(
+  socketPath: string,
+  argv: string[],
+): Promise<{ code: number; stdout: string[]; stderr: string[] }> {
+  return new Promise((resolve, reject) => {
+    const req = request(
+      {
+        socketPath,
+        path: '/cli',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      },
+      res => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => {
+          body += chunk;
+        });
+        res.on('end', () => {
+          try {
+            if (res.statusCode !== 200) {
+              throw new Error(body);
+            }
+            resolve(JSON.parse(body));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    req.setTimeout(60000, () => req.destroy(new Error('Daemon control request timed out')));
+    req.on('error', reject);
+    req.end(JSON.stringify(argv));
+  });
+}
+
 async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['--experimental-strip-types', new URL('../../bin/dealerd.js', import.meta.url).pathname, ...argv], {
-      detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, DEALER_STATE_DIR: stateDir },
-    });
-    let output = '', errors = '', settled = false;
-    const timer = setTimeout(() => { child.kill(); finish(new Error('Daemon startup timed out')); }, 30000);
-    function finish(error?: Error, value?: unknown) { if (settled) return; settled = true; clearTimeout(timer); if (error) reject(error); else { child.stdout.destroy(); child.stderr.destroy(); child.unref(); resolve(value); } }
+    const child = spawn(
+      process.execPath,
+      ['--experimental-strip-types', new URL('../../bin/dealerd.js', import.meta.url).pathname, ...argv],
+      {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, DEALER_STATE_DIR: stateDir },
+      },
+    );
+    let output = '';
+    let errors = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(new Error('Daemon startup timed out'));
+    }, 30000);
+    function finish(error?: Error, value?: unknown) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        reject(error);
+      } else {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        resolve(value);
+      }
+    }
     child.on('error', error => finish(error));
     child.on('exit', code => finish(new Error(`Daemon exited ${code}: ${errors}`)));
-    child.stderr.on('data', chunk => { errors += chunk; });
-    child.stdout.on('data', chunk => { output += chunk; if (output.includes('\n')) { try { finish(undefined, JSON.parse(output.split('\n')[0])); } catch (error) { finish(error as Error); } } });
+    child.stderr.on('data', chunk => {
+      errors += chunk;
+    });
+    child.stdout.on('data', chunk => {
+      output += chunk;
+      if (output.includes('\n')) {
+        try {
+          finish(undefined, JSON.parse(output.split('\n')[0]));
+        } catch (error) {
+          finish(error as Error);
+        }
+      }
+    });
   });
 }
+
 export async function runDealerCli(argv: string[], options: DealerCliOptions = {}): Promise<number> {
-  const stdout = options.stdout ?? console.log, stderr = options.stderr ?? console.error;
+  const stdout = options.stdout ?? console.log;
+  const stderr = options.stderr ?? console.error;
   let owned: DealerNodeRuntime | undefined;
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action, target] = p;
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
     if (!options.runtime && existsSync(join(stateDir, 'control.sock'))) {
-      const result = await rpc(join(stateDir, 'control.sock'), argv); result.stdout.forEach(line => stdout(line)); result.stderr.forEach(line => stderr(line)); return result.code;
+      const result = await rpc(join(stateDir, 'control.sock'), argv);
+      result.stdout.forEach(line => stdout(line));
+      result.stderr.forEach(line => stderr(line));
+      return result.code;
     }
-    if (!options.runtime && group === 'node' && action === 'up') { stdout(JSON.stringify(await launchDaemon(argv, stateDir))); return 0; }
+    if (!options.runtime && group === 'node' && action === 'up') {
+      stdout(JSON.stringify(await launchDaemon(argv, stateDir)));
+      return 0;
+    }
     if (!options.runtime && group === 'node' && action === 'status') {
-      const file = join(stateDir, 'config.json'); const config = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-      stdout(JSON.stringify({ running: false, profile: config.profile, member: config.member, networks: (config.networks ?? []).map(n => n.networkId) })); return 0;
+      const file = join(stateDir, 'config.json');
+      const config = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+      stdout(
+        JSON.stringify({
+          running: false,
+          profile: config.profile,
+          member: config.member,
+          networks: (config.networks ?? []).map((n: { networkId: string }) => n.networkId),
+        }),
+      );
+      return 0;
     }
     const runtime = options.runtime ?? (owned = new DealerNodeRuntime({ stateDir }));
     await runtime.start();
@@ -66,74 +222,180 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     const network = v.network as string | undefined;
     if (group === 'node') {
       if (action === 'up' || action === 'status') {
-        if (action === 'up' && ['profile', 'patch', 'member', 'name', 'skills', 'port'].some(key => v[key] !== undefined)) throw new Error('Node already running; stop it before changing startup configuration');
+        if (action === 'up' && ['profile', 'patch', 'member', 'name', 'skills', 'port'].some(key => v[key] !== undefined)) {
+          throw new Error('Node already running; stop it before changing startup configuration');
+        }
         result = runtime.status();
+      } else if (action === 'card') {
+        result = network
+          ? runtime.node.getSelfCard(network)
+          : runtime.transport.listMountedNetworks().map(id => runtime.node.getSelfCard(id));
+      } else {
+        throw new Error('Unknown node command');
       }
-      else if (action === 'card') result = network ? runtime.node.getSelfCard(network) : runtime.transport.listMountedNetworks().map(id => runtime.node.getSelfCard(id));
-      else throw new Error('Unknown node command');
     } else if (group === 'network') {
       if (action === 'mount') {
-        const invite = required(target, 'networkId').startsWith('dealer-net:') ? decodeNetworkInvite(target) : { networkId: target, passphrase: required(v.passphrase, '--passphrase') };
-        await runtime.mountNetwork({ ...invite, ...(v.seed ? { bootstrapPeers: String(v.seed).split(',') } : {}), ...(v.gate ? { admissionMode: admissionMode(String(v.gate)) } : {}), ...(v.role ? { role: String(v.role) } : {}) });
+        const invite = required(target, 'networkId').startsWith('dealer-net:')
+          ? decodeNetworkInvite(target)
+          : { networkId: target, passphrase: required(v.passphrase, '--passphrase') };
+        await runtime.mountNetwork({
+          ...invite,
+          ...(v.seed ? { bootstrapPeers: String(v.seed).split(',') } : {}),
+          ...(v.gate ? { admissionMode: admissionMode(String(v.gate)) } : {}),
+          ...(v.role ? { role: String(v.role) } : {}),
+        });
         result = { mounted: invite.networkId };
-      } else if (action === 'unmount') { await runtime.unmountNetwork(required(target, 'networkId')); result = { unmounted: target }; }
-      else if (action === 'list') result = runtime.config.networks.map(({ passphrase, ...rest }) => rest);
-      else if (action === 'invite') {
-        const config = runtime.config.networks.find(n => n.networkId === target); if (!config) throw new Error('Network not mounted');
-        result = { uri: encodeNetworkInvite({ ...config, passphrase: String(v.passphrase ?? config.passphrase) }, duration(v.ttl as string | undefined)) };
-      } else throw new Error('Unknown network command');
+      } else if (action === 'unmount') {
+        await runtime.unmountNetwork(required(target, 'networkId'));
+        result = { unmounted: target };
+      } else if (action === 'list') {
+        result = runtime.config.networks.map(({ passphrase, ...rest }) => rest);
+      } else if (action === 'invite') {
+        const config = runtime.config.networks.find(n => n.networkId === target);
+        if (!config) {
+          throw new Error('Network not mounted');
+        }
+        result = {
+          uri: encodeNetworkInvite(
+            { ...config, passphrase: String(v.passphrase ?? config.passphrase) },
+            duration(v.ttl as string | undefined),
+          ),
+        };
+      } else {
+        throw new Error('Unknown network command');
+      }
     } else if (group === 'peers') {
-      if (action === 'list') result = runtime.node.listPeers({ networkId: network, skillTag: v.skill as string | undefined }).filter(c => !v.status || c.runtimeState.load === v.status || c.admissionMode === v.status);
-      else if (action === 'resolve') result = runtime.node.resolveTarget(required(target, 'selector'), network);
-      else throw new Error('Unknown peers command');
+      if (action === 'list') {
+        result = runtime.node
+          .listPeers({ networkId: network, skillTag: v.skill as string | undefined })
+          .filter(c => !v.status || c.runtimeState.load === v.status || c.admissionMode === v.status);
+      } else if (action === 'resolve') {
+        result = runtime.node.resolveTarget(required(target, 'selector'), network);
+      } else {
+        throw new Error('Unknown peers command');
+      }
     } else if (group === 'gate') {
-      if (action === 'mode') { await runtime.setGateMode(admissionMode(required(target, 'mode')), network); result = { mode: network ? runtime.gate.getNetworkMode(network) : runtime.gate.getMode() }; }
-      else if (action === 'list') result = runtime.gate.listPendingApprovals().filter(item => !network || item.envelope.networkId === network);
-      else if (action === 'approve' || action === 'reject') {
-        const id = required(target, 'envelopeId'); const pending = runtime.gate.listPendingApprovals().filter(item => item.id === id || item.envelope.id === id);
-        if (pending.length !== 1) throw new Error('Unknown or ambiguous approval');
-        if (action === 'approve') await runtime.gate.approve(pending[0].id, { trustSender: v['trust-sender'] === true });
-        else await runtime.gate.reject(pending[0].id, v.reason as string | undefined);
+      if (action === 'mode') {
+        await runtime.setGateMode(admissionMode(required(target, 'mode')), network);
+        result = { mode: network ? runtime.gate.getNetworkMode(network) : runtime.gate.getMode() };
+      } else if (action === 'list') {
+        result = runtime.gate.listPendingApprovals().filter(item => !network || item.envelope.networkId === network);
+      } else if (action === 'approve' || action === 'reject') {
+        const id = required(target, 'envelopeId');
+        const pending = runtime.gate.listPendingApprovals().filter(item => item.id === id || item.envelope.id === id);
+        if (pending.length !== 1) {
+          throw new Error('Unknown or ambiguous approval');
+        }
+        if (action === 'approve') {
+          await runtime.gate.approve(pending[0].id, { trustSender: v['trust-sender'] === true });
+        } else {
+          await runtime.gate.reject(pending[0].id, v.reason as string | undefined);
+        }
         result = { [action === 'approve' ? 'approved' : 'rejected']: id };
-      } else if (action === 'drain') { await runtime.gate.drainDnd(network); result = { drained: true }; }
-      else throw new Error('Unknown gate command');
+      } else if (action === 'drain') {
+        await runtime.gate.drainDnd(network);
+        result = { drained: true };
+      } else {
+        throw new Error('Unknown gate command');
+      }
     } else if (group === 'send' || group === 'broadcast') {
-      const topic = required(v.topic, '--topic'), body = required(v.body, '--body');
-      if (group === 'send' && Boolean(v.to) === Boolean(v['auto-route'])) throw new Error('Choose exactly one of --to or --auto-route');
-      if (v.urgency && !['normal', 'high', 'critical'].includes(String(v.urgency))) throw new Error('Invalid urgency');
-      let payload = {}; try { const parsed = JSON.parse(body); payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { value: parsed }; } catch { /* plain text */ }
-      result = await runtime.emitter.emit({ networkId: required(v.network, '--network'), kind: topic, subject: topic, body, payload,
-        routing: { mode: group === 'broadcast' ? 'broadcast' : v['auto-route'] ? 'auto' : 'unicast', ...(v.to ? { targets: [String(v.to)] } : {}), topic },
-        filePaths: v.attach as string[] | undefined, priority: v.urgency === 'critical' ? 'urgent' : v.urgency as 'normal' | 'high' | undefined,
+      const topic = required(v.topic, '--topic');
+      const body = required(v.body, '--body');
+      const rawUrgency = (v.urgency ?? v.Urgency) as string | undefined;
+      if (group === 'send' && Boolean(v.to) === Boolean(v['auto-route'])) {
+        throw new Error('Choose exactly one of --to or --auto-route');
+      }
+      if (rawUrgency && !['normal', 'high', 'critical'].includes(String(rawUrgency))) {
+        throw new Error('Invalid urgency');
+      }
+      let payload = {};
+      try {
+        const parsed = JSON.parse(body);
+        payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { value: parsed };
+      } catch {
+        // Plain text body
+      }
+      result = await runtime.emitter.emit({
+        networkId: required(v.network, '--network'),
+        kind: topic,
+        subject: topic,
+        body,
+        payload,
+        routing: {
+          mode: group === 'broadcast' ? 'broadcast' : v['auto-route'] ? 'auto' : 'unicast',
+          ...(v.to ? { targets: [String(v.to)] } : {}),
+          topic,
+        },
+        filePaths: v.attach as string[] | undefined,
+        priority: rawUrgency === 'critical' ? 'urgent' : (rawUrgency as 'normal' | 'high' | undefined),
       });
     } else if ((group === 'route' || group === 'source') && action === 'add') {
-      if (owned && group === 'source') throw new Error('Start dealer node up before adding a live source');
+      if (owned && group === 'source') {
+        throw new Error('Start dealer node up before adding a live source');
+      }
       const config = v.config ? JSON.parse(readFileSync(String(v.config), 'utf8')) : {};
-      for (const key of ['command', 'endpoint', 'model', 'url', 'cwd', 'path']) if (v[key]) config[key] = v[key];
-      if (v.port !== undefined) config.port = Number(v.port);
-      if (v.args) config.args = JSON.parse(String(v.args));
-      if (v['interval-ms']) config.intervalMs = Number(v['interval-ms']);
-      if (v.token) config.bearerToken = v.token;
+      for (const key of ['command', 'endpoint', 'model', 'url', 'cwd', 'path']) {
+        if (v[key]) {
+          config[key] = v[key];
+        }
+      }
+      if (v.port !== undefined) {
+        config.port = Number(v.port);
+      }
+      if (v.args) {
+        config.args = JSON.parse(String(v.args));
+      }
+      if (v['interval-ms']) {
+        config.intervalMs = Number(v['interval-ms']);
+      }
+      if (v.token) {
+        config.bearerToken = v.token;
+      }
       const spec = { type: required(v.type, '--type'), config };
       const registration = group === 'route' ? runtime.installRoute(spec) : await runtime.installSource(spec);
       const list = group === 'route' ? runtime.config.routes : runtime.config.sources;
-      list.push(spec); try { runtime.persist(); } catch (error) { list.pop(); await registration.dispose(); throw error; }
+      list.push(spec);
+      try {
+        runtime.persist();
+      } catch (error) {
+        list.pop();
+        await registration.dispose();
+        throw error;
+      }
       result = { added: spec.type };
-    } else throw new Error('Unknown command; see skills/the-dealer/SKILL.md');
-    stdout(JSON.stringify(result, null, v.json ? undefined : 2)); return 0;
-  } catch (error) { stderr(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); return 1; }
-  finally { if (owned) await owned.stop(); }
+    } else {
+      throw new Error('Unknown command; see skills/the-dealer/SKILL.md');
+    }
+    stdout(JSON.stringify(result, null, v.json ? undefined : 2));
+    return 0;
+  } catch (error) {
+    stderr(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    return 1;
+  } finally {
+    if (owned) {
+      await owned.stop();
+    }
+  }
 }
+
 export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime> {
   const { values } = parse(argv);
   const runtime = new DealerNodeRuntime(runtimeOptions(values, defaultStateDir()));
   await runtime.start();
   try {
     await runtime.serveControl(async args => {
-      const stdout: string[] = [], stderr: string[] = [];
-      const code = await runDealerCli(args, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const code = await runDealerCli(args, {
+        runtime,
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+      });
       return { code, stdout, stderr };
     });
-  } catch (error) { await runtime.stop(); throw error; }
+  } catch (error) {
+    await runtime.stop();
+    throw error;
+  }
   return runtime;
 }
