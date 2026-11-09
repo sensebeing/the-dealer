@@ -1,7 +1,16 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
 
 export interface CommandRequest {
@@ -104,19 +113,176 @@ export interface OrcaSpawnOptions extends AgentOptions {
   namePrefix?: string;
   orcaCommand?: string;
   parentWorktree?: string;
+  seaCreatureNaming?: boolean;
+  agySettingsPath?: string;
+  interactiveCommand?: string;
 }
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
+/** Canonical worktree names used for sea-creature naming, in preference order. */
+export const SEA_CREATURE_POOL = [
+  'nautilus',
+  'seahorse',
+  'starfish',
+  'dolphin',
+  'octopus',
+  'jellyfish',
+  'stingray',
+  'manatee',
+  'narwhal',
+  'walrus',
+  'beluga',
+  'dugong',
+  'axolotl',
+  'coral',
+  'halibut',
+  'lamprey',
+  'mackerel',
+  'oarfish',
+  'pollock',
+  'remora',
+  'sardine',
+  'triggerfish',
+  'bonefish',
+  'cuttlefish',
+  'manta',
+  'killifish',
+  'lionfish',
+  'mudskipper',
+  'needlefish',
+  'paddlefish',
+  'triton',
+  'rockfish',
+  'sawfish',
+  'tilefish',
+  'weakfish',
+  'yellowtail',
+  'wahoo',
+  'tautog',
+  'sculpin',
+  'pomfret',
+  'coelacanth',
+  'lumpfish',
+  'hogfish',
+  'porpoise',
+  'dace',
+  'blenny',
+  'abalone',
+  'barnacle',
+  'cockle',
+  'krill',
+  'limpet',
+  'mussel',
+  'oyster',
+  'scallop',
+  'urchin',
+  'whelk',
+  'conch',
+  'prawn',
+  'hammerhead',
+  'anemone',
+  'wobbegong',
+  'hydroid',
+  'isopod',
+  'nudibranch',
+  'salp',
+  'tunicate',
+  'chimaera',
+  'copepod',
+  'amphipod',
+  'anglerfish',
+] as const;
+
+/**
+ * Trust a workspace in Antigravity by adding it to trustedWorkspaces.
+ * Missing settings files start from an empty object, then the file is replaced atomically.
+ */
+export function trustAntigravityWorkspace(workspacePath: string, settingsPath?: string): void {
+  const file = settingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
+  let settings: Record<string, unknown> = {};
+  if (existsSync(file)) {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`Antigravity settings at ${file} must be a JSON object`);
+    }
+    settings = parsed as Record<string, unknown>;
+  }
+  const trusted = Array.isArray(settings.trustedWorkspaces)
+    ? settings.trustedWorkspaces.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const candidates = existsSync(workspacePath)
+    ? [workspacePath, realpathSync(workspacePath)]
+    : [workspacePath];
+  for (const candidate of candidates) {
+    if (!trusted.includes(candidate)) {
+      trusted.push(candidate);
+    }
+  }
+  settings.trustedWorkspaces = trusted;
+  mkdirSync(dirname(file), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, file);
+}
+
+async function pickSeaCreatureName(
+  runner: CommandRunner,
+  command: string,
+  cwd: string | undefined,
+  signal?: AbortSignal,
+): Promise<string> {
+  const listed = await checkedCommand(runner, {
+    command,
+    args: ['worktree', 'list', '--json'],
+    cwd,
+    signal,
+  });
+  const raw = JSON.parse(listed.stdout) as {
+    ok?: boolean;
+    result?: { worktrees?: { path?: unknown; displayName?: unknown }[] };
+  };
+  if (raw.ok === false) {
+    throw new Error('Orca worktree listing failed');
+  }
+  const existing = new Set<string>();
+  for (const row of raw.result?.worktrees ?? []) {
+    if (typeof row.path === 'string' && row.path) {
+      existing.add(basename(row.path).toLowerCase());
+    }
+    if (typeof row.displayName === 'string' && row.displayName) {
+      existing.add(row.displayName.toLowerCase());
+    }
+  }
+  const available = SEA_CREATURE_POOL.find(creature => !existing.has(creature));
+  return available ?? `nautilus-${randomUUID().slice(0, 8)}`;
+}
+
 export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): ExecutorPlugin {
   return {
     name: 'orca-spawn',
-    async execute(batch, context) {
+    async execute(batch, context, runtimeConfig) {
       const runner = options.commandRunner ?? runCommand;
       const command = options.orcaCommand ?? 'orca';
-      const name = `${options.namePrefix ?? 'dealer'}-${randomUUID()}`;
+      const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
+      const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
       const parentWorktree =
-        options.parentWorktree ?? (options.cwd ? `path:${options.cwd}` : 'active');
+        typeof payload.parentWorktree === 'string' && payload.parentWorktree
+          ? payload.parentWorktree
+          : (config.parentWorktree ??
+            options.parentWorktree ??
+            (options.cwd ? `path:${options.cwd}` : 'active'));
+      const explicitName =
+        typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
+          ? payload.worktreeName.trim()
+          : undefined;
+      const seaCreatureNaming =
+        payload.seaCreatureNaming === true || options.seaCreatureNaming === true;
+      const name = explicitName
+        ? explicitName
+        : seaCreatureNaming
+          ? await pickSeaCreatureName(runner, command, options.cwd, context.signal)
+          : `${options.namePrefix ?? 'dealer'}-${randomUUID()}`;
       const created = await checkedCommand(runner, {
         command,
         args: ['worktree', 'create', '--parent-worktree', parentWorktree, '--name', name, '--json'],
@@ -131,6 +297,120 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const path = workspace.path ?? workspace.worktree?.path;
       if (!path) {
         throw new Error('Orca worktree create returned no path');
+      }
+      const terminalPrompt =
+        typeof payload.terminalPrompt === 'string' && payload.terminalPrompt.trim()
+          ? payload.terminalPrompt
+          : undefined;
+      if (terminalPrompt) {
+        const explicitSettingsPath =
+          typeof payload.agySettingsPath === 'string' && payload.agySettingsPath
+            ? payload.agySettingsPath
+            : undefined;
+        const optionSettingsPath =
+          typeof options.agySettingsPath === 'string' && options.agySettingsPath
+            ? options.agySettingsPath
+            : undefined;
+        const settingsFile =
+          explicitSettingsPath ??
+          optionSettingsPath ??
+          join(homedir(), '.gemini/antigravity-cli/settings.json');
+        if (
+          payload.trustAntigravity !== false &&
+          (existsSync(settingsFile) ||
+            explicitSettingsPath !== undefined ||
+            optionSettingsPath !== undefined)
+        ) {
+          trustAntigravityWorkspace(path, settingsFile);
+        }
+        const interactiveCommand =
+          typeof payload.interactiveCommand === 'string' && payload.interactiveCommand.trim()
+            ? payload.interactiveCommand.trim()
+            : (options.interactiveCommand ??
+              (existsSync(join(homedir(), '.local/bin/magpie'))
+                ? `${shellQuote(join(homedir(), '.local/bin/magpie'))} agy run --dangerously-skip-permissions`
+                : shellQuote(options.command ?? 'codex')));
+        const launched = await checkedCommand(runner, {
+          command,
+          args: [
+            'terminal',
+            'create',
+            '--worktree',
+            `path:${path}`,
+            '--command',
+            interactiveCommand,
+            '--json',
+          ],
+          cwd: path,
+          signal: context.signal,
+        });
+        const terminal = JSON.parse(launched.stdout);
+        if (terminal.ok === false) {
+          throw new Error('Orca terminal launch failed');
+        }
+        const terminalHandle =
+          terminal.result?.terminal?.handle ?? terminal.result?.handle ?? terminal.handle;
+        if (typeof terminalHandle === 'string' && terminalHandle) {
+          if (typeof payload.workspaceComment === 'string' && payload.workspaceComment.trim()) {
+            await checkedCommand(runner, {
+              command,
+              args: [
+                'worktree',
+                'set',
+                '--worktree',
+                `path:${path}`,
+                '--comment',
+                payload.workspaceComment,
+                '--json',
+              ],
+              cwd: path,
+              signal: context.signal,
+            });
+          }
+          try {
+            await runner({
+              command,
+              args: [
+                'terminal',
+                'wait',
+                '--terminal',
+                String(terminalHandle),
+                '--for',
+                'tui-idle',
+                '--timeout-ms',
+                '30000',
+                '--json',
+              ],
+              cwd: path,
+              signal: context.signal,
+            });
+          } catch {
+            // A wait timeout does not invalidate an already-idle TUI; send the prompt regardless.
+          }
+          await checkedCommand(runner, {
+            command,
+            args: [
+              'terminal',
+              'send',
+              '--terminal',
+              String(terminalHandle),
+              '--text',
+              terminalPrompt,
+              '--enter',
+              '--wait-submit',
+              '5',
+              '--json',
+            ],
+            cwd: path,
+            signal: context.signal,
+          });
+        }
+        return {
+          executor: 'orca-spawn',
+          executionId: randomUUID(),
+          worktreePath: path,
+          terminal,
+        };
       }
       const agent = options.command ?? 'codex';
       // Orca terminal's --command is a shell command; quote every untrusted argument.

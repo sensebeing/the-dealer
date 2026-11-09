@@ -1,7 +1,8 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Kernel } from '../packages/kernel/index.ts';
@@ -14,7 +15,7 @@ import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin } from '../packages/plugins-policy/index.ts';
-import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin } from '../packages/plugins-executor/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace } from '../packages/plugins-executor/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/plugins-executor/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
 
@@ -189,6 +190,176 @@ test('all official executors deliver via Emitter using injected commands and not
   assert.ok(requests.some(r => r.args.includes('run:run-test')));
   assert.ok(requests.some(r => r.args.includes('--comment')));
   assert.match(await readFile(join(dir, 'inbox.jsonl'), 'utf8'), /Task/);
+});
+
+test('orca-spawn honors per-envelope parent worktrees, explicit names and sea-creature naming', async () => {
+  const requests: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    requests.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: { worktrees: [{ path: '/tmp/Nautilus' }, { displayName: 'Seahorse' }] },
+        }),
+      };
+    }
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/child' } } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const executor = createOrcaSpawnExecutorPlugin({
+    commandRunner,
+    command: 'codex',
+    cwd: '/workspace',
+    seaCreatureNaming: true,
+  });
+  const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
+  const createdArgs = () =>
+    requests.find(r => r.args[0] === 'worktree' && r.args[1] === 'create')!.args;
+  const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
+
+  await executor.execute(
+    [envelope({ payload: { parentWorktree: 'path:/ephemeral', worktreeName: ' explicit ' } })],
+    context,
+    {},
+  );
+  assert.equal(flagValue(createdArgs(), '--parent-worktree'), 'path:/ephemeral');
+  assert.equal(flagValue(createdArgs(), '--name'), 'explicit');
+  assert.equal(requests.some(r => r.args[1] === 'list'), false);
+
+  requests.length = 0;
+  await executor.execute(
+    [envelope({ payload: { seaCreatureNaming: true } })],
+    context,
+    { parentWorktree: 'path:/runtime' },
+  );
+  assert.equal(flagValue(createdArgs(), '--parent-worktree'), 'path:/runtime');
+  assert.equal(flagValue(createdArgs(), '--name'), 'starfish');
+  assert.ok(requests.some(r => r.args[0] === 'worktree' && r.args[1] === 'list'));
+
+  requests.length = 0;
+  const fallback = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'claude', cwd: '/workspace' });
+  await fallback.execute([envelope()], context, {});
+  assert.equal(flagValue(createdArgs(), '--parent-worktree'), 'path:/workspace');
+  assert.match(String(flagValue(createdArgs(), '--name')), /^dealer-/);
+});
+
+test('trustAntigravityWorkspace records workspace paths atomically and idempotently', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-agy-settings-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const settingsPath = join(dir, 'settings.json');
+  const workspacePath = join(dir, 'workspace');
+  await mkdir(workspacePath);
+  await writeFile(settingsPath, JSON.stringify({ theme: 'dark', trustedWorkspaces: ['/already-trusted', 42] }));
+  trustAntigravityWorkspace(workspacePath, settingsPath);
+  trustAntigravityWorkspace(workspacePath, settingsPath);
+  const resolved = await realpath(workspacePath);
+  const expected = resolved === workspacePath ? [workspacePath] : [workspacePath, resolved];
+  const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.equal(settings.theme, 'dark');
+  assert.deepEqual(settings.trustedWorkspaces, ['/already-trusted', ...expected]);
+  assert.equal((await stat(settingsPath)).mode & 0o777, 0o600);
+
+  trustAntigravityWorkspace('/missing/workspace', settingsPath);
+  const extended = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.deepEqual(extended.trustedWorkspaces, ['/already-trusted', ...expected, '/missing/workspace']);
+
+  await writeFile(settingsPath, JSON.stringify({ trustedWorkspaces: 'invalid' }));
+  trustAntigravityWorkspace(workspacePath, settingsPath);
+  const normalized = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.deepEqual(normalized.trustedWorkspaces, expected);
+});
+
+test('orca-spawn launches an interactive antigravity terminal and injects the prompt', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-agy-run-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const settingsPath = join(dir, 'settings.json');
+  const requests: CommandRequest[] = [];
+  let waitFails = false;
+  const commandRunner: CommandRunner = async request => {
+    requests.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: dir } } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle: 'term-agy' } } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait' && waitFails) {
+      throw new Error('wait timed out');
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex' });
+  const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
+  const commandNames = () => requests.map(r => `${r.args[0]} ${r.args[1]}`);
+  const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
+
+  await executor.execute(
+    [
+      envelope({
+        payload: {
+          terminalPrompt: 'Fix the flaky test',
+          interactiveCommand: 'agy run --dangerously-skip-permissions',
+          workspaceComment: 'dealer: antigravity',
+          agySettingsPath: settingsPath,
+        },
+      }),
+    ],
+    context,
+    {},
+  );
+  assert.deepEqual(commandNames(), [
+    'worktree create',
+    'terminal create',
+    'worktree set',
+    'terminal wait',
+    'terminal send',
+  ]);
+  assert.equal(flagValue(requests[1].args, '--command'), 'agy run --dangerously-skip-permissions');
+  assert.equal(flagValue(requests[2].args, '--comment'), 'dealer: antigravity');
+  assert.equal(flagValue(requests[3].args, '--timeout-ms'), '30000');
+  assert.equal(flagValue(requests[4].args, '--terminal'), 'term-agy');
+  assert.equal(flagValue(requests[4].args, '--text'), 'Fix the flaky test');
+  assert.ok(requests[4].args.includes('--enter'));
+  assert.equal(flagValue(requests[4].args, '--wait-submit'), '5');
+  const trusted = JSON.parse(await readFile(settingsPath, 'utf8')).trustedWorkspaces;
+  assert.ok(trusted.includes(dir));
+
+  requests.length = 0;
+  waitFails = true;
+  await executor.execute(
+    [
+      envelope({
+        payload: { terminalPrompt: 'Retry after timeout', interactiveCommand: 'agy run', agySettingsPath: settingsPath },
+      }),
+    ],
+    context,
+    {},
+  );
+  assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait', 'terminal send']);
+
+  requests.length = 0;
+  const untrustedSettings = join(dir, 'untrusted.json');
+  await executor.execute(
+    [
+      envelope({
+        payload: { terminalPrompt: 'Do not trust', agySettingsPath: untrustedSettings, trustAntigravity: false },
+      }),
+    ],
+    context,
+    {},
+  );
+  assert.equal(existsSync(untrustedSettings), false);
+  assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait', 'terminal send']);
+
+  requests.length = 0;
+  await executor.execute([envelope({ payload: {} })], context, {});
+  assert.deepEqual(commandNames(), ['worktree create', 'terminal create']);
+  const agentCommand = String(flagValue(requests[1].args, '--command'));
+  assert.match(agentCommand, /^'codex' 'exec'/);
+  assert.match(agentCommand, /Investigate/);
 });
 
 test('webhook, watermark poller and JSON-lines script run end-to-end through emitter', async t => {
