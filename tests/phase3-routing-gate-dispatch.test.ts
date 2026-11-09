@@ -185,7 +185,9 @@ test('all official executors deliver via Emitter using injected commands and not
     dispatcher.registerExecutor(executor, {});
     const result = await emitter.emit({ ...input, payload: { executor: executor.name } }); assert.equal(result.receipts[0].stage, 'dispatched'); assert.equal(result.receipts[0].executionReceipt?.executor, executor.name);
   }
-  assert.ok(requests.some(r => r.args.includes('--no-parent'))); assert.ok(requests.some(r => r.args.includes('run:run-test'))); assert.ok(requests.some(r => r.args.includes('--comment')));
+  assert.ok(requests.some(r => r.args.includes('--parent-worktree')));
+  assert.ok(requests.some(r => r.args.includes('run:run-test')));
+  assert.ok(requests.some(r => r.args.includes('--comment')));
   assert.match(await readFile(join(dir, 'inbox.jsonl'), 'utf8'), /Task/);
 });
 
