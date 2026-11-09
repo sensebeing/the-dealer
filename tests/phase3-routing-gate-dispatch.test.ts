@@ -441,14 +441,12 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
       envelope({
         payload: {
           terminalPrompt: 'Fix the flaky test',
-          interactiveCommand: 'agy run --dangerously-skip-permissions',
           workspaceComment: 'dealer: antigravity',
-          agySettingsPath: settingsPath,
         },
       }),
     ],
     context,
-    {},
+    { interactiveCommand: 'agy run --dangerously-skip-permissions', agySettingsPath: settingsPath },
   );
   assert.deepEqual(commandNames(), [
     'worktree create',
@@ -472,11 +470,11 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   await executor.execute(
     [
       envelope({
-        payload: { terminalPrompt: 'Retry after timeout', interactiveCommand: 'agy run', agySettingsPath: settingsPath },
+        payload: { terminalPrompt: 'Retry after timeout' },
       }),
     ],
     context,
-    {},
+    { interactiveCommand: 'agy run', agySettingsPath: settingsPath },
   );
   assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait', 'terminal send']);
 
@@ -485,11 +483,11 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   await executor.execute(
     [
       envelope({
-        payload: { terminalPrompt: 'Do not trust', agySettingsPath: untrustedSettings, trustAntigravity: false },
+        payload: { terminalPrompt: 'Do not trust', trustAntigravity: false },
       }),
     ],
     context,
-    {},
+    { agySettingsPath: untrustedSettings },
   );
   assert.equal(existsSync(untrustedSettings), false);
   assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait', 'terminal send']);
@@ -500,6 +498,55 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   const agentCommand = String(flagValue(requests[1].args, '--command'));
   assert.match(agentCommand, /^'codex' 'exec'/);
   assert.match(agentCommand, /Investigate/);
+});
+
+test('orca-spawn ignores inbound command and settings authority and prefers receiver cwd', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-receiver-authority-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const requests: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    requests.push(request);
+    return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: dir } } }) };
+  };
+  const senderSettings = join(dir, 'sender-settings.json');
+  const optionSettings = join(dir, 'option-settings.json');
+  const runtimeSettings = join(dir, 'runtime-settings.json');
+  const executor = createOrcaSpawnExecutorPlugin({
+    commandRunner,
+    cwd: '/receiver/options',
+    interactiveCommand: 'receiver-options-command',
+    agySettingsPath: optionSettings,
+  });
+  const input = envelope({ payload: {
+    terminalPrompt: 'Do the work',
+    interactiveCommand: 'sender-controlled-command',
+    agySettingsPath: senderSettings,
+    repoPath: '/sender/repo',
+  } });
+  const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
+  await executor.execute([input], context, {
+    cwd: '/receiver/runtime',
+    interactiveCommand: 'receiver-runtime-command',
+    agySettingsPath: runtimeSettings,
+  });
+  assert.equal(requests[0].cwd, '/receiver/runtime');
+  assert.equal(requests[1].args[requests[1].args.indexOf('--command') + 1], 'receiver-runtime-command');
+  assert.ok(JSON.parse(await readFile(runtimeSettings, 'utf8')).trustedWorkspaces.includes(dir));
+  assert.equal(existsSync(optionSettings), false);
+  assert.equal(existsSync(senderSettings), false);
+
+  requests.length = 0;
+  await executor.execute([input], context, {});
+  assert.equal(requests[0].cwd, '/receiver/options');
+  assert.equal(requests[1].args[requests[1].args.indexOf('--command') + 1], 'receiver-options-command');
+  assert.ok(JSON.parse(await readFile(optionSettings, 'utf8')).trustedWorkspaces.includes(dir));
+  assert.equal(existsSync(senderSettings), false);
+
+  requests.length = 0;
+  await createOrcaSpawnExecutorPlugin({ commandRunner }).execute(
+    [envelope({ payload: { repoPath: '/loopback/repo' } })], context, {},
+  );
+  assert.equal(requests[0].cwd, '/loopback/repo');
 });
 
 test('webhook, watermark poller and JSON-lines script run end-to-end through emitter', async t => {

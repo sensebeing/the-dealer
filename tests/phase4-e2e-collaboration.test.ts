@@ -10,6 +10,7 @@ import {
   runDealerCli,
   getBuiltInProfile,
   readPatch,
+  validateConfig,
   decodeNetworkInvite,
   encodeNetworkInvite,
   createLocalAgentRouterPlugin,
@@ -587,6 +588,14 @@ test('Phase 4: declarative YAML patch and live route/source registrations', asyn
   const runtime = await node(t, root, 'configured', {
     patch: { ...readPatch(patchPath), executorConfig: {} },
   });
+  assert.throws(() => validateConfig({ ...runtime.config, executorConfig: { orcaSpawn: {} } }), /Unknown executor/);
+  for (const invalid of [null, [], 'invalid', 42]) {
+    assert.throws(() => validateConfig({ ...runtime.config, executorConfig: invalid as any }), /Invalid executorConfig/);
+    assert.throws(() => validateConfig({ ...runtime.config, executorConfig: { 'orca-spawn': invalid as any } }), /Invalid executorConfig/);
+  }
+  assert.doesNotThrow(() => validateConfig({ ...runtime.config, executorConfig: {
+    'orca-spawn': {}, 'orca-wave': {}, 'agent-pty': {}, notify: {},
+  } }));
   assert.equal(runtime.gate.getMode(), 'dnd');
   assert.deepEqual(runtime.config.skills, ['ios', 'runtime']);
   await cli(runtime, 'route', 'add', '--type', 'local-agent', '--command', 'codex');

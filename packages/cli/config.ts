@@ -228,6 +228,8 @@ export function readPatch(path: string): Partial<RuntimeConfig> {
   return root;
 }
 
+const BUILTIN_EXECUTORS = ['orca-spawn', 'orca-wave', 'agent-pty', 'notify'];
+
 export function validateConfig(config: RuntimeConfig): void {
   validatePluginRefs(config.userPlugins);
   if (!Array.isArray(config.projects)) {
@@ -255,8 +257,19 @@ export function validateConfig(config: RuntimeConfig): void {
   if (!config.executors.includes(config.defaultExecutor)) {
     throw new Error('Default executor must be enabled');
   }
-  if (config.executors.some(e => !['orca-spawn', 'orca-wave', 'agent-pty', 'notify'].includes(e))) {
+  if (config.executors.some(e => !BUILTIN_EXECUTORS.includes(e))) {
     throw new Error('Unknown executor');
+  }
+  if (!isRecord(config.executorConfig)) {
+    throw new Error('Invalid executorConfig');
+  }
+  for (const [executor, options] of Object.entries(config.executorConfig)) {
+    if (!BUILTIN_EXECUTORS.includes(executor)) {
+      throw new Error('Unknown executor');
+    }
+    if (!isRecord(options)) {
+      throw new Error('Invalid executorConfig');
+    }
   }
   if (config.policies.some(p => !['dedup-cas', 'wave-coalescer'].includes(p))) {
     throw new Error('Unknown policy');

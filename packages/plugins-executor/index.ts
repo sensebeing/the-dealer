@@ -308,11 +308,12 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           : typeof payload.cwd === 'string' && payload.cwd
             ? payload.cwd
             : undefined;
-      // Orca resolves worktree creation relative to the caller's repo, so run from the repo or
-      // parent worktree path whenever the plugin itself was not given an explicit cwd.
+      const configuredCwd =
+        (typeof config.cwd === 'string' && config.cwd ? config.cwd : undefined) ?? options.cwd;
+      // Receiver configuration selects the local checkout; payload paths support loopback.
       const worktreeCwd =
+        configuredCwd ??
         repoPath ??
-        options.cwd ??
         (parentWorktree?.startsWith('path:') ? parentWorktree.slice(5) : undefined);
       const explicitName =
         typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
@@ -349,8 +350,8 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           : undefined;
       if (terminalPrompt) {
         const explicitSettingsPath =
-          typeof payload.agySettingsPath === 'string' && payload.agySettingsPath
-            ? payload.agySettingsPath
+          typeof config.agySettingsPath === 'string' && config.agySettingsPath
+            ? config.agySettingsPath
             : undefined;
         const optionSettingsPath =
           typeof options.agySettingsPath === 'string' && options.agySettingsPath
@@ -369,8 +370,8 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           trustAntigravityWorkspace(path, settingsFile);
         }
         const interactiveCommand =
-          typeof payload.interactiveCommand === 'string' && payload.interactiveCommand.trim()
-            ? payload.interactiveCommand.trim()
+          typeof config.interactiveCommand === 'string' && config.interactiveCommand.trim()
+            ? config.interactiveCommand.trim()
             : (options.interactiveCommand ??
               (existsSync(join(homedir(), '.local/bin/magpie'))
                 ? `${shellQuote(join(homedir(), '.local/bin/magpie'))} agy run --dangerously-skip-permissions`
