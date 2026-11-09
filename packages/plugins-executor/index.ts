@@ -290,26 +290,25 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const command = options.orcaCommand ?? 'orca';
       const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
-      const explicitNoParent =
-        payload.noParent === true ||
-        payload.parentWorktree === 'none' ||
-        (payload.parentWorktree === undefined &&
-          (config.noParent === true || options.noParent === true));
-      const parentWorktree = explicitNoParent
-        ? undefined
-        : typeof payload.parentWorktree === 'string' && payload.parentWorktree
-          ? payload.parentWorktree
-          : (config.parentWorktree ??
-            options.parentWorktree ??
-            (options.cwd ? `path:${options.cwd}` : 'active'));
+      const configuredCwd =
+        (typeof config.cwd === 'string' && config.cwd ? config.cwd : undefined) ?? options.cwd;
+      let parentWorktree: string | undefined = configuredCwd ? `path:${configuredCwd}` : 'active';
+      for (const hierarchy of [config, options, payload]) {
+        if (hierarchy.noParent === true || hierarchy.parentWorktree === 'none') {
+          parentWorktree = undefined;
+          break;
+        }
+        if (typeof hierarchy.parentWorktree === 'string' && hierarchy.parentWorktree) {
+          parentWorktree = hierarchy.parentWorktree;
+          break;
+        }
+      }
       const repoPath =
         typeof payload.repoPath === 'string' && payload.repoPath
           ? payload.repoPath
           : typeof payload.cwd === 'string' && payload.cwd
             ? payload.cwd
             : undefined;
-      const configuredCwd =
-        (typeof config.cwd === 'string' && config.cwd ? config.cwd : undefined) ?? options.cwd;
       // Receiver configuration selects the local checkout; payload paths support loopback.
       const worktreeCwd =
         configuredCwd ??

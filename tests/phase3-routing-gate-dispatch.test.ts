@@ -514,6 +514,7 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
   const executor = createOrcaSpawnExecutorPlugin({
     commandRunner,
     cwd: '/receiver/options',
+    noParent: true,
     interactiveCommand: 'receiver-options-command',
     agySettingsPath: optionSettings,
   });
@@ -522,14 +523,18 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
     interactiveCommand: 'sender-controlled-command',
     agySettingsPath: senderSettings,
     repoPath: '/sender/repo',
+    parentWorktree: 'path:/sender/worktree',
   } });
   const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
   await executor.execute([input], context, {
     cwd: '/receiver/runtime',
+    parentWorktree: 'path:/receiver/parent',
     interactiveCommand: 'receiver-runtime-command',
     agySettingsPath: runtimeSettings,
   });
   assert.equal(requests[0].cwd, '/receiver/runtime');
+  assert.equal(requests[0].args[requests[0].args.indexOf('--parent-worktree') + 1], 'path:/receiver/parent');
+  assert.equal(requests[0].args.includes('--no-parent'), false);
   assert.equal(requests[1].args[requests[1].args.indexOf('--command') + 1], 'receiver-runtime-command');
   assert.ok(JSON.parse(await readFile(runtimeSettings, 'utf8')).trustedWorkspaces.includes(dir));
   assert.equal(existsSync(optionSettings), false);
@@ -538,6 +543,8 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
   requests.length = 0;
   await executor.execute([input], context, {});
   assert.equal(requests[0].cwd, '/receiver/options');
+  assert.ok(requests[0].args.includes('--no-parent'));
+  assert.equal(requests[0].args.includes('--parent-worktree'), false);
   assert.equal(requests[1].args[requests[1].args.indexOf('--command') + 1], 'receiver-options-command');
   assert.ok(JSON.parse(await readFile(optionSettings, 'utf8')).trustedWorkspaces.includes(dir));
   assert.equal(existsSync(senderSettings), false);
