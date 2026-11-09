@@ -433,6 +433,7 @@ test('Stage 1: project plugins, user overlays, restart and unlink', async t => {
   const module = '.dealer/plugins/custom-project-plugin.ts';
   writeFileSync(join(projectRoot, module), `
 export async function createPlugin(config: Record<string, unknown>, context: any) {
+  const executor = context.api.createNotifyExecutorPlugin({});
   return {
     apply(ctx: any, applied: any) {
       ctx.on('emitter/prepare', (input: any, next: any) => next({
@@ -440,6 +441,7 @@ export async function createPlugin(config: Record<string, unknown>, context: any
         body: String(applied.message),
         projectRoot: context.projectRoot,
         patchSkill: context.userPatch.skills.at(-1),
+        factoryExecutor: executor.name,
       }));
     },
   };
@@ -459,6 +461,7 @@ export async function createPlugin(config: Record<string, unknown>, context: any
   assert.equal(prepared.body, 'overlay');
   assert.equal(prepared.projectRoot, projectRoot);
   assert.equal(prepared.patchSkill, 'personal');
+  assert.equal(prepared.factoryExecutor, 'notify');
   assert.equal((await cli(runtime, 'project', 'list')).length, 1);
   const status = await cli(runtime, 'project', 'status', '--project', 'demo');
   assert.equal(status.projects[0].manifest.defaultNetworkId, 'team');
@@ -467,11 +470,23 @@ export async function createPlugin(config: Record<string, unknown>, context: any
   assert.equal(runtime.config.projects.length, 1);
   mkdirSync(join(runtime.stateDir, 'plugins'), { recursive: true });
   writeFileSync(join(runtime.stateDir, 'plugins/user.ts'), `
-export default {
-  name: 'user-example',
-  apply(ctx: any) {
-    ctx.on('emitter/prepare', (input: any, next: any) => next({ ...input, userPlugin: true }));
-  },
+export default (_config: any, context: any) => {
+  const factories = [
+    'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
+    'createDedupCasPolicyPlugin', 'createWaveCoalescerPolicyPlugin', 'createOrcaSpawnExecutorPlugin',
+    'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
+    'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin',
+  ];
+  if (factories.some(name => typeof context.api[name] !== 'function')) {
+    throw new Error('Missing built-in factory');
+  }
+  const policy = context.api.createDedupCasPolicyPlugin();
+  return {
+    name: 'user-example',
+    apply(ctx: any) {
+      ctx.on('emitter/prepare', (input: any, next: any) => next({ ...input, userPlugin: true, factoryPolicy: policy.name }));
+    },
+  };
 };
 `);
   await cli(runtime, 'plugin', 'add', '--name', 'user-example', '--module', 'plugins/user.ts');
@@ -482,6 +497,7 @@ export default {
   const afterRestart = await restored.kernel.ctx.waterfall('emitter/prepare', { body: 'original' } as any);
   assert.equal(afterRestart.body, 'overlay');
   assert.equal(afterRestart.userPlugin, true);
+  assert.equal(afterRestart.factoryPolicy, 'dedup-cas');
   assert.equal((await cli(restored, 'project', 'status')).userPlugins[0].name, 'user-example');
   await cli(restored, 'project', 'unlink', 'demo');
   assert.deepEqual((await cli(restored, 'project', 'list')), []);

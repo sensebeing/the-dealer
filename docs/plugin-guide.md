@@ -107,7 +107,14 @@ export function createPlugin(config, context) {
 ```
 
 The factory context includes `projectRoot` (project plugins only), `stateDir`,
-`runtime`, and the parsed `userPatch`. Register effects with the kernel context
+`runtime`, the parsed `userPatch`, and `api`. The `api` bag exposes the built-in
+webhook/poll-watermark/script source factories, dedup-CAS/wave-coalescer policy
+factories, Orca spawn/wave, agent-PTY and notify executor factories, and local-agent
+and LLM-API router factories under their exported `create*Plugin` names. Both
+project and user factories can call, for example,
+`context.api.createNotifyExecutorPlugin(config)` without importing a checkout
+path. Register the resulting source, policy, executor or judge with its owning
+service inside `apply`, and dispose that registration during plugin cleanup. Register effects with the kernel context
 so unlinking and reloading can clean them up. Factories should construct plugin
 objects; keep reversible runtime effects in `apply` and its cleanup.
 

@@ -45,6 +45,19 @@ export interface ExternalPluginContext {
   stateDir: string;
   runtime: DealerNodeRuntime;
   userPatch?: Record<string, any>;
+  api: {
+    createWebhookSourcePlugin: typeof createWebhookSourcePlugin;
+    createPollWatermarkSourcePlugin: typeof createPollWatermarkSourcePlugin;
+    createScriptSourcePlugin: typeof createScriptSourcePlugin;
+    createDedupCasPolicyPlugin: typeof createDedupCasPolicyPlugin;
+    createWaveCoalescerPolicyPlugin: typeof createWaveCoalescerPolicyPlugin;
+    createOrcaSpawnExecutorPlugin: typeof createOrcaSpawnExecutorPlugin;
+    createOrcaWaveExecutorPlugin: typeof createOrcaWaveExecutorPlugin;
+    createAgentPtyExecutorPlugin: typeof createAgentPtyExecutorPlugin;
+    createNotifyExecutorPlugin: typeof createNotifyExecutorPlugin;
+    createLocalAgentRouterPlugin: typeof createLocalAgentRouterPlugin;
+    createLlmApiRouterPlugin: typeof createLlmApiRouterPlugin;
+  };
 }
 
 export type ExternalPluginFactory = (
@@ -257,12 +270,28 @@ export class DealerNodeRuntime {
   private async loadExternalPlugin(
     ref: DealerProjectPluginRef,
     config: Record<string, any>,
-    context: ExternalPluginContext,
+    context: Omit<ExternalPluginContext, 'api'>,
   ): Promise<LoadedExternalPlugin> {
     const resolvedPath = resolve(context.projectRoot ?? this.stateDir, ref.module);
     const module = await import(pathToFileURL(resolvedPath).href);
     const exported = module.createPlugin ?? module.default;
-    const candidate = typeof exported === 'function' ? await exported(config, context) : exported;
+    const factoryContext: ExternalPluginContext = {
+      ...context,
+      api: {
+        createWebhookSourcePlugin,
+        createPollWatermarkSourcePlugin,
+        createScriptSourcePlugin,
+        createDedupCasPolicyPlugin,
+        createWaveCoalescerPolicyPlugin,
+        createOrcaSpawnExecutorPlugin,
+        createOrcaWaveExecutorPlugin,
+        createAgentPtyExecutorPlugin,
+        createNotifyExecutorPlugin,
+        createLocalAgentRouterPlugin,
+        createLlmApiRouterPlugin,
+      },
+    };
+    const candidate = typeof exported === 'function' ? await exported(config, factoryContext) : exported;
     if (!candidate || typeof candidate !== 'object' || typeof candidate.apply !== 'function') {
       throw new Error(`Invalid external plugin: ${ref.name}`);
     }
