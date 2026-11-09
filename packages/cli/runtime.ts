@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, chmodSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
@@ -28,8 +29,33 @@ import {
 import type { CommandRunner } from '../plugins-executor/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
-import { getBuiltInProfile, saveJson, validateConfig, admissionMode } from './config.ts';
-import type { RuntimeConfig, PluginSpec } from './config.ts';
+import {
+  getBuiltInProfile,
+  saveJson,
+  validateConfig,
+  admissionMode,
+  readProjectManifest,
+  readPatch,
+  validatePluginRefs,
+} from './config.ts';
+import type { RuntimeConfig, PluginSpec, DealerProjectPluginRef, DealerProjectManifest } from './config.ts';
+
+export interface ExternalPluginContext {
+  projectRoot?: string;
+  stateDir: string;
+  runtime: DealerNodeRuntime;
+  userPatch?: Record<string, any>;
+}
+
+export type ExternalPluginFactory = (
+  config: Record<string, any>,
+  context: ExternalPluginContext,
+) => Plugin | Promise<Plugin>;
+
+interface LoadedExternalPlugin {
+  plugin: Plugin;
+  config: Record<string, any>;
+}
 
 export interface DealerRuntimeOptions {
   stateDir?: string;
@@ -54,6 +80,9 @@ export class DealerNodeRuntime {
   readonly options: DealerRuntimeOptions;
   config!: RuntimeConfig;
   wave?: WaveCoalescerPolicy;
+  private loadedProjects = new Map<string, { manifest: DealerProjectManifest; plugins: LoadedExternalPlugin[] }>();
+  private loadedUserPlugins = new Map<string, LoadedExternalPlugin>();
+  private externalChanges: Promise<unknown> = Promise.resolve();
   private streams = new Set<string>();
   private server?: Server;
   private started = false;
@@ -122,6 +151,8 @@ export class DealerNodeRuntime {
         executors: profile.executors,
         policies: profile.policies,
         executorConfig: {},
+        projects: [],
+        userPlugins: [],
         routes: [],
         sources: [],
         wave: {},
@@ -201,6 +232,12 @@ export class DealerNodeRuntime {
       for (const source of this.config.sources) {
         await this.installSource(source);
       }
+      for (const project of [...this.config.projects]) {
+        await this.linkProject(project.rootPath, project.userPatchPath);
+      }
+      for (const ref of [...this.config.userPlugins]) {
+        await this.installUserPlugin(ref);
+      }
       this.persist();
       this.started = true;
       return this;
@@ -208,6 +245,171 @@ export class DealerNodeRuntime {
       await this.stop();
       throw error;
     }
+  }
+
+  private changeExternal<T>(change: () => Promise<T>): Promise<T> {
+    const result = this.externalChanges.then(change);
+    this.externalChanges = result.catch(() => {});
+    return result;
+  }
+
+  // This is the sole dynamic import boundary for explicitly trusted local modules.
+  private async loadExternalPlugin(
+    ref: DealerProjectPluginRef,
+    config: Record<string, any>,
+    context: ExternalPluginContext,
+  ): Promise<LoadedExternalPlugin> {
+    const resolvedPath = resolve(context.projectRoot ?? this.stateDir, ref.module);
+    const module = await import(pathToFileURL(resolvedPath).href);
+    const exported = module.createPlugin ?? module.default;
+    const candidate = typeof exported === 'function' ? await exported(config, context) : exported;
+    if (!candidate || typeof candidate !== 'object' || typeof candidate.apply !== 'function') {
+      throw new Error(`Invalid external plugin: ${ref.name}`);
+    }
+    const plugin = { ...candidate, name: candidate.name || ref.name };
+    if (typeof plugin.name !== 'string' || !plugin.name.trim()) {
+      throw new Error(`Invalid external plugin name: ${ref.name}`);
+    }
+    return { plugin, config };
+  }
+
+  private async replaceExternal(
+    previous: LoadedExternalPlugin[],
+    next: LoadedExternalPlugin[],
+    commit: () => Promise<void>,
+  ): Promise<void> {
+    const available = new Set(previous.map(entry => entry.plugin.name));
+    const occupied = new Set(this.kernel.enabledPluginNames().filter(name => !available.has(name)));
+    for (const entry of next) {
+      if (occupied.has(entry.plugin.name)) {
+        throw new Error(`Plugin name already owned: ${entry.plugin.name}`);
+      }
+      occupied.add(entry.plugin.name);
+    }
+    const config = structuredClone(this.config);
+    try {
+      await this.kernel.applyPatch(previous.map(({ plugin }) => ({ name: plugin.name, enabled: false })));
+      for (const entry of next) {
+        await this.kernel.use(entry.plugin, entry.config);
+      }
+      await commit();
+      this.persist();
+    } catch (error) {
+      this.config = config;
+      try {
+        await this.kernel.applyPatch([
+          ...next.map(({ plugin }) => ({ name: plugin.name, plugin, enabled: false })),
+          ...previous.map(entry => ({ ...entry, enabled: true })),
+        ]);
+        await this.publishSkills();
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], 'External plugin change and rollback failed');
+      }
+      throw error;
+    }
+  }
+
+  private async publishSkills(): Promise<void> {
+    await this.node.updateSelfProfile({
+      capabilities: {
+        summary: this.config.name,
+        skills: this.config.skills.map(id => ({ id, description: id })),
+      },
+    });
+  }
+
+  async linkProject(projectRoot: string, userPatchPath?: string): Promise<{
+    projectId: string;
+    defaultNetworkId: string;
+    loadedPlugins: string[];
+    userPatchPath?: string;
+  }> {
+    return this.changeExternal(async () => {
+      const rootPath = resolve(projectRoot);
+      const manifest = readProjectManifest(rootPath);
+      const patchPath = resolve(userPatchPath ?? join(this.stateDir, 'projects', `${manifest.projectId}.patch.json`));
+      const userPatch: Record<string, any> | undefined = existsSync(patchPath) ? readPatch(patchPath) : undefined;
+      if (userPatch?.skills !== undefined &&
+          (!Array.isArray(userPatch.skills) || userPatch.skills.some((skill: unknown) => typeof skill !== 'string'))) {
+        throw new Error('Invalid project user patch skills');
+      }
+      const overrides = userPatch?.pluginConfig;
+      if (overrides !== undefined && (!overrides || typeof overrides !== 'object' || Array.isArray(overrides))) {
+        throw new Error('Invalid project user patch pluginConfig');
+      }
+      const plugins: LoadedExternalPlugin[] = [];
+      for (const ref of manifest.plugins ?? []) {
+        const overlay = overrides && Object.hasOwn(overrides, ref.name) ? overrides[ref.name] : undefined;
+        if (overlay !== undefined && (!overlay || typeof overlay !== 'object' || Array.isArray(overlay))) {
+          throw new Error(`Invalid plugin configuration overlay: ${ref.name}`);
+        }
+        const config = { ...ref.config, ...overlay };
+        plugins.push(await this.loadExternalPlugin(ref, config, {
+          projectRoot: rootPath,
+          stateDir: this.stateDir,
+          runtime: this,
+          userPatch,
+        }));
+      }
+      // Retain explicit paths even before creation so the next start can discover the patch.
+      const resolvedPatchPath = userPatchPath !== undefined || userPatch !== undefined ? patchPath : undefined;
+      const linked = {
+        projectId: manifest.projectId,
+        rootPath,
+        ...(resolvedPatchPath ? { userPatchPath: resolvedPatchPath } : {}),
+      };
+      await this.replaceExternal(this.loadedProjects.get(manifest.projectId)?.plugins ?? [], plugins, async () => {
+        this.config.skills = [...new Set([...this.config.skills, ...(manifest.skills ?? []), ...(userPatch?.skills ?? [])])];
+        await this.publishSkills();
+        this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
+      });
+      this.loadedProjects.set(manifest.projectId, { manifest, plugins });
+      return {
+        projectId: manifest.projectId,
+        defaultNetworkId: manifest.defaultNetworkId,
+        loadedPlugins: plugins.map(entry => entry.plugin.name),
+        ...(resolvedPatchPath ? { userPatchPath: resolvedPatchPath } : {}),
+      };
+    });
+  }
+
+  async unlinkProject(projectId: string): Promise<void> {
+    return this.changeExternal(async () => {
+      if (!this.config.projects.some(project => project.projectId === projectId)) {
+        throw new Error(`Project not linked: ${projectId}`);
+      }
+      await this.replaceExternal(this.loadedProjects.get(projectId)?.plugins ?? [], [], async () => {
+        this.config.projects = this.config.projects.filter(project => project.projectId !== projectId);
+      });
+      this.loadedProjects.delete(projectId);
+    });
+  }
+
+  async installUserPlugin(ref: DealerProjectPluginRef): Promise<{ added: string }> {
+    return this.changeExternal(async () => {
+      validatePluginRefs([ref]);
+      const loaded = await this.loadExternalPlugin(ref, ref.config ?? {}, { stateDir: this.stateDir, runtime: this });
+      const previous = this.loadedUserPlugins.get(ref.name);
+      await this.replaceExternal(previous ? [previous] : [], [loaded], async () => {
+        this.config.userPlugins = [...this.config.userPlugins.filter(plugin => plugin.name !== ref.name), structuredClone(ref)];
+      });
+      this.loadedUserPlugins.set(ref.name, loaded);
+      return { added: ref.name };
+    });
+  }
+
+  projectStatus(projectId?: string) {
+    return {
+      projects: this.config.projects.filter(project => !projectId || project.projectId === projectId).map(project => ({
+        ...project,
+        manifest: this.loadedProjects.get(project.projectId)?.manifest,
+        loadedPlugins: (this.loadedProjects.get(project.projectId)?.plugins ?? []).map(entry => entry.plugin.name),
+      })),
+      userPlugins: this.config.userPlugins.filter(ref => this.loadedUserPlugins.has(ref.name)).map(ref => ({
+        ...ref,
+        loadedName: this.loadedUserPlugins.get(ref.name)!.plugin.name,
+      })),
+    };
   }
 
   private integrationPlugin(): Plugin {

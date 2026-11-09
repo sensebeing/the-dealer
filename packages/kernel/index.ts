@@ -304,8 +304,15 @@ export class Kernel {
     });
   }
 
+  /** Enabled names are reserved even while their dependencies are unavailable. */
+  enabledPluginNames(): string[] {
+    return [...this.#states.values()]
+      .filter(state => state.entry.enabled !== false)
+      .map(state => state.entry.plugin.name);
+  }
+
   async use<C>(plugin: Plugin<C>, config?: C): Promise<void> {
-    return this.applyPatch([{ plugin, config }]);
+    return this.applyPatch([{ plugin, config, enabled: true }]);
   }
 
   async applyPatch(patch: Patch): Promise<void> {

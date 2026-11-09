@@ -256,3 +256,30 @@ test('parallel invokes every observer despite synchronous failure and serial sto
   await assert.rejects(kernel.ctx.serial('work'), /listener failed/);
   assert.deepEqual(seen, ['first']); await kernel.stop();
 });
+
+test('explicit use reactivates a disabled plugin and exposes enabled name reservations', async () => {
+  const kernel = new Kernel();
+  let active = 0;
+  const plugin: Plugin = {
+    name: 'reusable',
+    apply() {
+      active++;
+      return () => {
+        active--;
+      };
+    },
+  };
+  try {
+    await kernel.use(plugin);
+    assert.deepEqual(kernel.enabledPluginNames(), ['reusable']);
+    await kernel.applyPatch([{ name: 'reusable', enabled: false }]);
+    assert.equal(active, 0);
+    assert.deepEqual(kernel.enabledPluginNames(), []);
+    await kernel.use(plugin);
+    assert.equal(active, 1);
+    assert.deepEqual(kernel.enabledPluginNames(), ['reusable']);
+  } finally {
+    await kernel.stop();
+  }
+  assert.equal(active, 0);
+});

@@ -1,9 +1,9 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   DealerNodeRuntime,
@@ -16,6 +16,8 @@ import {
   createPollWatermarkSourcePlugin,
   createOrcaWaveExecutorPlugin,
   blake3,
+  readProjectManifest,
+  initProjectScaffold,
 } from '../packages/index.ts';
 import type { DealerRuntimeOptions, CommandRequest, EmitMessageInput } from '../packages/index.ts';
 
@@ -335,9 +337,10 @@ test('Phase 4: identity/config persistence, exclusive state ownership and privat
 test('Phase 4: actual dealer node up launches dealerd and CLI talks over socket', async t => {
   const root = directory(t);
   const stateDir = join(root, 'daemon');
-  const run = (args: string[]) =>
+  const run = (args: string[], cwd = process.cwd()) =>
     new Promise<{ code: number | null; output: string; errors: string }>((resolve, reject) => {
-      const child = spawn(process.execPath, ['--experimental-strip-types', 'bin/dealer.js', ...args], {
+      const child = spawn(process.execPath, ['--experimental-strip-types', resolvePath('bin/dealer.js'), ...args], {
+        cwd,
         env: { ...process.env, DEALER_STATE_DIR: stateDir },
       });
       let output = '';
@@ -372,6 +375,32 @@ test('Phase 4: actual dealer node up launches dealerd and CLI talks over socket'
   assert.equal((await run(['network', 'mount', 'daemon-test', '--passphrase', 'secret', '--json'])).code, 0);
   const list = await run(['network', 'list', '--json']);
   assert.equal(JSON.parse(list.output)[0].networkId, 'daemon-test');
+  const projectRoot = join(root, 'daemon-project');
+  mkdirSync(projectRoot);
+  const scaffold = await run(['project', 'init', '--id', 'daemon-project', '--network', 'daemon-test', '--json'], projectRoot);
+  assert.equal(scaffold.code, 0, scaffold.errors);
+  const manifest = JSON.parse(scaffold.output);
+  manifest.plugins = [{ name: 'daemon-project-plugin', module: '.dealer/plugins/live.ts' }];
+  writeFileSync(join(projectRoot, '.dealer/project.json'), JSON.stringify(manifest));
+  writeFileSync(join(projectRoot, '.dealer/plugins/live.ts'), `
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+export default (config: any, context: any) => ({
+  apply() {
+    const marker = join(context.projectRoot, 'execution.txt');
+    writeFileSync(marker, config.message);
+    return () => writeFileSync(marker, 'unlinked');
+  },
+});
+`);
+  writeFileSync(join(projectRoot, 'overlay.json'), JSON.stringify({ pluginConfig: { 'daemon-project-plugin': { message: 'live' } } }));
+  const link = await run(['project', 'link', '--user-patch', 'overlay.json', '--json'], projectRoot);
+  assert.equal(link.code, 0, link.errors);
+  assert.equal(readFileSync(join(projectRoot, 'execution.txt'), 'utf8'), 'live');
+  const projectStatus = await run(['project', 'status', '--project', 'daemon-project', '--json']);
+  assert.equal(realpathSync(JSON.parse(projectStatus.output).projects[0].rootPath), realpathSync(projectRoot));
+  assert.equal((await run(['project', 'unlink', 'daemon-project', '--json'])).code, 0);
+  assert.equal(readFileSync(join(projectRoot, 'execution.txt'), 'utf8'), 'unlinked');
 });
 
 test('Phase 4: declarative YAML patch and live route/source registrations', async t => {
@@ -393,4 +422,122 @@ test('Phase 4: declarative YAML patch and live route/source registrations', asyn
   assert.equal(runtime.config.routes.length, 2);
   assert.equal(runtime.config.sources.length, 2);
   assert.equal(await runDealerCli(['source', 'add', '--type', 'invalid'], { runtime, stderr: () => {} }), 1);
+});
+
+test('Stage 1: project plugins, user overlays, restart and unlink', async t => {
+  const root = directory(t);
+  const runtime = await node(t, root, 'project-user');
+  const projectRoot = join(root, 'project');
+  const manifest = await cli(runtime, 'project', 'init', '--root', projectRoot, '--id', 'demo', '--network', 'team', '--skills', 'shared');
+  assert.equal(manifest.schema, 'the-dealer-project/v1');
+  const module = '.dealer/plugins/custom-project-plugin.ts';
+  writeFileSync(join(projectRoot, module), `
+export async function createPlugin(config: Record<string, unknown>, context: any) {
+  return {
+    apply(ctx: any, applied: any) {
+      ctx.on('emitter/prepare', (input: any, next: any) => next({
+        ...input,
+        body: String(applied.message),
+        projectRoot: context.projectRoot,
+        patchSkill: context.userPatch.skills.at(-1),
+      }));
+    },
+  };
+}
+`);
+  manifest.plugins = [{ name: 'project-example', module, config: { message: 'base' } }];
+  manifest.topics = { triage: { description: 'Triage requests', defaultExecutor: 'notify' } };
+  writeFileSync(join(projectRoot, '.dealer/project.json'), JSON.stringify(manifest));
+  const overlay = join(runtime.stateDir, 'projects', 'demo.patch.json');
+  mkdirSync(join(runtime.stateDir, 'projects'), { recursive: true });
+  writeFileSync(overlay, JSON.stringify({ skills: ['shared', 'personal'], pluginConfig: { 'project-example': { message: 'overlay' } } }));
+  const linked = await cli(runtime, 'project', 'link', projectRoot);
+  assert.deepEqual(linked.loadedPlugins, ['project-example']);
+  assert.equal(linked.userPatchPath, overlay);
+  assert.deepEqual(runtime.config.skills, ['shared', 'personal']);
+  const prepared = await runtime.kernel.ctx.waterfall('emitter/prepare', { body: 'original' } as any);
+  assert.equal(prepared.body, 'overlay');
+  assert.equal(prepared.projectRoot, projectRoot);
+  assert.equal(prepared.patchSkill, 'personal');
+  assert.equal((await cli(runtime, 'project', 'list')).length, 1);
+  const status = await cli(runtime, 'project', 'status', '--project', 'demo');
+  assert.equal(status.projects[0].manifest.defaultNetworkId, 'team');
+  assert.equal(status.projects[0].manifest.topics.triage.defaultExecutor, 'notify');
+  await cli(runtime, 'project', 'link', projectRoot);
+  assert.equal(runtime.config.projects.length, 1);
+  mkdirSync(join(runtime.stateDir, 'plugins'), { recursive: true });
+  writeFileSync(join(runtime.stateDir, 'plugins/user.ts'), `
+export default {
+  name: 'user-example',
+  apply(ctx: any) {
+    ctx.on('emitter/prepare', (input: any, next: any) => next({ ...input, userPlugin: true }));
+  },
+};
+`);
+  await cli(runtime, 'plugin', 'add', '--name', 'user-example', '--module', 'plugins/user.ts');
+  await runtime.stop();
+  const restored = new DealerNodeRuntime({ stateDir: runtime.stateDir, transport: { discoveryDir: join(root, 'mesh') } });
+  await restored.start();
+  t.after(() => restored.stop());
+  const afterRestart = await restored.kernel.ctx.waterfall('emitter/prepare', { body: 'original' } as any);
+  assert.equal(afterRestart.body, 'overlay');
+  assert.equal(afterRestart.userPlugin, true);
+  assert.equal((await cli(restored, 'project', 'status')).userPlugins[0].name, 'user-example');
+  await cli(restored, 'project', 'unlink', 'demo');
+  assert.deepEqual((await cli(restored, 'project', 'list')), []);
+  const afterUnlink = await restored.kernel.ctx.waterfall('emitter/prepare', { body: 'original' } as any);
+  assert.equal(afterUnlink.body, 'original');
+  assert.equal(afterUnlink.userPlugin, true);
+  assert.deepEqual(JSON.parse(readFileSync(join(restored.stateDir, 'config.json'), 'utf8')).projects, []);
+});
+
+
+test('Stage 1: invalid manifests, collisions and failed activation preserve the live project', async t => {
+  const root = directory(t);
+  const runtime = await node(t, root, 'validation');
+  const project = join(root, 'project');
+  assert.throws(() => initProjectScaffold(project, { projectId: '../escape', defaultNetworkId: 'team' }), /Invalid project/);
+  const manifest = initProjectScaffold(project, { projectId: 'valid', defaultNetworkId: 'team' });
+  assert.throws(() => initProjectScaffold(project, { projectId: 'valid', defaultNetworkId: 'team' }), /EEXIST/);
+  const manifestPath = join(project, '.dealer/project.json');
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, plugins: [{ name: 'bad', module: 42 }] }));
+  assert.throws(() => readProjectManifest(project), /Invalid plugin/);
+  writeFileSync(join(project, '.dealer/plugins/good.ts'), `
+export default () => ({
+  name: 'good',
+  apply(ctx: any) {
+    ctx.on('emitter/prepare', (input: any, next: any) => next({ ...input, good: true }));
+  },
+});
+`);
+  const ref = { name: 'good', module: '.dealer/plugins/good.ts' };
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, plugins: [ref] }));
+  await runtime.linkProject(project);
+  const before = readFileSync(join(runtime.stateDir, 'config.json'), 'utf8');
+  writeFileSync(join(project, '.dealer/plugins/bad.ts'), `
+export default {
+  name: 'bad',
+  apply() {
+    throw new Error('activation failed');
+  },
+};
+`);
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, plugins: [ref, { name: 'bad', module: '.dealer/plugins/bad.ts' }] }));
+  await assert.rejects(runtime.linkProject(project), /activation failed/);
+  assert.equal(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8'), before);
+  assert.equal((await runtime.kernel.ctx.waterfall('emitter/prepare', {} as any)).good, true);
+  assert.deepEqual(runtime.projectStatus().projects[0].loadedPlugins, ['good']);
+  await assert.rejects(runtime.installUserPlugin({ name: 'different-ref', module: join(project, ref.module) }), /already owned/);
+  writeFileSync(join(project, '.dealer/plugins/core.ts'), `
+export default {
+  name: 'transport',
+  apply() {},
+};
+`);
+  await assert.rejects(runtime.installUserPlugin({ name: 'core', module: join(project, '.dealer/plugins/core.ts') }), /already owned/);
+  assert.ok(runtime.transport.localNodeId);
+  await runtime.unlinkProject('valid');
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, plugins: [ref] }));
+  await runtime.linkProject(project);
+  assert.equal((await runtime.kernel.ctx.waterfall('emitter/prepare', {} as any)).good, true);
 });

@@ -41,3 +41,96 @@ export const customAlertSourcePlugin: Plugin<CustomAlertSourceConfig> = {
 3. **`GateRulePlugin` (`gate.registerRule`)**: Hook into `gate/evaluate` (`bail` mode) to allow, require human approval (`pending_approval`), queue under DND (`queued_dnd`), or reject inbound messages by sender member, skill, or message kind.
 4. **`DispatchPolicyPlugin` (`dispatcher.registerPolicy`)**: Wrap inbound execution with CAS idempotency watermarks (`policy-dedup-cas`) or wave coalescing + workspace idle gates + automatic `/new` session rotation (`policy-wave-coalescer`).
 5. **`ExecutorPlugin` (`dispatcher.registerExecutor`)**: Actuate admitted messages locally—e.g., spawning an isolated Orca worktree + agent terminal (`executor-orca-spawn`), delivering a coalesced wave to a resident Orca workspace (`executor-orca-wave`), or running a local CLI agent (`executor-agent-pty`).
+
+## 3. Three-tier onboarding: built-in, project, user
+
+The built-in profile supplies the core services and executors. A repository's
+`.dealer/project.json` declares portable project plugins and metadata. Personal
+settings belong in `~/.dealer/projects/<id>.patch.json`; standalone personal
+plugins belong in `~/.dealer/plugins/*.ts`. `DEALER_STATE_DIR` replaces `~/.dealer`
+for isolated nodes. Only link projects or install modules you trust: importing
+an external module executes local code with the daemon's permissions.
+
+```sh
+dealer project init --root ./my-project --id my-project --network team --skills triage --description 'Team automation' --json
+dealer project link ./my-project --json
+dealer project list --json
+dealer project status --project my-project --json
+dealer plugin add --name personal-hook --module plugins/personal-hook.ts --config ./personal.json --json
+dealer project unlink my-project --json
+```
+
+`init` creates `.dealer/plugins/` and refuses to overwrite an existing manifest.
+Its root defaults to the caller's working directory, ID to the root directory
+name, and network to that ID. `link` also defaults to the caller's working
+directory. A project ID must start with an ASCII letter or digit and contain
+only letters, digits, dots, underscores or hyphens (it is also a patch filename).
+Linking records metadata; it does not mount a network or grant admission.
+
+Example `.dealer/project.json`:
+
+```json
+{
+  "schema": "the-dealer-project/v1",
+  "projectId": "my-project",
+  "defaultNetworkId": "team",
+  "skills": ["triage"],
+  "plugins": [
+    { "name": "project-hook", "module": ".dealer/plugins/hook.ts", "config": { "label": "team" } }
+  ],
+  "topics": { "triage": { "description": "Triage requests", "defaultExecutor": "notify", "streamKey": "triage" } }
+}
+```
+
+Project module paths resolve relative to the project root; user plugin paths
+resolve relative to stateDir. Absolute paths also work. TypeScript modules must
+use syntax supported by Node's type stripping; ESM `.mjs`/`.js` modules work too.
+Export `createPlugin(config, context)` or a default plugin object/factory.
+Factories may be async. A missing plugin name defaults to the reference name.
+Plugin names share the kernel namespace: collisions with core services, other
+projects or personal plugins are rejected.
+
+Example `.dealer/plugins/hook.ts`:
+
+```ts
+export function createPlugin(config, context) {
+  return {
+    name: 'project-hook',
+    apply(ctx, appliedConfig) {
+      ctx.on('emitter/prepare', (envelope, next) => next({
+        ...envelope,
+        body: `[${appliedConfig.label}] ${envelope.body}`,
+      }));
+    },
+  };
+}
+```
+
+The factory context includes `projectRoot` (project plugins only), `stateDir`,
+`runtime`, and the parsed `userPatch`. Register effects with the kernel context
+so unlinking and reloading can clean them up. Factories should construct plugin
+objects; keep reversible runtime effects in `apply` and its cleanup.
+
+Example `~/.dealer/projects/my-project.patch.json`:
+
+```json
+{
+  "skills": ["personal-triage"],
+  "pluginConfig": { "project-hook": { "label": "personal" } }
+}
+```
+
+`--user-patch ./custom.json` selects an alternate patch (JSON or the existing
+restricted YAML mapping format). The shallow per-plugin overlay wins over
+manifest config. Project and patch skills merge into the node's skill list with
+deduplication. Skills remain in that list after unlink; unlink deactivates the
+project's plugins and removes its link, without removing personal plugins.
+Topics/defaultNetworkId are exposed as project metadata, not automatic routing
+or executor overrides in this stage.
+
+Persisted projects load after the built-in profile, followed by personal plugins
+on daemon start. Relinking refreshes manifest/patch configuration and replaces
+that project's registrations. Node caches imported modules; restart the daemon
+after editing module source. A failed activation fails the command and restores
+the previous registrations/config where cleanup succeeds; cleanup failures are
+reported, never treated as successful installation.

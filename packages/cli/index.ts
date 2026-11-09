@@ -1,16 +1,22 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, basename } from 'node:path';
 import { request } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
-import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite } from './config.ts';
+import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
 
 const booleanFlags = ['json', 'auto-route', 'trust-sender'];
 const stringFlags = [
+  'root',
+  'id',
+  'project',
+  'user-patch',
+  'module',
+  'description',
   'profile',
   'patch',
   'member',
@@ -191,7 +197,40 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   let owned: DealerNodeRuntime | undefined;
   try {
     const { values: v, positionals: p } = parse(argv);
-    const [group, action, target] = p;
+    const [group, action] = p;
+    let target = p[2];
+    if (group === 'project' && action === 'init') {
+      const root = resolve(String(v.root ?? process.cwd()));
+      const projectId = String(v.id ?? basename(root));
+      stdout(JSON.stringify(initProjectScaffold(root, {
+        projectId,
+        defaultNetworkId: String(v.network ?? projectId),
+        ...(v.description !== undefined ? { description: String(v.description) } : {}),
+        ...(v.skills !== undefined ? { skills: String(v.skills).split(',').filter(Boolean) } : {}),
+      }), null, v.json ? undefined : 2));
+      return 0;
+    }
+    if (group === 'project' && action === 'link') {
+      target = resolve(target ?? process.cwd());
+      p[2] = target;
+      if (v['user-patch'] !== undefined) {
+        v['user-patch'] = resolve(String(v['user-patch']));
+      }
+    }
+    if (group === 'plugin' && action === 'add' && v.config !== undefined) {
+      v.config = resolve(String(v.config));
+    }
+    // Preserve caller-relative paths when the daemon has a different cwd.
+    if (group === 'project' || group === 'plugin') {
+      argv = [...p];
+      for (const [key, value] of Object.entries(v)) {
+        if (value === true) {
+          argv.push(`--${key}`);
+        } else if (typeof value === 'string') {
+          argv.push(`--${key}`, value);
+        }
+      }
+    }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
     if (!options.runtime && existsSync(join(stateDir, 'control.sock'))) {
       const result = await rpc(join(stateDir, 'control.sock'), argv);
@@ -220,7 +259,27 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     await runtime.start();
     let result: unknown;
     const network = v.network as string | undefined;
-    if (group === 'node') {
+    if (group === 'project') {
+      if (action === 'link') {
+        result = await runtime.linkProject(target!, v['user-patch'] as string | undefined);
+      } else if (action === 'list') {
+        result = runtime.projectStatus().projects;
+      } else if (action === 'status') {
+        result = runtime.projectStatus(v.project as string | undefined);
+      } else if (action === 'unlink') {
+        const projectId = required(target, 'projectId');
+        await runtime.unlinkProject(projectId);
+        result = { unlinked: projectId };
+      } else {
+        throw new Error('Unknown project command');
+      }
+    } else if (group === 'plugin' && action === 'add') {
+      result = await runtime.installUserPlugin({
+        name: required(v.name, '--name'),
+        module: required(v.module, '--module'),
+        config: v.config ? JSON.parse(readFileSync(String(v.config), 'utf8')) : {},
+      });
+    } else if (group === 'node') {
       if (action === 'up' || action === 'status') {
         if (action === 'up' && ['profile', 'patch', 'member', 'name', 'skills', 'port'].some(key => v[key] !== undefined)) {
           throw new Error('Node already running; stop it before changing startup configuration');

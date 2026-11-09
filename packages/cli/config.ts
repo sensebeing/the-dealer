@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AdmissionMode, NetworkMountConfig } from '../core-types/index.ts';
 
@@ -47,6 +48,103 @@ export interface PluginSpec {
   config: Record<string, any>;
 }
 
+export interface DealerProjectPluginRef {
+  name: string;
+  module: string;
+  config?: Record<string, any>;
+}
+
+export interface DealerTopicSpec {
+  description: string;
+  defaultExecutor?: string;
+  streamKey?: string;
+}
+
+export interface DealerProjectManifest {
+  schema: 'the-dealer-project/v1';
+  projectId: string;
+  defaultNetworkId: string;
+  description?: string;
+  skills?: string[];
+  plugins?: DealerProjectPluginRef[];
+  topics?: Record<string, DealerTopicSpec>;
+}
+
+export interface LinkedProjectConfig {
+  projectId: string;
+  rootPath: string;
+  userPatchPath?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function nonempty(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function validProjectId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
+}
+
+export function validatePluginRefs(refs: unknown): asserts refs is DealerProjectPluginRef[] {
+  if (!Array.isArray(refs)) {
+    throw new Error('Plugins must be an array');
+  }
+  const names = new Set<string>();
+  for (const ref of refs) {
+    if (!isRecord(ref) || !nonempty(ref.name) || !nonempty(ref.module) ||
+        (ref.config !== undefined && !isRecord(ref.config))) {
+      throw new Error('Invalid plugin reference');
+    }
+    if (names.has(ref.name)) {
+      throw new Error(`Duplicate plugin reference: ${ref.name}`);
+    }
+    names.add(ref.name);
+  }
+}
+
+function validateManifest(manifest: DealerProjectManifest): void {
+  if (!isRecord(manifest) || manifest.schema !== 'the-dealer-project/v1' ||
+      !validProjectId(manifest.projectId) || !nonempty(manifest.defaultNetworkId)) {
+    throw new Error('Invalid project manifest schema, projectId or defaultNetworkId');
+  }
+  if (manifest.description !== undefined && typeof manifest.description !== 'string') {
+    throw new Error('Invalid project description');
+  }
+  if (manifest.skills !== undefined &&
+      (!Array.isArray(manifest.skills) || manifest.skills.some(skill => !nonempty(skill)))) {
+    throw new Error('Invalid project skills');
+  }
+  validatePluginRefs(manifest.plugins === undefined ? [] : manifest.plugins);
+  if (manifest.topics !== undefined) {
+    if (!isRecord(manifest.topics) || Object.values(manifest.topics).some(topic =>
+      !isRecord(topic) || typeof topic.description !== 'string' ||
+      (topic.defaultExecutor !== undefined && !nonempty(topic.defaultExecutor)) ||
+      (topic.streamKey !== undefined && !nonempty(topic.streamKey)))) {
+      throw new Error('Invalid project topics');
+    }
+  }
+}
+
+export function readProjectManifest(projectRoot: string): DealerProjectManifest {
+  const manifest = JSON.parse(readFileSync(join(projectRoot, '.dealer', 'project.json'), 'utf8'));
+  validateManifest(manifest);
+  return manifest;
+}
+
+export function initProjectScaffold(
+  projectRoot: string,
+  opts: { projectId: string; defaultNetworkId: string; description?: string; skills?: string[] },
+): DealerProjectManifest {
+  const manifest: DealerProjectManifest = { ...opts, schema: 'the-dealer-project/v1' };
+  validateManifest(manifest);
+  mkdirSync(join(projectRoot, '.dealer', 'plugins'), { recursive: true });
+  writeFileSync(join(projectRoot, '.dealer', 'project.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
+  return manifest;
+}
+
 export interface RuntimeConfig {
   profile: string;
   member: string;
@@ -59,6 +157,8 @@ export interface RuntimeConfig {
   policies: string[];
   executors: string[];
   executorConfig: Record<string, Record<string, any>>;
+  projects: LinkedProjectConfig[];
+  userPlugins: DealerProjectPluginRef[];
   routes: PluginSpec[];
   sources: PluginSpec[];
   wave: {
@@ -129,6 +229,21 @@ export function readPatch(path: string): Partial<RuntimeConfig> {
 }
 
 export function validateConfig(config: RuntimeConfig): void {
+  validatePluginRefs(config.userPlugins);
+  if (!Array.isArray(config.projects)) {
+    throw new Error('Projects must be an array');
+  }
+  const projectIds = new Set<string>();
+  for (const project of config.projects) {
+    if (!isRecord(project) || !validProjectId(project.projectId) || !nonempty(project.rootPath) ||
+        (project.userPatchPath !== undefined && !nonempty(project.userPatchPath))) {
+      throw new Error('Invalid linked project');
+    }
+    if (projectIds.has(project.projectId)) {
+      throw new Error(`Duplicate linked project: ${project.projectId}`);
+    }
+    projectIds.add(project.projectId);
+  }
   getBuiltInProfile(config.profile);
   admissionMode(config.gateMode);
   if (!config.member || !config.name || !Array.isArray(config.skills) || config.skills.some(s => typeof s !== 'string')) {

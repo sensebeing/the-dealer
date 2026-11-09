@@ -111,3 +111,40 @@ Read [profile-and-patch-spec.md](references/profile-and-patch-spec.md) to
 select profiles, overlay node configuration, bind Orca waves, and set rotation.
 Read [writing-custom-plugins.md](references/writing-custom-plugins.md) to
 implement a Source, RouteJudge, GateRule, DispatchPolicy, or WorkExecutor.
+
+## Project and personal plugins
+
+The three tiers are the built-in profile, repository-owned project modules, and
+personal configuration/modules. Only load trusted local code.
+
+```sh
+dealer project init --root ./project --id project --network team --skills triage --json
+dealer project link ./project --json
+dealer project list --json
+dealer project status --project project --json
+dealer project unlink project --json
+dealer plugin add --name personal-hook --module plugins/personal-hook.ts --config ./settings.json --json
+```
+
+`init` creates `.dealer/project.json` and `.dealer/plugins/`, refusing overwrite.
+Without flags it uses the current directory, its basename as project ID, and
+that ID as default network. Put project TypeScript/ESM plugins in
+`.dealer/plugins/*.ts` and list their root-relative paths in manifest `plugins`.
+`link` defaults to the caller's current directory. It loads modules immediately
+and persists the link for restart; it does not mount the default network.
+
+Personal overrides default to `~/.dealer/projects/<id>.patch.json`, or use
+`project link --user-patch ./custom.json`. A patch can supply `skills` and
+`pluginConfig: { "plugin-name": { ...settings } }`; per-plugin settings shallowly
+override manifest config. Skills are merged/deduplicated and remain after unlink.
+Standalone user modules such as `~/.dealer/plugins/personal-hook.ts` are installed
+by `plugin add`, with module paths relative to stateDir (`DEALER_STATE_DIR` can
+replace `~/.dealer`). `--config` is a JSON object file relative to the caller.
+
+`status` returns linked manifests, loaded plugin names, and personal plugins.
+Unlink cleans up only the project's registrations; it retains project files,
+personal patches and personal plugins. Restart loads projects then user plugins.
+Relink applies updated configuration; restart after changing module source due
+to Node's import cache. Topics and defaultNetworkId are metadata in this stage.
+See [the plugin guide](../../docs/plugin-guide.md#3-three-tier-onboarding-built-in-project-user)
+for the manifest, factory context and lifecycle contracts.
