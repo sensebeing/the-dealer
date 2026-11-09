@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
 
 export interface CommandRequest {
@@ -114,6 +114,7 @@ export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): Execut
 export interface OrcaSpawnOptions extends AgentOptions {
   namePrefix?: string;
   orcaCommand?: string;
+  projectRoots?: Readonly<Record<string, string>>;
   parentWorktree?: string;
   noParent?: boolean;
   seaCreatureNaming?: boolean;
@@ -282,6 +283,49 @@ async function pickSeaCreatureName(
   return available ?? `nautilus-${randomUUID().slice(0, 8)}`;
 }
 
+function gitCommonDir(directory: string): string | undefined {
+  if (!existsSync(directory)) {
+    return undefined;
+  }
+  let commonDir: string;
+  try {
+    commonDir = execFileSync(
+      'git', ['-C', directory, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim();
+  } catch {
+    return undefined;
+  }
+  return existsSync(commonDir) ? realpathSync(commonDir) : resolve(commonDir);
+}
+
+function assertParentInProject(projectId: string, boundRoot: string, parentWorktree: string): void {
+  const parentPath = parentWorktree.startsWith('path:')
+    ? parentWorktree.slice(5)
+    : /^id:[^:]+::(.+)$/.exec(parentWorktree)?.[1];
+  const reject = () => new Error(`Parent worktree does not belong to project ${projectId}`);
+  if (!parentPath?.trim()) {
+    throw reject();
+  }
+  const resolvedRoot = resolve(boundRoot);
+  const resolvedParent = resolve(parentPath);
+  if (resolvedParent === resolvedRoot) {
+    return;
+  }
+  const rootCommon = gitCommonDir(resolvedRoot);
+  const parentCommon = gitCommonDir(resolvedParent);
+  if (rootCommon !== undefined || parentCommon !== undefined) {
+    if (rootCommon === undefined || rootCommon !== parentCommon) {
+      throw reject();
+    }
+    return;
+  }
+  const rel = relative(resolvedRoot, resolvedParent);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw reject();
+  }
+}
+
 export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): ExecutorPlugin {
   return {
     name: 'orca-spawn',
@@ -292,8 +336,22 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
       const configuredCwd =
         (typeof config.cwd === 'string' && config.cwd ? config.cwd : undefined) ?? options.cwd;
-      let parentWorktree: string | undefined = configuredCwd ? `path:${configuredCwd}` : 'active';
-      for (const hierarchy of [config, options, payload]) {
+      const projectId =
+        typeof payload.projectId === 'string' && payload.projectId.trim()
+          ? payload.projectId.trim()
+          : undefined;
+      const projectRoots = { ...(options.projectRoots ?? {}), ...(config.projectRoots ?? {}) };
+      const boundRoot = projectId && typeof projectRoots[projectId] === 'string'
+        ? projectRoots[projectId].trim() || undefined
+        : undefined;
+      if (projectId && !boundRoot) {
+        throw new Error(`Unbound project on receiver: ${projectId}`);
+      }
+      const defaultCwd = boundRoot ?? configuredCwd;
+      let parentWorktree: string | undefined = payload.noParent === true
+        ? undefined
+        : defaultCwd ? `path:${defaultCwd}` : 'active';
+      for (const hierarchy of [config, options]) {
         if (hierarchy.noParent === true || hierarchy.parentWorktree === 'none') {
           parentWorktree = undefined;
           break;
@@ -303,17 +361,14 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           break;
         }
       }
-      const repoPath =
-        typeof payload.repoPath === 'string' && payload.repoPath
-          ? payload.repoPath
-          : typeof payload.cwd === 'string' && payload.cwd
-            ? payload.cwd
-            : undefined;
-      // Receiver configuration selects the local checkout; payload paths support loopback.
-      const worktreeCwd =
-        configuredCwd ??
-        repoPath ??
+      if (projectId && boundRoot && parentWorktree !== undefined) {
+        assertParentInProject(projectId, boundRoot, parentWorktree);
+      }
+      const worktreeCwd = boundRoot ?? configuredCwd ??
         (parentWorktree?.startsWith('path:') ? parentWorktree.slice(5) : undefined);
+      if (parentWorktree === undefined && !worktreeCwd) {
+        throw new Error('Top-level Orca worktree requires receiver cwd or bound projectId');
+      }
       const explicitName =
         typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
           ? payload.worktreeName.trim()

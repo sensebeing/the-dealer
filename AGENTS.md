@@ -16,7 +16,7 @@
 | [`packages/node/index.ts`](packages/node/index.ts) | 本机 Ed25519 身份私钥唯一真源（`privateKeyPem`）、按网络隔离的签名 `NodeCard` 周期发布与版本号单调递增校验、多维 Selector 解析（`ed25519:` / `member:` / `skill:` / `member@node` / `network/selector`） | 不直接管理底层 Socket 或执行入站任务 |
 | [`packages/router/index.ts`](packages/router/index.ts) & [`packages/plugins-router/index.ts`](packages/plugins-router/index.ts) | 出站消息三级路由判定（Explicit Selector → Capability/Load 规则 → `RouteJudgePlugin` 智能裁判），强制校验裁判返回的 `targetNodeIds` 必须属于当前网络可用候选集 | 不直接发送网络字节流，不把未认证文本拼入 Shell 命令 |
 | [`packages/gate/index.ts`](packages/gate/index.ts) | 入站四态门禁（`open` / `approval_required` / `dnd` / `closed`）、按网络覆盖模式、优先级 `GateRulePlugin`、`approve(--trust-sender)` 发送方信任放行与 `drainDnd()` 排空 | 不越过 `dispatcher` 直接调用外部执行器 |
-| [`packages/dispatcher/index.ts`](packages/dispatcher/index.ts) & [`packages/plugins-policy/index.ts`](packages/plugins-policy/index.ts) & [`packages/plugins-executor/index.ts`](packages/plugins-executor/index.ts) | 持久化原子账本 `DeliveryLedger`、策略中间件链（`dedup-cas` CAS 水位去重、`wave-coalescer` 空闲门禁波次聚合与 `/new` 会话轮转）、以及向 `orca-spawn`（显式指定 `--no-parent` 一级工作区或 `--parent-worktree` 子工作区，执行命令与本地路径以接收端配置为准）、`orca-wave`、`agent-pty`、`notify` 投递并签发 `DeliveryReceipt` | 不静默吞掉执行错误；未知外部副作用状态（`dispatching` / `failed`）不盲目自动重放 |
+| [`packages/dispatcher/index.ts`](packages/dispatcher/index.ts) & [`packages/plugins-policy/index.ts`](packages/plugins-policy/index.ts) & [`packages/plugins-executor/index.ts`](packages/plugins-executor/index.ts) | 持久化原子账本 `DeliveryLedger`、策略中间件链（`dedup-cas` CAS 水位去重、`wave-coalescer` 空闲门禁波次聚合与 `/new` 会话轮转）、以及向 `orca-spawn`（显式指定 `--no-parent` 一级工作区或 `--parent-worktree` 子工作区，执行命令以接收端配置为准，projectId 仅通过接收端 projectRoots / config.projects 解析，绝不信任发送端路径，接收端 parentWorktree 必须验证属于目标仓库）、`orca-wave`、`agent-pty`、`notify` 投递并签发 `DeliveryReceipt` | 不静默吞掉执行错误；未知外部副作用状态（`dispatching` / `failed`）不盲目自动重放 |
 | [`packages/emitter/index.ts`](packages/emitter/index.ts) & [`packages/plugins-source/index.ts`](packages/plugins-source/index.ts) | 出站消息制备（`emitter/prepare` waterfall）、附件自动 `shareFile`、Ed25519 信封签名、回执签名校验，以及外部事件源（`webhook` / `poll-watermark` / `script`）生命周期托管 | 不允许 `emitter/prepare` 钩子篡改发送方身份或所属 `networkId` |
 | [`packages/cli/`](packages/cli/index.ts) & [`bin/`](bin/dealer.js) | 内置 Profile（`personal-dev` / `dedicated-worker` / `headless-relay`）、声明式 JSON/YAML Patch 解析、独占状态目录 `DealerNodeRuntime`（`0700` 目录 + `runtime.lock` + `0600` 私钥与 Unix Control Socket）及 `dealer` / `dealerd` CLI 入口 | 不在 CLI 层重新实现核心服务已有协议或绕过门禁/签名校验 |
 
@@ -49,7 +49,7 @@ rules:
 
   - id: peq.security-and-isolation
     severity: block
-    summary: 不同 Network 通过 HKDF 派生的 AEAD 密钥与 Header AAD 严格隔离；执行外部命令统一使用 shell: false 参数数组或严格单引号转义；orca-spawn 创建工作区必须显式指定层级策略（独立一级工作区传 --no-parent，子工作区传 --parent-worktree）；状态目录与控制 Socket 保持 0700/0600 权限与 runtime.lock 独占锁。
+    summary: 不同 Network 通过 HKDF 派生的 AEAD 密钥与 Header AAD 严格隔离；执行外部命令统一使用 shell: false 参数数组或严格单引号转义；orca-spawn 创建工作区必须显式指定层级策略（独立一级工作区传 --no-parent，子工作区传 --parent-worktree）；projectId 仅通过接收端 projectRoots（config.projects）绑定，忽略发送端 repoPath/cwd/parentWorktree，接收端 parentWorktree 须属于绑定仓库；状态目录与控制 Socket 保持 0700/0600 权限与 runtime.lock 独占锁。
 
   - id: peq.test-case-quality
     severity: block

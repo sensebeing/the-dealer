@@ -193,7 +193,7 @@ test('all official executors deliver via Emitter using injected commands and not
   assert.match(await readFile(join(dir, 'inbox.jsonl'), 'utf8'), /Task/);
 });
 
-test('orca-spawn honors per-envelope parent worktrees, explicit names and sea-creature naming', async () => {
+test('orca-spawn honors receiver parent worktrees, explicit names and sea-creature naming', async () => {
   const requests: CommandRequest[] = [];
   const commandRunner: CommandRunner = async request => {
     requests.push(request);
@@ -222,9 +222,9 @@ test('orca-spawn honors per-envelope parent worktrees, explicit names and sea-cr
   const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
 
   await executor.execute(
-    [envelope({ payload: { parentWorktree: 'path:/ephemeral', worktreeName: ' explicit ' } })],
+    [envelope({ payload: { worktreeName: ' explicit ' } })],
     context,
-    {},
+    { parentWorktree: 'path:/ephemeral' },
   );
   assert.equal(flagValue(createdArgs(), '--parent-worktree'), 'path:/ephemeral');
   assert.equal(flagValue(createdArgs(), '--name'), 'explicit');
@@ -283,9 +283,9 @@ test('orca-spawn runs orca inside a path parent worktree when no cwd is configur
 
   requests.length = 0;
   await executor.execute(
-    [envelope({ payload: { seaCreatureNaming: true, noParent: true, repoPath: missingParent } })],
+    [envelope({ payload: { seaCreatureNaming: true, noParent: true, projectId: 'alter-service' } })],
     context,
-    {},
+    { projectRoots: { 'alter-service': missingParent } },
   );
   assert.equal(request('list').cwd, missingParent);
   assert.equal(request('create').cwd, missingParent);
@@ -523,6 +523,7 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
     interactiveCommand: 'sender-controlled-command',
     agySettingsPath: senderSettings,
     repoPath: '/sender/repo',
+    cwd: '/sender/cwd',
     parentWorktree: 'path:/sender/worktree',
   } });
   const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
@@ -551,9 +552,18 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
 
   requests.length = 0;
   await createOrcaSpawnExecutorPlugin({ commandRunner }).execute(
-    [envelope({ payload: { repoPath: '/loopback/repo' } })], context, {},
+    [envelope({ payload: { repoPath: '/loopback/repo', cwd: '/sender/cwd', parentWorktree: 'path:/sender/parent' } })], context, {},
   );
-  assert.equal(requests[0].cwd, '/loopback/repo');
+  assert.equal(requests[0].cwd, undefined);
+  assert.equal(requests[0].args[requests[0].args.indexOf('--parent-worktree') + 1], 'active');
+  requests.length = 0;
+  await assert.rejects(
+    createOrcaSpawnExecutorPlugin({ commandRunner }).execute(
+      [envelope({ payload: { noParent: true, repoPath: '/sender/repo', cwd: '/sender/cwd' } })], context, {},
+    ),
+    /Top-level Orca worktree requires receiver cwd or bound projectId/,
+  );
+  assert.equal(requests.length, 0);
 });
 
 test('webhook, watermark poller and JSON-lines script run end-to-end through emitter', async t => {
@@ -730,4 +740,63 @@ test('CAS reserves failed claims to avoid replaying an ambiguous external effect
   await assert.rejects(policy.process(message, execute), /timeout/);
   assert.equal((await policy.process(envelope({ ...message, id: 'redelivery' }), execute)).stage, 'rejected');
   assert.equal(count, 1);
+});
+
+test('orca-spawn binds project identity only on the receiver and validates parent repository', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dealer-project-roots-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = join(root, 'repo');
+  const sibling = join(root, 'sibling');
+  const other = join(repo, 'other');
+  await mkdir(other, { recursive: true });
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync('git', ['-C', cwd, ...args], { stdio: 'ignore' });
+  git(repo, 'init', '--quiet');
+  git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-m', 'init');
+  git(repo, 'worktree', 'add', '--detach', sibling);
+  git(other, 'init', '--quiet');
+  const requests: CommandRequest[] = [];
+  const executor = createOrcaSpawnExecutorPlugin({
+    cwd: '/unrelated/receiver',
+    projectRoots: { 'alter-service': repo, virtual: join(root, 'virtual') },
+    commandRunner: async request => {
+      requests.push(request);
+      return { stdout: JSON.stringify({ ok: true, result: { path: join(root, 'spawned') } }) };
+    },
+  });
+  const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
+  const payload = { projectId: ' alter-service ', noParent: true, repoPath: '/sender/repo',
+    cwd: '/sender/cwd', parentWorktree: 'path:/sender/parent' };
+  await executor.execute([envelope({ payload })], context, {});
+  assert.equal(requests[0].cwd, repo);
+  assert.ok(requests[0].args.includes('--no-parent'));
+  for (const parentWorktree of [`path:${sibling}`, `id:receiver-repo::${sibling}`, `path:${repo}`]) {
+    requests.length = 0;
+    await executor.execute([envelope({ payload })], context, { parentWorktree });
+    assert.equal(requests[0].cwd, repo);
+    assert.equal(requests[0].args[requests[0].args.indexOf('--parent-worktree') + 1], parentWorktree);
+  }
+  for (const parentWorktree of [`path:${other}`, 'active', 'path:', 'id:repo::', `path:${root}/missing`]) {
+    requests.length = 0;
+    await assert.rejects(executor.execute([envelope({ payload })], context, { parentWorktree }),
+      /Parent worktree does not belong/);
+    assert.equal(requests.length, 0);
+  }
+  requests.length = 0;
+  await assert.rejects(executor.execute([envelope({ payload: { ...payload, projectId: 'missing' } })], context, {}),
+    /Unbound project on receiver: missing/);
+  await assert.rejects(executor.execute([envelope({ payload })], context,
+    { projectRoots: { 'alter-service': ' ' } }), /Unbound project/);
+  assert.equal(requests.length, 0);
+  await executor.execute([envelope({ payload: { projectId: 'alter-service' } })], context, {});
+  assert.equal(requests[0].args[requests[0].args.indexOf('--parent-worktree') + 1], `path:${repo}`);
+  requests.length = 0;
+  await executor.execute([envelope({ payload })], context, { projectRoots: { 'alter-service': sibling } });
+  assert.equal(requests[0].cwd, sibling);
+  requests.length = 0;
+  await executor.execute([envelope({ payload: { projectId: 'virtual' } })], context,
+    { parentWorktree: `path:${root}/virtual/child` });
+  assert.equal(requests[0].cwd, join(root, 'virtual'));
+  await assert.rejects(executor.execute([envelope({ payload: { projectId: 'virtual' } })], context,
+    { parentWorktree: `path:${root}/virtual-other` }), /Parent worktree does not belong/);
 });

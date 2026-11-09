@@ -740,3 +740,32 @@ export default {
   await runtime.linkProject(project);
   assert.equal((await runtime.kernel.ctx.waterfall('emitter/prepare', {} as any)).good, true);
 });
+
+test('Phase 4: runtime binds linked receiver projects into orca-spawn', async t => {
+  const root = directory(t);
+  const projectRoot = join(root, 'linked-project');
+  mkdirSync(projectRoot);
+  initProjectScaffold(projectRoot, { projectId: 'alter-service', defaultNetworkId: 'sensebeing' });
+  const calls: CommandRequest[] = [];
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', {
+    profile: 'personal-dev',
+    patch: {
+      gateMode: 'open',
+      projects: [{ projectId: 'alter-service', rootPath: projectRoot }],
+      executorConfig: { 'orca-spawn': { cwd: '/unrelated/receiver' } },
+    },
+    commandRunner: async request => {
+      calls.push(request);
+      return { stdout: JSON.stringify({ ok: true, result: { path: join(root, 'spawned') } }) };
+    },
+  });
+  await connect(alice, bob);
+  const result = await alice.emitter.emit(input('bob', {
+    projectId: 'alter-service', noParent: true, repoPath: '/sender/repo',
+    cwd: '/sender/cwd', parentWorktree: 'path:/sender/parent',
+  }));
+  assert.equal(result.receipts[0].stage, 'dispatched');
+  assert.equal(calls[0].cwd, projectRoot);
+  assert.ok(calls[0].args.includes('--no-parent'));
+});

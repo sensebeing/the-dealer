@@ -449,9 +449,17 @@ export class DealerNodeRuntime {
       inject: ['dispatcher', 'transport', 'emitter', 'router'],
       apply: ctx => {
         const runner = this.options.commandRunner ?? runCommand;
+        const linkedProjectRoots = Object.fromEntries(
+          this.config.projects.map(project => [project.projectId, project.rootPath]),
+        );
+        const spawnConfig = this.config.executorConfig['orca-spawn'] ?? {};
         const executors: Record<string, ExecutorPlugin> = {
           'orca-spawn': createOrcaSpawnExecutorPlugin({
-            ...this.config.executorConfig['orca-spawn'],
+            ...spawnConfig,
+            projectRoots: {
+              ...linkedProjectRoots,
+              ...(spawnConfig.projectRoots ?? {}),
+            },
             commandRunner: runner,
           }),
           'orca-wave': createOrcaWaveExecutorPlugin({
