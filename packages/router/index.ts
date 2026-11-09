@@ -66,7 +66,7 @@ export function createRouterPlugin(): Plugin {
             });
             return decision(cards, 'explicit');
           }
-          const candidates = node
+          const remoteCandidates = node
             .listPeers({ networkId: envelope.networkId, onlyAvailable: true })
             .filter(
               c =>
@@ -74,19 +74,41 @@ export function createRouterPlugin(): Plugin {
                 c.admissionMode !== 'closed' &&
                 c.runtimeState.load !== 'overloaded',
             );
+          const selfCard =
+            typeof node.getSelfCard === 'function'
+              ? node.getSelfCard(envelope.networkId)
+              : undefined;
+          const selfAvailable =
+            selfCard !== undefined &&
+            selfCard.networkId === envelope.networkId &&
+            selfCard.admissionMode !== 'closed' &&
+            selfCard.runtimeState.load !== 'overloaded';
+          const candidates: NodeCard[] = [...remoteCandidates];
+          if (
+            selfAvailable &&
+            selfCard &&
+            !remoteCandidates.some(c => c.nodeId === selfCard.nodeId)
+          ) {
+            candidates.push(selfCard);
+          }
           const terms = [
             ...selectors.filter(t => t.startsWith('skill:')).map(t => t.slice(6)),
             envelope.payload?.requiredSkill,
             envelope.payload?.area,
           ].filter((v): v is string => typeof v === 'string' && v.length > 0);
-          const matches = candidates.filter(c =>
-            c.capabilities.skills.some(
-              s =>
-                terms.some(
-                  t => s.id === t || s.tags?.includes(t) || s.acceptedTypes?.includes(t),
-                ) || s.acceptedTypes?.includes(envelope.kind),
-            ),
-          );
+          const capabilityMatches = (pool: readonly NodeCard[]) =>
+            pool.filter(c =>
+              c.capabilities.skills.some(
+                s =>
+                  terms.some(
+                    t => s.id === t || s.tags?.includes(t) || s.acceptedTypes?.includes(t),
+                  ) || s.acceptedTypes?.includes(envelope.kind),
+              ),
+            );
+          // Remote capability matches take precedence; the local self card is the
+          // zero-config fallback when no other same-network peer can serve the task.
+          const remoteMatches = capabilityMatches(remoteCandidates);
+          const matches = remoteMatches.length ? remoteMatches : capabilityMatches(candidates);
           if (matches.length) {
             const idle = matches.filter(c => c.runtimeState.load === 'idle');
             return decision(idle.length ? idle : matches, 'capability');

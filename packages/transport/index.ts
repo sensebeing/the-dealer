@@ -362,8 +362,9 @@ export class P2PTransportService implements TransportService {
     };
   }
 
-  getNetworkConfig(networkId: string): NetworkMountConfig {
-    return structuredClone(this.get(networkId).config);
+  getNetworkConfig(networkId: string): NetworkMountConfig | undefined {
+    const mount = this.mounts.get(networkId);
+    return mount ? structuredClone(mount.config) : undefined;
   }
 
   onNetworksChanged(handler: () => void | Promise<void>): Disposable {
@@ -514,7 +515,7 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs = 5000,
   ): Promise<Uint8Array> {
-    const address = m.peers.get(target);
+    const address = target === this.localNodeId ? this.endpointAddr : m.peers.get(target);
     if (!address) {
       throw new Error(`Unknown peer: ${target}`);
     }
@@ -542,8 +543,53 @@ export class P2PTransportService implements TransportService {
     bytes: Uint8Array,
     opts?: { timeoutMs?: number },
   ): Promise<Uint8Array> {
-    const m = this.get(networkId);
+    const m = this.mounts.get(networkId);
+    if (!m) {
+      if (target === this.localNodeId) {
+        return this.deliverLocal(networkId, bytes);
+      }
+      throw new Error(`Network not mounted: ${networkId}`);
+    }
     return this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs);
+  }
+
+  /** Same-machine zero-config mode: deliver an unmounted network frame without a socket. */
+  private async deliverLocal(networkId: string, bytes: Uint8Array): Promise<Uint8Array> {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(Buffer.from(bytes).toString('utf8'));
+    } catch {
+      payload = bytes;
+    }
+    if (
+      payload &&
+      typeof payload === 'object' &&
+      (payload as { protocol?: string }).protocol === 'the-dealer-wire/v1'
+    ) {
+      throw new Error(`Network not mounted: ${networkId}`);
+    }
+    if (this.handlers.size === 0 && !this.ctx) {
+      throw new Error('No inbound handler registered');
+    }
+    const event: InboundFrameEvent & { rawBytes: Uint8Array } = {
+      networkId,
+      senderNodeId: this.localNodeId,
+      mode: 'unicast',
+      payload,
+      rawBytes: bytes,
+    };
+    let reply: Uint8Array = new Uint8Array();
+    for (const handler of this.handlers) {
+      const value = await handler(event);
+      if (value !== undefined) {
+        reply = value;
+      }
+    }
+    const value = await this.ctx?.serial('transport/inbound', event);
+    if (value !== undefined) {
+      reply = value;
+    }
+    return reply;
   }
 
   async sendMulticast(
@@ -694,7 +740,17 @@ export class P2PTransportService implements TransportService {
     }
     await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
     const temp = `${destPath}.${randomUUID()}.part`;
-    const socket = this.track(createConnection(parseEndpoint(url.host)));
+    let nodeId: string;
+    try {
+      nodeId = decodeURIComponent(url.username);
+    } catch {
+      throw new Error('Invalid blob ticket');
+    }
+    const address = nodeId === this.localNodeId ? this.endpointAddr : url.host;
+    if (!address) {
+      throw new Error('Transport endpoint unavailable');
+    }
+    const socket = this.track(createConnection(parseEndpoint(address)));
     const reader = new SocketReader(socket);
     const output = createWriteStream(temp, { flags: 'wx', mode: 0o600 });
     // Keep stream errors handled during network reads; writes observe them below.

@@ -203,6 +203,25 @@ test('webhook, watermark poller and JSON-lines script run end-to-end through emi
   const script = createScriptSourcePlugin({ command: 'fixture', commandRunner: async () => ({ stdout: JSON.stringify(input) + '\n' + JSON.stringify(input) }) }); await script.start(emitter); await script.stop(); assert.equal(calls.length, 5);
 });
 
+test('scheduled watermark source polls immediately when an interval is configured', async () => {
+  let polls = 0;
+  const poller = createPollWatermarkSourcePlugin({
+    initialCursor: 0,
+    poll: async cursor => {
+      polls++;
+      return { items: [], cursor };
+    },
+    toInput: () => ({ networkId: 'test', routing: { mode: 'auto' }, kind: 'task', subject: '', body: '', payload: {} }),
+    intervalMs: 60000,
+  });
+  const emitter = { async emit() { throw new Error('unused'); }, registerSource() { throw new Error('unused'); } };
+  await poller.start(emitter);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(polls, 1);
+  await poller.stop();
+  assert.equal(polls, 1);
+});
+
 test('poll cursor remains unchanged on failed delivery and agent process nonzero is failure', async () => {
   const poller = createPollWatermarkSourcePlugin({ initialCursor: 0, poll: async () => ({ items: [1], cursor: 1 }), toInput: () => ({ networkId: 'test', routing: { mode: 'auto' }, kind: 'task', subject: '', body: '', payload: {} }) });
   await poller.start({ async emit() { throw new Error('offline'); }, registerSource() { throw new Error('unused'); } });
@@ -264,6 +283,66 @@ test('Orca idle inspection includes child workspaces and rejects truncated inven
   ] } }) }) });
   assert.equal((await executor.checkIdle!({})).idle, false); busy = false; assert.equal((await executor.checkIdle!({})).idle, true);
   truncated = true; assert.equal((await executor.checkIdle!({})).idle, false);
+});
+
+test('Orca idle inspection trusts real TUI previews and skips terminal wait', async () => {
+  let lastLine = '  ⏵⏵ bypass permissions on';
+  let waits = 0;
+  const executor = createOrcaWaveExecutorPlugin({
+    cwd: '/workspace',
+    terminalHandle: 'term-test',
+    commandRunner: async request => {
+      if (request.args[0] === 'worktree') {
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            result: {
+              truncated: false,
+              worktrees: [
+                {
+                  path: '/workspace',
+                  worktreeId: 'parent',
+                  childWorktreeIds: [],
+                  unverifiableTerminalCount: 0,
+                  agents: [{ state: 'done' }],
+                },
+              ],
+            },
+          }),
+        };
+      }
+      if (request.args[1] === 'list') {
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            result: {
+              terminals: [
+                {
+                  handle: 'term-test',
+                  connected: true,
+                  writable: true,
+                  agentIdentity: 'antigravity',
+                  preview: `history\n${lastLine}`,
+                  lastOutputAt: 1,
+                },
+              ],
+            },
+          }),
+        };
+      }
+      if (request.args[1] === 'wait') {
+        waits++;
+        return { stdout: '{"ok":false,"error":{"code":"timeout"}}' };
+      }
+      return { stdout: '{"ok":true}' };
+    },
+  });
+  assert.equal((await executor.checkIdle!({})).idle, true);
+  assert.equal(waits, 0);
+  lastLine = '> unsent draft';
+  assert.equal((await executor.checkIdle!({})).idle, false);
+  lastLine = '>';
+  assert.equal((await executor.checkIdle!({})).idle, true);
 });
 
 test('local command executor actually runs a process and captures JSON without shell interpolation', async () => {

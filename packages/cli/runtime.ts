@@ -24,6 +24,7 @@ import {
   createAgentPtyExecutorPlugin,
   createNotifyExecutorPlugin,
   checkedCommand,
+  resolveOrcaWorkspaceTerminal,
   runCommand,
 } from '../plugins-executor/index.ts';
 import type { CommandRunner } from '../plugins-executor/index.ts';
@@ -215,6 +216,7 @@ export class DealerNodeRuntime {
       await this.kernel.use(
         createGatePlugin({
           mode: this.config.gateMode,
+          localNodeId: keyPair.nodeId,
           networkModes: Object.fromEntries(
             this.config.networks
               .filter(n => n.admissionMode)
@@ -511,15 +513,30 @@ export class DealerNodeRuntime {
             streamKey,
             maxWaves: this.config.wave.rotateAfterWaves,
             minAgeMs: this.config.wave.minAgeMs,
-            rotateSession: async () => {
+            rotateSession: async (_command, _streamKey, streamConfig?: any) => {
               const config = this.config.executorConfig['orca-wave'] ?? {};
-              if (!config.terminalHandle) {
-                throw new Error('Session rotation requires terminalHandle');
+              const cwd = streamConfig?.cwd ?? config.cwd;
+              const orcaCommand = config.orcaCommand ?? 'orca';
+              const terminalHandle =
+                streamConfig?.terminalHandle ??
+                config.terminalHandle ??
+                (cwd ? await resolveOrcaWorkspaceTerminal(runner, orcaCommand, cwd) : undefined);
+              if (!terminalHandle) {
+                throw new Error('Session rotation requires terminalHandle or workspace cwd');
               }
               const result = await checkedCommand(runner, {
-                command: config.orcaCommand ?? 'orca',
-                args: ['terminal', 'send', '--terminal', config.terminalHandle, '--text', '/new', '--enter', '--json'],
-                cwd: config.cwd,
+                command: orcaCommand,
+                args: [
+                  'terminal',
+                  'send',
+                  '--terminal',
+                  terminalHandle,
+                  '--text',
+                  '/new',
+                  '--enter',
+                  '--json',
+                ],
+                cwd,
               });
               if (JSON.parse(result.stdout).ok === false) {
                 throw new Error('Session rotation failed');

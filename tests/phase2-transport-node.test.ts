@@ -104,6 +104,9 @@ test('BLAKE3 vectors and large binary streaming verify before atomic replacement
   await ts[1].fetchBlobToPath(blob.ticket, dest);
   assert.deepEqual(await readFile(dest), bytes);
   assert.equal((await stat(dest)).mode & 0o777, 0o600);
+  const selfDest = join(dir, 'received', 'self-video.bin');
+  await ts[0].fetchBlobToPath(blob.ticket, selfDest);
+  assert.deepEqual(await readFile(selfDest), bytes);
   await writeFile(input, Buffer.alloc(bytes.length, 1));
   await assert.rejects(ts[1].fetchBlobToPath(blob.ticket, dest), /hash|digest/i);
   assert.deepEqual(await readFile(dest), bytes);

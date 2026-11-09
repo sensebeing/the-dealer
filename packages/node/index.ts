@@ -23,7 +23,7 @@ export interface NodePluginConfig {
 
 interface ObservableTransport extends TransportService {
   identityKeyPair?: ReturnType<typeof generateNodeKeyPair>;
-  getNetworkConfig?(networkId: string): NetworkMountConfig;
+  getNetworkConfig?(networkId: string): NetworkMountConfig | undefined;
   onNetworksChanged?(handler: () => void | Promise<void>): Disposable;
 }
 
@@ -188,9 +188,8 @@ export class PeerDirectoryService implements NodeService {
   }
 
   getSelfCard(networkId: string): NodeCard {
-    if (!this.transport.listMountedNetworks().includes(networkId)) {
-      throw new Error(`Network not mounted: ${networkId}`);
-    }
+    // The self card is local identity, available before any network mount. Zero-config
+    // single-machine use addresses this card without ever creating a network scope.
     if (!this.self.has(networkId)) {
       this.self.set(networkId, this.build(networkId));
     }
@@ -216,6 +215,9 @@ export class PeerDirectoryService implements NodeService {
   }
 
   async updateNetworkAdmissionMode(networkId: string, mode: AdmissionMode): Promise<void> {
+    if (!this.transport.listMountedNetworks().includes(networkId)) {
+      throw new Error(`Network not mounted: ${networkId}`);
+    }
     this.getSelfCard(networkId);
     this.modes.set(networkId, mode);
     await this.publish();
@@ -247,6 +249,20 @@ export class PeerDirectoryService implements NodeService {
       .map(card => structuredClone(card));
   }
 
+  private matchSelector(card: NodeCard, selector: string): boolean {
+    if (selector.startsWith('ed25519:')) {
+      return card.nodeId === selector;
+    }
+    if (selector.startsWith('member:')) {
+      return card.identity.member === selector.slice(7);
+    }
+    if (selector.startsWith('skill:')) {
+      const term = selector.slice(6);
+      return card.capabilities.skills.some(s => s.id === term || s.tags?.includes(term));
+    }
+    return `${card.identity.member}@${card.identity.nodeName}` === selector;
+  }
+
   resolveTarget(selector: string, defaultNetworkId?: string): readonly NodeCard[] {
     let networkId = defaultNetworkId;
     const slash = selector.indexOf('/');
@@ -254,21 +270,12 @@ export class PeerDirectoryService implements NodeService {
       networkId = selector.slice(0, slash);
       selector = selector.slice(slash + 1);
     }
-    const peers = this.listPeers({ networkId });
-    if (selector.startsWith('ed25519:')) {
-      return peers.filter(c => c.nodeId === selector);
+    const remote = this.listPeers({ networkId }).filter(card => this.matchSelector(card, selector));
+    if (remote.length > 0) {
+      return remote;
     }
-    if (selector.startsWith('member:')) {
-      return peers.filter(c => c.identity.member === selector.slice(7));
-    }
-    if (selector.startsWith('skill:')) {
-      return peers.filter(c =>
-        c.capabilities.skills.some(
-          s => s.id === selector.slice(6) || s.tags?.includes(selector.slice(6)),
-        ),
-      );
-    }
-    return peers.filter(c => `${c.identity.member}@${c.identity.nodeName}` === selector);
+    const selfCard = this.getSelfCard(networkId ?? 'local');
+    return this.matchSelector(selfCard, selector) ? [selfCard] : [];
   }
 
   async dispose(): Promise<void> {

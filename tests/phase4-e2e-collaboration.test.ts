@@ -245,6 +245,180 @@ test('Phase 4: polling, CAS dedup, busy wave coalescing and session rotation', a
   await registration.dispose();
 });
 
+test('Phase 4: single-machine zero-config self loopback routes without network mount', async t => {
+  const root = directory(t);
+  const solo = await node(t, root, 'solo', {
+    skills: ['local-dev'],
+    patch: { gateMode: 'approval_required' },
+  });
+  assert.deepEqual(solo.transport.listMountedNetworks(), []);
+  assert.equal(solo.gate.getMode(), 'approval_required');
+  assert.equal(solo.node.listPeers().length, 0);
+  const member = await solo.emitter.emit({
+    networkId: 'local',
+    routing: { mode: 'unicast', targets: ['member:solo'] },
+    kind: 'collab.request.v1',
+    subject: 'Self member delivery',
+    body: 'Run the local sweep',
+    payload: { summary: 'local' },
+  });
+  assert.equal(member.receipts.length, 1);
+  assert.equal(member.receipts[0].stage, 'dispatched');
+  assert.equal(member.receipts[0].fromNodeId, solo.transport.localNodeId);
+  const skill = await solo.emitter.emit({
+    networkId: 'local',
+    routing: { mode: 'auto', targets: ['skill:local-dev'] },
+    kind: 'alert.event',
+    subject: 'Local skill delivery',
+    body: 'Handle the local alert',
+    payload: { area: 'local-dev' },
+  });
+  assert.equal(skill.receipts[0].stage, 'dispatched');
+  assert.equal(skill.receipts[0].fromNodeId, solo.transport.localNodeId);
+  assert.equal(solo.gate.listPendingApprovals().length, 0);
+  assert.equal(
+    solo.node.resolveTarget('member:solo', 'local')[0].nodeId,
+    solo.transport.localNodeId,
+  );
+  const inbox = readFileSync(join(solo.stateDir, 'notifications.jsonl'), 'utf8');
+  assert.match(inbox, /Self member delivery/);
+  assert.match(inbox, /Local skill delivery/);
+});
+
+test('Phase 4: wave streams resolve workspace terminal and rotate per stream', async t => {
+  const root = directory(t);
+  const workspaceA = join(root, 'workspace-a');
+  const workspaceB = join(root, 'workspace-b');
+  const calls: CommandRequest[] = [];
+  const runner = async (request: CommandRequest) => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            truncated: false,
+            worktrees: [
+              {
+                path: request.cwd,
+                worktreeId: `worktree-${request.cwd}`,
+                childWorktreeIds: [],
+                unverifiableTerminalCount: 0,
+                agents: [{ state: 'done' }],
+              },
+            ],
+          },
+        }),
+      };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      const handle = request.args.includes(`path:${workspaceA}`) ? 'term-a' : 'term-b';
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            terminals: [
+              {
+                handle: `${handle}-claude`,
+                connected: true,
+                writable: true,
+                agentIdentity: 'claude',
+                lastOutputAt: 20,
+                preview: 'Idle',
+              },
+              {
+                handle,
+                connected: true,
+                writable: true,
+                agentIdentity: 'antigravity',
+                lastOutputAt: 10,
+                preview: '⏵⏵ bypass permissions on',
+              },
+            ],
+          },
+        }),
+      };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const worker = await node(t, root, 'worker', {
+    profile: 'dedicated-worker',
+    commandRunner: runner,
+    patch: {
+      defaultExecutor: 'orca-wave',
+      executorConfig: { 'orca-wave': {} },
+      wave: { flushIntervalMs: 100000 },
+    },
+    executorOverrides: [createOrcaWaveExecutorPlugin({ commandRunner: runner })],
+  });
+  const streamInput = (
+    workspacePath: string,
+    prompt: string,
+    revision: number,
+    workspaceComment?: string,
+  ): EmitMessageInput => ({
+    networkId: 'local',
+    routing: { mode: 'unicast', targets: ['member:worker'] },
+    kind: 'alert.event',
+    subject: 'wave item',
+    body: 'details',
+    payload: {
+      executor: 'orca-wave',
+      streamKey: workspacePath,
+      workspacePath,
+      terminalPrompt: prompt,
+      rotateAfterWaves: 1,
+      revision,
+      ...(workspaceComment ? { workspaceComment } : {}),
+    },
+  });
+  const first = await worker.emitter.emit(streamInput(workspaceA, 'A first\nline', 1));
+  assert.equal(first.receipts[0].stage, 'dispatched');
+  const second = await worker.emitter.emit(streamInput(workspaceA, 'A second', 2));
+  assert.equal(second.receipts[0].stage, 'dispatched');
+  const other = await worker.emitter.emit(
+    streamInput(workspaceB, 'B first', 1, 'Wave B in progress'),
+  );
+  assert.equal(other.receipts[0].stage, 'dispatched');
+
+  const sends = calls.filter(c => c.args[0] === 'terminal' && c.args[1] === 'send');
+  const textOf = (call: CommandRequest) => call.args[call.args.indexOf('--text') + 1];
+  const handleOf = (call: CommandRequest) => call.args[call.args.indexOf('--terminal') + 1];
+  const aSends = sends.filter(c => handleOf(c) === 'term-a');
+  const bSends = sends.filter(c => handleOf(c) === 'term-b');
+  assert.ok(aSends.some(c => textOf(c) === 'A first line'));
+  assert.ok(aSends.some(c => textOf(c) === 'A second'));
+  assert.ok(aSends.some(c => textOf(c) === '/new'));
+  assert.ok(bSends.some(c => textOf(c) === 'B first'));
+  assert.equal(bSends.some(c => textOf(c) === '/new'), false);
+  assert.ok(
+    calls.some(
+      c =>
+        c.args[0] === 'terminal' &&
+        c.args[1] === 'list' &&
+        c.args.includes(`path:${workspaceA}`),
+    ),
+  );
+  assert.ok(
+    calls.some(
+      c =>
+        c.args[0] === 'terminal' &&
+        c.args[1] === 'list' &&
+        c.args.includes(`path:${workspaceB}`),
+    ),
+  );
+  assert.ok(calls.some(c => c.args[0] === 'worktree' && c.args[1] === 'ps' && c.cwd === workspaceA));
+  assert.ok(calls.some(c => c.args[0] === 'worktree' && c.args[1] === 'ps' && c.cwd === workspaceB));
+  assert.ok(
+    calls.some(
+      c =>
+        c.args[0] === 'worktree' &&
+        c.args[1] === 'set' &&
+        c.args.includes('Wave B in progress'),
+    ),
+  );
+});
+
 test('Phase 4: CLI commands, gate states and invite URI round trip', async t => {
   const root = directory(t);
   const alice = await node(t, root, 'alice');

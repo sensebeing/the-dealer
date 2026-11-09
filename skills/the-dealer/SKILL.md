@@ -1,6 +1,6 @@
 ---
 name: the-dealer
-description: Operate a The Dealer P2P collaboration node from Codex, Claude Code, or Antigravity to discover peers, send tasks and files, manage inbound approvals, and configure routes and sources.
+description: Operate a The Dealer collaboration node from Codex, Claude Code, or Antigravity: start with zero-config same-machine multi-agent dispatch, then join encrypted cross-machine and cross-team P2P networks to discover peers, send tasks and files, manage inbound approvals, and configure routes and sources.
 ---
 
 # The Dealer
@@ -10,6 +10,39 @@ Use `dealer` with Node 22.23.3 or newer. From a checkout, use
 select an isolated node; the default is `~/.dealer`. Every command accepts
 `--json` before or after its subcommand. Nonzero exit means failure; inspect
 stderr's JSON error instead of treating failure as an empty result.
+
+`the-dealer` is a **same-machine multi-agent collaboration and dispatch system
+first**, and a cross-machine/cross-team P2P collaboration network only after a
+network is mounted. Prefer Step 1 for local workspaces; mount a network only
+when work must reach another machine or teammate.
+
+## Step 1 — same-machine collaboration (zero network config)
+
+Start the local node and address it directly. No `network mount`, passphrase,
+or peer discovery is involved, yet the message still goes through the same
+gate, dispatcher, policies, and executors.
+
+```sh
+dealer node up --profile personal-dev --member alice --name laptop --skills agent-runtime --json
+dealer send --network local --to member:alice --topic collab.request.v1 --body '{"summary":"Run the local quality sweep"}' --json
+dealer send --network local --to skill:agent-runtime --topic triage --body '{"area":"agent-runtime"}' --json
+```
+
+`local` is only a stable scope name. Self-originated deliveries bypass
+`approval_required` knocks but still respect `dnd` and `closed`. A linked
+project's `defaultNetworkId` is the scope its source plugins emit on.
+
+## Step 2 — cross-machine and cross-team P2P extension
+
+Agree on a `networkId` and shared passphrase, then mount the same network on
+every participating machine. Selectors, gates, policies, and executors keep
+working unchanged inside the encrypted network.
+
+```sh
+dealer network mount sensebeing --passphrase "$TEAM_SECRET" --member alice --name laptop --json
+dealer peers list --network sensebeing --json
+dealer send --network sensebeing --to member:bob --topic collab.request.v1 --body '{"summary":"Review the release"}' --json
+```
 
 ## Inspect and connect
 

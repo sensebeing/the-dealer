@@ -52,7 +52,7 @@ export interface WaveCoalescerOptions<C> {
   streamKey?: (envelope: MessageEnvelope) => string;
   maxWaves?: number;
   minAgeMs?: number;
-  rotateSession?: (command: '/new', streamKey: string) => Promise<void>;
+  rotateSession?: (command: '/new', streamKey: string, streamConfig?: C) => Promise<void>;
   now?: () => number;
 }
 
@@ -90,17 +90,40 @@ export function createWaveCoalescerPolicyPlugin<C>(
     if (!wave?.envelopes.length) {
       return { stage: 'queued', detail: 'No pending wave' };
     }
-    if (options.executor.checkIdle && !(await options.executor.checkIdle(options.executorConfig)).idle) {
+    const firstPayload = wave.envelopes[0]?.payload ?? {};
+    // Each stream may target a different Orca workspace and terminal; resolve them
+    // from the wave's own payload instead of one global executor configuration.
+    const streamConfig = {
+      ...((options.executorConfig ?? {}) as Record<string, unknown>),
+      ...(typeof firstPayload.workspacePath === 'string' && firstPayload.workspacePath
+        ? { cwd: firstPayload.workspacePath }
+        : {}),
+      ...(typeof firstPayload.cwd === 'string' && firstPayload.cwd
+        ? { cwd: firstPayload.cwd }
+        : {}),
+      ...(typeof firstPayload.runId === 'string' && firstPayload.runId
+        ? { runId: firstPayload.runId }
+        : {}),
+      ...(typeof firstPayload.terminalHandle === 'string' && firstPayload.terminalHandle
+        ? { terminalHandle: firstPayload.terminalHandle }
+        : {}),
+    } as C;
+    if (options.executor.checkIdle && !(await options.executor.checkIdle(streamConfig)).idle) {
       return { stage: 'queued', detail: 'Executor busy' };
     }
-    if (
-      wave.waves >= (options.maxWaves ?? Infinity) ||
-      now() - wave.startedAt >= (options.minAgeMs ?? Infinity)
-    ) {
+    const maxWaves =
+      typeof firstPayload.rotateAfterWaves === 'number'
+        ? firstPayload.rotateAfterWaves
+        : (options.maxWaves ?? Infinity);
+    const minAgeMs =
+      typeof firstPayload.minAgeMs === 'number'
+        ? firstPayload.minAgeMs
+        : (options.minAgeMs ?? Infinity);
+    if (wave.waves >= maxWaves || now() - wave.startedAt >= minAgeMs) {
       if (!options.rotateSession) {
         throw new Error('Session rotation required but no rotation hook configured');
       }
-      await options.rotateSession('/new', key);
+      await options.rotateSession('/new', key, streamConfig);
       wave.waves = 0;
       wave.startedAt = now();
     }

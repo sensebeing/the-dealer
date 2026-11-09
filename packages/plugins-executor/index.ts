@@ -170,20 +170,97 @@ export interface OrcaWaveOptions {
   idleCheck?: () => Promise<{ idle: boolean; reason?: string }>;
 }
 
+interface OrcaTerminalRow {
+  handle: string;
+  connected: boolean;
+  writable?: boolean;
+  preview?: unknown;
+  agentIdentity?: unknown;
+  lastOutputAt?: unknown;
+}
+
+/** Resolve the freshest connected antigravity terminal in an Orca workspace, spawning one if needed. */
+export async function resolveOrcaWorkspaceTerminal(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const listed = await checkedCommand(runner, {
+    command,
+    args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
+    cwd,
+    signal,
+  });
+  const terminals = (JSON.parse(listed.stdout)?.result?.terminals ?? []) as OrcaTerminalRow[];
+  const connected = terminals.filter(t => t && t.connected && t.writable !== false);
+  const preferred = connected.filter(t => t.agentIdentity === 'antigravity');
+  const matched = (preferred.length ? preferred : connected).sort(
+    (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
+  );
+  if (matched.length) {
+    return String(matched[0].handle);
+  }
+  const spawned = await checkedCommand(runner, {
+    command,
+    args: [
+      'terminal',
+      'spawn',
+      '--worktree',
+      `path:${cwd}`,
+      '--agent',
+      'antigravity',
+      '--wait',
+      '--json',
+    ],
+    cwd,
+    signal,
+  });
+  const raw = JSON.parse(spawned.stdout);
+  const handle = raw.result?.terminal?.handle ?? raw.result?.handle;
+  if (handle === undefined || handle === null || handle === '') {
+    throw new Error('Orca terminal spawn returned no handle');
+  }
+  return String(handle);
+}
+
 export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): ExecutorPlugin {
   const runner = options.commandRunner ?? runCommand;
   const command = options.orcaCommand ?? 'orca';
-  const checkIdle = async () => {
+  const resolveTarget = (
+    runtimeConfig?: Partial<OrcaWaveOptions>,
+    batch?: readonly MessageEnvelope[],
+  ) => {
+    const payload = batch?.[0]?.payload ?? {};
+    return {
+      cwd:
+        typeof payload.workspacePath === 'string' && payload.workspacePath
+          ? payload.workspacePath
+          : typeof payload.cwd === 'string' && payload.cwd
+            ? payload.cwd
+            : (runtimeConfig?.cwd ?? options.cwd),
+      runId:
+        typeof payload.runId === 'string' && payload.runId
+          ? payload.runId
+          : (runtimeConfig?.runId ?? options.runId),
+      terminalHandle:
+        typeof payload.terminalHandle === 'string' && payload.terminalHandle
+          ? payload.terminalHandle
+          : (runtimeConfig?.terminalHandle ?? options.terminalHandle),
+    };
+  };
+  const checkIdle = async (runtimeConfig?: Partial<OrcaWaveOptions>) => {
     if (options.idleCheck) {
       return options.idleCheck();
     }
-    if (!options.cwd) {
+    const target = resolveTarget(runtimeConfig);
+    if (!target.cwd) {
       return { idle: false, reason: 'cwd or authoritative idleCheck required' };
     }
     const output = await checkedCommand(runner, {
       command,
       args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'],
-      cwd: options.cwd,
+      cwd: target.cwd,
     });
     const raw = JSON.parse(output.stdout);
     const inventory = raw.result;
@@ -198,7 +275,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): Executor
       agents?: { state?: string }[];
     };
     const rows: Workspace[] = inventory.worktrees;
-    const root = rows.find(row => row.path === options.cwd);
+    const root = rows.find(row => row.path === target.cwd);
     if (!root) {
       return { idle: false, reason: 'Workspace not found' };
     }
@@ -218,7 +295,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): Executor
       const listed = await checkedCommand(runner, {
         command,
         args: ['terminal', 'list', '--worktree', `path:${row.path}`, '--json'],
-        cwd: options.cwd,
+        cwd: target.cwd,
       });
       const terminals = JSON.parse(listed.stdout);
       if (
@@ -228,8 +305,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): Executor
       ) {
         return false;
       }
-      const handles: { handle: string; connected: boolean; writable: boolean }[] =
-        terminals.result.terminals;
+      const handles: OrcaTerminalRow[] = terminals.result.terminals;
       // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
       if (handles.length < row.agents.length) {
         return false;
@@ -238,27 +314,43 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): Executor
         if (!terminal.connected || !terminal.writable) {
           return false;
         }
-        try {
-          const waited = await checkedCommand(runner, {
-            command,
-            args: [
-              'terminal',
-              'wait',
-              '--terminal',
-              terminal.handle,
-              '--for',
-              'tui-idle',
-              '--timeout-ms',
-              '1',
-              '--json',
-            ],
-            cwd: options.cwd,
-          });
-          if (JSON.parse(waited.stdout).ok !== true) {
+        const realOrcaTerminal =
+          typeof terminal.preview === 'string' || typeof terminal.agentIdentity === 'string';
+        if (!realOrcaTerminal) {
+          // Synthetic or older inventory without TUI metadata: ask Orca directly.
+          try {
+            const waited = await checkedCommand(runner, {
+              command,
+              args: [
+                'terminal',
+                'wait',
+                '--terminal',
+                terminal.handle,
+                '--for',
+                'tui-idle',
+                '--timeout-ms',
+                '1',
+                '--json',
+              ],
+              cwd: target.cwd,
+            });
+            if (JSON.parse(waited.stdout).ok !== true) {
+              return false;
+            }
+          } catch {
             return false;
           }
-        } catch {
-          return false;
+          continue;
+        }
+        if (typeof terminal.preview === 'string') {
+          // A trailing "> " is an unsent composer draft; a bare ">" is an idle prompt.
+          const lastLine = terminal.preview
+            .split(/\r?\n/)
+            .filter(line => line.trim())
+            .at(-1);
+          if (lastLine?.trimStart().startsWith('> ')) {
+            return false;
+          }
         }
       }
       for (const id of row.childWorktreeIds ?? []) {
@@ -275,19 +367,40 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): Executor
   return {
     name: 'orca-wave',
     checkIdle,
-    async execute(batch, context) {
-      if (!(await checkIdle()).idle) {
+    async execute(batch, context, runtimeConfig) {
+      const target = resolveTarget(runtimeConfig as Partial<OrcaWaveOptions>, batch);
+      if (!(await checkIdle(target)).idle) {
         throw new Error('Orca workspace is busy');
       }
-      if (!options.runId && !options.terminalHandle) {
+      let terminalHandle = target.terminalHandle;
+      if (!target.runId && !terminalHandle && target.cwd) {
+        terminalHandle = await resolveOrcaWorkspaceTerminal(
+          runner,
+          command,
+          target.cwd,
+          context.signal,
+        );
+      }
+      if (!target.runId && !terminalHandle) {
         throw new Error('Orca wave requires runId or terminalHandle');
       }
-      const args = options.runId
+      const text =
+        !target.runId &&
+        batch.some(e => typeof e.payload?.terminalPrompt === 'string' && e.payload.terminalPrompt)
+          ? batch
+              .map(e =>
+                String(e.payload?.terminalPrompt || e.body)
+                  .replace(/\s*\n+\s*/g, ' ')
+                  .trim(),
+              )
+              .join(' ； ')
+          : renderWave(batch);
+      const args = target.runId
         ? [
             'orchestration',
             'send',
             '--to',
-            `run:${options.runId}`,
+            `run:${target.runId}`,
             '--subject',
             `Dealer wave (${batch.length})`,
             '--body',
@@ -298,16 +411,16 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): Executor
             'terminal',
             'send',
             '--terminal',
-            options.terminalHandle!,
+            terminalHandle!,
             '--text',
-            renderWave(batch),
+            text,
             '--enter',
             '--json',
           ];
       const output = await checkedCommand(runner, {
         command,
         args,
-        cwd: options.cwd,
+        cwd: target.cwd,
         signal: context.signal,
       });
       const delivery = JSON.parse(output.stdout);
@@ -320,12 +433,15 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): Executor
           'worktree',
           'set',
           '--worktree',
-          options.cwd ? `path:${options.cwd}` : 'current',
+          target.cwd ? `path:${target.cwd}` : 'current',
           '--comment',
-          `Dealer: dispatched ${batch.length} message(s)`,
+          String(
+            batch.at(-1)?.payload?.workspaceComment ||
+              `Dealer: dispatched ${batch.length} message(s)`,
+          ),
           '--json',
         ],
-        cwd: options.cwd,
+        cwd: target.cwd,
         signal: context.signal,
       });
       if (JSON.parse(comment.stdout).ok === false) {

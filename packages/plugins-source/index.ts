@@ -107,7 +107,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
 ): PollWatermarkSource<Cursor> {
   let cursor = config.initialCursor;
   let emitter: EmitterService | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
   let active: Promise<void> | undefined;
   let stopped = true;
   const pollOnce = (): Promise<void> => {
@@ -133,20 +133,8 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
     });
     return active;
   };
-  const schedule = () => {
-    if (stopped || config.intervalMs === undefined) {
-      return;
-    }
-    timer = setTimeout(async () => {
-      try {
-        await pollOnce();
-      } catch (error) {
-        config.onError?.(error);
-      } finally {
-        schedule();
-      }
-    }, config.intervalMs);
-    timer.unref();
+  const run = () => {
+    void pollOnce().catch(error => config.onError?.(error));
   };
   return {
     name: 'poll-watermark',
@@ -158,14 +146,28 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       }
       emitter = value;
       stopped = false;
-      schedule();
+      if (config.intervalMs !== undefined && config.intervalMs > 0) {
+        // Drain the current watermark immediately instead of waiting one full interval.
+        queueMicrotask(() => {
+          if (!stopped) {
+            run();
+          }
+        });
+        timer = setInterval(() => {
+          if (!stopped) {
+            run();
+          }
+        }, config.intervalMs);
+        timer.unref();
+      }
     },
     async stop() {
       stopped = true;
       if (timer) {
-        clearTimeout(timer);
+        clearInterval(timer);
       }
-      await active;
+      // Poll failures are reported through onError; stop only waits for quiescence.
+      await active?.catch(() => {});
       emitter = undefined;
     },
   };

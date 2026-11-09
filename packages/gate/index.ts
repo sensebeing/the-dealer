@@ -12,6 +12,8 @@ import type { Plugin } from '../kernel/index.ts';
 export interface GateConfig {
   mode?: AdmissionMode;
   networkModes?: Record<string, AdmissionMode>;
+  /** This node's signing identity; lets locally originated envelopes skip approval knocks. */
+  localNodeId?: string;
 }
 
 export interface NetworkGateService extends GateService {
@@ -90,6 +92,14 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
           }
           if (!verdict && trustKeys(envelope).some(k => trusted.has(k))) {
             verdict = { status: 'allow' };
+          }
+          if (!verdict && config.localNodeId && envelope.from.nodeId === config.localNodeId) {
+            const networkMode = service.getNetworkMode(envelope.networkId);
+            // Self-originated local deliveries are admission checks, not knocks. DND
+            // still queues them and closed still rejects them.
+            if (networkMode !== 'closed' && networkMode !== 'dnd') {
+              verdict = { status: 'allow' };
+            }
           }
           if (!verdict) {
             switch (service.getNetworkMode(envelope.networkId)) {

@@ -1,4 +1,4 @@
-# `the-dealer` — 跨机/跨团队实时 Agent 协作网络架构与模块契约设计
+# `the-dealer` — 单机多 Agent 协作与跨机/跨团队实时 Agent 协作网络架构与模块契约设计
 
 > [!IMPORTANT]
 > - **项目名称**：`the-dealer`（CLI：`dealer`，后台守护进程：`dealerd`）
@@ -7,6 +7,39 @@
 >   1. **Everything is a Plugin（无特权内核）**：参考 DeepSeek Harness (`Cordis`)，核心能力全部表现为挂载在 `Context` 上的标准 `Service` 与 `Typed Events`，通过 `Profile + Patch` 声明式组装，支持热插拔（HMR）。
 >   2. **单一真源（Single Source of Truth）**：节点身份、能力名片（`NodeCard`）、门禁策略、投递租约水位（`Watermark / Revision`）各自由唯一模块拥有，不跨层复制状态。
 >   3. **信令与大数据流分离**：控制信封与实时协作消息走低延迟 QUIC Stream / Gossip 树；日志包、截图、音视频、Git Patch 走 `iroh-blobs`（BLAKE3 哈希树内容寻址流），零中心服务器支持千节点级低延迟分发。
+
+---
+
+## 零、 使用层级：Local First，P2P 渐进扩展
+
+`the-dealer` 的第一使用形态是**单机多 Agent / 多工作区自动协作与派发中枢**：一名开发者即可在同一台机器上协调多个专用 Agent 工作区（dev/prod 告警波次、反馈与低质会话认领、prod-release 交接、隔离 Orca 子工作区任务）。当团队挂载加密协作网络后，同一套内核与插件契约再渐进扩展为**跨机器设备互联、跨团队成员 P2P 协作网络**。
+
+### 为什么是 Local First？
+
+绝大多数多 Agent 协作首先发生在同一台开发机上：多个 Orca 工作区、不同 Agent CLI、各类告警/反馈触发源共享同一个开发者与同一份本地代码。若这一层必须依赖网络挂载、口令分发、Peer 发现与远端可达性，单机任务会被无谓地拖入分布式复杂度。`the-dealer` 因此把单机回环作为第一等能力，同时保留与跨机协作完全相同的信封签名、门禁、幂等、波次聚合与执行器链路，避免形成第二套派发栈。
+
+### 第一步 — 单机多 Agent 协作（本地优先，零网络配置）
+
+- 运行 `dealer node up` 启动本机节点；无需 `dealer network mount`、`networkId`、`passphrase` 或任何外部 Peer。
+- 将消息发往 `member:<self>`、`skill:<local-skill>` 或本机 `ed25519:<nodeId>`。`transport` 在目标为本机且网络未挂载时，直接在进程内把帧交给同一 `transport/inbound` 处理器；已挂载时则复用本地 endpoint。
+- `node.resolveTarget` 优先返回已发现的远端节点，仅在无远端匹配时回退本机自身 `NodeCard`；`router` 将本机名片作为合法候选，`gate` 对本机签名身份放行 `approval_required`（`dnd` 仍入队，`closed` 仍拒收）。
+- 项目清单中的 `defaultNetworkId` 只是其触发源在本机发送时使用的稳定作用域名称，不代表必须进行网络挂载。
+
+### 第二步 — 跨机器 / 跨团队成员 P2P 协作（`networkId + passphrase`）
+
+- 团队成员约定 `networkId` 与共享口令 `passphrase` 并执行 `dealer network mount`；`transport` 通过 HKDF-SHA256 派生 `swarmTopicId` 与 AEAD 帧密钥，完成加密发现、准入与网络隔离。
+- 签名 `NodeCard`、多维选择器、三级路由、四态门禁、CAS 去重、波次聚合与全部执行器无需改动，即可在加密协作网络内工作。
+- 跨机 P2P 是同一内核的渐进扩展，而不是另一套协议或第二真源。
+
+```bash
+# 第一步：单机多 Agent 协作（零网络配置）
+./bin/dealer.js node up --profile personal-dev --member ben.xu --name mbp --skills agent-runtime --json
+./bin/dealer.js send --network local --to member:ben.xu --topic collab.request.v1 --body '{"summary":"Run the local quality sweep"}' --json
+
+# 第二步：跨机器 / 跨团队 P2P 扩展
+./bin/dealer.js network mount sensebeing --passphrase "team-shared-secret" --member ben.xu --node mbp-main --json
+./bin/dealer.js send --network sensebeing --to member:oliver --topic collab.request.v1 --body '{"summary":"Review the release"}' --json
+```
 
 ---
 
