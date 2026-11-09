@@ -1,6 +1,7 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -15,7 +16,7 @@ import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin } from '../packages/plugins-policy/index.ts';
-import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace } from '../packages/plugins-executor/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, checkedCommand, runCommand } from '../packages/plugins-executor/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/plugins-executor/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
 
@@ -244,6 +245,134 @@ test('orca-spawn honors per-envelope parent worktrees, explicit names and sea-cr
   await fallback.execute([envelope()], context, {});
   assert.equal(flagValue(createdArgs(), '--parent-worktree'), 'path:/workspace');
   assert.match(String(flagValue(createdArgs(), '--name')), /^dealer-/);
+});
+
+test('orca-spawn runs orca inside a path parent worktree when no cwd is configured', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dealer-parent-worktree-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const missingParent = join(root, 'harlequin');
+  const requests: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    requests.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
+    }
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/child' } } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex', seaCreatureNaming: true });
+  const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
+  const request = (name: string) =>
+    requests.find(r => r.args[0] === 'worktree' && r.args[1] === name)!;
+  const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
+
+  await executor.execute([envelope({ payload: { seaCreatureNaming: true } })], context, {
+    parentWorktree: `path:${missingParent}`,
+  });
+  assert.equal(request('list').cwd, missingParent);
+  assert.equal(request('create').cwd, missingParent);
+  assert.equal(flagValue(request('create').args, '--parent-worktree'), `path:${missingParent}`);
+
+  requests.length = 0;
+  await executor.execute([envelope({ payload: { seaCreatureNaming: true } })], context, {});
+  assert.equal(request('list').cwd, undefined);
+  assert.equal(request('create').cwd, undefined);
+  assert.equal(flagValue(request('create').args, '--parent-worktree'), 'active');
+});
+
+test('sea-creature naming treats Orca worktree branches as taken', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dealer-branch-collision-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const requests: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    requests.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            worktrees: [
+              { path: '/scratch/first', branch: 'refs/heads/ben.xu/nautilus' },
+              { path: '/scratch/second', branch: 'refs/heads/seahorse' },
+            ],
+          },
+        }),
+      };
+    }
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/child' } } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex', seaCreatureNaming: true });
+  await executor.execute(
+    [envelope({ payload: { seaCreatureNaming: true } })],
+    { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' },
+    // A never-created parent skips the local git scan; only Orca branch rows can collide.
+    { parentWorktree: `path:${join(root, 'parent')}` },
+  );
+  const created = requests.find(r => r.args[0] === 'worktree' && r.args[1] === 'create')!;
+  assert.equal(created.args[created.args.indexOf('--name') + 1], 'starfish');
+});
+
+test('sea-creature naming treats existing local git branches as taken', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-git-branches-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const git = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore' });
+  git('init', '--quiet');
+  git(
+    '-c', 'user.name=dealer',
+    '-c', 'user.email=dealer@example.test',
+    '-c', 'commit.gpgsign=false',
+    'commit', '--allow-empty', '--quiet', '-m', 'init',
+  );
+  git('branch', 'nautilus');
+  git('branch', 'ben.xu/seahorse');
+  const requests: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    requests.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
+    }
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/child' } } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex', cwd: dir, seaCreatureNaming: true });
+  await executor.execute(
+    [envelope({ payload: { seaCreatureNaming: true } })],
+    { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' },
+    {},
+  );
+  const created = requests.find(r => r.args[0] === 'worktree' && r.args[1] === 'create')!;
+  assert.equal(created.args[created.args.indexOf('--name') + 1], 'starfish');
+});
+
+test('command failures surface stdout when the CLI writes errors there', async () => {
+  await assert.rejects(
+    runCommand({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('orca JSON failure'); process.exit(2)"],
+    }),
+    /exited 2: .*orca JSON failure/,
+  );
+  await assert.rejects(
+    checkedCommand(
+      async () => ({ stdout: '{"ok":false,"error":"Missing repo selector"}', stderr: '', exitCode: 2 }),
+      { command: 'orca', args: ['worktree', 'create'] },
+    ),
+    /orca exited 2: .*Missing repo selector/,
+  );
+  await assert.rejects(
+    checkedCommand(
+      async () => ({ stdout: 'stdout noise', stderr: 'stderr wins', exitCode: 1 }),
+      { command: 'orca', args: ['worktree', 'list'] },
+    ),
+    /orca exited 1: stderr wins$/,
+  );
 });
 
 test('trustAntigravityWorkspace records workspace paths atomically and idempotently', async t => {

@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   existsSync,
@@ -47,7 +47,7 @@ export const runCommand: CommandRunner = request =>
     child.on('close', code =>
       code === 0
         ? resolve({ stdout, stderr, exitCode: code })
-        : reject(new Error(`${request.command} exited ${code}: ${stderr}`)),
+        : reject(new Error(`${request.command} exited ${code}: ${(stderr || stdout).trim()}`)),
     );
     child.stdin.on('error', reject);
     child.stdin.end(request.input);
@@ -56,7 +56,9 @@ export const runCommand: CommandRunner = request =>
 export async function checkedCommand(runner: CommandRunner, request: CommandRequest) {
   const result = await runner(request);
   if (result.exitCode !== undefined && result.exitCode !== 0) {
-    throw new Error(`${request.command} exited ${result.exitCode}: ${result.stderr ?? ''}`);
+    throw new Error(
+      `${request.command} exited ${result.exitCode}: ${(result.stderr || result.stdout).trim()}`,
+    );
   }
   return result;
 }
@@ -240,7 +242,7 @@ async function pickSeaCreatureName(
   });
   const raw = JSON.parse(listed.stdout) as {
     ok?: boolean;
-    result?: { worktrees?: { path?: unknown; displayName?: unknown }[] };
+    result?: { worktrees?: { path?: unknown; displayName?: unknown; branch?: unknown }[] };
   };
   if (raw.ok === false) {
     throw new Error('Orca worktree listing failed');
@@ -252,6 +254,27 @@ async function pickSeaCreatureName(
     }
     if (typeof row.displayName === 'string' && row.displayName) {
       existing.add(row.displayName.toLowerCase());
+    }
+    // Branch refs such as refs/heads/ben.xu/seahorse collide once their basename matches a creature.
+    if (typeof row.branch === 'string' && row.branch) {
+      existing.add(basename(row.branch).toLowerCase());
+    }
+  }
+  // Local branches outlive removed worktrees; never reuse a creature whose branch still exists.
+  if (typeof cwd === 'string' && existsSync(cwd)) {
+    try {
+      const branches = execFileSync(
+        'git',
+        ['-C', cwd, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+        { encoding: 'utf8' },
+      );
+      for (const branch of branches.split('\n')) {
+        if (branch.trim()) {
+          existing.add(basename(branch.trim()).toLowerCase());
+        }
+      }
+    } catch {
+      // A non-git directory has no local branches to collide with.
     }
   }
   const available = SEA_CREATURE_POOL.find(creature => !existing.has(creature));
@@ -272,6 +295,10 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           : (config.parentWorktree ??
             options.parentWorktree ??
             (options.cwd ? `path:${options.cwd}` : 'active'));
+      // Orca resolves --parent-worktree relative to the caller's repo, so run from the parent
+      // worktree whenever the plugin itself was not given an explicit cwd.
+      const worktreeCwd =
+        options.cwd ?? (parentWorktree.startsWith('path:') ? parentWorktree.slice(5) : undefined);
       const explicitName =
         typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
           ? payload.worktreeName.trim()
@@ -281,12 +308,12 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const name = explicitName
         ? explicitName
         : seaCreatureNaming
-          ? await pickSeaCreatureName(runner, command, options.cwd, context.signal)
+          ? await pickSeaCreatureName(runner, command, worktreeCwd, context.signal)
           : `${options.namePrefix ?? 'dealer'}-${randomUUID()}`;
       const created = await checkedCommand(runner, {
         command,
         args: ['worktree', 'create', '--parent-worktree', parentWorktree, '--name', name, '--json'],
-        cwd: options.cwd,
+        cwd: worktreeCwd,
         signal: context.signal,
       });
       const raw = JSON.parse(created.stdout);
