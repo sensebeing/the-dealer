@@ -1,0 +1,17 @@
+{
+  "name": "the-dealer",
+  "version": "0.1.0",
+  "description": "The Dealer — A P2P, plugin-driven Agent Dispatcher & Mesh for cross-machine, cross-team agent collaboration.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "bin": {
+    "dealer": "./bin/dealer.js",
+    "dealerd": "./bin/dealerd.js"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test 'tests/**/*.test.ts'"
+  }
+}

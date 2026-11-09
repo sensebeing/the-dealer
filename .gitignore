@@ -1,0 +1,7 @@
+node_modules/
+dist/
+target/
+.worktrees/
+.dealer-state/
+*.log
+.DS_Store
