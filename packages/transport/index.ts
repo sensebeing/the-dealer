@@ -212,6 +212,7 @@ export interface TransportPluginOptions {
   discoveryInterface?: string;
   mDnsPort?: number;
   discoveryIntervalMs?: number;
+  socketTimeoutMs?: number;
 }
 
 interface Mount {
@@ -253,7 +254,9 @@ export class P2PTransportService implements TransportService {
   private track(socket: Socket): Socket {
     this.sockets.add(socket);
     socket.once('close', () => this.sockets.delete(socket));
-    socket.setTimeout(10_000, () => socket.destroy(new Error('Transport timeout')));
+    socket.setTimeout(this.options.socketTimeoutMs ?? 90_000, () =>
+      socket.destroy(new Error('Transport timeout')),
+    );
     socket.on('error', () => {});
     return socket;
   }
