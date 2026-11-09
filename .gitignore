@@ -3,5 +3,6 @@ dist/
 target/
 .worktrees/
 .dealer-state/
+.serena/
 *.log
 .DS_Store

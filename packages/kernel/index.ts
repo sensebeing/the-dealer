@@ -1,6 +1,6 @@
 import type {
   Disposable, TransportService, NodeService, EmitterService, RouterService, GateService,
-  DispatcherService, NodeCard, MessageEnvelope, GateVerdict, DispatchReceipt,
+  DispatcherService, NodeCard, MessageEnvelope, GateVerdict, DispatchReceipt, InboundFrameEvent,
 } from '../core-types/index.ts';
 
 export type { Disposable } from '../core-types/index.ts';
@@ -11,6 +11,7 @@ export interface Services {
 }
 /** Extend these interfaces via module augmentation for application services and events. */
 export interface Events {
+  'transport/inbound': (event: InboundFrameEvent) => Uint8Array | void | Promise<Uint8Array | void>;
   'node/peer-updated': (card: NodeCard) => void;
   'emitter/prepare': (envelope: MessageEnvelope, next: (envelope: MessageEnvelope) => Promise<MessageEnvelope>) => MessageEnvelope | Promise<MessageEnvelope>;
   'gate/evaluate': (envelope: MessageEnvelope) => GateVerdict | null | undefined | Promise<GateVerdict | null | undefined>;

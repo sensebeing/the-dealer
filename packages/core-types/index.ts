@@ -39,15 +39,25 @@ export interface SealedNetworkFrame {
   protocol: 'the-dealer-wire/v1'; swarmTopicId: string; senderNodeId: string;
   nonce: string; ciphertext: string; authTag: string;
 }
-export interface MountedNetworkHandle extends Disposable { readonly networkId: string; readonly swarmTopicId: string }
+export interface InboundFrameEvent {
+  networkId: string;
+  senderNodeId: string;
+  mode: 'unicast' | 'broadcast';
+  subTopic?: string;
+  payload: unknown;
+}
+export interface MountedNetworkHandle extends Disposable { readonly networkId: string; readonly swarmTopicId: string; readonly endpointAddr?: string }
 export interface TransportService {
   readonly localNodeId: string;
+  readonly endpointAddr?: string;
   mountNetwork(config: NetworkMountConfig): Promise<MountedNetworkHandle>;
   unmountNetwork(networkId: string): Promise<void>;
   listMountedNetworks(): readonly string[];
+  registerPeerEndpoint?(networkId: string, peerNodeId: string, endpointAddr: string): void;
   sendUnicast(networkId: string, targetNodeId: string, frame: Uint8Array, opts?: { timeoutMs?: number }): Promise<Uint8Array>;
   sendMulticast(networkId: string, targetNodeIds: readonly string[], frame: Uint8Array): Promise<Map<string, Result<Uint8Array>>>;
   broadcast(networkId: string, subTopic: string, frame: Uint8Array): Promise<void>;
+  onInboundFrame?(handler: (frame: InboundFrameEvent) => Promise<Uint8Array | void> | Uint8Array | void): Disposable;
   shareFile(filePath: string): Promise<BlobAttachment>;
   fetchBlobToPath(ticket: string, destPath: string): Promise<void>;
 }
