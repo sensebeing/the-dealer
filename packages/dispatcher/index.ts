@@ -116,8 +116,9 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       if (frame?.type !== 'message.envelope' || !frame.envelope) return;
       const envelope = frame.envelope;
       const self = ctx.services.node.getSelfCard(event.networkId);
-      if (!config.privateKeyPem) throw new Error('Dispatcher signing key is required for inbound receipts');
-      const identityProof = signReceipt({ messageId: envelope.id, networkId: event.networkId, fromNodeId: self.nodeId, stage: 'received', updatedAt: new Date().toISOString() }, config.privateKeyPem);
+      const signingKey = config.privateKeyPem ?? (ctx.services.node as { privateKeyPem?: string }).privateKeyPem;
+      if (!signingKey) throw new Error('Dispatcher signing key is required for inbound receipts');
+      const identityProof = signReceipt({ messageId: envelope.id, networkId: event.networkId, fromNodeId: self.nodeId, stage: 'received', updatedAt: new Date().toISOString() }, signingKey);
       if (!verifyReceipt(identityProof)) throw new Error('Dispatcher key does not match node identity');
       let receipt: DispatchReceipt;
       if (!verifyEnvelope(envelope) || envelope.networkId !== event.networkId || envelope.from.nodeId !== event.senderNodeId) {
@@ -129,7 +130,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           catch (error) { receipt = { stage: 'failed', detail: String(error) }; }
         } else receipt = { stage: verdict.status === 'pending_approval' ? 'pending_approval' : verdict.status === 'queued_dnd' ? 'queued' : 'rejected', detail: verdict.reason };
       }
-      const signed = signReceipt({ messageId: envelope.id, networkId: event.networkId, fromNodeId: self.nodeId, ...receipt, updatedAt: new Date().toISOString() }, config.privateKeyPem);
+      const signed = signReceipt({ messageId: envelope.id, networkId: event.networkId, fromNodeId: self.nodeId, ...receipt, updatedAt: new Date().toISOString() }, signingKey);
       if (!verifyReceipt(signed)) throw new Error('Dispatcher key does not match node identity');
       return Buffer.from(JSON.stringify(signed));
     });

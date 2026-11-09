@@ -3,11 +3,12 @@ import { signEnvelope, verifyEnvelope, verifyReceipt } from '../core-types/index
 import type { DeliveryReceipt, EmitMessageInput, EmitterService, MessageEnvelope, SourcePlugin } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 
-export interface EmitterConfig { privateKeyPem: string; onSourceError?: (error: unknown) => void }
+export interface EmitterConfig { privateKeyPem?: string; onSourceError?: (error: unknown) => void }
 export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfig> {
   return { name: 'emitter', inject: ['transport', 'node', 'router'], apply(ctx, supplied) {
-    const settings = config ?? supplied;
-    if (!settings?.privateKeyPem) throw new Error('Emitter signing key required');
+    const settings = { ...config, ...supplied };
+    const privateKeyPem = settings.privateKeyPem ?? (ctx.services.node as { privateKeyPem?: string }).privateKeyPem;
+    if (!privateKeyPem) throw new Error('Emitter signing key required');
     const sources = new Map<SourcePlugin, Promise<void>>();
     const service: EmitterService = {
       async emit<T>(input: EmitMessageInput<T>) {
@@ -20,10 +21,10 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           from: { nodeId: self.nodeId, ...self.identity }, routing: input.routing, kind: input.kind,
           priority: input.priority ?? 'normal', subject: input.subject, body: input.body, payload: input.payload,
           attachments, createdAt: new Date().toISOString(),
-        }, settings.privateKeyPem);
+        }, privateKeyPem);
         const prepared = await ctx.waterfall('emitter/prepare', initial as MessageEnvelope);
         if (prepared.networkId !== input.networkId || prepared.from.nodeId !== self.nodeId || prepared.from.member !== self.identity.member || prepared.from.nodeName !== self.identity.nodeName) throw new Error('Prepare hook cannot change sender or network identity');
-        const envelope = signEnvelope(prepared, settings.privateKeyPem);
+        const envelope = signEnvelope(prepared, privateKeyPem);
         if (!verifyEnvelope(envelope)) throw new Error('Emitter key does not match node identity');
         const route = await router.route(envelope);
         const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));

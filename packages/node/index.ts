@@ -15,6 +15,7 @@ interface ObservableTransport extends TransportService {
 }
 /** The directory owns signed presence; transport owns endpoints and network secrets. */
 export class PeerDirectoryService implements NodeService {
+  readonly privateKeyPem: string;
   private transport: ObservableTransport;
   private ctx: Context;
   private config: NodePluginConfig;
@@ -31,6 +32,7 @@ export class PeerDirectoryService implements NodeService {
   constructor(ctx: Context, config: NodePluginConfig) {
     this.ctx = ctx; this.config = structuredClone(config); this.transport = ctx.services.transport;
     this.keyPair = config.keyPair ?? this.transport.identityKeyPair ?? generateNodeKeyPair();
+    this.privateKeyPem = this.keyPair.privateKeyPem;
     if (this.keyPair.nodeId !== this.transport.localNodeId) throw new Error('Node keyPair must match transport localNodeId');
     const observe = this.transport.onNetworksChanged?.(() => this.publish()); if (observe) this.listeners.push(observe);
     // Revision checks make duplicate delivery through both supported ingress APIs harmless.
