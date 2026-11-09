@@ -49,7 +49,7 @@ rules:
 
   - id: peq.security-and-isolation
     severity: block
-    summary: 不同 Network 通过 HKDF 派生的 AEAD 密钥与 Header AAD 严格隔离；执行外部命令统一使用 shell: false 参数数组或严格单引号转义；orca-spawn 创建工作区必须显式指定 --parent-worktree（严禁 --no-parent）；状态目录与控制 Socket 保持 0700/0600 权限与 runtime.lock 独占锁。
+    summary: 不同 Network 通过 HKDF 派生的 AEAD 密钥与 Header AAD 严格隔离；执行外部命令统一使用 shell: false 参数数组或严格单引号转义；orca-spawn 创建工作区必须显式指定层级策略（独立一级工作区传 --no-parent，子工作区传 --parent-worktree）；状态目录与控制 Socket 保持 0700/0600 权限与 runtime.lock 独占锁。
 
   - id: peq.test-case-quality
     severity: block

@@ -280,6 +280,17 @@ test('orca-spawn runs orca inside a path parent worktree when no cwd is configur
   assert.equal(request('list').cwd, undefined);
   assert.equal(request('create').cwd, undefined);
   assert.equal(flagValue(request('create').args, '--parent-worktree'), 'active');
+
+  requests.length = 0;
+  await executor.execute(
+    [envelope({ payload: { seaCreatureNaming: true, noParent: true, repoPath: missingParent } })],
+    context,
+    {},
+  );
+  assert.equal(request('list').cwd, missingParent);
+  assert.equal(request('create').cwd, missingParent);
+  assert.equal(request('create').args.includes('--no-parent'), true);
+  assert.equal(request('create').args.includes('--parent-worktree'), false);
 });
 
 test('sea-creature naming treats Orca worktree branches as taken', async t => {

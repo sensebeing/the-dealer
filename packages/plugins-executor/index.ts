@@ -115,6 +115,7 @@ export interface OrcaSpawnOptions extends AgentOptions {
   namePrefix?: string;
   orcaCommand?: string;
   parentWorktree?: string;
+  noParent?: boolean;
   seaCreatureNaming?: boolean;
   agySettingsPath?: string;
   interactiveCommand?: string;
@@ -289,16 +290,30 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const command = options.orcaCommand ?? 'orca';
       const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
-      const parentWorktree =
-        typeof payload.parentWorktree === 'string' && payload.parentWorktree
+      const explicitNoParent =
+        payload.noParent === true ||
+        payload.parentWorktree === 'none' ||
+        (payload.parentWorktree === undefined &&
+          (config.noParent === true || options.noParent === true));
+      const parentWorktree = explicitNoParent
+        ? undefined
+        : typeof payload.parentWorktree === 'string' && payload.parentWorktree
           ? payload.parentWorktree
           : (config.parentWorktree ??
             options.parentWorktree ??
             (options.cwd ? `path:${options.cwd}` : 'active'));
-      // Orca resolves --parent-worktree relative to the caller's repo, so run from the parent
-      // worktree whenever the plugin itself was not given an explicit cwd.
+      const repoPath =
+        typeof payload.repoPath === 'string' && payload.repoPath
+          ? payload.repoPath
+          : typeof payload.cwd === 'string' && payload.cwd
+            ? payload.cwd
+            : undefined;
+      // Orca resolves worktree creation relative to the caller's repo, so run from the repo or
+      // parent worktree path whenever the plugin itself was not given an explicit cwd.
       const worktreeCwd =
-        options.cwd ?? (parentWorktree.startsWith('path:') ? parentWorktree.slice(5) : undefined);
+        repoPath ??
+        options.cwd ??
+        (parentWorktree?.startsWith('path:') ? parentWorktree.slice(5) : undefined);
       const explicitName =
         typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
           ? payload.worktreeName.trim()
@@ -310,9 +325,12 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         : seaCreatureNaming
           ? await pickSeaCreatureName(runner, command, worktreeCwd, context.signal)
           : `${options.namePrefix ?? 'dealer'}-${randomUUID()}`;
+      const createArgs = parentWorktree
+        ? ['worktree', 'create', '--parent-worktree', parentWorktree, '--name', name, '--json']
+        : ['worktree', 'create', '--no-parent', '--name', name, '--json'];
       const created = await checkedCommand(runner, {
         command,
-        args: ['worktree', 'create', '--parent-worktree', parentWorktree, '--name', name, '--json'],
+        args: createArgs,
         cwd: worktreeCwd,
         signal: context.signal,
       });
