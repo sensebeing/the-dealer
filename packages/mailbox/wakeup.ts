@@ -77,9 +77,14 @@ export function buildTaskPreamble(
   mailboxId: string,
   messageId: string,
   leaseId?: string,
+  taskPrompt?: string,
 ): string {
+  const lead =
+    typeof taskPrompt === 'string' && taskPrompt.trim()
+      ? `${singleLine(taskPrompt)} — `
+      : '';
   return singleLine(
-    `Dealer Task dispatched to mailbox ${mailboxId} (Message ID: ${messageId}). Run \`dealer inbox check --mailbox ${mailboxId} --json\` to read the full spec & attachments. If blocked on decisions, run \`dealer ask --reply-to ${messageId} --mailbox ${mailboxId} --body "<question>"\` and end your turn. When finished, run \`dealer settle ${messageId} --outcome succeeded --summary "<result>" --ack ${leaseId ?? '<leaseId>'}\`.`,
+    `${lead}Dealer Task dispatched to mailbox ${mailboxId} (Message ID: ${messageId}). Run \`dealer inbox check --mailbox ${mailboxId} --json\` to read the full spec & attachments. If blocked on decisions, run \`dealer ask --reply-to ${messageId} --mailbox ${mailboxId} --body "<question>"\` and end your turn. When finished, run \`dealer settle ${messageId} --outcome succeeded --summary "<result>" --ack ${leaseId ?? '<leaseId>'}\`.`,
   );
 }
 
@@ -372,12 +377,18 @@ export class WakeupRedriveService {
       return undefined;
     }
     const taskMessageId = mailboxId.startsWith('task:') ? mailboxId.slice(5) : undefined;
+    const taskItem = taskMessageId ? preview.items.find(item => item.id === taskMessageId) : undefined;
     if (
       taskMessageId &&
       target.completedWaves === 0 &&
-      preview.items.some(item => item.id === taskMessageId)
+      taskItem
     ) {
-      return buildTaskPreamble(mailboxId, taskMessageId);
+      const rawPrompt =
+        typeof taskItem.envelope.payload?.terminalPrompt === 'string' &&
+        taskItem.envelope.payload.terminalPrompt.trim()
+          ? taskItem.envelope.payload.terminalPrompt
+          : (taskItem.envelope.body || taskItem.envelope.subject);
+      return buildTaskPreamble(mailboxId, taskMessageId, undefined, rawPrompt);
     }
     const latestHint = preview.items.at(-1)?.wakeupHint;
     return singleLine(

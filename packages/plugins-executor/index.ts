@@ -441,11 +441,15 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                 idle = false;
               }
               if (idle) {
+                const rawPrompt =
+                  typeof payload.terminalPrompt === 'string' && payload.terminalPrompt.trim()
+                    ? payload.terminalPrompt
+                    : (batch[0].body || batch[0].subject);
                 await sendOrcaTerminalText(
                   runner,
                   command,
                   handle,
-                  buildTaskPreamble(mailboxId, batch[0].id),
+                  buildTaskPreamble(mailboxId, batch[0].id, undefined, rawPrompt),
                   { cwd: path, signal: context.signal, waitSubmit: 5 },
                 );
                 store.upsertWakeTarget(mailboxId, {

@@ -397,7 +397,7 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
   const preamble = textOf(preambleSends[0]);
   assert.match(
     preamble,
-    /^Dealer Task dispatched to mailbox task:task-timeout \(Message ID: task-timeout\)\./,
+    /^alert body — Dealer Task dispatched to mailbox task:task-timeout \(Message ID: task-timeout\)\./,
   );
   assert.equal(/[\r\n]/.test(preamble), false);
   assert.ok(preamble.includes('dealer ask --reply-to task-timeout'));
@@ -412,9 +412,38 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
   assert.equal(directSends.length, 1);
   assert.match(
     textOf(directSends[0]),
-    /^Dealer Task dispatched to mailbox task:task-ready \(Message ID: task-ready\)\./,
+    /^alert body — Dealer Task dispatched to mailbox task:task-ready \(Message ID: task-ready\)\./,
   );
   assert.equal(store.getWakeTarget('task:task-ready')!.pendingWake, false);
+
+  const promptCases = [
+    { terminalPrompt: '  Custom\n task\r\n prompt  ', body: 'Body', subject: 'Subject', lead: 'Custom task prompt' },
+    { terminalPrompt: ' \n ', body: '  Body\n details  ', subject: 'Subject', lead: 'Body details' },
+    { terminalPrompt: 42, body: '', subject: '  Subject\n fallback ', lead: 'Subject fallback' },
+    { terminalPrompt: undefined, body: '', subject: '', lead: '' },
+  ];
+  for (const [index, promptCase] of promptCases.entries()) {
+    for (const direct of [false, true]) {
+      calls.length = 0;
+      waitOk = direct;
+      const message = alert(`prompt-${index}-${direct}`, {
+        body: promptCase.body,
+        subject: promptCase.subject,
+        payload: { interactive: true, terminalPrompt: promptCase.terminalPrompt },
+      });
+      await executor.execute([message], {} as ExecutionContext);
+      if (!direct) {
+        assert.equal(terminalSends(calls).length, 0);
+        await service.flushMailbox(`task:${message.id}`);
+      }
+      const sends = terminalSends(calls);
+      assert.equal(sends.length, 1);
+      const text = textOf(sends[0]);
+      const prefix = promptCase.lead ? `${promptCase.lead} — ` : '';
+      assert.ok(text.startsWith(`${prefix}Dealer Task dispatched to mailbox task:${message.id}`));
+      assert.equal(/[\r\n]/.test(text), false);
+    }
+  }
 });
 
 test('single-machine loopback send -> ask -> reply -> settle keeps both thread legs', async t => {

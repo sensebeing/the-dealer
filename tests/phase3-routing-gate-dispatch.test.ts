@@ -466,8 +466,9 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
   assert.equal(flagValue(requests[4].args, '--terminal'), 'term-agy');
   assert.equal(
     flagValue(requests[4].args, '--text'),
-    buildTaskPreamble(`task:${first.id}`, first.id),
+    buildTaskPreamble(`task:${first.id}`, first.id, undefined, first.body || first.subject),
   );
+  assert.ok(flagValue(requests[4].args, '--text').startsWith('Details — Dealer Task dispatched to mailbox '));
   assert.ok(requests[4].args.includes('--enter'));
   assert.equal(flagValue(requests[4].args, '--wait-submit'), '5');
   const trusted = JSON.parse(await readFile(settingsPath, 'utf8')).trustedWorkspaces;
@@ -540,8 +541,9 @@ test('orca-spawn payload.interactive selects the mailbox TUI path', async t => {
   assert.equal(queued.length, 1);
   assert.deepEqual(queued[0].envelope, message);
   const sent = requests.find(r => r.args[0] === 'terminal' && r.args[1] === 'send')!;
-  const preamble = buildTaskPreamble(mailboxId, message.id);
+  const preamble = buildTaskPreamble(mailboxId, message.id, undefined, message.body || message.subject);
   assert.equal(flagValue(sent.args, '--text'), preamble);
+  assert.ok(preamble.startsWith('Details — Dealer Task dispatched to mailbox '));
   assert.equal(/[\r\n]/.test(preamble), false);
   assert.equal(store.getWakeTarget(mailboxId)!.pendingWake, false);
 
