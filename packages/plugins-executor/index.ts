@@ -1,4 +1,4 @@
-import { buildAgentHostInvocation } from '../agent-host/index.ts';
+import { buildAgentHostInvocation, resolveAgentSessionId } from '../agent-host/index.ts';
 import type { SupportedAgentHost } from '../agent-host/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -14,7 +14,7 @@ import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
 import { resolveMailboxId } from '../mailbox/index.ts';
 import { MailboxStore } from '../mailbox/index.ts';
-import { buildTaskPreamble } from '../mailbox/index.ts';
+import { buildTaskPreamble, buildWakeupPointer, maxPreviewSequence } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
@@ -92,6 +92,8 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
       let request;
       let mailboxId: string | undefined;
+      let deliveredSequence = -1;
+      let effectiveSessionId: string | undefined;
       const store = options.store ?? config.store;
       let claim: ReturnType<WakeupRedriveService['claim']> | undefined;
       try {
@@ -104,19 +106,16 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           const conversationMode = mode ?? 'spawn';
           mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
           const terminalPrompt = optionalString(typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined);
-          const promptText = store
-            ? conversationMode === 'spawn'
-              ? buildTaskPreamble(mailboxId, first.id, undefined, terminalPrompt ?? (first.body || first.subject))
-              : singleLine(`You have ${batch.length} Dealer message(s) in ${mailboxId}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`)
-            : singleLine(terminalPrompt ?? renderWave(batch));
+          let promptText = singleLine(terminalPrompt ?? renderWave(batch));
           const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
           const command = config.command ?? options.command;
           const agentProfile = payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile;
           const targetBot = payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot;
           const sessionId = payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId;
-          const invocation = buildAgentHostInvocation({
+          effectiveSessionId = resolveAgentSessionId(mailboxId, sessionId);
+          let invocation = buildAgentHostInvocation({
             agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
-            command, agentProfile, targetBot, sessionId,
+            command, agentProfile, targetBot, sessionId: effectiveSessionId,
           });
           if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || options.commandRunner === undefined)) {
             trustAntigravityWorkspace(cwd, agySettingsPath);
@@ -128,13 +127,24 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
             ...(command ? { interactiveCommand: command } : {}),
             ...(agentProfile ? { agentProfile } : {}),
             ...(targetBot ? { targetBot } : {}),
-            ...(sessionId ? { sessionId } : {}),
+            sessionId: effectiveSessionId,
           } });
+          if (store) {
+            const preview = store.check({ mailboxId, peek: true });
+            deliveredSequence = maxPreviewSequence(preview);
+            const target = store.getWakeTarget(mailboxId)!;
+            promptText = buildWakeupPointer(mailboxId, target, preview) ?? '';
+            if (!promptText) throw new Error(`No pending Dealer messages in ${mailboxId}`);
+            invocation = buildAgentHostInvocation({
+              agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
+              command, agentProfile, targetBot, sessionId: effectiveSessionId,
+            });
+          }
           request = { ...invocation, cwd };
         }
         const output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
-        if (store && mailboxId) store.upsertWakeTarget(mailboxId, {
-          pendingWake: false, attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined,
+        if (store && mailboxId) store.completeWakeDelivery(mailboxId, deliveredSequence, {
+          conversationMode: 'fixed', sessionId: effectiveSessionId,
         });
         let structuredOutput: unknown;
         try {
@@ -536,6 +546,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                     : {}),
                 },
               });
+              const deliveredSequence = maxPreviewSequence(store.check({ mailboxId, peek: true }));
               let idle = false;
               try {
                 const waited = await checkedCommand(runner, {
@@ -570,12 +581,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                   buildTaskPreamble(mailboxId, batch[0].id, undefined, rawPrompt),
                   { cwd: path, signal: context.signal, waitSubmit: 5 },
                 );
-                store.upsertWakeTarget(mailboxId, {
-                  pendingWake: false,
-                  attemptCount: 0,
-                  earliestWakeAt: 0,
-                  lastWakeError: undefined,
-                });
+                store.completeWakeDelivery(mailboxId, deliveredSequence);
               } else {
                 // Never inject into a busy or unverifiable terminal; the redrive service will.
                 store.upsertWakeTarget(mailboxId, { pendingWake: true });

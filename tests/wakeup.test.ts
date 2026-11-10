@@ -217,7 +217,7 @@ test('unacked recovery pointer suppresses rotation, and /new follows the ack', a
   const dual = terminalSends(calls).at(-1)!;
   assert.match(
     textOf(dual),
-    new RegExp(`^Unacknowledged Dealer batch ${lease.deliveryId} \\+ 1 newer message\\(s\\) in stream:alerts\\.`),
+    new RegExp(`^Unacknowledged Dealer batch ${lease.deliveryId} \\+ 1 newer message\\(s\\) in stream:alerts \\[`),
   );
   assert.equal(calls.some(call => call.args.includes('/new')), false);
 
@@ -391,8 +391,9 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
   assert.equal(store.getWakeTarget('task:task-timeout')!.pendingWake, true);
   assert.equal(store.list({ mailboxId: 'task:task-timeout' }).queuedCount, 1);
 
+  await until(() => store.getWakeTarget('task:task-timeout')!.attemptCount > 0, 'claim release probes busy target');
   idle = true;
-  await service.flushMailbox('task:task-timeout');
+  await service.flushMailbox('task:task-timeout', { force: true });
   const preambleSends = terminalSends(calls);
   assert.equal(preambleSends.length, 1);
   const preamble = textOf(preambleSends[0]);
@@ -943,4 +944,74 @@ test('only newly inserted conversational frames bypass coalescing and never rese
   t.after(() => wakeup.stop());
   assert.equal((await wakeup.flushReady()).filter(result => result.woke).length, 3);
   assert.equal(calls.length, 3);
+});
+
+test('outstanding lease exposes a cloned latest queued reply in both check and peek', t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.enqueue([alert('task')], { mailboxId: 'box' });
+  const lease = store.check({ mailboxId: 'box' });
+  store.enqueue([alert('reply', { body: 'The answer', semantic: { type: 'reply', threadId: 'task' } })], { mailboxId: 'box' });
+  for (const peek of [false, true]) {
+    const preview = store.check({ mailboxId: 'box', peek });
+    assert.equal(preview.deliveryId, lease.deliveryId);
+    assert.deepEqual(preview.items.map(item => item.id), ['task']);
+    assert.equal(preview.newerQueuedCount, 1);
+    assert.equal(preview.latestQueued?.id, 'reply');
+    preview.latestQueued!.envelope.body = 'mutated';
+    assert.equal(store.check({ mailboxId: 'box', peek: true }).latestQueued!.envelope.body, 'The answer');
+  }
+});
+
+for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
+  test(`${mode} wake delivery redrives newer sequences immediately after its in-flight command`, async t => {
+    const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+    const mailboxId = 'box';
+    store.enqueue([alert('old')], { mailboxId });
+    store.check({ mailboxId });
+    store.enqueue([alert('first', { semantic: { type: 'reply', threadId: 'old' } })], { mailboxId,
+      wakeTarget: { mode, ...(mode === 'passive' ? { hostAgent: 'claude-code', conversationMode: 'spawn' } : {}), runId: 'run', terminalHandle: 'term' } });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const pointers: string[] = [];
+    const service = new WakeupRedriveService({ store, flushIntervalMs: 100_000, idleCheck: async () => ({ idle: true }), commandRunner: async call => {
+      if (mode !== 'orca-terminal' || call.args[1] === 'send') {
+        pointers.push(mode === 'passive' ? call.args.at(-1)! : mode === 'orca-run' ? bodyOf(call) : textOf(call));
+        if (pointers.length === 1) await held;
+      }
+      return { stdout: '{"ok":true}' };
+    } });
+    t.after(() => service.stop());
+    const first = service.flushMailbox(mailboxId);
+    await until(() => pointers.length === 1, 'first command starts');
+    store.enqueue([alert('second', { body: 'Second reply', semantic: { type: 'reply', threadId: 'old' } })], { mailboxId });
+    release();
+    await first;
+    await until(() => pointers.length === 2 && !store.getWakeTarget(mailboxId)!.pendingWake, 'new message redrives without timer');
+    assert.match(pointers[0], /Latest \(reply from sender, thread old\)/);
+    assert.match(pointers[1], /Second reply/);
+    if (mode === 'passive') {
+      assert.equal(store.getWakeTarget(mailboxId)?.conversationMode, 'fixed');
+      assert.equal(store.getWakeTarget(mailboxId)?.sessionId, 'box');
+    }
+  });
+}
+
+test('sequence settlement remains finite when wall clock order differs from arrival order', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 20_000 });
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.enqueue([alert('leased')], { mailboxId: 'box' });
+  store.check({ mailboxId: 'box' });
+  store.enqueue([alert('later-clock')], { mailboxId: 'box', wakeTarget: { mode: 'passive', hostAgent: 'codex' } });
+  t.mock.timers.setTime(10_000);
+  store.enqueue([alert('later-sequence')], { mailboxId: 'box' });
+  assert.equal(store.check({ mailboxId: 'box', peek: true }).latestQueued?.id, 'later-clock');
+  let calls = 0;
+  const wakeup = new WakeupRedriveService({ store, commandRunner: async () => {
+    calls++;
+    return { stdout: '{}' };
+  } });
+  t.after(() => wakeup.stop());
+  await wakeup.flushMailbox('box', { force: true });
+  assert.equal(calls, 1);
+  assert.equal(store.getWakeTarget('box')?.pendingWake, false);
 });

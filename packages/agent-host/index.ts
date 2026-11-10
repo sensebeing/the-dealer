@@ -1,6 +1,11 @@
 export type SupportedAgentHost = 'orca' | 'antigravity' | 'claude' | 'claude-code' | 'codex' | 'chatgpt-dot' | 'grok-bot';
 export type AgentConversationMode = 'spawn' | 'fixed' | 'inbox-only';
 
+export function resolveAgentSessionId(mailboxId: string, sessionId?: string): string {
+  const raw = sessionId?.trim() ? sessionId.trim() : mailboxId;
+  return raw.replace(/[^A-Za-z0-9._-]/g, '-');
+}
+
 export function buildAgentHostInvocation(options: {
   agent: SupportedAgentHost;
   conversationMode: 'spawn' | 'fixed';
@@ -13,7 +18,7 @@ export function buildAgentHostInvocation(options: {
   sessionId?: string;
 }): { command: string; args: string[] } {
   const { agent, conversationMode: mode, mailboxId, promptText, cwd, agentProfile, targetBot, sessionId } = options;
-  const session = sessionId || mailboxId;
+  const session = resolveAgentSessionId(mailboxId, sessionId);
   switch (agent) {
     case 'codex':
       return { command: options.command ?? 'codex', args: [
@@ -25,7 +30,7 @@ export function buildAgentHostInvocation(options: {
     case 'claude':
     case 'claude-code':
       return { command: options.command ?? 'claude', args: [
-        '--bg', ...(mode === 'fixed' ? ['--resume', session] : ['--name', mailboxId.replace(/[^A-Za-z0-9._-]/g, '-')]),
+        '--bg', ...(mode === 'fixed' ? ['--resume', session] : ['--name', session]),
         ...(agentProfile ? ['--agent', agentProfile] : []), promptText,
       ] };
     case 'antigravity':

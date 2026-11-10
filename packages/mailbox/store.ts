@@ -170,6 +170,9 @@ export interface MailboxCheckResult {
   deliveryId: string | null;
   redelivered: boolean;
   newerQueuedCount: number;
+  latestQueued?: MailboxItem;
+  /** Sequence witness is independent of receivedAt ordering (including clock rollback). */
+  maxQueuedSequence?: number;
   items: MailboxItem[];
 }
 
@@ -1123,6 +1126,9 @@ export class MailboxStore {
     return this.mutate(state => {
       const record = state.mailboxes[mailboxId];
       if (record?.outstanding) {
+        const queued = state.items
+          .filter(item => item.mailboxId === mailboxId && item.status === 'queued')
+          .sort(compareOldestFirst);
         const lease: DeliveryLease = {
           ...record.outstanding,
           wakeCount: record.outstanding.wakeCount + 1,
@@ -1140,9 +1146,9 @@ export class MailboxStore {
           mailboxId,
           deliveryId: lease.leaseId,
           redelivered: true,
-          newerQueuedCount: state.items.filter(
-            item => item.mailboxId === mailboxId && item.status === 'queued',
-          ).length,
+          newerQueuedCount: queued.length,
+          maxQueuedSequence: queued.reduce((max, item) => Math.max(max, item.sequence), -1),
+          ...(queued.length ? { latestQueued: cloneItem(queued.at(-1)!) } : {}),
           items: items.map(cloneItem),
         };
       }
@@ -1203,13 +1209,16 @@ export class MailboxStore {
     const state = this.read();
     const record = state.mailboxes[mailboxId];
     if (record?.outstanding) {
+      const queued = state.items
+        .filter(item => item.mailboxId === mailboxId && item.status === 'queued')
+        .sort(compareOldestFirst);
       return {
         mailboxId,
         deliveryId: record.outstanding.leaseId,
         redelivered: true,
-        newerQueuedCount: state.items.filter(
-          item => item.mailboxId === mailboxId && item.status === 'queued',
-        ).length,
+        newerQueuedCount: queued.length,
+        maxQueuedSequence: queued.reduce((max, item) => Math.max(max, item.sequence), -1),
+        ...(queued.length ? { latestQueued: cloneItem(queued.at(-1)!) } : {}),
         items: state.items
           .filter(
             item =>
@@ -1470,6 +1479,29 @@ export class MailboxStore {
       this.events.emit('target', id);
     }
     return merged;
+  }
+
+  /** Settle only the observed wave; messages arriving during delivery retain their wake. */
+  completeWakeDelivery(
+    mailboxId: string,
+    deliveredSequence: number,
+    patch: Partial<WakeTargetState> = {},
+  ): WakeTargetState {
+    const id = normalizeMailboxId(mailboxId);
+    const completed = this.mutate(state => {
+      const pendingWake = state.items.some(item =>
+        item.mailboxId === id && item.status === 'queued' && item.sequence > deliveredSequence,
+      );
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const next = validateWakeTarget(mergeWakeTarget(current, {
+        ...patch, pendingWake, attemptCount: 0,
+        earliestWakeAt: pendingWake ? Date.now() : 0, lastWakeError: undefined,
+      }));
+      state.wakeTargets[id] = next;
+      return structuredClone(next);
+    });
+    if (completed.pendingWake) this.events.emit('target', id);
+    return completed;
   }
 
   getWakeTarget(mailboxId: string): WakeTargetState | undefined {

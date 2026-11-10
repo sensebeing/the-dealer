@@ -1,3 +1,4 @@
+import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/agent-host/index.ts';
 import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -113,6 +114,9 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
         assert.ok(prompt.startsWith('Perform task then report — Dealer Task dispatched to mailbox task:test'));
         assert.ok(!prompt.includes('Payload:'));
       }
+      assert.equal(store.getWakeTarget(mailboxId)?.conversationMode, 'fixed');
+      assert.equal(store.getWakeTarget(mailboxId)?.sessionId, 'session');
+      if (conversationMode === 'fixed') assert.match(prompt, /Latest .*Perform task then report/);
       assert.equal(call.cwd, root);
       if (agent === 'codex') {
         assert.equal(call.command, 'codex');
@@ -120,7 +124,7 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
         assert.ok(args.includes('-p'));
       } else if (agent === 'claude-code') {
         assert.equal(call.command, 'claude');
-        assert.deepEqual(args.slice(0, 3), conversationMode === 'spawn' ? ['--bg', '--name', 'task-test'] : ['--bg', '--resume', 'session']);
+        assert.deepEqual(args.slice(0, 3), conversationMode === 'spawn' ? ['--bg', '--name', 'session'] : ['--bg', '--resume', 'session']);
       } else if (agent === 'antigravity') {
         assert.equal(call.command, 'agy');
         assert.deepEqual(args.slice(0, 2), ['run', '--dangerously-skip-permissions']);
@@ -616,5 +620,104 @@ test('host-bound passive mailboxes redrive inbox conversation frames after initi
     assert.equal(store.getWakeTarget('stream:session')?.attemptCount, 1);
     assert.match(store.getWakeTarget('stream:session')!.lastWakeError!, /exited 2/);
     await wakeup.stop();
+  }
+});
+
+for (const agent of ['codex', 'claude-code'] as const) {
+  test(`${agent} spawn transitions to fixed and resumes a leased task with reply preview`, async t => {
+    const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+    const calls: CommandRequest[] = [];
+    const runner: CommandRunner = async call => {
+      calls.push(call);
+      return { stdout: '{}' };
+    };
+    const wakeup = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+    t.after(() => wakeup.stop());
+    await createAgentPtyExecutorPlugin({ store, wakeup, agent, conversationMode: 'spawn', commandRunner: runner })
+      .execute([message('msg-1')], context, {});
+    const mailboxId = 'task:msg-1';
+    assert.deepEqual(calls[0].args.slice(0, agent === 'codex' ? 2 : 3),
+      agent === 'codex' ? ['exec', '--worktree'] : ['--bg', '--name', 'task-msg-1']);
+    assert.equal(store.getWakeTarget(mailboxId)?.conversationMode, 'fixed');
+    assert.equal(store.getWakeTarget(mailboxId)?.sessionId, 'task-msg-1');
+    store.check({ mailboxId });
+    const reply = { ...message('reply', { mailboxId, wakeupHint: 'Answer ready' }),
+      body: 'Use the smaller design', semantic: { type: 'reply' as const, threadId: 'msg-1', targetMailbox: mailboxId } };
+    await createInboxExecutorPlugin({ store }).execute([reply], context, {});
+    await wakeup.flushMailbox(mailboxId);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1].args.slice(0, agent === 'codex' ? 4 : 3),
+      agent === 'codex' ? ['queue', '--thread', 'task-msg-1', '--resume'] : ['--bg', '--resume', 'task-msg-1']);
+    assert.match(calls[1].args.at(-1)!, /\[Answer ready\].*Latest \(reply from alice, thread msg-1\): "Use the smaller design"/);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
+  });
+}
+
+test('agent executor preserves an in-flight arrival and releases its claim for immediate fixed redrive', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let redriven!: () => void;
+  const second = new Promise<void>(resolve => { redriven = resolve; });
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async call => {
+    calls.push(call);
+    if (calls.length === 1) { entered(); await held; }
+    else redriven();
+    return { stdout: '{}' };
+  };
+  const wakeup = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+  t.after(() => wakeup.stop());
+  const executing = createCodexExecutorPlugin({ store, wakeup, commandRunner: runner }).execute([message('race')], context, {});
+  await started;
+  const mailboxId = 'task:race';
+  store.check({ mailboxId });
+  store.enqueue([{ ...message('new'), body: 'New instruction', semantic: { type: 'reply', threadId: 'race' } }], { mailboxId });
+  release();
+  await executing;
+  await Promise.race([second, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('No immediate redrive')), 2000); timer.unref(); })]);
+  await wakeup.flushMailbox(mailboxId);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].args.slice(0, 4), ['queue', '--thread', 'task-race', '--resume']);
+  assert.match(calls[1].args.at(-1)!, /New instruction/);
+  assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
+});
+
+test('failed initial host launch stays spawn across restart until a successful redrive', async t => {
+  const file = join(directory(t), 'mailbox.json');
+  const store = new MailboxStore(file);
+  await assert.rejects(createClaudeCodeExecutorPlugin({ store, commandRunner: async () => {
+    throw new Error('launch failed');
+  } }).execute([message('recover')], context, {}), /launch failed/);
+  assert.equal(store.getWakeTarget('task:recover')?.conversationMode, 'spawn');
+  assert.equal(store.getWakeTarget('task:recover')?.pendingWake, true);
+  const restarted = new MailboxStore(file);
+  const calls: CommandRequest[] = [];
+  const wakeup = new WakeupRedriveService({ store: restarted, commandRunner: async call => {
+    calls.push(call);
+    return { stdout: '{}' };
+  } });
+  t.after(() => wakeup.stop());
+  await wakeup.flushMailbox('task:recover');
+  assert.deepEqual(calls[0].args.slice(0, 3), ['--bg', '--name', 'task-recover']);
+  assert.equal(restarted.getWakeTarget('task:recover')?.conversationMode, 'fixed');
+  assert.equal(restarted.getWakeTarget('task:recover')?.pendingWake, false);
+});
+
+
+test('host session keys normalize identically for spawn and fixed and preserve valid explicit identifiers', () => {
+  for (const sessionId of [undefined, '   ', '  explicit._-key  ', 'key:with/slash']) {
+    const expected = sessionId?.trim() ? sessionId.trim().replace(/[^A-Za-z0-9._-]/g, '-') : 'task-msg-1';
+    assert.equal(resolveAgentSessionId('task:msg-1', sessionId), expected);
+    for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot'] as const) {
+      for (const conversationMode of ['spawn', 'fixed'] as const) {
+        const { args } = buildAgentHostInvocation({ agent, conversationMode, mailboxId: 'task:msg-1', sessionId, promptText: 'hello', targetBot: 'bot' });
+        if (agent === 'codex' && conversationMode === 'spawn') continue;
+        const flag = agent === 'codex' ? '--thread' : agent === 'claude-code' ? (conversationMode === 'spawn' ? '--name' : '--resume') : '--session-key';
+        assert.equal(args[args.indexOf(flag) + 1], expected);
+      }
+    }
   }
 });

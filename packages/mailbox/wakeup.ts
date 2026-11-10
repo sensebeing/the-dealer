@@ -1,4 +1,4 @@
-import { buildAgentHostInvocation } from '../agent-host/index.ts';
+import { buildAgentHostInvocation, resolveAgentSessionId } from '../agent-host/index.ts';
 import {
   checkedCommand,
   checkOrcaWorkspaceIdle,
@@ -15,6 +15,7 @@ import type { CommandRunner, OrcaIdleResult } from '../orca-workspace/index.ts';
 import type { Disposable } from '../core-types/index.ts';
 import type {
   MailboxCheckResult,
+  MailboxItem,
   MailboxStore,
   WakeTargetMode,
   WakeTargetState,
@@ -55,6 +56,71 @@ const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
 const MAX_BACKOFF_MS = 10_000;
 const MAX_INLINE_BODY_CHARS = 400;
+
+export function maxPreviewSequence(preview: MailboxCheckResult): number {
+  return preview.items.reduce((max, item) => Math.max(max, item.sequence),
+    Math.max(preview.maxQueuedSequence ?? -1, preview.latestQueued?.sequence ?? -1));
+}
+
+function formatInlinePreview(item: MailboxItem | undefined): string {
+  if (!item) return '';
+  const latest = item.envelope;
+  const rawBody = singleLine(latest.body);
+  if (!rawBody) return '';
+  const kindLabel = latest.semantic?.type && latest.semantic.type !== 'message' ? latest.semantic.type : latest.kind;
+  const fromLabel = latest.from?.member || latest.from?.nodeId || 'peer';
+  const threadId = latest.semantic?.threadId ?? latest.id;
+  const snippet = rawBody.length > MAX_INLINE_BODY_CHARS ? `${rawBody.slice(0, MAX_INLINE_BODY_CHARS)}...` : rawBody;
+  return ` — Latest (${kindLabel} from ${fromLabel}, thread ${threadId}): "${snippet}"`;
+}
+
+export function buildWakeupPointer(
+  mailboxId: string,
+  target: Pick<WakeTargetState, 'completedWaves' | 'wakeupPrefix'>,
+  preview: MailboxCheckResult,
+): string | undefined {
+  const body = buildPointerBody(mailboxId, target, preview);
+  return body && target.wakeupPrefix?.trim() ? `${singleLine(target.wakeupPrefix)} ${body}` : body;
+}
+
+function buildPointerBody(
+  mailboxId: string,
+  target: Pick<WakeTargetState, 'completedWaves' | 'wakeupPrefix'>,
+  preview: MailboxCheckResult,
+): string | undefined {
+  if (preview.deliveryId) {
+    if (preview.newerQueuedCount === 0) {
+      return undefined;
+    }
+    const latestHint = preview.latestQueued?.wakeupHint;
+    const inline = formatInlinePreview(preview.latestQueued);
+    return singleLine(
+      `Unacknowledged Dealer batch ${preview.deliveryId} + ${preview.newerQueuedCount} newer message(s) in ${mailboxId}${latestHint ? ` [${latestHint}]` : ''}${inline}. Run \`dealer inbox check --mailbox ${mailboxId} --json\` to resume, or add \`--ack ${preview.deliveryId}\` if already handled.`,
+    );
+  }
+  if (preview.items.length === 0) {
+    return undefined;
+  }
+  const taskMessageId = mailboxId.startsWith('task:') ? mailboxId.slice(5) : undefined;
+  const taskItem = taskMessageId ? preview.items.find(item => item.id === taskMessageId) : undefined;
+  if (
+    taskMessageId &&
+    target.completedWaves === 0 &&
+    taskItem
+  ) {
+    const rawPrompt =
+      typeof taskItem.envelope.payload?.terminalPrompt === 'string' &&
+      taskItem.envelope.payload.terminalPrompt.trim()
+        ? taskItem.envelope.payload.terminalPrompt
+        : (taskItem.envelope.body || taskItem.envelope.subject);
+    return buildTaskPreamble(mailboxId, taskMessageId, undefined, rawPrompt);
+  }
+  const latestHint = preview.items.at(-1)?.wakeupHint;
+  const inline = formatInlinePreview(preview.items.at(-1));
+  return singleLine(
+    `You have ${preview.items.length} Dealer message(s) in ${mailboxId}${latestHint ? ` [${latestHint}]` : ''}${inline}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`,
+  );
+}
 
 /** Exponential busy-backoff: 1s -> 2s -> 5s -> capped at 10s. */
 export function wakeupBackoffDelay(attemptCount: number): number {
@@ -156,6 +222,7 @@ export class WakeupRedriveService {
         const remaining = (this.claims.get(id) ?? 1) - 1;
         if (remaining <= 0) {
           this.claims.delete(id);
+          this.notifyMailbox(id);
         } else {
           this.claims.set(id, remaining);
         }
@@ -190,13 +257,21 @@ export class WakeupRedriveService {
     if (this.stopped) {
       return Promise.resolve(noWake(id, 'passive', 'Wakeup service stopped'));
     }
+    if (this.claims.has(id)) {
+      return Promise.resolve(noWake(id, this.store.getWakeTarget(id)?.mode ?? 'passive', 'Wakeup suppressed by an active claim'));
+    }
     const ongoing = this.inFlight.get(id);
     if (ongoing) {
       return ongoing;
     }
-    const operation = this.flushInternal(id, options.force === true).finally(() => {
+    let delivered = false;
+    const operation = this.flushInternal(id, options.force === true).then(result => {
+      delivered = result.woke;
+      return result;
+    }).finally(() => {
       if (this.inFlight.get(id) === operation) {
         this.inFlight.delete(id);
+        if (delivered) this.notifyMailbox(id);
       }
     });
     this.inFlight.set(id, operation);
@@ -248,9 +323,6 @@ export class WakeupRedriveService {
       if (!target.pendingWake) {
         return noWake(mailboxId, target.mode, 'No pending wake');
       }
-      if (this.claims.has(mailboxId)) {
-        return noWake(mailboxId, target.mode, 'Wakeup suppressed by an active claim');
-      }
       if (!force && target.earliestWakeAt > this.now()) {
         return noWake(mailboxId, target.mode, 'Coalescing');
       }
@@ -285,7 +357,7 @@ export class WakeupRedriveService {
         );
       }
       if (target.mode === 'passive' && target.hostAgent) {
-        const pointer = this.buildPointer(mailboxId, target, preview)!;
+        const pointer = buildWakeupPointer(mailboxId, target, preview)!;
         const invocation = buildAgentHostInvocation({
           agent: target.hostAgent,
           conversationMode: target.conversationMode ?? 'fixed',
@@ -294,8 +366,8 @@ export class WakeupRedriveService {
           targetBot: target.targetBot, sessionId: target.sessionId,
         });
         await checkedCommand(this.runner, { ...invocation, cwd: target.workspacePath });
-        this.store.upsertWakeTarget(mailboxId, {
-          pendingWake: false, attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined,
+        this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
+          conversationMode: 'fixed', sessionId: resolveAgentSessionId(mailboxId, target.sessionId),
         });
         return { mailboxId, mode: target.mode, woke: true, pointer, reason: 'Agent host wakeup delivered' };
       }
@@ -371,57 +443,6 @@ export class WakeupRedriveService {
       lastWakeError: reason,
     });
     return noWake(mailboxId, target.mode, reason);
-  }
-
-  private buildPointer(mailboxId: string, target: WakeTargetState, preview: MailboxCheckResult): string | undefined {
-    const body = this.buildPointerBody(mailboxId, target, preview);
-    return body && target.wakeupPrefix?.trim() ? `${singleLine(target.wakeupPrefix)} ${body}` : body;
-  }
-
-  private buildPointerBody(
-    mailboxId: string,
-    target: WakeTargetState,
-    preview: MailboxCheckResult,
-  ): string | undefined {
-    if (preview.deliveryId) {
-      if (preview.newerQueuedCount === 0) {
-        return undefined;
-      }
-      return singleLine(
-        `Unacknowledged Dealer batch ${preview.deliveryId} + ${preview.newerQueuedCount} newer message(s) in ${mailboxId}. Run \`dealer inbox check --mailbox ${mailboxId} --json\` to resume, or add \`--ack ${preview.deliveryId}\` if already handled.`,
-      );
-    }
-    if (preview.items.length === 0) {
-      return undefined;
-    }
-    const taskMessageId = mailboxId.startsWith('task:') ? mailboxId.slice(5) : undefined;
-    const taskItem = taskMessageId ? preview.items.find(item => item.id === taskMessageId) : undefined;
-    if (
-      taskMessageId &&
-      target.completedWaves === 0 &&
-      taskItem
-    ) {
-      const rawPrompt =
-        typeof taskItem.envelope.payload?.terminalPrompt === 'string' &&
-        taskItem.envelope.payload.terminalPrompt.trim()
-          ? taskItem.envelope.payload.terminalPrompt
-          : (taskItem.envelope.body || taskItem.envelope.subject);
-      return buildTaskPreamble(mailboxId, taskMessageId, undefined, rawPrompt);
-    }
-    const latestHint = preview.items.at(-1)?.wakeupHint;
-    const latest = preview.items.at(-1)?.envelope;
-    const rawBody = latest ? singleLine(latest.body) : '';
-    let inline = '';
-    if (latest && rawBody) {
-      const kindLabel = latest.semantic?.type && latest.semantic.type !== 'message' ? latest.semantic.type : latest.kind;
-      const fromLabel = latest.from?.member || latest.from?.nodeId || 'peer';
-      const threadId = latest.semantic?.threadId ?? latest.id;
-      const snippet = rawBody.length > MAX_INLINE_BODY_CHARS ? `${rawBody.slice(0, MAX_INLINE_BODY_CHARS)}...` : rawBody;
-      inline = ` — Latest (${kindLabel} from ${fromLabel}, thread ${threadId}): "${snippet}"`;
-    }
-    return singleLine(
-      `You have ${preview.items.length} Dealer message(s) in ${mailboxId}${latestHint ? ` [${latestHint}]` : ''}${inline}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`,
-    );
   }
 
   private async postRotationIdle(
@@ -501,14 +522,9 @@ export class WakeupRedriveService {
       }
     }
 
-    const pointer = this.buildPointer(mailboxId, target, preview);
+    const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) {
-      this.store.upsertWakeTarget(mailboxId, {
-        pendingWake: false,
-        attemptCount: 0,
-        earliestWakeAt: 0,
-        lastWakeError: undefined,
-      });
+      this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview));
       return noWake(mailboxId, target.mode, 'Nothing new to deliver');
     }
 
@@ -569,12 +585,7 @@ export class WakeupRedriveService {
       }
     }
 
-    this.store.upsertWakeTarget(mailboxId, {
-      pendingWake: false,
-      attemptCount: 0,
-      earliestWakeAt: 0,
-      lastWakeError: undefined,
-    });
+    this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview));
     return {
       mailboxId,
       mode: target.mode,
