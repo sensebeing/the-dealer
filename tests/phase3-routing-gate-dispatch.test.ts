@@ -17,7 +17,7 @@ import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
-import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace } from '../packages/plugins-executor/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL } from '../packages/plugins-executor/index.ts';
 import { checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/orca-workspace/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
@@ -1289,4 +1289,94 @@ test('DND legacy loading, revision admission and signature CAS preserve newer ob
   const clone = gate.listDndQueue()[0];
   clone.envelope.body = 'mutated snapshot';
   assert.deepEqual(gate.listDndQueue()[0].envelope, newest);
+});
+
+function cleanedWorktreeRunner(names: string[], resolvedName?: string): CommandRunner {
+  return async request => {
+    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
+    }
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      const name = request.args[request.args.indexOf('--name') + 1];
+      names.push(name);
+      return { stdout: JSON.stringify({ ok: true, result: { path: `/retired/${resolvedName ?? name}` } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+}
+
+const spawnContext = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
+
+test('sea-creature names remain issued after worktree cleanup, including resolved paths', async () => {
+  const names: string[] = [];
+  const executor = createOrcaSpawnExecutorPlugin({
+    commandRunner: cleanedWorktreeRunner(names, 'seahorse'), command: 'codex', seaCreatureNaming: true,
+  });
+  await executor.execute([envelope()], spawnContext, {});
+  await executor.execute([envelope()], spawnContext, {});
+  assert.deepEqual(names, ['nautilus', 'starfish']);
+});
+
+test('sea-creature naming skips each durable workspace history source after restart', async t => {
+  for (const source of ['wakeTargets', 'retiredWorkspacePaths', 'deliveries', 'trustedWorkspaces']) {
+    await t.test(source, async t => {
+      const dir = await mkdtemp(join(tmpdir(), 'dealer-retired-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const mailboxPath = join(dir, 'mailbox.json');
+      const settingsPath = join(dir, 'settings.json');
+      await writeFile(settingsPath, JSON.stringify({ trustedWorkspaces: [] }));
+      let store = new MailboxStore(mailboxPath);
+      if (source === 'wakeTargets') {
+        store.upsertWakeTarget('historical', { workspacePath: '/old/NAUTILUS' });
+        const state = JSON.parse(await readFile(mailboxPath, 'utf8'));
+        assert.deepEqual(state.retiredWorkspacePaths, ['/old/NAUTILUS']);
+        delete state.retiredWorkspacePaths;
+        await writeFile(mailboxPath, JSON.stringify(state));
+      } else if (source === 'retiredWorkspacePaths') {
+        store.recordSpawnedWorkspace(' /old/NAUTILUS ');
+        store.recordSpawnedWorkspace('/old/NAUTILUS');
+        store.recordSpawnedWorkspace(' ');
+        assert.deepEqual(store.listKnownWorkspacePaths(), ['/old/NAUTILUS']);
+      } else if (source === 'deliveries') {
+        await writeFile(join(dir, 'deliveries.json'), JSON.stringify({ records: [
+          { executionReceipt: { worktreePath: '/old/NAUTILUS' } }, {},
+        ] }));
+      } else {
+        await writeFile(settingsPath, JSON.stringify({ trustedWorkspaces: ['/old/NAUTILUS'] }));
+      }
+      store = new MailboxStore(mailboxPath);
+      const names: string[] = [];
+      const executor = createOrcaSpawnExecutorPlugin({
+        commandRunner: cleanedWorktreeRunner(names), command: 'codex', seaCreatureNaming: true,
+        store, agySettingsPath: settingsPath,
+      });
+      await executor.execute([envelope()], spawnContext, {});
+      assert.deepEqual(names, ['seahorse']);
+      assert.ok(new MailboxStore(mailboxPath).listKnownWorkspacePaths().includes('/retired/seahorse'));
+      const restarted = createOrcaSpawnExecutorPlugin({
+        commandRunner: cleanedWorktreeRunner(names), command: 'codex', seaCreatureNaming: true,
+        store: new MailboxStore(mailboxPath), agySettingsPath: settingsPath,
+      });
+      await restarted.execute([envelope()], spawnContext, {});
+      assert.deepEqual(names, ['seahorse', 'starfish']);
+    });
+  }
+});
+
+test('sea-creature naming advances through numeric tiers using receiver settings without a store', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-tiers-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const settingsPath = join(dir, 'settings.json');
+  await writeFile(settingsPath, JSON.stringify({ trustedWorkspaces: SEA_CREATURE_POOL.map(name => `/old/${name}`) }));
+  const names: string[] = [];
+  const executor = createOrcaSpawnExecutorPlugin({
+    commandRunner: cleanedWorktreeRunner(names), command: 'codex', seaCreatureNaming: true,
+    agySettingsPath: settingsPath,
+  });
+  await executor.execute([envelope()], spawnContext, {});
+  await executor.execute([envelope()], spawnContext, {});
+  assert.deepEqual(names, ['nautilus-2', 'seahorse-2']);
+  for (const name of names) {
+    assert.match(name, /^[a-z-]+-\d+$/);
+  }
 });

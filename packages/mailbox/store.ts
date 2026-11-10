@@ -205,6 +205,7 @@ interface MailboxFileState {
   mailboxes: Record<string, MailboxStateRecord>;
   wakeTargets: Record<string, WakeTargetState>;
   threads: Record<string, ThreadRouteRecord>;
+  retiredWorkspacePaths?: string[];
 }
 
 interface LegacyInboxAttachment {
@@ -615,6 +616,7 @@ function emptyState(): MailboxFileState {
     mailboxes: {},
     wakeTargets: {},
     threads: {},
+    retiredWorkspacePaths: [],
   };
 }
 
@@ -629,6 +631,10 @@ function loadState(raw: string): MailboxFileState {
     throw invalidStore();
   }
   if (!isNonNegativeInteger(parsed.sequence) || !Array.isArray(parsed.items)) {
+    throw invalidStore();
+  }
+  const retiredWorkspacePaths = parsed.retiredWorkspacePaths ?? [];
+  if (!Array.isArray(retiredWorkspacePaths) || retiredWorkspacePaths.some(path => typeof path !== 'string')) {
     throw invalidStore();
   }
   const items = parsed.items.map(validateItem);
@@ -667,6 +673,7 @@ function loadState(raw: string): MailboxFileState {
     mailboxes: mailboxes as Record<string, MailboxStateRecord>,
     wakeTargets: wakeTargets as Record<string, WakeTargetState>,
     threads: normalizedThreads,
+    retiredWorkspacePaths: [...new Set(retiredWorkspacePaths.map(path => path.trim()).filter(Boolean))],
   };
 }
 
@@ -1378,6 +1385,43 @@ export class MailboxStore {
     });
   }
 
+  recordSpawnedWorkspace(workspacePath: string): void {
+    const path = workspacePath.trim();
+    if (!path) {
+      return;
+    }
+    this.withFileLock(() => {
+      const state = this.read();
+      const paths = state.retiredWorkspacePaths ??= [];
+      if (!paths.includes(path)) {
+        paths.push(path);
+        this.save(state);
+      }
+    });
+  }
+
+  listKnownWorkspacePaths(): string[] {
+    const state = this.read();
+    const paths = [
+      ...Object.values(state.wakeTargets).map(target => target.workspacePath),
+      ...(state.retiredWorkspacePaths ?? []),
+    ];
+    const ledgerPath = join(dirname(this.path), 'deliveries.json');
+    if (existsSync(ledgerPath)) {
+      const ledger: unknown = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+      if (isRecord(ledger) && Array.isArray(ledger.records)) {
+        for (const record of ledger.records) {
+          if (isRecord(record) && isRecord(record.executionReceipt) &&
+            typeof record.executionReceipt.worktreePath === 'string') {
+            paths.push(record.executionReceipt.worktreePath);
+          }
+        }
+      }
+    }
+    return [...new Set(paths.filter((path): path is string => typeof path === 'string')
+      .map(path => path.trim()).filter(Boolean))];
+  }
+
   upsertWakeTarget(
     mailboxId: string,
     patch: Partial<WakeTargetState> = {},
@@ -1387,6 +1431,11 @@ export class MailboxStore {
       const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
       const next = validateWakeTarget(mergeWakeTarget(current, patch));
       state.wakeTargets[id] = next;
+      const path = next.workspacePath?.trim();
+      const paths = state.retiredWorkspacePaths ??= [];
+      if (path && !paths.includes(path)) {
+        paths.push(path);
+      }
       return structuredClone(next);
     });
     if (merged.pendingWake) {

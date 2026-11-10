@@ -249,6 +249,7 @@ async function pickSeaCreatureName(
   runner: CommandRunner,
   command: string,
   cwd: string | undefined,
+  history: { issuedNames: Set<string>; knownWorkspacePaths: string[]; trustedSettingsFile?: string },
   signal?: AbortSignal,
 ): Promise<string> {
   const listed = await checkedCommand(runner, {
@@ -267,14 +268,14 @@ async function pickSeaCreatureName(
   const existing = new Set<string>();
   for (const row of raw.result?.worktrees ?? []) {
     if (typeof row.path === 'string' && row.path) {
-      existing.add(basename(row.path).toLowerCase());
+      existing.add(basename(row.path).trim().toLowerCase());
     }
     if (typeof row.displayName === 'string' && row.displayName) {
-      existing.add(row.displayName.toLowerCase());
+      existing.add(row.displayName.trim().toLowerCase());
     }
     // Branch refs such as refs/heads/ben.xu/seahorse collide once their basename matches a creature.
     if (typeof row.branch === 'string' && row.branch) {
-      existing.add(basename(row.branch).toLowerCase());
+      existing.add(basename(row.branch).trim().toLowerCase());
     }
   }
   // Local branches outlive removed worktrees; never reuse a creature whose branch still exists.
@@ -287,6 +288,7 @@ async function pickSeaCreatureName(
       );
       for (const branch of branches.split('\n')) {
         if (branch.trim()) {
+          existing.add(branch.trim().toLowerCase());
           existing.add(basename(branch.trim()).toLowerCase());
         }
       }
@@ -294,8 +296,29 @@ async function pickSeaCreatureName(
       // A non-git directory has no local branches to collide with.
     }
   }
-  const available = SEA_CREATURE_POOL.find(creature => !existing.has(creature));
-  return available ?? `nautilus-${randomUUID().slice(0, 8)}`;
+  for (const name of history.issuedNames) {
+    existing.add(name.trim().toLowerCase());
+  }
+  const paths = [...history.knownWorkspacePaths];
+  if (history.trustedSettingsFile && existsSync(history.trustedSettingsFile)) {
+    const settings = JSON.parse(readFileSync(history.trustedSettingsFile, 'utf8'));
+    if (Array.isArray(settings?.trustedWorkspaces)) {
+      paths.push(...settings.trustedWorkspaces.filter((path: unknown): path is string => typeof path === 'string'));
+    }
+  }
+  for (const path of paths) {
+    existing.add(basename(path).trim().toLowerCase());
+  }
+  for (let tier = 1; tier <= 10_000; tier += 1) {
+    for (const creature of SEA_CREATURE_POOL) {
+      const candidate = tier === 1 ? creature : `${creature}-${tier}`;
+      if (!existing.has(candidate)) {
+        history.issuedNames.add(candidate);
+        return candidate;
+      }
+    }
+  }
+  throw new Error('Sea-creature worktree names exhausted');
 }
 
 function gitCommonDir(directory: string): string | undefined {
@@ -342,6 +365,7 @@ function assertParentInProject(projectId: string, boundRoot: string, parentWorkt
 }
 
 export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): ExecutorPlugin {
+  const issuedNames = new Set<string>();
   return {
     name: 'orca-spawn',
     async execute(batch, context, runtimeConfig) {
@@ -392,6 +416,20 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       if (interactive && !store) {
         throw new Error('Interactive orca-spawn requires a durable mailbox store');
       }
+      const explicitSettingsPath =
+        typeof config.agySettingsPath === 'string' && config.agySettingsPath
+          ? config.agySettingsPath
+          : undefined;
+      const optionSettingsPath =
+        typeof options.agySettingsPath === 'string' && options.agySettingsPath
+          ? options.agySettingsPath
+          : undefined;
+      const settingsFile =
+        explicitSettingsPath ??
+        optionSettingsPath ??
+        join(homedir(), '.gemini/antigravity-cli/settings.json');
+      const mayTrust = !options.commandRunner || store !== undefined ||
+        explicitSettingsPath !== undefined || optionSettingsPath !== undefined;
       const explicitName =
         typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
           ? payload.worktreeName.trim()
@@ -401,7 +439,11 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const name = explicitName
         ? explicitName
         : seaCreatureNaming
-          ? await pickSeaCreatureName(runner, command, worktreeCwd, context.signal)
+          ? await pickSeaCreatureName(runner, command, worktreeCwd, {
+            issuedNames,
+            knownWorkspacePaths: store?.listKnownWorkspacePaths() ?? [],
+            trustedSettingsFile: mayTrust ? settingsFile : undefined,
+          }, context.signal)
           : `${options.namePrefix ?? 'dealer'}-${randomUUID()}`;
       const createArgs = parentWorktree
         ? ['worktree', 'create', '--parent-worktree', parentWorktree, '--name', name, '--json']
@@ -421,19 +463,9 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       if (!path) {
         throw new Error('Orca worktree create returned no path');
       }
+      issuedNames.add(basename(path).trim().toLowerCase());
+      store?.recordSpawnedWorkspace(path);
       if (interactive) {
-        const explicitSettingsPath =
-          typeof config.agySettingsPath === 'string' && config.agySettingsPath
-            ? config.agySettingsPath
-            : undefined;
-        const optionSettingsPath =
-          typeof options.agySettingsPath === 'string' && options.agySettingsPath
-            ? options.agySettingsPath
-            : undefined;
-        const settingsFile =
-          explicitSettingsPath ??
-          optionSettingsPath ??
-          join(homedir(), '.gemini/antigravity-cli/settings.json');
         if (
           effectiveAgent === 'antigravity' &&
           payload.trustAntigravity !== false &&
