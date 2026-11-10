@@ -5,6 +5,8 @@ import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { MailboxStore } from '../mailbox/index.ts';
+import type { ResolvedReplyTarget } from '../mailbox/index.ts';
+import type { SettlementOutcome } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
 import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 
@@ -54,6 +56,12 @@ const stringFlags = [
   'mailbox',
   'ack',
   'timeout-ms',
+  'outcome',
+  'summary',
+  'reply-to',
+  'reply-mailbox',
+  'target-mailbox',
+  'subject',
 ];
 
 function parse(argv: string[]) {
@@ -358,6 +366,267 @@ async function runInboxCommand(
   throw new Error(`Unknown inbox command: ${String(action)}`);
 }
 
+function payloadFromBody(body: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(body);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : { value: parsed };
+  } catch {
+    return {};
+  }
+}
+
+function offlineMailboxStore(stateDir: string): MailboxStore {
+  const file = join(stateDir, 'config.json');
+  const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+  return new MailboxStore(join(stateDir, 'mailbox.json'), {
+    legacyInboxPath:
+      savedConfig.executorConfig?.inbox?.inboxPath ?? join(stateDir, 'inbox.json'),
+  });
+}
+
+async function mailboxStoreFor(
+  options: DealerCliOptions,
+  stateDir: string,
+): Promise<MailboxStore> {
+  if (options.runtime) {
+    await options.runtime.start();
+    return options.runtime.mailbox;
+  }
+  return offlineMailboxStore(stateDir);
+}
+
+function replyTargetOrThrow(store: MailboxStore, messageId: string): ResolvedReplyTarget {
+  const route = store.resolveReplyTarget(messageId);
+  if (!route) {
+    throw new Error(`Unknown message or thread: ${messageId}`);
+  }
+  if (!route.peerNodeId) {
+    throw new Error(`No reply route for: ${messageId}`);
+  }
+  return route;
+}
+
+function settlementOutcome(value: unknown): SettlementOutcome {
+  if (value === 'succeeded' || value === 'failed' || value === 'cancelled') {
+    return value;
+  }
+  throw new Error('Required: --outcome succeeded|failed|cancelled');
+}
+
+function runThreadCommand(
+  store: MailboxStore,
+  action: string | undefined,
+  target: string | undefined,
+  v: Record<string, any>,
+) {
+  if (action !== 'show') {
+    throw new Error('Unknown thread command; use thread show <id>');
+  }
+  const id = required(target, 'thread-id');
+  const records = store.listThreadRecords(id);
+  if (!records.length) {
+    throw new Error(`Unknown thread: ${id}`);
+  }
+  const rank: Record<'open' | 'replied' | 'settled', number> = {
+    open: 0,
+    replied: 1,
+    settled: 2,
+  };
+  let state: 'open' | 'replied' | 'settled' = 'open';
+  for (const record of records) {
+    if (rank[record.state] > rank[state]) {
+      state = record.state;
+    }
+  }
+  const settlement = records.filter(record => record.settlement !== undefined).at(-1)
+    ?.settlement;
+  return {
+    threadId: records[0].threadId,
+    state,
+    ...(settlement ? { settlement } : {}),
+    records,
+  };
+}
+
+/**
+ * Non-blocking session control: ask/reply/settle all return as soon as the signed envelope is
+ * dispatched. Replies wake the caller's mailbox through the durable wake target, not a wait loop.
+ */
+async function runSessionCommand(
+  runtime: DealerNodeRuntime,
+  group: 'ask' | 'reply' | 'settle',
+  positional: string | undefined,
+  v: Record<string, any>,
+) {
+  const store = runtime.mailbox;
+  const callerMailboxFlag =
+    typeof v.mailbox === 'string' && v.mailbox ? String(v.mailbox) : undefined;
+  const ackId = typeof v.ack === 'string' && v.ack ? String(v.ack) : undefined;
+
+  if (group === 'ask') {
+    const replyTo = typeof v['reply-to'] === 'string' && v['reply-to']
+      ? String(v['reply-to'])
+      : undefined;
+    if (replyTo !== undefined) {
+      const route = replyTargetOrThrow(store, replyTo);
+      if (ackId) {
+        store.ack(ackId, route.localMailbox);
+      }
+      const body = required(v.body, '--body');
+      const replyMailbox = callerMailboxFlag ?? route.localMailbox;
+      const targetMailbox =
+        typeof v['target-mailbox'] === 'string' && v['target-mailbox']
+          ? String(v['target-mailbox'])
+          : route.targetMailbox;
+      const emitted = await runtime.emitter.emit({
+        networkId: typeof v.network === 'string' && v.network ? String(v.network) : route.networkId,
+        kind: typeof v.topic === 'string' && v.topic ? String(v.topic) : route.kind,
+        subject:
+          typeof v.subject === 'string' && v.subject
+            ? String(v.subject)
+            : `Question: ${route.subject}`,
+        body,
+        payload: {},
+        replyToId: replyTo,
+        traceId: route.traceId,
+        routing: { mode: 'unicast', targets: [route.peerNodeId], topic: route.kind },
+        semantic: {
+          type: 'question',
+          threadId: route.threadId,
+          targetMailbox,
+          replyMailbox,
+        },
+        filePaths: v.attach as string[] | undefined,
+      });
+      return {
+        questionId: emitted.messageId,
+        threadId: route.threadId,
+        targetNodeId: route.peerNodeId,
+        targetMailbox,
+        replyMailbox,
+        receipts: emitted.receipts,
+        next: 'End your turn now; Dealer will wake this mailbox when the reply arrives.',
+      };
+    }
+    const networkId = required(v.network, '--network');
+    const topic = required(v.topic, '--topic');
+    const body = required(v.body, '--body');
+    if (Boolean(v.to) === Boolean(v['auto-route'])) {
+      throw new Error('Choose exactly one of --to or --auto-route');
+    }
+    if (ackId) {
+      store.ack(ackId, callerMailboxFlag ?? 'default');
+    }
+    const targetMailbox =
+      typeof v['target-mailbox'] === 'string' && v['target-mailbox']
+        ? String(v['target-mailbox'])
+        : undefined;
+    const emitted = await runtime.emitter.emit({
+      networkId,
+      kind: topic,
+      subject:
+        typeof v.subject === 'string' && v.subject ? String(v.subject) : `Question: ${topic}`,
+      body,
+      payload: {},
+      routing: {
+        mode: v['auto-route'] ? 'auto' : 'unicast',
+        ...(v.to ? { targets: [String(v.to)] } : {}),
+        topic,
+      },
+      semantic: {
+        type: 'question',
+        ...(targetMailbox ? { targetMailbox } : {}),
+        ...(callerMailboxFlag ? { replyMailbox: callerMailboxFlag } : {}),
+      },
+      filePaths: v.attach as string[] | undefined,
+    });
+    return {
+      questionId: emitted.messageId,
+      threadId: emitted.messageId,
+      targetNodeId: emitted.receipts[0]?.fromNodeId,
+      targetMailbox: targetMailbox ?? 'default',
+      replyMailbox: callerMailboxFlag ?? 'default',
+      receipts: emitted.receipts,
+      next: 'End your turn now; Dealer will wake this mailbox when the reply arrives.',
+    };
+  }
+
+  const messageId = required(positional, 'message-id');
+  const route = replyTargetOrThrow(store, messageId);
+  if (ackId) {
+    store.ack(ackId, route.localMailbox);
+  }
+  const replyMailbox = callerMailboxFlag ?? route.localMailbox;
+
+  if (group === 'reply') {
+    const body = required(v.body, '--body');
+    const emitted = await runtime.emitter.emit({
+      networkId: route.networkId,
+      kind: route.kind,
+      subject:
+        typeof v.subject === 'string' && v.subject
+          ? String(v.subject)
+          : `Re: ${route.subject}`,
+      body,
+      payload: {},
+      replyToId: messageId,
+      traceId: route.traceId,
+      routing: { mode: 'unicast', targets: [route.peerNodeId], topic: route.kind },
+      semantic: {
+        type: 'reply',
+        threadId: route.threadId,
+        targetMailbox: route.targetMailbox,
+        replyMailbox,
+      },
+      filePaths: v.attach as string[] | undefined,
+    });
+    return {
+      replyId: emitted.messageId,
+      threadId: route.threadId,
+      targetNodeId: route.peerNodeId,
+      targetMailbox: route.targetMailbox,
+      receipts: emitted.receipts,
+    };
+  }
+
+  const outcome = settlementOutcome(v.outcome);
+  const summary = required(
+    typeof v.summary === 'string' && v.summary ? v.summary : v.body,
+    '--summary',
+  );
+  const emitted = await runtime.emitter.emit({
+    networkId: route.networkId,
+    kind: route.kind,
+    subject:
+      typeof v.subject === 'string' && v.subject
+        ? String(v.subject)
+        : `[${outcome}] ${route.subject}`,
+    body: summary,
+    payload: { summary, outcome, settledMessageId: messageId },
+    replyToId: messageId,
+    traceId: route.traceId,
+    routing: { mode: 'unicast', targets: [route.peerNodeId], topic: route.kind },
+    semantic: {
+      type: 'settle',
+      threadId: route.threadId,
+      targetMailbox: route.targetMailbox,
+      replyMailbox,
+      outcome,
+    },
+    filePaths: v.attach as string[] | undefined,
+  });
+  return {
+    settlementId: emitted.messageId,
+    threadId: route.threadId,
+    outcome,
+    targetNodeId: route.peerNodeId,
+    targetMailbox: route.targetMailbox,
+    receipts: emitted.receipts,
+  };
+}
+
 export async function runDealerCli(argv: string[], options: DealerCliOptions = {}): Promise<number> {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
@@ -406,21 +675,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return result.code;
     }
     if (group === 'inbox') {
-      let store: MailboxStore;
-      if (options.runtime) {
-        await options.runtime.start();
-        store = options.runtime.mailbox;
-      } else {
-        // Offline access is serialized by the mailbox file lock, so it stays coherent even if
-        // the daemon owns the state directory.
-        const file = join(stateDir, 'config.json');
-        const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-        store = new MailboxStore(join(stateDir, 'mailbox.json'), {
-          legacyInboxPath:
-            savedConfig.executorConfig?.inbox?.inboxPath ?? join(stateDir, 'inbox.json'),
-        });
-      }
+      // Offline access is serialized by the mailbox file lock, so it stays coherent even if
+      // the daemon owns the state directory.
+      const store = await mailboxStoreFor(options, stateDir);
       stdout(JSON.stringify(await runInboxCommand(store, action, target, v, options.signal), null, v.json ? undefined : 2));
+      return 0;
+    }
+    if (group === 'thread') {
+      const store = await mailboxStoreFor(options, stateDir);
+      stdout(JSON.stringify(runThreadCommand(store, action, target, v), null, v.json ? undefined : 2));
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'up') {
@@ -444,7 +707,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     await runtime.start();
     let result: unknown;
     const network = v.network as string | undefined;
-    if (group === 'project') {
+    if (group === 'ask' || group === 'reply' || group === 'settle') {
+      result = await runSessionCommand(runtime, group, action, v);
+    } else if (group === 'project') {
       if (action === 'link') {
         result = await runtime.linkProject(target!, v['user-patch'] as string | undefined);
       } else if (action === 'list') {
@@ -552,24 +817,33 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       if (rawUrgency && !['normal', 'high', 'critical'].includes(String(rawUrgency))) {
         throw new Error('Invalid urgency');
       }
-      let payload = {};
-      try {
-        const parsed = JSON.parse(body);
-        payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { value: parsed };
-      } catch {
-        // Plain text body
-      }
+      const targetMailbox =
+        typeof v.mailbox === 'string' && v.mailbox ? String(v.mailbox) : undefined;
+      const replyMailbox =
+        typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
+          ? String(v['reply-mailbox'])
+          : undefined;
       result = await runtime.emitter.emit({
         networkId: required(v.network, '--network'),
         kind: topic,
-        subject: topic,
+        subject:
+          typeof v.subject === 'string' && v.subject ? String(v.subject) : topic,
         body,
-        payload,
+        payload: payloadFromBody(body),
         routing: {
           mode: group === 'broadcast' ? 'broadcast' : v['auto-route'] ? 'auto' : 'unicast',
           ...(v.to ? { targets: [String(v.to)] } : {}),
           topic,
         },
+        ...(targetMailbox !== undefined || replyMailbox !== undefined
+          ? {
+              semantic: {
+                type: 'message' as const,
+                ...(targetMailbox !== undefined ? { targetMailbox } : {}),
+                ...(replyMailbox !== undefined ? { replyMailbox } : {}),
+              },
+            }
+          : {}),
         filePaths: v.attach as string[] | undefined,
         priority: rawUrgency === 'critical' ? 'urgent' : (rawUrgency as 'normal' | 'high' | undefined),
       });

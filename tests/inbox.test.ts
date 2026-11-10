@@ -251,7 +251,6 @@ test('topic defaults, P2P delivery and thread reverse routes converge end to end
       transport: { discoveryDir: join(root, 'mesh') },
       patch: {
         gateMode: 'open',
-        policies: ['wave-coalescer'],
         executorConfig: { 'orca-wave': { runId: 'test' } },
       },
       commandRunner: async () => {
@@ -368,7 +367,9 @@ test('topic defaults, P2P delivery and thread reverse routes converge end to end
     body: '',
     payload: {},
   });
-  assert.equal(queued.receipts[0].stage, 'queued');
+  // Durable wave ingestion commits before the busy/idle decision, so dispatch always succeeds.
+  assert.equal(queued.receipts[0].stage, 'dispatched');
+  assert.equal(bob.mailbox.list({ mailboxId: 'stream:wave' }).totalCount, 1);
 });
 
 test('streaming control keeps long waits alive and aborts cleanly on disconnect', async t => {

@@ -119,11 +119,11 @@ certified identities: only mount networks whose members you trust. Existing
 GateService trust rules can bypass mode defaults, including closed/DND;
 do not use a mode change as a way to revoke previously trusted senders.
 
-Gate pending items/trust, CAS policy watermarks, and buffered waves are
-currently in-memory. Stop only after settling inbound work, and do not
-assume restart replays a queued wave. Identity, mounts, configuration, source
-cursors, and the dispatch ledger persist. A persisted `dispatching` or
-`failed` entry must be reconciled with the external executor before retrying.
+Gate pending items/trust and CAS policy watermarks are currently in-memory.
+Identity, mounts, configuration, source cursors, the dispatch ledger, the
+mailbox ledger, wake targets, and thread routes persist. A persisted
+`dispatching` or `failed` entry must be reconciled with the external executor
+before retrying.
 
 ## Sources, routes, profiles and plugins
 
@@ -208,3 +208,45 @@ dealer inbox list --all --json
 minting or mutating a lease. Repeating `ack` for the same lease is an idempotent
 no-op; an unknown or mismatched lease fails loudly. Legacy `~/.dealer/inbox.json`
 data is migrated once into the `default` mailbox on startup.
+
+Executors durably enqueue mail and record a `wakeTarget` before injecting
+anything into a terminal. `WakeupRedriveService` is the only wakeup owner. On
+new mail and on a timer it re-reads `mailbox.json`, verifies the authoritative
+Orca workspace/terminal idle gate, then sends exactly one single-line pointer:
+
+```text
+You have N Dealer message(s) in <mailbox> [hint]. Run `dealer inbox check --mailbox <mailbox> --json`.
+```
+
+If an unacknowledged lease predates newer queued mail, the pointer names the
+lease instead (`Unacknowledged Dealer batch <dlv> + N newer message(s)`) and
+includes the `--ack <dlv>` recovery command. A busy, timed-out, or unverifiable
+terminal is never typed into: retries use 1s → 2s → 5s → 10s backoff, and a
+daemon restart re-arms every pending target from disk. Acknowledge the batch
+after handling it, then end your turn; `/new` rotation happens only after the
+lease is acknowledged and the mailbox reaches `rotateAfterWaves`. Pending
+Leases, wake targets, and thread routes are not lost on restart.
+
+## Ask, reply, settle, and inspect a thread
+
+These commands are non-blocking: they return as soon as the signed envelope is
+dispatched. The other side is woken by the durable mailbox pointer, so never
+poll or wait for a reply in the same turn.
+
+```sh
+dealer ask --network local --to member:bob --topic collab.question.v1 \
+  --subject 'Runtime boundary' --body '{"question":"Who owns retries?"}' --json
+dealer ask --reply-to <inbound-envelope-id> --body 'Follow-up question' --json
+dealer reply <inbound-envelope-id> --body 'The dispatcher owns retries' --json
+dealer settle <inbound-envelope-id> --outcome succeeded --summary 'Verified' --json
+dealer thread show <envelope-or-thread-id> --json
+```
+
+`ask --reply-to`, `reply`, and `settle` resolve the thread's reverse route
+(peer node, network, topic, target mailbox, reply mailbox) and can acknowledge
+the local lease by passing `--ack <dlv_id>`. `dealer settle` requires
+`--outcome` (`succeeded`, `failed`, or `cancelled`) and a `--summary` (or body
+fallback). `thread show` returns the merged thread state and both directional
+records; it works through the daemon or directly against the saved mailbox.
+For plain messages, address a logical mailbox with
+`dealer send --mailbox <id> --reply-mailbox <id> --subject '...'`.

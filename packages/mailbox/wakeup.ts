@@ -1,0 +1,515 @@
+import {
+  checkOrcaWorkspaceIdle,
+  probeOrcaTerminalIdle,
+  resolveOrcaWorkspaceTerminal,
+  runCommand,
+  sendOrcaTerminalText,
+  setOrcaWorkspaceComment,
+  singleLine,
+} from '../orca-workspace/index.ts';
+import type { CommandRunner, OrcaIdleResult } from '../orca-workspace/index.ts';
+import type { Disposable } from '../core-types/index.ts';
+import type {
+  MailboxCheckResult,
+  MailboxStore,
+  WakeTargetMode,
+  WakeTargetState,
+} from './store.ts';
+import { normalizeMailboxId } from './store.ts';
+
+export interface WakeupRedriveOptions {
+  store: MailboxStore;
+  orcaCommand?: string;
+  commandRunner?: CommandRunner;
+  /** Authoritative host override; when provided it replaces the Orca inventory probe. */
+  idleCheck?: () => Promise<OrcaIdleResult>;
+  /** Background redrive cadence for coalescing and busy-backoff targets; defaults to 1000ms. */
+  flushIntervalMs?: number;
+  now?: () => number;
+  onError?: (error: unknown) => void;
+}
+
+export interface WakeupFlushResult {
+  mailboxId: string;
+  mode: WakeTargetMode;
+  woke: boolean;
+  reason?: string;
+  /** The exact single-line pointer delivered to the run or terminal. */
+  pointer?: string;
+  leaseId?: string;
+  newerQueuedCount?: number;
+  rotated?: boolean;
+  warning?: string;
+}
+
+export interface WakeupMailboxOptions {
+  /** Explicit flush ignores coalesce/backoff maturity, but never bypasses an active claim. */
+  force?: boolean;
+}
+
+const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
+const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
+const MAX_BACKOFF_MS = 10_000;
+
+/** Exponential busy-backoff: 1s -> 2s -> 5s -> capped at 10s. */
+export function wakeupBackoffDelay(attemptCount: number): number {
+  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) {
+    throw new Error('Invalid wake attempt count');
+  }
+  if (attemptCount <= DEFAULT_BACKOFF_MS.length) {
+    return DEFAULT_BACKOFF_MS[attemptCount - 1] ?? MAX_BACKOFF_MS;
+  }
+  return MAX_BACKOFF_MS;
+}
+
+function noWake(
+  mailboxId: string,
+  mode: WakeTargetMode,
+  reason: string,
+): WakeupFlushResult {
+  return { mailboxId, mode, woke: false, reason };
+}
+
+/** The one-line first-task pointer sent to a freshly spawned interactive worker. */
+export function buildTaskPreamble(
+  mailboxId: string,
+  messageId: string,
+  leaseId?: string,
+): string {
+  return singleLine(
+    `Dealer Task dispatched to mailbox ${mailboxId} (Message ID: ${messageId}). Run \`dealer inbox check --mailbox ${mailboxId} --json\` to read the full spec & attachments. If blocked on decisions, run \`dealer ask --reply-to ${messageId} --mailbox ${mailboxId} --body "<question>"\` and end your turn. When finished, run \`dealer settle ${messageId} --outcome succeeded --summary "<result>" --ack ${leaseId ?? '<leaseId>'}\`.`,
+  );
+}
+
+/**
+ * Durable wakeup redrive backed by the mailbox ledger. A wave or task is committed before any
+ * pointer is sent, so a busy workspace or a daemon restart can never lose it. Text is injected
+ * only after an authoritative idle proof; busy targets keep `pendingWake` and retry with backoff.
+ */
+export class WakeupRedriveService {
+  private readonly store: MailboxStore;
+  private readonly runner: CommandRunner;
+  private readonly command: string;
+  private readonly idleCheck?: () => Promise<OrcaIdleResult>;
+  private readonly now: () => number;
+  private readonly onError?: (error: unknown) => void;
+  private readonly timer: ReturnType<typeof setInterval>;
+  private readonly subscriptions: Disposable[] = [];
+  private readonly inFlight = new Map<string, Promise<WakeupFlushResult>>();
+  private readonly claims = new Map<string, number>();
+  private stopped = false;
+  private lastError?: string;
+
+  constructor(options: WakeupRedriveOptions) {
+    if (!options.store) {
+      throw new Error('Wakeup redrive requires a mailbox store');
+    }
+    const flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
+    if (!Number.isSafeInteger(flushIntervalMs) || flushIntervalMs <= 0) {
+      throw new Error('Flush interval must be a positive integer');
+    }
+    this.store = options.store;
+    this.runner = options.commandRunner ?? runCommand;
+    this.command = options.orcaCommand ?? 'orca';
+    this.idleCheck = options.idleCheck;
+    this.now = options.now ?? Date.now;
+    this.onError = options.onError;
+    // Zero-latency redrive for coalesceMs === 0 targets; the timer only handles delayed work.
+    this.subscriptions.push(
+      this.store.onMail(mailboxId => this.notifyMailbox(mailboxId)),
+      this.store.onWakeTarget(mailboxId => this.notifyMailbox(mailboxId)),
+    );
+    this.timer = setInterval(() => {
+      void this.flushReady().catch(error => this.report(error));
+    }, flushIntervalMs);
+    this.timer.unref();
+  }
+
+  getLastError(): string | undefined {
+    return this.lastError;
+  }
+
+  /**
+   * Suppress redrive for a mailbox while a caller performs its own bounded idle wait and send.
+   * Claims are in-process only: if the process dies, the persisted `pendingWake` takes over.
+   */
+  claim(mailboxId: string): Disposable {
+    const id = normalizeMailboxId(mailboxId);
+    this.claims.set(id, (this.claims.get(id) ?? 0) + 1);
+    let released = false;
+    return {
+      dispose: () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        const remaining = (this.claims.get(id) ?? 1) - 1;
+        if (remaining <= 0) {
+          this.claims.delete(id);
+        } else {
+          this.claims.set(id, remaining);
+        }
+      },
+    };
+  }
+
+  /** Wake immediately when a target's coalesce/backoff window has already matured. */
+  notifyMailbox(mailboxId: string): void {
+    if (this.stopped) {
+      return;
+    }
+    let id: string;
+    try {
+      id = normalizeMailboxId(mailboxId);
+    } catch {
+      return;
+    }
+    const target = this.store.getWakeTarget(id);
+    if (!target?.pendingWake || target.earliestWakeAt > this.now()) {
+      return;
+    }
+    void this.flushMailbox(id).catch(error => this.report(error));
+  }
+
+  /** Flush one mailbox; a mailbox has at most one in-flight wakeup. */
+  flushMailbox(
+    mailboxId: string,
+    options: WakeupMailboxOptions = {},
+  ): Promise<WakeupFlushResult> {
+    const id = normalizeMailboxId(mailboxId);
+    if (this.stopped) {
+      return Promise.resolve(noWake(id, 'passive', 'Wakeup service stopped'));
+    }
+    const ongoing = this.inFlight.get(id);
+    if (ongoing) {
+      return ongoing;
+    }
+    const operation = this.flushInternal(id, options.force === true).finally(() => {
+      if (this.inFlight.get(id) === operation) {
+        this.inFlight.delete(id);
+      }
+    });
+    this.inFlight.set(id, operation);
+    return operation;
+  }
+
+  /** Deterministic flush of every pending target, ignoring coalesce/backoff maturity. */
+  async flushWakeups(): Promise<WakeupFlushResult[]> {
+    const targets = this.store.listPendingWakeTargets(Number.MAX_SAFE_INTEGER);
+    const results: WakeupFlushResult[] = [];
+    for (const target of targets) {
+      results.push(await this.flushMailbox(target.mailboxId, { force: true }));
+    }
+    return results;
+  }
+
+  /** Background flush of mature targets only. */
+  async flushReady(): Promise<WakeupFlushResult[]> {
+    const targets = this.store.listPendingWakeTargets(this.now());
+    const results: WakeupFlushResult[] = [];
+    for (const target of targets) {
+      results.push(await this.flushMailbox(target.mailboxId));
+    }
+    return results;
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopped) {
+      return;
+    }
+    this.stopped = true;
+    clearInterval(this.timer);
+    for (const subscription of this.subscriptions.splice(0)) {
+      subscription.dispose();
+    }
+    await Promise.allSettled([...this.inFlight.values()]);
+  }
+
+  private async flushInternal(
+    mailboxId: string,
+    force: boolean,
+  ): Promise<WakeupFlushResult> {
+    let target: WakeTargetState | undefined;
+    try {
+      target = this.store.getWakeTarget(mailboxId);
+      if (!target) {
+        return noWake(mailboxId, 'passive', 'No wake target');
+      }
+      if (!target.pendingWake) {
+        return noWake(mailboxId, target.mode, 'No pending wake');
+      }
+      if (this.claims.has(mailboxId)) {
+        return noWake(mailboxId, target.mode, 'Wakeup suppressed by an active claim');
+      }
+      if (!force && target.earliestWakeAt > this.now()) {
+        return noWake(mailboxId, target.mode, 'Coalescing');
+      }
+      if (target.mode === 'passive' || target.mode === 'pty') {
+        this.store.upsertWakeTarget(mailboxId, {
+          pendingWake: false,
+          attemptCount: 0,
+          earliestWakeAt: 0,
+          lastWakeError: undefined,
+        });
+        return {
+          mailboxId,
+          mode: target.mode,
+          woke: true,
+          reason: 'In-process mailbox event delivered',
+        };
+      }
+      const preview = this.store.check({ mailboxId, peek: true });
+      if (!this.hasNewMail(preview)) {
+        this.store.upsertWakeTarget(mailboxId, {
+          pendingWake: false,
+          attemptCount: 0,
+          earliestWakeAt: 0,
+          lastWakeError: undefined,
+        });
+        return noWake(
+          mailboxId,
+          target.mode,
+          preview.deliveryId
+            ? 'No newer mail behind the outstanding lease'
+            : 'No queued mail',
+        );
+      }
+      const idle = await this.authoritativeIdle(target);
+      if (!idle.idle) {
+        return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
+      }
+      return await this.deliver(mailboxId, target, preview);
+    } catch (error) {
+      this.report(error);
+      if (!target) {
+        return noWake(mailboxId, 'passive', String(error));
+      }
+      try {
+        return this.defer(mailboxId, target, String(error));
+      } catch (deferError) {
+        this.report(deferError);
+        return noWake(mailboxId, target.mode, String(error));
+      }
+    }
+  }
+
+  private hasNewMail(preview: MailboxCheckResult): boolean {
+    return preview.deliveryId
+      ? preview.newerQueuedCount > 0
+      : preview.items.length > 0;
+  }
+
+  private async authoritativeIdle(target: WakeTargetState): Promise<OrcaIdleResult> {
+    if (this.idleCheck) {
+      return this.idleCheck();
+    }
+    const command = target.orcaCommand ?? this.command;
+    if (target.mode === 'orca-run') {
+      if (target.workspacePath) {
+        return checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath);
+      }
+      // Orchestration mail queues without touching a TUI composer, so no keystroke race exists.
+      return { idle: true };
+    }
+    if (target.workspacePath) {
+      return checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath);
+    }
+    if (target.terminalHandle) {
+      return probeOrcaTerminalIdle(
+        this.runner,
+        command,
+        target.terminalHandle,
+        target.workspacePath,
+      );
+    }
+    return { idle: false, reason: 'Authoritative terminal idle check required' };
+  }
+
+  private defer(
+    mailboxId: string,
+    target: WakeTargetState,
+    reason: string,
+  ): WakeupFlushResult {
+    const attemptCount = target.attemptCount + 1;
+    this.store.upsertWakeTarget(mailboxId, {
+      pendingWake: true,
+      attemptCount,
+      earliestWakeAt: this.now() + wakeupBackoffDelay(attemptCount),
+      lastWakeError: reason,
+    });
+    return noWake(mailboxId, target.mode, reason);
+  }
+
+  private buildPointer(
+    mailboxId: string,
+    target: WakeTargetState,
+    preview: MailboxCheckResult,
+  ): string | undefined {
+    if (preview.deliveryId) {
+      if (preview.newerQueuedCount === 0) {
+        return undefined;
+      }
+      return singleLine(
+        `Unacknowledged Dealer batch ${preview.deliveryId} + ${preview.newerQueuedCount} newer message(s) in ${mailboxId}. Run \`dealer inbox check --mailbox ${mailboxId} --json\` to resume, or add \`--ack ${preview.deliveryId}\` if already handled.`,
+      );
+    }
+    if (preview.items.length === 0) {
+      return undefined;
+    }
+    const taskMessageId = mailboxId.startsWith('task:') ? mailboxId.slice(5) : undefined;
+    if (
+      taskMessageId &&
+      target.completedWaves === 0 &&
+      preview.items.some(item => item.id === taskMessageId)
+    ) {
+      return buildTaskPreamble(mailboxId, taskMessageId);
+    }
+    const latestHint = preview.items.at(-1)?.wakeupHint;
+    return singleLine(
+      `You have ${preview.items.length} Dealer message(s) in ${mailboxId}${latestHint ? ` [${latestHint}]` : ''}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`,
+    );
+  }
+
+  private async resolveRotationTerminal(
+    target: WakeTargetState,
+  ): Promise<string | undefined> {
+    if (target.terminalHandle) {
+      return target.terminalHandle;
+    }
+    if (target.workspacePath) {
+      return resolveOrcaWorkspaceTerminal(
+        this.runner,
+        target.orcaCommand ?? this.command,
+        target.workspacePath,
+      );
+    }
+    return undefined;
+  }
+
+  private async deliver(
+    mailboxId: string,
+    target: WakeTargetState,
+    preview: MailboxCheckResult,
+  ): Promise<WakeupFlushResult> {
+    const command = target.orcaCommand ?? this.command;
+    let rotated = false;
+    if (
+      !preview.deliveryId &&
+      target.rotateAfterWaves !== undefined &&
+      target.completedWaves >= target.rotateAfterWaves
+    ) {
+      const terminalHandle = await this.resolveRotationTerminal(target);
+      if (terminalHandle) {
+        await sendOrcaTerminalText(
+          this.runner,
+          command,
+          terminalHandle,
+          '/new',
+          { cwd: target.workspacePath },
+        );
+        // Reset before the pointer so a crash cannot rotate twice for the same completed wave.
+        this.store.upsertWakeTarget(mailboxId, { completedWaves: 0 });
+        rotated = true;
+      }
+    }
+
+    const pointer = this.buildPointer(mailboxId, target, preview);
+    if (!pointer) {
+      this.store.upsertWakeTarget(mailboxId, {
+        pendingWake: false,
+        attemptCount: 0,
+        earliestWakeAt: 0,
+        lastWakeError: undefined,
+      });
+      return noWake(mailboxId, target.mode, 'Nothing new to deliver');
+    }
+
+    if (target.mode === 'orca-run') {
+      if (!target.runId) {
+        throw new Error('orca-run wake target requires runId');
+      }
+      const output = await this.runner({
+        command,
+        args: [
+          'orchestration',
+          'send',
+          '--to',
+          `run:${target.runId}`,
+          '--subject',
+          `Dealer wakeup (${mailboxId})`,
+          '--body',
+          pointer,
+          '--json',
+        ],
+        cwd: target.workspacePath,
+      });
+      if (output.exitCode !== undefined && output.exitCode !== 0) {
+        throw new Error(`Orca orchestration send exited ${output.exitCode}`);
+      }
+      if (JSON.parse(output.stdout).ok === false) {
+        throw new Error('Orca wakeup delivery failed');
+      }
+    } else {
+      const terminalHandle =
+        target.terminalHandle ??
+        (target.workspacePath
+          ? await resolveOrcaWorkspaceTerminal(
+              this.runner,
+              command,
+              target.workspacePath,
+            )
+          : undefined);
+      if (!terminalHandle) {
+        throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
+      }
+      await sendOrcaTerminalText(
+        this.runner,
+        command,
+        terminalHandle,
+        pointer,
+        { cwd: target.workspacePath },
+      );
+    }
+
+    let warning: string | undefined;
+    const comment =
+      target.workspaceComment ??
+      (mailboxId.startsWith('stream:') ? `Dealer: ${mailboxId} pending` : undefined);
+    if (comment !== undefined) {
+      try {
+        await setOrcaWorkspaceComment(
+          this.runner,
+          command,
+          target.workspacePath,
+          comment,
+        );
+      } catch (error) {
+        // The pointer is already delivered; retrying it would duplicate a wakeup.
+        warning = String(error);
+        this.report(error);
+      }
+    }
+
+    this.store.upsertWakeTarget(mailboxId, {
+      pendingWake: false,
+      attemptCount: 0,
+      earliestWakeAt: 0,
+      lastWakeError: undefined,
+    });
+    return {
+      mailboxId,
+      mode: target.mode,
+      woke: true,
+      pointer,
+      ...(preview.deliveryId ? { leaseId: preview.deliveryId } : {}),
+      newerQueuedCount: preview.newerQueuedCount,
+      rotated,
+      ...(warning !== undefined ? { warning } : {}),
+    };
+  }
+
+  private report(error: unknown): void {
+    this.lastError = String(error);
+    this.onError?.(error);
+  }
+}

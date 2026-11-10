@@ -15,7 +15,6 @@ import {
   encodeNetworkInvite,
   createLocalAgentRouterPlugin,
   createPollWatermarkSourcePlugin,
-  createOrcaWaveExecutorPlugin,
   blake3,
   readProjectManifest,
   initProjectScaffold,
@@ -179,7 +178,7 @@ test('Phase 4: local agent judge routes using discovered live NodeCards', async 
   assert.match(readFileSync(join(bob.stateDir, 'notifications.jsonl'), 'utf8'), /ios-crash/);
 });
 
-test('Phase 4: polling, CAS dedup, busy wave coalescing and session rotation', async t => {
+test('Phase 4: polling, CAS dedup, durable busy waves and rotation after ack', async t => {
   const root = directory(t);
   const calls: CommandRequest[] = [];
   let idle = false;
@@ -191,19 +190,12 @@ test('Phase 4: polling, CAS dedup, busy wave coalescing and session rotation', a
   const bob = await node(t, root, 'bob', {
     profile: 'dedicated-worker',
     commandRunner: runner,
+    wakeupIdleCheck: async () => ({ idle }),
     patch: {
       defaultExecutor: 'orca-wave',
       executorConfig: { 'orca-wave': { runId: 'test-run', terminalHandle: 'test-terminal' } },
       wave: { rotateAfterWaves: 1, flushIntervalMs: 100000 },
     },
-    executorOverrides: [
-      createOrcaWaveExecutorPlugin({
-        runId: 'test-run',
-        terminalHandle: 'test-terminal',
-        idleCheck: async () => ({ idle }),
-        commandRunner: runner,
-      }),
-    ],
   });
   await connect(alice, bob);
   let cursor = 0;
@@ -225,24 +217,39 @@ test('Phase 4: polling, CAS dedup, busy wave coalescing and session rotation', a
   await source.pollOnce();
   await source.pollOnce();
   assert.equal(cursor, 2);
-  assert.equal(calls.length, 0);
+  assert.equal(calls.length, 0, 'busy workspace must not receive text');
   const duplicate = await alice.emitter.emit({
     ...input('bob', { executor: 'orca-wave', streamKey: 'alerts', revision: 1 }),
     idempotencyKey: 'alert-0',
   });
   assert.equal(duplicate.receipts[0].stage, 'rejected');
-  const key = JSON.stringify(['sensebeing', 'alerts', 'orca-wave']);
-  assert.equal(bob.wave!.pendingCount(key), 2);
+  assert.equal(bob.mailbox.list({ mailboxId: 'stream:alerts' }).queuedCount, 2);
+
   idle = true;
-  await bob.flushWaves();
-  assert.equal(bob.wave!.pendingCount(key), 0);
-  assert.equal(calls.filter(c => c.args[0] === 'orchestration').length, 1);
-  assert.match(calls[0].args.join(' '), /Dealer wave \(2\)/);
+  await bob.flushWakeups();
+  const orchestration = calls.filter(c => c.args[0] === 'orchestration');
+  assert.equal(orchestration.length, 1);
+  const pointer = String(orchestration[0].args[orchestration[0].args.indexOf('--body') + 1]);
+  assert.match(pointer, /^You have 2 Dealer message\(s\) in stream:alerts/);
+  assert.equal(/[\r\n]/.test(pointer), false);
+  assert.equal(
+    orchestration[0].args[orchestration[0].args.indexOf('--subject') + 1],
+    'Dealer wakeup (stream:alerts)',
+  );
+
+  const lease = bob.mailbox.check({ mailboxId: 'stream:alerts' });
+  assert.equal(lease.items.length, 2);
+  bob.mailbox.ack(lease.deliveryId!);
   await source.pollOnce();
   assert.equal(cursor, 3);
   const rotation = calls.findIndex(c => c.args.includes('/new'));
   assert.ok(rotation >= 0);
-  assert.equal(calls.filter(c => c.args[0] === 'orchestration').length, 2);
+  const sends = calls.filter(
+    c => c.args[0] === 'orchestration' && c.args.includes('--body'),
+  );
+  assert.equal(sends.length, 2);
+  assert.ok(rotation < calls.indexOf(sends[1]));
+  assert.match(String(sends[1].args[sends[1].args.indexOf('--body') + 1]), /^You have 1 Dealer message/);
   await registration.dispose();
 });
 
@@ -286,7 +293,7 @@ test('Phase 4: single-machine zero-config self loopback routes without network m
   assert.match(inbox, /Local skill delivery/);
 });
 
-test('Phase 4: wave streams resolve workspace terminal and rotate per stream', async t => {
+test('Phase 4: wave streams resolve distinct workspace terminals with single-line pointers', async t => {
   const root = directory(t);
   const workspaceA = join(root, 'workspace-a');
   const workspaceB = join(root, 'workspace-b');
@@ -320,20 +327,12 @@ test('Phase 4: wave streams resolve workspace terminal and rotate per stream', a
           result: {
             terminals: [
               {
-                handle: `${handle}-claude`,
-                connected: true,
-                writable: true,
-                agentIdentity: 'claude',
-                lastOutputAt: 20,
-                preview: 'Idle',
-              },
-              {
                 handle,
                 connected: true,
                 writable: true,
                 agentIdentity: 'antigravity',
                 lastOutputAt: 10,
-                preview: '⏵⏵ bypass permissions on',
+                preview: 'Idle',
               },
             ],
           },
@@ -350,7 +349,6 @@ test('Phase 4: wave streams resolve workspace terminal and rotate per stream', a
       executorConfig: { 'orca-wave': {} },
       wave: { flushIntervalMs: 100000 },
     },
-    executorOverrides: [createOrcaWaveExecutorPlugin({ commandRunner: runner })],
   });
   const streamInput = (
     workspacePath: string,
@@ -373,25 +371,22 @@ test('Phase 4: wave streams resolve workspace terminal and rotate per stream', a
       ...(workspaceComment ? { workspaceComment } : {}),
     },
   });
-  const first = await worker.emitter.emit(streamInput(workspaceA, 'A first\nline', 1));
-  assert.equal(first.receipts[0].stage, 'dispatched');
-  const second = await worker.emitter.emit(streamInput(workspaceA, 'A second', 2));
-  assert.equal(second.receipts[0].stage, 'dispatched');
-  const other = await worker.emitter.emit(
-    streamInput(workspaceB, 'B first', 1, 'Wave B in progress'),
-  );
-  assert.equal(other.receipts[0].stage, 'dispatched');
+  await worker.emitter.emit(streamInput(workspaceA, 'A first\nline', 1));
+  await worker.emitter.emit(streamInput(workspaceA, 'A second', 2));
+  await worker.emitter.emit(streamInput(workspaceB, 'B first', 1, 'Wave B in progress'));
 
   const sends = calls.filter(c => c.args[0] === 'terminal' && c.args[1] === 'send');
   const textOf = (call: CommandRequest) => call.args[call.args.indexOf('--text') + 1];
   const handleOf = (call: CommandRequest) => call.args[call.args.indexOf('--terminal') + 1];
   const aSends = sends.filter(c => handleOf(c) === 'term-a');
   const bSends = sends.filter(c => handleOf(c) === 'term-b');
-  assert.ok(aSends.some(c => textOf(c) === 'A first line'));
-  assert.ok(aSends.some(c => textOf(c) === 'A second'));
-  assert.ok(aSends.some(c => textOf(c) === '/new'));
-  assert.ok(bSends.some(c => textOf(c) === 'B first'));
-  assert.equal(bSends.some(c => textOf(c) === '/new'), false);
+  assert.equal(aSends.length, 2);
+  assert.ok(aSends.every(c => !/[\r\n]/.test(textOf(c))));
+  assert.ok(aSends.some(c => /^You have 1 Dealer message\(s\) in stream:/.test(textOf(c))));
+  assert.ok(aSends.some(c => /^You have 2 Dealer message\(s\) in stream:/.test(textOf(c))));
+  assert.equal(bSends.length, 1);
+  assert.match(textOf(bSends[0]), /^You have 1 Dealer message\(s\) in stream:/);
+  assert.equal(sends.some(c => textOf(c) === '/new'), false);
   assert.ok(
     calls.some(
       c =>
@@ -656,7 +651,7 @@ export async function createPlugin(config: Record<string, unknown>, context: any
 export default (_config: any, context: any) => {
   const factories = [
     'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
-    'createDedupCasPolicyPlugin', 'isDedupCasDuplicateReceipt', 'createWaveCoalescerPolicyPlugin', 'createOrcaSpawnExecutorPlugin',
+    'createDedupCasPolicyPlugin', 'isDedupCasDuplicateReceipt', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
     'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin', 'createInboxExecutorPlugin',
   ];

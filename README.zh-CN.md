@@ -51,9 +51,12 @@
 5. **节点自主权限门禁（`gate`）**
    - 四态权限控制：`open`（直接放行）、`approval_required`（Knock 敲门待确认模式，确认后可一键签发发送方信任白名单）、`dnd`（免打扰仅入队）、`closed`（拒收）。
    - 本机自身发起的本地投递跳过敲门审批，但仍严格受 `dnd` 与 `closed` 约束。
-6. **插件化接收派发器（`dispatcher`）**
-   - **调度策略插件**：内置 `policy-dedup-cas`（代次水位 CAS 防重）与 `policy-wave-coalescer`（单水位波次聚合 + 按每条流的 `workspacePath`/`terminalHandle` 动态解析工作区空闲门禁 + 会话满阈值自动 `/new` 轮转）。
-   - **终端执行器插件**：内置 `executor-orca-spawn`（自动新建 Orca 独立工作区并启动 Agent）、`executor-orca-wave`（按流解析目标工作区与活跃 antigravity 终端、投递波次并更新卡片状态）、`executor-agent-pty`（无 Orca 环境的通用 CLI Agent 执行器）与 `executor-notify`。
+6. **插件化接收派发器与持久化信箱（`dispatcher` & `mailbox`）**
+   - **调度策略插件**：内置 `policy-dedup-cas`（代次水位 CAS 防重）。
+   - **持久化信箱与唤醒重驱**：`MailboxStore` 将入站消息、单未决投递租约（`dlv_*`）、唤醒目标与按方向区分的会话反向路由原子落盘到 `mailbox.json`；`WakeupRedriveService` 在守护进程重启后继续按权威 Orca 工作区/终端空闲门禁发送严格单行指针，忙时绝不注入文本，并在租约确认后按阈值自动 `/new` 轮转。
+   - **信箱检查与确认**：`dealer inbox check` 取走最早未确认批次并生成单一批次租约，`dealer inbox ack <dlv_id>` 确认处理完毕，`dealer inbox list` 只读查看；未确认批次永远不会与新消息混合。
+   - **终端执行器插件**：内置 `executor-orca-spawn`（自动新建 Orca 独立工作区并启动 Agent，仅在确认空闲后注入任务前言）、`executor-orca-wave`（将波次持久化入队并唤醒常驻工作区）、`executor-agent-pty`（无 Orca 环境的通用 CLI Agent 执行器）、`executor-inbox`（本地信箱留资）与 `executor-notify`。
+   - **非阻塞会话命令**：`dealer ask` / `reply` / `settle` / `thread show` 立即返回并依赖持久化信箱唤醒对端，无需 `--reply-to` 同步阻塞等待。
 
 ---
 
@@ -79,6 +82,13 @@ npm test
 # 向本机投递；`local` 只是稳定作用域名，无需 mount 或 passphrase
 ./bin/dealer.js send --network local --to member:ben.xu --topic collab.request.v1 --body '{"summary":"执行本地质量巡检"}' --json
 ./bin/dealer.js send --network local --to skill:agent-runtime --topic triage --body '{"area":"agent-runtime"}' --json
+
+# 非阻塞协作：ask 立即返回，答复通过持久化信箱唤醒当前 Agent
+./bin/dealer.js ask --network local --to member:ben.xu --topic collab.question.v1 --subject '归属确认' --body '{"question":"重试逻辑由谁负责？"}' --json
+./bin/dealer.js thread show <message-id> --json
+./bin/dealer.js inbox check --mailbox task:w1 --json
+./bin/dealer.js inbox ack <dlv_id> --mailbox task:w1 --json
+./bin/dealer.js inbox list --mailbox task:w1 --json
 ```
 
 已 link 的项目清单中的 `defaultNetworkId` 就是其触发源在本机发送时使用的稳定作用域；单机消息仍会路由到本机自身名片。

@@ -108,13 +108,27 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         await Promise.allSettled(active.values());
       });
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
-      const select = (e: MessageEnvelope) =>
-        typeof e.payload?.executor === 'string' && e.payload.executor.trim().length > 0
-          ? e.payload.executor
-          : config.resolveKindExecutor?.(e.kind) ??
-            config.kindExecutors?.[e.kind] ??
-            config.defaultExecutor ??
-            executors.keys().next().value;
+      const select = (e: MessageEnvelope) => {
+        const explicit = e.payload?.executor;
+        if (typeof explicit === 'string' && explicit.trim().length > 0) {
+          return explicit;
+        }
+        // Session control always lands in a mailbox; it must never spawn new worktrees.
+        const semanticType = e.semantic?.type;
+        if (
+          semanticType === 'question' ||
+          semanticType === 'reply' ||
+          semanticType === 'settle'
+        ) {
+          return 'inbox';
+        }
+        return (
+          config.resolveKindExecutor?.(e.kind) ??
+          config.kindExecutors?.[e.kind] ??
+          config.defaultExecutor ??
+          executors.keys().next().value
+        );
+      };
       const core = async (batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> => {
         if (!batch.length) {
           throw new Error('Empty execution batch');
@@ -232,6 +246,11 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               if (!ledger.get(id)) {
                 ledger.set(id, result);
               }
+              // Record the authenticated inbound route only after the gate allowed this delivery.
+              // Pending approval/DND knocks never reach here; gate.approve()/drainDnd() do.
+              if (result.stage !== 'rejected' && result.stage !== 'failed') {
+                ctx.emit('dispatcher/inbound', { envelope, receipt: result });
+              }
               return result;
             })
             .finally(() => active.delete(id));
@@ -294,7 +313,6 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               detail: verdict.reason,
             };
           }
-          ctx.emit('dispatcher/inbound', { envelope, receipt });
         }
         const signed = signReceipt(
           {

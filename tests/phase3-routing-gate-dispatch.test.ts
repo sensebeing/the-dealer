@@ -15,9 +15,11 @@ import type { NetworkGateService } from '../packages/gate/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
-import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, isDedupCasDuplicateReceipt } from '../packages/plugins-policy/index.ts';
-import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, checkedCommand, runCommand } from '../packages/plugins-executor/index.ts';
-import type { CommandRequest, CommandRunner } from '../packages/plugins-executor/index.ts';
+import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, isDedupCasDuplicateReceipt } from '../packages/plugins-policy/index.ts';
+import { MailboxStore, WakeupRedriveService } from '../packages/mailbox/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace } from '../packages/plugins-executor/index.ts';
+import { checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
+import type { CommandRequest, CommandRunner } from '../packages/orca-workspace/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
 
 const sender = generateNodeKeyPair(), receiver = generateNodeKeyPair();
@@ -135,22 +137,6 @@ test('CAS duplicate receipt classification excludes other outcomes and missing r
   }
 });
 
-test('wave coalescer buffers busy alerts, batches idle wave, rotates by count and age', async t => {
-  const { dispatcher, executor, calls } = await setup(t);
-  let idle = false, now = 0; const rotations: string[] = [];
-  executor.checkIdle = async () => ({ idle });
-  const wave = createWaveCoalescerPolicyPlugin({ executor, executorConfig: {}, streamKey: () => 'alerts', maxWaves: 1, minAgeMs: 100, now: () => now, rotateSession: async command => { rotations.push(command); } });
-  dispatcher.registerPolicy(createDedupCasPolicyPlugin()); dispatcher.registerPolicy(wave);
-  assert.equal((await dispatcher.dispatch(envelope())).stage, 'queued');
-  assert.equal((await dispatcher.dispatch(envelope())).stage, 'queued');
-  assert.equal(wave.pendingCount('alerts'), 2); assert.equal(calls.length, 0);
-  assert.equal((await wave.flushWave('alerts')).stage, 'queued');
-  idle = true; await wave.flushWave('alerts'); assert.equal(calls[0].length, 2);
-  await dispatcher.dispatch(envelope()); assert.deepEqual(rotations, ['/new']);
-  now = 200; await dispatcher.dispatch(envelope()); assert.deepEqual(rotations, ['/new', '/new']);
-  assert.equal(wave.pendingCount('alerts'), 0);
-});
-
 test('dispatcher ledger survives restart and concurrent duplicate does not execute twice', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-ledger-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const ledgerPath = join(dir, 'state.json');
@@ -198,13 +184,17 @@ test('all official executors deliver via Emitter using injected commands and not
   const { emitter, dispatcher, input } = await connected(t); const requests: CommandRequest[] = [];
   const commandRunner: CommandRunner = async request => { requests.push(request); return { stdout: request.args[0] === 'worktree' && request.args[1] === 'create' ? JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/isolated' } } }) : '{"ok":true}' }; };
   const dir = await mkdtemp(join(tmpdir(), 'dealer-inbox-')); t.after(() => rm(dir, { recursive: true, force: true }));
-  for (const executor of [createOrcaSpawnExecutorPlugin({ commandRunner }), createOrcaWaveExecutorPlugin({ runId: 'run-test', commandRunner, idleCheck: async () => ({ idle: true }) }), createAgentPtyExecutorPlugin({ commandRunner }), createNotifyExecutorPlugin({ inboxPath: join(dir, 'inbox.jsonl') })]) {
+  const store = new MailboxStore(join(dir, 'mailbox.json'));
+  const wakeup = new WakeupRedriveService({ store, commandRunner, idleCheck: async () => ({ idle: true }) });
+  t.after(() => wakeup.stop());
+  for (const executor of [createOrcaSpawnExecutorPlugin({ commandRunner }), createOrcaWaveExecutorPlugin({ runId: 'run-test', commandRunner, store, wakeup }), createAgentPtyExecutorPlugin({ commandRunner }), createNotifyExecutorPlugin({ inboxPath: join(dir, 'inbox.jsonl') })]) {
     dispatcher.registerExecutor(executor, {});
     const result = await emitter.emit({ ...input, payload: { executor: executor.name } }); assert.equal(result.receipts[0].stage, 'dispatched'); assert.equal(result.receipts[0].executionReceipt?.executor, executor.name);
   }
   assert.ok(requests.some(r => r.args.includes('--parent-worktree')));
   assert.ok(requests.some(r => r.args.includes('run:run-test')));
   assert.ok(requests.some(r => r.args.includes('--comment')));
+  assert.equal(store.list({ mailboxId: 'stream:task' }).queuedCount, 1);
   assert.match(await readFile(join(dir, 'inbox.jsonl'), 'utf8'), /Task/);
 });
 
@@ -472,7 +462,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   ]);
   assert.equal(flagValue(requests[1].args, '--command'), 'agy run --dangerously-skip-permissions');
   assert.equal(flagValue(requests[2].args, '--comment'), 'dealer: antigravity');
-  assert.equal(flagValue(requests[3].args, '--timeout-ms'), '30000');
+  assert.equal(flagValue(requests[3].args, '--timeout-ms'), '5000');
   assert.equal(flagValue(requests[4].args, '--terminal'), 'term-agy');
   assert.equal(flagValue(requests[4].args, '--text'), 'Fix the flaky test');
   assert.ok(requests[4].args.includes('--enter'));
@@ -491,7 +481,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
     context,
     { interactiveCommand: 'agy run', agySettingsPath: settingsPath },
   );
-  assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait', 'terminal send']);
+  assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait']);
 
   requests.length = 0;
   const untrustedSettings = join(dir, 'untrusted.json');
@@ -505,7 +495,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
     { agySettingsPath: untrustedSettings },
   );
   assert.equal(existsSync(untrustedSettings), false);
-  assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait', 'terminal send']);
+  assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait']);
 
   requests.length = 0;
   await executor.execute([envelope({ payload: {} })], context, {});
@@ -838,72 +828,71 @@ test('emitter broadcast and multicast paths preserve signed payload and validate
 
 test('Orca idle inspection includes child workspaces and rejects truncated inventories', async () => {
   let busy = true, truncated = false;
-  const executor = createOrcaWaveExecutorPlugin({ cwd: '/workspace', runId: 'run', commandRunner: async request => request.args[0] === 'terminal' ? { stdout: JSON.stringify(request.args[1] === 'list' ? { ok: true, result: { terminals: [{ handle: 'term-test', connected: true, writable: true }] } } : { ok: true }) } : ({ stdout: JSON.stringify({ ok: true, result: { truncated, worktrees: [
+  const runner: CommandRunner = async request => request.args[0] === 'terminal' ? { stdout: JSON.stringify(request.args[1] === 'list' ? { ok: true, result: { terminals: [{ handle: 'term-test', connected: true, writable: true }] } } : { ok: true }) } : ({ stdout: JSON.stringify({ ok: true, result: { truncated, worktrees: [
     { path: '/workspace', worktreeId: 'parent', childWorktreeIds: ['child'], unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
     { path: '/child', worktreeId: 'child', childWorktreeIds: [], unverifiableTerminalCount: 0, agents: [{ state: busy ? 'working' : 'done' }] },
-  ] } }) }) });
-  assert.equal((await executor.checkIdle!({})).idle, false); busy = false; assert.equal((await executor.checkIdle!({})).idle, true);
-  truncated = true; assert.equal((await executor.checkIdle!({})).idle, false);
+  ] } }) });
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
+  busy = false;
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
+  truncated = true;
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
 });
 
 test('Orca idle inspection trusts real TUI previews and skips terminal wait', async () => {
   let lastLine = '  ⏵⏵ bypass permissions on';
   let waits = 0;
-  const executor = createOrcaWaveExecutorPlugin({
-    cwd: '/workspace',
-    terminalHandle: 'term-test',
-    commandRunner: async request => {
-      if (request.args[0] === 'worktree') {
-        return {
-          stdout: JSON.stringify({
-            ok: true,
-            result: {
-              truncated: false,
-              worktrees: [
-                {
-                  path: '/workspace',
-                  worktreeId: 'parent',
-                  childWorktreeIds: [],
-                  unverifiableTerminalCount: 0,
-                  agents: [{ state: 'done' }],
-                },
-              ],
-            },
-          }),
-        };
-      }
-      if (request.args[1] === 'list') {
-        return {
-          stdout: JSON.stringify({
-            ok: true,
-            result: {
-              terminals: [
-                {
-                  handle: 'term-test',
-                  connected: true,
-                  writable: true,
-                  agentIdentity: 'antigravity',
-                  preview: `history\n${lastLine}`,
-                  lastOutputAt: 1,
-                },
-              ],
-            },
-          }),
-        };
-      }
-      if (request.args[1] === 'wait') {
-        waits++;
-        return { stdout: '{"ok":false,"error":{"code":"timeout"}}' };
-      }
-      return { stdout: '{"ok":true}' };
-    },
-  });
-  assert.equal((await executor.checkIdle!({})).idle, true);
+  const runner: CommandRunner = async request => {
+    if (request.args[0] === 'worktree') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            truncated: false,
+            worktrees: [
+              {
+                path: '/workspace',
+                worktreeId: 'parent',
+                childWorktreeIds: [],
+                unverifiableTerminalCount: 0,
+                agents: [{ state: 'done' }],
+              },
+            ],
+          },
+        }),
+      };
+    }
+    if (request.args[1] === 'list') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            terminals: [
+              {
+                handle: 'term-test',
+                connected: true,
+                writable: true,
+                agentIdentity: 'antigravity',
+                preview: `history\n${lastLine}`,
+                lastOutputAt: 1,
+              },
+            ],
+          },
+        }),
+      };
+    }
+    if (request.args[1] === 'wait') {
+      waits++;
+      return { stdout: '{"ok":false,"error":{"code":"timeout"}}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
   assert.equal(waits, 0);
   lastLine = '> unsent draft';
-  assert.equal((await executor.checkIdle!({})).idle, false);
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
   lastLine = '>';
-  assert.equal((await executor.checkIdle!({})).idle, true);
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
 });
 
 test('local command executor actually runs a process and captures JSON without shell interpolation', async () => {

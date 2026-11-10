@@ -16,20 +16,17 @@ import { createGatePlugin } from '../gate/index.ts';
 import type { NetworkGateService } from '../gate/index.ts';
 import { createDispatcherPlugin } from '../dispatcher/index.ts';
 import { createEmitterPlugin } from '../emitter/index.ts';
-import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin, isDedupCasDuplicateReceipt } from '../plugins-policy/index.ts';
-import type { WaveCoalescerPolicy } from '../plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, isDedupCasDuplicateReceipt } from '../plugins-policy/index.ts';
 import {
   createOrcaSpawnExecutorPlugin,
   createOrcaWaveExecutorPlugin,
   createAgentPtyExecutorPlugin,
   createNotifyExecutorPlugin,
   createInboxExecutorPlugin,
-  checkedCommand,
-  resolveOrcaWorkspaceTerminal,
-  runCommand,
 } from '../plugins-executor/index.ts';
-import type { CommandRunner } from '../plugins-executor/index.ts';
-import { MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
+import { runCommand } from '../orca-workspace/index.ts';
+import type { CommandRunner } from '../orca-workspace/index.ts';
+import { MailboxStore, resolveMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
 import {
@@ -54,7 +51,6 @@ export interface ExternalPluginContext {
     createScriptSourcePlugin: typeof createScriptSourcePlugin;
     createDedupCasPolicyPlugin: typeof createDedupCasPolicyPlugin;
     isDedupCasDuplicateReceipt: typeof isDedupCasDuplicateReceipt;
-    createWaveCoalescerPolicyPlugin: typeof createWaveCoalescerPolicyPlugin;
     createOrcaSpawnExecutorPlugin: typeof createOrcaSpawnExecutorPlugin;
     createOrcaWaveExecutorPlugin: typeof createOrcaWaveExecutorPlugin;
     createAgentPtyExecutorPlugin: typeof createAgentPtyExecutorPlugin;
@@ -86,6 +82,8 @@ export interface DealerRuntimeOptions {
   transport?: TransportPluginOptions;
   commandRunner?: CommandRunner;
   executorOverrides?: ExecutorPlugin[];
+  /** Authoritative idle probe for wakeup redrive; defaults to the recursive Orca inventory. */
+  wakeupIdleCheck?: () => Promise<{ idle: boolean; reason?: string }>;
 }
 
 export interface ControlRequestContext {
@@ -129,16 +127,13 @@ export class DealerNodeRuntime {
   readonly options: DealerRuntimeOptions;
   config!: RuntimeConfig;
   mailbox!: MailboxStore;
-  wave?: WaveCoalescerPolicy;
+  wakeups!: WakeupRedriveService;
   private loadedProjects = new Map<string, { manifest: DealerProjectManifest; plugins: LoadedExternalPlugin[] }>();
   private loadedUserPlugins = new Map<string, LoadedExternalPlugin>();
   private externalChanges: Promise<unknown> = Promise.resolve();
-  private streams = new Set<string>();
   private server?: Server;
   private started = false;
   private ownsLock = false;
-  private timer?: ReturnType<typeof setInterval>;
-  private flushing?: Promise<void>;
   lastError?: string;
 
   constructor(options: DealerRuntimeOptions = {}) {
@@ -231,10 +226,22 @@ export class DealerNodeRuntime {
       if (Array.isArray(this.config.executors) && !this.config.executors.includes('inbox')) {
         this.config.executors = [...this.config.executors, 'inbox'];
       }
+      // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config);
       this.mailbox = new MailboxStore(join(this.stateDir, 'mailbox.json'), {
         legacyInboxPath:
           this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'),
+      });
+      this.wakeups = new WakeupRedriveService({
+        store: this.mailbox,
+        commandRunner: this.options.commandRunner ?? runCommand,
+        flushIntervalMs: this.config.wave?.flushIntervalMs ?? 1_000,
+        onError: error => {
+          this.lastError = String(error);
+        },
+        ...(this.options.wakeupIdleCheck
+          ? { idleCheck: this.options.wakeupIdleCheck }
+          : {}),
       });
       const keyPath = join(this.stateDir, 'identity.json');
       const keyPair = existsSync(keyPath) ? JSON.parse(readFileSync(keyPath, 'utf8')) : generateNodeKeyPair();
@@ -334,7 +341,6 @@ export class DealerNodeRuntime {
         createScriptSourcePlugin,
         createDedupCasPolicyPlugin,
         isDedupCasDuplicateReceipt,
-        createWaveCoalescerPolicyPlugin,
         createOrcaSpawnExecutorPlugin,
         createOrcaWaveExecutorPlugin,
         createAgentPtyExecutorPlugin,
@@ -515,10 +521,21 @@ export class DealerNodeRuntime {
     return undefined;
   }
 
-  resolveExecutorName(envelope: { kind: string; payload?: Record<string, any> }): string {
+  resolveExecutorName(envelope: {
+    kind: string;
+    payload?: Record<string, any>;
+    semantic?: { type?: string };
+  }): string {
     const explicit = envelope.payload?.executor;
-    return typeof explicit === 'string' && explicit.trim().length > 0
-      ? explicit : this.resolveTopicDefaultExecutor(envelope.kind) ?? this.config.defaultExecutor;
+    if (typeof explicit === 'string' && explicit.trim().length > 0) {
+      return explicit;
+    }
+    // Session control must land in the target mailbox, never in a new worktree.
+    const type = envelope.semantic?.type;
+    if (type === 'question' || type === 'reply' || type === 'settle') {
+      return 'inbox';
+    }
+    return this.resolveTopicDefaultExecutor(envelope.kind) ?? this.config.defaultExecutor;
   }
 
   private integrationPlugin(): Plugin {
@@ -573,7 +590,11 @@ export class DealerNodeRuntime {
             ...this.config.executorConfig['agent-pty'],
             commandRunner: runner,
           }),
-          inbox: createInboxExecutorPlugin({ ...this.config.executorConfig.inbox, store: this.mailbox }),
+          inbox: createInboxExecutorPlugin({
+            ...this.config.executorConfig.inbox,
+            store: this.mailbox,
+            wakeup: this.wakeups,
+          }),
           notify: createNotifyExecutorPlugin({
             inboxPath: join(this.stateDir, 'notifications.jsonl'),
             ...this.config.executorConfig.notify,
@@ -598,17 +619,30 @@ export class DealerNodeRuntime {
                   await this.transport.fetchBlobToPath(attachment.ticket, destination);
                   files.push(destination);
                 }
-                local.push({
-                  ...envelope,
-                  payload: { ...envelope.payload, localAttachments: files },
-                });
+                const localEnvelope = files.length
+                  ? { ...envelope, payload: { ...envelope.payload, localAttachments: files } }
+                  : envelope;
+                local.push(localEnvelope);
               }
               return executor.execute(local, context, config);
             },
           };
           const registration = ctx.services.dispatcher.registerExecutor(
             wrapped,
-            this.config.executorConfig[name] ?? {},
+            name === 'orca-wave'
+              ? {
+                  ...this.config.executorConfig[name],
+                  store: this.mailbox,
+                  wakeup: this.wakeups,
+                  wave: this.config.wave,
+                }
+              : name === 'orca-spawn'
+                ? {
+                    ...this.config.executorConfig[name],
+                    store: this.mailbox,
+                    wakeup: this.wakeups,
+                  }
+                : (this.config.executorConfig[name] ?? {}),
           );
           ctx.effect(() => () => registration.dispose());
         }
@@ -620,81 +654,18 @@ export class DealerNodeRuntime {
           );
           ctx.effect(() => () => registration.dispose());
         }
-        if (this.config.policies.includes('wave-coalescer')) {
-          const streamKey = (envelope: any) =>
-            JSON.stringify([envelope.networkId, envelope.payload?.streamKey ?? envelope.kind, 'orca-wave']);
-          this.wave = createWaveCoalescerPolicyPlugin({
-            executor: executors['orca-wave'],
-            executorConfig: {},
-            streamKey,
-            maxWaves: this.config.wave.rotateAfterWaves,
-            minAgeMs: this.config.wave.minAgeMs,
-            rotateSession: async (_command, _streamKey, streamConfig?: any) => {
-              const config = this.config.executorConfig['orca-wave'] ?? {};
-              const cwd = streamConfig?.cwd ?? config.cwd;
-              const orcaCommand = config.orcaCommand ?? 'orca';
-              const terminalHandle =
-                streamConfig?.terminalHandle ??
-                config.terminalHandle ??
-                (cwd ? await resolveOrcaWorkspaceTerminal(runner, orcaCommand, cwd) : undefined);
-              if (!terminalHandle) {
-                throw new Error('Session rotation requires terminalHandle or workspace cwd');
-              }
-              const result = await checkedCommand(runner, {
-                command: orcaCommand,
-                args: [
-                  'terminal',
-                  'send',
-                  '--terminal',
-                  terminalHandle,
-                  '--text',
-                  '/new',
-                  '--enter',
-                  '--json',
-                ],
-                cwd,
-              });
-              if (JSON.parse(result.stdout).ok === false) {
-                throw new Error('Session rotation failed');
-              }
-            },
-          });
-          const registration = ctx.services.dispatcher.registerPolicy({
-            name: 'wave-coalescer',
-            process: (envelope, next) => {
-              if (this.resolveExecutorName(envelope) !== 'orca-wave') {
-                return next([envelope]);
-              }
-              this.streams.add(streamKey(envelope));
-              return this.wave!.process(envelope, next);
-            },
-          });
-          ctx.effect(() => () => registration.dispose());
-          this.timer = setInterval(() => {
-            if (!this.flushing) {
-              this.flushing = this.flushWaves()
-                .catch(error => {
-                  this.lastError = String(error);
-                })
-                .finally(() => {
-                  this.flushing = undefined;
-                });
-            }
-          }, this.config.wave.flushIntervalMs ?? 1000);
-          this.timer.unref();
-          ctx.effect(() => async () => {
-            clearInterval(this.timer);
-            await this.flushing;
-          });
-        }
       },
     };
   }
 
+  /** Deterministic flush of pending durable wakeups (primary test/inspection hook). */
+  async flushWakeups(): Promise<void> {
+    await this.wakeups.flushWakeups();
+  }
+
+  /** Backwards-compatible alias for the retired in-memory wave coalescer. */
   async flushWaves(): Promise<void> {
-    for (const key of this.streams) {
-      await this.wave?.flushWave(key);
-    }
+    await this.flushWakeups();
   }
 
   async mountNetwork(network: NetworkMountConfig & { role?: string }): Promise<void> {
@@ -954,14 +925,18 @@ export class DealerNodeRuntime {
     }
     this.server = undefined;
     try {
-      await this.kernel.stop();
+      await this.wakeups?.stop();
     } finally {
-      if (this.ownsLock) {
-        rmSync(this.socketPath, { force: true });
-        rmSync(join(this.stateDir, 'runtime.lock'), { recursive: true, force: true });
-        this.ownsLock = false;
+      try {
+        await this.kernel.stop();
+      } finally {
+        if (this.ownsLock) {
+          rmSync(this.socketPath, { force: true });
+          rmSync(join(this.stateDir, 'runtime.lock'), { recursive: true, force: true });
+          this.ownsLock = false;
+        }
+        this.started = false;
       }
-      this.started = false;
     }
   }
 }

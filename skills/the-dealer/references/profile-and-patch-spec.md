@@ -2,8 +2,8 @@
 
 | Profile | Default gate | Policies | Executors | Default executor |
 | --- | --- | --- | --- | --- |
-| personal-dev | approval_required | dedup-cas, wave-coalescer | orca-spawn, orca-wave, notify | orca-spawn |
-| dedicated-worker | open | dedup-cas, wave-coalescer | orca-spawn, orca-wave, agent-pty | orca-spawn |
+| personal-dev | approval_required | dedup-cas | orca-spawn, orca-wave, notify | orca-spawn |
+| dedicated-worker | open | dedup-cas | orca-spawn, orca-wave, agent-pty | orca-spawn |
 | headless-relay | open | none | notify | notify |
 
 The headless profile receives into a private notification inbox and can route
@@ -45,12 +45,17 @@ optional `bootstrapPeers`, `admissionMode`, `exposedSkills`, and local `role`.
 Avoid selecting `orca-wave` until its target and authoritative idle check are
 configured. The default check inspects the workspace and descendants.
 
-The wave policy applies only to envelopes selecting `orca-wave`; other
-executors dispatch immediately after dedup. Stream identity includes network,
-`payload.streamKey` (or message kind), and executor. Busy work is buffered;
-a timer retries flushing. Before the next wave, rotation sends `/new` to the
-configured terminal after `rotateAfterWaves` waves **or** `minAgeMs` elapsed
-(the underlying policy uses OR, not AND). A terminal handle is required for
+A wake target applies only to envelopes selecting `orca-wave`; other executors
+dispatch immediately after dedup. Stream identity includes network,
+`payload.streamKey` (or message kind), and executor. `orca-wave` durably
+enqueues the batch into its mailbox and records a wake target, returning
+`dispatched` even when the workspace is busy. `wave.minAgeMs` is the coalescing
+delay before a pointer (a message's `payload.minAgeMs` overrides it), and
+`wave.flushIntervalMs` controls the redrive timer. `WakeupRedriveService` never
+injects text into a busy, timed-out, or unverifiable terminal. Before the next
+pointer, rotation sends `/new` to the configured terminal only after the
+previous lease is acknowledged and `completedWaves >= rotateAfterWaves`; it
+never rotates an unacknowledged batch. A terminal handle is required for
 rotation even when deliveries target a run. Configure only a terminal whose
 rotation you own. `payload.executor` can select any enabled executor, so
 expose only executors permitted for admitted peers.

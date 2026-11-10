@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   existsSync,
@@ -12,57 +12,16 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
-
-export interface CommandRequest {
-  command: string;
-  args: readonly string[];
-  cwd?: string;
-  input?: string;
-  signal?: AbortSignal;
-}
-
-export type CommandRunner = (
-  request: CommandRequest,
-) => Promise<{ stdout: string; stderr?: string; exitCode?: number }>;
-
-export const runCommand: CommandRunner = request =>
-  new Promise((resolve, reject) => {
-    const child = spawn(request.command, [...request.args], {
-      cwd: request.cwd,
-      signal: request.signal,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: false,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => {
-      stdout += chunk;
-    });
-    child.stderr.on('data', chunk => {
-      stderr += chunk;
-    });
-    child.on('error', reject);
-    child.on('close', code =>
-      code === 0
-        ? resolve({ stdout, stderr, exitCode: code })
-        : reject(new Error(`${request.command} exited ${code}: ${(stderr || stdout).trim()}`)),
-    );
-    child.stdin.on('error', reject);
-    child.stdin.end(request.input);
-  });
-
-export async function checkedCommand(runner: CommandRunner, request: CommandRequest) {
-  const result = await runner(request);
-  if (result.exitCode !== undefined && result.exitCode !== 0) {
-    throw new Error(
-      `${request.command} exited ${result.exitCode}: ${(result.stderr || result.stdout).trim()}`,
-    );
-  }
-  return result;
-}
+import { resolveMailboxId } from '../mailbox/index.ts';
+import { MailboxStore } from '../mailbox/index.ts';
+import { buildTaskPreamble } from '../mailbox/index.ts';
+import type { WakeupRedriveService } from '../mailbox/index.ts';
+import {
+  checkedCommand,
+  runCommand,
+  sendOrcaTerminalText,
+} from '../orca-workspace/index.ts';
+import type { CommandRunner } from '../orca-workspace/index.ts';
 
 export function renderWave(batch: readonly MessageEnvelope[]): string {
   return batch
@@ -121,6 +80,9 @@ export interface OrcaSpawnOptions extends AgentOptions {
   seaCreatureNaming?: boolean;
   agySettingsPath?: string;
   interactiveCommand?: string;
+  /** Durable task mailbox ledger; always supplied by DealerNodeRuntime. */
+  store?: MailboxStore;
+  wakeup?: WakeupRedriveService;
 }
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -335,6 +297,8 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const command = options.orcaCommand ?? 'orca';
       const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
+      const store = options.store ?? config.store;
+      const wakeup = options.wakeup ?? config.wakeup;
       const configuredCwd =
         (typeof config.cwd === 'string' && config.cwd ? config.cwd : undefined) ?? options.cwd;
       const projectId =
@@ -452,6 +416,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         const terminalHandle =
           terminal.result?.terminal?.handle ?? terminal.result?.handle ?? terminal.handle;
         if (typeof terminalHandle === 'string' && terminalHandle) {
+          const handle = String(terminalHandle);
           if (typeof payload.workspaceComment === 'string' && payload.workspaceComment.trim()) {
             await checkedCommand(runner, {
               command,
@@ -468,43 +433,114 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
               signal: context.signal,
             });
           }
-          try {
-            await runner({
-              command,
-              args: [
-                'terminal',
-                'wait',
-                '--terminal',
-                String(terminalHandle),
-                '--for',
-                'tui-idle',
-                '--timeout-ms',
-                '30000',
-                '--json',
-              ],
-              cwd: path,
-              signal: context.signal,
-            });
-          } catch {
-            // A wait timeout does not invalidate an already-idle TUI; send the prompt regardless.
+          if (store && batch[0]) {
+            // The task is durable before any keystroke. Spawn owns the first idle window; a crash
+            // leaves pendingWake behind so WakeupRedriveService takes over after restart.
+            const mailboxId = `task:${batch[0].id}`;
+            const claim = wakeup?.claim(mailboxId);
+            try {
+              store.enqueue(batch, {
+                mailboxId,
+                wakeTarget: {
+                  mode: 'orca-terminal',
+                  orcaCommand: command,
+                  workspacePath: path,
+                  terminalHandle: handle,
+                  coalesceMs: 0,
+                  ...(typeof payload.workspaceComment === 'string' &&
+                  payload.workspaceComment.trim()
+                    ? { workspaceComment: payload.workspaceComment }
+                    : {}),
+                },
+              });
+              let idle = false;
+              try {
+                const waited = await checkedCommand(runner, {
+                  command,
+                  args: [
+                    'terminal',
+                    'wait',
+                    '--terminal',
+                    handle,
+                    '--for',
+                    'tui-idle',
+                    '--timeout-ms',
+                    '5000',
+                    '--json',
+                  ],
+                  cwd: path,
+                  signal: context.signal,
+                });
+                idle = JSON.parse(waited.stdout).ok === true;
+              } catch {
+                idle = false;
+              }
+              if (idle) {
+                await sendOrcaTerminalText(
+                  runner,
+                  command,
+                  handle,
+                  buildTaskPreamble(mailboxId, batch[0].id),
+                  { cwd: path, signal: context.signal, waitSubmit: 5 },
+                );
+                store.upsertWakeTarget(mailboxId, {
+                  pendingWake: false,
+                  attemptCount: 0,
+                  earliestWakeAt: 0,
+                  lastWakeError: undefined,
+                });
+              } else {
+                // Never inject into a busy or unverifiable terminal; the redrive service will.
+                store.upsertWakeTarget(mailboxId, { pendingWake: true });
+              }
+            } finally {
+              claim?.dispose();
+            }
+          } else {
+            // Standalone executors have no mailbox ledger; keep the explicit prompt but never
+            // send it without a confirmed tui-idle.
+            let idle = false;
+            try {
+              const waited = await checkedCommand(runner, {
+                command,
+                args: [
+                  'terminal',
+                  'wait',
+                  '--terminal',
+                  handle,
+                  '--for',
+                  'tui-idle',
+                  '--timeout-ms',
+                  '5000',
+                  '--json',
+                ],
+                cwd: path,
+                signal: context.signal,
+              });
+              idle = JSON.parse(waited.stdout).ok === true;
+            } catch {
+              idle = false;
+            }
+            if (idle) {
+              await checkedCommand(runner, {
+                command,
+                args: [
+                  'terminal',
+                  'send',
+                  '--terminal',
+                  handle,
+                  '--text',
+                  terminalPrompt,
+                  '--enter',
+                  '--wait-submit',
+                  '5',
+                  '--json',
+                ],
+                cwd: path,
+                signal: context.signal,
+              });
+            }
           }
-          await checkedCommand(runner, {
-            command,
-            args: [
-              'terminal',
-              'send',
-              '--terminal',
-              String(terminalHandle),
-              '--text',
-              terminalPrompt,
-              '--enter',
-              '--wait-submit',
-              '5',
-              '--json',
-            ],
-            cwd: path,
-            signal: context.signal,
-          });
         }
         return {
           executor: 'orca-spawn',
@@ -548,287 +584,102 @@ export interface OrcaWaveOptions {
   cwd?: string;
   orcaCommand?: string;
   commandRunner?: CommandRunner;
-  idleCheck?: () => Promise<{ idle: boolean; reason?: string }>;
+  /** Durable mailbox ledger; always supplied by DealerNodeRuntime. */
+  store?: MailboxStore;
+  wakeup?: WakeupRedriveService;
+  /** Default coalescing/rotation settings; payload values take precedence. */
+  wave?: { minAgeMs?: number; rotateAfterWaves?: number };
 }
 
-interface OrcaTerminalRow {
-  handle: string;
-  connected: boolean;
-  writable?: boolean;
-  preview?: unknown;
-  agentIdentity?: unknown;
-  lastOutputAt?: unknown;
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined;
 }
 
-/** Resolve the freshest connected antigravity terminal in an Orca workspace, spawning one if needed. */
-export async function resolveOrcaWorkspaceTerminal(
-  runner: CommandRunner,
-  command: string,
-  cwd: string,
-  signal?: AbortSignal,
-): Promise<string> {
-  const listed = await checkedCommand(runner, {
-    command,
-    args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
-    cwd,
-    signal,
-  });
-  const terminals = (JSON.parse(listed.stdout)?.result?.terminals ?? []) as OrcaTerminalRow[];
-  const connected = terminals.filter(t => t && t.connected && t.writable !== false);
-  const preferred = connected.filter(t => t.agentIdentity === 'antigravity');
-  const matched = (preferred.length ? preferred : connected).sort(
-    (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
-  );
-  if (matched.length) {
-    return String(matched[0].handle);
-  }
-  const spawned = await checkedCommand(runner, {
-    command,
-    args: [
-      'terminal',
-      'spawn',
-      '--worktree',
-      `path:${cwd}`,
-      '--agent',
-      'antigravity',
-      '--wait',
-      '--json',
-    ],
-    cwd,
-    signal,
-  });
-  const raw = JSON.parse(spawned.stdout);
-  const handle = raw.result?.terminal?.handle ?? raw.result?.handle;
-  if (handle === undefined || handle === null || handle === '') {
-    throw new Error('Orca terminal spawn returned no handle');
-  }
-  return String(handle);
+function optionalPositiveInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
 }
 
-export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions): ExecutorPlugin {
-  const runner = options.commandRunner ?? runCommand;
-  const command = options.orcaCommand ?? 'orca';
-  const resolveTarget = (
-    runtimeConfig?: Partial<OrcaWaveOptions>,
-    batch?: readonly MessageEnvelope[],
-  ) => {
-    const payload = batch?.[0]?.payload ?? {};
-    return {
-      cwd:
-        typeof payload.workspacePath === 'string' && payload.workspacePath
-          ? payload.workspacePath
-          : typeof payload.cwd === 'string' && payload.cwd
-            ? payload.cwd
-            : (runtimeConfig?.cwd ?? options.cwd),
-      runId:
-        typeof payload.runId === 'string' && payload.runId
-          ? payload.runId
-          : (runtimeConfig?.runId ?? options.runId),
-      terminalHandle:
-        typeof payload.terminalHandle === 'string' && payload.terminalHandle
-          ? payload.terminalHandle
-          : (runtimeConfig?.terminalHandle ?? options.terminalHandle),
-    };
-  };
-  const checkIdle = async (runtimeConfig?: Partial<OrcaWaveOptions>) => {
-    if (options.idleCheck) {
-      return options.idleCheck();
-    }
-    const target = resolveTarget(runtimeConfig);
-    if (!target.cwd) {
-      return { idle: false, reason: 'cwd or authoritative idleCheck required' };
-    }
-    const output = await checkedCommand(runner, {
-      command,
-      args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'],
-      cwd: target.cwd,
-    });
-    const raw = JSON.parse(output.stdout);
-    const inventory = raw.result;
-    if (raw.ok !== true || !inventory || inventory.truncated || !Array.isArray(inventory.worktrees)) {
-      return { idle: false, reason: 'Incomplete workspace inventory' };
-    }
-    type Workspace = {
-      path: string;
-      worktreeId: string;
-      childWorktreeIds?: string[];
-      unverifiableTerminalCount?: number;
-      agents?: { state?: string }[];
-    };
-    const rows: Workspace[] = inventory.worktrees;
-    const root = rows.find(row => row.path === target.cwd);
-    if (!root) {
-      return { idle: false, reason: 'Workspace not found' };
-    }
-    const visited = new Set<string>();
-    const idleTree = async (row: Workspace): Promise<boolean> => {
-      if (visited.has(row.worktreeId)) {
-        return false;
-      }
-      visited.add(row.worktreeId);
-      if (
-        row.unverifiableTerminalCount !== 0 ||
-        !row.agents ||
-        row.agents.some(agent => agent.state !== 'done')
-      ) {
-        return false;
-      }
-      const listed = await checkedCommand(runner, {
-        command,
-        args: ['terminal', 'list', '--worktree', `path:${row.path}`, '--json'],
-        cwd: target.cwd,
-      });
-      const terminals = JSON.parse(listed.stdout);
-      if (
-        terminals.ok !== true ||
-        terminals.result?.truncated ||
-        !Array.isArray(terminals.result?.terminals)
-      ) {
-        return false;
-      }
-      const handles: OrcaTerminalRow[] = terminals.result.terminals;
-      // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
-      if (handles.length < row.agents.length) {
-        return false;
-      }
-      for (const terminal of handles) {
-        if (!terminal.connected || !terminal.writable) {
-          return false;
-        }
-        const realOrcaTerminal =
-          typeof terminal.preview === 'string' || typeof terminal.agentIdentity === 'string';
-        if (!realOrcaTerminal) {
-          // Synthetic or older inventory without TUI metadata: ask Orca directly.
-          try {
-            const waited = await checkedCommand(runner, {
-              command,
-              args: [
-                'terminal',
-                'wait',
-                '--terminal',
-                terminal.handle,
-                '--for',
-                'tui-idle',
-                '--timeout-ms',
-                '1',
-                '--json',
-              ],
-              cwd: target.cwd,
-            });
-            if (JSON.parse(waited.stdout).ok !== true) {
-              return false;
-            }
-          } catch {
-            return false;
-          }
-          continue;
-        }
-        if (typeof terminal.preview === 'string') {
-          // A trailing "> " is an unsent composer draft; a bare ">" is an idle prompt.
-          const lastLine = terminal.preview
-            .split(/\r?\n/)
-            .filter(line => line.trim())
-            .at(-1);
-          if (lastLine?.trimStart().startsWith('> ')) {
-            return false;
-          }
-        }
-      }
-      for (const id of row.childWorktreeIds ?? []) {
-        const child = rows.find(item => item.worktreeId === id);
-        if (!child || !(await idleTree(child))) {
-          return false;
-        }
-      }
-      return true;
-    };
-    const idle = await idleTree(root);
-    return { idle, reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable' };
-  };
+/**
+ * Durable wave ingestion. The batch is committed to its logical stream mailbox before any
+ * pointer is attempted; a busy workspace or a daemon restart resumes from `pendingWake`, so an
+ * executor never rejects a wave merely because the workspace is busy.
+ */
+export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): ExecutorPlugin {
   return {
     name: 'orca-wave',
-    checkIdle,
-    async execute(batch, context, runtimeConfig) {
-      const target = resolveTarget(runtimeConfig as Partial<OrcaWaveOptions>, batch);
-      if (!(await checkIdle(target)).idle) {
-        throw new Error('Orca workspace is busy');
+    async execute(batch, _context, runtimeConfig) {
+      const config = (runtimeConfig ?? {}) as Partial<OrcaWaveOptions>;
+      const store = options.store ?? config.store;
+      if (!store) {
+        throw new Error('orca-wave requires a durable mailbox store');
       }
-      let terminalHandle = target.terminalHandle;
-      if (!target.runId && !terminalHandle && target.cwd) {
-        terminalHandle = await resolveOrcaWorkspaceTerminal(
-          runner,
-          command,
-          target.cwd,
-          context.signal,
-        );
+      const wakeup = options.wakeup ?? config.wakeup;
+      const first = batch[0];
+      if (!first) {
+        throw new Error('Empty wave batch');
       }
-      if (!target.runId && !terminalHandle) {
-        throw new Error('Orca wave requires runId or terminalHandle');
-      }
-      const text =
-        !target.runId &&
-        batch.some(e => typeof e.payload?.terminalPrompt === 'string' && e.payload.terminalPrompt)
-          ? batch
-              .map(e =>
-                String(e.payload?.terminalPrompt || e.body)
-                  .replace(/\s*\n+\s*/g, ' ')
-                  .trim(),
-              )
-              .join(' ； ')
-          : renderWave(batch);
-      const args = target.runId
-        ? [
-            'orchestration',
-            'send',
-            '--to',
-            `run:${target.runId}`,
-            '--subject',
-            `Dealer wave (${batch.length})`,
-            '--body',
-            renderWave(batch),
-            '--json',
-          ]
-        : [
-            'terminal',
-            'send',
-            '--terminal',
-            terminalHandle!,
-            '--text',
-            text,
-            '--enter',
-            '--json',
-          ];
-      const output = await checkedCommand(runner, {
-        command,
-        args,
-        cwd: target.cwd,
-        signal: context.signal,
+      const command = options.orcaCommand ?? 'orca';
+      const payload = (first.payload ?? {}) as Record<string, unknown>;
+      const mailboxId = resolveMailboxId(first, 'orca-wave');
+      const cwd =
+        optionalString(payload.workspacePath) ??
+        optionalString(payload.cwd) ??
+        config.cwd ??
+        options.cwd;
+      const runId =
+        optionalString(payload.runId) ?? config.runId ?? options.runId;
+      const terminalHandle =
+        optionalString(payload.terminalHandle) ??
+        config.terminalHandle ??
+        options.terminalHandle;
+      const waveConfig = config.wave ?? options.wave;
+      const requestedMinAge =
+        typeof payload.minAgeMs === 'number' && Number.isFinite(payload.minAgeMs)
+          ? Math.max(0, payload.minAgeMs)
+          : Math.max(0, waveConfig?.minAgeMs ?? 0);
+      const rotateAfterWaves =
+        optionalPositiveInteger(payload.rotateAfterWaves) ??
+        optionalPositiveInteger(waveConfig?.rotateAfterWaves);
+      const worktreeId = optionalString(payload.worktreeId);
+      const workspaceComment = String(
+        batch.at(-1)?.payload?.workspaceComment || `Dealer: ${mailboxId} pending`,
+      );
+      const enqueued = store.enqueue(batch, {
+        mailboxId,
+        wakeTarget: {
+          mode: runId ? 'orca-run' : 'orca-terminal',
+          orcaCommand: command,
+          coalesceMs: requestedMinAge,
+          ...(runId ? { runId } : {}),
+          ...(cwd ? { workspacePath: cwd } : {}),
+          ...(worktreeId ? { worktreeId } : {}),
+          ...(terminalHandle ? { terminalHandle } : {}),
+          ...(rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
+          workspaceComment,
+        },
       });
-      const delivery = JSON.parse(output.stdout);
-      if (delivery.ok === false) {
-        throw new Error('Orca wave delivery failed');
+      let woke = false;
+      let reason: string | undefined;
+      if (wakeup) {
+        try {
+          const result = await wakeup.flushMailbox(mailboxId);
+          woke = result.woke;
+          reason = result.reason;
+        } catch (error) {
+          // Durable ingestion already succeeded; the redrive timer owns retry.
+          reason = String(error);
+        }
       }
-      const comment = await checkedCommand(runner, {
-        command,
-        args: [
-          'worktree',
-          'set',
-          '--worktree',
-          target.cwd ? `path:${target.cwd}` : 'current',
-          '--comment',
-          String(
-            batch.at(-1)?.payload?.workspaceComment ||
-              `Dealer: dispatched ${batch.length} message(s)`,
-          ),
-          '--json',
-        ],
-        cwd: target.cwd,
-        signal: context.signal,
-      });
-      if (JSON.parse(comment.stdout).ok === false) {
-        throw new Error('Orca comment update failed after delivery');
-      }
-      return { executor: 'orca-wave', executionId: randomUUID(), delivery };
+      return {
+        executor: 'orca-wave',
+        executionId: randomUUID(),
+        mailboxId,
+        inserted: enqueued.inserted,
+        woke,
+        ...(reason !== undefined ? { reason } : {}),
+      };
     },
   };
 }
@@ -889,6 +740,8 @@ export function createNotifyExecutorPlugin(options: NotifyOptions = {}): Executo
 export interface InboxExecutorOptions {
   inboxPath?: string;
   store?: MailboxStore;
+  /** Reactive redrive for replies/questions/settlements landing in a live wake target. */
+  wakeup?: WakeupRedriveService;
 }
 
 export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): ExecutorPlugin {
@@ -908,7 +761,11 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
       }
       const inserted: string[] = [];
       for (const [mailboxId, envelopes] of groups) {
-        inserted.push(...store.enqueue(envelopes, { mailboxId }).inserted);
+        const result = store.enqueue(envelopes, { mailboxId });
+        inserted.push(...result.inserted);
+        if (result.inserted.length > 0) {
+          options.wakeup?.notifyMailbox(mailboxId);
+        }
       }
       return {
         executor: 'inbox',

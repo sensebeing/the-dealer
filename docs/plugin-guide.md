@@ -39,7 +39,7 @@ export const customAlertSourcePlugin: Plugin<CustomAlertSourceConfig> = {
 1. **`SourcePlugin` (`emitter.registerSource`)**: Connect external webhooks, watermark pollers (Lark Base, Source Hub feedback claims, runtime quality monitors), or custom scripts to emit messages into any mounted `Network`.
 2. **`RouteJudgePlugin` (`router.registerJudge`)**: Inspect an outbound `MessageEnvelope` with `routing.mode === "auto"` and the live list of candidate `NodeCard`s in that `Network`, returning a `RouteDecision` (`unicast`, `multicast`, or `broadcast`).
 3. **`GateRulePlugin` (`gate.registerRule`)**: Hook into `gate/evaluate` (`bail` mode) to allow, require human approval (`pending_approval`), queue under DND (`queued_dnd`), or reject inbound messages by sender member, skill, or message kind.
-4. **`DispatchPolicyPlugin` (`dispatcher.registerPolicy`)**: Wrap inbound execution with CAS idempotency watermarks (`policy-dedup-cas`) or wave coalescing + workspace idle gates + automatic `/new` session rotation (`policy-wave-coalescer`).
+4. **`DispatchPolicyPlugin` (`dispatcher.registerPolicy`)**: Wrap inbound execution with CAS idempotency watermarks (`policy-dedup-cas`). Durable wave/task wakeup is owned by `MailboxStore` and `WakeupRedriveService`, not by a policy plugin.
 5. **`ExecutorPlugin` (`dispatcher.registerExecutor`)**: Actuate admitted messages locally—e.g., spawning an isolated Orca worktree + agent terminal (`executor-orca-spawn`), delivering a coalesced wave to a resident Orca workspace (`executor-orca-wave`), or running a local CLI agent (`executor-agent-pty`).
 
 ## 3. Three-tier onboarding: built-in, project, user
@@ -108,7 +108,7 @@ export function createPlugin(config, context) {
 
 The factory context includes `projectRoot` (project plugins only), `stateDir`,
 `runtime`, the parsed `userPatch`, and `api`. The `api` bag exposes the built-in
-webhook/poll-watermark/script source factories, dedup-CAS/wave-coalescer policy
+webhook/poll-watermark/script source factories, dedup-CAS policy
 factories, Orca spawn/wave, agent-PTY and notify executor factories, and local-agent
 and LLM-API router factories under their exported `create*Plugin` names. Both
 project and user factories can call, for example,

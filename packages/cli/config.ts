@@ -15,14 +15,14 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
   'personal-dev': {
     name: 'personal-dev',
     gateMode: 'approval_required',
-    policies: ['dedup-cas', 'wave-coalescer'],
+    policies: ['dedup-cas'],
     executors: ['orca-spawn', 'orca-wave', 'notify', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'dedicated-worker': {
     name: 'dedicated-worker',
     gateMode: 'open',
-    policies: ['dedup-cas', 'wave-coalescer'],
+    policies: ['dedup-cas'],
     executors: ['orca-spawn', 'orca-wave', 'agent-pty', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
@@ -271,7 +271,12 @@ export function validateConfig(config: RuntimeConfig): void {
       throw new Error('Invalid executorConfig');
     }
   }
-  if (config.policies.some(p => !['dedup-cas', 'wave-coalescer'].includes(p))) {
+  if (!Array.isArray(config.policies)) {
+    throw new Error('Policies must be an array');
+  }
+  // Legacy configs persist the retired wave-coalescer policy; durable mailbox wakeup replaced it.
+  config.policies = config.policies.filter(policy => policy !== 'wave-coalescer');
+  if (config.policies.some(policy => policy !== 'dedup-cas')) {
     throw new Error('Unknown policy');
   }
   for (const network of config.networks) {

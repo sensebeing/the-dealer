@@ -70,7 +70,7 @@ flowchart TB
         
         subgraph DispPipeline["Dispatcher Plugins"]
             direction TB
-            Pol["Policy Plugins<br/>- dedup-cas (代次水位防重)<br/>- wave-coalescer (波次聚合 + Idle Gate + 会话轮转)"]
+            Pol["Policy / Mailbox Plugins<br/>- dedup-cas (代次水位防重)<br/>- MailboxStore + WakeupRedriveService (持久化波次、Idle Gate、单行指针、会话轮转)"]
             Exec["Executor Plugins<br/>- executor-orca-spawn (自动新建 Orca 工作区 + 起 Agent)<br/>- executor-orca-wave (投递常驻工作区 / Run)<br/>- executor-agent-pty (直接拉起 Claude/Codex/AGY/DSH)<br/>- executor-notify (桌面/飞书交互审批)"]
             Pol --> Exec
         end
@@ -119,13 +119,13 @@ export interface Services {
 | `node/peer-updated` | `emit`（只读广播） | 发现新节点、节点名片（能力/负载/权限状态）变更或离线时触发 |
 | `emitter/prepare` | `waterfall`（洋葱中间件） | 消息发出前依次执行：注入发送方身份 → 打包本地文件为 Blob Ticket → 调用 `router` 解析目标节点列表 |
 | `gate/evaluate` | `bail`（短路裁决） | 收到入站消息时优先执行：按规则返回 `allow`、`queue_approval`（待确认）、`defer_dnd`（仅入队）或 `reject`；一旦非 `allow` 立即短路 |
-| `dispatcher/route` | `serial`（有序派发） | 通过 `gate` 的消息先经 `PolicyPlugin`（CAS 去重、波次聚合、Idle Gate），就绪后交由匹配的 `ExecutorPlugin` 落地执行并回传 `DeliveryReceipt` |
+| `dispatcher/route` | `serial`（有序派发） | 通过 `gate` 的消息先经 `PolicyPlugin`（CAS 去重），就绪后交由匹配的 `ExecutorPlugin` 落地执行并回传 `DeliveryReceipt`；非 `rejected` / `failed` 的放行结果统一触发 `dispatcher/inbound`，驱动信箱反向路由与持久化唤醒 |
 
 ### 3. `Profile + Bundle + Patch` 声明式配置
 与 `dsh` 一致，节点运行时是一棵由 YAML 组装的插件树，保存在 `~/.dealer/profile.yaml`（并支持通过 Agent Skill 写入 `patch.yaml` 实时热更新）：
 - **内置 Profile 模板**：
   - `personal-dev`（个人研发节点：开启 mDNS + Team Swarm、Orca Spawn/Wave 执行器、Claude/Codex/AGY 路由判断器、跨人消息默认 `approval_required`）
-  - `dedicated-worker`（专属自动化节点，如你的 `prod-release`、`alert-processor`、`ios-crash`：对团队认证成员 `open`、开启 `wave-coalescer` 波次聚合与会话自动轮转）
+  - `dedicated-worker`（专属自动化节点，如你的 `prod-release`、`alert-processor`、`ios-crash`：对团队认证成员 `open`，通过持久化 `MailboxStore` + `WakeupRedriveService` 实现波次恢复、权威空闲门禁与会话自动轮转）
   - `headless-relay`（纯命令行或服务器节点：无 GUI 依赖，使用 `agent-pty` 执行器）
 
 ---
@@ -392,18 +392,17 @@ export interface ExecutorPlugin<C = unknown> {
 #### 官方核心内置插件清单（100% 覆盖并升维 `alter-service` 全部场景）
 
 1. **调度策略插件 (`packages/plugins-policy/`)**：
-   - **`plugin-policy-dedup-cas`**：基于 `idempotencyKey` 与单调代次水位（`claim_version / revision`）的本地 SQLite WAL 状态账本，确保同一事件精确派发一次，故障重启后沿用原回执对账，绝不重复建工作区。
-   - **`plugin-policy-wave-coalescer`**：直接提炼自 `alert_dispatcher.py`！支持按流配置：
-     - **Single Watermark & Wave Coalescing**：目标工作区忙碌时自动积压合并同类消息；
-     - **Idle Gate**：调用下游 Executor 的 `checkIdle()`，确认目标工作区及其子工作区无活跃任务、终端处于 `ready_empty` 时才发牌；
-     - **Session Rotation**：当常驻工作区累计完成 `N` 波次且满 `M` 小时，自动在派发新一波前执行 `/new` 会话轮转！
-2. **执行器插件 (`packages/plugins-executor/`)**：
+   - **`plugin-policy-dedup-cas`**：基于 `idempotencyKey` 与单调代次水位（`claim_version / revision`）的本地持久化状态账本，确保同一事件精确派发一次，故障重启后沿用原回执对账，绝不重复建工作区。
+2. **持久化信箱与唤醒重驱 (`packages/mailbox/`)**：
+   - **`MailboxStore`**：唯一原子落盘的信箱账本，承载逻辑 `mailboxId`、单未决租约 `dlv_*`、`wakeTargets` 重驱状态、`inbound:` / `outbound:` 方向化线程路由与旧 `inbox.json` 一次性迁移；通过文件锁 + `fsync`/`rename` 落盘，并以事件唤醒而非轮询驱动消费者。
+   - **`WakeupRedriveService`**：取代易失的 wave-coalescer。目标工作区忙碌或不可判定时只保留持久化 `pendingWake`，绝不注入文本；仅在权威 Orca 工作区/终端空闲门禁通过后投递严格单行指针，失败按 1s → 2s → 5s → 10s 退避，守护进程重启后自动恢复，租约确认后才按 `completedWaves` 阈值执行 `/new` 轮转。
+3. **执行器插件 (`packages/plugins-executor/`)**：
    - **`plugin-executor-orca-spawn`（独立工作区派生器）**：
      - 对应你的 `feedback_dispatcher`、低质会话派发与跨人协作 Request。
-     - 收到消息后：自动下载附件 Blob 到私有目录 → 调用 `orca worktree create` 创建独立工作区 → 预授权 `trustedWorkspaces` → 调用 `orca terminal create` 启动 `agy / claude / codex` → 渲染 Prompt 模板并确认投递成功。
+     - 收到消息后：自动下载附件 Blob 到私有目录 → 调用 `orca worktree create` 创建独立工作区 → 预授权 `trustedWorkspaces` → 调用 `orca terminal create` 启动 `agy / claude / codex` → 持久化任务信箱并等待 `tui-idle` 确认后才注入单行任务前言。
    - **`plugin-executor-orca-wave`（常驻工作区 / Run 投递器）**：
      - 对应你的 6 条告警流、`ios-crash` 与 `prod-release`（`run_9ae56f59708c`）。
-     - 收到单条或聚合波次消息后：直接投递给绑定的常驻 Orca 工作区 Coordinator 终端（或 `orca orchestration send --to run:<id>`），并自动更新 Orca 工作区卡片状态备注（如 `🚀 波次 #6 进行中...`）。
+     - 收到单条或聚合波次消息后：先持久化入队到 `stream:<streamKey>` 并登记唤醒目标；工作区忙碌时仍返回 `dispatched`，由 `WakeupRedriveService` 在空闲门禁通过后向绑定终端（或 `orca orchestration send --to run:<id>`）投递单行指针并更新卡片状态备注。
    - **`plugin-executor-agent-pty`（零 Orca 依赖的通用 CLI Agent 执行器）**：
      - 让全球任何没有安装 Orca 的开源用户也能开箱即用：通过本地 `git worktree` + 后台 PTY / `tmux` / headless 模式直接拉起 `claude`、`codex`、`deepseek-harness (dsh)` 或自定义 Shell 脚本处理任务，并将执行结果自动 `reply` 回发送节点。
 
@@ -454,7 +453,9 @@ the-dealer/                                 # 独立开源仓库根目录（建�
 │   ├── emitter/                            # @the-dealer/emitter：消息组装、附件自动转 Blob、SourcePlugin 宿主
 │   ├── router/                             # @the-dealer/router：三级路由链（Explicit -> Tag Rule -> AI/Agent Judge）
 │   ├── gate/                               # @the-dealer/gate：open / approval_required / dnd / closed 状态机与 ACL 规则
-│   ├── dispatcher/                         # @the-dealer/dispatcher：入站 SQLite WAL 账本、Policy 链与 Executor 宿主
+│   ├── dispatcher/                         # @the-dealer/dispatcher：入站账本、Policy 链与 Executor 宿主
+│   ├── mailbox/                            # @the-dealer/mailbox：持久化信箱账本、租约、方向化线程路由与 WakeupRedriveService
+│   ├── orca-workspace/                     # Orca 工作区/终端空闲检查、终端解析与单行投递的唯一 owner
 │   ├── plugins-source/                     # 官方内置发送触发源插件包
 │   │   ├── source-webhook/                 # 本地 HTTP Webhook 接收器
 │   │   ├── source-poll-watermark/          # 通用单水位轮询触发器（可配置对接 Lark / SourceHub / Monitor）
@@ -463,8 +464,7 @@ the-dealer/                                 # 独立开源仓库根目录（建�
 │   │   ├── router-llm-api/                 # 调用 OpenAI/Anthropic/DeepSeek兼容 API 根据 NodeCard 判定目标节点
 │   │   └── router-local-agent/             # 调用本机 Claude Code / Codex / AGY headless 判定目标节点
 │   ├── plugins-policy/                     # 官方内置入站调度策略插件包
-│   │   ├── policy-dedup-cas/               # 幂等水位与版本 CAS 防重插件
-│   │   └── policy-wave-coalescer/          # 波次聚合 + 空闲门禁 (Idle Gate) + 会话轮转 (/new) 插件
+│   │   └── policy-dedup-cas/               # 幂等水位与版本 CAS 防重插件
 │   ├── plugins-executor/                   # 官方内置终端派发执行器插件包
 │   │   ├── executor-orca-spawn/            # 自动新建 Orca Worktree 并拉起 Agent 会话处理
 │   │   ├── executor-orca-wave/             # 向常驻 Orca 工作区终端或受控 Run 投递波次并更新卡片状态
@@ -492,7 +492,7 @@ the-dealer/                                 # 独立开源仓库根目录（建�
    - 基于 Rust `iroh` 实现 `NodeId` 拨号、mDNS 局域网零配置自发现、跨网 QUIC 直连、`iroh-gossip` 千节点频道广播与 `NodeCard` 实时同步、`iroh-blobs` 多媒体/大文件流式传输。
 3. **Phase 3 — 发送路由与接收执行全插件生态 (`emitter` + `router` + `plugins-*`)**：
    - 实现三级智能路由链（显式 ID + Capability Tag + 本地 Agent/LLM Judge 插件）；
-   - 实现 `policy-dedup-cas`、`policy-wave-coalescer`（波次聚合 + Idle Gate + 会话轮转）；
+   - 实现 `policy-dedup-cas`、持久化 `MailboxStore` 与 `WakeupRedriveService`（波次恢复 + Idle Gate + 单行指针 + 会话轮转）；
    - 实现 `executor-orca-spawn`、`executor-orca-wave` 与通用的 `executor-agent-pty`。
 4. **Phase 4 — CLI、`dealer` 配套 Skill 与 `alter-service` 真实场景迁移验证**：
    - 交付 `dealer` / `dealerd` CLI 与 `skills/the-dealer/SKILL.md`；

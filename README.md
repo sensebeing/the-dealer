@@ -60,9 +60,12 @@ Modern AI engineering teams run multiple heterogeneous agents (**Antigravity**, 
    - Pluggable outbound triggers (`source-webhook`, `source-poll-watermark`, `source-script`, direct CLI/MCP).
    - 3-tier intelligent routing pipeline: **Explicit Selector** (`member:oliver`, `ben.xu@mbp`) → **Capability Tag Matcher** (`skill:ios-crash-triage`) → **AI Route Judge Plugin** (`router-local-agent` via AGY/Claude/Codex or `router-llm-api` reading live `NodeCard` capabilities). The local self card is a first-class candidate.
 5. **`@the-dealer/gate`**: Node-controlled inbound admission state machine (`open`, `approval_required` / Knock mode, `dnd` queue-only, `closed`) with fine-grained sender/skill trust rules. Self-originated local deliveries bypass approval knocks while still respecting `dnd` and `closed`.
-6. **`@the-dealer/dispatcher`**:
-   - **Policy Plugins**: `policy-dedup-cas` (monotonic version/watermark idempotency) and `policy-wave-coalescer` (single-watermark wave coalescing + per-stream workspace `Idle Gate` + automatic `/new` session rotation).
-   - **Executor Plugins**: `executor-orca-spawn` (spawns isolated Orca worktree + launches agent), `executor-orca-wave` (resolves the target workspace and active antigravity terminal per stream, delivers waves, and updates card status), `executor-agent-pty` (standalone CLI agent runner without Orca), and `executor-notify`.
+6. **`@the-dealer/dispatcher` & `@the-dealer/mailbox`**:
+   - **Policy Plugins**: `policy-dedup-cas` (monotonic version/watermark idempotency).
+   - **Durable Mailbox & Wakeup Redrive**: `MailboxStore` atomically persists inbound mail, a single outstanding lease (`dlv_*`), wake targets, and directional thread routes in `mailbox.json`; `WakeupRedriveService` survives daemon restarts, gates every single-line pointer on authoritative Orca workspace/terminal idleness, never injects into a busy terminal, and rotates `/new` only after an acknowledged batch reaches the configured threshold.
+   - **Inbox inspection and acknowledgement**: `dealer inbox check` leases the oldest unacknowledged batch, `dealer inbox ack <dlv_id>` completes it, and `dealer inbox list` is a read-only view; newer mail never mixes into an outstanding batch.
+   - **Executor Plugins**: `executor-orca-spawn` (spawns an isolated Orca worktree + agent and injects the task preamble only after confirmed idle), `executor-orca-wave` (durably enqueues waves and wakes the resident workspace), `executor-agent-pty` (standalone CLI agent runner without Orca), `executor-inbox` (local mailbox retention), and `executor-notify`.
+   - **Non-blocking conversation**: `dealer ask` / `reply` / `settle` / `thread show` return immediately and wake the peer through the durable mailbox, with no `--reply-to` blocking wait.
 
 ---
 
@@ -88,6 +91,13 @@ npm test
 # Deliver to this same node. `local` is only a stable scope name: no mount or passphrase required.
 ./bin/dealer.js send --network local --to member:ben.xu --topic collab.request.v1 --body '{"summary":"Run the local quality sweep"}' --json
 ./bin/dealer.js send --network local --to skill:agent-runtime --topic triage --body '{"area":"agent-runtime"}' --json
+
+# Non-blocking ask: returns immediately; the reply wakes this agent through the durable mailbox.
+./bin/dealer.js ask --network local --to member:ben.xu --topic collab.question.v1 --subject 'Ownership' --body '{"question":"Who owns retries?"}' --json
+./bin/dealer.js thread show <message-id> --json
+./bin/dealer.js inbox check --mailbox task:w1 --json
+./bin/dealer.js inbox ack <dlv_id> --mailbox task:w1 --json
+./bin/dealer.js inbox list --mailbox task:w1 --json
 ```
 
 A linked project's `defaultNetworkId` is the local scope its source plugins emit on; same-machine sends still route to the local self card.
