@@ -78,8 +78,12 @@ export function buildOnboardingPrompts(options: {
   const nodeName = options.nodeName ?? 'other-machine';
   const seeds = Array.isArray(options.seed) ? options.seed.join(',') : options.seed;
   const mount = `dealer network mount ${quote(inviteUri)}${seeds ? ` --seed ${quote(String(seeds))}` : ''} --json`;
-  const common = (identity: string) => [
-    'Set up the-dealer on this machine using the-dealer-setup skill. If dealer is absent, install from the trusted the-dealer checkout with npm link (Node >=22.6); do not overwrite an existing identity.',
+  const common = (identity: string, teammate = false) => [
+    'Set up the-dealer on this machine. Never overwrite ~/.dealer/identity.json or copy another machine’s private key. First check command -v dealer and node --version (Node >=22.6 required).',
+    'If dealer is absent, clone https://github.com/sensebeing/the-dealer.git into ~/the-dealer, or update that existing checkout with git -C ~/the-dealer pull --ff-only after checking for local changes; then run cd ~/the-dealer && npm install && npm link. If dealer is already installed, ensure this trusted checkout is available for the skills without replacing the existing installation.',
+    'Create ~/.agents/skills/ and ~/.claude/skills/. Symlink each of ~/the-dealer/skills/the-dealer, ~/the-dealer/skills/the-dealer-setup, and ~/the-dealer/skills/the-dealer-extend into both directories, and into ~/.gemini/config/skills/ if that directory exists. Preserve unrelated existing files and resolve conflicting skill links before changing them.',
+    'Read ~/the-dealer/skills/the-dealer-setup/SKILL.md, then run dealer setup probe --json before configuring anything.',
+    ...(teammate ? [`Ask for the teammate’s member handle before continuing; replace ${quote(peerMember)} below with their chosen handle. Ask for their Agent App (orca, antigravity, claude-code, codex, chatgpt-dot, grok-bot) and mode (spawn, fixed, inbox-only); generate dealer setup binding-preset --host <chosen-app> --mode <chosen-mode> --json (add --target-bot for grok-bot execution), then apply the reviewed preset through the setup skill.`] : []),
     `dealer node up --member ${quote(identity)} --name ${quote(nodeName)} --json`, mount,
     ...(options.projectId ? [`Link this local repository using dealer project link . --json; verify its projectId is ${quote(options.projectId)}.`] : []),
     `dealer peers list --network ${quote(networkId)} --json`,
@@ -88,7 +92,7 @@ export function buildOnboardingPrompts(options: {
   ].join('\n');
   return { networkId, inviteUri,
     crossMachinePrompt: common(member),
-    teammatePrompt: `${common(peerMember)}\nUse a durable inbox for collab.request.v4. Ask which Agent App and whether to use spawn (new conversation), fixed (dedicated conversation), or inbox-only before applying its binding preset.`,
+    teammatePrompt: `${common(peerMember, true)}\nUse a durable inbox for collab.request.v4 with the chosen conversation mode: spawn (new conversation), fixed (dedicated conversation), or inbox-only.`,
   };
 }
 

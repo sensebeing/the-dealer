@@ -2,7 +2,7 @@ import { createServer, createConnection, type Socket, type Server } from 'node:n
 import { createSocket, type Socket as DatagramSocket } from 'node:dgram';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, networkInterfaces } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
@@ -210,6 +210,7 @@ export interface TransportPluginOptions {
   listenHost?: string;
   advertisedHost?: string;
   discoveryInterface?: string;
+  multicast?: boolean;
   mDnsPort?: number;
   discoveryIntervalMs?: number;
   socketTimeoutMs?: number;
@@ -225,6 +226,13 @@ interface Mount {
 type Handler = (
   event: InboundFrameEvent & { rawBytes?: Uint8Array },
 ) => Promise<Uint8Array | void> | Uint8Array | void;
+
+/** Shared by the listener and offline invite generation. */
+export function defaultAdvertisedHost(options: TransportPluginOptions = {}): string {
+  if (options.advertisedHost) return options.advertisedHost;
+  if (options.listenHost && !['0.0.0.0', '::'].includes(options.listenHost)) return options.listenHost;
+  return Object.values(networkInterfaces()).flat().find(address => address?.family === 'IPv4' && !address.internal)?.address ?? '127.0.0.1';
+}
 
 export class P2PTransportService implements TransportService {
   readonly localNodeId: string;
@@ -276,33 +284,36 @@ export class P2PTransportService implements TransportService {
       this.server = server;
       server.listen(
         port ?? this.options.listenPort ?? 0,
-        this.options.listenHost ?? '127.0.0.1',
+        this.options.listenHost ?? '0.0.0.0',
       );
       await once(server, 'listening');
       const address = server.address();
       if (!address || typeof address === 'string') {
         throw new Error('Invalid listener address');
       }
-      this.endpointAddr = `${this.options.advertisedHost ?? '127.0.0.1'}:${address.port}`;
-      const udp = createSocket({ type: 'udp4', reuseAddr: true });
-      this.udp = udp;
-      udp.on('error', () => {}); // Registry discovery remains available on hosts disabling multicast.
-      udp.on('message', bytes => {
-        try {
-          this.learn(JSON.parse(bytes.toString()));
-        } catch {
-          // Unauthenticated discovery
-        }
-      });
-      udp.bind(this.options.mDnsPort ?? 45873, () => {
-        try {
-          udp.addMembership(GROUP, this.options.discoveryInterface ?? '127.0.0.1');
-          udp.setMulticastInterface(this.options.discoveryInterface ?? '127.0.0.1');
-          udp.setMulticastLoopback(true);
-        } catch {
-          // Multicast unavailable
-        }
-      });
+      const host = defaultAdvertisedHost(this.options);
+      this.endpointAddr = `${host.includes(':') ? `[${host}]` : host}:${address.port}`;
+      if (this.options.multicast !== false) {
+        const udp = createSocket({ type: 'udp4', reuseAddr: true });
+        this.udp = udp;
+        udp.on('error', () => {}); // Registry discovery remains available on hosts disabling multicast.
+        udp.on('message', bytes => {
+          try {
+            this.learn(JSON.parse(bytes.toString()));
+          } catch {
+            // Unauthenticated discovery
+          }
+        });
+        udp.bind(this.options.mDnsPort ?? 45873, () => {
+          try {
+            udp.addMembership(GROUP, this.options.discoveryInterface ?? '127.0.0.1');
+            udp.setMulticastInterface(this.options.discoveryInterface ?? '127.0.0.1');
+            udp.setMulticastLoopback(true);
+          } catch {
+            // Multicast unavailable
+          }
+        });
+      }
       this.timer = setInterval(() => {
         if (!this.tick) {
           this.tick = this.discover().finally(() => {
@@ -411,7 +422,7 @@ export class P2PTransportService implements TransportService {
     }
   }
 
-  private learn(frame: SealedNetworkFrame): void {
+  private learn(frame: SealedNetworkFrame): Mount | undefined {
     const m = [...this.mounts.values()].find(m => m.keys.swarmTopicId === frame.swarmTopicId);
     if (!m) {
       return;
@@ -429,10 +440,11 @@ export class P2PTransportService implements TransportService {
       return;
     }
     this.registerPeerEndpoint(m.config.networkId, frame.senderNodeId, beacon.endpointAddr);
+    return m;
   }
 
-  private async announce(m: Mount): Promise<void> {
-    const frame = sealNetworkFrame(
+  private discoveryFrame(m: Mount): SealedNetworkFrame {
+    return sealNetworkFrame(
       {
         type: 'discovery',
         endpointAddr: this.endpointAddr,
@@ -441,6 +453,10 @@ export class P2PTransportService implements TransportService {
       m.keys,
       this.localNodeId,
     );
+  }
+
+  private async announce(m: Mount): Promise<void> {
+    const frame = this.discoveryFrame(m);
     const bytes = Buffer.from(JSON.stringify(frame));
     const temp = `${m.file}.${randomUUID()}`;
     try {
@@ -452,8 +468,21 @@ export class P2PTransportService implements TransportService {
     try {
       this.udp?.send(bytes, m.config.mDnsPort ?? this.options.mDnsPort ?? 45873, GROUP);
     } catch {
-      // Local registry is authoritative fallback
+      // TCP seeds and the local registry remain available without multicast.
     }
+    await Promise.allSettled((m.config.bootstrapPeers ?? []).filter(seed => seed !== this.endpointAddr).map(async seed => {
+      const socket = this.track(createConnection(parseEndpoint(seed)));
+      socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
+      try {
+        socket.write(packet({ type: 'discovery', frame }));
+        const response = await new SocketReader(socket).json();
+        if (response.frame?.swarmTopicId !== m.keys.swarmTopicId || !this.learn(response.frame)) {
+          throw new Error('Invalid discovery response');
+        }
+      } finally {
+        socket.destroy();
+      }
+    }));
   }
 
   private async discover(): Promise<void> {
@@ -629,6 +658,12 @@ export class P2PTransportService implements TransportService {
 
   private async receive(socket: Socket): Promise<void> {
     const request = await new SocketReader(socket).json();
+    if (request.type === 'discovery') {
+      const mount = this.learn(request.frame);
+      if (!mount) throw new Error('Invalid discovery request');
+      socket.end(packet({ frame: this.discoveryFrame(mount) }));
+      return;
+    }
     if (request.type === 'blob') {
       const blob = this.blobs.get(request.hash);
       if (!blob) {
@@ -854,7 +889,7 @@ function parseEndpoint(address: string): { host: string; port: number } {
   if (!url.hostname || !Number.isInteger(port) || port < 1 || port > 65535 || url.pathname !== '') {
     throw new Error('Invalid endpoint');
   }
-  return { host: url.hostname, port };
+  return { host: url.hostname.replace(/^\[|\]$/g, ''), port };
 }
 
 function mimeType(name: string): string {

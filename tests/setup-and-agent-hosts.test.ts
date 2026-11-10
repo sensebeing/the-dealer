@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, networkInterfaces } from 'node:os';
+import { P2PTransportService, defaultAdvertisedHost } from '../packages/transport/index.ts';
 import { join } from 'node:path';
 import {
   AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli,
@@ -56,6 +57,17 @@ test('setup invite prompts reuse configured network, encode seeds, and do not mu
     assert.match(result.crossMachinePrompt, /--member 'alice'/);
     assert.match(result.teammatePrompt, /--member 'bob'/);
     assert.match(result.teammatePrompt, /collab.request.v4/);
+    for (const prompt of [result.crossMachinePrompt, result.teammatePrompt]) {
+      assert.match(prompt, /https:\/\/github.com\/sensebeing\/the-dealer.git/);
+      assert.match(prompt, /npm install && npm link/);
+      assert.match(prompt, /~\/\.agents\/skills\//);
+      assert.match(prompt, /~\/\.claude\/skills\//);
+      assert.match(prompt, /the-dealer-setup\/SKILL.md/);
+      assert.match(prompt, /dealer setup probe --json/);
+      assert.match(prompt, /Never overwrite ~\/\.dealer\/identity.json/);
+    }
+    assert.match(result.teammatePrompt, /Ask for the teammate’s member handle/);
+    assert.match(result.teammatePrompt, /dealer setup binding-preset/);
   }
 });
 
@@ -248,4 +260,67 @@ test('wake target host options merge, clear and validate after reload', t => {
   assert.equal(new MailboxStore(file).getWakeTarget('default')?.interactiveCommand, undefined);
   assert.throws(() => validateTopicBindings({ task: { executor: 'agent-pty', conversationMode: 'inbox-only' } }, ['agent-pty']), /Invalid topic binding/);
   assert.throws(() => validateTopicBindings({ task: { executor: 'orca-wave', agent: 'grok-bot' } }, ['orca-wave']), /Invalid topic binding/);
+});
+
+
+test('TCP seeds discover both directions without shared registry or multicast and reject foreign keys', async t => {
+  const root = directory(t);
+  const seed = new P2PTransportService({ discoveryDir: join(root, 'seed'), multicast: false });
+  const peer = new P2PTransportService({ discoveryDir: join(root, 'peer'), multicast: false, listenHost: '127.0.0.1' });
+  const foreign = new P2PTransportService({ discoveryDir: join(root, 'foreign'), multicast: false, listenHost: '127.0.0.1' });
+  t.after(async () => { await Promise.all([seed.dispose(), peer.dispose(), foreign.dispose()]); });
+  await seed.mountNetwork({ networkId: 'team', passphrase: 'shared' });
+  await peer.mountNetwork({ networkId: 'team', passphrase: 'shared', bootstrapPeers: ['127.0.0.1:1', seed.endpointAddr!] });
+  assert.ok(seed.endpointAddr!.startsWith(`${defaultAdvertisedHost()}:`));
+  assert.equal(peer.listPeerEndpoints('team').get(seed.localNodeId), seed.endpointAddr);
+  assert.equal(seed.listPeerEndpoints('team').get(peer.localNodeId), peer.endpointAddr);
+  seed.onInboundFrame(() => Buffer.from('seed reply'));
+  peer.onInboundFrame(() => Buffer.from('peer reply'));
+  assert.equal(Buffer.from(await peer.sendUnicast('team', seed.localNodeId, Buffer.from('ping'))).toString(), 'seed reply');
+  assert.equal(Buffer.from(await seed.sendUnicast('team', peer.localNodeId, Buffer.from('ping'))).toString(), 'peer reply');
+  await foreign.mountNetwork({ networkId: 'team', passphrase: 'wrong', bootstrapPeers: [seed.endpointAddr!] });
+  assert.equal(foreign.listPeerEndpoints('team').size, 0);
+  assert.equal(seed.listPeerEndpoints('team').has(foreign.localNodeId), false);
+});
+
+test('advertised host prefers overrides, explicit listeners, then the primary LAN IPv4', () => {
+  const primary = Object.values(networkInterfaces()).flat().find(address => address?.family === 'IPv4' && !address.internal)?.address ?? '127.0.0.1';
+  assert.equal(defaultAdvertisedHost(), primary);
+  assert.equal(defaultAdvertisedHost({ listenHost: '0.0.0.0' }), primary);
+  assert.equal(defaultAdvertisedHost({ listenHost: '::' }), primary);
+  assert.equal(defaultAdvertisedHost({ listenHost: '127.0.0.1' }), '127.0.0.1');
+  assert.equal(defaultAdvertisedHost({ listenHost: '127.0.0.1', advertisedHost: 'reachable.example' }), 'reachable.example');
+});
+
+test('invite auto-seeds from live daemon endpoint, preserves explicit seeds and excludes loopback', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'),
+    transport: { discoveryDir: join(root, 'mesh'), multicast: false, advertisedHost: '192.0.2.42' },
+  }).start();
+  t.after(() => runtime.stop());
+  await runtime.transport.mountNetwork({ networkId: 'team', passphrase: 'shared' });
+  await runtime.serveControl(async argv => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+  const generated = await cli(['setup', 'invite-prompt', '--network', 'team'], runtime.stateDir);
+  assert.deepEqual(decodeNetworkInvite(generated.inviteUri).bootstrapPeers, [runtime.status().endpoint]);
+  const explicit = await cli(['setup', 'invite-prompt', '--network', 'team', '--seed', 'other.example:4567'], runtime.stateDir);
+  assert.deepEqual(decodeNetworkInvite(explicit.inviteUri).bootstrapPeers, ['other.example:4567']);
+  runtime.transport.endpointAddr = '127.0.0.1:4567';
+  const loopback = await cli(['setup', 'invite-prompt', '--network', 'team'], runtime.stateDir);
+  assert.equal(decodeNetworkInvite(loopback.inviteUri).bootstrapPeers?.length ?? 0, 0);
+});
+
+test('offline invite uses configured port with LAN address but never invents an ephemeral port', async t => {
+  const root = directory(t);
+  const primary = defaultAdvertisedHost();
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ port: 4567 }));
+  const configured = await cli(['setup', 'invite-prompt', '--network', 'team'], root);
+  assert.deepEqual(decodeNetworkInvite(configured.inviteUri).bootstrapPeers ?? [], primary === '127.0.0.1' ? [] : [`${primary}:4567`]);
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ port: 0 }));
+  const ephemeral = await cli(['setup', 'invite-prompt', '--network', 'team'], root);
+  assert.equal(decodeNetworkInvite(ephemeral.inviteUri).bootstrapPeers?.length ?? 0, 0);
 });

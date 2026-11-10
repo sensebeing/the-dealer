@@ -1,105 +1,170 @@
-# the-dealer（中文文档）
+# The Dealer
+
+**连接你的所有 Agent —— 跨工作区、跨机器、跨队友。**
+
+The Dealer 把独立的 Agent 会话连接为协作网络，统一处理路由、权限和持久化收件箱。从一台机器上的零网络配置开始，再通过加密 P2P 连接自己的其他机器和队友，复用同一条投递链路。
+
+```text
+1  Same-Machine Mesh / 同机多 Agent
+   Orca | Antigravity | Claude Code | Codex | ChatGPT Dot | Grok Bot
+                              |
+2  Cross-Machine Personal Mesh / 个人跨机网络
+                 MacBook <-> Mac mini <-> Devbox
+                              |
+3  Cross-Teammate P2P Collaboration / 跨队友协作
+   dealer-net:// -> Gate -> Durable Inbox -> spawn 新会话
+                                         -> fixed 专属会话
+```
 
 [English](README.md) | 简体中文
 
-> *"先与同一台机器上的每个 Agent 协作，再跨越任何机器与团队成员。"*
-> 把对的任务牌发给对的 Agent：单机多 Agent 协作优先，跨机跨团队 P2P 无缝扩展。
+## 30 秒接入 —— 复制提示词发给你的 Agent
 
-**`the-dealer`** 是一个开源的、基于无中心 P2P 网络与全插件化微内核的 **Agent 协作与派发系统**。它的第一使用形态是**单机多 Agent / 多工作区自动协作与派发中枢**：个人开发者无需任何网络配置，即可在同一台机器上协调多个专用 Agent 工作区（dev/prod 告警波次、反馈与低质会话认领、prod-release 交接、隔离子工作区任务），完成路由、去重、波次聚合、空闲门禁与 Orca 终端投递。
+### 提示词 1：在本机启动或加入 —— 粘贴给 Claude Code / Codex / Antigravity / Orca
 
-当团队约定并挂载加密协作网络（`networkId + passphrase`）后，同一套微内核、信封、路由、门禁与执行器无需修改即可渐进扩展为**跨机器设备互联、跨团队成员 P2P 协作网络**，并且依然不需要中心服务器。设计灵感汲取自 **DeepSeek Harness (`Cordis`)** 的 *"Everything is a Plugin"* 架构范式，底层结合 **Iroh (QUIC + Gossip + Blobs)** 高性能点对点网络设计。
+```text
+帮我配置 The Dealer，保留现有配置和 ~/.dealer/identity.json。
 
----
+1. 检查 `command -v dealer` 和 `node --version`，要求 Node >=22.6。
+   如果没有 dealer，将 https://github.com/sensebeing/the-dealer.git 克隆到
+   ~/the-dealer。如果该检出已存在，先检查本地修改，再用
+   `git -C ~/the-dealer pull --ff-only` 更新。然后运行：
+   cd ~/the-dealer && npm install && npm link
+   如果 dealer 已安装，确保此可信检出可供读取技能，不替换现有安装。
+2. 创建 ~/.agents/skills/ 和 ~/.claude/skills/，将以下三个目录分别软链到其中，
+   若 ~/.gemini/config/skills/ 存在也同样安装：
+   ~/the-dealer/skills/the-dealer
+   ~/the-dealer/skills/the-dealer-setup
+   ~/the-dealer/skills/the-dealer-extend
+   保留已有文件，先处理软链冲突再修改。
+   阅读 ~/the-dealer/skills/the-dealer-setup/SKILL.md。
+3. 运行 `dealer setup probe --json`，检查本机 Agent App 和节点状态。
+   不覆盖 ~/.dealer/identity.json，不复制其他机器的私钥。
+4. 问我想要：(1) 同机多 Agent 调度，(2) 连接自己的多台机器，还是
+   (3) 加入或创建队友网络，然后按 setup 技能执行。
+5. 接入队友时，询问我的成员名、Agent App（orca、antigravity、claude-code、
+   codex、chatgpt-dot、grok-bot）及会话模式（spawn 每个请求新开会话、
+   fixed 固定专属会话、inbox-only 手动处理）。生成：
+   dealer setup binding-preset --host <app> --mode <mode> --json
+   Grok 执行需补充 --target-bot <bot>。按 setup 技能审阅并应用返回的 binding
+   和 executorConfig，项目根目录由接收端本地绑定。
+6. 验证实际投递、收件箱读回和回复；确认对端身份前保持 approval_required。
+```
 
-## 两步式协作：Local First，P2P 渐进扩展
+### 提示词 2：邀请队友或自己的第二台机器 —— 生成并发给对方
 
-1. **第一步 — 单机多 Agent 协作（本地优先，零网络配置）**
-   运行 `dealer node up` 后直接向本机节点发送消息（`member:<self>` 或 `skill:<local-skill>`）。无需 `network mount`、`passphrase`、节点发现或任何外部网络；消息仍完整经过 `gate` → `dispatcher` → `policy` → `executor` 链路，因此单机任务同样享有幂等去重、波次聚合、空闲门禁与 Orca 工作区自动派发。项目清单中的 `defaultNetworkId` 只是其触发源在本机发送时使用的稳定作用域名称。
+创建者先在本机挂载网络，再生成新邀请：
 
-2. **第二步 — 跨机器 / 跨团队成员 P2P 扩展（`networkId + passphrase`）**
-   团队成员约定 `networkId` 与共享口令 `passphrase`，各自执行 `dealer network mount`。本地通过 `HKDF-SHA256 / BLAKE3` 确定性派生出加密发现频道 `swarmTopicId` 与 AEAD 帧密钥 `sealedKey`；签名 `NodeCard`、多维选择器（`member:` / `skill:` / `member@node` / `network/selector`）、四态入站门禁与全部执行器在加密网络内继续原样工作。
+```sh
+dealer setup invite-prompt --network <network-id>
+# 加 --json 获取独立的 crossMachinePrompt 和 teammatePrompt 字段。
+# 可选：--peer-member <成员名> --name <另一节点名> --seed <可达主机:端口>
+```
 
----
+将 `crossMachinePrompt` 发给自己第二台机器上的 Agent，或将 `teammatePrompt` 发给队友。两者都包含安装、技能接入、网络挂载和验证步骤；没有显式或已配置 seed 时，自动嵌入运行中节点公布的 TCP 端点，离线且配置了固定端口时使用主 LAN IPv4。
 
-## 为什么选择 `the-dealer`？
+完整可复制模板（执行前将 `<invite-uri>` 替换为生成的 `dealer-net://...` URI，并补齐其他占位符）：
 
-现代 AI 工程团队会在一台开发机上运行多个异构 Agent（**Antigravity**、**Claude Code**、**Codex**、**DeepSeek Harness**）与相互隔离的工作区（如 **Orca** worktree），随后才需要跨机器、跨成员协作。现有方案通常存在三类瓶颈：
+```text
+将这台机器接入我的 Dealer 网络，保留现有配置和身份。
 
-1. **依赖 Git 的协作请求慢且依赖人工**：把 Markdown 请求提交进仓库、等待 Webhook / 飞书卡片、再手动复制 Prompt 到新工作区，延迟高且充满重复劳动。
-2. **彼此孤立的本地派发脚本**：用户反馈、服务告警、iOS 崩溃符号化、低质会话审查、prod 发布波次等场景通常各自维护一套只耦合单机的轮询守护进程，没有共享的路由、门禁与幂等模型。
-3. **中心化 HTTP 协议（如 A2A）缺少 P2P 发现与本地工作区驱动能力**：标准 Web 协议假设公网 HTTPS 端点，缺少零配置 NAT 穿透、加密网络隔离、节点级准入状态机（`open` / `approval_required` / `dnd` / `closed`）与本地工作区启动器。
+检查 `command -v dealer`，确认 Node >=22.6。若未安装，将
+https://github.com/sensebeing/the-dealer.git 克隆到 ~/the-dealer；已有检出则先
+检查本地修改，再 `git -C ~/the-dealer pull --ff-only` 更新，然后运行：
+cd ~/the-dealer && npm install && npm link
+若已安装，确保可信的 ~/the-dealer 检出可用于读取技能。
+创建 ~/.agents/skills/ 和 ~/.claude/skills/，将
+~/the-dealer/skills/the-dealer、~/the-dealer/skills/the-dealer-setup、
+~/the-dealer/skills/the-dealer-extend 分别软链到两处；
+~/.gemini/config/skills/ 若存在也安装。保留无关文件，先解决软链冲突。
+阅读 ~/the-dealer/skills/the-dealer-setup/SKILL.md，运行 `dealer setup probe --json`。
+不覆盖 ~/.dealer/identity.json，不复制另一台机器的私钥。
 
-`the-dealer` 先以零配置本地回环解决单机多 Agent 协作，再用同一套契约承载跨机加密协作，而不是维护第二套派发栈。
+询问这是我的第二台机器还是队友的机器：自己的机器复用成员名，队友则询问
+其成员名，不把 teammate 当作真实身份。询问新节点名，然后运行：
+dealer node up --member '<member-handle>' --name '<node-name>' --json
+dealer network mount '<invite-uri>' --json
 
----
+询问接收端 Agent App：orca、antigravity、claude-code、codex、chatgpt-dot、
+grok-bot；以及模式：spawn、fixed、inbox-only。生成：
+dealer setup binding-preset --host <app> --mode <mode> --json
+Grok 执行需加 --target-bot <bot>。按 setup 技能审阅并应用预设，项目根目录
+在接收端绑定，确认宿主 CLI 支持对应参数。确认对端身份前保持 approval_required。
 
-## 核心特性
+dealer peers list --network '<network-id>' --json
+dealer send --network '<network-id>' --to 'member:<inviter-handle>' --topic setup.ping --body 'Please reply to verify connectivity' --json
+验证双向回复、持久化收件箱和宿主读回。dispatched 回执不等于任务完成。
+跨机器成员名重复时，用具体的 member@node selector。
+```
 
-1. **单机回环与加密多网络挂载（Multi-Network Mounting，`networkId + passphrase`）**
-   - 单机模式：未挂载网络时，发往本机节点的帧直接在进程内经同一入站处理器投递；已挂载网络时，本机目标复用本地 endpoint。
-   - 团队即网络（`Network`）：团队成员约定 `networkId`（如 `sensebeing`）与共享口令 `passphrase`，本地确定性派生出发现频道指纹与帧加密准入密钥。
-   - 单节点可同时挂载多个网络（如个人私域网 `ben-home` + 团队协作网 `sensebeing`），并为每个网络独立配置入站权限门禁与暴露的技能集。
-2. **高性能 P2P 传输与大附件流（`transport`）**
-   - 支持**定向单播（Unicast）**、**批量多播（Multicast）**、**千节点级频道广播（Broadcast）**。
-   - 原生支持内容寻址的 **多媒体/大文件附件传输（`BlobAttachment`）**：截图、音视频、百兆 DebugLog 诊断包、Git Patch 按需流式拉取至本地 `0700` 隔离目录。
-3. **节点身份与能力名片（`node` & `NodeCard`）**
-   - 每个节点拥有 Ed25519 公钥身份（`nodeId`）、成员标识（`member`）、节点名（`nodeName`）以及类 Agent Skill 的自然语言+结构化标签能力描述（`skills`），随 Gossip 心跳实时同步负载状态（`idle | busy | overloaded`）。
-   - 选择器解析优先使用已发现的远端节点，找不到时回退到本机自身 `NodeCard`，因此单机路由无需任何远端 Peer。
-4. **高自由度发送器与 AI 发送判断器（`emitter` & `router`）**
-   - 外部触发源插件化：支持 Webhook、单水位轮询（Lark 告警 / 反馈认领 / 低质会话认领）、自定义脚本或节点内 Agent 直接调用。
-   - 三级智能路由：显式身份直指（`member:oliver`）→ 技能标签匹配（`skill:prod-release`）→ **AI 发送判断器插件**（挂载本地 AGY / Claude Code / Codex 或 LLM API 读取在线节点 `NodeCard` 自动裁决单播/多播目标）。本机自身名片始终是合法候选。
-5. **节点自主权限门禁（`gate`）**
-   - 四态权限控制：`open`（直接放行）、`approval_required`（Knock 敲门待确认模式，确认后可一键签发发送方信任白名单）、`dnd`（免打扰仅入队）、`closed`（拒收）。
-   - 本机自身发起的本地投递跳过敲门审批，但仍严格受 `dnd` 与 `closed` 约束。
-6. **插件化接收派发器与持久化信箱（`dispatcher` & `mailbox`）**
-   - **调度策略插件**：内置 `policy-dedup-cas`（代次水位 CAS 防重）。
-   - **持久化信箱与唤醒重驱**：`MailboxStore` 将入站消息、单未决投递租约（`dlv_*`）、唤醒目标与按方向区分的会话反向路由原子落盘到 `mailbox.json`；`WakeupRedriveService` 在守护进程重启后继续按权威 Orca 工作区/终端空闲门禁发送严格单行指针，忙时绝不注入文本，并在租约确认后按阈值自动 `/new` 轮转。
-   - **信箱检查与确认**：`dealer inbox check` 取走最早未确认批次并生成单一批次租约，`dealer inbox ack <dlv_id>` 确认处理完毕，`dealer inbox list` 只读查看；未确认批次永远不会与新消息混合。
-   - **终端执行器插件**：内置 `executor-orca-spawn`（自动新建 Orca 独立工作区并启动 Agent，仅在确认空闲后注入任务前言）、`executor-orca-wave`（将波次持久化入队并唤醒常驻工作区）、`executor-agent-pty`（无 Orca 环境的通用 CLI Agent 执行器）、`executor-inbox`（本地信箱留资）与 `executor-notify`。
-   - **非阻塞会话命令**：`dealer ask` / `reply` / `settle` / `thread show` 立即返回并依赖持久化信箱唤醒对端，无需 `--reply-to` 同步阻塞等待。
+邀请包含共享密钥，只私下发给目标接收者，不提交到仓库。生成邀请是只读操作；创建者尚未挂载网络时，也要挂载同一份生成的邀请。TCP seed 支持可路由子网之间的发现，但需要地址和端口可达，不绕过防火墙，也不自动穿透 NAT；自动检测的 LAN 地址不合适时，用 `--seed` 指定 VPN 或可路由端点。
 
----
+## 三层渐进能力
 
-## 详细设计文档导航
+### 1. 同机多 Agent 调度
 
-- [整体架构与六大核心模块契约](docs/architecture.md)
-- [P2P 帧协议、多网络密钥派生与大文件流规范](docs/wire-protocol.md)
-- [插件开发指南（Source / Router / Gate / Policy / Executor）](docs/plugin-guide.md)
-- [配套 Agent Skill (`skills/the-dealer/SKILL.md`)](skills/the-dealer/SKILL.md)
+一个开发者、多个 Agent、独立工作区。运行 `dealer node up`，向自己的 `member:<成员名>` 或本地 skill 发消息，无需邀请、共享密钥或挂载网络；同机投递仍经过门禁、调度器、去重和执行器。
 
-## 快速开始
+### 2. 个人跨机器网络
 
-### 第一步 — 单机多 Agent 协作（零网络配置）
+MacBook、Mac mini 和 devbox 可以使用同一个成员名，各自保留独立签名身份。挂载同一邀请后，通过本地注册目录、UDP 组播或显式 TCP seed 发现节点，用 `member@node` 精确寻址某台机器。
 
-```bash
-# 运行完整测试套件（Node.js >= 22）
+### 3. 跨队友加密 P2P 与持久化收件箱
+
+分享网络邀请，由接收端决定准入和执行方式。持久化消息、投递租约、双向线程路由及可跨重启恢复的唤醒保证请求可读回；`ask`、`reply`、`settle` 将对话推进与执行器接收区分开。Orca 唤醒仅在权威空闲检查通过后注入消息指针。
+
+## 支持的 Agent App 与会话模式
+
+| Agent App（`--host`） | 集成方式 | 接收端配置 |
+| --- | --- | --- |
+| `orca` | 托管工作区 / 空闲门控会话 | `--agent codex`、`claude` 或 `antigravity`，本地工作区与项目 |
+| `antigravity` | Orca 托管工作区中的 Antigravity | 接收端工作区；独立 `agy` 也可通过 agent-pty 使用 |
+| `claude-code` | Claude Code CLI | 可选 profile 与固定 session ID |
+| `codex` | Codex CLI | 可选 profile 与固定 thread/session ID |
+| `chatgpt-dot` | OpenAI ChatGPT Personal Agent `dot` 桥接 | Agent/bot selector 与 session ID |
+| `grok-bot` | Grok Bot 桥接 | 执行时必须指定 `--target-bot <bot>` |
+
+- **`spawn`**：每个请求创建新会话，Orca 创建隔离工作区。
+- **`fixed`**：固定专属会话承接持续协作；Orca 使用空闲门控工作区，其他宿主遵循其会话接口。
+- **`inbox-only`**：仅持久化消息，供手动处理，不启动 Agent。
+
+六种宿主都提供三种模式的预设。`binding-preset` 只输出方案，不写配置或开启执行；probe 检测安装情况不代表 CLI 兼容，需要确认本机宿主或桥接程序支持生成的参数。详见[宿主矩阵](skills/the-dealer-setup/references/agent-app-matrix.md)。
+
+## 使用 the-dealer-extend 分三层扩展
+
+1. **个人 Patch**：定制本机 profile、路由、门禁和执行器配置，无需修改项目。
+2. **`.dealer/project.json` 项目插件**：声明项目身份、topic 和插件，将仓库关联到接收端本地路径。
+3. **自定义 Executor / Router / Source**：通过类型化插件接入新宿主、路由策略、webhook 或水位采集源，内核统一负责生命周期和依赖注入。
+
+从 [the-dealer-extend](skills/the-dealer-extend/SKILL.md) 开始，再读[插件指南](docs/plugin-guide.md)。零外部 npm 运行时依赖，Node.js >=22.6 直接运行 TypeScript 源码。
+
+## CLI 速查
+
+```sh
+dealer setup probe --json
+dealer node up --member alice --name laptop --json
+dealer node status --json
+dealer setup binding-preset --host codex --mode fixed --session-id <thread> --json
+dealer network mount <network-id> --passphrase '<shared-secret>' --gate approval_required --json
+dealer setup invite-prompt --network <network-id>
+dealer peers list --network <network-id> --json
+dealer send --network local --to member:alice --topic collab.request.v4 --body 'Review this change' --json
+dealer inbox check --mailbox <mailbox-id> --json
+dealer inbox ack <dlv-id> --mailbox <mailbox-id> --json
+dealer thread show <message-id> --json
 npm test
-
-# 启动本机节点并查看状态
-./bin/dealer.js node up --profile personal-dev --member ben.xu --name mbp --skills agent-runtime --json
-./bin/dealer.js node status --json
-
-# 向本机投递；`local` 只是稳定作用域名，无需 mount 或 passphrase
-./bin/dealer.js send --network local --to member:ben.xu --topic collab.request.v1 --body '{"summary":"执行本地质量巡检"}' --json
-./bin/dealer.js send --network local --to skill:agent-runtime --topic triage --body '{"area":"agent-runtime"}' --json
-
-# 非阻塞协作：ask 立即返回，答复通过持久化信箱唤醒当前 Agent
-./bin/dealer.js ask --network local --to member:ben.xu --topic collab.question.v1 --subject '归属确认' --body '{"question":"重试逻辑由谁负责？"}' --json
-./bin/dealer.js thread show <message-id> --json
-./bin/dealer.js inbox check --mailbox task:w1 --json
-./bin/dealer.js inbox ack <dlv_id> --mailbox task:w1 --json
-./bin/dealer.js inbox list --mailbox task:w1 --json
 ```
 
-已 link 的项目清单中的 `defaultNetworkId` 就是其触发源在本机发送时使用的稳定作用域；单机消息仍会路由到本机自身名片。
+回复与结算流程参见[日常操作技能](skills/the-dealer/SKILL.md)。
 
-### 第二步 — 跨机器与跨团队成员 P2P 扩展
+## 架构与安全
 
-```bash
-# 每台团队机器挂载同一个加密协作网络
-./bin/dealer.js network mount sensebeing --passphrase "team-shared-secret" --member ben.xu --node mbp-main --json
-./bin/dealer.js peers list --network sensebeing --json
-
-# 在加密网络内向其他机器发送任务
-./bin/dealer.js send --network sensebeing --to member:oliver --topic collab.request.v1 --body '{"summary":"Review the release"}' --json
+```text
+Sources / CLI -> Emitter -> Router -> Transport -> Gate -> Dispatcher -> Executor
+                         Node identity & directory       Durable mailbox
+                  Kernel: lifecycle, injection, typed events
 ```
+
+Ed25519 签名身份与消息，HKDF-SHA256 派生网络独立密钥，AES-256-GCM 保护帧。默认传输使用 TCP、加密发现信标和流式 BLAKE3 文件校验；可选 Rust Iroh 引擎位于 `native/`。准入状态由接收端控制（`open`、`approval_required`、`dnd`、`closed`），路由决定限制在当前网络候选集内，发送端路径不能决定接收端项目根目录；外部执行结果未知时不盲目自动重放。
+
+[架构](docs/architecture.md) · [线协议](docs/wire-protocol.md) · [接入技能](skills/the-dealer-setup/SKILL.md) · [MIT 许可证](LICENSE)

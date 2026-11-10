@@ -16,13 +16,23 @@ macOS Apps, redacted node configuration and `.dealer/project.json`. Probe is
 read-only. A socket's presence is not proof of a live daemon; run
 `dealer node status --json` to verify it. An installed CLI is not proof it
 supports this integration's flags; inspect its help before enabling delivery.
-If Dealer is missing, use Node >=22.6 and `npm link` in a trusted Dealer checkout.
+If Dealer is missing, check Node >=22.6, clone
+`https://github.com/sensebeing/the-dealer.git` into `~/the-dealer` (or inspect local
+changes and update that checkout with `git -C ~/the-dealer pull --ff-only`), then
+run `cd ~/the-dealer && npm install && npm link`. If already installed, ensure
+that trusted checkout is available for skill files without replacing the install.
+Create `~/.agents/skills/` and `~/.claude/skills/`; symlink each of
+`~/the-dealer/skills/the-dealer`, `~/the-dealer/skills/the-dealer-setup`, and
+`~/the-dealer/skills/the-dealer-extend` into both, and into
+`~/.gemini/config/skills/` if present. Preserve unrelated files and resolve link
+conflicts before changing them. Read `~/the-dealer/skills/the-dealer-setup/SKILL.md`
+and run `dealer setup probe --json` before configuration.
 Never replace an existing identity or copy another machine's private key.
 
 ## 2. Choose network topology
 
-Ask whether the user wants **same-machine local** (default), **join a colleague's
-network**, or **create a new network**. Reuse prior answers.
+Ask whether the user wants **same-machine local** (default), **connect their own machines**, or **join/create
+a teammate network**. Reuse prior answers.
 
 - Local needs no network mount, invite or passphrase.
 - Join: mount the quoted `dealer-net://v1/...` invite supplied by the user.
@@ -54,8 +64,14 @@ For Orca, spawn creates a child worktree; fixed uses an idle-gated workspace.
 After mounting the network on this machine, run:
 
 ```sh
-dealer setup invite-prompt --network <id> --member <self> --name <other-node> --seed <reachable-host:port> --ttl 1h --json
+dealer setup invite-prompt --network <id> --member <self> --name <other-node> --ttl 1h --json
 ```
+
+With no explicit or configured seeds, invite generation uses the running daemon's
+advertised TCP endpoint, or the primary LAN IPv4 plus a configured offline port.
+Loopback endpoints are not auto-shared. Use `--seed <reachable-host:port>` when a
+VPN/routed address is needed; TCP seeds require reachability and do not bypass
+NAT or firewalls. UDP multicast is not required between seed-connected peers.
 
 Give `crossMachinePrompt` to the other machine's Agent. See
 [onboarding-prompts](references/onboarding-prompts.md). Verify peer discovery
@@ -65,7 +81,10 @@ network; mount that same invite locally before expecting connectivity.
 
 ## 5. Connect a teammate and choose the conversation
 
-Keep incoming work in the durable inbox. Ask for the Agent App and one mode:
+Keep incoming work in the durable inbox. Ask for the teammate’s member handle;
+replace the generated `teammate` placeholder before starting a new node. Ask for
+the Agent App (`orca`, `antigravity`, `claude-code`, `codex`, `chatgpt-dot`,
+`grok-bot`) and one mode:
 **fixed** (recommended for ongoing collaboration), **spawn** (independent tasks),
 or **inbox-only** (manual processing). Ask only for the selected host's required
 selectors: Orca inner agent/workspace; Codex profile/thread; Claude role/session;

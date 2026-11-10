@@ -12,6 +12,7 @@ import { MailboxStore } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { SettlementOutcome } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
+import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 
 export * from './runtime.ts';
@@ -697,7 +698,28 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         const config = options.runtime?.config ?? (existsSync(configFile) ? JSON.parse(readFileSync(configFile, 'utf8')) : {});
         const existing = config.networks?.find((entry: { networkId: string }) => entry.networkId === networkId);
         const passphrase = v.passphrase ?? existing?.passphrase ?? randomBytes(32).toString('base64url');
-        const bootstrapPeers = v.seed?.split(',').filter(Boolean) ?? existing?.bootstrapPeers;
+        let bootstrapPeers = v.seed?.split(',').filter(Boolean) ?? existing?.bootstrapPeers;
+        if (!v.seed && !existing?.bootstrapPeers?.length) {
+          let endpoint = options.runtime?.status().endpoint;
+          let liveStatus = Boolean(options.runtime);
+          if (!options.runtime && existsSync(join(stateDir, 'control.sock'))) {
+            try {
+              const status = await rpc(join(stateDir, 'control.sock'), ['node', 'status', '--json'], { inactivityMs: 2000 });
+              if (status.code !== 0) throw new Error(status.stderr.join('\n'));
+              endpoint = JSON.parse(status.stdout.join('')).endpoint;
+              liveStatus = true;
+            } catch (error) {
+              if (!['ENOENT', 'ECONNREFUSED'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+            }
+          }
+          if (!liveStatus && Number.isInteger(config.port) && config.port > 0 && config.port <= 65535) {
+            endpoint = `${defaultAdvertisedHost()}:${config.port}`;
+          }
+          if (endpoint) {
+            const host = new URL(`tcp://${endpoint}`).hostname;
+            if (!['localhost', '0.0.0.0', '[::]', '[::1]'].includes(host) && !host.startsWith('127.')) bootstrapPeers = [endpoint];
+          }
+        }
         const inviteUri = encodeNetworkInvite({ networkId, passphrase, bootstrapPeers }, duration(v.ttl));
         result = buildOnboardingPrompts({ networkId, inviteUri, member: v.member ?? config.member,
           peerMember: v['peer-member'], nodeName: v.name, seed: bootstrapPeers, projectId: v.project });
