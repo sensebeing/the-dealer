@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { signEnvelope, verifyEnvelope, verifyReceipt } from '../core-types/index.ts';
+import {
+  resolveSemanticHeader,
+  signEnvelope,
+  validateSemanticHeader,
+  verifyEnvelope,
+  verifyReceipt,
+} from '../core-types/index.ts';
 import type {
   DeliveryReceipt,
   EmitMessageInput,
@@ -13,6 +19,10 @@ export interface EmitterConfig {
   privateKeyPem?: string;
   onSourceError?: (error: unknown) => void;
 }
+
+/** Unsigned envelope built by the emitter; semantic thread ids are resolved before signing. */
+export interface EnvelopeInput<T = Record<string, unknown>>
+  extends Omit<MessageEnvelope<T>, 'signature'> {}
 
 export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfig> {
   return {
@@ -34,25 +44,26 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             ...(input.attachments ?? []),
             ...(await Promise.all((input.filePaths ?? []).map(fp => transport.shareFile(fp)))),
           ];
-          const initial = signEnvelope(
-            {
-              id: randomUUID(),
-              traceId: input.traceId ?? randomUUID(),
-              networkId: input.networkId,
-              ...(input.replyToId ? { replyToId: input.replyToId } : {}),
-              ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
-              from: { nodeId: self.nodeId, ...self.identity },
-              routing: input.routing,
-              kind: input.kind,
-              priority: input.priority ?? 'normal',
-              subject: input.subject,
-              body: input.body,
-              payload: input.payload,
-              attachments,
-              createdAt: new Date().toISOString(),
-            },
-            privateKeyPem,
-          );
+          const id = randomUUID();
+          const semantic = input.semantic ? resolveSemanticHeader(input.semantic, id) : undefined;
+          const draft: EnvelopeInput<T> = {
+            id,
+            traceId: input.traceId ?? randomUUID(),
+            networkId: input.networkId,
+            ...(input.replyToId ? { replyToId: input.replyToId } : {}),
+            ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+            ...(semantic ? { semantic } : {}),
+            from: { nodeId: self.nodeId, ...self.identity },
+            routing: input.routing,
+            kind: input.kind,
+            priority: input.priority ?? 'normal',
+            subject: input.subject,
+            body: input.body,
+            payload: input.payload,
+            attachments,
+            createdAt: new Date().toISOString(),
+          };
+          const initial = signEnvelope(draft, privateKeyPem);
           const prepared = await ctx.waterfall('emitter/prepare', initial as MessageEnvelope);
           if (
             prepared.networkId !== input.networkId ||
@@ -61,6 +72,9 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             prepared.from.nodeName !== self.identity.nodeName
           ) {
             throw new Error('Prepare hook cannot change sender or network identity');
+          }
+          if (prepared.semantic !== undefined) {
+            validateSemanticHeader(prepared.semantic);
           }
           const envelope = signEnvelope(prepared, privateKeyPem);
           if (!verifyEnvelope(envelope)) {
@@ -105,6 +119,11 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               parse(result.value, target);
             }
           }
+          ctx.emit('emitter/sent', {
+            envelope,
+            targetNodeIds: route.targetNodeIds,
+            receipts,
+          });
           return { messageId: envelope.id, traceId: envelope.traceId, receipts };
         },
         registerSource(source) {

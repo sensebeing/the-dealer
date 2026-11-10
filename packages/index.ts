@@ -6,6 +6,7 @@ export * from './emitter/index.ts';
 export * from './router/index.ts';
 export * from './gate/index.ts';
 export * from './dispatcher/index.ts';
+export * from './mailbox/index.ts';
 export * from './plugins-source/index.ts';
 export * from './plugins-router/index.ts';
 export * from './plugins-policy/index.ts';

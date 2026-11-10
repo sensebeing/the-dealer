@@ -1,18 +1,18 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { request } from 'node:http';
+import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { InboxStore } from '../plugins-executor/index.ts';
+import { MailboxStore } from '../mailbox/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
-import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold, saveJson } from './config.ts';
+import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
 
-const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'mark-read'];
+const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait'];
 const stringFlags = [
-  'from',
   'limit',
   'root',
   'id',
@@ -51,6 +51,9 @@ const stringFlags = [
   'interval-ms',
   'token',
   'path',
+  'mailbox',
+  'ack',
+  'timeout-ms',
 ];
 
 function parse(argv: string[]) {
@@ -105,40 +108,134 @@ export interface DealerCliOptions {
   runtime?: DealerNodeRuntime;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  /** Aborted when the calling control request disconnects, so long waits release listeners. */
+  signal?: AbortSignal;
 }
 
-async function rpc(
+export interface ControlRpcOptions {
+  /** Inactivity window reset by every NDJSON line; defaults to 45000ms. */
+  inactivityMs?: number;
+}
+
+const DEFAULT_RPC_INACTIVITY_MS = 45_000;
+
+/**
+ * POST /cli-stream keeps normal commands fast while allowing long waits: the server emits an
+ * NDJSON keepalive every 15s, and every line resets the client inactivity window.
+ */
+export async function rpc(
   socketPath: string,
   argv: string[],
+  options: ControlRpcOptions = {},
 ): Promise<{ code: number; stdout: string[]; stderr: string[] }> {
+  const inactivityMs = options.inactivityMs ?? DEFAULT_RPC_INACTIVITY_MS;
+  if (!Number.isSafeInteger(inactivityMs) || inactivityMs <= 0) {
+    throw new Error('Inactivity timeout must be a positive integer');
+  }
   return new Promise((resolve, reject) => {
-    const req = request(
+    let settled = false;
+    let buffer = '';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let req: ClientRequest | undefined;
+    const finish = (
+      error?: Error,
+      value?: { code: number; stdout: string[]; stderr: string[] },
+    ) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      if (error) {
+        req?.destroy();
+        reject(error);
+      } else {
+        resolve(value!);
+      }
+    };
+    const arm = () => {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      timer = setTimeout(
+        () => finish(new Error('Daemon control request timed out')),
+        inactivityMs,
+      );
+    };
+    req = request(
       {
         socketPath,
-        path: '/cli',
+        path: '/cli-stream',
         method: 'POST',
         headers: { 'content-type': 'application/json' },
       },
       res => {
-        let body = '';
+        if (res.statusCode !== 200) {
+          let body = '';
+          res.setEncoding('utf8');
+          res.on('data', chunk => {
+            body += chunk;
+          });
+          res.on('end', () =>
+            finish(new Error(body || `Daemon control HTTP ${res.statusCode}`)),
+          );
+          return;
+        }
         res.setEncoding('utf8');
+        arm();
         res.on('data', chunk => {
-          body += chunk;
-        });
-        res.on('end', () => {
-          try {
-            if (res.statusCode !== 200) {
-              throw new Error(body);
+          arm();
+          buffer += chunk;
+          let newline = buffer.indexOf('\n');
+          while (newline !== -1) {
+            const line = buffer.slice(0, newline);
+            buffer = buffer.slice(newline + 1);
+            newline = buffer.indexOf('\n');
+            if (!line.trim()) {
+              continue;
             }
-            resolve(JSON.parse(body));
-          } catch (error) {
-            reject(error);
+            let message: Record<string, unknown>;
+            try {
+              message = JSON.parse(line) as Record<string, unknown>;
+            } catch {
+              finish(new Error(`Invalid control stream line: ${line}`));
+              return;
+            }
+            if (message.type === 'keepalive') {
+              arm();
+              continue;
+            }
+            if (message.type === 'result') {
+              finish(
+                undefined,
+                message.result as { code: number; stdout: string[]; stderr: string[] },
+              );
+              return;
+            }
+            if (message.type === 'error') {
+              finish(new Error(String(message.error)));
+              return;
+            }
+            finish(new Error('Unexpected control stream message'));
+            return;
           }
         });
+        res.on('end', () =>
+          finish(
+            new Error(
+              buffer.trim()
+                ? `Incomplete control stream response: ${buffer.trim()}`
+                : 'Daemon closed the control stream without a result',
+            ),
+          ),
+        );
+        res.on('error', error => finish(error));
       },
     );
-    req.setTimeout(60000, () => req.destroy(new Error('Daemon control request timed out')));
-    req.on('error', reject);
+    req.on('error', error => finish(error));
+    arm();
     req.end(JSON.stringify(argv));
   });
 }
@@ -194,40 +291,77 @@ async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> 
   });
 }
 
-async function runInboxCommand(inbox: InboxStore, action: string | undefined, target: string | undefined, v: Record<string, any>) {
-  const networkId = v.network as string | undefined;
-  if (action === 'list') {
-    if (v.all && v.status !== undefined && v.status !== 'all') {
-      throw new Error('Cannot combine --all with --status');
+function positiveInteger(value: unknown, flag: string): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
+    throw new Error(`${flag} must be a positive integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${flag} must be a positive integer`);
+  }
+  return parsed;
+}
+
+async function runInboxCommand(
+  store: MailboxStore,
+  action: string | undefined,
+  target: string | undefined,
+  v: Record<string, any>,
+  signal?: AbortSignal,
+) {
+  const command = action ?? 'list';
+  const mailboxId = v.mailbox as string | undefined;
+  const checkOnlyFlags =
+    v.ack !== undefined || v.peek === true || v.wait === true || v['timeout-ms'] !== undefined;
+  if (command === 'check') {
+    const timeoutMs = positiveInteger(v['timeout-ms'], '--timeout-ms');
+    const checkOptions = {
+      ...(mailboxId !== undefined ? { mailboxId } : {}),
+      ...(v.ack !== undefined ? { ackLeaseId: String(v.ack) } : {}),
+      ...(v.peek === true ? { peek: true } : {}),
+    };
+    if (v.wait === true) {
+      return store.waitForMail({
+        ...checkOptions,
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(signal !== undefined ? { signal } : {}),
+      });
     }
-    return inbox.list({
-      networkId,
-      topic: v.topic,
-      from: v.from,
-      status: v.all ? 'all' : (v.status ?? 'unread'),
-      limit: v.limit === undefined ? undefined : Number(v.limit),
+    if (timeoutMs !== undefined) {
+      throw new Error('--timeout-ms requires --wait');
+    }
+    return store.check(checkOptions);
+  }
+  if (command === 'ack') {
+    if (checkOnlyFlags) {
+      throw new Error('--ack, --peek, --wait and --timeout-ms are only valid with inbox check');
+    }
+    if (v.all === true) {
+      throw new Error('--all is only valid with inbox list');
+    }
+    return store.ack(required(target, 'delivery-id'), mailboxId);
+  }
+  if (command === 'list') {
+    if (checkOnlyFlags) {
+      throw new Error('--ack, --peek, --wait and --timeout-ms are only valid with inbox check');
+    }
+    const limit = positiveInteger(v.limit, '--limit');
+    return store.list({
+      ...(mailboxId !== undefined ? { mailboxId } : {}),
+      ...(v.all === true ? { includeAcked: true } : {}),
+      ...(limit !== undefined ? { limit } : {}),
     });
   }
-  if (action === 'show') {
-    return inbox.show(required(target, 'message-id'), { networkId, markRead: v['mark-read'] === true });
-  }
-  if (action === 'read' || action === 'ack') {
-    if (Boolean(target) === Boolean(v.all)) {
-      throw new Error('Specify either <messageId> or --all');
-    }
-    if (target && (v.topic !== undefined || v.from !== undefined)) {
-      throw new Error('Filter flags require --all');
-    }
-    return inbox.markRead({ id: target, all: v.all === true, networkId, topic: v.topic, from: v.from });
-  }
-  throw new Error('Unknown inbox command');
+  throw new Error(`Unknown inbox command: ${String(action)}`);
 }
 
 export async function runDealerCli(argv: string[], options: DealerCliOptions = {}): Promise<number> {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
   let owned: DealerNodeRuntime | undefined;
-  let offlineLockDir: string | undefined;
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action] = p;
@@ -272,29 +406,21 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return result.code;
     }
     if (group === 'inbox') {
-      let inbox: InboxStore;
+      let store: MailboxStore;
       if (options.runtime) {
         await options.runtime.start();
-        inbox = options.runtime.inbox;
+        store = options.runtime.mailbox;
       } else {
-        if (action === 'read' || action === 'ack' || (action === 'show' && v['mark-read'] === true)) {
-          mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-          const lockDir = join(stateDir, 'runtime.lock');
-          try {
-            mkdirSync(lockDir);
-          } catch {
-            throw new Error(
-              'State directory already owned; use the running daemon (remove runtime.lock only after verifying its process stopped)',
-            );
-          }
-          offlineLockDir = lockDir;
-          saveJson(join(lockDir, 'owner.json'), { pid: process.pid });
-        }
+        // Offline access is serialized by the mailbox file lock, so it stays coherent even if
+        // the daemon owns the state directory.
         const file = join(stateDir, 'config.json');
         const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-        inbox = new InboxStore(savedConfig.executorConfig?.inbox?.inboxPath ?? join(stateDir, 'inbox.json'));
+        store = new MailboxStore(join(stateDir, 'mailbox.json'), {
+          legacyInboxPath:
+            savedConfig.executorConfig?.inbox?.inboxPath ?? join(stateDir, 'inbox.json'),
+        });
       }
-      stdout(JSON.stringify(await runInboxCommand(inbox, action, target, v), null, v.json ? undefined : 2));
+      stdout(JSON.stringify(await runInboxCommand(store, action, target, v, options.signal), null, v.json ? undefined : 2));
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'up') {
@@ -490,9 +616,6 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     stderr(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
     return 1;
   } finally {
-    if (offlineLockDir) {
-      rmSync(offlineLockDir, { recursive: true, force: true });
-    }
     if (owned) {
       await owned.stop();
     }
@@ -504,13 +627,14 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   const runtime = new DealerNodeRuntime(runtimeOptions(values, defaultStateDir()));
   await runtime.start();
   try {
-    await runtime.serveControl(async args => {
+    await runtime.serveControl(async (args, context) => {
       const stdout: string[] = [];
       const stderr: string[] = [];
       const code = await runDealerCli(args, {
         runtime,
         stdout: line => stdout.push(line),
         stderr: line => stderr.push(line),
+        signal: context.signal,
       });
       return { code, stdout, stderr };
     });

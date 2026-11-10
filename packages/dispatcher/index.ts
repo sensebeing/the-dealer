@@ -294,6 +294,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               detail: verdict.reason,
             };
           }
+          ctx.emit('dispatcher/inbound', { envelope, receipt });
         }
         const signed = signReceipt(
           {

@@ -76,12 +76,33 @@ export interface NodeCard {
   signature: string;
 }
 
+export type SemanticMessageType = 'message' | 'question' | 'reply' | 'settle';
+export type SettlementOutcome = 'succeeded' | 'failed' | 'cancelled';
+
+export interface SemanticHeader {
+  readonly type: SemanticMessageType;
+  readonly threadId: string;
+  readonly targetMailbox?: string;
+  readonly replyMailbox?: string;
+  readonly outcome?: SettlementOutcome;
+}
+
+/** Emitter input: a new thread defaults its threadId to the generated envelope id. */
+export interface SemanticHeaderInput {
+  readonly type: SemanticMessageType;
+  readonly threadId?: string;
+  readonly targetMailbox?: string;
+  readonly replyMailbox?: string;
+  readonly outcome?: SettlementOutcome;
+}
+
 export interface MessageEnvelope<T = Record<string, unknown>> {
   id: string;
   networkId: string;
   traceId: string;
   replyToId?: string;
   idempotencyKey?: string;
+  semantic?: SemanticHeader;
   from: { nodeId: string; member: string; nodeName: string };
   routing: {
     mode: 'unicast' | 'multicast' | 'broadcast' | 'auto';
@@ -188,6 +209,7 @@ export interface EmitMessageInput<T = Record<string, unknown>> {
   traceId?: string;
   replyToId?: string;
   idempotencyKey?: string;
+  semantic?: SemanticHeaderInput;
   attachments?: readonly BlobAttachment[];
   filePaths?: readonly string[];
 }
@@ -374,7 +396,94 @@ function serializeJson(value: unknown, omitSignature: boolean): string {
 }
 
 export function signCanonicalPayload(payload: object, privateKeyPem: string): string {
-  return sign(null, Buffer.from(canonicalJson(payload)), privateKeyPem).toString('base64url');
+  return signCanonicalText(canonicalJson(payload), privateKeyPem);
+}
+
+function signCanonicalText(text: string, privateKeyPem: string): string {
+  return sign(null, Buffer.from(text), privateKeyPem).toString('base64url');
+}
+
+const SEMANTIC_MESSAGE_TYPES: readonly SemanticMessageType[] = [
+  'message',
+  'question',
+  'reply',
+  'settle',
+];
+const SETTLEMENT_OUTCOMES: readonly SettlementOutcome[] = ['succeeded', 'failed', 'cancelled'];
+const MAX_MAILBOX_ID_LENGTH = 256;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
+
+/** A mailbox id is a trimmed, non-empty logical channel name without control characters. */
+export function isValidMailboxId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_MAILBOX_ID_LENGTH &&
+    value.trim() === value &&
+    !CONTROL_CHARACTER.test(value)
+  );
+}
+
+/** Validate and normalize the authenticated semantic header carried by an envelope. */
+export function validateSemanticHeader(value: unknown): SemanticHeader {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid semantic header');
+  }
+  const header = value as Partial<SemanticHeader>;
+  if (!SEMANTIC_MESSAGE_TYPES.includes(header.type as SemanticMessageType)) {
+    throw new Error(`Invalid semantic message type: ${String(header.type)}`);
+  }
+  const type = header.type as SemanticMessageType;
+  if (typeof header.threadId !== 'string' || !header.threadId) {
+    throw new Error('Semantic threadId must be a non-empty string');
+  }
+  if (header.targetMailbox !== undefined && !isValidMailboxId(header.targetMailbox)) {
+    throw new Error('Invalid semantic targetMailbox');
+  }
+  if (header.replyMailbox !== undefined && !isValidMailboxId(header.replyMailbox)) {
+    throw new Error('Invalid semantic replyMailbox');
+  }
+  if (type === 'settle') {
+    if (!SETTLEMENT_OUTCOMES.includes(header.outcome as SettlementOutcome)) {
+      throw new Error('Settlement outcome required');
+    }
+  } else if (header.outcome !== undefined) {
+    throw new Error('Settlement outcome is only valid for settle messages');
+  }
+  return {
+    type,
+    threadId: header.threadId,
+    ...(header.targetMailbox !== undefined ? { targetMailbox: header.targetMailbox } : {}),
+    ...(header.replyMailbox !== undefined ? { replyMailbox: header.replyMailbox } : {}),
+    ...(header.outcome !== undefined ? { outcome: header.outcome } : {}),
+  };
+}
+
+/** Resolve emitter input into a complete semantic header, defaulting the thread to this envelope. */
+export function resolveSemanticHeader(
+  input: SemanticHeaderInput,
+  fallbackThreadId: string,
+): SemanticHeader {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw new Error('Invalid semantic header');
+  }
+  return validateSemanticHeader({
+    ...input,
+    threadId: input.threadId === undefined ? fallbackThreadId : input.threadId,
+  });
+}
+
+/**
+ * Canonical signed form of an envelope. Without a semantic header this is byte-for-byte the v1
+ * representation; with one, the normalized header is covered by the Ed25519 signature.
+ */
+export function canonicalizeEnvelopeForSigning<T>(
+  envelope: MessageEnvelope<T> | Omit<MessageEnvelope<T>, 'signature'>,
+): string {
+  if (envelope.semantic === undefined) {
+    return canonicalJson(envelope);
+  }
+  return canonicalJson({ ...envelope, semantic: validateSemanticHeader(envelope.semantic) });
 }
 
 export function verifyCanonicalPayload(
@@ -382,6 +491,14 @@ export function verifyCanonicalPayload(
   signature: string,
   nodeId: string,
 ): boolean {
+  try {
+    return verifyCanonicalText(canonicalJson(payload), signature, nodeId);
+  } catch {
+    return false;
+  }
+}
+
+function verifyCanonicalText(text: string, signature: string, nodeId: string): boolean {
   try {
     if (!/^ed25519:[0-9a-f]{64}$/.test(nodeId) || !/^[A-Za-z0-9_-]{86}$/.test(signature)) {
       return false;
@@ -395,7 +512,7 @@ export function verifyCanonicalPayload(
       format: 'der',
       type: 'spki',
     });
-    return verify(null, Buffer.from(canonicalJson(payload)), publicKey, bytes);
+    return verify(null, Buffer.from(text), publicKey, bytes);
   } catch {
     return false;
   }
@@ -413,11 +530,22 @@ export function signEnvelope<T>(
   envelope: Omit<MessageEnvelope<T>, 'signature'>,
   privateKeyPem: string,
 ): MessageEnvelope<T> {
-  return { ...envelope, signature: signCanonicalPayload(envelope, privateKeyPem) };
+  return {
+    ...envelope,
+    signature: signCanonicalText(canonicalizeEnvelopeForSigning(envelope), privateKeyPem),
+  };
 }
 
 export function verifyEnvelope<T>(envelope: MessageEnvelope<T>): boolean {
-  return verifyCanonicalPayload(envelope, envelope.signature, envelope.from?.nodeId);
+  try {
+    return verifyCanonicalText(
+      canonicalizeEnvelopeForSigning(envelope),
+      envelope.signature,
+      envelope.from?.nodeId,
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function signReceipt(

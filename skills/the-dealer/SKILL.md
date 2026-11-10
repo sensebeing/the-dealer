@@ -185,17 +185,26 @@ for the manifest, factory context and lifecycle contracts.
 
 ## Local inbox
 
-The `inbox` executor retains messages and materialized attachments locally. Read/unread
-tracks only mailbox visibility; acknowledging a message does not complete a domain request.
-Commands work against the running daemon or directly against the saved inbox when offline.
+The `inbox` executor retains messages and materialized attachments in the durable
+`mailbox.json` ledger. Each message is routed to a logical mailbox (`default`,
+`stream:<streamKey>` for `orca-wave`, `task:<messageId>` for `orca-spawn`, or an
+explicit `semantic.targetMailbox` / `payload.mailbox`). A mailbox has at most one
+unacknowledged delivery lease (`dlv_<12hex>`), so re-running `check` returns the same
+batch until it is acknowledged; newer mail queues behind the lease and is never mixed
+into it. `list` is a read-only view and never mints a lease. Commands work against the
+running daemon (streaming control socket with keepalives) or directly against the saved
+mailbox when offline.
 
 ```sh
-dealer inbox list
-dealer inbox list --all --topic triage --from alice --limit 20 --json
-dealer inbox show <id> --mark-read
-dealer inbox read <id>
-dealer inbox ack --all
+dealer inbox check --json
+dealer inbox check --mailbox stream:alerts --wait --timeout-ms 900000 --json
+dealer inbox check --ack <dlv_id> --json
+dealer inbox ack <dlv_id> --mailbox stream:alerts --json
+dealer inbox list --mailbox stream:alerts --limit 20 --json
+dealer inbox list --all --json
 ```
 
-Use `--network <id>` to scope listings or disambiguate message IDs. Reading or
-acknowledging preserves historical items and their original receipt timestamps.
+`--peek` previews the current mailbox, including an outstanding lease, without
+minting or mutating a lease. Repeating `ack` for the same lease is an idempotent
+no-op; an unknown or mismatched lease fails loudly. Legacy `~/.dealer/inbox.json`
+data is migrated once into the `default` mailbox on startup.

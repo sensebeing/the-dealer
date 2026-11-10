@@ -10,6 +10,7 @@ import type {
   MessageEnvelope,
   GateVerdict,
   DispatchReceipt,
+  DeliveryReceipt,
   InboundFrameEvent,
 } from '../core-types/index.ts';
 
@@ -41,6 +42,12 @@ export interface Events {
   'dispatcher/route': (
     envelope: MessageEnvelope,
   ) => DispatchReceipt | undefined | Promise<DispatchReceipt | undefined>;
+  'dispatcher/inbound': (event: { envelope: MessageEnvelope; receipt: DispatchReceipt }) => void;
+  'emitter/sent': (event: {
+    envelope: MessageEnvelope;
+    targetNodeIds: readonly string[];
+    receipts: readonly DeliveryReceipt[];
+  }) => void;
 }
 
 export interface Plugin<C = unknown> {

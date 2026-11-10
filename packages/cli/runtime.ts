@@ -3,9 +3,9 @@ import { join, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { createServer } from 'node:http';
-import type { Server } from 'node:http';
+import type { IncomingMessage, Server } from 'node:http';
 import { generateNodeKeyPair } from '../core-types/index.ts';
-import type { AdmissionMode, Disposable, ExecutorPlugin, NetworkMountConfig, SourcePlugin } from '../core-types/index.ts';
+import type { AdmissionMode, Disposable, ExecutorPlugin, MessageEnvelope, NetworkMountConfig, SourcePlugin } from '../core-types/index.ts';
 import { Kernel } from '../kernel/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 import { createTransportPlugin, P2PTransportService } from '../transport/index.ts';
@@ -24,12 +24,12 @@ import {
   createAgentPtyExecutorPlugin,
   createNotifyExecutorPlugin,
   createInboxExecutorPlugin,
-  InboxStore,
   checkedCommand,
   resolveOrcaWorkspaceTerminal,
   runCommand,
 } from '../plugins-executor/index.ts';
 import type { CommandRunner } from '../plugins-executor/index.ts';
+import { MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
 import {
@@ -88,6 +88,37 @@ export interface DealerRuntimeOptions {
   executorOverrides?: ExecutorPlugin[];
 }
 
+export interface ControlRequestContext {
+  signal: AbortSignal;
+}
+
+export interface ControlServerOptions {
+  /** NDJSON keepalive cadence for POST /cli-stream; defaults to 15000ms. */
+  keepaliveMs?: number;
+}
+
+const CONTROL_BODY_LIMIT = 1_048_576;
+const DEFAULT_KEEPALIVE_MS = 15_000;
+
+async function readControlBody(request: IncomingMessage): Promise<string> {
+  let body = '';
+  for await (const chunk of request) {
+    body += chunk;
+    if (body.length > CONTROL_BODY_LIMIT) {
+      throw new Error('Control request too large');
+    }
+  }
+  return body;
+}
+
+function parseControlArgv(body: string): string[] {
+  const argv = JSON.parse(body);
+  if (!Array.isArray(argv) || argv.some(value => typeof value !== 'string')) {
+    throw new Error('Expected argv array');
+  }
+  return argv;
+}
+
 export function defaultStateDir(): string {
   return resolve(process.env.DEALER_STATE_DIR ?? join(homedir(), '.dealer'));
 }
@@ -97,7 +128,7 @@ export class DealerNodeRuntime {
   readonly kernel = new Kernel();
   readonly options: DealerRuntimeOptions;
   config!: RuntimeConfig;
-  inbox!: InboxStore;
+  mailbox!: MailboxStore;
   wave?: WaveCoalescerPolicy;
   private loadedProjects = new Map<string, { manifest: DealerProjectManifest; plugins: LoadedExternalPlugin[] }>();
   private loadedUserPlugins = new Map<string, LoadedExternalPlugin>();
@@ -129,6 +160,11 @@ export class DealerNodeRuntime {
 
   get emitter() {
     return this.kernel.getService('emitter');
+  }
+
+  /** Single durable mailbox instance; the legacy accessor name remains as a convenience. */
+  get inbox(): MailboxStore {
+    return this.mailbox;
   }
 
   get socketPath(): string {
@@ -196,7 +232,10 @@ export class DealerNodeRuntime {
         this.config.executors = [...this.config.executors, 'inbox'];
       }
       validateConfig(this.config);
-      this.inbox = new InboxStore(this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'));
+      this.mailbox = new MailboxStore(join(this.stateDir, 'mailbox.json'), {
+        legacyInboxPath:
+          this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'),
+      });
       const keyPath = join(this.stateDir, 'identity.json');
       const keyPair = existsSync(keyPath) ? JSON.parse(readFileSync(keyPath, 'utf8')) : generateNodeKeyPair();
       if (!existsSync(keyPath)) {
@@ -487,6 +526,31 @@ export class DealerNodeRuntime {
       name: 'runtime-plugins',
       inject: ['dispatcher', 'transport', 'emitter', 'router'],
       apply: ctx => {
+        // Thread reverse routes are populated from the authenticated dispatcher/emitter boundary,
+        // not from raw transport frames, so forged senders and gate-rejected messages never
+        // create routes.
+        ctx.on('dispatcher/inbound', ({ envelope, receipt }) => {
+          if (receipt.stage === 'rejected') {
+            return;
+          }
+          try {
+            const mailboxId = resolveMailboxId(envelope, this.resolveExecutorName(envelope));
+            this.mailbox.recordInboundEnvelope(envelope, mailboxId);
+          } catch (error) {
+            this.lastError = String(error);
+          }
+        });
+        ctx.on('emitter/sent', ({ envelope, targetNodeIds }) => {
+          try {
+            this.mailbox.recordOutboundEnvelope(
+              envelope,
+              targetNodeIds,
+              envelope.semantic?.replyMailbox ?? 'default',
+            );
+          } catch (error) {
+            this.lastError = String(error);
+          }
+        });
         const runner = this.options.commandRunner ?? runCommand;
         const linkedProjectRoots = Object.fromEntries(
           this.config.projects.map(project => [project.projectId, project.rootPath]),
@@ -509,7 +573,7 @@ export class DealerNodeRuntime {
             ...this.config.executorConfig['agent-pty'],
             commandRunner: runner,
           }),
-          inbox: createInboxExecutorPlugin({ ...this.config.executorConfig.inbox, store: this.inbox }),
+          inbox: createInboxExecutorPlugin({ ...this.config.executorConfig.inbox, store: this.mailbox }),
           notify: createNotifyExecutorPlugin({
             inboxPath: join(this.stateDir, 'notifications.jsonl'),
             ...this.config.executorConfig.notify,
@@ -767,33 +831,108 @@ export class DealerNodeRuntime {
     };
   }
 
-  async serveControl(handler: (argv: string[]) => Promise<{ code: number; stdout: string[]; stderr: string[] }>): Promise<void> {
+  async serveControl(
+    handler: (
+      argv: string[],
+      context: ControlRequestContext,
+    ) => Promise<{ code: number; stdout: string[]; stderr: string[] }>,
+    options: ControlServerOptions = {},
+  ): Promise<void> {
     if (this.server) {
       throw new Error('Control server already started');
+    }
+    const keepaliveMs = options.keepaliveMs ?? DEFAULT_KEEPALIVE_MS;
+    if (!Number.isSafeInteger(keepaliveMs) || keepaliveMs <= 0) {
+      throw new Error('Keepalive interval must be a positive integer');
     }
     // Only the stateDir lock owner may remove a stale socket.
     rmSync(this.socketPath, { force: true });
     const server = createServer(async (request, response) => {
-      if (request.method !== 'POST' || request.url !== '/cli') {
+      if (
+        request.method !== 'POST' ||
+        (request.url !== '/cli' && request.url !== '/cli-stream')
+      ) {
         response.writeHead(404).end();
         return;
       }
-      try {
-        let body = '';
-        for await (const chunk of request) {
-          body += chunk;
-          if (body.length > 1_048_576) {
-            throw new Error('Control request too large');
+      if (request.url === '/cli') {
+        try {
+          const argv = parseControlArgv(await readControlBody(request));
+          const result = await handler(argv, { signal: new AbortController().signal });
+          response
+            .writeHead(200, { 'content-type': 'application/json' })
+            .end(JSON.stringify(result));
+        } catch (error) {
+          if (!response.destroyed && !response.writableEnded) {
+            response.writeHead(400).end(JSON.stringify({ error: String(error) }));
           }
         }
-        const argv = JSON.parse(body);
-        if (!Array.isArray(argv) || argv.some(x => typeof x !== 'string')) {
-          throw new Error('Expected argv array');
+        return;
+      }
+      const controller = new AbortController();
+      let completed = false;
+      let started = false;
+      let keepalive: ReturnType<typeof setInterval> | undefined;
+      const abortIfActive = () => {
+        if (!completed) {
+          controller.abort();
         }
-        const result = await handler(argv);
-        response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
+      };
+      // A completed request body also emits 'close' on the request stream; only a premature
+      // connection loss aborts the handler. The response stream reports disconnect reliably.
+      request.on('close', () => {
+        if (!request.complete) {
+          abortIfActive();
+        }
+      });
+      response.on('close', abortIfActive);
+      response.on('error', abortIfActive);
+      try {
+        const argv = parseControlArgv(await readControlBody(request));
+        if (!response.destroyed && !response.writableEnded) {
+          response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+          started = true;
+          keepalive = setInterval(() => {
+            if (!completed && !response.destroyed && !response.writableEnded) {
+              response.write(`${JSON.stringify({ type: 'keepalive', ts: Date.now() })}\n`);
+            }
+          }, keepaliveMs);
+          keepalive.unref();
+        }
+        let line: Record<string, unknown>;
+        try {
+          const result = await handler(argv, { signal: controller.signal });
+          line = { type: 'result', result };
+        } catch (error) {
+          line = {
+            type: 'error',
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        completed = true;
+        if (keepalive) {
+          clearInterval(keepalive);
+        }
+        if (!response.destroyed && !response.writableEnded) {
+          response.end(`${JSON.stringify(line)}\n`);
+        }
       } catch (error) {
-        response.writeHead(400).end(JSON.stringify({ error: String(error) }));
+        completed = true;
+        if (keepalive) {
+          clearInterval(keepalive);
+        }
+        if (!response.destroyed && !response.writableEnded) {
+          if (!started) {
+            response.writeHead(400).end(JSON.stringify({ error: String(error) }));
+          } else {
+            response.end(`${JSON.stringify({ type: 'error', error: String(error) })}\n`);
+          }
+        }
+      } finally {
+        completed = true;
+        if (keepalive) {
+          clearInterval(keepalive);
+        }
       }
     });
     this.server = server;

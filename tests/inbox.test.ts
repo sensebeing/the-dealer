@@ -1,15 +1,40 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DealerNodeRuntime, InboxStore, createInboxExecutorPlugin, initProjectScaffold, runDealerCli } from '../packages/index.ts';
-import type { MessageEnvelope, ExecutionContext } from '../packages/index.ts';
+import {
+  DealerNodeRuntime,
+  MailboxStore,
+  createInboxExecutorPlugin,
+  initProjectScaffold,
+  rpc,
+  runDealerCli,
+} from '../packages/index.ts';
+import type { ExecutionContext, MessageEnvelope } from '../packages/index.ts';
 
-function envelope(id: string, networkId = 'team', member = 'alice', kind = 'triage'): MessageEnvelope {
-  return { id, networkId, traceId: id, from: { nodeId: member, member, nodeName: member },
-    routing: { mode: 'broadcast' }, kind, priority: 'normal', subject: id, body: 'body', payload: {},
-    attachments: [], createdAt: new Date().toISOString(), signature: '' };
+function envelope(
+  id: string,
+  networkId = 'team',
+  member = 'alice',
+  kind = 'triage',
+): MessageEnvelope {
+  return {
+    id,
+    networkId,
+    traceId: id,
+    from: { nodeId: member, member, nodeName: member },
+    routing: { mode: 'broadcast' },
+    kind,
+    priority: 'normal',
+    subject: id,
+    body: 'body',
+    payload: {},
+    attachments: [],
+    createdAt: new Date().toISOString(),
+    signature: '',
+  };
 }
 
 async function cli(state: string | DealerNodeRuntime, ...args: string[]) {
@@ -17,182 +42,225 @@ async function cli(state: string | DealerNodeRuntime, ...args: string[]) {
   const err: string[] = [];
   const code = await runDealerCli(['inbox', ...args, '--json'], {
     ...(typeof state === 'string' ? { stateDir: state } : { runtime: state }),
-    stdout: line => out.push(line), stderr: line => err.push(line),
+    stdout: line => out.push(line),
+    stderr: line => err.push(line),
   });
-  return { code, value: JSON.parse((code ? err : out).join('\n')) };
+  return { code, value: JSON.parse((code ? err : out).join('\n')) as any };
 }
 
-test('inbox snapshots deduplicate composite identity, serialize mutations and preserve read state', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'inbox-store-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const path = join(root, 'inbox.json');
-  const store = new InboxStore(path);
-  assert.throws(() => createInboxExecutorPlugin(), /requires store or inboxPath/);
-  await Promise.all(Array.from({ length: 20 }, (_, i) => store.deliver([envelope(String(i))])));
-  assert.equal((await store.list()).totalCount, 20);
-  const read = await store.show('0', { markRead: true });
-  assert.deepEqual(await store.deliver([envelope('0')]), { inserted: [], duplicateIds: ['0'] });
-  assert.deepEqual(await store.show('0'), read);
-  assert.deepEqual((await store.markRead({ id: '0' })).updated, []);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
-  const second = new InboxStore(path);
-  await second.deliver([envelope('other')]);
-  await store.markRead({ id: 'other' });
-  assert.equal((await second.show('other')).status, 'read');
-  await store.deliver([envelope('0', 'other-network')]);
-  await assert.rejects(store.show('0'), /Ambiguous inbox message/);
-  await assert.rejects(store.markRead({ id: '0' }), /Ambiguous inbox message/);
-  assert.equal((await store.show('0', { networkId: 'other-network' })).status, 'unread');
-  await assert.rejects(store.show('missing'), /Inbox message not found/);
-  await assert.rejects(store.markRead({}), /Specify either/);
-  const scoped = await store.list({ networkId: 'team', status: 'read', limit: 1 });
-  assert.equal(scoped.totalCount, 21);
-  assert.equal(scoped.unreadCount, 19);
-  assert.equal(scoped.items.length, 1);
-  await store.markRead({ all: true, networkId: 'team' });
-  assert.equal((await store.list()).unreadCount, 1);
-  for (const invalid of ['{', '{}', '{"schema":"the-dealer-inbox/v1","items":[{}]}']) {
-    writeFileSync(path, invalid);
-    await assert.rejects(store.list(), /Invalid inbox store/);
-  }
-  writeFileSync(path, '{"schema":"the-dealer-inbox/v1","items":[]}');
-  assert.equal((await store.list()).totalCount, 0);
-});
-
-test('inbox ordering compares instants across offsets with deterministic ties', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'inbox-order-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const path = join(root, 'inbox.json');
-  const store = new InboxStore(path);
-  await store.deliver([envelope('older'), envelope('newer'), envelope('tie')]);
-  const saved = JSON.parse(readFileSync(path, 'utf8'));
-  saved.items[0].receivedAt = '2026-11-10T09:00:00+08:00';
-  saved.items[1].receivedAt = '2026-11-10T02:00:00Z';
-  saved.items[2].receivedAt = '2026-11-10T10:00:00+08:00';
-  writeFileSync(path, JSON.stringify(saved));
-  assert.deepEqual((await store.list()).items.map(item => item.id), ['tie', 'newer', 'older']);
-});
-
-test('inbox ordering preserves reverse insertion for equal instants with different offsets', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'inbox-offset-tie-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const path = join(root, 'inbox.json');
-  const store = new InboxStore(path);
-  await store.deliver([envelope('first'), envelope('second')]);
-  const saved = JSON.parse(readFileSync(path, 'utf8'));
-  saved.items[0].receivedAt = '2026-11-10T08:00:00.000+08:00';
-  saved.items[1].receivedAt = '2026-11-10T00:00:00.000Z';
-  writeFileSync(path, JSON.stringify(saved));
-  assert.deepEqual((await store.list()).items.map(item => item.id), ['second', 'first']);
-});
-
-test('runtime upgrades persisted legacy executors and dispatches to its built-in inbox', async t => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'inbox-upgrade-'));
-  const path = join(stateDir, 'config.json');
-  const legacyExecutors = ['orca-spawn', 'orca-wave', 'notify'];
-  writeFileSync(path, JSON.stringify({ executors: legacyExecutors }));
-  const runtime = new DealerNodeRuntime({ stateDir,
-    transport: { discoveryDir: join(stateDir, 'mesh') },
-    commandRunner: async () => { throw new Error('Unexpected external executor'); },
+function rawControl(path: string, socketPath: string, argv: string[]): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const req = request(
+      { socketPath, path, method: 'POST', headers: { 'content-type': 'application/json' } },
+      res => {
+        const chunks: Buffer[] = [];
+        res.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        res.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: res.statusCode })));
+      },
+    );
+    req.on('error', reject);
+    req.end(JSON.stringify(argv));
   });
-  t.after(async () => {
-    await runtime.stop();
-    rmSync(stateDir, { recursive: true, force: true });
-  });
-  await runtime.start();
-  assert.deepEqual(runtime.config.executors, [...legacyExecutors, 'inbox']);
-  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).executors, runtime.config.executors);
-  await runtime.mountNetwork({ networkId: 'team', passphrase: 'secret' });
-  const message = envelope('upgraded', 'team', 'alice', 'collab.request.v4');
-  message.payload = { executor: 'inbox' };
-  const receipt = await runtime.kernel.getService('dispatcher').dispatch(message);
-  assert.equal(receipt.stage, 'dispatched');
-  assert.equal((await runtime.inbox.show(message.id)).id, message.id);
-});
+}
 
-test('offline inbox mutations respect an embedded runtime ownership lock', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'inbox-owned-'));
-  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), profile: 'headless-relay',
-    transport: { discoveryDir: join(root, 'mesh') } }).start();
-  t.after(async () => {
-    await runtime.stop();
-    rmSync(root, { recursive: true, force: true });
-  });
-  await runtime.inbox.deliver([envelope('owned')]);
-  const lockDir = join(runtime.stateDir, 'runtime.lock');
-  const owner = readFileSync(join(lockDir, 'owner.json'), 'utf8');
-  assert.equal(existsSync(join(runtime.stateDir, 'control.sock')), false);
-  assert.equal((await cli(runtime.stateDir, 'list')).code, 0);
-  assert.equal((await cli(runtime.stateDir, 'show', 'owned')).value.status, 'unread');
-  for (const args of [['read', 'owned'], ['ack', 'owned'], ['show', 'owned', '--mark-read']]) {
-    const result = await cli(runtime.stateDir, ...args);
-    assert.equal(result.code, 1);
-    assert.match(result.value.error, /State directory already owned/);
-    assert.equal(readFileSync(join(lockDir, 'owner.json'), 'utf8'), owner);
-  }
-  assert.equal((await runtime.inbox.show('owned')).status, 'unread');
-  await runtime.stop();
-  assert.equal((await cli(runtime.stateDir, 'read', 'missing')).code, 1);
-  assert.equal(existsSync(lockDir), false);
-  assert.equal((await cli(runtime.stateDir, 'read', 'owned')).code, 0);
-  assert.equal(existsSync(lockDir), false);
-});
-
-test('inbox CLI supports live, control socket and offline queries and acknowledgements', async t => {
+test('inbox CLI supports live, control socket and offline check/ack/list', async t => {
   const root = mkdtempSync(join(tmpdir(), 'inbox-cli-'));
-  const inboxPath = join(root, 'custom', 'mail.json');
-  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), profile: 'headless-relay',
-    transport: { discoveryDir: join(root, 'mesh') }, patch: { executorConfig: { inbox: { inboxPath } } } }).start();
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+  }).start();
   t.after(async () => {
     await runtime.stop();
     rmSync(root, { recursive: true, force: true });
   });
-  await runtime.serveControl(async args => {
+  await runtime.serveControl(async (argv, context) => {
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const code = await runDealerCli(args, { runtime, stdout: s => stdout.push(s), stderr: s => stderr.push(s) });
+    const code = await runDealerCli(argv, {
+      runtime,
+      stdout: line => stdout.push(line),
+      stderr: line => stderr.push(line),
+      signal: context.signal,
+    });
     return { code, stdout, stderr };
   });
-  for (const mode of ['live', 'socket', 'offline']) {
-    if (mode === 'offline') {
-      runtime.persist();
-      await runtime.stop();
-    }
-    const state = mode === 'live' ? runtime : runtime.stateDir;
-    const store = new InboxStore(inboxPath);
-    await store.deliver([envelope(`${mode}-a`), envelope(`${mode}-b`, 'team', 'bob', 'other')]);
-    const listed = await cli(state, 'list');
-    assert.equal(listed.code, 0);
-    assert.equal(listed.value.status, 'unread');
-    assert.equal((await cli(state, 'show', `${mode}-a`, '--mark-read')).value.status, 'read');
-    assert.deepEqual((await cli(state, 'read', `${mode}-a`)).value.updated, []);
-    assert.equal((await cli(state, 'list', '--status', 'read', '--topic', 'triage', '--from', 'alice', '--limit', '1')).value.items.length, 1);
-    assert.equal((await cli(state, 'list', '--all', '--network', 'team')).value.items.length, ['live', 'socket', 'offline'].indexOf(mode) * 3 + 2);
-    assert.deepEqual((await cli(state, 'ack', `${mode}-b`)).value.updated, [`${mode}-b`]);
-    await store.deliver([envelope(`${mode}-c`)]);
-    assert.deepEqual((await cli(state, 'ack', '--all', '--topic', 'triage', '--from', 'alice')).value.updated, [`${mode}-c`]);
-    // Acknowledge without removing any history.
-    assert.equal((await cli(state, 'read', '--all')).value.unreadCount, 0);
-    for (const args of [['list', '--all', '--status', 'read'], ['list', '--status', 'bad'],
-      ['list', '--limit', '0'], ['list', '--limit', '1.5'], ['read'], ['read', 'id', '--all'],
-      ['read', 'id', '--topic', 'triage'], ['show']]) {
-      assert.equal((await cli(state, ...args)).code, 1, args.join(' '));
-    }
+
+  runtime.mailbox.enqueue([envelope('live-a'), envelope('live-b', 'team', 'bob', 'other')]);
+  const first = await cli(runtime, 'check');
+  assert.equal(first.code, 0);
+  assert.match(first.value.deliveryId, /^dlv_[0-9a-f]{12}$/);
+  assert.equal(first.value.redelivered, false);
+  assert.equal(first.value.mailboxId, 'default');
+  assert.deepEqual(first.value.items.map((item: any) => item.id), ['live-a', 'live-b']);
+  const redelivered = await cli(runtime, 'check');
+  assert.equal(redelivered.value.deliveryId, first.value.deliveryId);
+  assert.equal(redelivered.value.redelivered, true);
+
+  const peeked = await cli(runtime, 'check', '--peek');
+  assert.equal(peeked.value.deliveryId, first.value.deliveryId);
+  assert.equal(peeked.value.redelivered, true);
+
+  const listed = await cli(runtime, 'list');
+  assert.equal(listed.value.leasedCount, 2);
+  assert.equal(listed.value.queuedCount, 0);
+  const aliased = await cli(runtime);
+  assert.equal(aliased.value.totalCount, 2);
+
+  const acked = await cli(runtime, 'check', '--ack', String(first.value.deliveryId));
+  assert.equal(acked.value.deliveryId, null);
+  assert.equal(acked.value.redelivered, false);
+  const archived = await cli(runtime, 'list', '--all');
+  assert.equal(archived.value.ackedCount, 2);
+  const repeated = await cli(runtime, 'ack', String(first.value.deliveryId));
+  assert.equal(repeated.value.alreadyAcknowledged, true);
+  const unknown = await cli(runtime, 'ack', 'dlv_ffffffffffff');
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.value.error, /Unknown or mismatched delivery lease/);
+
+  runtime.mailbox.enqueue([envelope('streamed')], { mailboxId: 'stream:alerts' });
+  const isolated = await cli(runtime, 'check', '--mailbox', 'stream:alerts');
+  assert.equal(isolated.value.mailboxId, 'stream:alerts');
+  assert.deepEqual(isolated.value.items.map((item: any) => item.id), ['streamed']);
+  assert.equal((await cli(runtime, 'list')).value.totalCount, 3);
+  const defaultOnly = await cli(runtime, 'list', '--mailbox', 'default');
+  assert.equal(defaultOnly.value.queuedCount, 0);
+  assert.equal(defaultOnly.value.leasedCount, 0);
+  assert.equal(defaultOnly.value.ackedCount, 2);
+
+  // Control socket path for an ordinary (non-waiting) command.
+  runtime.mailbox.enqueue([envelope('socket-a')]);
+  const socketCheck = await cli(runtime.stateDir, 'check');
+  assert.equal(socketCheck.code, 0);
+  assert.deepEqual(socketCheck.value.items.map((item: any) => item.id), ['socket-a']);
+  assert.equal((await cli(runtime.stateDir, 'check')).value.deliveryId, socketCheck.value.deliveryId);
+  assert.equal(
+    (await cli(runtime.stateDir, 'check', '--ack', String(socketCheck.value.deliveryId))).code,
+    0,
+  );
+
+  // Offline direct MailboxStore path.
+  runtime.persist();
+  await runtime.stop();
+  const mailboxPath = join(runtime.stateDir, 'mailbox.json');
+  assert.equal(statSync(mailboxPath).mode & 0o777, 0o600);
+  assert.equal((await cli(runtime.stateDir, 'list', '--all')).value.ackedCount, 3);
+  const offlineStore = new MailboxStore(mailboxPath);
+  offlineStore.enqueue([envelope('offline-a')]);
+  const offlineCheck = await cli(runtime.stateDir, 'check');
+  assert.equal(offlineCheck.code, 0);
+  assert.deepEqual(offlineCheck.value.items.map((item: any) => item.id), ['offline-a']);
+  const offlineAck = await cli(
+    runtime.stateDir,
+    'ack',
+    String(offlineCheck.value.deliveryId),
+  );
+  assert.equal(offlineAck.code, 0);
+  assert.equal(offlineAck.value.alreadyAcknowledged, false);
+
+  for (const args of [
+    ['read', 'live-a'],
+    ['show', 'live-a'],
+    ['list', '--wait'],
+    ['list', '--peek'],
+    ['check', '--timeout-ms', '0'],
+    ['check', '--timeout-ms', '10'],
+    ['ack'],
+    ['ack', 'dlv_ffffffffffff', '--all'],
+    ['bogus'],
+  ]) {
+    assert.equal((await cli(runtime.stateDir, ...args)).code, 1, args.join(' '));
   }
   assert.equal(existsSync(join(runtime.stateDir, 'runtime.lock')), false);
   assert.equal(existsSync(join(runtime.stateDir, 'control.sock')), false);
 });
 
-test('topic defaults converge with wave policy and deliver verified attachments to inbox', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'inbox-routing-'));
-  const make = (member: string, receiver = false) => new DealerNodeRuntime({
-    stateDir: join(root, member), member, name: member, profile: 'personal-dev',
+test('offline CLI and a live runtime observe the same durable lease', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'inbox-shared-'));
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    profile: 'headless-relay',
     transport: { discoveryDir: join(root, 'mesh') },
-    patch: { gateMode: 'open', policies: ['wave-coalescer'],
-      executorConfig: { 'orca-wave': { runId: 'test' } } },
-    commandRunner: async () => { throw new Error('Unexpected external executor'); },
-    executorOverrides: receiver ? [{ name: 'notify', async execute() { return { executor: 'notify' }; } }] : [],
+  }).start();
+  t.after(async () => {
+    await runtime.stop();
+    rmSync(root, { recursive: true, force: true });
   });
+  await runtime.mailbox.enqueue([envelope('shared')]);
+  assert.equal(existsSync(join(runtime.stateDir, 'control.sock')), false);
+  const offline = await cli(runtime.stateDir, 'check');
+  assert.equal(offline.code, 0);
+  const leaseId = String(offline.value.deliveryId);
+  assert.equal(runtime.mailbox.check().deliveryId, leaseId);
+  assert.equal(runtime.mailbox.check().redelivered, true);
+  await runtime.stop();
+  const acked = await cli(runtime.stateDir, 'ack', leaseId);
+  assert.equal(acked.code, 0);
+  assert.equal(acked.value.alreadyAcknowledged, false);
+  assert.equal(new MailboxStore(join(runtime.stateDir, 'mailbox.json')).list({ includeAcked: true }).ackedCount, 1);
+});
+
+test('inbox executor routes logical mailboxes, deduplicates and preserves attachments', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'inbox-plugin-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'mailbox.json');
+  const store = new MailboxStore(path);
+  const plugin = createInboxExecutorPlugin({ store });
+  assert.throws(() => createInboxExecutorPlugin(), /requires store or inboxPath/);
+  const first = envelope('shared');
+  first.payload = { content: { keep: true }, localAttachments: ['/verified/file'] };
+  first.attachments = [
+    { name: 'file', mimeType: 'text/plain', sizeBytes: 4, blake3Hash: 'hash', ticket: 'ticket' },
+    { name: 'absent', mimeType: 'text/plain', sizeBytes: 0, blake3Hash: 'hash2', ticket: 'ticket2' },
+  ];
+  const result = (await plugin.execute([first, first], {} as ExecutionContext)) as {
+    count: number;
+    inserted: string[];
+  };
+  assert.equal(result.count, 2);
+  assert.deepEqual(result.inserted, ['shared']);
+  const [item] = store.list().items;
+  assert.deepEqual(item.envelope.payload, {
+    content: { keep: true },
+    localAttachments: ['/verified/file'],
+  });
+  assert.deepEqual(item.envelope.attachments.map(attachment => attachment.name), [
+    'file',
+    'absent',
+  ]);
+  assert.equal(Object.hasOwn(item.envelope.attachments[0], 'localPath'), false);
+
+  const routed = envelope('routed');
+  routed.payload = { mailbox: 'stream:alerts' };
+  await plugin.execute([routed], {} as ExecutionContext);
+  assert.equal(store.list({ mailboxId: 'stream:alerts' }).totalCount, 1);
+  assert.equal(store.list({ mailboxId: 'default' }).totalCount, 1);
+  await plugin.execute([first], {} as ExecutionContext);
+  assert.equal(store.list({ mailboxId: 'default' }).totalCount, 1);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+});
+
+test('topic defaults, P2P delivery and thread reverse routes converge end to end', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'inbox-routing-'));
+  const make = (member: string, receiver = false) =>
+    new DealerNodeRuntime({
+      stateDir: join(root, member),
+      member,
+      name: member,
+      profile: 'personal-dev',
+      transport: { discoveryDir: join(root, 'mesh') },
+      patch: {
+        gateMode: 'open',
+        policies: ['wave-coalescer'],
+        executorConfig: { 'orca-wave': { runId: 'test' } },
+      },
+      commandRunner: async () => {
+        throw new Error('Unexpected external executor');
+      },
+      executorOverrides: receiver
+        ? [{ name: 'notify', async execute() { return { executor: 'notify' }; } }]
+        : [],
+    });
   const alice = await make('alice').start();
   const bob = await make('bob', true).start();
   t.after(async () => {
@@ -204,14 +272,24 @@ test('topic defaults converge with wave policy and deliver verified attachments 
   initProjectScaffold(project, { projectId: 'one', defaultNetworkId: 'team' });
   const manifestPath = join(project, '.dealer', 'project.json');
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  manifest.topics = { triage: { description: 'Triage', defaultExecutor: 'inbox' }, wave: { description: 'Wave', defaultExecutor: 'orca-wave' } };
+  manifest.topics = {
+    triage: { description: 'Triage', defaultExecutor: 'inbox' },
+    wave: { description: 'Wave', defaultExecutor: 'orca-wave' },
+  };
   writeFileSync(manifestPath, JSON.stringify(manifest));
   await bob.linkProject(project);
   assert.equal(bob.resolveExecutorName({ kind: 'triage', payload: { executor: ' ' } }), 'inbox');
   assert.equal(bob.resolveExecutorName({ kind: 'other' }), 'orca-spawn');
   const conflicting = join(root, 'conflict');
   initProjectScaffold(conflicting, { projectId: 'two', defaultNetworkId: 'team' });
-  writeFileSync(join(conflicting, '.dealer', 'project.json'), JSON.stringify({ ...manifest, projectId: 'two', topics: { triage: { description: 'Triage', defaultExecutor: 'notify' } } }));
+  writeFileSync(
+    join(conflicting, '.dealer', 'project.json'),
+    JSON.stringify({
+      ...manifest,
+      projectId: 'two',
+      topics: { triage: { description: 'Triage', defaultExecutor: 'notify' } },
+    }),
+  );
   await assert.rejects(bob.linkProject(conflicting), /Conflicting defaultExecutor for topic: triage/);
   assert.equal(bob.config.projects.length, 1);
   for (const runtime of [alice, bob]) {
@@ -222,58 +300,161 @@ test('topic defaults converge with wave policy and deliver verified attachments 
     assert.ok(Date.now() < deadline, 'peer discovery');
     await new Promise(resolve => setTimeout(resolve, 25));
   }
+
   const file = join(root, 'attachment.txt');
   writeFileSync(file, 'verified inbox attachment');
-  const sent = await runDealerCli(['send', '--network', 'team', '--to', 'member:bob', '--topic', 'triage', '--body', '{}', '--attach', file], {
-    runtime: alice, stdout: () => {}, stderr: line => assert.fail(line),
+  const sent = await alice.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'unicast', targets: ['member:bob'] },
+    kind: 'triage',
+    subject: 'triage',
+    body: '{}',
+    payload: {},
+    semantic: {
+      type: 'message',
+      targetMailbox: 'task:one',
+      replyMailbox: 'worktree:main',
+    },
+    filePaths: [file],
   });
-  assert.equal(sent, 0);
-  const [item] = (await bob.inbox.list()).items;
-  assert.equal(readFileSync(item.attachments[0].localPath, 'utf8'), 'verified inbox attachment');
-  assert.equal(Object.hasOwn(item.payload, 'localAttachments'), false);
-  assert.equal(statSync(join(bob.stateDir, 'inbox.json')).mode & 0o777, 0o600);
-  const override = await alice.emitter.emit({ networkId: 'team', routing: { mode: 'unicast', targets: ['member:bob'] },
-    kind: 'triage', subject: 'override', body: '', payload: { executor: 'notify' } });
+  assert.equal(sent.receipts[0].stage, 'dispatched');
+  const [item] = bob.mailbox.list({ mailboxId: 'task:one' }).items;
+  assert.equal(item.envelope.semantic?.replyMailbox, 'worktree:main');
+  assert.equal(
+    readFileSync(item.envelope.payload.localAttachments[0], 'utf8'),
+    'verified inbox attachment',
+  );
+  assert.equal(Object.hasOwn(item.envelope.payload, 'localAttachments'), true);
+  assert.equal(statSync(join(bob.stateDir, 'mailbox.json')).mode & 0o777, 0o600);
+  assert.equal(bob.mailbox.list({ mailboxId: 'task:one' }).totalCount, 1);
+  assert.equal(bob.mailbox.list({ mailboxId: 'default' }).totalCount, 0);
+
+  const inboundRoute = bob.mailbox.getThread(sent.messageId)!;
+  assert.equal(inboundRoute.direction, 'inbound');
+  assert.equal(inboundRoute.localMailbox, 'task:one');
+  assert.deepEqual(
+    bob.mailbox.resolveReplyTarget(sent.messageId),
+    {
+      threadId: sent.messageId,
+      messageId: sent.messageId,
+      peerNodeId: alice.transport.localNodeId,
+      networkId: 'team',
+      targetMailbox: 'worktree:main',
+      localMailbox: 'task:one',
+      traceId: sent.traceId,
+      kind: 'triage',
+      subject: 'triage',
+    },
+  );
+  const outboundRoute = alice.mailbox.getThread(sent.messageId)!;
+  assert.equal(outboundRoute.direction, 'outbound');
+  assert.deepEqual(outboundRoute.peerNodeIds, [bob.transport.localNodeId]);
+
+  const override = await alice.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'unicast', targets: ['member:bob'] },
+    kind: 'triage',
+    subject: 'override',
+    body: '',
+    payload: { executor: 'notify' },
+  });
   assert.equal(override.receipts[0].stage, 'dispatched');
-  assert.equal((await bob.inbox.list()).totalCount, 1);
-  const queued = await alice.emitter.emit({ networkId: 'team', routing: { mode: 'unicast', targets: ['member:bob'] },
-    kind: 'wave', subject: 'wave', body: '', payload: {} });
+  assert.equal(bob.mailbox.list({ mailboxId: 'task:one' }).totalCount, 1);
+  const queued = await alice.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'unicast', targets: ['member:bob'] },
+    kind: 'wave',
+    subject: 'wave',
+    body: '',
+    payload: {},
+  });
   assert.equal(queued.receipts[0].stage, 'queued');
 });
 
+test('streaming control keeps long waits alive and aborts cleanly on disconnect', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'inbox-stream-'));
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+  }).start();
+  t.after(async () => {
+    await runtime.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await runtime.serveControl(async (argv, context) => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, {
+      runtime,
+      stdout: line => stdout.push(line),
+      stderr: line => stderr.push(line),
+      signal: context.signal,
+    });
+    return { code, stdout, stderr };
+  }, { keepaliveMs: 40 });
 
-test('inbox plugin preserves canonical attachments, batch deduplication and stable ordering', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'inbox-plugin-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const path = join(root, 'inbox.json');
-  const store = new InboxStore(path);
-  const plugin = createInboxExecutorPlugin({ store });
-  const first = envelope('shared');
-  first.payload = { content: { keep: true }, localAttachments: ['/verified/file'] };
-  first.attachments = [{ name: 'file', mimeType: 'text/plain', sizeBytes: 4, blake3Hash: 'hash', ticket: 'ticket' },
-    { name: 'absent', mimeType: 'text/plain', sizeBytes: 0, blake3Hash: 'hash2', ticket: 'ticket2' }];
-  const result = await plugin.execute([first, first], {} as ExecutionContext);
-  assert.equal(result.count, 2);
-  assert.deepEqual(result.inserted, ['shared']);
-  const read = await store.show('shared', { markRead: true });
-  assert.deepEqual(read.payload, { content: { keep: true } });
-  assert.deepEqual(read.attachments.map(a => a.localPath), ['/verified/file', '']);
-  assert.equal(Object.hasOwn(read.attachments[0], 'ticket'), false);
-  await plugin.execute([first], {} as ExecutionContext);
-  assert.deepEqual(await store.show('shared'), read);
-  first.payload.content = 'mutated';
-  assert.deepEqual((await store.show('shared')).payload, { content: { keep: true } });
-  await store.deliver([envelope('shared', 'team', 'bob'), envelope('third')]);
-  assert.equal((await store.list({ status: 'all' })).totalCount, 3);
-  await assert.rejects(store.show('shared', { networkId: 'team' }), /Ambiguous inbox message/);
-  const saved = JSON.parse(readFileSync(path, 'utf8'));
-  for (const item of saved.items) {
-    item.receivedAt = '2026-01-01T00:00:00.000Z';
-  }
-  writeFileSync(path, JSON.stringify(saved));
-  assert.deepEqual((await store.list({ status: 'all' })).items.map(item => item.from.member + ':' + item.id),
-    ['alice:third', 'bob:shared', 'alice:shared']);
-  assert.deepEqual(await store.markRead({ all: true, from: 'bob' }), { updated: ['shared'], unreadCount: 0 });
-  await Promise.all([store.deliver([envelope('last')]), store.markRead({ all: true })]);
-  assert.equal((await store.list()).unreadCount, 0);
+  const waiting = rpc(
+    runtime.socketPath,
+    ['inbox', 'check', '--wait', '--timeout-ms', '5000', '--json'],
+    { inactivityMs: 250 },
+  );
+  // Several keepalives (40ms cadence) span more than one 250ms inactivity window.
+  await new Promise(resolve => setTimeout(resolve, 600));
+  runtime.mailbox.enqueue([envelope('wake-live')]);
+  const result = await waiting;
+  assert.equal(result.code, 0);
+  const payload = JSON.parse(result.stdout[0]);
+  assert.equal(payload.timedOut, false);
+  assert.deepEqual(payload.items.map((item: any) => item.id), ['wake-live']);
+  assert.equal(payload.redelivered, false);
+
+  const direct = await rawControl('/cli', runtime.socketPath, ['inbox', 'list', '--json']);
+  assert.equal(direct.status, 200);
+  const listed = await direct.json();
+  assert.equal(listed.code, 0);
+  assert.equal(JSON.parse(listed.stdout[0]).leasedCount, 1);
+
+  const abandoned = new Promise<void>((resolve, reject) => {
+    const req = request(
+      {
+        socketPath: runtime.socketPath,
+        path: '/cli-stream',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      },
+      res => {
+        res.resume();
+        res.on('end', () => resolve());
+      },
+    );
+    req.on('error', error => {
+      if ((error as NodeJS.ErrnoException).code === 'ECONNRESET') {
+        resolve();
+      } else {
+        reject(error);
+      }
+    });
+    req.on('close', () => resolve());
+    req.end(
+      JSON.stringify([
+        'inbox',
+        'check',
+        '--mailbox',
+        'abandoned',
+        '--wait',
+        '--timeout-ms',
+        '30000',
+        '--json',
+      ]),
+    );
+    setTimeout(() => req.destroy(), 60);
+  });
+  await abandoned;
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const after = await rpc(runtime.socketPath, ['inbox', 'list', '--json'], {
+    inactivityMs: 2_000,
+  });
+  assert.equal(after.code, 0);
+  assert.equal(JSON.parse(after.stdout[0]).totalCount, 1);
 });
