@@ -59,6 +59,48 @@ test('inbox snapshots deduplicate composite identity, serialize mutations and pr
   assert.equal((await store.list()).totalCount, 0);
 });
 
+test('inbox ordering compares instants across offsets with deterministic ties', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'inbox-order-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'inbox.json');
+  const store = new InboxStore(path);
+  await store.deliver([envelope('older'), envelope('newer'), envelope('tie')]);
+  const saved = JSON.parse(readFileSync(path, 'utf8'));
+  saved.items[0].receivedAt = '2026-11-10T09:00:00+08:00';
+  saved.items[1].receivedAt = '2026-11-10T02:00:00Z';
+  saved.items[2].receivedAt = '2026-11-10T10:00:00+08:00';
+  writeFileSync(path, JSON.stringify(saved));
+  assert.deepEqual((await store.list()).items.map(item => item.id), ['tie', 'newer', 'older']);
+});
+
+test('offline inbox mutations respect an embedded runtime ownership lock', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'inbox-owned-'));
+  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') } }).start();
+  t.after(async () => {
+    await runtime.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await runtime.inbox.deliver([envelope('owned')]);
+  const lockDir = join(runtime.stateDir, 'runtime.lock');
+  const owner = readFileSync(join(lockDir, 'owner.json'), 'utf8');
+  assert.equal(existsSync(join(runtime.stateDir, 'control.sock')), false);
+  assert.equal((await cli(runtime.stateDir, 'list')).code, 0);
+  assert.equal((await cli(runtime.stateDir, 'show', 'owned')).value.status, 'unread');
+  for (const args of [['read', 'owned'], ['ack', 'owned'], ['show', 'owned', '--mark-read']]) {
+    const result = await cli(runtime.stateDir, ...args);
+    assert.equal(result.code, 1);
+    assert.match(result.value.error, /State directory already owned/);
+    assert.equal(readFileSync(join(lockDir, 'owner.json'), 'utf8'), owner);
+  }
+  assert.equal((await runtime.inbox.show('owned')).status, 'unread');
+  await runtime.stop();
+  assert.equal((await cli(runtime.stateDir, 'read', 'missing')).code, 1);
+  assert.equal(existsSync(lockDir), false);
+  assert.equal((await cli(runtime.stateDir, 'read', 'owned')).code, 0);
+  assert.equal(existsSync(lockDir), false);
+});
+
 test('inbox CLI supports live, control socket and offline queries and acknowledgements', async t => {
   const root = mkdtempSync(join(tmpdir(), 'inbox-cli-'));
   const inboxPath = join(root, 'custom', 'mail.json');

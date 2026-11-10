@@ -1078,7 +1078,14 @@ export class InboxStore {
         unreadCount: matching.filter(item => item.status === 'unread').length,
         status,
         items: matching.reverse().filter(item => status === 'all' || item.status === status)
-          .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)).slice(0, options.limit),
+          .sort((a, b) => {
+            const tb = Date.parse(b.receivedAt);
+            const ta = Date.parse(a.receivedAt);
+            if (Number.isFinite(tb) && Number.isFinite(ta) && tb !== ta) {
+              return tb - ta;
+            }
+            return b.receivedAt > a.receivedAt ? 1 : b.receivedAt < a.receivedAt ? -1 : 0;
+          }).slice(0, options.limit),
       };
     });
   }

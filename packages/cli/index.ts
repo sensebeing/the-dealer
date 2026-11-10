@@ -1,11 +1,11 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { request } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { InboxStore } from '../plugins-executor/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
-import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
+import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold, saveJson } from './config.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
@@ -227,6 +227,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
   let owned: DealerNodeRuntime | undefined;
+  let offlineLockDir: string | undefined;
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action] = p;
@@ -276,6 +277,19 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         await options.runtime.start();
         inbox = options.runtime.inbox;
       } else {
+        if (action === 'read' || action === 'ack' || (action === 'show' && v['mark-read'] === true)) {
+          mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+          const lockDir = join(stateDir, 'runtime.lock');
+          try {
+            mkdirSync(lockDir);
+          } catch {
+            throw new Error(
+              'State directory already owned; use the running daemon (remove runtime.lock only after verifying its process stopped)',
+            );
+          }
+          offlineLockDir = lockDir;
+          saveJson(join(lockDir, 'owner.json'), { pid: process.pid });
+        }
         const file = join(stateDir, 'config.json');
         const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
         inbox = new InboxStore(savedConfig.executorConfig?.inbox?.inboxPath ?? join(stateDir, 'inbox.json'));
@@ -476,6 +490,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     stderr(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
     return 1;
   } finally {
+    if (offlineLockDir) {
+      rmSync(offlineLockDir, { recursive: true, force: true });
+    }
     if (owned) {
       await owned.stop();
     }
