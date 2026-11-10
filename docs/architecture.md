@@ -395,8 +395,10 @@ export interface ExecutorPlugin<C = unknown> {
    - **`plugin-policy-dedup-cas`**：基于 `idempotencyKey` 与单调代次水位（`claim_version / revision`）的本地持久化状态账本，确保同一事件精确派发一次，故障重启后沿用原回执对账，绝不重复建工作区。
 2. **持久化信箱与唤醒重驱 (`packages/mailbox/`)**：
    - **`MailboxStore`**：唯一原子落盘的信箱账本，承载逻辑 `mailboxId`、单未决租约 `dlv_*`、`wakeTargets` 重驱状态、`inbound:` / `outbound:` 方向化线程路由与旧 `inbox.json` 一次性迁移；通过文件锁 + `fsync`/`rename` 落盘，并以事件唤醒而非轮询驱动消费者。
-   - **`WakeupRedriveService`**：取代易失的 wave-coalescer。目标工作区忙碌或不可判定时只保留持久化 `pendingWake`，绝不注入文本；仅在权威 Orca 工作区/终端空闲门禁通过后投递严格单行指针，失败按 1s → 2s → 5s → 10s 退避，守护进程重启后自动恢复，租约确认后才按 `completedWaves` 阈值执行 `/new` 轮转。
+   - **`WakeupRedriveService`**：取代易失的 wave-coalescer。目标工作区忙碌或不可判定时只保留持久化 `pendingWake`，绝不注入文本；仅在权威 Orca 工作区/终端空闲门禁通过后投递严格单行指针，空闲探测或投递前准备失败按 1s → 2s → 5s → 10s 退避，安全待投递工作在守护进程重启后恢复，租约确认后才按 `completedWaves` 阈值执行 `/new` 轮转。
 3. **执行器插件 (`packages/plugins-executor/`)**：
+   - **投递结算与未知结果**：`MailboxStore.beginWakeDelivery` 在外部命令前持久化 `deliveryInDoubt`；只有成功回执才由 `completeWakeDelivery` 清除此围栏。错误、abort 或进程中断保留围栏与原因，后续入队、强制 flush 和重启均不能自动重放，须先核实外部结果再显式修复目标。成功结算只覆盖预览序号水位内的消息，新入队消息保留 `enqueue` 决定的截止时间；会话帧即时唤醒，普通波次仍遵守 coalescing。
+   - **宿主会话身份**：`agent-host` 唯一负责身份映射和启动回执解析。显式 `sessionId` 原样保留；Claude 缺省名称由信箱 ID 可逆编码，Dot/Grok 使用原始信箱 ID。Codex 仅在显式身份或启动 JSON 的 `threadId`/`sessionId` 可用时启用 fixed 续接；无身份的 Codex 与独立 `agy run` 成功后清除自动宿主唤醒绑定，信箱仍可手动读取。已有 fixed 会话不从任务输出重新推断身份。
    - **`plugin-executor-orca-spawn`（独立工作区派生器）**：
      - 对应你的 `feedback_dispatcher`、低质会话派发与跨人协作 Request。
      - 收到消息后：自动下载附件 Blob 到私有目录 → 调用 `orca worktree create` 创建独立工作区 → 预授权 `trustedWorkspaces` → 调用 `orca terminal create` 启动 `agy / claude / codex` → 持久化任务信箱并等待 `tui-idle` 确认后才注入单行任务前言。

@@ -1,4 +1,4 @@
-import { buildAgentHostInvocation, resolveAgentSessionId } from '../agent-host/index.ts';
+import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import {
   checkedCommand,
   checkOrcaWorkspaceIdle,
@@ -222,7 +222,6 @@ export class WakeupRedriveService {
         const remaining = (this.claims.get(id) ?? 1) - 1;
         if (remaining <= 0) {
           this.claims.delete(id);
-          this.notifyMailbox(id);
         } else {
           this.claims.set(id, remaining);
         }
@@ -242,7 +241,7 @@ export class WakeupRedriveService {
       return;
     }
     const target = this.store.getWakeTarget(id);
-    if (!target?.pendingWake || target.earliestWakeAt > this.now()) {
+    if (!target?.pendingWake || target.deliveryInDoubt || target.earliestWakeAt > this.now()) {
       return;
     }
     void this.flushMailbox(id).catch(error => this.report(error));
@@ -320,6 +319,7 @@ export class WakeupRedriveService {
       if (!target) {
         return noWake(mailboxId, 'passive', 'No wake target');
       }
+      if (target.deliveryInDoubt) return noWake(mailboxId, target.mode, target.lastWakeError ?? 'Wake delivery requires reconciliation');
       if (!target.pendingWake) {
         return noWake(mailboxId, target.mode, 'No pending wake');
       }
@@ -365,10 +365,16 @@ export class WakeupRedriveService {
           command: target.interactiveCommand, agentProfile: target.agentProfile,
           targetBot: target.targetBot, sessionId: target.sessionId,
         });
-        await checkedCommand(this.runner, { ...invocation, cwd: target.workspacePath });
-        this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
-          conversationMode: 'fixed', sessionId: resolveAgentSessionId(mailboxId, target.sessionId),
-        });
+        this.store.beginWakeDelivery(mailboxId);
+        let output;
+        try {
+          output = await checkedCommand(this.runner, { ...invocation, cwd: target.workspacePath });
+        } catch (error) {
+          this.store.parkWakeDelivery(mailboxId, error);
+          throw error;
+        }
+        this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview),
+          resolveAgentHostContinuation(target.hostAgent, mailboxId, target.sessionId, output.stdout, target.conversationMode ?? 'fixed'));
         return { mailboxId, mode: target.mode, woke: true, pointer, reason: 'Agent host wakeup delivered' };
       }
       if (!this.idleCheck && target.mode === 'orca-terminal' && target.workspacePath && target.autoCreateWorkspace === true) {
@@ -390,6 +396,10 @@ export class WakeupRedriveService {
         return noWake(mailboxId, 'passive', String(error));
       }
       try {
+        if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
+          this.store.parkWakeDelivery(mailboxId, error);
+          return noWake(mailboxId, target.mode, String(error));
+        }
         return this.defer(mailboxId, target, String(error));
       } catch (deferError) {
         this.report(deferError);
@@ -528,6 +538,7 @@ export class WakeupRedriveService {
       return noWake(mailboxId, target.mode, 'Nothing new to deliver');
     }
 
+    this.store.beginWakeDelivery(mailboxId);
     if (target.mode === 'orca-run') {
       if (!target.runId) {
         throw new Error('orca-run wake target requires runId');

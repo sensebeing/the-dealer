@@ -1,4 +1,4 @@
-import { buildAgentHostInvocation, resolveAgentSessionId } from '../agent-host/index.ts';
+import { buildAgentHostInvocation, resolveAgentSessionId, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import type { SupportedAgentHost } from '../agent-host/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -94,6 +94,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       let mailboxId: string | undefined;
       let deliveredSequence = -1;
       let effectiveSessionId: string | undefined;
+      let wakeDelivered = false;
       const store = options.store ?? config.store;
       let claim: ReturnType<WakeupRedriveService['claim']> | undefined;
       try {
@@ -112,7 +113,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           const agentProfile = payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile;
           const targetBot = payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot;
           const sessionId = payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId;
-          effectiveSessionId = resolveAgentSessionId(mailboxId, sessionId);
+          effectiveSessionId = resolveAgentSessionId(mailboxId, sessionId, agent ?? 'codex');
           let invocation = buildAgentHostInvocation({
             agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
             command, agentProfile, targetBot, sessionId: effectiveSessionId,
@@ -142,10 +143,19 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           }
           request = { ...invocation, cwd };
         }
-        const output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
-        if (store && mailboxId) store.completeWakeDelivery(mailboxId, deliveredSequence, {
-          conversationMode: 'fixed', sessionId: effectiveSessionId,
-        });
+        if (store && mailboxId) store.beginWakeDelivery(mailboxId);
+        let output;
+        try {
+          output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
+        } catch (error) {
+          if (store && mailboxId) store.parkWakeDelivery(mailboxId, error);
+          throw error;
+        }
+        if (store && mailboxId) {
+          store.completeWakeDelivery(mailboxId, deliveredSequence,
+            resolveAgentHostContinuation(agent ?? 'codex', mailboxId, effectiveSessionId, output.stdout, mode === 'fixed' ? 'fixed' : 'spawn'));
+          wakeDelivered = true;
+        }
         let structuredOutput: unknown;
         try {
           structuredOutput = JSON.parse(output.stdout);
@@ -155,6 +165,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
         return { executor: name, executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '' };
       } finally {
         claim?.dispose();
+        if (wakeDelivered && mailboxId) (options.wakeup ?? config.wakeup)?.notifyMailbox(mailboxId);
       }
     },
   };
@@ -574,6 +585,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                   typeof payload.terminalPrompt === 'string' && payload.terminalPrompt.trim()
                     ? payload.terminalPrompt
                     : (batch[0].body || batch[0].subject);
+                store.beginWakeDelivery(mailboxId);
                 await sendOrcaTerminalText(
                   runner,
                   command,
@@ -586,8 +598,12 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                 // Never inject into a busy or unverifiable terminal; the redrive service will.
                 store.upsertWakeTarget(mailboxId, { pendingWake: true });
               }
+            } catch (error) {
+              if (store.getWakeTarget(mailboxId)?.deliveryInDoubt) store.parkWakeDelivery(mailboxId, error);
+              throw error;
             } finally {
               claim?.dispose();
+              wakeup?.notifyMailbox(mailboxId);
             }
           }
         }

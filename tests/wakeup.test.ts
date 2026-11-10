@@ -1001,7 +1001,7 @@ test('sequence settlement remains finite when wall clock order differs from arri
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   store.enqueue([alert('leased')], { mailboxId: 'box' });
   store.check({ mailboxId: 'box' });
-  store.enqueue([alert('later-clock')], { mailboxId: 'box', wakeTarget: { mode: 'passive', hostAgent: 'codex' } });
+  store.enqueue([alert('later-clock')], { mailboxId: 'box', wakeTarget: { mode: 'passive', hostAgent: 'codex', sessionId: 'existing' } });
   t.mock.timers.setTime(10_000);
   store.enqueue([alert('later-sequence')], { mailboxId: 'box' });
   assert.equal(store.check({ mailboxId: 'box', peek: true }).latestQueued?.id, 'later-clock');
@@ -1014,4 +1014,79 @@ test('sequence settlement remains finite when wall clock order differs from arri
   await wakeup.flushMailbox('box', { force: true });
   assert.equal(calls, 1);
   assert.equal(store.getWakeTarget('box')?.pendingWake, false);
+});
+
+test('in-flight ordinary arrivals retain enqueue coalescing deadline while replies remain immediate', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
+    mode: 'passive', hostAgent: 'claude-code', conversationMode: 'fixed', sessionId: 'session', coalesceMs: 5000,
+  } });
+  let calls = 0;
+  const wakeup = new WakeupRedriveService({ store, commandRunner: async () => {
+    calls++;
+    if (calls === 1) {
+      t.mock.timers.setTime(11_000);
+      store.enqueue([alert('ordinary')], { mailboxId: 'box' });
+    }
+    return { stdout: '{}' };
+  } });
+  t.after(() => wakeup.stop());
+  await wakeup.flushMailbox('box', { force: true });
+  assert.equal(calls, 1);
+  assert.equal(store.getWakeTarget('box')?.pendingWake, true);
+  assert.equal(store.getWakeTarget('box')?.earliestWakeAt, 16_000);
+  assert.deepEqual(await wakeup.flushReady(), []);
+  t.mock.timers.setTime(16_000);
+  await wakeup.flushReady();
+  assert.equal(calls, 2);
+  assert.equal(store.getWakeTarget('box')?.pendingWake, false);
+});
+
+for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
+  test(`${mode} uncertain external delivery is fenced against retries, later mail and restart`, async t => {
+    const file = join(directory(t), 'mailbox.json');
+    const store = new MailboxStore(file);
+    store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
+      mode, ...(mode === 'passive' ? { hostAgent: 'claude-code' as const, conversationMode: 'spawn' as const } : {}), runId: 'run', terminalHandle: 'term',
+    } });
+    let effects = 0;
+    const wakeup = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async call => {
+      if (mode !== 'orca-terminal' || call.args[1] === 'send') {
+        effects++;
+        throw new Error('accepted then result lost');
+      }
+      return { stdout: '{"ok":true}' };
+    } });
+    t.after(() => wakeup.stop());
+    assert.equal((await wakeup.flushMailbox('box')).woke, false);
+    assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
+    assert.equal(store.getWakeTarget('box')?.pendingWake, false);
+    assert.match(store.getWakeTarget('box')!.lastWakeError!, /result lost/);
+    await wakeup.stop();
+    const restarted = new MailboxStore(file);
+    const recovery = new WakeupRedriveService({ store: restarted, commandRunner: async () => {
+      effects++;
+      return { stdout: '{}' };
+    } });
+    t.after(() => recovery.stop());
+    restarted.enqueue([alert('next')], { mailboxId: 'box' });
+    await recovery.flushReady();
+    assert.equal((await recovery.flushMailbox('box', { force: true })).woke, false);
+    assert.equal(effects, 1);
+  });
+}
+
+test('a restart with an unfinished external wake remains fenced even without a failure callback', async t => {
+  const file = join(directory(t), 'mailbox.json');
+  const store = new MailboxStore(file);
+  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: { mode: 'passive', hostAgent: 'claude-code' } });
+  store.beginWakeDelivery('box');
+  const restarted = new MailboxStore(file);
+  const service = new WakeupRedriveService({ store: restarted, commandRunner: async () => {
+    assert.fail('unknown delivery must not be replayed');
+  } });
+  t.after(() => service.stop());
+  assert.equal((await service.flushMailbox('box', { force: true })).woke, false);
+  assert.equal(restarted.getWakeTarget('box')?.deliveryInDoubt, true);
 });
