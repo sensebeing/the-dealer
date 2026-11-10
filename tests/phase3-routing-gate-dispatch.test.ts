@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { Kernel } from '../packages/kernel/index.ts';
 import { generateNodeKeyPair, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
@@ -1379,4 +1380,45 @@ test('sea-creature naming advances through numeric tiers using receiver settings
   for (const name of names) {
     assert.match(name, /^[a-z-]+-\d+$/);
   }
+});
+
+
+test('mock Orca with a store uses durable history without reading or changing default host settings', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-settings-isolation-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  // Redirect only the home lookup so this test never touches the real host settings.
+  const homeMock = t.mock.method(os, 'homedir', () => dir);
+  syncBuiltinESMExports();
+  t.after(() => {
+    homeMock.mock.restore();
+    syncBuiltinESMExports();
+  });
+  const settingsDir = join(dir, '.gemini/antigravity-cli');
+  await mkdir(settingsDir, { recursive: true });
+  const settingsPath = join(settingsDir, 'settings.json');
+  const originalSettings = JSON.stringify({ trustedWorkspaces: ['/host/seahorse'] });
+  await writeFile(settingsPath, originalSettings);
+  const store = new MailboxStore(join(dir, 'mailbox.json'));
+  store.recordSpawnedWorkspace('/retired/nautilus');
+  const names: string[] = [];
+  const baseRunner = cleanedWorktreeRunner(names);
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle: 'term-isolated' } } }) };
+    }
+    return baseRunner(request);
+  };
+  const executor = createOrcaSpawnExecutorPlugin({
+    commandRunner, store, seaCreatureNaming: true, agent: 'antigravity',
+  });
+  await executor.execute([envelope({ payload: { interactive: true } })], spawnContext, {});
+  assert.deepEqual(names, ['seahorse']);
+  assert.equal(await readFile(settingsPath, 'utf8'), originalSettings);
+  assert.ok(store.listKnownWorkspacePaths().includes('/retired/seahorse'));
+
+  // Invalid host JSON must also be irrelevant to mocked execution.
+  await writeFile(settingsPath, 'not JSON');
+  await executor.execute([envelope({ payload: { interactive: true } })], spawnContext, {});
+  assert.deepEqual(names, ['seahorse', 'starfish']);
+  assert.equal(await readFile(settingsPath, 'utf8'), 'not JSON');
 });

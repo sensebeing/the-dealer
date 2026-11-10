@@ -428,7 +428,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         explicitSettingsPath ??
         optionSettingsPath ??
         join(homedir(), '.gemini/antigravity-cli/settings.json');
-      const mayTrust = !options.commandRunner || store !== undefined ||
+      const mayTrust = !options.commandRunner ||
         explicitSettingsPath !== undefined || optionSettingsPath !== undefined;
       const explicitName =
         typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
@@ -467,6 +467,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       store?.recordSpawnedWorkspace(path);
       if (interactive) {
         if (
+          mayTrust &&
           effectiveAgent === 'antigravity' &&
           payload.trustAntigravity !== false &&
           (existsSync(settingsFile) ||
