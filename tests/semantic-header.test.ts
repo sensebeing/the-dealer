@@ -342,6 +342,108 @@ test('prepare hooks cannot inject an invalid semantic header', async t => {
       payload: {},
       semantic: { type: 'message' },
     }),
-    /threadId must be a non-empty string/,
+    /Settlement outcome required/,
   );
+});
+
+test('prepare hooks may inject a message semantic without a threadId', async t => {
+  const kernel = new Kernel();
+  const card = peerCard();
+  const sent: MessageEnvelope[] = [];
+  const node: NodeService = {
+    getSelfCard: networkId =>
+      signNodeCard(
+        {
+          nodeId: sender.nodeId,
+          networkId,
+          revision: 1,
+          identity: { member: 'alice', nodeName: 'laptop' },
+          admissionMode: 'open',
+          capabilities: { summary: 'Sender', skills: [] },
+          runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+          updatedAt: '2026-11-10T00:00:00.000Z',
+        },
+        sender.privateKeyPem,
+      ),
+    async updateSelfProfile() {},
+    listPeers: () => [card],
+    resolveTarget: selector => (selector === card.nodeId ? [card] : []),
+  };
+  const transport: TransportService = {
+    localNodeId: sender.nodeId,
+    async mountNetwork() {
+      throw new Error('unused');
+    },
+    async unmountNetwork() {},
+    listMountedNetworks: () => ['test'],
+    async sendUnicast(networkId, targetNodeId, frame) {
+      const envelope = JSON.parse(Buffer.from(frame).toString('utf8')).envelope as MessageEnvelope;
+      sent.push(envelope);
+      return Buffer.from(
+        JSON.stringify(
+          signReceipt(
+            {
+              messageId: envelope.id,
+              networkId,
+              fromNodeId: targetNodeId,
+              stage: 'dispatched',
+              updatedAt: new Date().toISOString(),
+            },
+            receiver.privateKeyPem,
+          ),
+        ),
+      );
+    },
+    async sendMulticast() {
+      return new Map();
+    },
+    async broadcast() {},
+    async shareFile() {
+      throw new Error('unused');
+    },
+    async fetchBlobToPath() {},
+  };
+  kernel.ctx.provide('node', node);
+  kernel.ctx.provide('transport', transport);
+  await kernel.use(createRouterPlugin());
+  await kernel.use(createEmitterPlugin({ privateKeyPem: sender.privateKeyPem }));
+  t.after(() => kernel.stop());
+  kernel.ctx.on('emitter/prepare', (message, next) =>
+    next({
+      ...message,
+      semantic: {
+        type: 'message',
+        targetMailbox: 'task:w1',
+        replyMailbox: 'worktree:main',
+      } as unknown as SemanticHeader,
+    }),
+  );
+
+  const input = {
+    networkId: 'test',
+    routing: { mode: 'unicast' as const, targets: [receiver.nodeId] },
+    kind: 'task',
+    subject: 'Task',
+    body: 'Do it',
+    payload: {},
+  };
+  const result = await kernel.ctx.services.emitter.emit(input);
+  assert.equal(sent.length, 1);
+  assert.equal(result.messageId, sent[0].id);
+  assert.deepEqual(sent[0].semantic, {
+    type: 'message',
+    threadId: sent[0].id,
+    targetMailbox: 'task:w1',
+    replyMailbox: 'worktree:main',
+  });
+  assert.ok(verifyEnvelope(sent[0]));
+
+  kernel.ctx.on('emitter/prepare', (message, next) =>
+    next({ ...message, id: 'forged-message-id' }),
+  );
+  await assert.rejects(
+    kernel.ctx.services.emitter.emit(input),
+    /Prepare hook cannot change message id/,
+  );
+  assert.equal(sent.length, 1);
 });

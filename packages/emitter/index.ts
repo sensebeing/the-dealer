@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import {
   resolveSemanticHeader,
   signEnvelope,
-  validateSemanticHeader,
   verifyEnvelope,
   verifyReceipt,
 } from '../core-types/index.ts';
@@ -65,6 +64,9 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           };
           const initial = signEnvelope(draft, privateKeyPem);
           const prepared = await ctx.waterfall('emitter/prepare', initial as MessageEnvelope);
+          if (prepared.id !== id) {
+            throw new Error('Prepare hook cannot change message id');
+          }
           if (
             prepared.networkId !== input.networkId ||
             prepared.from.nodeId !== self.nodeId ||
@@ -73,10 +75,18 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           ) {
             throw new Error('Prepare hook cannot change sender or network identity');
           }
-          if (prepared.semantic !== undefined) {
-            validateSemanticHeader(prepared.semantic);
-          }
-          const envelope = signEnvelope(prepared, privateKeyPem);
+          // Hooks may inject a semantic header without a threadId; normalize it against the
+          // authenticated message id before the final signature.
+          const preparedSemantic =
+            prepared.semantic !== undefined
+              ? resolveSemanticHeader(prepared.semantic, prepared.id)
+              : undefined;
+          const envelope = signEnvelope(
+            preparedSemantic !== undefined
+              ? { ...prepared, semantic: preparedSemantic }
+              : prepared,
+            privateKeyPem,
+          );
           if (!verifyEnvelope(envelope)) {
             throw new Error('Emitter key does not match node identity');
           }
