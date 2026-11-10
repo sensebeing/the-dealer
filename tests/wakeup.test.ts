@@ -846,6 +846,25 @@ test('Autopilot composer recognition preserves human drafts and clears only befo
     return { stdout: '{"ok":true}' };
   };
   assert.deepEqual(await checkOrcaWorkspaceIdle(runner, 'orca', root), { idle: true, composerPrefilled: true, reason: undefined });
+  const childPath = join(root, 'child');
+  for (const childPreview of [
+    `• ,1（主推）：${suggestion}\n> ${suggestion}`,
+    `• ,1（主推）：${suggestion}\n> ${suggestion}\nstatus bar`,
+  ]) {
+    const childRunner: CommandRunner = async request => {
+      if (request.args[0] === 'worktree') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [
+        { path: root, worktreeId: 'root', childWorktreeIds: ['child'], unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+        { path: childPath, worktreeId: 'child', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+      ] } }) };
+      assert.equal(request.args[1], 'list');
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: [
+        { handle: 'term', connected: true, writable: true, preview: request.args.includes(`path:${childPath}`) ? childPreview : '>' },
+      ] } }) };
+    };
+    const result = await checkOrcaWorkspaceIdle(childRunner, 'orca', root);
+    assert.equal(result.idle, true);
+    assert.equal(Boolean(result.composerPrefilled), false);
+  }
   preview = 'history\n> unsent draft';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', root)).idle, false);
   preview = `• ,1（主推）：${suggestion}\n> ${suggestion}\nstatus bar`;

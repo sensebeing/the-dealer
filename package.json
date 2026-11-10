@@ -1,7 +1,7 @@
 {
   "name": "the-dealer",
   "version": "0.1.0",
-  "description": "The Dealer \u2014 Plugin-driven Agent Collaboration & Dispatch System: start with zero-config multi-agent collaboration on a single machine, and scale seamlessly to cross-machine and cross-team P2P networks.",
+  "description": "Plugin-driven Agent Collaboration & Dispatch Mesh — scale from zero-config same-machine multi-agent dispatch to encrypted cross-machine & cross-team P2P networks.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -12,7 +12,28 @@
     "dealerd": "./bin/dealerd.js"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test 'tests/**/*.test.ts'"
+    "test": "node --experimental-strip-types --test 'tests/**/*.test.ts'",
+    "build:native": "cargo build --release --manifest-path native/dealer-iroh-engine/Cargo.toml"
   },
-  "exports": "./packages/index.ts"
+  "exports": "./packages/index.ts",
+  "homepage": "https://github.com/sensebeing/the-dealer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sensebeing/the-dealer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sensebeing/the-dealer/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "multi-agent-systems",
+    "agent-orchestration",
+    "p2p",
+    "iroh",
+    "orca",
+    "codex",
+    "claude-code",
+    "antigravity",
+    "developer-tools"
+  ]
 }

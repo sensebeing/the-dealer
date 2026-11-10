@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible Dealer failure with redacted evidence.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For vulnerabilities, use the private reporting instructions in SECURITY.md.
+        Never include private keys, network invitations, credentials or private conversations.
+  - type: input
+    id: version
+    attributes:
+      label: Dealer version or commit
+      placeholder: "0.1.0 / commit SHA"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Node version, host CLI/version, profile and transport (TCP or optional Iroh).
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include minimal commands, receiver binding/mode and synthetic message data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and evidence
+      description: Redacted errors, receipts and mailbox state; distinguish handoff from completion.
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Verification and scope
+      description: Relevant tests, restart behavior, reproducibility and checks you could not run.

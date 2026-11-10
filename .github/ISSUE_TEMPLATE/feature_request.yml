@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose an observable improvement to agent collaboration.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and scenario
+      description: Who encounters the problem, and in which collaboration workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired behavior
+      description: Describe an observable outcome and a concrete example.
+    validations:
+      required: true
+  - type: textarea
+    id: ownership
+    attributes:
+      label: Ownership and safety boundaries
+      description: Which module or plugin should own this? Consider trust, persistence and execution.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Could an existing profile, project patch or plugin solve this more simply?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: How would tests or a real host interaction demonstrate success?

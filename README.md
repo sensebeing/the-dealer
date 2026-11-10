@@ -1,220 +1,222 @@
 # The Dealer
 
-**Connect your agents — across workspaces, across machines, across teammates.**
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node.js >=22.6](https://img.shields.io/badge/node-%3E%3D22.6-blue.svg)](package.json)
+[![Zero runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-green.svg)](package.json)
+[![Rust Iroh Engine](https://img.shields.io/badge/native_transport-Rust_Iroh-orange.svg)](native/dealer-iroh-engine/Cargo.toml)
 
-The Dealer turns independent agent conversations into a collaboration mesh with routing, permissions, and a durable inbox. Start on one machine with no network setup, then connect your other machines and teammates through encrypted P2P networks using the same delivery pipeline.
+**Turn isolated coding agents into a real-time, zero-config local and P2P collaboration mesh.**
 
-```text
-1  Same-Machine Mesh
-   Orca | Antigravity | Claude Code | Codex | ChatGPT Dot | Grok Bot
-                              |
-2  Cross-Machine Personal Mesh
-                 MacBook <-> Mac mini <-> Devbox
-                              |
-3  Cross-Teammate P2P Collaboration
-   dealer-net:// -> Gate -> Durable Inbox -> spawn new conversation
-                                         -> fixed dedicated conversation
-```
+One developer can run Codex, Claude Code, Antigravity and Orca on a single Mac—yet their conversations remain isolated. The Dealer connects them through a shared delivery protocol, then extends the same workflow to encrypted collaboration across machines and teams. Ed25519 identities, receiver-owned trust gates, durable JSON mailbox waves and real-time session wakeups keep handoffs accountable. The default TCP transport has an optional Rust Iroh QUIC engine; `lark-mirror` and the OS `notify` executor keep the human copilot in the loop.
 
-English | [简体中文](README.zh-CN.md)
-
-### Host profiles and one-command presets
-
-| Environment | Built-in profile | First-class executor |
-| --- | --- | --- |
-| Orca | `orca-dev` | `orca-spawn`, `orca-wave` |
-| Codex | `codex-dev` | `codex` |
-| Claude Code | `claude-dev` | `claude-code` |
-| Antigravity | `antigravity-dev` | `antigravity` (standalone `agy`) |
-
-All four profiles use `approval_required` and `dedup-cas`. The named Codex,
-Claude Code and Antigravity executors default to `spawn` and support `fixed`;
-`agent-pty` remains available for existing configurations and other bridges.
-
-```sh
-dealer node up --profile codex-dev --json
-dealer setup apply-preset --host codex --mode fixed --topic collab.request.v4 --session-id <thread> --set-default --json
-```
-
-`apply-preset` persists the topic binding, enables required executors and merges
-executor settings. It works offline or through the running daemon, taking effect
-without a restart. Omit `--set-default` to preserve the node's current default.
-`--mode inbox-only` selects durable manual intake. Supported selectors include
-`--project`, `--workspace-path`, `--agent`, `--agent-profile`, `--target-bot`,
-and `--session-id`; `--notify-lark` enables mailbox eligibility, not Lark credentials.
-
-For compatibility, `apply-preset` applies the same bindings as `binding-preset`:
-Orca and Antigravity use managed `orca-spawn`/`orca-wave`; Codex and Claude Code
-use `agent-pty`. `--set-default` selects the named host executor for unbound
-messages (or `inbox` for inbox-only). For direct named-executor topic bindings,
-use the ready-to-use [host patches](examples/user-patches/): `orca.patch.json`,
-`codex.patch.json`, `claude-code.patch.json`, and `antigravity.patch.json`.
-Start a node with `dealer node up --patch examples/user-patches/codex.patch.json --json`,
-or link its topic bindings with `dealer project link <repo> --user-patch <file>`.
-Project user patches do not change node-wide profiles; enable the corresponding
-profile at node startup. Add receiver-owned workspace paths and real session IDs
-when selecting fixed conversations; verify the installed CLI's argv contract.
+[中文文档](README.zh-CN.md) · [Get started](#get-started-in-30-seconds--copy--paste-to-your-agent) · [Scenarios](#why-the-dealer--three-progressive-scenarios) · [Architecture](#architecture--real-time-session-delivery) · [Host presets](#host-profiles-agent-apps--one-command-presets) · [CLI](#cli-cheat-sheet--bundled-skills)
 
 ## Get Started in 30 Seconds — Copy & Paste to Your Agent
 
-### Prompt 1: Start or Join on Your Machine — Paste into Claude Code / Codex / Antigravity / Orca
+Paste either prompt into your coding agent. The agent inspects your machine and performs setup; the prompts do not assume that every host CLI is installed.
+
+### Prompt 1 — Start or Join on Your Machine
 
 ```text
-Set up The Dealer for me, preserving my existing configuration and ~/.dealer/identity.json.
+Set up The Dealer, preserving my existing configuration and identity.
 
-1. Check `command -v dealer` and `node --version`. Require Node >=22.6.
-   If dealer is absent, clone https://github.com/sensebeing/the-dealer.git into
-   ~/the-dealer. If the checkout already exists, inspect local changes before
-   updating it with `git -C ~/the-dealer pull --ff-only`. Then run:
-   cd ~/the-dealer && npm install && npm link
-   If dealer is already installed, ensure this trusted checkout is available
-   for skills without replacing the existing installation.
-2. Create ~/.agents/skills/ and ~/.claude/skills/. Symlink these three directories
-   into both skill directories, and ~/.gemini/config/skills/ if it exists:
+1. Check `node --version` (Node >=22.6) and `command -v dealer`.
+   Clone https://github.com/sensebeing/the-dealer.git to ~/the-dealer if absent.
+   For an existing checkout, inspect local changes and its remote before running
+   `git -C ~/the-dealer pull --ff-only`. Install with `npm --prefix ~/the-dealer link`.
+   Preserve an existing installation if it points to another trusted checkout.
+2. Create ~/.agents/skills/, ~/.claude/skills/ and ~/.gemini/config/skills/.
+   Symlink each directory below into all three skill directories:
    ~/the-dealer/skills/the-dealer
    ~/the-dealer/skills/the-dealer-setup
    ~/the-dealer/skills/the-dealer-extend
-   Preserve existing files; resolve conflicting links before replacing them.
+   Preserve unrelated files; resolve conflicting links before replacement.
    Read ~/the-dealer/skills/the-dealer-setup/SKILL.md.
-3. Run `dealer setup probe --json` to inspect local Agent Apps and node state.
-   Never overwrite ~/.dealer/identity.json or copy another machine's private key.
-4. Ask whether I want (1) same-machine multi-agent dispatch, (2) to connect my
-   own machines, or (3) to join/create a teammate network. Follow the setup skill.
-5. For teammates, ask my member handle, Agent App (orca, antigravity, claude-code,
-   codex, chatgpt-dot, grok-bot), and conversation mode (spawn: new conversation per
-   request; fixed: dedicated conversation; inbox-only: manual processing).
-   Generate `dealer setup binding-preset --host <app> --mode <mode> --json`;
-   add --target-bot <bot> for Grok execution. Review and apply its binding and
-   executorConfig through the setup skill, using receiver-owned project roots.
-6. Verify actual delivery, inbox readback and a reply. Keep remote admission
-   approval_required until the intended peer has been verified.
+3. Run `dealer setup probe --json` and `dealer node status --json`.
+   Ask for my member handle, node name, host and mode (spawn/fixed/inbox-only).
+   Use local collaboration unless I request a remote network. Never replace
+   ~/.dealer/identity.json or copy another machine's private key.
+4. Select the host profile: orca-dev, codex-dev, claude-dev or antigravity-dev.
+   Start dealerd with `dealer node up --profile <profile> --member <member>
+   --name <node> --json`. If a daemon already runs, preserve its configuration;
+   coordinate any required restart rather than starting a second daemon.
+   Generate `dealer setup binding-preset --host <host> --mode <mode> --json`,
+   then apply the reviewed selectors with `dealer setup apply-preset` using
+   the same arguments. Add receiver-owned project/workspace or session IDs
+   where required; inspect host CLI help to verify the generated argv contract.
+5. For a safe self-loopback, apply an inbox-only binding to setup.ping:
+   `dealer setup apply-preset --host <host> --mode inbox-only --topic setup.ping --json`.
+   Send `dealer send --network local --to member:<member> --topic setup.ping
+   --body 'Dealer loopback check' --json`. Resolve any pending approval explicitly.
+   Read `dealer inbox check --mailbox stream:setup.ping --json`, verify the body,
+   and acknowledge the returned delivery lease. Verify a reply using the daily
+   skill. Report mailbox readback separately from actual host execution.
+6. If I provide a remote invite, mount it with `dealer network mount '<invite>'
+   --json`, keep approval_required, then verify peer discovery and replies.
 ```
 
-### Prompt 2: Invite a Teammate or Your Second Machine — Generate & Send to Colleague
-
-On the creator's machine, mount your network, then generate a fresh invitation:
-
-```sh
-dealer setup invite-prompt --network <network-id>
-# Add --json for crossMachinePrompt and teammatePrompt as separate fields.
-# Optional: --peer-member <handle> --name <other-node> --seed <reachable-host:port>
-```
-
-Send `crossMachinePrompt` to your own second machine or `teammatePrompt` to a colleague. Both contain installation, skill setup, network mounting and verification steps. A live node's advertised TCP endpoint is embedded automatically when no seeds are already configured; an offline node with a configured port uses its primary LAN IPv4.
-
-Complete template (replace `<invite-uri>` with the generated `dealer-net://...` URI and the other placeholders before executing commands):
+### Prompt 2 — Invite a Teammate or Your Second Machine
 
 ```text
-Connect this machine to my Dealer network. Preserve existing configuration and identity.
+Prepare a private Dealer invitation and a ready-to-forward onboarding message.
 
-Check `command -v dealer` and Node >=22.6. If missing, clone
-https://github.com/sensebeing/the-dealer.git to ~/the-dealer (or inspect and update
-that checkout with `git -C ~/the-dealer pull --ff-only`), then run:
-cd ~/the-dealer && npm install && npm link
-If already installed, ensure the trusted ~/the-dealer checkout exists for skills.
-Create ~/.agents/skills/ and ~/.claude/skills/, then symlink each of
-~/the-dealer/skills/the-dealer, ~/the-dealer/skills/the-dealer-setup, and
-~/the-dealer/skills/the-dealer-extend into both, and ~/.gemini/config/skills/ if
-present. Preserve unrelated files and resolve link conflicts first.
-Read ~/the-dealer/skills/the-dealer-setup/SKILL.md and run `dealer setup probe --json`.
-Never overwrite ~/.dealer/identity.json or copy another machine's private key.
-
-Ask whether this is my second machine or a teammate's machine. For my own machine,
-reuse my member handle; for a teammate, ask their handle (do not use "teammate"
-as a literal identity). Ask for the new node name, then run:
-dealer node up --member '<member-handle>' --name '<node-name>' --json
-dealer network mount '<invite-uri>' --json
-
-Ask for the receiving Agent App: orca, antigravity, claude-code, codex, chatgpt-dot,
-or grok-bot; and mode: spawn, fixed, or inbox-only. Generate:
-dealer setup binding-preset --host <app> --mode <mode> --json
-For Grok execution add --target-bot <bot>. Review and apply the returned preset
-through the setup skill; bind project roots locally and verify host CLI support.
-Keep approval_required admission until the intended peer is verified.
-
-dealer peers list --network '<network-id>' --json
-dealer send --network '<network-id>' --to 'member:<inviter-handle>' --topic setup.ping --body 'Please reply to verify connectivity' --json
-Verify replies in both directions and durable inbox/host readback. A dispatched
-receipt alone does not prove task completion. If member handles repeat across
-machines, use a specific member@node selector.
+1. Read the-dealer-setup/SKILL.md and inspect `dealer node status --json`.
+   Ask which network to share and whether this is my own machine or a teammate.
+   Reuse an existing network. For a new network generate a strong secret and run
+   `dealer network mount <network-id> --passphrase '<secret>'
+   --gate approval_required --json`. Keep secrets out of logs and source control.
+2. Run `dealer setup invite-prompt --network <network-id> --member <my-handle>
+   --peer-member <recipient-handle> --name <recipient-node> --ttl 1h --json`.
+   Use the returned dealer-net://v1/... invite without editing it. If the detected
+   TCP address is not reachable, specify `--seed <reachable-host:port>`.
+3. Return crossMachinePrompt for my own machine or teammatePrompt for a teammate
+   as a complete message I can forward privately; do not send it automatically.
+   Ensure it covers Node >=22.6, installation, all three bundled skill symlinks,
+   a distinct node identity, selected host/mode and the exact network mount command.
+   Replace placeholders with confirmed identities; do not copy private keys.
+4. The recipient should inspect the host CLI contract, apply the receiving
+   binding, keep approval_required, run `dealer peers list --network <network-id>
+   --json`, and verify a ping and reply in both directions plus mailbox readback.
+   If generation occurred offline for an unmounted network, mount that same
+   invite on the creator too. Distinguish delivery receipts from task completion.
 ```
 
-Invites contain a shared secret: send them privately, never commit them. Generation is read-only; if the creator has not mounted the network, mount the same generated invite there too. TCP seeds work across routed subnets when the advertised address and port are reachable; they do not bypass firewalls or provide automatic NAT traversal. Use `--seed` for a reachable VPN/routed endpoint when the detected LAN address is unsuitable.
+Invites carry the network shared secret. Their expiry limits importing, not continued access. Default TCP seeds require a reachable address and port; they do not bypass NAT or firewalls. See the [setup guide](skills/the-dealer-setup/SKILL.md).
 
-## Three Progressive Superpowers
+## Why The Dealer & Three Progressive Scenarios
 
-### 1. Same-Machine Multi-Agent Dispatch
+Start with the agents you already run; add machines and teammates without inventing another handoff protocol.
 
-One developer, several agents, isolated workspaces. Run `dealer node up` and send to your own `member:<handle>` or local skill: no invite, shared secret, or network mount is required. Local delivery still uses the gate, dispatcher, deduplication and executor pipeline.
-
-### 2. Cross-Machine Personal Mesh
-
-Keep the same member handle across your MacBook, Mac mini and devbox while each machine retains its own signing identity. Mount the same invite to discover peers through local registry, UDP multicast or explicit TCP seeds, then address a particular machine with `member@node`.
-
-### 3. Cross-Teammate Encrypted P2P & Durable Inbox
-
-Share a network invitation and let each receiver choose admission and execution. Durable mail, delivery leases, directional threads and restart-safe wakeups keep requests available; `ask`, `reply` and `settle` separate conversation progress from executor handoff. Orca wakeups wait for authoritative idle state before injecting a pointer.
-
-## Supported Agent Apps & Conversation Modes
-
-| Agent App (`--host`) | Integration | Receiver configuration |
+| Scenario | Setup | What it enables |
 | --- | --- | --- |
-| `orca` | Managed worktrees / idle-gated conversations | Choose inner agent with `--agent codex`, `claude`, or `antigravity`; receiver workspace/project |
-| `antigravity` | Antigravity in Orca-managed worktrees | Receiver workspace; standalone `agy` also available via agent-pty |
-| `claude-code` | Claude Code CLI | Optional profile and fixed session ID |
-| `codex` | Codex CLI | Optional profile and fixed thread/session ID |
-| `chatgpt-dot` | OpenAI ChatGPT Personal Agent `dot` bridge | Agent/bot selector and session ID |
-| `grok-bot` | Grok Bot bridge | `--target-bot <bot>` required for execution |
+| **Same-Machine Multi-Agent Dispatch** | `local`; zero network setup | Handoffs and review between Orca, Codex, Claude Code and Antigravity through the same gate and mailbox pipeline. |
+| **Personal Multi-Machine Mesh** | `dealer network mount` and `dealer network invite` | Connect a MacBook and Studio/Linux workstation; each retains its own key. Address a specific machine with `member@node`. |
+| **Team Collaboration & Source Dispatch** | Shared network, verified sender identities, receiver-owned `approval_required` admission | Route by member or advertised skill; connect source plugins, durable waves and restart-safe redrive. Explicit trust or `open` admission is a receiver decision. |
 
-- **`spawn`**: a new conversation per request; Orca creates an isolated worktree.
-- **`fixed`**: a dedicated conversation for ongoing work; Orca uses an idle-gated workspace, other hosts use their configured session contract.
-- **`inbox-only`**: retain durable mail for manual processing without launching an agent.
+## Architecture & Real-Time Session Delivery
 
-All six hosts have presets for all three modes. `binding-preset` prints a proposal; it does not apply configuration or enable execution. Probe detects installations, not CLI compatibility: verify the installed host or bridge supports the generated argv contract. See the [host matrix](skills/the-dealer-setup/references/agent-app-matrix.md).
-
-## Extend in 3 Tiers with the-dealer-extend
-
-1. **Personal Patch** — customize your node's profile, routing, gates and executor settings without changing a project.
-2. **Project Plugins in `.dealer/project.json`** — declare project identity, topics and plugins; link the repository to receiver-owned paths.
-3. **Custom Executors/Routers/Sources** — implement typed plugins for new agent hosts, routing decisions, webhooks or watermark-based sources. The kernel owns lifecycle and dependency injection.
-
-Start with [the-dealer-extend](skills/the-dealer-extend/SKILL.md), then the [plugin guide](docs/plugin-guide.md). No external npm runtime dependencies; Node.js >=22.6 runs the TypeScript sources directly.
-
-Manage personal plugins through the daemon; removal hot-unloads hooks and persists across restarts, leaving the module file on disk.
-
-```sh
-dealer plugin add --name personal-hook --module plugins/personal-hook.ts --config ./personal.json --json
-dealer plugin list --json
-dealer plugin remove personal-hook --json
+```mermaid
+flowchart LR
+  CLI["CLI / Skill"] --> E["Emitter / Outbound Router"]
+  Sources["Source Plugins"] --> E
+  E --> T["Transport: TCP / optional Iroh QUIC"]
+  Peers["Peer Nodes"] --> T
+  T --> G["Inbound Gate: Trust & Approval"]
+  G --> D["Dispatcher / Inbound Routing"]
+  D --> M["Durable JSON Mailbox"]
+  M --> W["Idle-gated Wakeup / Executor Plugins"]
+  W --> A["Orca / Codex / Claude Code / Antigravity"]
+  G --> H["Human Copilot: Lark / OS Notification"]
+  M --> H
 ```
 
-## CLI Cheat Sheet
+The kernel owns lifecycle and typed events. Outbound routing selects authenticated candidates; the gate owns admission, the dispatcher owns execution and receipts, and the mailbox owns durable records. JSON state uses file locks and atomic `fsync`/rename writes. No second delivery ledger is introduced by the host adapters.
+
+| Capability | Behavior and boundary |
+| --- | --- |
+| Inline message preview | Wakeup pointers include bounded latest-message text, sender and thread. Short messages are visible immediately; mailbox leases remain authoritative. |
+| Instant conversational wakeups | `question` / `reply` / `settle` frames use `0ms` coalescing. Active claims, busy workspaces and retry backoff still apply; this is not a latency guarantee. |
+| Turn Autopilot compatibility | Recognized recommendation prefills are treated as idle. `Ctrl+U` clears a target-root prefill before its pointer; a child prefill does not request clearing the root composer. Human drafts remain busy. |
+| Unified session modes | Orca, Codex, Claude Code and Antigravity (`agy`) expose `spawn`, `fixed` and `inbox-only` configuration. Orca-managed wakeups have durable idle-gated redrive; other host behavior depends on installed CLI contracts. |
+| Human copilot mirrors | `lark-mirror` mirrors eligible mailbox/approval events; the `notify` executor provides OS notifications. Notification does not grant approval or prove agent completion. |
+
+See [architecture](docs/architecture.md), [wire protocol](docs/wire-protocol.md), and the [host matrix](skills/the-dealer-setup/references/agent-app-matrix.md).
+
+## Host Profiles, Agent Apps & One-Command Presets
+
+### Host profiles and sample patches
+
+| Host (`--host`) | Startup profile (`--profile`) | Sample patch | Named executor |
+| --- | --- | --- | --- |
+| `orca` | `orca-dev` | [orca.patch.json](examples/user-patches/orca.patch.json) | `orca-spawn` / `orca-wave` |
+| `codex` | `codex-dev` | [codex.patch.json](examples/user-patches/codex.patch.json) | `codex` |
+| `claude-code` | `claude-dev` | [claude-code.patch.json](examples/user-patches/claude-code.patch.json) | `claude-code` |
+| `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity` |
+
+All four profiles use `approval_required` and `dedup-cas`. Host names and startup profile names are different CLI arguments.
+
+### Supported Agent Apps and conversation modes
+
+| Host / mode | `spawn` | `fixed` | Receiver requirements |
+| --- | --- | --- | --- |
+| `orca` | New child worktree | Idle-gated workspace | Receiver project/workspace and inner `--agent` |
+| `codex` | New CLI worktree session | Existing thread queue | Compatible CLI; optional profile and fixed session ID |
+| `claude-code` | Background conversation | Resumed session | Compatible CLI; optional profile and fixed session ID |
+| `antigravity` | Orca-managed agy worktree | Orca-managed agy workspace | Orca and agy; standalone named executor also available |
+| `inbox-only` (mode on any host) | No launch | No launch | Durable manual intake, no external executor |
+
+`chatgpt-dot` and `grok-bot` bridge presets also exist; Grok execution requires `--target-bot`. CLI presence does not prove support for generated queue/background flags. Verify the installed version's interface before enabling it.
+
+### Canonical request and binding presets
+
+The names below describe `--host` / `--mode` pairs, not additional preset IDs. The default topic is `collab.request.v4`.
+
+| Configuration | Arguments | Generated executor |
+| --- | --- | --- |
+| `orca-fixed` | `--host orca --mode fixed` | `orca-wave` |
+| `orca-spawn` | `--host orca --mode spawn` | `orca-spawn` |
+| `codex-spawn` | `--host codex --mode spawn` | `agent-pty` |
+| `codex-fixed` | `--host codex --mode fixed` | `agent-pty` |
+| `claude-spawn` | `--host claude-code --mode spawn` | `agent-pty` |
+| `claude-fixed` | `--host claude-code --mode fixed` | `agent-pty` |
+| `antigravity-spawn` | `--host antigravity --mode spawn` | `orca-spawn` |
+| `antigravity-fixed` | `--host antigravity --mode fixed` | `orca-wave` |
+| `lark-mirror` (notification plugin) | `apply-preset --notify-lark` enables binding eligibility | Configure `larkNotify` credentials/target separately; not a binding-preset host |
 
 ```sh
-dealer setup probe --json
-dealer node up --member alice --name laptop --json
-dealer node status --json
-dealer setup binding-preset --host codex --mode fixed --session-id <thread> --json
-dealer network mount <network-id> --passphrase '<shared-secret>' --gate approval_required --json
-dealer setup invite-prompt --network <network-id>
-dealer peers list --network <network-id> --json
-dealer send --network local --to member:alice --topic collab.request.v4 --body 'Review this change' --json
-dealer inbox check --mailbox <mailbox-id> --json
-dealer inbox ack <dlv-id> --mailbox <mailbox-id> --json
-dealer thread show <message-id> --json
+dealer node up --profile codex-dev --json
+dealer setup binding-preset --host codex --mode fixed --topic collab.request.v4 --session-id <thread> --json
+dealer setup apply-preset --host codex --mode fixed --topic collab.request.v4 --session-id <thread> --set-default --json
+dealer setup apply-preset --host orca --mode spawn --project <project-id> --workspace-path <receiver-repo> --agent codex --json
+```
+
+Replace angle-bracket placeholders before running. `binding-preset` only prints a proposal. `apply-preset` persists bindings, enables required executors and updates a live daemon without a restart. `--set-default` changes unbound-message delivery to the named host executor; omit it to preserve the default. Sample patches use named executors directly. Link project patches with `dealer project link <repo> --user-patch <file> --json`; project patches do not change node-wide startup profiles.
+
+## Extend in 3 Tiers
+
+| Tier | Configuration | Owner boundary |
+| --- | --- | --- |
+| **1. Personal overrides** | `~/.dealer/config.json`; generated host bindings | Node profile, receiver gates, executor settings and notification targets. |
+| **2. Project patches** | `~/.dealer/projects/<project>.patch.json`, linked to `.dealer/project.json` | Shared topics and plugin references live in the project; local paths and sessions stay receiver-owned. |
+| **3. Custom plugins** | Source / Router / Executor plugins and notifier lifecycle hooks | Contracts in [packages/core-types/index.ts](packages/core-types/index.ts); external factory API and kernel lifecycle preserve one semantic owner. |
+
+Use [the-dealer-extend](skills/the-dealer-extend/SKILL.md) and the [plugin guide](docs/plugin-guide.md). Personal plugin modules live in `~/.dealer/plugins/`; `dealer plugin add`, `list` and `remove` manage them through the daemon. Keep npm runtime dependencies at zero.
+
+## CLI Cheat Sheet & Bundled Skills
+
+| Command | Purpose |
+| --- | --- |
+| `dealer setup probe --json` | Inspect installed hosts and redacted node configuration. |
+| `dealer node up --profile orca-dev --json` / `dealer node status --json` | Start dealerd / inspect its state. |
+| `dealer network mount <id> --passphrase '<secret>' --gate approval_required --json` | Create a local network mount. |
+| `dealer network invite <id> --ttl 1h --json` | Generate a shared-secret invite. |
+| `dealer network mount '<invite>' --json` / `dealer network unmount <id> --json` | Join / detach a network. |
+| `dealer peers list --network <id> --json` | Inspect peers in one network. |
+| `dealer send --network local --to member:alice --topic collab.request.v4 --body 'Review this change' --json` | Send a routed message. |
+| `dealer inbox check --mailbox <id> --json` | Acquire pending mail as a delivery lease. |
+| `dealer inbox ack <dlv-id> --mailbox <id> --json` | Acknowledge that lease. |
+| `dealer thread show <message-id> --json` | Read conversation state and reverse routing. |
+| `dealer ask` / `dealer reply` / `dealer settle` | Conversation protocol; see the daily skill for required arguments. |
+
+| Bundled skill | Use it for |
+| --- | --- |
+| [the-dealer-setup](skills/the-dealer-setup/SKILL.md) | Installation, topology, host selection and verified onboarding. |
+| [the-dealer](skills/the-dealer/SKILL.md) | Sending, replying, delivery leases and settlement. |
+| [the-dealer-extend](skills/the-dealer-extend/SKILL.md) | Personal overrides, project sources and custom integrations. |
+
+## Security & Verification
+
+Ed25519 signs node cards, envelopes and receipts. HKDF-SHA256 derives network-specific keys; AES-256-GCM isolates frames. Invitations carry a shared secret and expiry rather than a signed capability token. BLAKE3 verifies streamed content-addressed attachments. The receiver controls `open`, `approval_required`, `dnd` and `closed` admission and maps project IDs to trusted local roots; incoming filesystem paths cannot select execution roots. Unknown external side effects are not safe automatic replays.
+
+Use Node.js >=22.6; TypeScript runs directly with Node's type stripping. The optional native engine needs Rust/Cargo and builds separately; building it does not select it as the default transport.
+
+```sh
 npm test
+git diff --check
+# Optional Rust engine / 可选 Rust 引擎
+npm run build:native
 ```
 
-For reply/settlement workflows, see the [daily operations skill](skills/the-dealer/SKILL.md).
+Tests cover crypto, lifecycle, routing, gates, mailbox recovery and real daemon round trips. Mocked host tests are not proof that a specific installed Agent App completed work. Report native build and live host verification separately.
 
-## Architecture & Security
-
-```text
-Sources / CLI -> Emitter -> Router -> Transport -> Gate -> Dispatcher -> Executor
-                         Node identity & directory       Durable mailbox
-                  Kernel: lifecycle, injection, typed events
-```
-
-Ed25519 signs identities and messages; HKDF-SHA256 derives network-specific keys and AES-256-GCM protects frames. The default transport uses TCP, encrypted discovery beacons and streaming BLAKE3 file verification; an optional Rust Iroh engine lives under `native/`. Admission is receiver-owned (`open`, `approval_required`, `dnd`, `closed`), routing decisions stay within the current network's candidate set, and sender paths cannot choose receiver project roots. Unknown external execution outcomes are never treated as safe automatic replays.
-
-[Architecture](docs/architecture.md) · [Wire protocol](docs/wire-protocol.md) · [Setup skill](skills/the-dealer-setup/SKILL.md) · [MIT License](LICENSE)
+[Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [MIT License](LICENSE)

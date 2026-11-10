@@ -194,12 +194,13 @@ export async function checkOrcaWorkspaceIdle(
           .split(/\r?\n/)
           .filter(line => line.trim())
           .at(-1);
-        if (lastLine?.trimStart().startsWith('> ')) {
-          if (!isAutopilotComposerPrefill(terminal.preview)) return false;
-          composerPrefilled = true;
-        } else if (isAutopilotComposerPrefill(terminal.preview)) {
-          composerPrefilled = true;
+        if (isAutopilotComposerPrefill(terminal.preview)) {
+          if (row.path === cwd) {
+            composerPrefilled = true;
+          }
+          continue;
         }
+        if (lastLine?.trimStart().startsWith('> ')) return false;
       }
     }
     for (const id of row.childWorktreeIds ?? []) {
