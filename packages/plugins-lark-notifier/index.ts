@@ -135,7 +135,7 @@ export class LarkMailboxNotifier {
             messageId = await this.send(target, markdown, `dlr-${hash.slice(0, 40)}`, matching?.messageId);
           } catch (error) {
             if (!matching || !/(?:message|root).*(?:not found|deleted|withdrawn|not exist)|(?:not found|deleted|withdrawn).*(?:message|root)/i.test(String(error))) throw error;
-            messageId = await this.send(target, markdown, `dlr-r-${hash.slice(0, 38)}`);
+            messageId = await this.send(target, this.render(item, false), `dlr-r-${hash.slice(0, 38)}`);
             newRoot = true;
           }
           const now = new Date().toISOString();
@@ -207,9 +207,9 @@ export class LarkMailboxNotifier {
     }
     const type = envelope.semantic?.type ?? 'message';
     const threadId = envelope.semantic?.threadId ?? envelope.id;
-    const markdown = followup || ['question', 'reply', 'settle'].includes(type)
+    const markdown = followup
       ? `**[${type}] ${envelope.from.member}**\n\n${envelope.body}`
-      : `**[${envelope.kind}] ${envelope.subject}**\n- From: \`${envelope.from.member}\` (\`${envelope.from.nodeName}\`)\n- Mailbox: \`${item.mailboxId}\` | Priority: \`${envelope.priority}\`\n- Thread: \`${threadId}\`\n\n${envelope.body}`;
+      : `**[${envelope.kind}] ${envelope.subject}**${type !== 'message' ? `\n- Type: \`${type}\`` : ''}\n- From: \`${envelope.from.member}\` (\`${envelope.from.nodeName}\`)\n- Mailbox: \`${item.mailboxId}\` | Priority: \`${envelope.priority}\`\n- Thread: \`${threadId}\`\n\n${envelope.body}`;
     return markdown + (envelope.attachments.length ? `\n\nAttachments:\n${envelope.attachments.map(file => `- ${file.name}`).join('\n')}` : '');
   }
   private persist(state: NotifyState): void {

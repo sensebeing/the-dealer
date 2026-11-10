@@ -110,6 +110,15 @@ test('linked bindings override defaults, validate conflicts and refresh on unlin
   await runtime.linkProject(project, patch);
   assert.equal(runtime.resolveExecutorName({ kind: 'request' }), 'orca-wave');
   assert.equal(runtime.mailbox.getWakeTarget('stream:linked')?.repoRoot, project);
+  const updated = JSON.parse(readFileSync(patch, 'utf8'));
+  updated.topicBindings.request.coalesceMs = 5000;
+  writeFileSync(patch, JSON.stringify(updated));
+  await runtime.linkProject(project, patch);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:linked')?.coalesceMs, 5000);
+  delete updated.topicBindings.request.coalesceMs;
+  writeFileSync(patch, JSON.stringify(updated));
+  await runtime.linkProject(project, patch);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:linked')?.coalesceMs, 0);
   const other = join(root, 'other');
   initProjectScaffold(other, { projectId: 'other', defaultNetworkId: 'local' });
   await assert.rejects(runtime.linkProject(other, patch), /Conflicting topicBindings/);
@@ -204,11 +213,13 @@ test('Lark auth, personalized markdown, root threading, deleted root fallback an
   store.enqueue([envelope('reply', { semantic: { type: 'reply', threadId: 'root' } })]);
   await notifier.flush();
   assert.ok(calls.at(-1)!.args.includes('--reply-in-thread'));
+  assert.equal(argument(calls.at(-1)!, '--markdown'), '**[reply] alice**\n\nDetails');
   deleted = true;
   store.enqueue([envelope('next', { semantic: { type: 'question', threadId: 'root' } })]);
   await notifier.flush();
   assert.ok(calls.at(-1)!.args.includes('+messages-send'));
   assert.match(argument(calls.at(-1)!, '--idempotency-key'), /^dlr-r-/);
+  assert.equal(argument(calls.at(-1)!, '--markdown'), '**[request] next**\n- Type: `question`\n- From: `alice` (`laptop`)\n- Mailbox: `default` | Priority: `normal`\n- Thread: `root`\n\nDetails');
   await notifier.stop();
   const before = calls.length;
   const restarted = new LarkMailboxNotifier(options);
@@ -379,3 +390,29 @@ test('Lark retry timer preserves idempotency and stops without advancing a faile
   assert.equal(keys[0], keys[1]);
   assert.equal(JSON.parse(readFileSync(join(root, 'lark-notify.json'), 'utf8')).cursorSequence, 0);
 });
+
+for (const type of ['question', 'reply', 'settle'] as const) {
+  test(`Lark ${type} without a prior local root retains full thread context`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    store.enqueue([envelope(`first-${type}`, { semantic: {
+      type, threadId: 'outbound-thread', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}),
+    } })]);
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store, stateDir: root, localNodeId: 'local', localMember: 'bob',
+      config: { enabled: true, target: { chatId: 'chat' } },
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: '{"message_id":"new-root"}' };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+    await notifier.flush();
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].args.includes('+messages-send'));
+    assert.equal(argument(calls[0], '--markdown'),
+      `**[request] first-${type}**\n- Type: \`${type}\`\n- From: \`alice\` (\`laptop\`)\n- Mailbox: \`default\` | Priority: \`normal\`\n- Thread: \`outbound-thread\`\n\nDetails`);
+  });
+}

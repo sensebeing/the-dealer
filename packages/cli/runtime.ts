@@ -586,7 +586,7 @@ export class DealerNodeRuntime {
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
         workspacePath, worktreeId, runId, terminalHandle, repoRoot: projectRoot,
-        autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves,
+        autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0, rotateAfterWaves,
       });
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);
