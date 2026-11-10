@@ -421,6 +421,9 @@ export class WakeupRedriveService {
       const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath);
       terminalHandle = resolved.handle;
       if (resolved.spawned) {
+        if (resolved.shellBootstrapped === true) {
+          return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
+        }
         const idle = this.idleCheck ? await this.idleCheck() : await waitOrcaTerminalIdle(this.runner, command, terminalHandle, target.workspacePath, 5000);
         if (!idle.idle) return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
       }

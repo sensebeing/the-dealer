@@ -1,13 +1,13 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DealerNodeRuntime, MailboxStore, LarkMailboxNotifier, WakeupRedriveService,
   signEnvelope, generateNodeKeyPair, verifyEnvelope, runDealerCli,
-  ensureOrcaWorkspace, checkOrcaWorkspaceIdle, resolveOrSpawnOrcaWorkspaceTerminal,
+  ensureOrcaWorkspace, checkOrcaWorkspaceIdle, resolveOrSpawnOrcaWorkspaceTerminal, defaultAntigravityLaunchCommand,
   validateTopicBindings, validateLarkNotify, initProjectScaffold,
 } from '../packages/index.ts';
 import type { MessageEnvelope, CommandRequest, CommandRunner } from '../packages/index.ts';
@@ -168,7 +168,8 @@ test('spawned terminals wait for idle before a prefixed pointer is injected', as
   const runner: CommandRunner = async call => {
     calls.push(call);
     if (call.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: spawned ? [{ handle: 'new', connected: true, writable: true }] : [] } }) };
-    if (call.args[1] === 'spawn') {
+    if (call.args[0] === 'terminal' && call.args[1] === 'create') {
+      assert.deepEqual(call.args, ['terminal', 'create', '--worktree', `path:${call.cwd}`, '--command', defaultAntigravityLaunchCommand(), '--json']);
       spawned = true;
       return { stdout: JSON.stringify({ ok: true, result: { handle: 'new' } }) };
     }
@@ -315,10 +316,11 @@ test('native bootstrap stores canonical path and blocks newborn TUI until author
   const runner: CommandRunner = async call => {
     calls.push(call);
     if (call.args[0] === 'worktree' && call.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
-    if (call.args[1] === 'create') return { stdout: JSON.stringify({ ok: true, result: { path } }) };
+    if (call.args[0] === 'worktree' && call.args[1] === 'create') return { stdout: JSON.stringify({ ok: true, result: { path } }) };
     if (call.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path, worktreeId: 'fixed', agents: [], unverifiableTerminalCount: 0 }] } }) };
     if (call.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: spawned ? [{ handle: 'term', connected: true, writable: true }] : [] } }) };
-    if (call.args[1] === 'spawn') {
+    if (call.args[0] === 'terminal' && call.args[1] === 'create') {
+      assert.deepEqual(call.args, ['terminal', 'create', '--worktree', `path:${call.cwd}`, '--command', defaultAntigravityLaunchCommand(), '--json']);
       spawned = true;
       return { stdout: '{"ok":true,"result":{"handle":"term"}}' };
     }
@@ -416,3 +418,52 @@ for (const type of ['question', 'reply', 'settle'] as const) {
       `**[request] first-${type}**\n- Type: \`${type}\`\n- From: \`alice\` (\`laptop\`)\n- Mailbox: \`default\` | Priority: \`normal\`\n- Thread: \`outbound-thread\`\n\nDetails`);
   });
 }
+
+test('bare-shell bootstrap defers task text until the next authoritative idle tick', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let detected = false;
+  const runner: CommandRunner = async call => {
+    calls.push(call);
+    if (call.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{
+      path: root, worktreeId: 'fixed', agents: detected ? [{ state: 'done' }] : [], unverifiableTerminalCount: 0,
+    }] } }) };
+    if (call.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{
+      handle: 'shell-1', connected: true, writable: true, preview: detected ? '>' : 'user@mac %',
+      ...(detected ? { agentIdentity: 'antigravity' } : {}),
+    }] } }) };
+    assert.equal(call.args[1], 'send');
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 60000 });
+  t.after(() => service.stop());
+  store.enqueue([envelope('shell-bootstrap')], { wakeTarget: { mode: 'orca-terminal', workspacePath: root } });
+  const first = await service.flushMailbox('default');
+  assert.equal(first.woke, false);
+  assert.match(first.reason!, /Terminal spawned; waiting for tui-idle/);
+  const sends = () => calls.filter(call => call.args[1] === 'send');
+  assert.equal(sends().length, 1);
+  assert.equal(argument(sends()[0], '--terminal'), 'shell-1');
+  assert.equal(argument(sends()[0], '--text'), defaultAntigravityLaunchCommand());
+  assert.equal(store.getWakeTarget('default')?.pendingWake, true);
+  detected = true;
+  const second = await service.flushMailbox('default', { force: true });
+  assert.equal(second.woke, true);
+  assert.equal(sends().length, 2);
+  assert.equal(argument(sends()[1], '--terminal'), 'shell-1');
+  assert.match(argument(sends()[1], '--text'), /^You have 1 Dealer message/);
+});
+
+test('temporary workspace bootstrap does not modify default Antigravity settings', async t => {
+  const root = directory(t);
+  const path = join(root, 'not-created-by-mock');
+  const settings = join(homedir(), '.gemini/antigravity-cli/settings.json');
+  const before = existsSync(settings) ? readFileSync(settings) : undefined;
+  const runner: CommandRunner = async call => ({ stdout: JSON.stringify({ ok: true, result:
+    call.args[1] === 'list' ? { worktrees: [] } : { path },
+  }) });
+  assert.equal((await ensureOrcaWorkspace(runner, 'orca', { workspacePath: path, repoRoot: root })).created, true);
+  const after = existsSync(settings) ? readFileSync(settings) : undefined;
+  assert.deepEqual(after, before);
+});

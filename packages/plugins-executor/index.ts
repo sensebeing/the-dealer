@@ -17,6 +17,7 @@ import type { WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
   trustAntigravityWorkspace,
+  defaultAntigravityLaunchCommand,
   runCommand,
   sendOrcaTerminalText,
 } from '../orca-workspace/index.ts';
@@ -358,9 +359,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           typeof config.interactiveCommand === 'string' && config.interactiveCommand.trim()
             ? config.interactiveCommand.trim()
             : (options.interactiveCommand ??
-              (existsSync(join(homedir(), '.local/bin/magpie'))
-                ? `${shellQuote(join(homedir(), '.local/bin/magpie'))} agy run --dangerously-skip-permissions`
-                : shellQuote(options.command ?? 'codex')));
+              defaultAntigravityLaunchCommand());
         const launched = await checkedCommand(runner, {
           command,
           args: [
