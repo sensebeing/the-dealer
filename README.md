@@ -143,6 +143,14 @@ All six hosts have presets for all three modes. `binding-preset` prints a propos
 
 Start with [the-dealer-extend](skills/the-dealer-extend/SKILL.md), then the [plugin guide](docs/plugin-guide.md). No external npm runtime dependencies; Node.js >=22.6 runs the TypeScript sources directly.
 
+Manage personal plugins through the daemon; removal hot-unloads hooks and persists across restarts, leaving the module file on disk.
+
+```sh
+dealer plugin add --name personal-hook --module plugins/personal-hook.ts --config ./personal.json --json
+dealer plugin list --json
+dealer plugin remove personal-hook --json
+```
+
 ## CLI Cheat Sheet
 
 ```sh

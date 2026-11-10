@@ -559,6 +559,20 @@ export class DealerNodeRuntime {
     });
   }
 
+  async removeUserPlugin(name: string): Promise<{ removed: string }> {
+    return this.changeExternal(async () => {
+      if (!this.config.userPlugins.some(plugin => plugin.name === name)) {
+        throw new Error(`User plugin not installed: ${name}`);
+      }
+      const previous = this.loadedUserPlugins.get(name);
+      await this.replaceExternal(previous ? [previous] : [], [], async () => {
+        this.config.userPlugins = this.config.userPlugins.filter(plugin => plugin.name !== name);
+      });
+      this.loadedUserPlugins.delete(name);
+      return { removed: name };
+    });
+  }
+
   projectStatus(projectId?: string) {
     return {
       projects: this.config.projects.filter(project => !projectId || project.projectId === projectId).map(project => ({

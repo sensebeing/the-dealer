@@ -784,12 +784,20 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       } else {
         throw new Error('Unknown project command');
       }
-    } else if (group === 'plugin' && action === 'add') {
-      result = await runtime.installUserPlugin({
-        name: required(v.name, '--name'),
-        module: required(v.module, '--module'),
-        config: v.config ? JSON.parse(readFileSync(String(v.config), 'utf8')) : {},
-      });
+    } else if (group === 'plugin') {
+      if (action === 'add') {
+        result = await runtime.installUserPlugin({
+          name: required(v.name, '--name'),
+          module: required(v.module, '--module'),
+          config: v.config ? JSON.parse(readFileSync(String(v.config), 'utf8')) : {},
+        });
+      } else if (action === 'remove') {
+        result = await runtime.removeUserPlugin(required(target ?? v.name, 'plugin name'));
+      } else if (action === 'list') {
+        result = runtime.projectStatus().userPlugins;
+      } else {
+        throw new Error('Unknown plugin command');
+      }
     } else if (group === 'node') {
       if (action === 'up' || action === 'status') {
         if (action === 'up' && (['profile', 'patch', 'member', 'name', 'skills', 'port'] as const).some(key => v[key] !== undefined)) {

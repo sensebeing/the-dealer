@@ -11,7 +11,7 @@ import {
   parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin,
   Kernel, createRouterPlugin, generateNodeKeyPair, signEnvelope, signNodeCard,
   DealerNodeRuntime, resolveBoundMailboxId, resolveMailboxId, validateTopicBindings,
-  createOrcaSpawnExecutorPlugin, initProjectScaffold,
+  createOrcaSpawnExecutorPlugin, initProjectScaffold, runDealerCli,
 } from '../packages/index.ts';
 import type { DeliveryReceipt, EmitterService, MessageEnvelope, NodeCard, CommandRequest } from '../packages/index.ts';
 
@@ -319,4 +319,41 @@ test('stopping while HTTP wake starts leaves no listening server or scheduled po
   await started;
   assert.equal(source.wakeAddress(), null);
   assert.equal(polls, 0);
+});
+
+
+test('user plugin CLI add, list and remove unload hooks and persist removal across restart', async t => {
+  const root = directory(t);
+  writeFileSync(join(root, 'personal.ts'), `export default {
+    name: 'personal-hook-runtime',
+    apply(ctx) {
+      ctx.on('emitter/prepare', message => ({ ...message, subject: 'personal hook' }));
+    },
+  };`);
+  let runtime = await new DealerNodeRuntime({ stateDir: root, profile: 'personal-dev' }).start();
+  t.after(() => runtime.stop());
+  const cli = async (...args: string[]) => {
+    const output: string[] = [];
+    const errors: string[] = [];
+    assert.equal(await runDealerCli(['plugin', ...args, '--json'], {
+      runtime, stdout: line => output.push(line), stderr: line => errors.push(line),
+    }), 0, errors.join('\n'));
+    return JSON.parse(output.join('\n'));
+  };
+  assert.deepEqual(await cli('list'), []);
+  assert.deepEqual(await cli('add', '--name', 'personal', '--module', 'personal.ts'), { added: 'personal' });
+  assert.deepEqual(await cli('list'), [{ name: 'personal', module: 'personal.ts', config: {}, loadedName: 'personal-hook-runtime' }]);
+  assert.equal((await runtime.kernel.ctx.waterfall('emitter/prepare', envelope('before'))).subject, 'personal hook');
+  assert.deepEqual(await cli('remove', 'personal'), { removed: 'personal' });
+  assert.deepEqual(await cli('list'), []);
+  assert.equal(runtime.kernel.enabledPluginNames().includes('personal-hook-runtime'), false);
+  assert.equal((await runtime.kernel.ctx.waterfall('emitter/prepare', envelope('after'))).subject, 'after');
+  assert.deepEqual(JSON.parse(readFileSync(join(root, 'config.json'), 'utf8')).userPlugins, []);
+  await assert.rejects(runtime.removeUserPlugin('missing'), /User plugin not installed: missing/);
+  await runtime.stop();
+  runtime = await new DealerNodeRuntime({ stateDir: root }).start();
+  assert.deepEqual(await cli('list'), []);
+  assert.equal((await runtime.kernel.ctx.waterfall('emitter/prepare', envelope('restarted'))).subject, 'restarted');
+  await cli('add', '--name', 'personal', '--module', 'personal.ts');
+  assert.deepEqual(await cli('remove', '--name', 'personal'), { removed: 'personal' });
 });

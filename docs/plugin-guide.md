@@ -57,8 +57,12 @@ dealer project link ./my-project --json
 dealer project list --json
 dealer project status --project my-project --json
 dealer plugin add --name personal-hook --module plugins/personal-hook.ts --config ./personal.json --json
+dealer plugin list --json
+dealer plugin remove personal-hook --json
 dealer project unlink my-project --json
 ```
+
+`plugin remove` hot-unloads the named personal plugin and persists its removal through the running daemon; it leaves the module file on disk. Use these commands instead of editing a running node's `config.json`.
 
 `init` creates `.dealer/plugins/` and refuses to overwrite an existing manifest.
 Its root defaults to the caller's working directory, ID to the root directory

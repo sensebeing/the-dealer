@@ -138,6 +138,14 @@ MacBook、Mac mini 和 devbox 可以使用同一个成员名，各自保留独�
 
 从 [the-dealer-extend](skills/the-dealer-extend/SKILL.md) 开始，再读[插件指南](docs/plugin-guide.md)。零外部 npm 运行时依赖，Node.js >=22.6 直接运行 TypeScript 源码。
 
+通过守护进程管理个人插件；移除会热卸载钩子并持久化配置，重启后仍生效，插件模块文件保留在磁盘上。
+
+```sh
+dealer plugin add --name personal-hook --module plugins/personal-hook.ts --config ./personal.json --json
+dealer plugin list --json
+dealer plugin remove personal-hook --json
+```
+
 ## CLI 速查
 
 ```sh
