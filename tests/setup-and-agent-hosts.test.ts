@@ -93,6 +93,10 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
       const prompt = args.at(-1)!;
       assert.match(prompt, new RegExp(mailboxId));
       assert.ok(!prompt.includes('\n'));
+      if (conversationMode === 'spawn') {
+        assert.ok(prompt.startsWith('Perform task then report — Dealer Task dispatched to mailbox task:test'));
+        assert.ok(!prompt.includes('Payload:'));
+      }
       assert.equal(call.cwd, root);
       if (agent === 'codex') {
         assert.equal(call.command, 'codex');
@@ -177,7 +181,7 @@ test('runtime uses a generated fixed binding, persists mailbox and supports setu
   const calls: CommandRequest[] = [];
   const preset = buildAgentBindingPreset({ host: 'codex', conversationMode: 'fixed', workspacePath: root, sessionId: 'review' });
   const runtime = new DealerNodeRuntime({
-    stateDir: join(root, 'state'), member: 'solo', profile: 'dedicated-worker',
+    stateDir: join(root, 'state'), member: 'solo',
     transport: { discoveryDir: join(root, 'discovery') },
     patch: { topicBindings: { [preset.topic]: preset.binding } },
     commandRunner: async request => {
@@ -187,6 +191,8 @@ test('runtime uses a generated fixed binding, persists mailbox and supports setu
   });
   await runtime.start();
   t.after(() => runtime.stop());
+  assert.equal(runtime.config.profile, 'personal-dev');
+  assert.equal(runtime.config.gateMode, 'approval_required');
   const result = await runtime.emitter.emit({ networkId: 'local', kind: preset.topic,
     routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check this change', payload: {} });
   assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
@@ -198,6 +204,29 @@ test('runtime uses a generated fixed binding, persists mailbox and supports setu
   assert.equal(decodeNetworkInvite(invite.inviteUri).networkId, 'new-team');
   assert.equal((await cli(['setup', 'binding-preset', '--host', 'claude-code', '--mode', 'fixed'], runtime.stateDir)).binding.agent, 'claude-code');
 });
+
+for (const scenario of [
+  { name: 'saved personal-dev', profile: 'personal-dev', override: false, expected: true },
+  { name: 'explicit executor override', profile: 'personal-dev', override: true, expected: false },
+  { name: 'another saved profile', profile: 'headless-relay', override: false, expected: false },
+]) {
+  test(`runtime agent-pty migration respects ${scenario.name}`, async t => {
+    const root = directory(t);
+    const executors = ['notify', 'inbox'];
+    writeFileSync(join(root, 'config.json'), JSON.stringify({
+      profile: scenario.profile, executors, defaultExecutor: 'inbox', gateMode: 'approval_required',
+    }));
+    const runtime = new DealerNodeRuntime({
+      stateDir: root,
+      transport: { discoveryDir: join(root, 'discovery') },
+      ...(scenario.override ? { patch: { executors } } : {}),
+    });
+    await runtime.start();
+    t.after(() => runtime.stop());
+    assert.equal(runtime.config.executors.includes('agent-pty'), scenario.expected);
+    assert.equal(runtime.config.gateMode, 'approval_required');
+  });
+}
 
 test('failed host execution leaves durable mail and does not report success', async t => {
   const root = directory(t);

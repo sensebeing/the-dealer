@@ -232,6 +232,10 @@ export class DealerNodeRuntime {
       if (Array.isArray(this.config.executors) && !this.config.executors.includes('inbox')) {
         this.config.executors = [...this.config.executors, 'inbox'];
       }
+      if (this.config.profile === 'personal-dev' && this.options.patch?.executors === undefined
+        && Array.isArray(this.config.executors) && !this.config.executors.includes('agent-pty')) {
+        this.config.executors = [...this.config.executors, 'agent-pty'];
+      }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config);
       this.mailbox = new MailboxStore(join(this.stateDir, 'mailbox.json'), {

@@ -124,12 +124,12 @@ export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): Execut
         const conversationMode = mode ?? 'spawn';
         const mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
         const store = options.store ?? config.store;
-        const rawPrompt = optionalString(payload.terminalPrompt) ?? renderWave(batch);
+        const terminalPrompt = optionalString(typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined);
         const promptText = store
           ? conversationMode === 'spawn'
-            ? buildTaskPreamble(mailboxId, first.id, undefined, rawPrompt)
+            ? buildTaskPreamble(mailboxId, first.id, undefined, terminalPrompt ?? (first.body || first.subject))
             : singleLine(`You have ${batch.length} Dealer message(s) in ${mailboxId}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`)
-          : singleLine(rawPrompt);
+          : singleLine(terminalPrompt ?? renderWave(batch));
         const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
         const invocation = buildAgentHostInvocation({
           agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,

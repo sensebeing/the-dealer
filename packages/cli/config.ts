@@ -17,7 +17,7 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     name: 'personal-dev',
     gateMode: 'approval_required',
     policies: ['dedup-cas'],
-    executors: ['orca-spawn', 'orca-wave', 'notify', 'inbox'],
+    executors: ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'dedicated-worker': {
