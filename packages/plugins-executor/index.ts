@@ -20,6 +20,7 @@ import {
   checkedCommand,
   runCommand,
   sendOrcaTerminalText,
+  singleLine,
 } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
 
@@ -367,7 +368,9 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         typeof payload.terminalPrompt === 'string' && payload.terminalPrompt.trim()
           ? payload.terminalPrompt
           : undefined;
-      if (terminalPrompt) {
+      // Interactive mode is selectable without duplicating a terminalPrompt; a prompt remains
+      // accepted for backwards compatibility but is not the only source of intent.
+      if (payload.interactive === true || terminalPrompt !== undefined) {
         const explicitSettingsPath =
           typeof config.agySettingsPath === 'string' && config.agySettingsPath
             ? config.agySettingsPath
@@ -522,6 +525,13 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
               idle = false;
             }
             if (idle) {
+              const standaloneText =
+                terminalPrompt ??
+                singleLine(
+                  typeof payload.wakeupHint === 'string' && payload.wakeupHint.trim()
+                    ? payload.wakeupHint
+                    : batch[0]?.subject ?? 'Task dispatched',
+                );
               await checkedCommand(runner, {
                 command,
                 args: [
@@ -530,7 +540,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                   '--terminal',
                   handle,
                   '--text',
-                  terminalPrompt,
+                  standaloneText,
                   '--enter',
                   '--wait-submit',
                   '5',

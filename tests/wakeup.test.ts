@@ -451,6 +451,83 @@ test('single-machine loopback send -> ask -> reply -> settle keeps both thread l
   assert.equal(storedSettlement.envelope.semantic?.outcome, 'succeeded');
 });
 
+test('session commands honor an explicit --mailbox when acknowledging a lease', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'node'),
+    member: 'alice',
+    name: 'alice',
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+    commandRunner: async () => ({ stdout: '{"ok":true}' }),
+    wakeupIdleCheck: async () => ({ idle: true }),
+    patch: { defaultExecutor: 'inbox', gateMode: 'open' },
+  }).start();
+  t.after(() => runtime.stop());
+
+  const sent = await cli(
+    runtime,
+    'send',
+    '--network',
+    'local',
+    '--to',
+    'member:alice',
+    '--topic',
+    'triage',
+    '--mailbox',
+    'task:w1',
+    '--reply-mailbox',
+    'worktree:coord',
+    '--body',
+    'Investigate',
+  );
+  const messageId = String(sent.messageId);
+
+  runtime.mailbox.enqueue([alert('ack-ask')], { mailboxId: 'custom:ask' });
+  const askLease = runtime.mailbox.check({ mailboxId: 'custom:ask' });
+  const asked = await cli(
+    runtime,
+    'ask',
+    '--reply-to',
+    messageId,
+    '--body',
+    'Which branch?',
+    '--mailbox',
+    'custom:ask',
+    '--ack',
+    String(askLease.deliveryId),
+  );
+  assert.equal(asked.targetMailbox, 'worktree:coord');
+  assert.equal(asked.replyMailbox, 'custom:ask');
+  assert.equal(
+    runtime.mailbox
+      .list({ mailboxId: 'custom:ask', includeAcked: true })
+      .items.find(item => item.id === 'ack-ask')!.status,
+    'acked',
+  );
+
+  runtime.mailbox.enqueue([alert('ack-reply')], { mailboxId: 'custom:reply' });
+  const replyLease = runtime.mailbox.check({ mailboxId: 'custom:reply' });
+  const replied = await cli(
+    runtime,
+    'reply',
+    messageId,
+    '--body',
+    'Use main',
+    '--mailbox',
+    'custom:reply',
+    '--ack',
+    String(replyLease.deliveryId),
+  );
+  assert.equal(replied.targetMailbox, 'worktree:coord');
+  assert.equal(
+    runtime.mailbox
+      .list({ mailboxId: 'custom:reply', includeAcked: true })
+      .items.find(item => item.id === 'ack-reply')!.status,
+    'acked',
+  );
+});
+
 test('two-node P2P closed loop verifies signatures and keeps unapproved knocks route-free', async t => {
   const root = directory(t);
   const calls: CommandRequest[] = [];

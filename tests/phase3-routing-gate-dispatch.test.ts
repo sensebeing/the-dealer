@@ -16,7 +16,7 @@ import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, isDedupCasDuplicateReceipt } from '../packages/plugins-policy/index.ts';
-import { MailboxStore, WakeupRedriveService } from '../packages/mailbox/index.ts';
+import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace } from '../packages/plugins-executor/index.ts';
 import { checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/orca-workspace/index.ts';
@@ -503,6 +503,64 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   const agentCommand = String(flagValue(requests[1].args, '--command'));
   assert.match(agentCommand, /^'codex' 'exec'/);
   assert.match(agentCommand, /Investigate/);
+});
+
+test('orca-spawn payload.interactive selects the mailbox TUI path without terminalPrompt', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-interactive-flag-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const requests: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    requests.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: dir } } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      return {
+        stdout: JSON.stringify({ ok: true, result: { terminal: { handle: 'term-interactive' } } }),
+      };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const store = new MailboxStore(join(dir, 'mailbox.json'));
+  const executor = createOrcaSpawnExecutorPlugin({
+    commandRunner,
+    command: 'codex',
+    store,
+  });
+  const message = envelope({
+    payload: { interactive: true, wakeupHint: 'Investigate the flaky suite' },
+  });
+  const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
+
+  await executor.execute([message], context, {
+    interactiveCommand: 'agy run',
+    agySettingsPath: join(dir, 'settings.json'),
+  });
+
+  const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
+  const created = requests.find(r => r.args[0] === 'terminal' && r.args[1] === 'create')!;
+  assert.equal(flagValue(created.args, '--command'), 'agy run');
+  const mailboxId = `task:${message.id}`;
+  const queued = store.list({ mailboxId }).items;
+  assert.equal(queued.length, 1);
+  assert.deepEqual(queued[0].envelope, message);
+  const sent = requests.find(r => r.args[0] === 'terminal' && r.args[1] === 'send')!;
+  const preamble = buildTaskPreamble(mailboxId, message.id);
+  assert.equal(flagValue(sent.args, '--text'), preamble);
+  assert.equal(/[\r\n]/.test(preamble), false);
+  assert.equal(store.getWakeTarget(mailboxId)!.pendingWake, false);
+
+  requests.length = 0;
+  const standalone = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex' });
+  await standalone.execute(
+    [envelope({ payload: { interactive: true, wakeupHint: 'Standalone hint' } })],
+    context,
+    { interactiveCommand: 'agy run', agySettingsPath: join(dir, 'settings.json') },
+  );
+  const standaloneSend = requests.find(
+    request => request.args[0] === 'terminal' && request.args[1] === 'send',
+  )!;
+  assert.equal(flagValue(standaloneSend.args, '--text'), 'Standalone hint');
 });
 
 test('orca-spawn ignores inbound command and settings authority and prefers receiver cwd', async t => {

@@ -472,7 +472,7 @@ async function runSessionCommand(
     if (replyTo !== undefined) {
       const route = replyTargetOrThrow(store, replyTo);
       if (ackId) {
-        store.ack(ackId, route.localMailbox);
+        store.ack(ackId, callerMailboxFlag ?? route.localMailbox);
       }
       const body = required(v.body, '--body');
       const replyMailbox = callerMailboxFlag ?? route.localMailbox;
@@ -556,7 +556,7 @@ async function runSessionCommand(
   const messageId = required(positional, 'message-id');
   const route = replyTargetOrThrow(store, messageId);
   if (ackId) {
-    store.ack(ackId, route.localMailbox);
+    store.ack(ackId, callerMailboxFlag ?? route.localMailbox);
   }
   const replyMailbox = callerMailboxFlag ?? route.localMailbox;
 
