@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir, networkInterfaces } from 'node:os';
+import { tmpdir } from 'node:os';
+import type { NetworkInterfaceInfo } from 'node:os';
 import { P2PTransportService, defaultAdvertisedHost } from '../packages/transport/index.ts';
 import { join } from 'node:path';
 import {
@@ -284,7 +285,7 @@ test('TCP seeds discover both directions without shared registry or multicast an
 });
 
 test('advertised host prefers overrides, explicit listeners, then the primary LAN IPv4', () => {
-  const primary = Object.values(networkInterfaces()).flat().find(address => address?.family === 'IPv4' && !address.internal)?.address ?? '127.0.0.1';
+  const primary = defaultAdvertisedHost();
   assert.equal(defaultAdvertisedHost(), primary);
   assert.equal(defaultAdvertisedHost({ listenHost: '0.0.0.0' }), primary);
   assert.equal(defaultAdvertisedHost({ listenHost: '::' }), primary);
@@ -323,4 +324,57 @@ test('offline invite uses configured port with LAN address but never invents an 
   writeFileSync(join(root, 'config.json'), JSON.stringify({ port: 0 }));
   const ephemeral = await cli(['setup', 'invite-prompt', '--network', 'team'], root);
   assert.equal(decodeNetworkInvite(ephemeral.inviteUri).bootstrapPeers?.length ?? 0, 0);
+});
+
+
+test('advertised host ranks physical private LAN addresses and excludes TUN and link-local IPv4', () => {
+  const ipv4 = (address: string, internal = false): NetworkInterfaceInfo => ({
+    address, family: 'IPv4', internal, netmask: '255.255.0.0', mac: '00:00:00:00:00:00', cidr: null,
+  });
+  const unusable = { lo0: [ipv4('127.0.0.1', true)], utun0: [ipv4('198.18.0.1')],
+    utun1: [ipv4('198.19.255.1')], en0: [ipv4('169.254.1.2')] };
+  assert.equal(defaultAdvertisedHost({}, unusable), '127.0.0.1');
+  for (const name of ['en0', 'eth0', 'wlan0']) {
+    for (const address of ['10.1.2.3', '192.168.1.2', '172.16.0.2', '172.31.255.2']) {
+      assert.equal(defaultAdvertisedHost({}, { ...unusable, vpn0: [ipv4('10.8.0.1')],
+        public0: [ipv4('203.0.113.2')], [name]: [ipv4(address)] }), address);
+    }
+  }
+  for (const address of ['172.15.0.1', '172.32.0.1', '192.169.1.2']) {
+    assert.equal(defaultAdvertisedHost({}, { other0: [ipv4('203.0.113.2')], en0: [ipv4(address)] }), '203.0.113.2');
+  }
+  assert.equal(defaultAdvertisedHost({}, { ...unusable, other0: [ipv4('203.0.113.2')] }), '203.0.113.2');
+  assert.equal(defaultAdvertisedHost({}, {}), '127.0.0.1');
+});
+
+test('TCP seed probes are bounded across 50ms ticks for discovered and unavailable seeds', async t => {
+  const root = directory(t);
+  const seed = new P2PTransportService({ discoveryDir: join(root, 'seed'), multicast: false, listenHost: '127.0.0.1' });
+  const peer = new P2PTransportService({ discoveryDir: join(root, 'peer'), multicast: false, listenHost: '127.0.0.1' });
+  t.after(async () => { await peer.dispose(); await seed.dispose(); });
+  await seed.mountNetwork({ networkId: 'team', passphrase: 'shared' });
+  clearInterval(seed['timer']);
+  const attempts = t.mock.fn(peer['track']);
+  peer['track'] = attempts;
+  let connections = 0;
+  seed['server']!.on('connection', () => { connections++; });
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
+  // The same seed with a foreign key remains undiscovered, exercising failed probes too.
+  await peer.mountNetwork({ networkId: 'foreign', passphrase: 'wrong', bootstrapPeers: [seed.endpointAddr!, '127.0.0.1:1'] });
+  await peer.mountNetwork({ networkId: 'team', passphrase: 'shared', bootstrapPeers: [seed.endpointAddr!] });
+  clearInterval(peer['timer']);
+  assert.equal(connections, 2, 'one initial probe per mount');
+  assert.equal(attempts.mock.callCount(), 3, 'unreachable seed also probed once');
+  assert.equal(peer.listPeerEndpoints('team').get(seed.localNodeId), seed.endpointAddr);
+  assert.equal(peer.listPeerEndpoints('foreign').size, 0);
+  for (let tick = 1; tick < 40; tick++) {
+    t.mock.timers.tick(50);
+    await peer['discover']();
+  }
+  assert.equal(connections, 2, 'no TCP churn during fast discovery ticks');
+  assert.equal(attempts.mock.callCount(), 3, 'unreachable seed retries are also bounded');
+  t.mock.timers.tick(50);
+  await peer['discover']();
+  assert.equal(connections, 4, 'both known and failed seeds are retried at the bounded interval');
+  assert.equal(attempts.mock.callCount(), 6, 'unreachable seed is retried at the bounded interval');
 });

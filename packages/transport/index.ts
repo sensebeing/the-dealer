@@ -221,6 +221,7 @@ interface Mount {
   keys: DerivedNetworkKeys;
   peers: Map<string, string>;
   file: string;
+  lastSeedProbeAt: number;
 }
 
 type Handler = (
@@ -228,10 +229,19 @@ type Handler = (
 ) => Promise<Uint8Array | void> | Uint8Array | void;
 
 /** Shared by the listener and offline invite generation. */
-export function defaultAdvertisedHost(options: TransportPluginOptions = {}): string {
+export function defaultAdvertisedHost(
+  options: TransportPluginOptions = {},
+  interfaces = networkInterfaces(),
+): string {
   if (options.advertisedHost) return options.advertisedHost;
   if (options.listenHost && !['0.0.0.0', '::'].includes(options.listenHost)) return options.listenHost;
-  return Object.values(networkInterfaces()).flat().find(address => address?.family === 'IPv4' && !address.internal)?.address ?? '127.0.0.1';
+  const candidates = Object.entries(interfaces).flatMap(([name, addresses]) =>
+    (addresses ?? []).filter(address => address.family === 'IPv4' && !address.internal &&
+      !/^(169\.254|198\.(18|19))\./.test(address.address)).map(address => ({ name, address: address.address })),
+  );
+  const lan = candidates.find(({ name, address }) => /^(en|eth|wlan)/.test(name) &&
+    /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(address));
+  return lan?.address ?? candidates[0]?.address ?? '127.0.0.1';
 }
 
 export class P2PTransportService implements TransportService {
@@ -357,11 +367,12 @@ export class P2PTransportService implements TransportService {
       keys,
       peers: new Map<string, string>(),
       file,
+      lastSeedProbeAt: Number.NEGATIVE_INFINITY,
     };
     this.mounts.set(config.networkId, mount);
     try {
       await this.announce(mount);
-      await this.discover();
+      await this.discover(false);
       await this.notifyMount();
     } catch (error) {
       this.mounts.delete(config.networkId);
@@ -470,6 +481,11 @@ export class P2PTransportService implements TransportService {
     } catch {
       // TCP seeds and the local registry remain available without multicast.
     }
+    // Seed discovery has its own cadence; local registry/multicast discovery stays fast.
+    // A single bounded round also rate-limits unreachable seeds without per-seed timers.
+    const now = Date.now();
+    if (now - m.lastSeedProbeAt < Math.max(this.options.discoveryIntervalMs ?? 50, 2000)) return;
+    m.lastSeedProbeAt = now;
     await Promise.allSettled((m.config.bootstrapPeers ?? []).filter(seed => seed !== this.endpointAddr).map(async seed => {
       const socket = this.track(createConnection(parseEndpoint(seed)));
       socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
@@ -485,10 +501,10 @@ export class P2PTransportService implements TransportService {
     }));
   }
 
-  private async discover(): Promise<void> {
+  private async discover(announce = true): Promise<void> {
     for (const m of this.mounts.values()) {
       try {
-        await this.announce(m);
+        if (announce) await this.announce(m);
         for (const name of await readdir(dirname(m.file))) {
           if (!name.endsWith('.json')) {
             continue;
