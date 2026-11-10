@@ -106,6 +106,16 @@ export function createPlugin(config, context) {
 }
 ```
 
+The host also exposes `isDurableQueuedReceipt(receipt)` and
+`isDedupCasDuplicateReceipt(receipt, { allowQueued?: boolean })`. The latter
+recognizes only durable confirmed handoffs (settled by default, queued when
+explicitly allowed). An unknown external outcome is never a confirmed duplicate.
+Dedup watermarks persist `revision` and `status` (`unknown`, `queued`, `settled`);
+definite pre-execution failures and non-durable queues release their reservation.
+Runtime DND envelopes persist in `gate-dnd.json` before a durable queued receipt
+is signed. Recovery drains only open mounted networks after project and user
+admission rules have loaded, retaining failed deliveries for reconciliation.
+
 The factory context includes `projectRoot` (project plugins only), `stateDir`,
 `runtime`, the parsed `userPatch`, and `api`. The `api` bag exposes the built-in
 webhook/poll-watermark/script source factories, dedup-CAS policy

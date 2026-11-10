@@ -131,15 +131,15 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       };
       const core = async (batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> => {
         if (!batch.length) {
-          throw new Error('Empty execution batch');
+          throw Object.assign(new Error('Empty execution batch'), { beforeExternalEffect: true });
         }
         const name = select(batch[0]);
         if (batch.some(e => select(e) !== name || e.networkId !== batch[0].networkId)) {
-          throw new Error('Batch crosses executor or network boundary');
+          throw Object.assign(new Error('Batch crosses executor or network boundary'), { beforeExternalEffect: true });
         }
         const executor = name && executors.get(name);
         if (!executor) {
-          throw new Error(`Executor unavailable: ${name}`);
+          throw Object.assign(new Error(`Executor unavailable: ${name}`), { beforeExternalEffect: true });
         }
         for (const e of batch) {
           const prior = ledger.get(key(e));
@@ -206,7 +206,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         },
         dispatch(envelope) {
           if (controller.signal.aborted) {
-            return Promise.reject(new Error('Dispatcher stopped'));
+            return Promise.reject(Object.assign(new Error('Dispatcher stopped'), { beforeExternalEffect: true }));
           }
           const id = key(envelope);
           const ongoing = active.get(id);
@@ -311,6 +311,13 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                     ? 'queued'
                     : 'rejected',
               detail: verdict.reason,
+              ...(verdict.status === 'queued_dnd' ? {
+                executionReceipt: {
+                  executor: 'gate-dnd',
+                  executionId: 'gate-dnd:' + envelope.id,
+                  durable: Boolean(verdict.durable),
+                },
+              } : {}),
             };
           }
         }

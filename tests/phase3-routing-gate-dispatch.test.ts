@@ -15,7 +15,7 @@ import type { NetworkGateService } from '../packages/gate/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
-import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, isDedupCasDuplicateReceipt } from '../packages/plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace } from '../packages/plugins-executor/index.ts';
 import { checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
@@ -33,10 +33,10 @@ function envelope(patch: Partial<MessageEnvelope> = {}): MessageEnvelope {
 function node(keys = receiver, peers: NodeCard[] = [card()]): NodeService {
   return { getSelfCard: networkId => card(keys, { networkId }), async updateSelfProfile() {}, listPeers: ({ networkId } = {}) => peers.filter(c => !networkId || c.networkId === networkId), resolveTarget: (selector, networkId) => peers.filter(c => c.networkId === networkId && (c.nodeId === selector || `member:${c.identity.member}` === selector || `${c.identity.member}@${c.identity.nodeName}` === selector)) };
 }
-async function setup(t: TestContext, options: { mode?: 'open' | 'dnd' | 'closed' | 'approval_required'; ledgerPath?: string } = {}) {
+async function setup(t: TestContext, options: { mode?: 'open' | 'dnd' | 'closed' | 'approval_required'; ledgerPath?: string; dndQueuePath?: string; maxDndItems?: number } = {}) {
   const kernel = new Kernel();
   kernel.ctx.provide('node', node());
-  await kernel.use(createGatePlugin({ mode: options.mode ?? 'open' }));
+  await kernel.use(createGatePlugin({ mode: options.mode ?? 'open', dndQueuePath: options.dndQueuePath, maxDndItems: options.maxDndItems }));
   await kernel.use(createDispatcherPlugin({ privateKeyPem: receiver.privateKeyPem, ledgerPath: options.ledgerPath }));
   const batches: readonly MessageEnvelope[][] = [];
   const calls = batches as MessageEnvelope[][];
@@ -89,12 +89,12 @@ test('gate four modes, trusted approvals, DND drains, overrides and rejection hi
   assert.equal((await gate.evaluate(envelope())).status, 'allow');
   assert.equal((await gate.evaluate(envelope({ networkId: 'other' }))).status, 'pending_approval');
   await gate.setMode('dnd');
-  const stranger = envelope({ from: { nodeId: receiver.nodeId, member: 'stranger', nodeName: 'other' } });
+  const stranger = signEnvelope({ ...envelope(), from: { nodeId: receiver.nodeId, member: 'stranger', nodeName: 'other' } }, receiver.privateKeyPem);
   assert.equal((await gate.evaluate(stranger)).status, 'queued_dnd');
   await gate.setMode('open'); assert.equal(calls.length, 2);
   await gate.setNetworkMode('test', 'closed');
   assert.equal((await gate.evaluate(stranger)).status, 'reject'); assert.equal(gate.listRejections().length, 1);
-  await gate.setNetworkMode('test', 'dnd'); await gate.evaluate(envelope({ ...stranger, id: 'dnd-2' })); await gate.drainDnd(); assert.equal(calls.length, 3);
+  await gate.setNetworkMode('test', 'dnd'); await gate.evaluate(signEnvelope({ ...stranger, id: 'dnd-2' }, receiver.privateKeyPem)); await gate.drainDnd(); assert.equal(calls.length, 2); await gate.setNetworkMode('test', 'open'); assert.equal(calls.length, 3);
   await gate.setNetworkMode('test', 'approval_required');
   const v = await gate.evaluate(envelope({ ...stranger, id: 'pending-reject' })); if (v.status !== 'pending_approval') throw new Error('Expected pending');
   await gate.reject(v.approvalId, 'no'); assert.equal(gate.listRejections().at(-1)?.reason, 'no');
@@ -116,9 +116,9 @@ test('CAS dedup serializes concurrent equal versions, rejects stale and permits 
   const message = envelope({ idempotencyKey: 'entity', payload: { claimVersion: 2 } });
   const results = await Promise.all([policy.process(message, next), policy.process(envelope({ ...message, id: 'different' }), next)]);
   assert.equal(executions, 1); assert.equal(results[1].stage, 'rejected');
-  assert.equal(isDedupCasDuplicateReceipt(results[1]), true);
+  assert.equal(isDedupCasDuplicateReceipt(results[1]), false);
   const stale = await policy.process(envelope({ ...message, payload: { revision: 1 } }), next);
-  assert.equal(isDedupCasDuplicateReceipt(stale), true);
+  assert.equal(isDedupCasDuplicateReceipt(stale), false);
   assert.equal((await policy.process(envelope({ ...message, payload: { claimVersion: 3 } }), next)).stage, 'dispatched');
   assert.equal(executions, 2);
   assert.equal((await policy.process(envelope({ payload: { claimVersion: 'bad' } }), next)).stage, 'rejected');
@@ -669,7 +669,7 @@ test('CAS watermarks persist reserved versions across restarts and reject corrup
   const first = createDedupCasPolicyPlugin({ watermarksPath });
   assert.equal((await first.process(message, dispatch)).stage, 'dispatched');
   assert.equal((await stat(watermarksPath)).mode & 0o777, 0o600);
-  assert.deepEqual(Object.values(JSON.parse(await readFile(watermarksPath, 'utf8'))), [4]);
+  assert.deepEqual(Object.values(JSON.parse(await readFile(watermarksPath, 'utf8'))), [{ revision: 4, status: 'settled' }]);
   const second = createDedupCasPolicyPlugin({ watermarksPath });
   assert.equal((await second.process(envelope({ ...message, id: 'after-restart' }), dispatch)).stage, 'rejected');
   assert.equal(executions, 1);
@@ -1028,4 +1028,162 @@ test('orca-spawn binds project identity only on the receiver and validates paren
   assert.equal(requests[0].cwd, join(root, 'virtual'));
   await assert.rejects(executor.execute([envelope({ payload: { projectId: 'virtual' } })], context,
     { parentWorktree: `path:${root}/virtual-other` }), /Parent worktree does not belong/);
+});
+
+test('CAS durable handoff states distinguish settled, queued, unknown and legacy versions', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-cas-states-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const watermarksPath = join(dir, 'dedup.json');
+  const message = envelope({ idempotencyKey: 'states', payload: { revision: 2 } });
+  const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);
+  const never = async () => { throw new Error('Must not execute'); };
+  await writeFile(watermarksPath, JSON.stringify({ [key]: 2 }));
+  let policy = createDedupCasPolicyPlugin({ watermarksPath });
+  assert.equal(isDedupCasDuplicateReceipt(await policy.process(message, never)), true);
+  for (const stage of ['dispatched', 'settled', 'queued', 'failed', 'dispatching'] as const) {
+    await writeFile(watermarksPath, '{}');
+    policy = createDedupCasPolicyPlugin({ watermarksPath });
+    await policy.process(message, async () => {
+      assert.deepEqual(JSON.parse(await readFile(watermarksPath, 'utf8'))[key], { revision: 2, status: 'unknown' });
+      return { stage, executionReceipt: { executor: 'test', executionId: 'id', durable: true } };
+    });
+    const status = stage === 'dispatched' || stage === 'settled' ? 'settled' : stage === 'queued' ? 'queued' : 'unknown';
+    assert.deepEqual(JSON.parse(await readFile(watermarksPath, 'utf8'))[key], { revision: 2, status });
+    const duplicate = await createDedupCasPolicyPlugin({ watermarksPath }).process(message, never);
+    assert.equal(duplicate.executionReceipt?.handoff, status);
+    assert.equal(duplicate.detail, status === 'unknown' ? DEDUP_CAS_AMBIGUOUS_DETAIL : DEDUP_CAS_DUPLICATE_DETAIL);
+    assert.equal(isDedupCasDuplicateReceipt(duplicate), status === 'settled');
+    assert.equal(isDedupCasDuplicateReceipt(duplicate, { allowQueued: true }), status !== 'unknown');
+  }
+  await writeFile(watermarksPath, '{}');
+  policy = createDedupCasPolicyPlugin({ watermarksPath });
+  await assert.rejects(policy.process(message, async () => { throw new Error('external timeout'); }), /external timeout/);
+  const unknown = await createDedupCasPolicyPlugin({ watermarksPath }).process(message, never);
+  assert.equal(unknown.detail, DEDUP_CAS_AMBIGUOUS_DETAIL);
+  assert.equal(isDedupCasDuplicateReceipt(unknown, { allowQueued: true }), false);
+  for (const entry of [{ revision: -1, status: 'settled' }, { revision: 1, status: 'other' }, { revision: 1.5, status: 'unknown' }, [], null]) {
+    await writeFile(watermarksPath, JSON.stringify({ [key]: entry }));
+    assert.throws(() => createDedupCasPolicyPlugin({ watermarksPath }), /Invalid dedup watermark store/);
+  }
+});
+
+test('CAS rolls back definite pre-effect outcomes and restores the prior version', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-cas-rollback-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const watermarksPath = join(dir, 'dedup.json');
+  for (const hadPrior of [false, true]) {
+    for (const stage of ['rejected', 'pending_approval', 'queued', 'throw'] as const) {
+      await writeFile(watermarksPath, '{}');
+      const policy = createDedupCasPolicyPlugin({ watermarksPath });
+      const message = envelope({ idempotencyKey: 'retry', payload: { revision: 2 } });
+      if (hadPrior) await policy.process(envelope({ ...message, payload: { revision: 1 } }), async () => ({ stage: 'settled' }));
+      const before = await readFile(watermarksPath, 'utf8');
+      const operation = policy.process(message, async () => {
+        if (stage === 'throw') throw Object.assign(new Error('not started'), { beforeExternalEffect: true });
+        return { stage };
+      });
+      if (stage === 'throw') await assert.rejects(operation, /not started/);
+      else assert.equal((await operation).stage, stage);
+      assert.equal(await readFile(watermarksPath, 'utf8'), before);
+      assert.equal((await policy.process(message, async () => ({ stage: 'dispatched' }))).stage, 'dispatched');
+    }
+  }
+  const { dispatcher, calls } = await setup(t);
+  dispatcher.registerPolicy(createDedupCasPolicyPlugin());
+  const message = envelope({ payload: { executor: 'later', revision: 1 } });
+  await assert.rejects(dispatcher.dispatch(message), error => (error as { beforeExternalEffect?: boolean }).beforeExternalEffect === true);
+  dispatcher.registerExecutor({ name: 'later', async execute() { return { executor: 'later', executionId: 'ok' }; } }, {});
+  assert.equal((await dispatcher.dispatch(message)).stage, 'dispatched');
+  assert.equal(calls.length, 0);
+});
+
+test('DND persists signed queued receipts, restores capacity and rechecks admission before draining', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dndQueuePath = join(dir, 'dnd.json');
+  const first = await setup(t, { mode: 'dnd', dndQueuePath, maxDndItems: 2 });
+  const allowed = envelope({ idempotencyKey: 'allowed' });
+  const blocked = envelope({ idempotencyKey: 'blocked' });
+  const response = await first.kernel.ctx.bail('transport/inbound', {
+    networkId: 'test', senderNodeId: sender.nodeId, mode: 'unicast',
+    payload: { type: 'message.envelope', envelope: allowed },
+  });
+  const receipt = JSON.parse(Buffer.from(response!).toString());
+  assert.equal(verifyReceipt(receipt), true);
+  assert.equal(isDurableQueuedReceipt(receipt), true);
+  assert.equal((await stat(dndQueuePath)).mode & 0o777, 0o600);
+  await first.gate.evaluate(blocked);
+  assert.equal((await first.gate.evaluate(envelope())).status, 'reject');
+  await first.kernel.stop();
+  const second = await setup(t, { mode: 'dnd', dndQueuePath, maxDndItems: 2 });
+  assert.equal((await second.gate.evaluate(envelope())).status, 'reject');
+  second.gate.registerRule({ name: 'deny', priority: 10, async evaluate(e) {
+    return e.id === blocked.id ? { status: 'reject', code: 'blocked', reason: 'new rule' } : null;
+  } });
+  await second.gate.setMode('open');
+  assert.deepEqual(second.calls.map(batch => batch[0].id), [allowed.id]);
+  assert.equal(second.gate.listRejections().at(-1)?.reason, 'new rule');
+  assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), { queued: {} });
+  await second.gate.drainDnd();
+  assert.equal(second.calls.length, 1);
+});
+
+test('DND keeps failures durable, drains later items, and rejects corrupt or oversized stores', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-errors-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dndQueuePath = join(dir, 'dnd.json');
+  const { gate, dispatcher, calls } = await setup(t, { mode: 'dnd', dndQueuePath });
+  const missing = envelope({ payload: { executor: 'missing' } });
+  await gate.evaluate(missing);
+  await gate.evaluate(envelope());
+  await assert.rejects(gate.setMode('open'), /DND drain failed/);
+  assert.equal(calls.length, 1);
+  assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 1);
+  dispatcher.registerExecutor({ name: 'missing', async execute() { throw new Error('external failure'); } }, {});
+  await assert.rejects(gate.drainDnd(), /DND drain failed/);
+  await assert.rejects(gate.drainDnd(), /DND drain failed/);
+  assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 1);
+  const invalid = { ...missing, body: 'tampered' };
+  const validKey = JSON.stringify([missing.networkId, missing.from.nodeId, missing.id]);
+  for (const saved of ['bad json', JSON.stringify({ queued: { [validKey]: invalid } }), JSON.stringify({ queued: [] }), JSON.stringify({ queued: { wrong: missing } })]) {
+    await writeFile(dndQueuePath, saved);
+    const kernel = new Kernel();
+    await assert.rejects(kernel.use(createGatePlugin({ dndQueuePath })), /Invalid gate DND store/);
+  }
+  const ephemeral = await setup(t, { mode: 'dnd' });
+  const verdict = await ephemeral.gate.evaluate(envelope());
+  assert.equal(verdict.status === 'queued_dnd' && verdict.durable, false);
+  assert.equal(isDurableQueuedReceipt({ stage: 'queued' }), false);
+});
+
+test('DND rechecks network mode mid-drain and retains approval items across restart', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-admission-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dndQueuePath = join(dir, 'dnd.json');
+  const first = await setup(t, { mode: 'dnd', dndQueuePath });
+  await first.gate.evaluate(envelope());
+  await first.gate.evaluate(envelope());
+  first.gate.registerRule({ name: 'mode-change', priority: 1, async evaluate() {
+    await first.gate.setMode('closed');
+    return { status: 'allow' };
+  } });
+  await first.gate.setMode('open');
+  assert.equal(first.calls.length, 0);
+  assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 2);
+  const oversized = new Kernel();
+  await assert.rejects(oversized.use(createGatePlugin({ dndQueuePath, maxDndItems: 1 })), /Invalid gate DND store/);
+  await first.kernel.stop();
+  const second = await setup(t, { mode: 'dnd', dndQueuePath });
+  second.gate.registerRule({ name: 'approval', priority: 1, async evaluate(e) {
+    return { status: 'pending_approval', approvalId: e.id, reason: 'review' };
+  } });
+  await second.gate.setMode('open');
+  assert.equal(second.calls.length, 0);
+  assert.equal(second.gate.listPendingApprovals().length, 2);
+  assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 2);
+  const [approve, reject] = second.gate.listPendingApprovals();
+  await second.gate.approve(approve.id);
+  await second.gate.reject(reject.id);
+  assert.equal(second.calls.length, 1);
+  assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), { queued: {} });
 });

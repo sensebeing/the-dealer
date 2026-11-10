@@ -651,7 +651,7 @@ export async function createPlugin(config: Record<string, unknown>, context: any
 export default (_config: any, context: any) => {
   const factories = [
     'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
-    'createDedupCasPolicyPlugin', 'isDedupCasDuplicateReceipt', 'createOrcaSpawnExecutorPlugin',
+    'createDedupCasPolicyPlugin', 'isDedupCasDuplicateReceipt', 'isDurableQueuedReceipt', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
     'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin', 'createInboxExecutorPlugin',
   ];
@@ -693,7 +693,7 @@ export default (_config: any, context: any) => {
   assert.equal(afterRestart.body, 'overlay');
   assert.equal(afterRestart.userPlugin, true);
   assert.equal(afterRestart.factoryPolicy, 'dedup-cas');
-  assert.equal(afterRestart.duplicateReceiptRecognized, true);
+  assert.equal(afterRestart.duplicateReceiptRecognized, false);
   assert.equal(afterRestart.dispatchedReceiptRecognized, false);
   assert.equal((await cli(restored, 'project', 'status')).userPlugins[0].name, 'user-example');
   await cli(restored, 'project', 'unlink', 'demo');
@@ -782,4 +782,75 @@ test('Phase 4: runtime binds linked receiver projects into orca-spawn', async t 
   assert.equal(result.receipts[0].stage, 'dispatched');
   assert.equal(calls[0].cwd, projectRoot);
   assert.ok(calls[0].args.includes('--no-parent'));
+});
+
+test('Phase 4: DND durable receipt survives runtime restart and drains after user admission rules load', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'dnd-alice');
+  const bob = await node(t, root, 'dnd-bob', { patch: { gateMode: 'dnd', defaultExecutor: 'inbox' } });
+  await connect(alice, bob);
+  const allowed = await alice.emitter.emit({ ...input('dnd-bob'), subject: 'allowed' });
+  const denied = await alice.emitter.emit({ ...input('dnd-bob'), subject: 'deny after restart' });
+  assert.equal(allowed.receipts[0].stage, 'queued');
+  assert.equal(allowed.receipts[0].executionReceipt?.durable, true);
+  assert.equal(denied.receipts[0].stage, 'queued');
+  assert.equal(bob.mailbox.list({ mailboxId: 'default' }).queuedCount, 0);
+  mkdirSync(join(bob.stateDir, 'plugins'), { recursive: true });
+  writeFileSync(join(bob.stateDir, 'plugins/admission.ts'), `
+export default {
+  name: 'restart-admission',
+  apply(ctx: any) {
+    ctx.services.gate.registerRule({
+      name: 'restart-deny', priority: 100,
+      async evaluate(envelope: any) {
+        return envelope.subject === 'deny after restart'
+          ? { status: 'reject', code: 'denied', reason: 'Current admission rule' }
+          : null;
+      },
+    });
+  },
+};
+`);
+  await cli(bob, 'plugin', 'add', '--name', 'restart-admission', '--module', 'plugins/admission.ts');
+  const stateDir = bob.stateDir;
+  await bob.stop();
+  const restarted = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'mesh') }, patch: { gateMode: 'open' } });
+  await restarted.start();
+  t.after(() => restarted.stop());
+  assert.equal(restarted.mailbox.list({ mailboxId: 'default' }).queuedCount, 1);
+  assert.equal(restarted.gate.listRejections()[0]?.reason, 'Current admission rule');
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
+  await restarted.gate.drainDnd();
+  assert.equal(restarted.mailbox.list({ mailboxId: 'default' }).queuedCount, 1);
+});
+
+test('Phase 4: failed restored DND delivery stays ledger-fenced without preventing node startup', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'fail-alice');
+  const bob = await node(t, root, 'fail-bob', { patch: { gateMode: 'dnd', defaultExecutor: 'inbox' } });
+  await connect(alice, bob);
+  await alice.emitter.emit({ ...input('fail-bob'), subject: 'failure' });
+  await alice.emitter.emit({ ...input('fail-bob'), subject: 'success' });
+  const stateDir = bob.stateDir;
+  await bob.stop();
+  const calls: string[] = [];
+  const options: DealerRuntimeOptions = {
+    stateDir, transport: { discoveryDir: join(root, 'mesh') }, patch: { gateMode: 'open' },
+    executorOverrides: [{ name: 'inbox', async execute(batch) {
+      calls.push(batch[0].subject);
+      if (batch[0].subject === 'failure') throw new Error('external outcome unknown');
+      return { executor: 'inbox', executionId: batch[0].id };
+    } }],
+  };
+  const restarted = new DealerNodeRuntime(options);
+  await restarted.start();
+  assert.match(restarted.lastError!, /DND drain failed/);
+  assert.deepEqual(calls, ['failure', 'success']);
+  assert.equal(Object.keys(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')).queued).length, 1);
+  await restarted.stop();
+  const again = new DealerNodeRuntime(options);
+  await again.start();
+  t.after(() => again.stop());
+  assert.match(again.lastError!, /DND drain failed/);
+  assert.deepEqual(calls, ['failure', 'success'], 'unknown external effects are never replayed');
 });

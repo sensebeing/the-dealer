@@ -16,7 +16,7 @@ import { createGatePlugin } from '../gate/index.ts';
 import type { NetworkGateService } from '../gate/index.ts';
 import { createDispatcherPlugin } from '../dispatcher/index.ts';
 import { createEmitterPlugin } from '../emitter/index.ts';
-import { createDedupCasPolicyPlugin, isDedupCasDuplicateReceipt } from '../plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../plugins-policy/index.ts';
 import {
   createOrcaSpawnExecutorPlugin,
   createOrcaWaveExecutorPlugin,
@@ -51,6 +51,7 @@ export interface ExternalPluginContext {
     createScriptSourcePlugin: typeof createScriptSourcePlugin;
     createDedupCasPolicyPlugin: typeof createDedupCasPolicyPlugin;
     isDedupCasDuplicateReceipt: typeof isDedupCasDuplicateReceipt;
+    isDurableQueuedReceipt: typeof isDurableQueuedReceipt;
     createOrcaSpawnExecutorPlugin: typeof createOrcaSpawnExecutorPlugin;
     createOrcaWaveExecutorPlugin: typeof createOrcaWaveExecutorPlugin;
     createAgentPtyExecutorPlugin: typeof createAgentPtyExecutorPlugin;
@@ -271,6 +272,7 @@ export class DealerNodeRuntime {
       await this.kernel.use(
         createGatePlugin({
           mode: this.config.gateMode,
+          dndQueuePath: join(this.stateDir, 'gate-dnd.json'),
           localNodeId: keyPair.nodeId,
           networkModes: Object.fromEntries(
             this.config.networks
@@ -309,6 +311,16 @@ export class DealerNodeRuntime {
       for (const ref of [...this.config.userPlugins]) {
         await this.installUserPlugin(ref);
       }
+      const gate = this.kernel.ctx.services.gate as NetworkGateService;
+      for (const networkId of this.transport.listMountedNetworks()) {
+        if (gate.getNetworkMode(networkId) !== 'open') continue;
+        try {
+          await gate.drainDnd(networkId);
+        } catch (error) {
+          // Failed items remain durable and ledger-fenced; keep the node available for recovery.
+          this.lastError = String(error);
+        }
+      }
       this.persist();
       this.started = true;
       return this;
@@ -341,6 +353,7 @@ export class DealerNodeRuntime {
         createScriptSourcePlugin,
         createDedupCasPolicyPlugin,
         isDedupCasDuplicateReceipt,
+        isDurableQueuedReceipt,
         createOrcaSpawnExecutorPlugin,
         createOrcaWaveExecutorPlugin,
         createAgentPtyExecutorPlugin,

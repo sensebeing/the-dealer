@@ -255,7 +255,7 @@ export interface RouterService {
 export type GateVerdict =
   | { status: 'allow' }
   | { status: 'pending_approval'; approvalId: string; reason: string }
-  | { status: 'queued_dnd'; reason: string }
+  | { status: 'queued_dnd'; reason: string; durable?: boolean }
   | { status: 'reject'; code: string; reason: string };
 
 export interface GateRulePlugin {
