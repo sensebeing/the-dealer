@@ -676,13 +676,6 @@ export class DealerNodeRuntime {
                 const receipt = legacyLedger.get(key);
                 if (this.mailbox.hasConfirmedEnvelope(networkId, senderNodeId, entityId, revision) ||
                     receipt?.stage === 'dispatched' || receipt?.stage === 'settled') return 'settled';
-                if (isDurableQueuedReceipt(receipt) || this.gate.listDndQueue().some(item => {
-                  const envelope = item.envelope;
-                  const value = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
-                  return item.status === 'queued' && envelope.networkId === networkId &&
-                    envelope.from.nodeId === senderNodeId && (envelope.idempotencyKey ?? envelope.id) === entityId &&
-                    typeof value === 'number' && Number.isSafeInteger(value) && value >= revision;
-                })) return 'queued';
                 return 'unknown';
               },
             }),

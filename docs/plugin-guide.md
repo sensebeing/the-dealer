@@ -123,8 +123,10 @@ entries; a strictly newer integer revision resets an entry to queued.
 Legacy numeric watermarks upgrade atomically to unknown unless
 `resolveLegacyWatermarkStatus(key, revision)` supplies durable corroboration.
 Runtime uses verified mailbox envelopes or dispatched/settled delivery records
-for settled status, and durable queued receipts or queued DND entries for queued
-status; failed, dispatching and absent evidence remain unknown.
+for settled status only; all other evidence, including queued receipts, pending
+DND entries, failed, dispatching and absent records, remains unknown. Pending DND
+obligations never self-confirm downstream dedup. Parked DND entries reject the
+same or older revision until a strictly newer integer revision resets them.
 
 The factory context includes `projectRoot` (project plugins only), `stateDir`,
 `runtime`, the parsed `userPatch`, and `api`. The `api` bag exposes the built-in

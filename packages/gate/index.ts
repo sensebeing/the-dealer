@@ -171,7 +171,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
                 if (verdict.status !== 'allow') continue;
                 if (service.getNetworkMode(envelope.networkId) !== 'open') continue;
                 const receipt = await ctx.services.dispatcher.dispatch(envelope);
-                if (isConfirmedHandoffReceipt(receipt, { allowQueued: true })) {
+                if (isConfirmedHandoffReceipt(receipt, { allowQueued: receipt.executionReceipt?.executor !== 'gate-dnd' })) {
                   // A concurrently admitted newer envelope must not be deleted with this one.
                   if (dnd.get(id)?.envelope.signature === envelope.signature) updateDnd(id);
                 } else {
@@ -265,6 +265,12 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
               return { status: 'reject', code: 'dnd_queue_full', reason: 'DND queue capacity exceeded' };
             }
             const existing = dnd.get(id);
+            if (existing?.status === 'parked' && revision(envelope) <= revision(existing.envelope)) {
+              return {
+                status: 'reject', code: 'dnd_handoff_parked',
+                reason: existing.lastError ?? 'Previous DND handoff outcome unknown; newer revision required',
+              };
+            }
             if (!existing || revision(envelope) > revision(existing.envelope)) {
               updateDnd(id, { envelope, status: 'queued', attempts: 0, updatedAt: new Date().toISOString() });
             }
@@ -286,7 +292,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
           approving.add(id);
           try {
             const receipt = await ctx.services.dispatcher.dispatch(item.envelope);
-            if (!isConfirmedHandoffReceipt(receipt, { allowQueued: true })) {
+            if (!isConfirmedHandoffReceipt(receipt, { allowQueued: receipt.executionReceipt?.executor !== 'gate-dnd' })) {
               throw new Error(`Unconfirmed approval handoff (${receipt.stage}): ${receipt.detail ?? 'no durable handoff evidence'}`);
             }
             const queuedId = dndKey(item.envelope);

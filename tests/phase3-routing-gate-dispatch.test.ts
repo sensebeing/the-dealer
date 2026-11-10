@@ -1204,6 +1204,7 @@ test('DND and approval retain every unconfirmed handoff and only clear confirmed
       executionReceipt: { executor: 'dedup-cas', executionId: 'd', durable: true, handoff: 'settled' } },
     { stage: 'rejected' as const, detail: DEDUP_CAS_DUPLICATE_DETAIL,
       executionReceipt: { executor: 'dedup-cas', executionId: 'd', durable: true, handoff: 'queued' } },
+    { stage: 'queued' as const, executionReceipt: { executor: 'gate-dnd', executionId: 'self', durable: true } },
     null,
   ];
   for (const approval of [false, true]) {
@@ -1225,8 +1226,8 @@ test('DND and approval retain every unconfirmed handoff and only clear confirmed
         await gate.setMode('open');
       }
       const operation = approval ? gate.approve(message.id) : gate.setMode('open');
-      const confirmed = index >= 6 && receipt !== null;
-      assert.equal(isConfirmedHandoffReceipt(receipt, { allowQueued: true }), confirmed);
+      const confirmed = index >= 6 && receipt !== null && receipt.executionReceipt?.executor !== 'gate-dnd';
+      assert.equal(isConfirmedHandoffReceipt(receipt, { allowQueued: receipt?.executionReceipt?.executor !== 'gate-dnd' }), confirmed);
       if (confirmed) {
         await operation;
         assert.equal(gate.listDndQueue().length, 0);
@@ -1263,8 +1264,12 @@ test('DND legacy loading, revision admission and signature CAS preserve newer ob
   await gate.setMode('dnd');
   const parked = gate.listDndQueue()[0];
   for (const message of [old, envelope({ ...old, id: 'equal' }), envelope({ ...old, payload: { revision: 1 } })]) {
-    await gate.evaluate(message);
+    assert.deepEqual(await gate.evaluate(message), {
+      status: 'reject', code: 'dnd_handoff_parked', reason: parked.lastError,
+    });
     assert.deepEqual(gate.listDndQueue()[0], parked);
+    const { id, ...entry } = parked;
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).queued[id], entry);
   }
   failed.dispose();
   const newer = envelope({ ...old, id: 'newer', payload: { claimVersion: 3 } });

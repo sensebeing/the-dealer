@@ -10,6 +10,7 @@ import {
   generateNodeKeyPair,
   signEnvelope,
   isDedupCasDuplicateReceipt,
+  isConfirmedHandoffReceipt,
   runDealerCli,
   getBuiltInProfile,
   readPatch,
@@ -948,8 +949,7 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
     const options = { stateDir, transport: { discoveryDir: join(root, 'mesh') } };
     const restarted = new DealerNodeRuntime(options);
     await restarted.start();
-    const status = ['mailbox', 'dispatched', 'settled'].includes(evidence) ? 'settled'
-      : ['dnd', 'queued-receipt'].includes(evidence) ? 'queued' : 'unknown';
+    const status = ['mailbox', 'dispatched', 'settled'].includes(evidence) ? 'settled' : 'unknown';
     const path = join(stateDir, 'dedup-watermarks.json');
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf8'))[key], { revision: 2, status }, evidence);
     await restarted.stop();
@@ -968,4 +968,61 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
     }
     await again.stop();
   }
+});
+
+
+test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND obligation after restart', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'legacy-alice');
+  const bob = await node(t, root, 'legacy-bob', {
+    patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
+  });
+  await connect(alice, bob);
+  const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity' };
+  assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'queued');
+  const message = bob.gate.listDndQueue()[0].envelope;
+  const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);
+  const stateDir = bob.stateDir;
+  assert.equal(bob.mailbox.list().totalCount, 0);
+  await bob.stop();
+  writeFileSync(join(stateDir, 'dedup-watermarks.json'), JSON.stringify({ [key]: 2 }));
+  const restarted = new DealerNodeRuntime({
+    stateDir, transport: { discoveryDir: join(root, 'mesh') }, patch: { gateMode: 'open' },
+  });
+  await restarted.start();
+  t.after(() => restarted.stop());
+  assert.match(restarted.lastError!, /DND drain failed/);
+  assert.equal(restarted.mailbox.list().totalCount, 0);
+  const [parked] = restarted.gate.listDndQueue();
+  assert.deepEqual(parked.envelope, message);
+  assert.equal(parked.status, 'parked');
+  assert.ok(parked.lastError);
+  const { id, ...persisted } = parked;
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')).queued[id], persisted);
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'dedup-watermarks.json'), 'utf8'))[key], {
+    revision: 2, status: 'unknown',
+  });
+  const retry = await alice.emitter.emit(request);
+  assert.equal(isConfirmedHandoffReceipt(retry.receipts[0], { allowQueued: true }), false);
+  assert.deepEqual(restarted.gate.listDndQueue(), [parked]);
+  assert.equal(restarted.mailbox.list().totalCount, 0);
+  await restarted.gate.setMode('dnd');
+  for (const revision of [2, 1]) {
+    const rejected = await alice.emitter.emit({ ...request, payload: { revision } });
+    assert.equal(rejected.receipts[0].stage, 'rejected');
+    assert.equal(isConfirmedHandoffReceipt(rejected.receipts[0], { allowQueued: true }), false);
+    assert.deepEqual(restarted.gate.listDndQueue(), [parked]);
+    assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')).queued[id], persisted);
+  }
+  const recovered = await alice.emitter.emit({ ...request, payload: { revision: 3 } });
+  assert.equal(recovered.receipts[0].stage, 'queued');
+  const [queued] = restarted.gate.listDndQueue();
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.attempts, 0);
+  assert.equal(queued.lastError, undefined);
+  await restarted.gate.setMode('open');
+  assert.deepEqual(restarted.gate.listDndQueue(), []);
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
+  assert.equal(restarted.mailbox.list().totalCount, 1);
+  assert.deepEqual(restarted.mailbox.list().items[0].envelope, queued.envelope);
 });
