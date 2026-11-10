@@ -658,7 +658,7 @@ export default (_config: any, context: any) => {
     'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
     'createDedupCasPolicyPlugin', 'createWaveCoalescerPolicyPlugin', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
-    'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin',
+    'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin', 'createInboxExecutorPlugin',
   ];
   if (factories.some(name => typeof context.api[name] !== 'function')) {
     throw new Error('Missing built-in factory');

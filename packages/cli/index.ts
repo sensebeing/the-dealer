@@ -3,14 +3,17 @@ import { resolve, join, basename } from 'node:path';
 import { request } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
+import { InboxStore } from '../plugins-executor/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
 import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
 
-const booleanFlags = ['json', 'auto-route', 'trust-sender'];
+const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'mark-read'];
 const stringFlags = [
+  'from',
+  'limit',
   'root',
   'id',
   'project',
@@ -191,6 +194,35 @@ async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> 
   });
 }
 
+async function runInboxCommand(inbox: InboxStore, action: string | undefined, target: string | undefined, v: Record<string, any>) {
+  const networkId = v.network as string | undefined;
+  if (action === 'list') {
+    if (v.all && v.status !== undefined && v.status !== 'all') {
+      throw new Error('Cannot combine --all with --status');
+    }
+    return inbox.list({
+      networkId,
+      topic: v.topic,
+      from: v.from,
+      status: v.all ? 'all' : (v.status ?? 'unread'),
+      limit: v.limit === undefined ? undefined : Number(v.limit),
+    });
+  }
+  if (action === 'show') {
+    return inbox.show(required(target, 'message-id'), { networkId, markRead: v['mark-read'] === true });
+  }
+  if (action === 'read' || action === 'ack') {
+    if (Boolean(target) === Boolean(v.all)) {
+      throw new Error('Specify either <messageId> or --all');
+    }
+    if (target && (v.topic !== undefined || v.from !== undefined)) {
+      throw new Error('Filter flags require --all');
+    }
+    return inbox.markRead({ id: target, all: v.all === true, networkId, topic: v.topic, from: v.from });
+  }
+  throw new Error('Unknown inbox command');
+}
+
 export async function runDealerCli(argv: string[], options: DealerCliOptions = {}): Promise<number> {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
@@ -237,6 +269,19 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       result.stdout.forEach(line => stdout(line));
       result.stderr.forEach(line => stderr(line));
       return result.code;
+    }
+    if (group === 'inbox') {
+      let inbox: InboxStore;
+      if (options.runtime) {
+        await options.runtime.start();
+        inbox = options.runtime.inbox;
+      } else {
+        const file = join(stateDir, 'config.json');
+        const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+        inbox = new InboxStore(savedConfig.executorConfig?.inbox?.inboxPath ?? join(stateDir, 'inbox.json'));
+      }
+      stdout(JSON.stringify(await runInboxCommand(inbox, action, target, v), null, v.json ? undefined : 2));
+      return 0;
     }
     if (!options.runtime && group === 'node' && action === 'up') {
       stdout(JSON.stringify(await launchDaemon(argv, stateDir)));

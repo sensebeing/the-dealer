@@ -16,21 +16,21 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     name: 'personal-dev',
     gateMode: 'approval_required',
     policies: ['dedup-cas', 'wave-coalescer'],
-    executors: ['orca-spawn', 'orca-wave', 'notify'],
+    executors: ['orca-spawn', 'orca-wave', 'notify', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'dedicated-worker': {
     name: 'dedicated-worker',
     gateMode: 'open',
     policies: ['dedup-cas', 'wave-coalescer'],
-    executors: ['orca-spawn', 'orca-wave', 'agent-pty'],
+    executors: ['orca-spawn', 'orca-wave', 'agent-pty', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'headless-relay': {
     name: 'headless-relay',
     gateMode: 'open',
     policies: [],
-    executors: ['notify'],
+    executors: ['notify', 'inbox'],
     defaultExecutor: 'notify',
   },
 });
@@ -228,7 +228,7 @@ export function readPatch(path: string): Partial<RuntimeConfig> {
   return root;
 }
 
-const BUILTIN_EXECUTORS = ['orca-spawn', 'orca-wave', 'agent-pty', 'notify'];
+const BUILTIN_EXECUTORS = ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'];
 
 export function validateConfig(config: RuntimeConfig): void {
   validatePluginRefs(config.userPlugins);

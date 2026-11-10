@@ -23,6 +23,8 @@ import {
   createOrcaWaveExecutorPlugin,
   createAgentPtyExecutorPlugin,
   createNotifyExecutorPlugin,
+  createInboxExecutorPlugin,
+  InboxStore,
   checkedCommand,
   resolveOrcaWorkspaceTerminal,
   runCommand,
@@ -56,6 +58,7 @@ export interface ExternalPluginContext {
     createOrcaWaveExecutorPlugin: typeof createOrcaWaveExecutorPlugin;
     createAgentPtyExecutorPlugin: typeof createAgentPtyExecutorPlugin;
     createNotifyExecutorPlugin: typeof createNotifyExecutorPlugin;
+    createInboxExecutorPlugin: typeof createInboxExecutorPlugin;
     createLocalAgentRouterPlugin: typeof createLocalAgentRouterPlugin;
     createLlmApiRouterPlugin: typeof createLlmApiRouterPlugin;
   };
@@ -93,6 +96,7 @@ export class DealerNodeRuntime {
   readonly kernel = new Kernel();
   readonly options: DealerRuntimeOptions;
   config!: RuntimeConfig;
+  inbox!: InboxStore;
   wave?: WaveCoalescerPolicy;
   private loadedProjects = new Map<string, { manifest: DealerProjectManifest; plugins: LoadedExternalPlugin[] }>();
   private loadedUserPlugins = new Map<string, LoadedExternalPlugin>();
@@ -188,6 +192,7 @@ export class DealerNodeRuntime {
         ...this.options.patch,
       };
       validateConfig(this.config);
+      this.inbox = new InboxStore(this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'));
       const keyPath = join(this.stateDir, 'identity.json');
       const keyPair = existsSync(keyPath) ? JSON.parse(readFileSync(keyPath, 'utf8')) : generateNodeKeyPair();
       if (!existsSync(keyPath)) {
@@ -228,6 +233,7 @@ export class DealerNodeRuntime {
         createDispatcherPlugin({
           ledgerPath: join(this.stateDir, 'deliveries.json'),
           defaultExecutor: this.config.defaultExecutor,
+          resolveKindExecutor: kind => this.resolveTopicDefaultExecutor(kind),
         }),
       );
       await this.kernel.use(
@@ -289,6 +295,7 @@ export class DealerNodeRuntime {
         createOrcaWaveExecutorPlugin,
         createAgentPtyExecutorPlugin,
         createNotifyExecutorPlugin,
+        createInboxExecutorPlugin,
         createLocalAgentRouterPlugin,
         createLlmApiRouterPlugin,
       },
@@ -358,6 +365,17 @@ export class DealerNodeRuntime {
     return this.changeExternal(async () => {
       const rootPath = resolve(projectRoot);
       const manifest = readProjectManifest(rootPath);
+      for (const [kind, topic] of Object.entries(manifest.topics ?? {})) {
+        if (topic.defaultExecutor === undefined) {
+          continue;
+        }
+        for (const [otherProjectId, other] of this.loadedProjects) {
+          const existing = other.manifest.topics?.[kind]?.defaultExecutor;
+          if (otherProjectId !== manifest.projectId && existing !== undefined && existing !== topic.defaultExecutor) {
+            throw new Error(`Conflicting defaultExecutor for topic: ${kind}`);
+          }
+        }
+      }
       const patchPath = resolve(userPatchPath ?? join(this.stateDir, 'projects', `${manifest.projectId}.patch.json`));
       const userPatch: Record<string, any> | undefined = existsSync(patchPath) ? readPatch(patchPath) : undefined;
       if (userPatch?.skills !== undefined &&
@@ -443,6 +461,22 @@ export class DealerNodeRuntime {
     };
   }
 
+  resolveTopicDefaultExecutor(kind: string): string | undefined {
+    for (const { manifest } of this.loadedProjects.values()) {
+      const executor = manifest.topics?.[kind]?.defaultExecutor;
+      if (executor !== undefined) {
+        return executor;
+      }
+    }
+    return undefined;
+  }
+
+  resolveExecutorName(envelope: { kind: string; payload?: Record<string, any> }): string {
+    const explicit = envelope.payload?.executor;
+    return typeof explicit === 'string' && explicit.trim().length > 0
+      ? explicit : this.resolveTopicDefaultExecutor(envelope.kind) ?? this.config.defaultExecutor;
+  }
+
   private integrationPlugin(): Plugin {
     return {
       name: 'runtime-plugins',
@@ -470,6 +504,7 @@ export class DealerNodeRuntime {
             ...this.config.executorConfig['agent-pty'],
             commandRunner: runner,
           }),
+          inbox: createInboxExecutorPlugin({ ...this.config.executorConfig.inbox, store: this.inbox }),
           notify: createNotifyExecutorPlugin({
             inboxPath: join(this.stateDir, 'notifications.jsonl'),
             ...this.config.executorConfig.notify,
@@ -554,7 +589,7 @@ export class DealerNodeRuntime {
           const registration = ctx.services.dispatcher.registerPolicy({
             name: 'wave-coalescer',
             process: (envelope, next) => {
-              if ((envelope.payload?.executor ?? this.config.defaultExecutor) !== 'orca-wave') {
+              if (this.resolveExecutorName(envelope) !== 'orca-wave') {
                 return next([envelope]);
               }
               this.streams.add(streamKey(envelope));

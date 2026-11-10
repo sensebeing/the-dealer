@@ -23,6 +23,7 @@ export interface DispatcherConfig {
   privateKeyPem?: string;
   ledgerPath?: string;
   defaultExecutor?: string;
+  resolveKindExecutor?: (kind: string) => string | undefined;
   kindExecutors?: Record<string, string>;
 }
 
@@ -108,9 +109,10 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       });
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
       const select = (e: MessageEnvelope) =>
-        typeof e.payload?.executor === 'string'
+        typeof e.payload?.executor === 'string' && e.payload.executor.trim().length > 0
           ? e.payload.executor
-          : config.kindExecutors?.[e.kind] ??
+          : config.resolveKindExecutor?.(e.kind) ??
+            config.kindExecutors?.[e.kind] ??
             config.defaultExecutor ??
             executors.keys().next().value;
       const core = async (batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> => {

@@ -1,6 +1,10 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
+  closeSync,
+  fsyncSync,
+  openSync,
+  rmSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -881,6 +885,266 @@ export function createNotifyExecutorPlugin(options: NotifyOptions = {}): Executo
         });
       }
       return { executor: 'notify', executionId: randomUUID(), count: batch.length };
+    },
+  };
+}
+
+
+export interface InboxAttachmentRecord {
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  blake3Hash: string;
+  localPath: string;
+}
+
+export interface InboxItem {
+  id: string;
+  networkId: string;
+  topic: string;
+  priority: MessageEnvelope['priority'];
+  from: MessageEnvelope['from'];
+  subject: string;
+  body: string;
+  payload: Record<string, any>;
+  attachments: InboxAttachmentRecord[];
+  createdAt: string;
+  receivedAt: string;
+  status: 'unread' | 'read';
+  readAt?: string;
+}
+
+export interface InboxListOptions {
+  networkId?: string;
+  topic?: string;
+  from?: string;
+  status?: 'unread' | 'read' | 'all';
+  limit?: number;
+}
+
+export interface InboxListResult {
+  unreadCount: number;
+  totalCount: number;
+  status: 'unread' | 'read' | 'all';
+  items: InboxItem[];
+}
+
+export interface InboxMarkReadOptions {
+  id?: string;
+  all?: boolean;
+  networkId?: string;
+  topic?: string;
+  from?: string;
+}
+
+export interface InboxMarkReadResult {
+  updated: string[];
+  unreadCount: number;
+}
+
+function inboxMatches(item: InboxItem, options: InboxListOptions): boolean {
+  return (options.networkId === undefined || item.networkId === options.networkId) &&
+    (options.topic === undefined || item.topic === options.topic) &&
+    (options.from === undefined || item.from.member === options.from || item.from.nodeId === options.from);
+}
+
+export class InboxStore {
+  private inboxPath: string;
+  private pending: Promise<unknown> = Promise.resolve();
+
+  constructor(inboxPath: string) {
+    this.inboxPath = inboxPath;
+  }
+
+  private load(): InboxItem[] {
+    let raw: string;
+    try {
+      raw = readFileSync(this.inboxPath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    }
+    try {
+      const saved = JSON.parse(raw);
+      if (saved?.schema !== 'the-dealer-inbox/v1' || !Array.isArray(saved.items) ||
+          saved.items.some((item: InboxItem) => !item ||
+            !['id', 'networkId', 'topic', 'subject', 'body', 'createdAt', 'receivedAt'].every(key =>
+              typeof item[key as keyof InboxItem] === 'string') ||
+            !item.from || !['nodeId', 'member', 'nodeName'].every(key =>
+              typeof item.from[key as keyof InboxItem['from']] === 'string') ||
+            !['urgent', 'high', 'normal', 'low'].includes(item.priority) ||
+            !['unread', 'read'].includes(item.status) ||
+            (item.readAt !== undefined && typeof item.readAt !== 'string') ||
+            !item.payload || typeof item.payload !== 'object' || Array.isArray(item.payload) ||
+            !Array.isArray(item.attachments) || item.attachments.some(a => !a ||
+              typeof a.name !== 'string' || typeof a.mimeType !== 'string' ||
+              typeof a.sizeBytes !== 'number' || typeof a.blake3Hash !== 'string' ||
+              typeof a.localPath !== 'string'))) {
+        throw new Error('Invalid inbox store');
+      }
+      return saved.items;
+    } catch {
+      throw new Error('Invalid inbox store');
+    }
+  }
+
+  private save(items: InboxItem[]): void {
+    mkdirSync(dirname(this.inboxPath), { recursive: true, mode: 0o700 });
+    const temp = `${this.inboxPath}.${randomUUID()}.tmp`;
+    try {
+      const fd = openSync(temp, 'wx', 0o600);
+      try {
+        writeFileSync(fd, JSON.stringify({ schema: 'the-dealer-inbox/v1', items }));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temp, this.inboxPath);
+      const directory = openSync(dirname(this.inboxPath), 'r');
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+    } finally {
+      rmSync(temp, { force: true });
+    }
+  }
+
+  private locked<T>(operation: (items: InboxItem[]) => T): Promise<T> {
+    const result = this.pending.then(() => operation(this.load()));
+    this.pending = result.catch(() => undefined);
+    return result;
+  }
+
+  deliver(batch: readonly MessageEnvelope[]): Promise<{ inserted: string[]; duplicateIds: string[] }> {
+    return this.locked(items => {
+      const key = (id: string, networkId: string, nodeId: string) => JSON.stringify([networkId, nodeId, id]);
+      const keys = new Set(items.map(item => key(item.id, item.networkId, item.from.nodeId)));
+      const inserted: string[] = [];
+      const duplicateIds: string[] = [];
+      for (const envelope of batch) {
+        const identity = key(envelope.id, envelope.networkId, envelope.from.nodeId);
+        if (keys.has(identity)) {
+          duplicateIds.push(envelope.id);
+          continue;
+        }
+        const { localAttachments, ...payload } = envelope.payload ?? {};
+        items.push({
+          id: envelope.id,
+          networkId: envelope.networkId,
+          topic: envelope.kind,
+          priority: envelope.priority,
+          from: structuredClone(envelope.from),
+          subject: envelope.subject,
+          body: envelope.body,
+          payload: structuredClone(payload),
+          attachments: envelope.attachments.map((attachment, index) => ({
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes,
+            blake3Hash: attachment.blake3Hash,
+            localPath: Array.isArray(localAttachments) && typeof localAttachments[index] === 'string'
+              ? localAttachments[index] : '',
+          })),
+          createdAt: envelope.createdAt,
+          receivedAt: new Date().toISOString(),
+          status: 'unread',
+        });
+        keys.add(identity);
+        inserted.push(envelope.id);
+      }
+      if (inserted.length) {
+        this.save(items);
+      }
+      return { inserted, duplicateIds };
+    });
+  }
+
+  list(options: InboxListOptions = {}): Promise<InboxListResult> {
+    return this.locked(items => {
+      const status = options.status ?? 'unread';
+      if (!['unread', 'read', 'all'].includes(status)) {
+        throw new Error('Invalid inbox status');
+      }
+      if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit <= 0)) {
+        throw new Error('Limit must be a positive integer');
+      }
+      const matching = items.filter(item => inboxMatches(item, options));
+      return {
+        totalCount: matching.length,
+        unreadCount: matching.filter(item => item.status === 'unread').length,
+        status,
+        items: matching.reverse().filter(item => status === 'all' || item.status === status)
+          .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)).slice(0, options.limit),
+      };
+    });
+  }
+
+  private find(items: InboxItem[], id: string, networkId?: string): InboxItem {
+    const matches = items.filter(item => item.id === id && (networkId === undefined || item.networkId === networkId));
+    if (!matches.length) {
+      throw new Error(`Inbox message not found: ${id}`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`Ambiguous inbox message: ${id}; specify --network`);
+    }
+    return matches[0];
+  }
+
+  show(id: string, options: { networkId?: string; markRead?: boolean } = {}): Promise<InboxItem> {
+    return this.locked(items => {
+      const item = this.find(items, id, options.networkId);
+      if (options.markRead && item.status === 'unread') {
+        item.status = 'read';
+        item.readAt = new Date().toISOString();
+        this.save(items);
+      }
+      return structuredClone(item);
+    });
+  }
+
+  markRead(options: InboxMarkReadOptions): Promise<InboxMarkReadResult> {
+    return this.locked(items => {
+      if (Boolean(options.id) === (options.all === true)) {
+        throw new Error('Specify either <messageId> or --all');
+      }
+      const targets = options.id ? [this.find(items, options.id, options.networkId)]
+        : items.filter(item => inboxMatches(item, options));
+      const updated: string[] = [];
+      const readAt = new Date().toISOString();
+      for (const item of targets) {
+        if (item.status === 'unread') {
+          item.status = 'read';
+          item.readAt = readAt;
+          updated.push(item.id);
+        }
+      }
+      if (updated.length) {
+        this.save(items);
+      }
+      return { updated, unreadCount: items.filter(item => item.status === 'unread' && inboxMatches(item, options)).length };
+    });
+  }
+}
+
+export interface InboxExecutorOptions {
+  inboxPath?: string;
+  store?: InboxStore;
+}
+
+export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): ExecutorPlugin {
+  if (!options.store && !options.inboxPath) {
+    throw new Error('Inbox executor requires store or inboxPath');
+  }
+  const store = options.store ?? new InboxStore(options.inboxPath!);
+  return {
+    name: 'inbox',
+    async execute(batch) {
+      const result = await store.deliver(batch);
+      return { executor: 'inbox', executionId: randomUUID(), count: batch.length, inserted: result.inserted };
     },
   };
 }

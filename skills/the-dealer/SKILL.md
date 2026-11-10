@@ -178,6 +178,24 @@ replace `~/.dealer`). `--config` is a JSON object file relative to the caller.
 Unlink cleans up only the project's registrations; it retains project files,
 personal patches and personal plugins. Restart loads projects then user plugins.
 Relink applies updated configuration; restart after changing module source due
-to Node's import cache. Topics and defaultNetworkId are metadata in this stage.
+to Node's import cache. `topics.<kind>.defaultExecutor` selects the receiving node's default executor for that topic when `payload.executor` is omitted (or blank). `defaultNetworkId` remains metadata.
 See [the plugin guide](../../docs/plugin-guide.md#3-three-tier-onboarding-built-in-project-user)
 for the manifest, factory context and lifecycle contracts.
+
+
+## Local inbox
+
+The `inbox` executor retains messages and materialized attachments locally. Read/unread
+tracks only mailbox visibility; acknowledging a message does not complete a domain request.
+Commands work against the running daemon or directly against the saved inbox when offline.
+
+```sh
+dealer inbox list
+dealer inbox list --all --topic triage --from alice --limit 20 --json
+dealer inbox show <id> --mark-read
+dealer inbox read <id>
+dealer inbox ack --all
+```
+
+Use `--network <id>` to scope listings or disambiguate message IDs. Reading or
+acknowledging preserves historical items and their original receipt timestamps.
