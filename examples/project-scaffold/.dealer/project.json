@@ -1,0 +1,18 @@
+{
+  "schema": "the-dealer-project/v1",
+  "projectId": "example-project",
+  "defaultNetworkId": "local",
+  "description": "Portable core plugin patterns; source polling is opt-in",
+  "skills": ["example-collaboration"],
+  "plugins": [
+    { "name": "example-team-router", "module": "./.dealer/plugins/team-router.ts", "config": {} },
+    { "name": "example-cas-claim-source", "module": "./.dealer/plugins/cas-claim-source.ts", "config": { "enabled": false } },
+    { "name": "example-coalesced-wave-source", "module": "./.dealer/plugins/coalesced-wave-source.ts", "config": { "enabled": false } },
+    { "name": "example-collab-request", "module": "./.dealer/plugins/collab-request.ts", "config": {} }
+  ],
+  "topics": {
+    "claim.example.v1": { "description": "Versioned claims", "defaultExecutor": "orca-spawn" },
+    "wave.alert.v1": { "description": "Coalesced stream batches", "defaultExecutor": "orca-wave" },
+    "collab.request.v4": { "description": "Markdown collaboration request", "defaultExecutor": "inbox" }
+  }
+}

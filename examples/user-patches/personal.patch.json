@@ -1,0 +1,12 @@
+{
+  "topicBindings": {
+    "claim.example.v1": { "executor": "orca-spawn", "agent": "codex", "projectId": "example-project", "noParent": true, "assignee": "alice" },
+    "wave.alert.v1:tools-alert": { "executor": "orca-wave", "workspacePath": "/path/to/tools-workspace", "terminalHandle": "term_tools", "coalesceMs": 5000 },
+    "wave.alert.v1:quality-review": { "executor": "orca-wave", "workspacePath": "/path/to/quality-workspace", "terminalHandle": "term_quality", "coalesceMs": 5000 },
+    "wave.quality.v1:quality-review": { "executor": "orca-wave", "workspacePath": "/path/to/quality-workspace", "terminalHandle": "term_quality", "rotateAfterWaves": 6 },
+    "personal.claude": { "executor": "agent-pty", "agent": "claude-code", "conversationMode": "spawn" },
+    "personal.codex": { "executor": "agent-pty", "agent": "codex", "conversationMode": "spawn" },
+    "personal.dot": { "executor": "agent-pty", "agent": "chatgpt-dot", "conversationMode": "fixed", "sessionId": "example-session" },
+    "personal.grok": { "executor": "agent-pty", "agent": "grok-bot", "conversationMode": "fixed", "targetBot": "example-bot", "sessionId": "example-session" }
+  }
+}

@@ -1,0 +1,22 @@
+team:
+  - name: alice
+    git_names: ['Alice Example']
+    modules: [tools]
+  - name: bob
+    git_names: ['Bob Example']
+    modules: [quality]
+areas:
+  tools:
+    owner: alice
+    default_recipients: [alice]
+  quality:
+    owner: bob
+modules:
+  tools:
+    services: [example-worker]
+  quality:
+    services: [example-review]
+review_policies:
+  tools:
+    reviewer: bob
+    gate: required

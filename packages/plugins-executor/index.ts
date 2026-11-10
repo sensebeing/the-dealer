@@ -38,7 +38,7 @@ export type AgentConversationMode = 'spawn' | 'fixed' | 'inbox-only';
 
 export interface AgentOptions {
   store?: MailboxStore;
-  resolveTopicBinding?: (kind: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
+  resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   agent?: SupportedAgentHost;
   conversationMode?: 'spawn' | 'fixed';
   agentProfile?: string;
@@ -110,7 +110,7 @@ export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): Execut
       const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
       const first = batch[0];
       const payload = first?.payload ?? {};
-      const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind) : undefined;
+      const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined) : undefined;
       const agent = payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
       const mode = payload.conversationMode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode;
       const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
@@ -349,7 +349,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const command = options.orcaCommand ?? 'orca';
       const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
-      const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(batch[0]?.kind);
+      const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(batch[0]?.kind, typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined);
       const interactive = payload.interactive === true || binding?.conversationMode === 'spawn' || config.interactive === true || options.interactive === true;
       const store = options.store ?? config.store;
       const effectiveAgent = orcaAgent(payload.agent ?? binding?.agent ?? config.agent ?? options.agent);
@@ -368,7 +368,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         throw new Error(`Unbound project on receiver: ${projectId}`);
       }
       const defaultCwd = boundRoot ?? configuredCwd;
-      let parentWorktree: string | undefined = payload.noParent === true
+      let parentWorktree: string | undefined = (payload.noParent ?? binding?.noParent) === true
         ? undefined
         : defaultCwd ? `path:${defaultCwd}` : 'active';
       for (const hierarchy of [config, options]) {
@@ -594,7 +594,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
 export interface OrcaWaveOptions {
   agent?: SupportedOrcaAgent;
   interactiveCommand?: string;
-  resolveTopicBinding?: (kind: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
+  resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   runId?: string;
   terminalHandle?: string;
   cwd?: string;
@@ -638,7 +638,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
       }
       const command = options.orcaCommand ?? 'orca';
       const payload = (first.payload ?? {}) as Record<string, unknown>;
-      const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind);
+      const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined);
       const mailboxId = resolveMailboxId(first, 'orca-wave', binding);
       const cwd =
         optionalString(payload.workspacePath) ??
@@ -762,7 +762,7 @@ export function createNotifyExecutorPlugin(options: NotifyOptions = {}): Executo
 }
 
 export interface InboxExecutorOptions {
-  resolveTopicBinding?: (kind: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
+  resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   inboxPath?: string;
   store?: MailboxStore;
   /** Reactive redrive for replies/questions/settlements landing in a live wake target. */
@@ -780,7 +780,7 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
       const config = (runtimeConfig ?? {}) as InboxExecutorOptions;
       const groups = new Map<string, MessageEnvelope[]>();
       for (const envelope of batch) {
-        const mailboxId = resolveMailboxId(envelope, 'inbox', (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(envelope.kind));
+        const mailboxId = resolveMailboxId(envelope, 'inbox', (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(envelope.kind, typeof envelope?.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined));
         const group = groups.get(mailboxId) ?? [];
         group.push(envelope);
         groups.set(mailboxId, group);

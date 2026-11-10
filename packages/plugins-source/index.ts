@@ -1,3 +1,7 @@
+import { randomUUID } from 'node:crypto';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { isConfirmedHandoffReceipt } from '../plugins-policy/index.ts';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import type {
@@ -93,8 +97,54 @@ export function createWebhookSourcePlugin(config: WebhookSourceConfig = {}): Web
   };
 }
 
+/** Persist only complete JSON snapshots; failed writes never replace the previous cursor. */
+export function writeAtomicCursorFile(path: string, cursor: unknown): void {
+  const json = JSON.stringify(cursor);
+  if (json === undefined) throw new Error('Cursor must be JSON serializable');
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true });
+  const temporary = join(directory, `.cursor-${randomUUID()}.tmp`);
+  try {
+    const fd = openSync(temporary, 'wx', 0o600);
+    try {
+      writeFileSync(fd, json + '\n');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, path);
+    const directoryFd = openSync(directory, 'r');
+    try {
+      fsyncSync(directoryFd);
+    } finally {
+      closeSync(directoryFd);
+    }
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+export function readJsonCursorFile<T>(path: string, fallback: T): T {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as T;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return fallback;
+    throw error;
+  }
+}
+
+export function everyReceiptSettled(
+  receipts: readonly DeliveryReceipt[],
+  predicate: (receipt: DeliveryReceipt) => boolean,
+): boolean {
+  return receipts.length > 0 && receipts.every(predicate);
+}
+
 export interface PollWatermarkSourceConfig<T, Cursor> {
   initialCursor: Cursor;
+  cursorPath?: string;
+  settlementMode?: 'settled' | 'queued-or-settled';
+  wake?: { port?: number; host?: string; path?: string; allowedOrigins?: readonly string[] };
   poll: (cursor: Cursor) => Promise<{ items: readonly T[]; cursor: Cursor }>;
   toInput: (item: T) => EmitMessageInput | Promise<EmitMessageInput>;
   advanceItemCursor?: (
@@ -110,12 +160,19 @@ export interface PollWatermarkSourceConfig<T, Cursor> {
 export interface PollWatermarkSource<Cursor> extends SourcePlugin {
   pollOnce(): Promise<void>;
   getCursor(): Cursor;
+  wakeAddress(): ReturnType<Server['address']>;
 }
 
 export function createPollWatermarkSourcePlugin<T, Cursor>(
   config: PollWatermarkSourceConfig<T, Cursor>,
 ): PollWatermarkSource<Cursor> {
-  let cursor = config.initialCursor;
+  const loadCursor = () => config.cursorPath && existsSync(config.cursorPath)
+    ? readJsonCursorFile(config.cursorPath, config.initialCursor) : config.initialCursor;
+  let cursor = loadCursor();
+  const saveCursor = config.saveCursor ?? (config.cursorPath
+    ? async (value: Cursor) => writeAtomicCursorFile(config.cursorPath!, value) : undefined);
+  let wakeServer: Server | undefined;
+  let wakeStarting: Promise<void> | undefined;
   let emitter: EmitterService | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let active: Promise<void> | undefined;
@@ -135,7 +192,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       if (advance) {
         // Bootstrap or baseline cursor updates must survive a later item failure.
         if (JSON.stringify(page.cursor) !== JSON.stringify(cursor)) {
-          await config.saveCursor?.(page.cursor);
+          await saveCursor?.(page.cursor);
           cursor = page.cursor;
         }
         for (const item of page.items) {
@@ -143,7 +200,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
             const result = await target.emit(await config.toInput(item));
             const nextCursor = advance(cursor, item, result.receipts);
             if (nextCursor !== undefined) {
-              await config.saveCursor?.(nextCursor);
+              await saveCursor?.(nextCursor);
               cursor = nextCursor;
             } else {
               firstError ??= new Error('Poll item delivery failed; cursor retained');
@@ -157,7 +214,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
         for (const item of page.items) {
           try {
             const result = await target.emit(await config.toInput(item));
-            if (result.receipts.some(r => r.stage === 'failed' || r.stage === 'rejected')) {
+            if (!everyReceiptSettled(result.receipts, receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: config.settlementMode === 'queued-or-settled' }))) {
               firstError ??= new Error('Poll item delivery failed; cursor retained');
             }
           } catch (error) {
@@ -165,7 +222,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
           }
         }
         if (firstError === undefined) {
-          await config.saveCursor?.(page.cursor);
+          await saveCursor?.(page.cursor);
           cursor = page.cursor;
         }
       }
@@ -183,13 +240,62 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
   return {
     name: 'poll-watermark',
     getCursor: () => cursor,
+    wakeAddress: () => wakeServer?.address() ?? null,
     pollOnce,
-    start(value) {
-      if (!stopped) {
+    async start(value) {
+      if (!stopped || wakeStarting) {
         throw new Error('Poll source already started');
       }
+      if (config.cursorPath && existsSync(config.cursorPath)) cursor = loadCursor();
       emitter = value;
       stopped = false;
+      if (config.wake) {
+        const wake = config.wake;
+        wakeServer = createServer((request, response) => {
+          if (request.url !== (wake.path ?? '/wake')) {
+            response.writeHead(404).end();
+            return;
+          }
+          const origin = request.headers.origin;
+          if (origin && wake.allowedOrigins && !wake.allowedOrigins.includes(origin)) {
+            response.writeHead(403).end();
+            return;
+          }
+          if (origin && wake.allowedOrigins?.includes(origin)) {
+            response.setHeader('access-control-allow-origin', origin);
+            response.setHeader('vary', 'Origin');
+            response.setHeader('access-control-allow-methods', 'POST, OPTIONS');
+            response.setHeader('access-control-allow-headers', 'Content-Type');
+          }
+          if (request.method === 'OPTIONS') {
+            response.writeHead(204).end();
+          } else if (request.method === 'POST') {
+            run();
+            response.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
+          } else {
+            response.writeHead(405, { allow: 'POST, OPTIONS' }).end();
+          }
+          request.resume();
+        });
+        try {
+          wakeStarting = new Promise<void>((resolve, reject) => {
+            wakeServer!.once('error', reject);
+            wakeServer!.listen(wake.port ?? 0, wake.host ?? '127.0.0.1', () => {
+              wakeServer!.off('error', reject);
+              resolve();
+            });
+          });
+          await wakeStarting;
+        } catch (error) {
+          wakeServer = undefined;
+          stopped = true;
+          emitter = undefined;
+          throw error;
+        } finally {
+          wakeStarting = undefined;
+        }
+      }
+      if (stopped) return;
       if (config.intervalMs !== undefined && config.intervalMs > 0) {
         // Drain the current watermark immediately instead of waiting one full interval.
         queueMicrotask(() => {
@@ -209,6 +315,12 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       stopped = true;
       if (timer) {
         clearInterval(timer);
+      }
+      await wakeStarting?.catch(() => {});
+      const server = wakeServer;
+      wakeServer = undefined;
+      if (server?.listening) {
+        await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
       }
       // Poll failures are reported through onError; stop only waits for quiescence.
       await active?.catch(() => {});

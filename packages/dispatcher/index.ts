@@ -23,7 +23,7 @@ export interface DispatcherConfig {
   privateKeyPem?: string;
   ledgerPath?: string;
   defaultExecutor?: string;
-  resolveKindExecutor?: (kind: string) => string | undefined;
+  resolveKindExecutor?: (kind: string, streamKey?: string) => string | undefined;
   kindExecutors?: Record<string, string>;
 }
 
@@ -123,7 +123,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           return explicit;
         }
         return (
-          config.resolveKindExecutor?.(e.kind) ??
+          config.resolveKindExecutor?.(e.kind, typeof e.payload?.streamKey === 'string' ? e.payload.streamKey : undefined) ??
           config.kindExecutors?.[e.kind] ??
           config.defaultExecutor ??
           executors.keys().next().value

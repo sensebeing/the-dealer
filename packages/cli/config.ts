@@ -147,6 +147,8 @@ export function initProjectScaffold(
 }
 
 export interface TopicBindingConfig {
+  noParent?: boolean;
+  assignee?: string;
   agent?: 'orca' | 'antigravity' | 'claude' | 'claude-code' | 'codex' | 'chatgpt-dot' | 'grok-bot';
   interactiveCommand?: string;
   conversationMode?: 'spawn' | 'fixed' | 'inbox-only';
@@ -186,11 +188,11 @@ export interface LarkNotifyConfig {
 
 export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[]): asserts bindings is Record<string, TopicBindingConfig> {
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
-  const strings = ['agent', 'interactiveCommand', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
-  const booleans = ['autoCreateWorkspace', 'notifyLark'];
+  const strings = ['assignee', 'agent', 'interactiveCommand', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
+  const booleans = ['noParent', 'autoCreateWorkspace', 'notifyLark'];
   const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves']);
   for (const [kind, binding] of Object.entries(bindings)) {
-    if (!nonempty(kind) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
+    if (!nonempty(kind) || (kind.includes(':') && (!nonempty(kind.slice(0, kind.indexOf(':'))) || !nonempty(kind.slice(kind.indexOf(':') + 1)))) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
         (binding.agent !== undefined && !['orca', 'antigravity', 'claude', 'claude-code', 'codex', 'chatgpt-dot', 'grok-bot'].includes(binding.agent)) ||
         (binding.conversationMode !== undefined && !['spawn', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
         (binding.conversationMode === 'inbox-only' && binding.executor !== 'inbox') ||
@@ -202,7 +204,7 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
         (binding.rotateAfterWaves !== undefined && (!Number.isSafeInteger(binding.rotateAfterWaves) || binding.rotateAfterWaves < 1)) ||
         (binding.mailboxId !== undefined && !isValidMailboxId(binding.mailboxId)) ||
         (binding.streamKey !== undefined && !isValidMailboxId(`stream:${binding.streamKey}`)) ||
-        (binding.executor === 'orca-wave' && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? kind}`)) ||
+        (binding.executor === 'orca-wave' && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
         (binding.projectId !== undefined && !validProjectId(binding.projectId))) {
       throw new Error(`Invalid topic binding: ${kind}`);
     }

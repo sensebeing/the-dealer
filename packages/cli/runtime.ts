@@ -28,8 +28,8 @@ import { LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
 import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
-import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
-import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
+import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
+import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
 import {
   getBuiltInProfile,
   saveJson,
@@ -48,6 +48,14 @@ export interface ExternalPluginContext {
   runtime: DealerNodeRuntime;
   userPatch?: Record<string, any>;
   api: {
+    parseYaml: typeof parseYaml;
+    parseMarkdownFrontmatter: typeof parseMarkdownFrontmatter;
+    parseTeamRegistry: typeof parseTeamRegistry;
+    resolveTeamRegistryMembers: typeof resolveTeamRegistryMembers;
+    createTeamRegistryRouterPlugin: typeof createTeamRegistryRouterPlugin;
+    writeAtomicCursorFile: typeof writeAtomicCursorFile;
+    readJsonCursorFile: typeof readJsonCursorFile;
+    everyReceiptSettled: typeof everyReceiptSettled;
     createWebhookSourcePlugin: typeof createWebhookSourcePlugin;
     createPollWatermarkSourcePlugin: typeof createPollWatermarkSourcePlugin;
     createScriptSourcePlugin: typeof createScriptSourcePlugin;
@@ -294,7 +302,7 @@ export class DealerNodeRuntime {
         createDispatcherPlugin({
           ledgerPath: join(this.stateDir, 'deliveries.json'),
           defaultExecutor: this.config.defaultExecutor,
-          resolveKindExecutor: kind => this.resolveTopicDefaultExecutor(kind),
+          resolveKindExecutor: (kind, streamKey) => this.resolveTopicDefaultExecutor(kind, streamKey),
         }),
       );
       await this.kernel.use(
@@ -367,6 +375,14 @@ export class DealerNodeRuntime {
     const factoryContext: ExternalPluginContext = {
       ...context,
       api: {
+        parseYaml,
+        parseMarkdownFrontmatter,
+        parseTeamRegistry,
+        resolveTeamRegistryMembers,
+        createTeamRegistryRouterPlugin,
+        writeAtomicCursorFile,
+        readJsonCursorFile,
+        everyReceiptSettled,
         createWebhookSourcePlugin,
         createPollWatermarkSourcePlugin,
         createScriptSourcePlugin,
@@ -557,21 +573,25 @@ export class DealerNodeRuntime {
     };
   }
 
-  resolveTopicBinding(kind: string): { binding: TopicBindingConfig; projectRoot?: string } | undefined {
-    for (const project of this.loadedProjects.values()) {
-      const bindings = project.userPatch?.topicBindings;
-      const binding = bindings && Object.hasOwn(bindings, kind) ? bindings[kind] : undefined;
-      if (binding) return {
-        binding,
-        projectRoot: binding.projectId ? this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath : project.rootPath,
-      };
+  resolveTopicBinding(kind: string, streamKey?: string): { binding: TopicBindingConfig; projectRoot?: string } | undefined {
+    const keys = streamKey === undefined ? [kind] : [`${kind}:${streamKey}`, kind];
+    for (const key of keys) {
+      for (const project of this.loadedProjects.values()) {
+        const bindings = project.userPatch?.topicBindings;
+        const binding = bindings && Object.hasOwn(bindings, key) ? bindings[key] : undefined;
+        if (binding) return {
+          binding,
+          projectRoot: binding.projectId ? this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath : project.rootPath,
+        };
+      }
+      const binding = this.config.topicBindings && Object.hasOwn(this.config.topicBindings, key) ? this.config.topicBindings[key] : undefined;
+      if (binding) return { binding, projectRoot: this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath };
     }
-    const binding = this.config.topicBindings && Object.hasOwn(this.config.topicBindings, kind) ? this.config.topicBindings[kind] : undefined;
-    return binding ? { binding, projectRoot: this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath } : undefined;
+    return undefined;
   }
 
-  private executorTopicBinding = (kind: string) => {
-    const resolved = this.resolveTopicBinding(kind);
+  private executorTopicBinding = (kind: string, streamKey?: string) => {
+    const resolved = this.resolveTopicBinding(kind, streamKey);
     return resolved ? { ...resolved.binding, repoRoot: resolved.projectRoot } : undefined;
   };
 
@@ -597,8 +617,8 @@ export class DealerNodeRuntime {
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);
   }
 
-  resolveTopicDefaultExecutor(kind: string): string | undefined {
-    const bound = this.resolveTopicBinding(kind);
+  resolveTopicDefaultExecutor(kind: string, streamKey?: string): string | undefined {
+    const bound = this.resolveTopicBinding(kind, streamKey);
     if (bound) return bound.binding.executor;
     for (const { manifest } of this.loadedProjects.values()) {
       const executor = manifest.topics?.[kind]?.defaultExecutor;
@@ -623,7 +643,7 @@ export class DealerNodeRuntime {
     if (typeof explicit === 'string' && explicit.trim().length > 0) {
       return explicit;
     }
-    return this.resolveTopicDefaultExecutor(envelope.kind) ?? this.config.defaultExecutor;
+    return this.resolveTopicDefaultExecutor(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined) ?? this.config.defaultExecutor;
   }
 
   private integrationPlugin(): Plugin {
@@ -639,7 +659,7 @@ export class DealerNodeRuntime {
             return;
           }
           try {
-            const mailboxId = resolveMailboxId(envelope, this.resolveExecutorName(envelope), this.resolveTopicBinding(envelope.kind)?.binding);
+            const mailboxId = resolveMailboxId(envelope, this.resolveExecutorName(envelope), this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding);
             this.mailbox.recordInboundEnvelope(envelope, mailboxId);
           } catch (error) {
             this.lastError = String(error);
@@ -647,9 +667,11 @@ export class DealerNodeRuntime {
         });
         ctx.on('emitter/prepare', (envelope, next) => {
           if (envelope.semantic?.replyMailbox !== undefined) return next(envelope);
-          const resolved = this.resolveTopicBinding(envelope.kind);
+          const resolved = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined);
           if (!resolved) return next(envelope);
-          const replyMailbox = resolveBoundMailboxId(envelope.kind, resolved.binding);
+          const bindingKind = typeof envelope.payload?.streamKey === 'string'
+            ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
+          const replyMailbox = resolveBoundMailboxId(bindingKind, resolved.binding);
           return next(replyMailbox === 'default' ? envelope : {
             ...envelope, semantic: { ...(envelope.semantic ?? { type: 'message' as const, threadId: envelope.id }), replyMailbox },
           });

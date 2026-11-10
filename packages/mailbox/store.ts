@@ -270,14 +270,16 @@ export interface MailboxTopicBinding {
 export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding): string {
   if (binding.mailboxId !== undefined) return normalizeMailboxId(binding.mailboxId);
   return binding.executor === 'orca-wave'
-    ? normalizeMailboxId(`stream:${binding.streamKey ?? kind}`) : 'default';
+    ? normalizeMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`) : 'default';
 }
 
 export function resolveMailboxId(envelope: MessageEnvelope, executorName?: string, binding?: MailboxTopicBinding): string {
+  const bindingKind = typeof envelope.payload?.streamKey === 'string'
+    ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
   const semantic = envelope.semantic;
   const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
   if (binding && control && (semantic?.targetMailbox === undefined || semantic.targetMailbox === 'default')) {
-    const bound = resolveBoundMailboxId(envelope.kind, binding);
+    const bound = resolveBoundMailboxId(bindingKind, binding);
     if (bound !== 'default') return bound;
   }
   if (semantic?.targetMailbox !== undefined) {
@@ -294,10 +296,10 @@ export function resolveMailboxId(envelope: MessageEnvelope, executorName?: strin
     if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
       return normalizeMailboxId(`stream:${payload.streamKey}`);
     }
-    return resolveBoundMailboxId(envelope.kind, binding);
+    return resolveBoundMailboxId(bindingKind, binding);
   }
   if (executorName === 'orca-wave') {
-    return normalizeMailboxId(`stream:${String(payload?.streamKey ?? envelope.kind)}`, 'stream mailbox');
+    return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
   }
   if (executorName === 'orca-spawn') {
     return normalizeMailboxId(`task:${envelope.id}`, 'task mailbox');

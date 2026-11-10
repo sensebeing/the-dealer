@@ -205,6 +205,7 @@ test('Phase 4: polling, CAS dedup, durable busy waves and rotation after ack', a
   let cursor = 0;
   const source = createPollWatermarkSourcePlugin({
     initialCursor: 0,
+    settlementMode: 'queued-or-settled',
     poll: async current => ({
       items: [{ id: `alert-${current}`, revision: 1 }],
       cursor: current + 1,
@@ -664,6 +665,8 @@ export async function createPlugin(config: Record<string, unknown>, context: any
   writeFileSync(join(runtime.stateDir, 'plugins/user.ts'), `
 export default (_config: any, context: any) => {
   const factories = [
+    'writeAtomicCursorFile', 'readJsonCursorFile', 'everyReceiptSettled',
+    'parseYaml', 'parseMarkdownFrontmatter', 'parseTeamRegistry', 'resolveTeamRegistryMembers', 'createTeamRegistryRouterPlugin',
     'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
     'createDedupCasPolicyPlugin', 'isConfirmedHandoffReceipt', 'isDedupCasDuplicateReceipt', 'isDurableQueuedReceipt', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
