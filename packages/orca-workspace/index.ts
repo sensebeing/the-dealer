@@ -17,14 +17,34 @@ export type CommandRunner = (
   request: CommandRequest,
 ) => Promise<{ stdout: string; stderr?: string; exitCode?: number }>;
 
+/** Only the process boundary may prove that no external process was started. */
+export class CommandNotStartedError extends Error {
+  constructor(cause: unknown) {
+    super(`Command did not start: ${String(cause)}`, { cause });
+    this.name = 'CommandNotStartedError';
+  }
+}
+
 export const runCommand: CommandRunner = request =>
   new Promise((resolve, reject) => {
-    const child = spawn(request.command, [...request.args], {
-      cwd: request.cwd,
-      signal: request.signal,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: false,
-    });
+    if (request.signal?.aborted) {
+      reject(new CommandNotStartedError(request.signal.reason));
+      return;
+    }
+    let child;
+    try {
+      child = spawn(request.command, [...request.args], {
+        cwd: request.cwd,
+        signal: request.signal,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: false,
+      });
+    } catch (error) {
+      reject(new CommandNotStartedError(error));
+      return;
+    }
+    let started = false;
+    child.once('spawn', () => { started = true; });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -35,7 +55,9 @@ export const runCommand: CommandRunner = request =>
     child.stderr.on('data', chunk => {
       stderr += chunk;
     });
-    child.on('error', reject);
+    child.on('error', error => reject(
+      started || child.pid !== undefined ? error : new CommandNotStartedError(error),
+    ));
     child.on('close', code =>
       code === 0
         ? resolve({ stdout, stderr, exitCode: code })

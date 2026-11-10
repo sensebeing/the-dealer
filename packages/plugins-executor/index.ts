@@ -14,7 +14,7 @@ import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
 import { resolveMailboxId } from '../mailbox/index.ts';
 import { MailboxStore } from '../mailbox/index.ts';
-import { buildTaskPreamble, buildWakeupPointer, maxPreviewSequence } from '../mailbox/index.ts';
+import { buildTaskPreamble, buildWakeupPointer, maxPreviewSequence, settleWakeDeliveryFailure } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
@@ -148,7 +148,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
         try {
           output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
         } catch (error) {
-          if (store && mailboxId) store.parkWakeDelivery(mailboxId, error);
+          if (store && mailboxId) settleWakeDeliveryFailure(store, mailboxId, error);
           throw error;
         }
         if (store && mailboxId) {
@@ -599,7 +599,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                 store.upsertWakeTarget(mailboxId, { pendingWake: true });
               }
             } catch (error) {
-              if (store.getWakeTarget(mailboxId)?.deliveryInDoubt) store.parkWakeDelivery(mailboxId, error);
+              if (store.getWakeTarget(mailboxId)?.deliveryInDoubt) settleWakeDeliveryFailure(store, mailboxId, error);
               throw error;
             } finally {
               claim?.dispose();

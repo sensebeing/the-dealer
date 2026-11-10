@@ -1,6 +1,7 @@
 import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import {
   checkedCommand,
+  CommandNotStartedError,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
   resolveOrSpawnOrcaWorkspaceTerminal,
@@ -131,6 +132,19 @@ export function wakeupBackoffDelay(attemptCount: number): number {
     return DEFAULT_BACKOFF_MS[attemptCount - 1] ?? MAX_BACKOFF_MS;
   }
   return MAX_BACKOFF_MS;
+}
+
+/** Share failure classification between initial executors and background redrive. */
+export function settleWakeDeliveryFailure(store: MailboxStore, mailboxId: string, error: unknown, now = Date.now()): void {
+  if (error instanceof CommandNotStartedError) {
+    const attemptCount = (store.getWakeTarget(mailboxId)?.attemptCount ?? 0) + 1;
+    store.upsertWakeTarget(mailboxId, {
+      deliveryInDoubt: undefined, pendingWake: true, attemptCount,
+      earliestWakeAt: now + wakeupBackoffDelay(attemptCount), lastWakeError: String(error),
+    });
+  } else {
+    store.parkWakeDelivery(mailboxId, error);
+  }
 }
 
 function noWake(
@@ -366,13 +380,7 @@ export class WakeupRedriveService {
           targetBot: target.targetBot, sessionId: target.sessionId,
         });
         this.store.beginWakeDelivery(mailboxId);
-        let output;
-        try {
-          output = await checkedCommand(this.runner, { ...invocation, cwd: target.workspacePath });
-        } catch (error) {
-          this.store.parkWakeDelivery(mailboxId, error);
-          throw error;
-        }
+        const output = await checkedCommand(this.runner, { ...invocation, cwd: target.workspacePath });
         this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview),
           resolveAgentHostContinuation(target.hostAgent, mailboxId, target.sessionId, output.stdout, target.conversationMode ?? 'fixed'));
         return { mailboxId, mode: target.mode, woke: true, pointer, reason: 'Agent host wakeup delivered' };
@@ -397,7 +405,7 @@ export class WakeupRedriveService {
       }
       try {
         if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
-          this.store.parkWakeDelivery(mailboxId, error);
+          settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
           return noWake(mailboxId, target.mode, String(error));
         }
         return this.defer(mailboxId, target, String(error));
@@ -538,11 +546,10 @@ export class WakeupRedriveService {
       return noWake(mailboxId, target.mode, 'Nothing new to deliver');
     }
 
+    if (target.mode === 'orca-run' && !target.runId) throw new Error('orca-run wake target requires runId');
+    if (target.mode === 'orca-terminal' && !terminalHandle) throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
     this.store.beginWakeDelivery(mailboxId);
     if (target.mode === 'orca-run') {
-      if (!target.runId) {
-        throw new Error('orca-run wake target requires runId');
-      }
       const output = await this.runner({
         command,
         args: [
@@ -565,13 +572,10 @@ export class WakeupRedriveService {
         throw new Error('Orca wakeup delivery failed');
       }
     } else {
-      if (!terminalHandle) {
-        throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
-      }
       await sendOrcaTerminalText(
         this.runner,
         command,
-        terminalHandle,
+        terminalHandle!,
         pointer,
         { cwd: target.workspacePath, ...(composerPrefilled ? { clearComposer: true } : {}) },
       );

@@ -1,3 +1,4 @@
+import { runCommand, CommandNotStartedError } from '../packages/orca-workspace/index.ts';
 import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/agent-host/index.ts';
 import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
 import test from 'node:test';
@@ -100,7 +101,7 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
       const commandRunner: CommandRunner = async request => {
         assert.equal(store.getWakeTarget(mailboxId)?.mode, 'passive');
         calls.push(request);
-        return { stdout: '{"accepted":true}' };
+        return { stdout: agent === 'codex' ? '{"threadId":"session"}' : '{"accepted":true}' };
       };
       const plugin = createAgentPtyExecutorPlugin({ store, commandRunner, resolveTopicBinding: () => ({ executor: 'agent-pty', agent, conversationMode,
         mailboxId: 'stream:collab.request.v4', agentProfile: 'review', targetBot: 'bot', sessionId: 'session', workspacePath: root }) });
@@ -666,11 +667,11 @@ test('agent executor preserves an in-flight arrival and releases its claim for i
     calls.push(call);
     if (calls.length === 1) { entered(); await held; }
     else redriven();
-    return { stdout: '{}' };
+    return { stdout: '{"threadId":"real-race"}' };
   };
   const wakeup = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
   t.after(() => wakeup.stop());
-  const executing = createCodexExecutorPlugin({ store, wakeup, commandRunner: runner, sessionId: 'real-race' }).execute([message('race')], context, {});
+  const executing = createCodexExecutorPlugin({ store, wakeup, commandRunner: runner }).execute([message('race')], context, {});
   await started;
   const mailboxId = 'task:race';
   store.check({ mailboxId });
@@ -738,7 +739,7 @@ for (const agent of ['codex', 'antigravity'] as const) {
     const runner: CommandRunner = async () => { calls++; return { stdout: '{"accepted":true}' }; };
     const wakeup = new WakeupRedriveService({ store, commandRunner: runner });
     t.after(() => wakeup.stop());
-    await createAgentPtyExecutorPlugin({ agent, conversationMode: 'spawn', store, wakeup, commandRunner: runner }).execute([message('manual')], context, {});
+    await createAgentPtyExecutorPlugin({ agent, conversationMode: 'spawn', sessionId: 'unbound-existing', store, wakeup, commandRunner: runner }).execute([message('manual')], context, {});
     const target = store.getWakeTarget('task:manual')!;
     assert.equal(target.hostAgent, undefined);
     assert.equal(target.conversationMode, undefined);
@@ -766,4 +767,52 @@ test('aborted host launch retains its unknown-effect fence without claim-release
   await wakeup.flushMailbox('task:aborted', { force: true });
   assert.equal(calls, 1);
   assert.equal(store.getWakeTarget('task:aborted')?.deliveryInDoubt, true);
+});
+
+test('command boundary distinguishes absent executables, synchronous validation and pre-abort from post-spawn failures', async t => {
+  const root = directory(t);
+  await assert.rejects(runCommand({ command: join(root, 'missing'), args: [] }), CommandNotStartedError);
+  await assert.rejects(runCommand({ command: '', args: [] }), CommandNotStartedError);
+  const before = new AbortController();
+  before.abort('before invocation');
+  await assert.rejects(runCommand({ command: process.execPath, args: [], signal: before.signal }), CommandNotStartedError);
+  await assert.rejects(runCommand({ command: process.execPath, args: ['-e', 'process.exit(2)'] }), error =>
+    error instanceof Error && !(error instanceof CommandNotStartedError) && /exited 2/.test(error.message));
+  const marker = join(root, 'started');
+  const after = new AbortController();
+  t.after(() => after.abort());
+  const execution = runCommand({ command: process.execPath, args: ['-e',
+    'require("node:fs").writeFileSync(process.argv[1], "started"); setInterval(() => {}, 1000)', marker], signal: after.signal });
+  const outcome = assert.rejects(execution, error => error instanceof Error && !(error instanceof CommandNotStartedError));
+  const deadline = Date.now() + 3000;
+  while (!existsSync(marker)) {
+    assert.ok(Date.now() < deadline, 'child starts before abort');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  after.abort();
+  await outcome;
+});
+
+test('initial host ENOENT is retryable and recovery binds the actual Codex receipt', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  await assert.rejects(createCodexExecutorPlugin({ store, command: join(root, 'missing'), sessionId: 'not-created' })
+    .execute([message('pre-effect')], context, {}), CommandNotStartedError);
+  const target = store.getWakeTarget('task:pre-effect')!;
+  assert.equal(target.deliveryInDoubt, undefined);
+  assert.equal(target.pendingWake, true);
+  assert.equal(target.attemptCount, 1);
+  assert.equal(target.conversationMode, 'spawn');
+  assert.ok(target.earliestWakeAt > Date.now());
+  const calls: CommandRequest[] = [];
+  const service = new WakeupRedriveService({ store, commandRunner: async call => {
+    calls.push(call);
+    return { stdout: '{"sessionId":"host-returned-identity"}' };
+  } });
+  t.after(() => service.stop());
+  await service.flushMailbox('task:pre-effect', { force: true });
+  assert.deepEqual(calls[0].args.slice(0, 2), ['exec', '--worktree']);
+  assert.equal(store.getWakeTarget('task:pre-effect')?.sessionId, 'host-returned-identity');
+  assert.equal(store.getWakeTarget('task:pre-effect')?.conversationMode, 'fixed');
+  assert.equal(store.getWakeTarget('task:pre-effect')?.pendingWake, false);
 });

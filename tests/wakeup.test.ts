@@ -1090,3 +1090,46 @@ test('a restart with an unfinished external wake remains fenced even without a f
   assert.equal((await service.flushMailbox('box', { force: true })).woke, false);
   assert.equal(restarted.getWakeTarget('box')?.deliveryInDoubt, true);
 });
+
+for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
+  test(`${mode} pre-effect command failure backs off and resumes safely after repair`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
+      mode, ...(mode === 'passive' ? { hostAgent: 'claude-code' as const } : {}), runId: 'run', terminalHandle: 'term',
+      interactiveCommand: join(root, 'missing'), orcaCommand: join(root, 'missing'),
+    } });
+    const failing = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }) });
+    t.after(() => failing.stop());
+    assert.equal((await failing.flushMailbox('box')).woke, false);
+    const failed = store.getWakeTarget('box')!;
+    assert.equal(failed.deliveryInDoubt, undefined);
+    assert.equal(failed.pendingWake, true);
+    assert.equal(failed.attemptCount, 1);
+    assert.ok(failed.earliestWakeAt > Date.now());
+    await failing.stop();
+    const repaired = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async () => ({ stdout: '{"ok":true}' }) });
+    t.after(() => repaired.stop());
+    assert.equal((await repaired.flushMailbox('box', { force: true })).woke, true);
+    assert.equal(store.getWakeTarget('box')?.pendingWake, false);
+  });
+}
+
+test('local Orca target validation does not create an unknown-effect fence', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  let effects = 0;
+  const service = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async () => {
+    effects++;
+    return { stdout: '{"ok":true}' };
+  } });
+  t.after(() => service.stop());
+  const claim = service.claim('box');
+  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: { mode: 'orca-run' } });
+  claim.dispose();
+  assert.equal((await service.flushMailbox('box')).woke, false);
+  assert.equal(effects, 0);
+  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
+  store.upsertWakeTarget('box', { runId: 'repaired' });
+  assert.equal((await service.flushMailbox('box', { force: true })).woke, true);
+  assert.equal(effects, 1);
+});

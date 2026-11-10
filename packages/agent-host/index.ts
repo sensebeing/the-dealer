@@ -14,6 +14,7 @@ export function resolveAgentSessionId(mailboxId: string, sessionId?: string, age
 export function resolveAgentHostContinuation(agent: SupportedAgentHost, mailboxId: string, sessionId: string | undefined, stdout: string, mode: 'spawn' | 'fixed') {
   let resolved = resolveAgentSessionId(mailboxId, sessionId, agent);
   if (agent === 'codex' && mode === 'spawn') {
+    resolved = undefined;
     let receipt: unknown;
     try { receipt = JSON.parse(stdout); } catch { /* Plain output carries no session receipt. */ }
     if (receipt && typeof receipt === 'object') {
