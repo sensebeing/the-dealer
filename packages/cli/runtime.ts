@@ -16,7 +16,7 @@ import { createGatePlugin } from '../gate/index.ts';
 import type { NetworkGateService } from '../gate/index.ts';
 import { createDispatcherPlugin, DeliveryLedger } from '../dispatcher/index.ts';
 import { createEmitterPlugin } from '../emitter/index.ts';
-import { createDedupCasPolicyPlugin, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, isConfirmedHandoffReceipt, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../plugins-policy/index.ts';
 import {
   createOrcaSpawnExecutorPlugin,
   createOrcaWaveExecutorPlugin,
@@ -50,6 +50,7 @@ export interface ExternalPluginContext {
     createPollWatermarkSourcePlugin: typeof createPollWatermarkSourcePlugin;
     createScriptSourcePlugin: typeof createScriptSourcePlugin;
     createDedupCasPolicyPlugin: typeof createDedupCasPolicyPlugin;
+    isConfirmedHandoffReceipt: typeof isConfirmedHandoffReceipt;
     isDedupCasDuplicateReceipt: typeof isDedupCasDuplicateReceipt;
     isDurableQueuedReceipt: typeof isDurableQueuedReceipt;
     createOrcaSpawnExecutorPlugin: typeof createOrcaSpawnExecutorPlugin;
@@ -352,6 +353,7 @@ export class DealerNodeRuntime {
         createPollWatermarkSourcePlugin,
         createScriptSourcePlugin,
         createDedupCasPolicyPlugin,
+        isConfirmedHandoffReceipt,
         isDedupCasDuplicateReceipt,
         isDurableQueuedReceipt,
         createOrcaSpawnExecutorPlugin,
@@ -660,6 +662,7 @@ export class DealerNodeRuntime {
           ctx.effect(() => () => registration.dispose());
         }
         if (this.config.policies.includes('dedup-cas')) {
+          let legacyLedger: DeliveryLedger | undefined;
           const registration = ctx.services.dispatcher.registerPolicy(
             createDedupCasPolicyPlugin({
               watermarksPath: join(this.stateDir, 'dedup-watermarks.json'),
@@ -669,7 +672,8 @@ export class DealerNodeRuntime {
                   return 'unknown';
                 }
                 const [networkId, senderNodeId, entityId] = parts;
-                const receipt = new DeliveryLedger(join(this.stateDir, 'deliveries.json')).get(key);
+                legacyLedger ??= new DeliveryLedger(join(this.stateDir, 'deliveries.json'));
+                const receipt = legacyLedger.get(key);
                 if (this.mailbox.hasConfirmedEnvelope(networkId, senderNodeId, entityId, revision) ||
                     receipt?.stage === 'dispatched' || receipt?.stage === 'settled') return 'settled';
                 if (isDurableQueuedReceipt(receipt) || this.gate.listDndQueue().some(item => {
