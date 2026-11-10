@@ -57,7 +57,7 @@ export interface MailboxStateRecord {
   readonly ackedLeaseIds: readonly string[];
 }
 
-export type WakeTargetMode = 'passive' | 'orca-run' | 'orca-terminal' | 'pty';
+export type WakeTargetMode = 'passive' | 'orca-run' | 'orca-terminal';
 
 export interface WakeTargetState {
   readonly mailboxId: string;
@@ -67,7 +67,6 @@ export interface WakeTargetState {
   readonly worktreeId?: string;
   readonly workspacePath?: string;
   readonly terminalHandle?: string;
-  readonly ptyCommand?: string;
   readonly workspaceComment?: string;
   readonly coalesceMs: number;
   readonly rotateAfterWaves?: number;
@@ -296,7 +295,6 @@ function mergeWakeTarget(
   const worktreeId = optional('worktreeId');
   const workspacePath = optional('workspacePath');
   const terminalHandle = optional('terminalHandle');
-  const ptyCommand = optional('ptyCommand');
   const workspaceComment = optional('workspaceComment');
   const rotateAfterWaves = optional('rotateAfterWaves');
   const lastWakeError = optional('lastWakeError');
@@ -313,7 +311,6 @@ function mergeWakeTarget(
     ...(worktreeId !== undefined ? { worktreeId } : {}),
     ...(workspacePath !== undefined ? { workspacePath } : {}),
     ...(terminalHandle !== undefined ? { terminalHandle } : {}),
-    ...(ptyCommand !== undefined ? { ptyCommand } : {}),
     ...(workspaceComment !== undefined ? { workspaceComment } : {}),
     ...(rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
     ...(lastWakeError !== undefined ? { lastWakeError } : {}),
@@ -324,7 +321,6 @@ const WAKE_TARGET_MODES: readonly WakeTargetMode[] = [
   'passive',
   'orca-run',
   'orca-terminal',
-  'pty',
 ];
 
 function validateWakeTarget(value: unknown): WakeTargetState {
@@ -359,7 +355,6 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     'worktreeId',
     'workspacePath',
     'terminalHandle',
-    'ptyCommand',
     'workspaceComment',
     'lastWakeError',
   ] as const) {
@@ -589,8 +584,8 @@ function loadState(raw: string): MailboxFileState {
   for (const [key, value] of Object.entries(threads)) {
     const record = validateThreadRecord(value);
     const expected = threadKey(record);
-    // Phase 1 keyed records by message id only; normalize them to directional keys on read.
-    if (key !== expected && key !== record.messageId) {
+    // Records are always stored under directional keys; any other key is a corrupted store.
+    if (key !== expected) {
       throw invalidStore();
     }
     normalizedThreads[expected] = record;
@@ -1462,9 +1457,9 @@ export class MailboxStore {
         peerNodeId: peers[0] ?? '',
         peerNodeIds: peers,
         networkId: envelope.networkId,
-        // The outbound semantic target is where the peer's replies must land.
+        // The outbound target, including an explicit payload mailbox, is where replies land.
         peerReplyMailbox: normalizeMailboxId(
-          envelope.semantic?.targetMailbox ?? 'default',
+          envelope.semantic?.targetMailbox ?? resolveMailboxId(envelope),
           'peer reply mailbox',
         ),
         localMailbox: local,

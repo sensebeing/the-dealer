@@ -663,11 +663,6 @@ export class DealerNodeRuntime {
     await this.wakeups.flushWakeups();
   }
 
-  /** Backwards-compatible alias for the retired in-memory wave coalescer. */
-  async flushWaves(): Promise<void> {
-    await this.flushWakeups();
-  }
-
   async mountNetwork(network: NetworkMountConfig & { role?: string }): Promise<void> {
     if (!network.networkId || !network.passphrase) {
       throw new Error('Network and passphrase required');

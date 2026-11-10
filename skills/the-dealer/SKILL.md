@@ -119,11 +119,11 @@ certified identities: only mount networks whose members you trust. Existing
 GateService trust rules can bypass mode defaults, including closed/DND;
 do not use a mode change as a way to revoke previously trusted senders.
 
-Gate pending items/trust and CAS policy watermarks are currently in-memory.
-Identity, mounts, configuration, source cursors, the dispatch ledger, the
-mailbox ledger, wake targets, and thread routes persist. A persisted
-`dispatching` or `failed` entry must be reconciled with the external executor
-before retrying.
+Gate pending items/trust are in-memory. CAS policy watermarks
+(`dedup-watermarks.json`), identity, mounts, configuration, source cursors,
+the dispatch ledger, `mailbox.json`, wake targets, and thread routes persist
+on disk. A persisted `dispatching` or `failed` entry must be reconciled with
+the external executor before retrying.
 
 ## Sources, routes, profiles and plugins
 

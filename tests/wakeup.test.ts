@@ -233,6 +233,115 @@ test('unacked recovery pointer suppresses rotation, and /new follows the ack', a
   assert.equal(store.getWakeTarget('stream:alerts')!.completedWaves, 0);
 });
 
+test('/new waits for post-rotation tui-idle before delivering the pointer', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({
+    store,
+    commandRunner: runner,
+    flushIntervalMs: 100_000,
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('rotate-now')], {
+    mailboxId: 'stream:rotate',
+    wakeTarget: {
+      mode: 'orca-run',
+      runId: 'run-rotate',
+      terminalHandle: 'term-rotate',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+    },
+  });
+
+  const result = await service.flushMailbox('stream:rotate');
+  assert.equal(result.woke, true);
+  assert.equal(result.rotated, true);
+  const newIndex = calls.findIndex(
+    call => call.args[0] === 'terminal' && call.args[1] === 'send' && textOf(call) === '/new',
+  );
+  const waitIndex = calls.findIndex(
+    call => call.args[0] === 'terminal' && call.args[1] === 'wait',
+  );
+  const pointerIndex = calls.findIndex(call => call.args[0] === 'orchestration');
+  assert.ok(newIndex >= 0);
+  assert.ok(waitIndex > newIndex);
+  assert.equal(calls[waitIndex].args[calls[waitIndex].args.indexOf('--for') + 1], 'tui-idle');
+  assert.equal(calls[waitIndex].args[calls[waitIndex].args.indexOf('--timeout-ms') + 1], '5000');
+  assert.ok(pointerIndex > waitIndex);
+  assert.match(bodyOf(calls[pointerIndex]), /^You have 1 Dealer message\(s\) in stream:rotate/);
+  assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, false);
+  assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
+});
+
+test('/new defers the pointer until the rotated terminal reports idle again', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let waitOk = false;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
+      return { stdout: JSON.stringify({ ok: waitOk }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({
+    store,
+    commandRunner: runner,
+    flushIntervalMs: 100_000,
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('rotate-later')], {
+    mailboxId: 'stream:rotate',
+    wakeTarget: {
+      mode: 'orca-run',
+      runId: 'run-rotate',
+      terminalHandle: 'term-rotate',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+    },
+  });
+
+  const first = await service.flushMailbox('stream:rotate');
+  assert.equal(first.woke, false);
+  assert.equal(first.rotated, true);
+  assert.equal(first.reason, 'Session rotated; waiting for tui-idle before wakeup');
+  assert.equal(calls.some(call => call.args[0] === 'orchestration'), false);
+  assert.equal(
+    calls.filter(
+      call => call.args[0] === 'terminal' && call.args[1] === 'send' && textOf(call) === '/new',
+    ).length,
+    1,
+  );
+  assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, true);
+  assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
+
+  waitOk = true;
+  const before = calls.length;
+  const second = await service.flushWakeups();
+  assert.equal(second.length, 1);
+  assert.equal(second[0].woke, true);
+  assert.equal(second[0].rotated, false);
+  const followUp = calls.slice(before);
+  assert.equal(
+    followUp.some(
+      call => call.args[0] === 'terminal' && call.args[1] === 'send' && textOf(call) === '/new',
+    ),
+    false,
+  );
+  const pointer = followUp.find(call => call.args[0] === 'orchestration')!;
+  assert.match(pointer.args[pointer.args.indexOf('--body') + 1], /^You have 1 Dealer message\(s\) in stream:rotate/);
+  assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, false);
+  assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
+});
+
 test('orca-spawn never injects after a failed idle wait and redrive sends the task preamble', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
@@ -275,7 +384,7 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
     wakeup: service,
   });
 
-  const timedOut = alert('task-timeout', { payload: { terminalPrompt: 'do the work' } });
+  const timedOut = alert('task-timeout', { payload: { interactive: true } });
   await executor.execute([timedOut], {} as ExecutionContext);
   assert.equal(terminalSends(calls).length, 0, 'must not send on a failed idle wait');
   assert.equal(store.getWakeTarget('task:task-timeout')!.pendingWake, true);
@@ -297,7 +406,7 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
 
   calls.length = 0;
   waitOk = true;
-  const ready = alert('task-ready', { payload: { terminalPrompt: 'also do this' } });
+  const ready = alert('task-ready', { payload: { interactive: true } });
   await executor.execute([ready], {} as ExecutionContext);
   const directSends = terminalSends(calls);
   assert.equal(directSends.length, 1);

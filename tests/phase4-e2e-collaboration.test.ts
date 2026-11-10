@@ -365,7 +365,7 @@ test('Phase 4: wave streams resolve distinct workspace terminals with single-lin
       executor: 'orca-wave',
       streamKey: workspacePath,
       workspacePath,
-      terminalPrompt: prompt,
+      prompt,
       rotateAfterWaves: 1,
       revision,
       ...(workspaceComment ? { workspaceComment } : {}),

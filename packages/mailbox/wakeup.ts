@@ -6,6 +6,7 @@ import {
   sendOrcaTerminalText,
   setOrcaWorkspaceComment,
   singleLine,
+  waitOrcaTerminalIdle,
 } from '../orca-workspace/index.ts';
 import type { CommandRunner, OrcaIdleResult } from '../orca-workspace/index.ts';
 import type { Disposable } from '../core-types/index.ts';
@@ -244,7 +245,7 @@ export class WakeupRedriveService {
       if (!force && target.earliestWakeAt > this.now()) {
         return noWake(mailboxId, target.mode, 'Coalescing');
       }
-      if (target.mode === 'passive' || target.mode === 'pty') {
+      if (target.mode === 'passive') {
         this.store.upsertWakeTarget(mailboxId, {
           pendingWake: false,
           attemptCount: 0,
@@ -386,6 +387,30 @@ export class WakeupRedriveService {
     return undefined;
   }
 
+  private async postRotationIdle(
+    target: WakeTargetState,
+    terminalHandle: string,
+    command: string,
+  ): Promise<OrcaIdleResult> {
+    if (this.idleCheck) {
+      return this.idleCheck();
+    }
+    const terminal = await waitOrcaTerminalIdle(
+      this.runner,
+      command,
+      terminalHandle,
+      target.workspacePath,
+      5000,
+    );
+    if (!terminal.idle) {
+      return terminal;
+    }
+    if (target.workspacePath) {
+      return checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath);
+    }
+    return { idle: true };
+  }
+
   private async deliver(
     mailboxId: string,
     target: WakeTargetState,
@@ -393,23 +418,38 @@ export class WakeupRedriveService {
   ): Promise<WakeupFlushResult> {
     const command = target.orcaCommand ?? this.command;
     let rotated = false;
+    let rotationTerminal: string | undefined;
     if (
       !preview.deliveryId &&
       target.rotateAfterWaves !== undefined &&
       target.completedWaves >= target.rotateAfterWaves
     ) {
-      const terminalHandle = await this.resolveRotationTerminal(target);
-      if (terminalHandle) {
+      rotationTerminal = await this.resolveRotationTerminal(target);
+      if (rotationTerminal) {
         await sendOrcaTerminalText(
           this.runner,
           command,
-          terminalHandle,
+          rotationTerminal,
           '/new',
           { cwd: target.workspacePath },
         );
         // Reset before the pointer so a crash cannot rotate twice for the same completed wave.
         this.store.upsertWakeTarget(mailboxId, { completedWaves: 0 });
         rotated = true;
+      }
+    }
+
+    if (rotated && rotationTerminal) {
+      // `/new` tears down and re-initializes the TUI; never race the wakeup pointer into that
+      // transition. A busy target keeps pendingWake so the next idle tick delivers only the pointer.
+      const idle = await this.postRotationIdle(target, rotationTerminal, command);
+      if (!idle.idle) {
+        const deferred = this.defer(
+          mailboxId,
+          { ...target, completedWaves: 0 },
+          'Session rotated; waiting for tui-idle before wakeup',
+        );
+        return { ...deferred, rotated: true };
       }
     }
 

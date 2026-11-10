@@ -417,7 +417,7 @@ test('trustAntigravityWorkspace records workspace paths atomically and idempoten
   assert.deepEqual(normalized.trustedWorkspaces, expected);
 });
 
-test('orca-spawn launches an interactive antigravity terminal and injects the prompt', async t => {
+test('orca-spawn launches an interactive antigravity terminal and injects the task preamble', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-agy-run-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const settingsPath = join(dir, 'settings.json');
@@ -436,20 +436,20 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
     }
     return { stdout: '{"ok":true}' };
   };
-  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex' });
+  const store = new MailboxStore(join(dir, 'mailbox.json'));
+  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex', store });
   const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
   const commandNames = () => requests.map(r => `${r.args[0]} ${r.args[1]}`);
   const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
 
+  const first = envelope({
+    payload: {
+      interactive: true,
+      workspaceComment: 'dealer: antigravity',
+    },
+  });
   await executor.execute(
-    [
-      envelope({
-        payload: {
-          terminalPrompt: 'Fix the flaky test',
-          workspaceComment: 'dealer: antigravity',
-        },
-      }),
-    ],
+    [first],
     context,
     { interactiveCommand: 'agy run --dangerously-skip-permissions', agySettingsPath: settingsPath },
   );
@@ -464,7 +464,10 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   assert.equal(flagValue(requests[2].args, '--comment'), 'dealer: antigravity');
   assert.equal(flagValue(requests[3].args, '--timeout-ms'), '5000');
   assert.equal(flagValue(requests[4].args, '--terminal'), 'term-agy');
-  assert.equal(flagValue(requests[4].args, '--text'), 'Fix the flaky test');
+  assert.equal(
+    flagValue(requests[4].args, '--text'),
+    buildTaskPreamble(`task:${first.id}`, first.id),
+  );
   assert.ok(requests[4].args.includes('--enter'));
   assert.equal(flagValue(requests[4].args, '--wait-submit'), '5');
   const trusted = JSON.parse(await readFile(settingsPath, 'utf8')).trustedWorkspaces;
@@ -473,11 +476,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   requests.length = 0;
   waitFails = true;
   await executor.execute(
-    [
-      envelope({
-        payload: { terminalPrompt: 'Retry after timeout' },
-      }),
-    ],
+    [envelope({ payload: { interactive: true } })],
     context,
     { interactiveCommand: 'agy run', agySettingsPath: settingsPath },
   );
@@ -486,11 +485,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   requests.length = 0;
   const untrustedSettings = join(dir, 'untrusted.json');
   await executor.execute(
-    [
-      envelope({
-        payload: { terminalPrompt: 'Do not trust', trustAntigravity: false },
-      }),
-    ],
+    [envelope({ payload: { interactive: true, trustAntigravity: false } })],
     context,
     { agySettingsPath: untrustedSettings },
   );
@@ -505,7 +500,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the pr
   assert.match(agentCommand, /Investigate/);
 });
 
-test('orca-spawn payload.interactive selects the mailbox TUI path without terminalPrompt', async t => {
+test('orca-spawn payload.interactive selects the mailbox TUI path', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-interactive-flag-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const requests: CommandRequest[] = [];
@@ -552,15 +547,15 @@ test('orca-spawn payload.interactive selects the mailbox TUI path without termin
 
   requests.length = 0;
   const standalone = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex' });
-  await standalone.execute(
-    [envelope({ payload: { interactive: true, wakeupHint: 'Standalone hint' } })],
-    context,
-    { interactiveCommand: 'agy run', agySettingsPath: join(dir, 'settings.json') },
+  await assert.rejects(
+    standalone.execute(
+      [envelope({ payload: { interactive: true, wakeupHint: 'Standalone hint' } })],
+      context,
+      { interactiveCommand: 'agy run', agySettingsPath: join(dir, 'settings.json') },
+    ),
+    /durable mailbox store/,
   );
-  const standaloneSend = requests.find(
-    request => request.args[0] === 'terminal' && request.args[1] === 'send',
-  )!;
-  assert.equal(flagValue(standaloneSend.args, '--text'), 'Standalone hint');
+  assert.deepEqual(requests, []);
 });
 
 test('orca-spawn ignores inbound command and settings authority and prefers receiver cwd', async t => {
@@ -580,9 +575,10 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
     noParent: true,
     interactiveCommand: 'receiver-options-command',
     agySettingsPath: optionSettings,
+    store: new MailboxStore(join(dir, 'mailbox.json')),
   });
   const input = envelope({ payload: {
-    terminalPrompt: 'Do the work',
+    interactive: true,
     interactiveCommand: 'sender-controlled-command',
     agySettingsPath: senderSettings,
     repoPath: '/sender/repo',

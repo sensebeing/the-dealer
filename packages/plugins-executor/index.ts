@@ -20,7 +20,6 @@ import {
   checkedCommand,
   runCommand,
   sendOrcaTerminalText,
-  singleLine,
 } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
 
@@ -335,6 +334,9 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       if (parentWorktree === undefined && !worktreeCwd) {
         throw new Error('Top-level Orca worktree requires receiver cwd or bound projectId');
       }
+      if (payload.interactive === true && !store) {
+        throw new Error('Interactive orca-spawn requires a durable mailbox store');
+      }
       const explicitName =
         typeof payload.worktreeName === 'string' && payload.worktreeName.trim()
           ? payload.worktreeName.trim()
@@ -364,13 +366,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       if (!path) {
         throw new Error('Orca worktree create returned no path');
       }
-      const terminalPrompt =
-        typeof payload.terminalPrompt === 'string' && payload.terminalPrompt.trim()
-          ? payload.terminalPrompt
-          : undefined;
-      // Interactive mode is selectable without duplicating a terminalPrompt; a prompt remains
-      // accepted for backwards compatibility but is not the only source of intent.
-      if (payload.interactive === true || terminalPrompt !== undefined) {
+      if (payload.interactive === true) {
         const explicitSettingsPath =
           typeof config.agySettingsPath === 'string' && config.agySettingsPath
             ? config.agySettingsPath
@@ -436,7 +432,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
               signal: context.signal,
             });
           }
-          if (store && batch[0]) {
+          if (batch[0]) {
             // The task is durable before any keystroke. Spawn owns the first idle window; a crash
             // leaves pendingWake behind so WakeupRedriveService takes over after restart.
             const mailboxId = `task:${batch[0].id}`;
@@ -498,57 +494,6 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
               }
             } finally {
               claim?.dispose();
-            }
-          } else {
-            // Standalone executors have no mailbox ledger; keep the explicit prompt but never
-            // send it without a confirmed tui-idle.
-            let idle = false;
-            try {
-              const waited = await checkedCommand(runner, {
-                command,
-                args: [
-                  'terminal',
-                  'wait',
-                  '--terminal',
-                  handle,
-                  '--for',
-                  'tui-idle',
-                  '--timeout-ms',
-                  '5000',
-                  '--json',
-                ],
-                cwd: path,
-                signal: context.signal,
-              });
-              idle = JSON.parse(waited.stdout).ok === true;
-            } catch {
-              idle = false;
-            }
-            if (idle) {
-              const standaloneText =
-                terminalPrompt ??
-                singleLine(
-                  typeof payload.wakeupHint === 'string' && payload.wakeupHint.trim()
-                    ? payload.wakeupHint
-                    : batch[0]?.subject ?? 'Task dispatched',
-                );
-              await checkedCommand(runner, {
-                command,
-                args: [
-                  'terminal',
-                  'send',
-                  '--terminal',
-                  handle,
-                  '--text',
-                  standaloneText,
-                  '--enter',
-                  '--wait-submit',
-                  '5',
-                  '--json',
-                ],
-                cwd: path,
-                signal: context.signal,
-              });
             }
           }
         }

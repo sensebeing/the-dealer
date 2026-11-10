@@ -192,12 +192,13 @@ export async function checkOrcaWorkspaceIdle(
   return { idle, reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable' };
 }
 
-/** Probe one terminal without injecting anything; used when no workspace path is known. */
-export async function probeOrcaTerminalIdle(
+/** Bounded `terminal wait --for tui-idle`; timeout, busy, or command failure is never idle. */
+export async function waitOrcaTerminalIdle(
   runner: CommandRunner,
   command: string,
   terminalHandle: string,
   cwd?: string,
+  timeoutMs = 5000,
   signal?: AbortSignal,
 ): Promise<OrcaIdleResult> {
   try {
@@ -211,7 +212,7 @@ export async function probeOrcaTerminalIdle(
         '--for',
         'tui-idle',
         '--timeout-ms',
-        '1',
+        String(timeoutMs),
         '--json',
       ],
       cwd,
@@ -222,8 +223,22 @@ export async function probeOrcaTerminalIdle(
     }
     return { idle: true };
   } catch (error) {
-    return { idle: false, reason: `Terminal idle probe failed: ${String(error)}` };
+    return { idle: false, reason: `Terminal idle wait failed: ${String(error)}` };
   }
+}
+
+/** Probe one terminal without injecting anything; used when no workspace path is known. */
+export async function probeOrcaTerminalIdle(
+  runner: CommandRunner,
+  command: string,
+  terminalHandle: string,
+  cwd?: string,
+  signal?: AbortSignal,
+): Promise<OrcaIdleResult> {
+  const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal);
+  return result.idle
+    ? result
+    : { idle: false, reason: `Terminal idle probe failed: ${result.reason ?? 'Terminal is busy'}` };
 }
 
 /** Resolve the freshest connected antigravity terminal in an Orca workspace, spawning one if needed. */
