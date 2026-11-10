@@ -1,3 +1,5 @@
+import { buildAgentHostInvocation } from '../agent-host/index.ts';
+import type { SupportedAgentHost } from '../agent-host/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
@@ -13,7 +15,7 @@ import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-
 import { resolveMailboxId } from '../mailbox/index.ts';
 import { MailboxStore } from '../mailbox/index.ts';
 import { buildTaskPreamble } from '../mailbox/index.ts';
-import type { WakeupRedriveService } from '../mailbox/index.ts';
+import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
   trustAntigravityWorkspace,
@@ -33,10 +35,11 @@ export function renderWave(batch: readonly MessageEnvelope[]): string {
     .join('\n\n---\n\n');
 }
 
-export type SupportedAgentHost = 'orca' | 'antigravity' | 'claude' | 'claude-code' | 'codex' | 'chatgpt-dot' | 'grok-bot';
-export type AgentConversationMode = 'spawn' | 'fixed' | 'inbox-only';
+export { buildAgentHostInvocation } from '../agent-host/index.ts';
+export type { SupportedAgentHost, AgentConversationMode } from '../agent-host/index.ts';
 
 export interface AgentOptions {
+  wakeup?: WakeupRedriveService;
   store?: MailboxStore;
   resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   agent?: SupportedAgentHost;
@@ -52,49 +55,6 @@ export interface AgentOptions {
 
 function agentArgs(command: string): string[] {
   return command === 'codex' ? ['exec', '-'] : command === 'claude' ? ['-p'] : [];
-}
-
-export function buildAgentHostInvocation(options: {
-  agent: SupportedAgentHost;
-  conversationMode: 'spawn' | 'fixed';
-  mailboxId: string;
-  promptText: string;
-  command?: string;
-  cwd?: string;
-  agentProfile?: string;
-  targetBot?: string;
-  sessionId?: string;
-}): { command: string; args: string[] } {
-  const { agent, conversationMode: mode, mailboxId, promptText, cwd, agentProfile, targetBot, sessionId } = options;
-  const session = sessionId || mailboxId;
-  switch (agent) {
-    case 'codex':
-      return { command: options.command ?? 'codex', args: [
-        ...(mode === 'fixed' ? ['queue', '--thread', session, '--resume'] : ['exec', '--worktree']),
-        ...(agentProfile ? ['-p', agentProfile] : []),
-        ...(cwd ? ['-C', cwd] : []),
-        ...(mode === 'fixed' ? ['--message'] : []), promptText,
-      ] };
-    case 'claude':
-    case 'claude-code':
-      return { command: options.command ?? 'claude', args: [
-        '--bg', ...(mode === 'fixed' ? ['--resume', session] : ['--name', mailboxId.replace(/[^A-Za-z0-9._-]/g, '-')]),
-        ...(agentProfile ? ['--agent', agentProfile] : []), promptText,
-      ] };
-    case 'antigravity':
-      return { command: options.command ?? 'agy', args: ['run', '--dangerously-skip-permissions', promptText] };
-    case 'chatgpt-dot': {
-      const dotTarget = targetBot ?? agentProfile;
-      return { command: options.command ?? 'dot', args: ['send', '--session-mode', mode, '--session-key', session,
-        ...(dotTarget ? ['--agent', dotTarget] : []), '--message', promptText] };
-    }
-    case 'grok-bot':
-      if (!targetBot?.trim()) throw new Error('grok-bot requires targetBot');
-      return { command: options.command ?? 'grok-bot', args: ['dispatch', '--bot', targetBot, '--session-mode', mode,
-        '--session-key', session, '--message', promptText] };
-    default:
-      throw new Error(`Unsupported agent-pty host: ${agent}`);
-  }
 }
 
 function orcaAgent(value: unknown): SupportedOrcaAgent {
@@ -131,43 +91,61 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       const mode = payload.conversationMode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
       const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
       let request;
-      if (!hostMode) {
-        const command = options.command ?? 'codex';
-        request = { command, args: options.args ?? agentArgs(command), cwd: options.cwd, input: renderWave(batch) };
-      } else {
-        if (!first) throw new Error('Empty agent batch');
-        if (mode !== undefined && mode !== 'spawn' && mode !== 'fixed') throw new Error('Invalid agent conversationMode');
-        const conversationMode = mode ?? 'spawn';
-        const mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
-        const store = options.store ?? config.store;
-        const terminalPrompt = optionalString(typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined);
-        const promptText = store
-          ? conversationMode === 'spawn'
-            ? buildTaskPreamble(mailboxId, first.id, undefined, terminalPrompt ?? (first.body || first.subject))
-            : singleLine(`You have ${batch.length} Dealer message(s) in ${mailboxId}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`)
-          : singleLine(terminalPrompt ?? renderWave(batch));
-        const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
-        const invocation = buildAgentHostInvocation({
-          agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
-          command: config.command ?? options.command,
-          agentProfile: payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile,
-          targetBot: payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot,
-          sessionId: payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId,
-        });
-        if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || options.commandRunner === undefined)) {
-          trustAntigravityWorkspace(cwd, agySettingsPath);
-        }
-        if (store) store.enqueue(batch, { mailboxId, wakeTarget: { mode: 'passive' } });
-        request = { ...invocation, cwd };
-      }
-      const output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
-      let structuredOutput: unknown;
+      let mailboxId: string | undefined;
+      const store = options.store ?? config.store;
+      let claim: ReturnType<WakeupRedriveService['claim']> | undefined;
       try {
-        structuredOutput = JSON.parse(output.stdout);
-      } catch {
-        structuredOutput = output.stdout;
+        if (!hostMode) {
+          const command = options.command ?? 'codex';
+          request = { command, args: options.args ?? agentArgs(command), cwd: options.cwd, input: renderWave(batch) };
+        } else {
+          if (!first) throw new Error('Empty agent batch');
+          if (mode !== undefined && mode !== 'spawn' && mode !== 'fixed') throw new Error('Invalid agent conversationMode');
+          const conversationMode = mode ?? 'spawn';
+          mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
+          const terminalPrompt = optionalString(typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined);
+          const promptText = store
+            ? conversationMode === 'spawn'
+              ? buildTaskPreamble(mailboxId, first.id, undefined, terminalPrompt ?? (first.body || first.subject))
+              : singleLine(`You have ${batch.length} Dealer message(s) in ${mailboxId}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`)
+            : singleLine(terminalPrompt ?? renderWave(batch));
+          const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
+          const command = config.command ?? options.command;
+          const agentProfile = payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile;
+          const targetBot = payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot;
+          const sessionId = payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId;
+          const invocation = buildAgentHostInvocation({
+            agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
+            command, agentProfile, targetBot, sessionId,
+          });
+          if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || options.commandRunner === undefined)) {
+            trustAntigravityWorkspace(cwd, agySettingsPath);
+          }
+          claim = (options.wakeup ?? config.wakeup)?.claim(mailboxId);
+          if (store) store.enqueue(batch, { mailboxId, wakeTarget: {
+            mode: 'passive', hostAgent: (agent ?? 'codex') as WakeTargetState['hostAgent'], conversationMode,
+            ...(cwd ? { workspacePath: cwd } : {}),
+            ...(command ? { interactiveCommand: command } : {}),
+            ...(agentProfile ? { agentProfile } : {}),
+            ...(targetBot ? { targetBot } : {}),
+            ...(sessionId ? { sessionId } : {}),
+          } });
+          request = { ...invocation, cwd };
+        }
+        const output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
+        if (store && mailboxId) store.upsertWakeTarget(mailboxId, {
+          pendingWake: false, attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined,
+        });
+        let structuredOutput: unknown;
+        try {
+          structuredOutput = JSON.parse(output.stdout);
+        } catch {
+          structuredOutput = output.stdout;
+        }
+        return { executor: name, executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '' };
+      } finally {
+        claim?.dispose();
       }
-      return { executor: name, executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '' };
     },
   };
 }

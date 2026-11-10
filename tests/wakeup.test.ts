@@ -1,3 +1,4 @@
+import { checkOrcaWorkspaceIdle, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -815,4 +816,112 @@ test('thread show fails loudly for an unknown thread', async t => {
   });
   assert.equal(code, 1);
   assert.match(JSON.parse(err.join('\n')).error, /Unknown thread: missing/);
+});
+
+test('Autopilot composer recognition preserves human drafts and clears only before pointer delivery', async t => {
+  const suggestion = '继续检查剩余任务';
+  for (const [preview, prefilled] of [
+    [`• ,1（主推）：${suggestion}\n> ${suggestion}`, true],
+    [`下一步建议\n> ${suggestion}\nstatus bar`, true],
+    [`自动预填\n> ${suggestion}`, true],
+    [`• ,1 (主推)\n> ${suggestion}`, true],
+    [`previous ${suggestion}\n> ${suggestion}`, true],
+    ['history\n> unsent draft', false],
+    ['下一步建议\n>', false],
+    ['> unsent draft\n自动预填', false],
+  ] as const) {
+    assert.equal(isAutopilotComposerPrefill(preview), prefilled, preview);
+  }
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  let preview = `• ,1（主推）：${suggestion}\n> ${suggestion}`;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [
+      { path: root, worktreeId: 'root', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+    ] } }) };
+    if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [
+      { handle: 'term', connected: true, writable: true, preview },
+    ] } }) };
+    return { stdout: '{"ok":true}' };
+  };
+  assert.deepEqual(await checkOrcaWorkspaceIdle(runner, 'orca', root), { idle: true, composerPrefilled: true, reason: undefined });
+  preview = 'history\n> unsent draft';
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', root)).idle, false);
+  preview = `• ,1（主推）：${suggestion}\n> ${suggestion}\nstatus bar`;
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  store.enqueue([alert('prefill')], { mailboxId: 'default', wakeTarget: { mode: 'orca-terminal', terminalHandle: 'term', workspacePath: root } });
+  const wakeup = new WakeupRedriveService({ store, commandRunner: runner });
+  t.after(() => wakeup.stop());
+  assert.equal((await wakeup.flushMailbox('default', { force: true })).woke, true);
+  const sends = terminalSends(calls);
+  assert.equal(sends.length, 2);
+  assert.equal(textOf(sends[0]), '\x15');
+  assert.equal(sends[0].args.includes('--enter'), false);
+  assert.match(textOf(sends[1]), /^You have 1 Dealer message\(s\) in default/);
+  assert.ok(sends[1].args.includes('--enter'));
+  const failedCalls: CommandRequest[] = [];
+  await assert.rejects(sendOrcaTerminalText(async call => {
+    failedCalls.push(call);
+    return { stdout: '{"ok":false}' };
+  }, 'orca', 'term', 'pointer', { clearComposer: true }), /clear failed/);
+  assert.equal(failedCalls.length, 1);
+});
+
+test('inline wakeup previews include bounded latest body, semantic sender and thread on one line', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const wakeup = new WakeupRedriveService({ store, commandRunner: async call => {
+    calls.push(call);
+    return { stdout: '{"ok":true}' };
+  } });
+  t.after(() => wakeup.stop());
+  for (const [id, body, semantic] of [
+    ['long', 'x'.repeat(450) + '\r\nend', { type: 'question', threadId: 'thread-1' }],
+    ['short', 'hello\r\nworld', { type: 'message', threadId: 'thread-2' }],
+    ['empty', ' \n ', undefined],
+  ] as const) {
+    const claim = wakeup.claim(id);
+    store.enqueue([alert(id, { body, semantic })], { mailboxId: id, wakeTarget: { mode: 'orca-run', runId: 'run' } });
+    await wakeup.flushMailbox(id);
+    claim.dispose();
+    const result = await wakeup.flushMailbox(id, { force: true });
+    const pointer = result.pointer!;
+    assert.match(pointer, new RegExp(`^You have 1 Dealer message\\(s\\) in ${id}`));
+    assert.equal(/[\r\n]/.test(pointer), false);
+    if (id === 'long') {
+      assert.ok(pointer.includes(`Latest (question from sender, thread thread-1): "${'x'.repeat(400)}...".`));
+      assert.ok(!pointer.includes('x'.repeat(401)));
+    } else if (id === 'short') {
+      assert.ok(pointer.includes('Latest (alerts from sender, thread thread-2): "hello world".'));
+    } else assert.ok(!pointer.includes('Latest'));
+  }
+});
+
+test('only newly inserted conversational frames bypass coalescing and never reset retry backoff', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  for (const type of ['question', 'reply', 'settle'] as const) {
+    store.enqueue([alert(type, { semantic: { type, threadId: 'thread', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } })], {
+      mailboxId: type, wakeTarget: { mode: 'orca-run', runId: 'run', coalesceMs: 5000 },
+    });
+    assert.equal(store.getWakeTarget(type)?.earliestWakeAt, 10_000);
+  }
+  store.enqueue([alert('normal'), alert('control', { semantic: { type: 'reply', threadId: 'thread' } })], {
+    mailboxId: 'mixed', wakeTarget: { mode: 'orca-run', runId: 'run', coalesceMs: 5000 },
+  });
+  assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 15_000);
+  store.enqueue([alert('normal'), alert('new-control', { semantic: { type: 'question', threadId: 'thread' } })], { mailboxId: 'mixed' });
+  assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 10_000, 'duplicates do not affect classification');
+  store.upsertWakeTarget('mixed', { attemptCount: 2, earliestWakeAt: 30_000 });
+  store.enqueue([alert('retry', { semantic: { type: 'settle', threadId: 'thread', outcome: 'succeeded' } })], { mailboxId: 'mixed' });
+  assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 30_000);
+  const calls: CommandRequest[] = [];
+  const wakeup = new WakeupRedriveService({ store, now: () => 10_000, commandRunner: async call => {
+    calls.push(call);
+    return { stdout: '{"ok":true}' };
+  } });
+  t.after(() => wakeup.stop());
+  assert.equal((await wakeup.flushReady()).filter(result => result.woke).length, 3);
+  assert.equal(calls.length, 3);
 });

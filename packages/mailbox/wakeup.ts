@@ -1,4 +1,6 @@
+import { buildAgentHostInvocation } from '../agent-host/index.ts';
 import {
+  checkedCommand,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
   resolveOrSpawnOrcaWorkspaceTerminal,
@@ -52,6 +54,7 @@ export interface WakeupMailboxOptions {
 const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
 const MAX_BACKOFF_MS = 10_000;
+const MAX_INLINE_BODY_CHARS = 400;
 
 /** Exponential busy-backoff: 1s -> 2s -> 5s -> capped at 10s. */
 export function wakeupBackoffDelay(attemptCount: number): number {
@@ -251,7 +254,7 @@ export class WakeupRedriveService {
       if (!force && target.earliestWakeAt > this.now()) {
         return noWake(mailboxId, target.mode, 'Coalescing');
       }
-      if (target.mode === 'passive') {
+      if (target.mode === 'passive' && !target.hostAgent) {
         this.store.upsertWakeTarget(mailboxId, {
           pendingWake: false,
           attemptCount: 0,
@@ -281,6 +284,21 @@ export class WakeupRedriveService {
             : 'No queued mail',
         );
       }
+      if (target.mode === 'passive' && target.hostAgent) {
+        const pointer = this.buildPointer(mailboxId, target, preview)!;
+        const invocation = buildAgentHostInvocation({
+          agent: target.hostAgent,
+          conversationMode: target.conversationMode ?? 'fixed',
+          mailboxId, promptText: pointer, cwd: target.workspacePath,
+          command: target.interactiveCommand, agentProfile: target.agentProfile,
+          targetBot: target.targetBot, sessionId: target.sessionId,
+        });
+        await checkedCommand(this.runner, { ...invocation, cwd: target.workspacePath });
+        this.store.upsertWakeTarget(mailboxId, {
+          pendingWake: false, attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined,
+        });
+        return { mailboxId, mode: target.mode, woke: true, pointer, reason: 'Agent host wakeup delivered' };
+      }
       if (!this.idleCheck && target.mode === 'orca-terminal' && target.workspacePath && target.autoCreateWorkspace === true) {
         const workspace = await ensureOrcaWorkspace(this.runner, target.orcaCommand ?? this.command, {
           workspacePath: target.workspacePath, repoRoot: target.repoRoot, comment: target.workspaceComment,
@@ -293,7 +311,7 @@ export class WakeupRedriveService {
       if (!idle.idle) {
         return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
       }
-      return await this.deliver(mailboxId, target, preview);
+      return await this.deliver(mailboxId, target, preview, idle.composerPrefilled === true);
     } catch (error) {
       this.report(error);
       if (!target) {
@@ -391,8 +409,18 @@ export class WakeupRedriveService {
       return buildTaskPreamble(mailboxId, taskMessageId, undefined, rawPrompt);
     }
     const latestHint = preview.items.at(-1)?.wakeupHint;
+    const latest = preview.items.at(-1)?.envelope;
+    const rawBody = latest ? singleLine(latest.body) : '';
+    let inline = '';
+    if (latest && rawBody) {
+      const kindLabel = latest.semantic?.type && latest.semantic.type !== 'message' ? latest.semantic.type : latest.kind;
+      const fromLabel = latest.from?.member || latest.from?.nodeId || 'peer';
+      const threadId = latest.semantic?.threadId ?? latest.id;
+      const snippet = rawBody.length > MAX_INLINE_BODY_CHARS ? `${rawBody.slice(0, MAX_INLINE_BODY_CHARS)}...` : rawBody;
+      inline = ` — Latest (${kindLabel} from ${fromLabel}, thread ${threadId}): "${snippet}"`;
+    }
     return singleLine(
-      `You have ${preview.items.length} Dealer message(s) in ${mailboxId}${latestHint ? ` [${latestHint}]` : ''}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`,
+      `You have ${preview.items.length} Dealer message(s) in ${mailboxId}${latestHint ? ` [${latestHint}]` : ''}${inline}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`,
     );
   }
 
@@ -424,6 +452,7 @@ export class WakeupRedriveService {
     mailboxId: string,
     target: WakeTargetState,
     preview: MailboxCheckResult,
+    composerPrefilled: boolean,
   ): Promise<WakeupFlushResult> {
     const command = target.orcaCommand ?? this.command;
     let terminalHandle = target.terminalHandle;
@@ -449,7 +478,7 @@ export class WakeupRedriveService {
           command,
           rotationTerminal,
           '/new',
-          { cwd: target.workspacePath },
+          { cwd: target.workspacePath, ...(composerPrefilled ? { clearComposer: true } : {}) },
         );
         // Reset before the pointer so a crash cannot rotate twice for the same completed wave.
         this.store.upsertWakeTarget(mailboxId, { completedWaves: 0 });
@@ -461,6 +490,7 @@ export class WakeupRedriveService {
       // `/new` tears down and re-initializes the TUI; never race the wakeup pointer into that
       // transition. A busy target keeps pendingWake so the next idle tick delivers only the pointer.
       const idle = await this.postRotationIdle(target, rotationTerminal, command);
+      composerPrefilled = idle.composerPrefilled === true;
       if (!idle.idle) {
         const deferred = this.defer(
           mailboxId,
@@ -516,7 +546,7 @@ export class WakeupRedriveService {
         command,
         terminalHandle,
         pointer,
-        { cwd: target.workspacePath },
+        { cwd: target.workspacePath, ...(composerPrefilled ? { clearComposer: true } : {}) },
       );
     }
 

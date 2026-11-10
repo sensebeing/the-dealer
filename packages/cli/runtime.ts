@@ -761,24 +761,28 @@ export class DealerNodeRuntime {
           'codex': createCodexExecutorPlugin({
             ...this.config.executorConfig['codex'],
             store: this.mailbox,
+            wakeup: this.wakeups,
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
           'claude-code': createClaudeCodeExecutorPlugin({
             ...this.config.executorConfig['claude-code'],
             store: this.mailbox,
+            wakeup: this.wakeups,
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
           'antigravity': createAntigravityExecutorPlugin({
             ...this.config.executorConfig['antigravity'],
             store: this.mailbox,
+            wakeup: this.wakeups,
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
           'agent-pty': createAgentPtyExecutorPlugin({
             ...this.config.executorConfig['agent-pty'],
             store: this.mailbox,
+            wakeup: this.wakeups,
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: runner,
           }),

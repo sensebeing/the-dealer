@@ -1,3 +1,4 @@
+import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
@@ -13,7 +14,7 @@ import {
   BUILTIN_EXECUTORS, getBuiltInProfile,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
 } from '../packages/index.ts';
-import type { CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
+import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
 
 const context = { networkId: 'test', nodeId: `ed25519:${'a'.repeat(64)}`, traceId: 'test' };
 function message(id = 'test', payload = {}): MessageEnvelope {
@@ -252,16 +253,28 @@ test('failed host execution leaves durable mail and does not report success', as
     commandRunner: async () => ({ stdout: '', stderr: 'host rejected command', exitCode: 2 }) });
   await assert.rejects(plugin.execute([message('failed')], context, {}), /exited 2/);
   assert.equal(new MailboxStore(join(root, 'mailbox.json')).getWakeTarget('task:failed')?.mode, 'passive');
+  assert.equal(store.getWakeTarget('task:failed')?.pendingWake, true);
 });
 
 test('wake target host options merge, clear and validate after reload', t => {
   const root = directory(t);
   const file = join(root, 'mailbox.json');
   const store = new MailboxStore(file);
-  store.upsertWakeTarget('default', { agent: 'codex', interactiveCommand: 'custom' });
+  store.upsertWakeTarget('default', { agent: 'codex', interactiveCommand: 'custom', hostAgent: 'claude-code', conversationMode: 'fixed', agentProfile: 'review', targetBot: 'bot', sessionId: 'session' });
   store.upsertWakeTarget('default', { workspacePath: root });
   assert.equal(new MailboxStore(file).getWakeTarget('default')?.agent, 'codex');
-  store.upsertWakeTarget('default', { agent: undefined, interactiveCommand: undefined });
+  const restored = new MailboxStore(file).getWakeTarget('default')!;
+  assert.equal(restored.hostAgent, 'claude-code');
+  assert.equal(restored.conversationMode, 'fixed');
+  assert.equal(restored.agentProfile, 'review');
+  assert.equal(restored.targetBot, 'bot');
+  assert.equal(restored.sessionId, 'session');
+  for (const patch of [{ hostAgent: 'invalid' }, { conversationMode: 'invalid' }, { agentProfile: 1 }, { targetBot: false }, { sessionId: [] }]) {
+    assert.throws(() => store.upsertWakeTarget('default', patch as Partial<WakeTargetState>));
+  }
+  store.upsertWakeTarget('default', { agent: undefined, interactiveCommand: undefined, hostAgent: undefined, conversationMode: undefined, agentProfile: undefined, targetBot: undefined, sessionId: undefined });
+  const cleared = new MailboxStore(file).getWakeTarget('default')!;
+  for (const field of ['hostAgent', 'conversationMode', 'agentProfile', 'targetBot', 'sessionId'] as const) assert.equal(cleared[field], undefined);
   assert.equal(new MailboxStore(file).getWakeTarget('default')?.interactiveCommand, undefined);
   assert.throws(() => validateTopicBindings({ task: { executor: 'agent-pty', conversationMode: 'inbox-only' } }, ['agent-pty']), /Invalid topic binding/);
   assert.throws(() => validateTopicBindings({ task: { executor: 'orca-wave', agent: 'grok-bot' } }, ['orca-wave']), /Invalid topic binding/);
@@ -540,4 +553,68 @@ test('live applied preset enables dispatch immediately and changes unbound defau
   assert.equal(runtime.mailbox.getWakeTarget('stream:review')?.mode, 'passive');
   runtime.applyAgentPreset({ host: 'claude', conversationMode: 'inbox-only', topic: 'manual', setDefault: true });
   assert.equal(runtime.config.defaultExecutor, 'inbox');
+});
+
+test('host-bound passive mailboxes redrive inbox conversation frames after initial execution and restart', async t => {
+  for (const [hostAgent, factory, command] of [
+    ['codex', createCodexExecutorPlugin, 'codex'],
+    ['claude-code', createClaudeCodeExecutorPlugin, 'claude'],
+    ['antigravity', createAntigravityExecutorPlugin, 'agy'],
+    ['codex', createAgentPtyExecutorPlugin, 'codex'],
+  ] as const) {
+    const root = directory(t);
+    const file = join(root, 'mailbox.json');
+    let store = new MailboxStore(file);
+    const calls: CommandRequest[] = [];
+    let wakeup: WakeupRedriveService;
+    let fail = false;
+    const commandRunner: CommandRunner = async call => {
+      calls.push(call);
+      if (calls.length === 1) {
+        assert.equal((await wakeup.flushMailbox('stream:session')).woke, false, 'initial execution must hold its claim');
+      }
+      return { stdout: '{}', exitCode: fail ? 2 : 0 };
+    };
+    wakeup = new WakeupRedriveService({ store, commandRunner });
+    t.after(() => wakeup.stop());
+    const plugin = factory({ store, wakeup, commandRunner, agent: hostAgent, conversationMode: 'fixed',
+      cwd: root, sessionId: 'existing-session', agentProfile: 'review', targetBot: 'bot',
+      resolveTopicBinding: () => ({ mailboxId: 'stream:session', executor: hostAgent }) });
+    await plugin.execute([message('initial')], context, {});
+    assert.equal(calls.length, 1);
+    assert.equal(store.getWakeTarget('stream:session')?.pendingWake, false);
+    assert.equal(store.getWakeTarget('stream:session')?.hostAgent, hostAgent);
+    const initial = store.check({ mailboxId: 'stream:session' });
+    store.ack(initial.deliveryId!, 'stream:session');
+    await wakeup.stop();
+    store = new MailboxStore(file);
+    wakeup = new WakeupRedriveService({ store, commandRunner });
+    const inbox = createInboxExecutorPlugin({ store, wakeup });
+    store.upsertWakeTarget('stream:session', { coalesceMs: 60_000 });
+    for (const type of ['reply', 'question', 'settle'] as const) {
+      const envelope = { ...message(type), semantic: { type, threadId: 'conversation', targetMailbox: 'stream:session', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } };
+      await inbox.execute([envelope], context, {});
+      const result = await wakeup.flushMailbox('stream:session');
+      assert.equal(result.woke, true);
+      assert.equal(result.reason, 'Agent host wakeup delivered');
+      assert.match(result.pointer!, new RegExp(`Latest \\(${type} from alice, thread conversation\\)`));
+      const call = calls.at(-1)!;
+      assert.equal(call.command, command);
+      assert.equal(call.cwd, root);
+      assert.ok(call.args.includes(result.pointer!));
+      if (hostAgent === 'codex') assert.deepEqual(call.args.slice(0, 4), ['queue', '--thread', 'existing-session', '--resume']);
+      if (hostAgent === 'claude-code') assert.deepEqual(call.args.slice(0, 3), ['--bg', '--resume', 'existing-session']);
+      assert.equal(store.getWakeTarget('stream:session')?.pendingWake, false);
+      const lease = store.check({ mailboxId: 'stream:session' });
+      store.ack(lease.deliveryId!, 'stream:session');
+    }
+    assert.equal(calls.length, 4);
+    fail = true;
+    await inbox.execute([{ ...message('failure'), semantic: { type: 'reply', threadId: 'conversation', targetMailbox: 'stream:session' } }], context, {});
+    assert.equal((await wakeup.flushMailbox('stream:session')).woke, false);
+    assert.equal(store.getWakeTarget('stream:session')?.pendingWake, true);
+    assert.equal(store.getWakeTarget('stream:session')?.attemptCount, 1);
+    assert.match(store.getWakeTarget('stream:session')!.lastWakeError!, /exited 2/);
+    await wakeup.stop();
+  }
 });

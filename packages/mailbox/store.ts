@@ -60,6 +60,12 @@ export interface MailboxStateRecord {
 export type WakeTargetMode = 'passive' | 'orca-run' | 'orca-terminal';
 
 export interface WakeTargetState {
+  readonly hostAgent?: 'codex' | 'claude' | 'claude-code' | 'antigravity' | 'chatgpt-dot' | 'grok-bot';
+  readonly conversationMode?: 'spawn' | 'fixed';
+  readonly agentProfile?: string;
+  readonly targetBot?: string;
+  readonly sessionId?: string;
+
   readonly mailboxId: string;
   readonly mode: WakeTargetMode;
   readonly orcaCommand?: string;
@@ -339,6 +345,11 @@ function mergeWakeTarget(
   // cannot express that, so own-property presence is the only reliable signal.
   const optional = <K extends keyof WakeTargetState>(key: K): WakeTargetState[K] | undefined =>
     Object.hasOwn(patch, key) ? patch[key] : current[key];
+  const hostAgent = optional('hostAgent');
+  const conversationMode = optional('conversationMode');
+  const agentProfile = optional('agentProfile');
+  const targetBot = optional('targetBot');
+  const sessionId = optional('sessionId');
   const agent = optional('agent');
   const interactiveCommand = optional('interactiveCommand');
   const orcaCommand = optional('orcaCommand');
@@ -360,6 +371,11 @@ function mergeWakeTarget(
     pendingWake: patch.pendingWake ?? current.pendingWake,
     earliestWakeAt: patch.earliestWakeAt ?? current.earliestWakeAt,
     attemptCount: patch.attemptCount ?? current.attemptCount,
+    ...(hostAgent !== undefined ? { hostAgent } : {}),
+    ...(conversationMode !== undefined ? { conversationMode } : {}),
+    ...(agentProfile !== undefined ? { agentProfile } : {}),
+    ...(targetBot !== undefined ? { targetBot } : {}),
+    ...(sessionId !== undefined ? { sessionId } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(interactiveCommand !== undefined ? { interactiveCommand } : {}),
     ...(orcaCommand !== undefined ? { orcaCommand } : {}),
@@ -387,6 +403,8 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     throw invalidStore();
   }
   const target = value as unknown as WakeTargetState;
+  if (target.hostAgent !== undefined && !['codex', 'claude', 'claude-code', 'antigravity', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
+  if (target.conversationMode !== undefined && !['spawn', 'fixed'].includes(target.conversationMode)) throw invalidStore();
   if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
   if (!isValidMailboxId(target.mailboxId) || !WAKE_TARGET_MODES.includes(target.mode)) {
     throw invalidStore();
@@ -410,6 +428,9 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     throw invalidStore();
   }
   for (const field of [
+    'agentProfile',
+    'targetBot',
+    'sessionId',
     'interactiveCommand',
     'orcaCommand',
     'runId',
@@ -1020,6 +1041,7 @@ export class MailboxStore {
     const now = new Date().toISOString();
     const nowMs = Date.now();
     const insertedByMailbox = new Map<string, number>();
+    const conversationalByMailbox = new Map<string, boolean>();
     const result = this.mutate(state => {
       const inserted: string[] = [];
       const duplicateIds: string[] = [];
@@ -1049,6 +1071,10 @@ export class MailboxStore {
           envelope: cloned,
         });
         state.sequence += 1;
+        conversationalByMailbox.set(mailboxId,
+          (conversationalByMailbox.get(mailboxId) ?? true) &&
+          ['question', 'reply', 'settle'].includes(envelope.semantic?.type ?? ''),
+        );
         inserted.push(cloned.id);
         insertedByMailbox.set(mailboxId, (insertedByMailbox.get(mailboxId) ?? 0) + 1);
       }
@@ -1066,10 +1092,12 @@ export class MailboxStore {
             state.wakeTargets[mailboxId] = validateWakeTarget({
               ...target,
               pendingWake: true,
-              earliestWakeAt: Math.max(
-                previous?.earliestWakeAt ?? 0,
-                nowMs + target.coalesceMs,
-              ),
+              earliestWakeAt: conversationalByMailbox.get(mailboxId) && target.attemptCount === 0
+                ? nowMs
+                : Math.max(
+                  previous?.earliestWakeAt ?? 0,
+                  nowMs + target.coalesceMs,
+                ),
             });
           }
         }

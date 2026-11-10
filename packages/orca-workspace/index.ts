@@ -57,6 +57,7 @@ export async function checkedCommand(runner: CommandRunner, request: CommandRequ
 
 export interface OrcaIdleResult {
   idle: boolean;
+  composerPrefilled?: boolean;
   reason?: string;
 }
 
@@ -73,6 +74,17 @@ export interface OrcaTerminalRow {
 /** Collapse arbitrary text into exactly one line; wakeup pointers must never span lines. */
 export function singleLine(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+/** Recognize an Autopilot recommendation copied into the terminal composer. */
+export function isAutopilotComposerPrefill(preview: string): boolean {
+  const lines = preview.split(/\r?\n/);
+  return lines.some((line, index) => {
+    const draft = /^\s*>\s+(\S.*)$/.exec(line)?.[1]?.trim();
+    return draft !== undefined && lines.slice(0, index).some(earlier =>
+      /下一步建议|,1（主推）|,1 \(主推\)|自动预填/.test(earlier) || earlier.includes(draft),
+    );
+  });
 }
 
 /**
@@ -109,6 +121,7 @@ export async function checkOrcaWorkspaceIdle(
   if (!root) {
     return { idle: false, reason: 'Workspace not found' };
   }
+  let composerPrefilled = false;
   const visited = new Set<string>();
   const idleTree = async (row: Workspace): Promise<boolean> => {
     if (visited.has(row.worktreeId)) {
@@ -176,13 +189,16 @@ export async function checkOrcaWorkspaceIdle(
         continue;
       }
       if (typeof terminal.preview === 'string') {
-        // A trailing "> " is an unsent composer draft; a bare ">" is an idle prompt.
+        // Autopilot recommendations may prefill the composer below an idle agent.
         const lastLine = terminal.preview
           .split(/\r?\n/)
           .filter(line => line.trim())
           .at(-1);
         if (lastLine?.trimStart().startsWith('> ')) {
-          return false;
+          if (!isAutopilotComposerPrefill(terminal.preview)) return false;
+          composerPrefilled = true;
+        } else if (isAutopilotComposerPrefill(terminal.preview)) {
+          composerPrefilled = true;
         }
       }
     }
@@ -195,7 +211,7 @@ export async function checkOrcaWorkspaceIdle(
     return true;
   };
   const idle = await idleTree(root);
-  return { idle, reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable' };
+  return { idle, ...(idle && composerPrefilled ? { composerPrefilled: true } : {}), reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable' };
 }
 
 /** Bounded `terminal wait --for tui-idle`; timeout, busy, or command failure is never idle. */
@@ -328,8 +344,17 @@ export async function sendOrcaTerminalText(
   command: string,
   terminalHandle: string,
   text: string,
-  options: { cwd?: string; signal?: AbortSignal; waitSubmit?: number } = {},
+  options: { cwd?: string; signal?: AbortSignal; waitSubmit?: number; clearComposer?: boolean } = {},
 ): Promise<void> {
+  if (options.clearComposer === true) {
+    const cleared = await checkedCommand(runner, {
+      command,
+      args: ['terminal', 'send', '--terminal', terminalHandle, '--text', '\x15', '--json'],
+      cwd: options.cwd,
+      signal: options.signal,
+    });
+    if (JSON.parse(cleared.stdout).ok === false) throw new Error('Orca composer clear failed');
+  }
   const args = [
     'terminal',
     'send',
