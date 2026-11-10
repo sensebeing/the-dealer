@@ -547,7 +547,11 @@ export class DealerNodeRuntime {
           ctx.effect(() => () => registration.dispose());
         }
         if (this.config.policies.includes('dedup-cas')) {
-          const registration = ctx.services.dispatcher.registerPolicy(createDedupCasPolicyPlugin());
+          const registration = ctx.services.dispatcher.registerPolicy(
+            createDedupCasPolicyPlugin({
+              watermarksPath: join(this.stateDir, 'dedup-watermarks.json'),
+            }),
+          );
           ctx.effect(() => () => registration.dispose());
         }
         if (this.config.policies.includes('wave-coalescer')) {

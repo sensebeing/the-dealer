@@ -1,3 +1,15 @@
+import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname } from 'node:path';
 import type {
   DispatchPolicyPlugin,
   DispatchReceipt,
@@ -7,10 +19,55 @@ import type {
 
 export interface DedupCasOptions {
   entityKey?: (envelope: MessageEnvelope) => string;
+  watermarksPath?: string;
+}
+
+function loadWatermarks(path: string): Record<string, number> {
+  if (!existsSync(path)) {
+    return {};
+  }
+  let saved: unknown;
+  try {
+    saved = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new Error('Invalid dedup watermark store');
+  }
+  if (
+    !saved ||
+    typeof saved !== 'object' ||
+    Array.isArray(saved) ||
+    Object.values(saved).some(
+      value => typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0,
+    )
+  ) {
+    throw new Error('Invalid dedup watermark store');
+  }
+  return saved as Record<string, number>;
+}
+
+function persistWatermarks(path: string, watermarks: ReadonlyMap<string, number>): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temp, 'wx', 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(Object.fromEntries(watermarks)));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(temp, path);
+  const dir = openSync(dirname(path), 'r');
+  try {
+    fsyncSync(dir);
+  } finally {
+    closeSync(dir);
+  }
 }
 
 export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): DispatchPolicyPlugin {
-  const watermarks = new Map<string, number>();
+  const watermarks = new Map<string, number>(
+    options.watermarksPath ? Object.entries(loadWatermarks(options.watermarksPath)) : [],
+  );
   const locks = new Map<string, Promise<unknown>>();
   return {
     name: 'dedup-cas',
@@ -32,6 +89,10 @@ export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): Dispa
         // Reserve before the external effect: a thrown call can have an unknown outcome.
         // Retrying the same claim would risk duplicate execution; a newer claim can recover it.
         watermarks.set(key, raw);
+        if (options.watermarksPath) {
+          // Persist the reservation before the effect so a restart cannot replay it.
+          persistWatermarks(options.watermarksPath, watermarks);
+        }
         return next([envelope]);
       });
       locks.set(key, operation);

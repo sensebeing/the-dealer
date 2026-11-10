@@ -9,6 +9,7 @@ import { once } from 'node:events';
 import { createConnection } from 'node:net';
 import { Kernel } from '../packages/kernel/index.ts';
 import { generateNodeKeyPair, deriveNetworkKeys, sealNetworkFrame } from '../packages/core-types/index.ts';
+import type { InboundFrameEvent } from '../packages/core-types/index.ts';
 import { createTransportPlugin, P2PTransportService, blake3 } from '../packages/transport/index.ts';
 import { createNodePlugin, PeerDirectoryService } from '../packages/node/index.ts';
 
@@ -177,4 +178,63 @@ test('UDP multicast discovers peers without a shared discovery directory', async
   await until(() => a.listPeerEndpoints('udp-test').has(b.localNodeId) && b.listPeerEndpoints('udp-test').has(a.localNodeId));
   b.onInboundFrame(() => Buffer.from('via-udp'));
   assert.equal(Buffer.from(await a.sendUnicast('udp-test',b.localNodeId,Buffer.from('bytes'))).toString(),'via-udp');
+});
+
+test('mounted same-node unicast stays in-process while sealed wire frames remain authenticated', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-self-'));
+  const keyPair = generateNodeKeyPair();
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: keyPair.nodeId, discoveryDir: dir, socketTimeoutMs: 30 }) },
+    { plugin: createNodePlugin({ keyPair, member: 'ben.xu', nodeName: 'mbp', exchangeIntervalMs: 60 }) },
+  ]);
+  t.after(async () => { await kernel.stop(); await rm(dir, { recursive: true, force: true }); });
+  await kernel.start();
+  const transport = kernel.ctx.services.transport as P2PTransportService;
+  await transport.mountNetwork({ networkId: 'self', passphrase: 'secret' });
+  const received: InboundFrameEvent[] = [];
+  kernel.ctx.on('transport/inbound', async event => {
+    if ((event.payload as { type?: string }).type !== 'slow.ping') {
+      return;
+    }
+    received.push(event);
+    // Longer than socketTimeoutMs: only an in-process delivery can complete.
+    await new Promise(resolve => setTimeout(resolve, 60));
+    return Buffer.from('in-process-pong');
+  });
+  const reply = await transport.sendUnicast('self', transport.localNodeId, encode({ type: 'slow.ping' }));
+  assert.equal(Buffer.from(reply).toString(), 'in-process-pong');
+  assert.equal(received.length, 1);
+  assert.equal(received[0].senderNodeId, transport.localNodeId);
+  assert.equal(received[0].mode, 'unicast');
+
+  const keys = deriveNetworkKeys('self', 'secret');
+  const sealed = sealNetworkFrame({ mode: 'unicast', dataBase64: encode({ type: 'slow.ping' }).toString('base64') }, keys, transport.localNodeId);
+  sealed.authTag = Buffer.alloc(16).toString('base64');
+  await assert.rejects(transport.sendUnicast('self', transport.localNodeId, encode(sealed)), /authenticate/);
+  const foreign = sealNetworkFrame({ mode: 'unicast', dataBase64: encode({ bad: true }).toString('base64') }, deriveNetworkKeys('other', 'secret'), transport.localNodeId);
+  await assert.rejects(transport.sendUnicast('self', transport.localNodeId, encode(foreign)), /Unknown swarm/);
+  assert.equal(received.length, 1);
+
+  const offline = new P2PTransportService({ localNodeId: generateNodeKeyPair().nodeId, discoveryDir: join(dir, 'offline') });
+  t.after(() => offline.dispose());
+  offline.onInboundFrame(() => Buffer.from('offline-pong'));
+  assert.equal(Buffer.from(await offline.sendUnicast('self', offline.localNodeId, encode({ type: 'ping' }))).toString(), 'offline-pong');
+});
+
+test('cross-node exchange defaults to socketTimeoutMs instead of a hardcoded short timeout', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dealer-timeout-'));
+  const options = { discoveryDir: root, socketTimeoutMs: 30 };
+  const a = new P2PTransportService(options);
+  const b = new P2PTransportService(options);
+  t.after(async () => { await Promise.all([a.dispose(), b.dispose()]); await rm(root, { recursive: true, force: true }); });
+  await a.mountNetwork({ networkId: 'timeout-test', passphrase: 'secret' });
+  await b.mountNetwork({ networkId: 'timeout-test', passphrase: 'secret' });
+  a.registerPeerEndpoint('timeout-test', b.localNodeId, b.endpointAddr!);
+  b.onInboundFrame(async () => {
+    await new Promise(resolve => setTimeout(resolve, 60));
+    return Buffer.from('late-pong');
+  });
+  const startedAt = performance.now();
+  await assert.rejects(a.sendUnicast('timeout-test', b.localNodeId, encode({ type: 'slow.ping' })), /Transport timeout/);
+  assert.ok(performance.now() - startedAt < 3000);
 });

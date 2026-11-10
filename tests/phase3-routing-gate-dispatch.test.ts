@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Kernel } from '../packages/kernel/index.ts';
 import { generateNodeKeyPair, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
-import type { EmitMessageInput, MessageEnvelope, NodeCard, NodeService, TransportService, ExecutorPlugin } from '../packages/core-types/index.ts';
+import type { DeliveryReceipt, EmitMessageInput, MessageEnvelope, NodeCard, NodeService, TransportService, ExecutorPlugin } from '../packages/core-types/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
 import { createGatePlugin } from '../packages/gate/index.ts';
 import type { NetworkGateService } from '../packages/gate/index.ts';
@@ -595,6 +595,177 @@ test('scheduled watermark source polls immediately when an interval is configure
   assert.equal(polls, 1);
   await poller.stop();
   assert.equal(polls, 1);
+});
+
+test('CAS watermarks persist reserved versions across restarts and reject corrupted stores', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-watermarks-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const watermarksPath = join(dir, 'dedup-watermarks.json');
+  const message = envelope({ idempotencyKey: 'persistent-entity', payload: { claimVersion: 4 } });
+  let executions = 0;
+  const dispatch = async () => {
+    executions++;
+    return { stage: 'dispatched' as const };
+  };
+  const first = createDedupCasPolicyPlugin({ watermarksPath });
+  assert.equal((await first.process(message, dispatch)).stage, 'dispatched');
+  assert.equal((await stat(watermarksPath)).mode & 0o777, 0o600);
+  assert.deepEqual(Object.values(JSON.parse(await readFile(watermarksPath, 'utf8'))), [4]);
+  const second = createDedupCasPolicyPlugin({ watermarksPath });
+  assert.equal((await second.process(envelope({ ...message, id: 'after-restart' }), dispatch)).stage, 'rejected');
+  assert.equal(executions, 1);
+  assert.equal((await second.process(envelope({ ...message, id: 'newer', payload: { claimVersion: 5 } }), dispatch)).stage, 'dispatched');
+  assert.equal(executions, 2);
+  const reserved = createDedupCasPolicyPlugin({ watermarksPath });
+  await assert.rejects(
+    reserved.process(envelope({ ...message, id: 'ambiguous', payload: { claimVersion: 6 } }), async () => {
+      throw new Error('unknown external outcome');
+    }),
+    /unknown external outcome/,
+  );
+  const restarted = createDedupCasPolicyPlugin({ watermarksPath });
+  assert.equal((await restarted.process(envelope({ ...message, id: 'replay', payload: { claimVersion: 6 } }), dispatch)).stage, 'rejected');
+  assert.equal(executions, 2);
+  for (const corrupt of [JSON.stringify({ key: -1 }), JSON.stringify({ key: 1.5 }), JSON.stringify({ key: 'x' }), JSON.stringify([1]), 'null', 'not json']) {
+    await writeFile(watermarksPath, corrupt);
+    assert.throws(() => createDedupCasPolicyPlugin({ watermarksPath }), /Invalid dedup watermark store/);
+  }
+});
+
+test('poll source attempts later items after an early failure and retains the batch cursor', async () => {
+  const deliveryReceipt = (item: number, stage: DeliveryReceipt['stage']): DeliveryReceipt => ({
+    messageId: `message-${item}`,
+    networkId: 'test',
+    fromNodeId: receiver.nodeId,
+    stage,
+    updatedAt: new Date().toISOString(),
+    signature: 'signature',
+  });
+  const runPoll = async (
+    emit: (item: number) => Promise<{ messageId: string; traceId: string; receipts: DeliveryReceipt[] }>,
+  ) => {
+    const attempts: number[] = [];
+    const saved: number[] = [];
+    const poller = createPollWatermarkSourcePlugin({
+      initialCursor: 0,
+      poll: async () => ({ items: [1, 2, 3], cursor: 3 }),
+      toInput: item => ({
+        networkId: 'test',
+        routing: { mode: 'auto' },
+        kind: 'task',
+        subject: '',
+        body: '',
+        payload: {},
+        idempotencyKey: `poll-${item}`,
+      }),
+      saveCursor: async cursor => {
+        saved.push(cursor);
+      },
+    });
+    const emitter = {
+      async emit(input: EmitMessageInput) {
+        const item = Number(input.idempotencyKey!.slice('poll-'.length));
+        attempts.push(item);
+        return emit(item);
+      },
+      registerSource() {
+        throw new Error('unused');
+      },
+    };
+    await poller.start(emitter);
+    return { attempts, saved, poller };
+  };
+  const thrown = await runPoll(async item => {
+    if (item === 1) {
+      throw new Error('item one offline');
+    }
+    return { messageId: `message-${item}`, traceId: 'trace', receipts: [deliveryReceipt(item, 'dispatched')] };
+  });
+  await assert.rejects(thrown.poller.pollOnce(), /item one offline/);
+  assert.deepEqual(thrown.attempts, [1, 2, 3]);
+  assert.equal(thrown.poller.getCursor(), 0);
+  assert.deepEqual(thrown.saved, []);
+  await thrown.poller.stop();
+
+  const rejected = await runPoll(async item => ({
+    messageId: `message-${item}`,
+    traceId: 'trace',
+    receipts: [deliveryReceipt(item, item === 2 ? 'rejected' : 'dispatched')],
+  }));
+  await assert.rejects(rejected.poller.pollOnce(), /cursor retained/);
+  assert.deepEqual(rejected.attempts, [1, 2, 3]);
+  assert.equal(rejected.poller.getCursor(), 0);
+  assert.deepEqual(rejected.saved, []);
+  await rejected.poller.stop();
+});
+
+test('per-item cursor mode persists converged progress immediately and retains failed items', async () => {
+  const stages: Record<number, DeliveryReceipt['stage']> = {
+    1: 'dispatched',
+    2: 'rejected',
+    3: 'failed',
+    4: 'dispatched',
+  };
+  const attempts: number[] = [];
+  const saved: { baseline: number; last: number }[] = [];
+  const emitter = {
+    async emit(input: EmitMessageInput) {
+      const item = Number(input.idempotencyKey!.slice('poll-'.length));
+      attempts.push(item);
+      const stage = stages[item];
+      if (stage === 'failed') {
+        throw new Error('item three offline');
+      }
+      return {
+        messageId: `message-${item}`,
+        traceId: 'trace',
+        receipts: [
+          {
+            messageId: `message-${item}`,
+            networkId: 'test',
+            fromNodeId: receiver.nodeId,
+            stage,
+            updatedAt: new Date().toISOString(),
+            signature: 'signature',
+          } satisfies DeliveryReceipt,
+        ],
+      };
+    },
+    registerSource() {
+      throw new Error('unused');
+    },
+  };
+  const poller = createPollWatermarkSourcePlugin<number, { baseline: number; last: number }>({
+    initialCursor: { baseline: 0, last: 0 },
+    poll: async () => ({ items: [1, 2, 3, 4], cursor: { baseline: 9, last: 0 } }),
+    toInput: item => ({
+      networkId: 'test',
+      routing: { mode: 'auto' },
+      kind: 'task',
+      subject: '',
+      body: '',
+      payload: {},
+      idempotencyKey: `poll-${item}`,
+    }),
+    advanceItemCursor: (cursor, item, receipts) =>
+      receipts.some(receipt => receipt.stage === 'failed')
+        ? undefined
+        : { baseline: cursor.baseline, last: item },
+    saveCursor: async cursor => {
+      saved.push(structuredClone(cursor));
+    },
+  });
+  await poller.start(emitter);
+  await assert.rejects(poller.pollOnce(), /item three offline/);
+  assert.deepEqual(attempts, [1, 2, 3, 4]);
+  assert.deepEqual(saved, [
+    { baseline: 9, last: 0 },
+    { baseline: 9, last: 1 },
+    { baseline: 9, last: 2 },
+    { baseline: 9, last: 4 },
+  ]);
+  assert.deepEqual(poller.getCursor(), { baseline: 9, last: 4 });
+  await poller.stop();
 });
 
 test('poll cursor remains unchanged on failed delivery and agent process nonzero is failure', async () => {

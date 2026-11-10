@@ -516,9 +516,9 @@ export class P2PTransportService implements TransportService {
     m: Mount,
     target: string,
     frame: SealedNetworkFrame,
-    timeoutMs = 5000,
+    timeoutMs = this.options.socketTimeoutMs ?? 90_000,
   ): Promise<Uint8Array> {
-    const address = target === this.localNodeId ? this.endpointAddr : m.peers.get(target);
+    const address = m.peers.get(target);
     if (!address) {
       throw new Error(`Unknown peer: ${target}`);
     }
@@ -547,52 +547,54 @@ export class P2PTransportService implements TransportService {
     opts?: { timeoutMs?: number },
   ): Promise<Uint8Array> {
     const m = this.mounts.get(networkId);
+    if (target === this.localNodeId) {
+      return this.deliverLocal(networkId, bytes, m);
+    }
     if (!m) {
-      if (target === this.localNodeId) {
-        return this.deliverLocal(networkId, bytes);
-      }
       throw new Error(`Network not mounted: ${networkId}`);
     }
     return this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs);
   }
 
-  /** Same-machine zero-config mode: deliver an unmounted network frame without a socket. */
-  private async deliverLocal(networkId: string, bytes: Uint8Array): Promise<Uint8Array> {
+  /** Same-machine mode: deliver a frame addressed to this node without opening a socket. */
+  private async deliverLocal(
+    networkId: string,
+    bytes: Uint8Array,
+    mount?: Mount,
+  ): Promise<Uint8Array> {
     let payload: unknown;
     try {
       payload = JSON.parse(Buffer.from(bytes).toString('utf8'));
     } catch {
       payload = bytes;
     }
+    let event: InboundFrameEvent & { rawBytes: Uint8Array };
     if (
       payload &&
       typeof payload === 'object' &&
       (payload as { protocol?: string }).protocol === 'the-dealer-wire/v1'
     ) {
-      throw new Error(`Network not mounted: ${networkId}`);
+      if (!mount) {
+        throw new Error(`Network not mounted: ${networkId}`);
+      }
+      const frame = payload as SealedNetworkFrame;
+      if (frame.swarmTopicId !== mount.keys.swarmTopicId) {
+        throw new Error('Unknown swarm');
+      }
+      event = this.inboundEvent(mount, frame);
+    } else {
+      event = {
+        networkId,
+        senderNodeId: this.localNodeId,
+        mode: 'unicast',
+        payload,
+        rawBytes: bytes,
+      };
     }
     if (this.handlers.size === 0 && !this.ctx) {
       throw new Error('No inbound handler registered');
     }
-    const event: InboundFrameEvent & { rawBytes: Uint8Array } = {
-      networkId,
-      senderNodeId: this.localNodeId,
-      mode: 'unicast',
-      payload,
-      rawBytes: bytes,
-    };
-    let reply: Uint8Array = new Uint8Array();
-    for (const handler of this.handlers) {
-      const value = await handler(event);
-      if (value !== undefined) {
-        reply = value;
-      }
-    }
-    const value = await this.ctx?.serial('transport/inbound', event);
-    if (value !== undefined) {
-      reply = value;
-    }
-    return reply;
+    return this.inboundReply(event);
   }
 
   async sendMulticast(
@@ -649,6 +651,43 @@ export class P2PTransportService implements TransportService {
     if (!m) {
       throw new Error('Unknown swarm');
     }
+    const event = this.inboundEvent(m, frame);
+    const reply = await this.inboundReply(event);
+    socket.end(
+      packet({
+        frame: sealNetworkFrame(
+          {
+            requestNonce: frame.nonce,
+            dataBase64: Buffer.from(reply).toString('base64'),
+          },
+          m.keys,
+          this.localNodeId,
+        ),
+      }),
+    );
+  }
+
+  private async inboundReply(
+    event: InboundFrameEvent & { rawBytes: Uint8Array },
+  ): Promise<Uint8Array> {
+    let reply: Uint8Array = new Uint8Array();
+    for (const handler of this.handlers) {
+      const value = await handler(event);
+      if (value !== undefined) {
+        reply = value;
+      }
+    }
+    const value = await this.ctx?.serial('transport/inbound', event);
+    if (value !== undefined) {
+      reply = value;
+    }
+    return reply;
+  }
+
+  private inboundEvent(
+    m: Mount,
+    frame: SealedNetworkFrame,
+  ): InboundFrameEvent & { rawBytes: Uint8Array } {
     const inner = unsealNetworkFrame<Record<string, unknown>>(frame, m.keys);
     if (!inner || typeof inner !== 'object') {
       throw new Error('Invalid frame payload');
@@ -672,7 +711,7 @@ export class P2PTransportService implements TransportService {
         // Preserve opaque binary
       }
     }
-    const event: InboundFrameEvent & { rawBytes: Uint8Array } = {
+    return {
       networkId: m.config.networkId,
       senderNodeId: frame.senderNodeId,
       mode,
@@ -680,29 +719,6 @@ export class P2PTransportService implements TransportService {
       payload,
       rawBytes,
     };
-    let reply: Uint8Array = new Uint8Array();
-    for (const handler of this.handlers) {
-      const value = await handler(event);
-      if (value !== undefined) {
-        reply = value;
-      }
-    }
-    const value = await this.ctx?.serial('transport/inbound', event);
-    if (value !== undefined) {
-      reply = value;
-    }
-    socket.end(
-      packet({
-        frame: sealNetworkFrame(
-          {
-            requestNonce: frame.nonce,
-            dataBase64: Buffer.from(reply).toString('base64'),
-          },
-          m.keys,
-          this.localNodeId,
-        ),
-      }),
-    );
   }
 
   async shareFile(filePath: string): Promise<BlobAttachment> {
