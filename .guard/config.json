@@ -1,0 +1,376 @@
+{
+  "manifest_file": "AGENTS.md",
+  "manifest_tag": "the-guard-policy",
+  "manifest_schema": "the-guard-policy/v1",
+  "detail_manifest_ref": "AGENTS.md#engineering-quality-policy",
+  "detail_dir": "docs/standards/rules",
+  "rule_id_prefix": "guard.",
+  "exempt_tag": "guard-exempt",
+  "main_branch": "main",
+  "module_doc_roots": [
+    "packages",
+    "native"
+  ],
+  "review": {
+    "project_title": "The Dealer",
+    "reviewable_extensions": [
+      ".ts",
+      ".js",
+      ".rs"
+    ],
+    "reviewable_prefixes": [
+      "bin/",
+      "native/"
+    ],
+    "extra_reviewable_paths": [
+      "docs/standards/rules/**",
+      "docs/architecture.md",
+      "docs/wire-protocol.md",
+      "docs/plugin-guide.md"
+    ],
+    "service_config_roots": [
+      "packages",
+      "native"
+    ]
+  },
+  "topology": {
+    "modules": [
+      {
+        "path": "packages/core-types",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/wire-protocol.md"
+        ],
+        "dependencies": []
+      },
+      {
+        "path": "packages/kernel",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/architecture.md"
+        ],
+        "dependencies": [
+          "packages/core-types"
+        ]
+      },
+      {
+        "path": "packages/agent-host",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": []
+      },
+      {
+        "path": "packages/orca-workspace",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": []
+      },
+      {
+        "path": "packages/transport",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/wire-protocol.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel",
+          "native/dealer-iroh-engine"
+        ]
+      },
+      {
+        "path": "native/dealer-iroh-engine",
+        "languages": [
+          "Rust"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/wire-protocol.md"
+        ],
+        "dependencies": []
+      },
+      {
+        "path": "packages/node",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel"
+        ]
+      },
+      {
+        "path": "packages/router",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel"
+        ]
+      },
+      {
+        "path": "packages/gate",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel",
+          "packages/plugins-policy"
+        ]
+      },
+      {
+        "path": "packages/dispatcher",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel"
+        ]
+      },
+      {
+        "path": "packages/emitter",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel"
+        ]
+      },
+      {
+        "path": "packages/mailbox",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/agent-host",
+          "packages/orca-workspace"
+        ]
+      },
+      {
+        "path": "packages/plugins-policy",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/plugin-guide.md"
+        ],
+        "dependencies": [
+          "packages/core-types"
+        ]
+      },
+      {
+        "path": "packages/plugins-router",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/plugin-guide.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel",
+          "packages/router",
+          "packages/orca-workspace"
+        ]
+      },
+      {
+        "path": "packages/plugins-source",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/plugin-guide.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel",
+          "packages/plugins-policy",
+          "packages/plugins-router"
+        ]
+      },
+      {
+        "path": "packages/plugins-executor",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/plugin-guide.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/agent-host",
+          "packages/mailbox",
+          "packages/orca-workspace",
+          "packages/cli"
+        ]
+      },
+      {
+        "path": "packages/plugins-lark-notifier",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/plugin-guide.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel",
+          "packages/mailbox",
+          "packages/orca-workspace"
+        ]
+      },
+      {
+        "path": "packages/cli",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/kernel",
+          "packages/transport",
+          "packages/node",
+          "packages/router",
+          "packages/gate",
+          "packages/dispatcher",
+          "packages/emitter",
+          "packages/mailbox",
+          "packages/orca-workspace",
+          "packages/plugins-policy",
+          "packages/plugins-router",
+          "packages/plugins-source",
+          "packages/plugins-executor",
+          "packages/plugins-lark-notifier"
+        ]
+      }
+    ],
+    "forbidden_imports": [
+      {
+        "from": "packages/core-types/",
+        "imports": [
+          "../kernel",
+          "../transport",
+          "../node",
+          "../router",
+          "../gate",
+          "../dispatcher",
+          "../emitter",
+          "../mailbox",
+          "../orca-workspace",
+          "../agent-host",
+          "../plugins-policy",
+          "../plugins-router",
+          "../plugins-source",
+          "../plugins-executor",
+          "../plugins-lark-notifier",
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "core-types is the leaf contract layer and must not import runtime packages."
+      },
+      {
+        "from": "packages/kernel/",
+        "imports": [
+          "../transport",
+          "../node",
+          "../router",
+          "../gate",
+          "../dispatcher",
+          "../emitter",
+          "../mailbox",
+          "../orca-workspace",
+          "../agent-host",
+          "../plugins-policy",
+          "../plugins-router",
+          "../plugins-source",
+          "../plugins-executor",
+          "../plugins-lark-notifier",
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "kernel owns lifecycle and dependency injection only; it must not import P2P, routing, gate, mailbox, or executor modules."
+      },
+      {
+        "from": "packages/agent-host/",
+        "imports": [
+          "../mailbox",
+          "../plugins-executor",
+          "../cli",
+          "../dispatcher",
+          "../gate"
+        ],
+        "rule_id": "guard.code-organization",
+        "message": "agent-host is a shared leaf builder for host CLI invocations and must not depend on mailbox or executor packages."
+      },
+      {
+        "from": "packages/mailbox/",
+        "imports": [
+          "../plugins-executor",
+          "../cli",
+          "../dispatcher",
+          "../gate",
+          "../router",
+          "../transport"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "mailbox owns durable storage and wakeup redrive; use agent-host and orca-workspace rather than importing plugins-executor or cli."
+      },
+      {
+        "from": "packages/gate/",
+        "imports": [
+          "../plugins-executor",
+          "../cli",
+          "../orca-workspace"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "gate owns inbound admission only and must not invoke executors directly."
+      }
+    ]
+  }
+}

@@ -43,19 +43,19 @@ Read [AGENTS.md](AGENTS.md), [architecture](docs/architecture.md) and the
 
 ```sh
 npm test
+guard check --base origin/main
+guard review
 git diff --check
 ```
 
-For native changes, also build the Rust engine. For host integrations, distinguish mocked argv
-contracts from a live host receipt and task completion. Do not call a daemon handoff business
-success. Never include keys, invites, customer data or unredacted private conversations in reports.
+`the-dealer` enforces architectural boundaries and pre-merge review via [the-guard](https://github.com/sensebeing/the-guard) (`AGENTS.md` + `.guard/config.json`). For native changes, also build the Rust engine. For host integrations, distinguish mocked argv contracts from a live host receipt and task completion. Do not call a daemon handoff business success. Never include keys, invites, customer data or unredacted private conversations in reports.
 
 ### Pull request checklist
 
 - [ ] Explain the concrete trigger, resulting behavior and responsible owner.
 - [ ] Keep the patch focused and avoid duplicate state or compatibility paths without a need.
 - [ ] Preserve trust, concurrency, idempotency and command-execution boundaries.
-- [ ] Run relevant tests and `git diff --check`; disclose failures and checks not run.
+- [ ] Run `npm test`, `guard check --base origin/main`, `guard review`, and `git diff --check`; disclose failures and checks not run.
 - [ ] Update both READMEs and the changelog when public behavior changes.
 - [ ] Commit on a topic branch and request maintainer review before integration.
 

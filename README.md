@@ -165,6 +165,8 @@ Requires Node.js >=22.6 (TypeScript runs directly via Node's built-in type strip
 
 ```sh
 npm test
+guard check --base origin/main
+guard review
 git diff --check
 # Optional Rust Iroh native engine
 npm run build:native

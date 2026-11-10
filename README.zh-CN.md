@@ -163,6 +163,8 @@ Ed25519 密钥签署节点名片、信封和投递回执；基于 HKDF-SHA256 �
 
 ```sh
 npm test
+guard check --base origin/main
+guard review
 git diff --check
 # 可选：构建 Rust Iroh 原生传输引擎
 npm run build:native
