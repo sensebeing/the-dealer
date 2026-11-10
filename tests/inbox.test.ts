@@ -73,6 +73,43 @@ test('inbox ordering compares instants across offsets with deterministic ties', 
   assert.deepEqual((await store.list()).items.map(item => item.id), ['tie', 'newer', 'older']);
 });
 
+test('inbox ordering preserves reverse insertion for equal instants with different offsets', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'inbox-offset-tie-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'inbox.json');
+  const store = new InboxStore(path);
+  await store.deliver([envelope('first'), envelope('second')]);
+  const saved = JSON.parse(readFileSync(path, 'utf8'));
+  saved.items[0].receivedAt = '2026-11-10T08:00:00.000+08:00';
+  saved.items[1].receivedAt = '2026-11-10T00:00:00.000Z';
+  writeFileSync(path, JSON.stringify(saved));
+  assert.deepEqual((await store.list()).items.map(item => item.id), ['second', 'first']);
+});
+
+test('runtime upgrades persisted legacy executors and dispatches to its built-in inbox', async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'inbox-upgrade-'));
+  const path = join(stateDir, 'config.json');
+  const legacyExecutors = ['orca-spawn', 'orca-wave', 'notify'];
+  writeFileSync(path, JSON.stringify({ executors: legacyExecutors }));
+  const runtime = new DealerNodeRuntime({ stateDir,
+    transport: { discoveryDir: join(stateDir, 'mesh') },
+    commandRunner: async () => { throw new Error('Unexpected external executor'); },
+  });
+  t.after(async () => {
+    await runtime.stop();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+  await runtime.start();
+  assert.deepEqual(runtime.config.executors, [...legacyExecutors, 'inbox']);
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).executors, runtime.config.executors);
+  await runtime.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+  const message = envelope('upgraded', 'team', 'alice', 'collab.request.v4');
+  message.payload = { executor: 'inbox' };
+  const receipt = await runtime.kernel.getService('dispatcher').dispatch(message);
+  assert.equal(receipt.stage, 'dispatched');
+  assert.equal((await runtime.inbox.show(message.id)).id, message.id);
+});
+
 test('offline inbox mutations respect an embedded runtime ownership lock', async t => {
   const root = mkdtempSync(join(tmpdir(), 'inbox-owned-'));
   const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), profile: 'headless-relay',

@@ -1081,7 +1081,7 @@ export class InboxStore {
           .sort((a, b) => {
             const tb = Date.parse(b.receivedAt);
             const ta = Date.parse(a.receivedAt);
-            if (Number.isFinite(tb) && Number.isFinite(ta) && tb !== ta) {
+            if (Number.isFinite(tb) && Number.isFinite(ta)) {
               return tb - ta;
             }
             return b.receivedAt > a.receivedAt ? 1 : b.receivedAt < a.receivedAt ? -1 : 0;

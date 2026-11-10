@@ -191,6 +191,9 @@ export class DealerNodeRuntime {
         ),
         ...this.options.patch,
       };
+      if (Array.isArray(this.config.executors) && !this.config.executors.includes('inbox')) {
+        this.config.executors = [...this.config.executors, 'inbox'];
+      }
       validateConfig(this.config);
       this.inbox = new InboxStore(this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'));
       const keyPath = join(this.stateDir, 'identity.json');
