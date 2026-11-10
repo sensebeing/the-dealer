@@ -255,13 +255,24 @@ export function defaultAntigravityLaunchCommand(): string {
     : 'agy --dangerously-skip-permissions';
 }
 
-/** Resolve the freshest connected antigravity terminal in an Orca workspace, spawning one if needed. */
+export type SupportedOrcaAgent = 'antigravity' | 'claude' | 'codex';
+
+export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravity'): string {
+  if (agent === 'claude') return 'claude --dangerously-skip-permissions';
+  if (agent === 'codex') return 'codex --dangerously-bypass-approvals-and-sandbox';
+  return defaultAntigravityLaunchCommand();
+}
+
+/** Resolve the freshest connected target-agent terminal in an Orca workspace, spawning one if needed. */
 export async function resolveOrSpawnOrcaWorkspaceTerminal(
   runner: CommandRunner,
   command: string,
   cwd: string,
   signal?: AbortSignal,
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string },
 ): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
+  const targetAgent = options?.agent ?? 'antigravity';
+  const launchCommand = options?.interactiveCommand?.trim() || defaultAgentLaunchCommand(targetAgent);
   const listed = await checkedCommand(runner, {
     command,
     args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
@@ -277,14 +288,16 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   const freshest = (rows: OrcaTerminalRow[]) => rows.sort(
     (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
   )[0];
-  const preferred = freshest(connected.filter(t => t.agentIdentity === 'antigravity'));
+  const preferred = freshest(connected.filter(t => t.agentIdentity === targetAgent || (targetAgent === 'claude' && t.agentIdentity === 'claude-code')));
   if (preferred) return { handle: String(preferred.handle), spawned: false };
+  const agent = freshest(connected.filter(t => typeof t.agentIdentity === 'string' && t.agentIdentity.trim()));
+  if (agent) return { handle: String(agent.handle), spawned: false };
   const synthetic = freshest(connected.filter(t => typeof t.preview !== 'string' && typeof t.agentIdentity !== 'string'));
   if (synthetic) return { handle: String(synthetic.handle), spawned: false };
   const bareShell = freshest(connected.filter(t => typeof t.preview === 'string' && !t.agentIdentity));
   if (bareShell) {
     const handle = String(bareShell.handle);
-    await sendOrcaTerminalText(runner, command, handle, defaultAntigravityLaunchCommand(), { cwd, signal });
+    await sendOrcaTerminalText(runner, command, handle, launchCommand, { cwd, signal });
     return { handle, spawned: true, shellBootstrapped: true };
   }
   const spawned = await checkedCommand(runner, {
@@ -295,7 +308,7 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
       '--worktree',
       `path:${cwd}`,
       '--command',
-      defaultAntigravityLaunchCommand(),
+      launchCommand,
       '--json',
     ],
     cwd,

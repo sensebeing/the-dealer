@@ -147,6 +147,12 @@ export function initProjectScaffold(
 }
 
 export interface TopicBindingConfig {
+  agent?: 'orca' | 'antigravity' | 'claude' | 'claude-code' | 'codex' | 'chatgpt-dot' | 'grok-bot';
+  interactiveCommand?: string;
+  conversationMode?: 'spawn' | 'fixed' | 'inbox-only';
+  targetBot?: string;
+  agentProfile?: string;
+  sessionId?: string;
   executor: string;
   streamKey?: string;
   mailboxId?: string;
@@ -180,11 +186,15 @@ export interface LarkNotifyConfig {
 
 export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[]): asserts bindings is Record<string, TopicBindingConfig> {
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
-  const strings = ['streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
+  const strings = ['agent', 'interactiveCommand', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
   const booleans = ['autoCreateWorkspace', 'notifyLark'];
   const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves']);
   for (const [kind, binding] of Object.entries(bindings)) {
     if (!nonempty(kind) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
+        (binding.agent !== undefined && !['orca', 'antigravity', 'claude', 'claude-code', 'codex', 'chatgpt-dot', 'grok-bot'].includes(binding.agent)) ||
+        (binding.conversationMode !== undefined && !['spawn', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
+        (binding.conversationMode === 'inbox-only' && binding.executor !== 'inbox') ||
+        (['orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(binding.agent)) ||
         Object.keys(binding).some(key => !allowed.has(key)) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||
         booleans.some(key => binding[key] !== undefined && typeof binding[key] !== 'boolean') ||

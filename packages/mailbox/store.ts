@@ -63,6 +63,8 @@ export interface WakeTargetState {
   readonly mailboxId: string;
   readonly mode: WakeTargetMode;
   readonly orcaCommand?: string;
+  readonly agent?: 'antigravity' | 'claude' | 'codex';
+  readonly interactiveCommand?: string;
   readonly runId?: string;
   readonly worktreeId?: string;
   readonly workspacePath?: string;
@@ -334,6 +336,8 @@ function mergeWakeTarget(
   // cannot express that, so own-property presence is the only reliable signal.
   const optional = <K extends keyof WakeTargetState>(key: K): WakeTargetState[K] | undefined =>
     Object.hasOwn(patch, key) ? patch[key] : current[key];
+  const agent = optional('agent');
+  const interactiveCommand = optional('interactiveCommand');
   const orcaCommand = optional('orcaCommand');
   const runId = optional('runId');
   const worktreeId = optional('worktreeId');
@@ -353,6 +357,8 @@ function mergeWakeTarget(
     pendingWake: patch.pendingWake ?? current.pendingWake,
     earliestWakeAt: patch.earliestWakeAt ?? current.earliestWakeAt,
     attemptCount: patch.attemptCount ?? current.attemptCount,
+    ...(agent !== undefined ? { agent } : {}),
+    ...(interactiveCommand !== undefined ? { interactiveCommand } : {}),
     ...(orcaCommand !== undefined ? { orcaCommand } : {}),
     ...(runId !== undefined ? { runId } : {}),
     ...(worktreeId !== undefined ? { worktreeId } : {}),
@@ -378,6 +384,7 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     throw invalidStore();
   }
   const target = value as unknown as WakeTargetState;
+  if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
   if (!isValidMailboxId(target.mailboxId) || !WAKE_TARGET_MODES.includes(target.mode)) {
     throw invalidStore();
   }
@@ -400,6 +407,7 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     throw invalidStore();
   }
   for (const field of [
+    'interactiveCommand',
     'orcaCommand',
     'runId',
     'worktreeId',

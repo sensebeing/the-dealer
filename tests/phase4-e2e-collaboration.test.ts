@@ -549,6 +549,16 @@ test('Phase 4: actual dealer node up launches dealerd and CLI talks over socket'
   assert.equal((await run(['network', 'mount', 'daemon-test', '--passphrase', 'secret', '--json'])).code, 0);
   const list = await run(['network', 'list', '--json']);
   assert.equal(JSON.parse(list.output)[0].networkId, 'daemon-test');
+  const setupProbe = await run(['setup', 'probe', '--root', root, '--json'], root);
+  assert.equal(setupProbe.code, 0, setupProbe.errors);
+  assert.equal(JSON.parse(setupProbe.output).cwd, root);
+  assert.equal(JSON.parse(setupProbe.output).node.controlSocketPresent, true);
+  const setupInvite = await run(['setup', 'invite-prompt', '--network', 'daemon-test', '--json']);
+  assert.equal(setupInvite.code, 0, setupInvite.errors);
+  assert.match(JSON.parse(setupInvite.output).teammatePrompt, /dealer network mount/);
+  const setupBinding = await run(['setup', 'binding-preset', '--host', 'codex', '--mode', 'fixed', '--json']);
+  assert.equal(setupBinding.code, 0, setupBinding.errors);
+  assert.equal(JSON.parse(setupBinding.output).binding.executor, 'agent-pty');
   const projectRoot = join(root, 'daemon-project');
   mkdirSync(projectRoot);
   const scaffold = await run(['project', 'init', '--id', 'daemon-project', '--network', 'daemon-test', '--json'], projectRoot);

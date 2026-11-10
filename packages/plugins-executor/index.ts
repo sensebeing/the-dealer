@@ -17,11 +17,12 @@ import type { WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
   trustAntigravityWorkspace,
-  defaultAntigravityLaunchCommand,
+  defaultAgentLaunchCommand,
+  singleLine,
   runCommand,
   sendOrcaTerminalText,
 } from '../orca-workspace/index.ts';
-import type { CommandRunner } from '../orca-workspace/index.ts';
+import type { CommandRunner, SupportedOrcaAgent } from '../orca-workspace/index.ts';
 
 export function renderWave(batch: readonly MessageEnvelope[]): string {
   return batch
@@ -32,7 +33,17 @@ export function renderWave(batch: readonly MessageEnvelope[]): string {
     .join('\n\n---\n\n');
 }
 
+export type SupportedAgentHost = 'orca' | 'antigravity' | 'claude' | 'claude-code' | 'codex' | 'chatgpt-dot' | 'grok-bot';
+export type AgentConversationMode = 'spawn' | 'fixed' | 'inbox-only';
+
 export interface AgentOptions {
+  store?: MailboxStore;
+  resolveTopicBinding?: (kind: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
+  agent?: SupportedAgentHost;
+  conversationMode?: 'spawn' | 'fixed';
+  agentProfile?: string;
+  targetBot?: string;
+  sessionId?: string;
   command?: string;
   args?: readonly string[];
   cwd?: string;
@@ -43,35 +54,108 @@ function agentArgs(command: string): string[] {
   return command === 'codex' ? ['exec', '-'] : command === 'claude' ? ['-p'] : [];
 }
 
+export function buildAgentHostInvocation(options: {
+  agent: SupportedAgentHost;
+  conversationMode: 'spawn' | 'fixed';
+  mailboxId: string;
+  promptText: string;
+  command?: string;
+  cwd?: string;
+  agentProfile?: string;
+  targetBot?: string;
+  sessionId?: string;
+}): { command: string; args: string[] } {
+  const { agent, conversationMode: mode, mailboxId, promptText, cwd, agentProfile, targetBot, sessionId } = options;
+  const session = sessionId || mailboxId;
+  switch (agent) {
+    case 'codex':
+      return { command: options.command ?? 'codex', args: [
+        ...(mode === 'fixed' ? ['queue', '--thread', session, '--resume'] : ['exec', '--worktree']),
+        ...(agentProfile ? ['-p', agentProfile] : []),
+        ...(cwd ? ['-C', cwd] : []),
+        ...(mode === 'fixed' ? ['--message'] : []), promptText,
+      ] };
+    case 'claude':
+    case 'claude-code':
+      return { command: options.command ?? 'claude', args: [
+        '--bg', ...(mode === 'fixed' ? ['--resume', session] : ['--name', mailboxId.replace(/[^A-Za-z0-9._-]/g, '-')]),
+        ...(agentProfile ? ['--agent', agentProfile] : []), promptText,
+      ] };
+    case 'antigravity':
+      return { command: options.command ?? 'agy', args: ['run', '--dangerously-skip-permissions', promptText] };
+    case 'chatgpt-dot': {
+      const dotTarget = targetBot ?? agentProfile;
+      return { command: options.command ?? 'dot', args: ['send', '--session-mode', mode, '--session-key', session,
+        ...(dotTarget ? ['--agent', dotTarget] : []), '--message', promptText] };
+    }
+    case 'grok-bot':
+      if (!targetBot?.trim()) throw new Error('grok-bot requires targetBot');
+      return { command: options.command ?? 'grok-bot', args: ['dispatch', '--bot', targetBot, '--session-mode', mode,
+        '--session-key', session, '--message', promptText] };
+    default:
+      throw new Error(`Unsupported agent-pty host: ${agent}`);
+  }
+}
+
+function orcaAgent(value: unknown): SupportedOrcaAgent {
+  if (value === undefined) return 'antigravity';
+  if (value === 'antigravity' || value === 'claude' || value === 'codex') return value;
+  throw new Error(`Unsupported Orca agent: ${String(value)}`);
+}
+
 export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): ExecutorPlugin {
   return {
     name: 'agent-pty',
-    async execute(batch, context) {
-      const command = options.command ?? 'codex';
-      const output = await checkedCommand(options.commandRunner ?? runCommand, {
-        command,
-        args: options.args ?? agentArgs(command),
-        cwd: options.cwd,
-        input: renderWave(batch),
-        signal: context.signal,
-      });
+    async execute(batch, context, runtimeConfig) {
+      const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
+      const first = batch[0];
+      const payload = first?.payload ?? {};
+      const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind) : undefined;
+      const agent = payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
+      const mode = payload.conversationMode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode;
+      const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
+      let request;
+      if (!hostMode) {
+        const command = options.command ?? 'codex';
+        request = { command, args: options.args ?? agentArgs(command), cwd: options.cwd, input: renderWave(batch) };
+      } else {
+        if (!first) throw new Error('Empty agent batch');
+        if (mode !== undefined && mode !== 'spawn' && mode !== 'fixed') throw new Error('Invalid agent conversationMode');
+        const conversationMode = mode ?? 'spawn';
+        const mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
+        const store = options.store ?? config.store;
+        const rawPrompt = optionalString(payload.terminalPrompt) ?? renderWave(batch);
+        const promptText = store
+          ? conversationMode === 'spawn'
+            ? buildTaskPreamble(mailboxId, first.id, undefined, rawPrompt)
+            : singleLine(`You have ${batch.length} Dealer message(s) in ${mailboxId}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`)
+          : singleLine(rawPrompt);
+        const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
+        const invocation = buildAgentHostInvocation({
+          agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
+          command: config.command ?? options.command,
+          agentProfile: payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile,
+          targetBot: payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot,
+          sessionId: payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId,
+        });
+        if (store) store.enqueue(batch, { mailboxId, wakeTarget: { mode: 'passive' } });
+        request = { ...invocation, cwd };
+      }
+      const output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
       let structuredOutput: unknown;
       try {
         structuredOutput = JSON.parse(output.stdout);
       } catch {
         structuredOutput = output.stdout;
       }
-      return {
-        executor: 'agent-pty',
-        executionId: randomUUID(),
-        output: structuredOutput,
-        stderr: output.stderr ?? '',
-      };
+      return { executor: 'agent-pty', executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '' };
     },
   };
 }
 
 export interface OrcaSpawnOptions extends AgentOptions {
+  agent?: SupportedOrcaAgent;
+  interactive?: boolean;
   namePrefix?: string;
   orcaCommand?: string;
   projectRoots?: Readonly<Record<string, string>>;
@@ -265,14 +349,17 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const command = options.orcaCommand ?? 'orca';
       const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
+      const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(batch[0]?.kind);
+      const interactive = payload.interactive === true || binding?.conversationMode === 'spawn' || config.interactive === true || options.interactive === true;
       const store = options.store ?? config.store;
+      const effectiveAgent = orcaAgent(payload.agent ?? binding?.agent ?? config.agent ?? options.agent);
       const wakeup = options.wakeup ?? config.wakeup;
-      const configuredCwd =
+      const configuredCwd = binding?.workspacePath ?? binding?.repoRoot ??
         (typeof config.cwd === 'string' && config.cwd ? config.cwd : undefined) ?? options.cwd;
       const projectId =
         typeof payload.projectId === 'string' && payload.projectId.trim()
           ? payload.projectId.trim()
-          : undefined;
+          : binding?.projectId;
       const projectRoots = { ...(options.projectRoots ?? {}), ...(config.projectRoots ?? {}) };
       const boundRoot = projectId && typeof projectRoots[projectId] === 'string'
         ? projectRoots[projectId].trim() || undefined
@@ -302,7 +389,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       if (parentWorktree === undefined && !worktreeCwd) {
         throw new Error('Top-level Orca worktree requires receiver cwd or bound projectId');
       }
-      if (payload.interactive === true && !store) {
+      if (interactive && !store) {
         throw new Error('Interactive orca-spawn requires a durable mailbox store');
       }
       const explicitName =
@@ -334,7 +421,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       if (!path) {
         throw new Error('Orca worktree create returned no path');
       }
-      if (payload.interactive === true) {
+      if (interactive) {
         const explicitSettingsPath =
           typeof config.agySettingsPath === 'string' && config.agySettingsPath
             ? config.agySettingsPath
@@ -348,6 +435,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           optionSettingsPath ??
           join(homedir(), '.gemini/antigravity-cli/settings.json');
         if (
+          effectiveAgent === 'antigravity' &&
           payload.trustAntigravity !== false &&
           (existsSync(settingsFile) ||
             explicitSettingsPath !== undefined ||
@@ -355,11 +443,9 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         ) {
           trustAntigravityWorkspace(path, settingsFile);
         }
-        const interactiveCommand =
-          typeof config.interactiveCommand === 'string' && config.interactiveCommand.trim()
-            ? config.interactiveCommand.trim()
-            : (options.interactiveCommand ??
-              defaultAntigravityLaunchCommand());
+        const interactiveCommand = binding?.interactiveCommand?.trim() ||
+          config.interactiveCommand?.trim() || options.interactiveCommand?.trim() ||
+          defaultAgentLaunchCommand(effectiveAgent);
         const launched = await checkedCommand(runner, {
           command,
           args: [
@@ -408,6 +494,8 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                 mailboxId,
                 wakeTarget: {
                   mode: 'orca-terminal',
+                  agent: effectiveAgent,
+                  interactiveCommand,
                   orcaCommand: command,
                   workspacePath: path,
                   terminalHandle: handle,
@@ -504,6 +592,8 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
 }
 
 export interface OrcaWaveOptions {
+  agent?: SupportedOrcaAgent;
+  interactiveCommand?: string;
   resolveTopicBinding?: (kind: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   runId?: string;
   terminalHandle?: string;
@@ -579,6 +669,8 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         mailboxId,
         wakeTarget: {
           mode: runId ? 'orca-run' : 'orca-terminal',
+          agent: orcaAgent(payload.agent ?? binding?.agent ?? config.agent ?? options.agent),
+          interactiveCommand: optionalString(payload.interactiveCommand) ?? binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
           orcaCommand: command,
           coalesceMs: requestedMinAge,
           ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),

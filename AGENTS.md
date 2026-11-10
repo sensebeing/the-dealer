@@ -77,3 +77,10 @@ rules:
   - 线协议与加密帧规范：[`docs/wire-protocol.md`](docs/wire-protocol.md)
   - 插件开发指南：[`docs/plugin-guide.md`](docs/plugin-guide.md)
   - Agent 操作 Skill：[`skills/the-dealer/SKILL.md`](skills/the-dealer/SKILL.md)
+
+### 接入、扩展与日常操作三件套
+
+- 接入向导：[`the-dealer-setup`](skills/the-dealer-setup/SKILL.md)，按环境探测、网络选择、同机编排、跨机提示词、同事宿主绑定五步配置。
+- 扩展指南：[`the-dealer-extend`](skills/the-dealer-extend/SKILL.md)，个人 Patch、项目插件与团队 Topic/路由/门禁。
+- 日常操作：[`the-dealer`](skills/the-dealer/SKILL.md)，发送、回复、收件箱租约和结算。
+- 只读接入命令：`dealer setup probe --root <repo> --json`、`dealer setup invite-prompt --network <id> --json`、`dealer setup binding-preset --host <host> --mode <spawn|fixed|inbox-only> --json`。预设生成不会自动写配置或开启执行；邀请包含共享密钥，不得提交入库。

@@ -16,6 +16,23 @@ first**, and a cross-machine/cross-team P2P collaboration network only after a
 network is mounted. Prefer Step 1 for local workspaces; mount a network only
 when work must reach another machine or teammate.
 
+## Setup and extension entry points
+
+For first-time onboarding use [the-dealer-setup](../the-dealer-setup/SKILL.md).
+For personal, project and team automation use
+[the-dealer-extend](../the-dealer-extend/SKILL.md). This skill owns daily operation.
+
+```sh
+dealer setup probe --root . --json
+dealer setup invite-prompt --network team --peer-member bob --ttl 1h --json
+dealer setup binding-preset --host codex --mode fixed --topic collab.request.v4 --session-id review --json
+```
+
+Setup commands print read-only proposals both offline and with dealerd running.
+Choose spawn for independent tasks, fixed for a dedicated conversation, or
+inbox-only for manual handling. Apply generated bindings through validated
+receiver configuration; host availability alone does not verify its CLI contract.
+
 ## Step 1 — same-machine collaboration (zero network config)
 
 Start the local node and address it directly. No `network mount`, passphrase,

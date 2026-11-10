@@ -582,10 +582,11 @@ export class DealerNodeRuntime {
       const mailboxId = resolveBoundMailboxId(kind, binding);
       if (binding.notifyLark !== false) mailboxes.push(mailboxId);
       if (binding.executor !== 'orca-wave' || !(binding.workspacePath || binding.runId || binding.terminalHandle)) continue;
-      const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves } = binding;
+      const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
         workspacePath, worktreeId, runId, terminalHandle, repoRoot: projectRoot,
+        agent: binding.agent as 'antigravity' | 'claude' | 'codex' | undefined, interactiveCommand,
         autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0, rotateAfterWaves,
       });
     }
@@ -667,6 +668,7 @@ export class DealerNodeRuntime {
         const spawnConfig = this.config.executorConfig['orca-spawn'] ?? {};
         const executors: Record<string, ExecutorPlugin> = {
           'orca-spawn': createOrcaSpawnExecutorPlugin({
+            resolveTopicBinding: this.executorTopicBinding,
             ...spawnConfig,
             projectRoots: {
               ...linkedProjectRoots,
@@ -681,6 +683,8 @@ export class DealerNodeRuntime {
           }),
           'agent-pty': createAgentPtyExecutorPlugin({
             ...this.config.executorConfig['agent-pty'],
+            store: this.mailbox,
+            resolveTopicBinding: this.executorTopicBinding,
             commandRunner: runner,
           }),
           inbox: createInboxExecutorPlugin({

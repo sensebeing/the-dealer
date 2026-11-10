@@ -1,3 +1,7 @@
+import { randomBytes } from 'node:crypto';
+import { probeDealerSetup, buildOnboardingPrompts, buildAgentBindingPreset } from './setup.ts';
+import type { SupportedAgentHost, AgentConversationMode } from '../plugins-executor/index.ts';
+import type { SupportedOrcaAgent } from '../orca-workspace/index.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { request } from 'node:http';
@@ -12,9 +16,11 @@ import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, ini
 
 export * from './runtime.ts';
 export * from './config.ts';
+export * from './setup.ts';
 
 const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait'] as const;
 const stringFlags = [
+  'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread',
   'state',
   'limit',
@@ -673,6 +679,34 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
+    if (group === 'setup') {
+      let result: unknown;
+      if (action === 'probe') {
+        result = probeDealerSetup({ stateDir, cwd: v.root });
+      } else if (action === 'binding-preset') {
+        result = buildAgentBindingPreset({
+          host: required(v.host, '--host') as SupportedAgentHost,
+          conversationMode: v.mode as AgentConversationMode | undefined,
+          topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
+          agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
+          targetBot: v['target-bot'], sessionId: v['session-id'],
+        });
+      } else if (action === 'invite-prompt') {
+        const networkId = required(v.network, '--network');
+        const configFile = join(stateDir, 'config.json');
+        const config = options.runtime?.config ?? (existsSync(configFile) ? JSON.parse(readFileSync(configFile, 'utf8')) : {});
+        const existing = config.networks?.find((entry: { networkId: string }) => entry.networkId === networkId);
+        const passphrase = v.passphrase ?? existing?.passphrase ?? randomBytes(32).toString('base64url');
+        const bootstrapPeers = v.seed?.split(',').filter(Boolean) ?? existing?.bootstrapPeers;
+        const inviteUri = encodeNetworkInvite({ networkId, passphrase, bootstrapPeers }, duration(v.ttl));
+        result = buildOnboardingPrompts({ networkId, inviteUri, member: v.member ?? config.member,
+          peerMember: v['peer-member'], nodeName: v.name, seed: bootstrapPeers, projectId: v.project });
+      } else {
+        throw new Error('Unknown setup command');
+      }
+      stdout(JSON.stringify(result, null, v.json ? undefined : 2));
+      return 0;
+    }
     if (!options.runtime && existsSync(join(stateDir, 'control.sock'))) {
       const result = await rpc(join(stateDir, 'control.sock'), argv);
       result.stdout.forEach(line => stdout(line));

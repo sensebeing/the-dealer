@@ -429,7 +429,7 @@ export class WakeupRedriveService {
     let terminalHandle = target.terminalHandle;
     const needsRotation = !preview.deliveryId && target.rotateAfterWaves !== undefined && target.completedWaves >= target.rotateAfterWaves;
     if (!terminalHandle && target.workspacePath && (target.mode === 'orca-terminal' || needsRotation)) {
-      const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath);
+      const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, { agent: target.agent, interactiveCommand: target.interactiveCommand });
       terminalHandle = resolved.handle;
       if (resolved.spawned) {
         if (resolved.shellBootstrapped === true) {
