@@ -17,6 +17,19 @@ import type {
   MessageEnvelope,
 } from '../core-types/index.ts';
 
+export const DEDUP_CAS_DUPLICATE_DETAIL = 'Duplicate or stale claim version';
+
+export function isDedupCasDuplicateReceipt(
+  receipt: { stage?: string; detail?: string } | null | undefined,
+): boolean {
+  return (
+    Boolean(receipt) &&
+    typeof receipt === 'object' &&
+    receipt.stage === 'rejected' &&
+    receipt.detail === DEDUP_CAS_DUPLICATE_DETAIL
+  );
+}
+
 export interface DedupCasOptions {
   entityKey?: (envelope: MessageEnvelope) => string;
   watermarksPath?: string;
@@ -84,7 +97,7 @@ export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): Dispa
       const previous = locks.get(key) ?? Promise.resolve();
       const operation = previous.catch(() => {}).then(async (): Promise<DispatchReceipt> => {
         if ((watermarks.get(key) ?? -1) >= raw) {
-          return { stage: 'rejected', detail: 'Duplicate or stale claim version' };
+          return { stage: 'rejected', detail: DEDUP_CAS_DUPLICATE_DETAIL };
         }
         // Reserve before the external effect: a thrown call can have an unknown outcome.
         // Retrying the same claim would risk duplicate execution; a newer claim can recover it.

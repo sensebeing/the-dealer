@@ -16,7 +16,7 @@ import { createGatePlugin } from '../gate/index.ts';
 import type { NetworkGateService } from '../gate/index.ts';
 import { createDispatcherPlugin } from '../dispatcher/index.ts';
 import { createEmitterPlugin } from '../emitter/index.ts';
-import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin } from '../plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin, isDedupCasDuplicateReceipt } from '../plugins-policy/index.ts';
 import type { WaveCoalescerPolicy } from '../plugins-policy/index.ts';
 import {
   createOrcaSpawnExecutorPlugin,
@@ -53,6 +53,7 @@ export interface ExternalPluginContext {
     createPollWatermarkSourcePlugin: typeof createPollWatermarkSourcePlugin;
     createScriptSourcePlugin: typeof createScriptSourcePlugin;
     createDedupCasPolicyPlugin: typeof createDedupCasPolicyPlugin;
+    isDedupCasDuplicateReceipt: typeof isDedupCasDuplicateReceipt;
     createWaveCoalescerPolicyPlugin: typeof createWaveCoalescerPolicyPlugin;
     createOrcaSpawnExecutorPlugin: typeof createOrcaSpawnExecutorPlugin;
     createOrcaWaveExecutorPlugin: typeof createOrcaWaveExecutorPlugin;
@@ -293,6 +294,7 @@ export class DealerNodeRuntime {
         createPollWatermarkSourcePlugin,
         createScriptSourcePlugin,
         createDedupCasPolicyPlugin,
+        isDedupCasDuplicateReceipt,
         createWaveCoalescerPolicyPlugin,
         createOrcaSpawnExecutorPlugin,
         createOrcaWaveExecutorPlugin,

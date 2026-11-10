@@ -15,7 +15,7 @@ import type { NetworkGateService } from '../packages/gate/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
-import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin } from '../packages/plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, createWaveCoalescerPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, isDedupCasDuplicateReceipt } from '../packages/plugins-policy/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, checkedCommand, runCommand } from '../packages/plugins-executor/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/plugins-executor/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
@@ -114,10 +114,25 @@ test('CAS dedup serializes concurrent equal versions, rejects stale and permits 
   const message = envelope({ idempotencyKey: 'entity', payload: { claimVersion: 2 } });
   const results = await Promise.all([policy.process(message, next), policy.process(envelope({ ...message, id: 'different' }), next)]);
   assert.equal(executions, 1); assert.equal(results[1].stage, 'rejected');
-  assert.equal((await policy.process(envelope({ ...message, payload: { revision: 1 } }), next)).stage, 'rejected');
+  assert.equal(isDedupCasDuplicateReceipt(results[1]), true);
+  const stale = await policy.process(envelope({ ...message, payload: { revision: 1 } }), next);
+  assert.equal(isDedupCasDuplicateReceipt(stale), true);
   assert.equal((await policy.process(envelope({ ...message, payload: { claimVersion: 3 } }), next)).stage, 'dispatched');
   assert.equal(executions, 2);
   assert.equal((await policy.process(envelope({ payload: { claimVersion: 'bad' } }), next)).stage, 'rejected');
+});
+
+test('CAS duplicate receipt classification excludes other outcomes and missing receipts', () => {
+  for (const receipt of [
+    { stage: 'rejected', detail: 'Node admission gate is closed' },
+    { stage: 'rejected', detail: 'Invalid claim version' },
+    { stage: 'dispatched' },
+    { stage: 'failed', detail: DEDUP_CAS_DUPLICATE_DETAIL },
+    null,
+    undefined,
+  ]) {
+    assert.equal(isDedupCasDuplicateReceipt(receipt), false);
+  }
 });
 
 test('wave coalescer buffers busy alerts, batches idle wave, rotates by count and age', async t => {

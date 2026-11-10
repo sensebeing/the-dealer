@@ -656,7 +656,7 @@ export async function createPlugin(config: Record<string, unknown>, context: any
 export default (_config: any, context: any) => {
   const factories = [
     'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
-    'createDedupCasPolicyPlugin', 'createWaveCoalescerPolicyPlugin', 'createOrcaSpawnExecutorPlugin',
+    'createDedupCasPolicyPlugin', 'isDedupCasDuplicateReceipt', 'createWaveCoalescerPolicyPlugin', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
     'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin', 'createInboxExecutorPlugin',
   ];
@@ -667,7 +667,24 @@ export default (_config: any, context: any) => {
   return {
     name: 'user-example',
     apply(ctx: any) {
-      ctx.on('emitter/prepare', (input: any, next: any) => next({ ...input, userPlugin: true, factoryPolicy: policy.name }));
+      ctx.on('emitter/prepare', async (input: any, next: any) => {
+        const envelope = {
+          id: 'api-contract',
+          networkId: 'team',
+          from: { nodeId: 'api-contract-sender' },
+          payload: { claimVersion: 1 },
+        };
+        const dispatch = async () => ({ stage: 'dispatched' });
+        const first = await policy.process(envelope, dispatch);
+        const duplicate = await policy.process(envelope, dispatch);
+        return next({
+          ...input,
+          userPlugin: true,
+          factoryPolicy: policy.name,
+          duplicateReceiptRecognized: context.api.isDedupCasDuplicateReceipt(duplicate),
+          dispatchedReceiptRecognized: context.api.isDedupCasDuplicateReceipt(first),
+        });
+      });
     },
   };
 };
@@ -681,6 +698,8 @@ export default (_config: any, context: any) => {
   assert.equal(afterRestart.body, 'overlay');
   assert.equal(afterRestart.userPlugin, true);
   assert.equal(afterRestart.factoryPolicy, 'dedup-cas');
+  assert.equal(afterRestart.duplicateReceiptRecognized, true);
+  assert.equal(afterRestart.dispatchedReceiptRecognized, false);
   assert.equal((await cli(restored, 'project', 'status')).userPlugins[0].name, 'user-example');
   await cli(restored, 'project', 'unlink', 'demo');
   assert.deepEqual((await cli(restored, 'project', 'list')), []);
