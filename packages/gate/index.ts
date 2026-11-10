@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { isConfirmedHandoffReceipt } from '../plugins-policy/index.ts';
 import { verifyEnvelope } from '../core-types/index.ts';
 import type {
   AdmissionMode,
@@ -21,10 +22,27 @@ export interface GateConfig {
   localNodeId?: string;
 }
 
+export interface DndQueueItem {
+  id: string;
+  envelope: MessageEnvelope;
+  status: 'queued' | 'parked';
+  attempts: number;
+  lastError?: string;
+  updatedAt: string;
+}
+
+type DndEntry = Omit<DndQueueItem, 'id'>;
+
+function revision(envelope: MessageEnvelope): number {
+  const value = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : -1;
+}
+
 export interface NetworkGateService extends GateService {
   getNetworkMode(networkId: string): AdmissionMode;
   setNetworkMode(networkId: string, mode: AdmissionMode): Promise<void>;
-  drainDnd(networkId?: string): Promise<void>;
+  drainDnd(networkId?: string, opts?: { includeParked?: boolean }): Promise<void>;
+  listDndQueue(): readonly DndQueueItem[];
   listRejections(): readonly { envelope: MessageEnvelope; reason: string }[];
 }
 
@@ -32,22 +50,32 @@ function dndKey(envelope: MessageEnvelope): string {
   return JSON.stringify([envelope.networkId, envelope.from.nodeId, envelope.idempotencyKey ?? envelope.id]);
 }
 
-function loadDnd(path: string | undefined, limit: number): Map<string, MessageEnvelope> {
+function loadDnd(path: string | undefined, limit: number): Map<string, DndEntry> {
   if (!path || !existsSync(path)) return new Map();
   try {
     const saved = JSON.parse(readFileSync(path, 'utf8'));
     if (!saved || typeof saved !== 'object' || Array.isArray(saved) ||
         !saved.queued || typeof saved.queued !== 'object' || Array.isArray(saved.queued)) throw new Error();
-    const entries = Object.entries(saved.queued) as [string, MessageEnvelope][];
-    if (entries.length > limit || entries.some(([key, envelope]) =>
-      !verifyEnvelope(envelope) || key !== dndKey(envelope))) throw new Error();
+    const entries: [string, DndEntry][] = Object.entries(saved.queued).map(([key, value]) => {
+      const raw = value as DndEntry & MessageEnvelope;
+      const entry: DndEntry = raw?.envelope ? raw : {
+        envelope: raw, status: 'queued', attempts: 0, updatedAt: raw?.createdAt,
+      };
+      if (!verifyEnvelope(entry.envelope) || key !== dndKey(entry.envelope) ||
+          !['queued', 'parked'].includes(entry.status) ||
+          !Number.isSafeInteger(entry.attempts) || entry.attempts < 0 ||
+          typeof entry.updatedAt !== 'string' || !Number.isFinite(Date.parse(entry.updatedAt)) ||
+          (entry.lastError !== undefined && typeof entry.lastError !== 'string')) throw new Error();
+      return [key, entry];
+    });
+    if (entries.length > limit) throw new Error();
     return new Map(entries);
   } catch {
     throw new Error('Invalid gate DND store');
   }
 }
 
-function persistDnd(path: string, queued: ReadonlyMap<string, MessageEnvelope>): void {
+function persistDnd(path: string, queued: ReadonlyMap<string, DndEntry>): void {
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(temp, 'wx', 0o600);
@@ -79,13 +107,23 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         throw new Error('Invalid DND queue capacity');
       }
       let dnd = loadDnd(config.dndQueuePath, maxDndItems);
-      const updateDnd = (id: string, envelope?: MessageEnvelope) => {
+      const updateDnd = (id: string, entry?: DndEntry) => {
         const updated = new Map(dnd);
-        if (envelope) updated.set(id, structuredClone(envelope));
+        if (entry) updated.set(id, structuredClone(entry));
         else updated.delete(id);
         if (config.dndQueuePath) persistDnd(config.dndQueuePath, updated);
         dnd = updated;
       };
+      const parkDnd = (id: string, envelope: MessageEnvelope, error: unknown) => {
+        const entry = dnd.get(id);
+        if (entry?.envelope.signature !== envelope.signature) return;
+        updateDnd(id, {
+          ...entry, status: 'parked', attempts: entry.attempts + 1,
+          lastError: error instanceof Error ? error.message : String(error),
+          updatedAt: new Date().toISOString(),
+        });
+      };
+      const approving = new Set<string>();
       const trusted = new Set<string>();
       const rejections: { envelope: MessageEnvelope; reason: string }[] = [];
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
@@ -100,7 +138,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         async setMode(value) {
           mode = value;
           if (value === 'open') {
-            for (const network of new Set([...dnd.values()].map(e => e.networkId))) {
+            for (const network of new Set([...dnd.values()].map(e => e.envelope.networkId))) {
               if (service.getNetworkMode(network) === 'open') {
                 await service.drainDnd(network);
               }
@@ -113,31 +151,34 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             await service.drainDnd(id);
           }
         },
-        drainDnd(networkId) {
+        drainDnd(networkId, opts) {
           const operation = draining.catch(() => {}).then(async () => {
             const errors: unknown[] = [];
             // Snapshot once: failed or re-queued items never spin within this drain.
-            for (const [id, envelope] of [...dnd]) {
+            for (const [id, entry] of [...dnd]) {
+              if (entry.status === 'parked' && opts?.includeParked !== true) continue;
+              const { envelope } = entry;
               if (networkId && envelope.networkId !== networkId) continue;
               if (service.getNetworkMode(envelope.networkId) !== 'open') continue;
               try {
                 if (!verifyEnvelope(envelope)) throw new Error('Invalid queued envelope signature');
                 const verdict = await service.evaluate(envelope);
                 if (verdict.status === 'reject') {
-                  if (dnd.get(id)?.signature === envelope.signature) updateDnd(id);
+                  if (dnd.get(id)?.envelope.signature === envelope.signature) updateDnd(id);
                   continue;
                 }
                 // Approval queues are volatile; retain the durable copy until approval succeeds.
                 if (verdict.status !== 'allow') continue;
                 if (service.getNetworkMode(envelope.networkId) !== 'open') continue;
                 const receipt = await ctx.services.dispatcher.dispatch(envelope);
-                if (receipt.stage !== 'failed') {
+                if (isConfirmedHandoffReceipt(receipt, { allowQueued: true })) {
                   // A concurrently admitted newer envelope must not be deleted with this one.
-                  if (dnd.get(id)?.signature === envelope.signature) updateDnd(id);
+                  if (dnd.get(id)?.envelope.signature === envelope.signature) updateDnd(id);
                 } else {
-                  errors.push(new Error(receipt.detail ?? 'DND dispatch failed'));
+                  throw new Error(`Unconfirmed DND handoff (${receipt.stage}): ${receipt.detail ?? 'no durable handoff evidence'}`);
                 }
               } catch (error) {
+                parkDnd(id, envelope, error);
                 errors.push(error);
               }
             }
@@ -223,13 +264,17 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             if (!dnd.has(id) && dnd.size >= maxDndItems) {
               return { status: 'reject', code: 'dnd_queue_full', reason: 'DND queue capacity exceeded' };
             }
-            updateDnd(id, envelope);
+            const existing = dnd.get(id);
+            if (!existing || revision(envelope) > revision(existing.envelope)) {
+              updateDnd(id, { envelope, status: 'queued', attempts: 0, updatedAt: new Date().toISOString() });
+            }
             return { ...verdict, durable: Boolean(config.dndQueuePath) };
           } else if (verdict.status === 'reject') {
             rejections.push({ envelope: structuredClone(envelope), reason: verdict.reason });
           }
           return verdict;
         },
+        listDndQueue: () => structuredClone([...dnd].map(([id, entry]) => ({ id, ...entry }))),
         listPendingApprovals: () => structuredClone([...pending.values()]),
         listRejections: () => structuredClone(rejections),
         async approve(id, opts) {
@@ -237,15 +282,21 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
           if (!item) {
             throw new Error(`Unknown approval: ${id}`);
           }
-          pending.delete(id);
+          if (approving.has(id)) throw new Error(`Approval already in progress: ${id}`);
+          approving.add(id);
           try {
             const receipt = await ctx.services.dispatcher.dispatch(item.envelope);
-            if (receipt.stage === 'failed') throw new Error(receipt.detail ?? 'Approval dispatch failed');
+            if (!isConfirmedHandoffReceipt(receipt, { allowQueued: true })) {
+              throw new Error(`Unconfirmed approval handoff (${receipt.stage}): ${receipt.detail ?? 'no durable handoff evidence'}`);
+            }
             const queuedId = dndKey(item.envelope);
-            if (dnd.get(queuedId)?.signature === item.envelope.signature) updateDnd(queuedId);
+            if (dnd.get(queuedId)?.envelope.signature === item.envelope.signature) updateDnd(queuedId);
+            pending.delete(id);
           } catch (error) {
-            pending.set(id, item);
+            parkDnd(dndKey(item.envelope), item.envelope, error);
             throw error;
+          } finally {
+            approving.delete(id);
           }
           if (opts?.trustSender) {
             for (const k of trustKeys(item.envelope)) {
@@ -260,7 +311,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
           }
           pending.delete(id);
           const queuedId = dndKey(item.envelope);
-          if (dnd.get(queuedId)?.signature === item.envelope.signature) updateDnd(queuedId);
+          if (dnd.get(queuedId)?.envelope.signature === item.envelope.signature) updateDnd(queuedId);
           rejections.push({ envelope: item.envelope, reason });
         },
       };

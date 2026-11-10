@@ -14,7 +14,7 @@ import { createNodePlugin, PeerDirectoryService } from '../node/index.ts';
 import { createRouterPlugin } from '../router/index.ts';
 import { createGatePlugin } from '../gate/index.ts';
 import type { NetworkGateService } from '../gate/index.ts';
-import { createDispatcherPlugin } from '../dispatcher/index.ts';
+import { createDispatcherPlugin, DeliveryLedger } from '../dispatcher/index.ts';
 import { createEmitterPlugin } from '../emitter/index.ts';
 import { createDedupCasPolicyPlugin, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../plugins-policy/index.ts';
 import {
@@ -663,6 +663,24 @@ export class DealerNodeRuntime {
           const registration = ctx.services.dispatcher.registerPolicy(
             createDedupCasPolicyPlugin({
               watermarksPath: join(this.stateDir, 'dedup-watermarks.json'),
+              resolveLegacyWatermarkStatus: (key, revision) => {
+                const parts: unknown = JSON.parse(key);
+                if (!Array.isArray(parts) || parts.length !== 3 || parts.some(part => typeof part !== 'string')) {
+                  return 'unknown';
+                }
+                const [networkId, senderNodeId, entityId] = parts;
+                const receipt = new DeliveryLedger(join(this.stateDir, 'deliveries.json')).get(key);
+                if (this.mailbox.hasConfirmedEnvelope(networkId, senderNodeId, entityId, revision) ||
+                    receipt?.stage === 'dispatched' || receipt?.stage === 'settled') return 'settled';
+                if (isDurableQueuedReceipt(receipt) || this.gate.listDndQueue().some(item => {
+                  const envelope = item.envelope;
+                  const value = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
+                  return item.status === 'queued' && envelope.networkId === networkId &&
+                    envelope.from.nodeId === senderNodeId && (envelope.idempotencyKey ?? envelope.id) === entityId &&
+                    typeof value === 'number' && Number.isSafeInteger(value) && value >= revision;
+                })) return 'queued';
+                return 'unknown';
+              },
             }),
           );
           ctx.effect(() => () => registration.dispose());

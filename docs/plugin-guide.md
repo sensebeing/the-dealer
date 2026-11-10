@@ -106,7 +106,8 @@ export function createPlugin(config, context) {
 }
 ```
 
-The host also exposes `isDurableQueuedReceipt(receipt)` and
+The host also exposes `isConfirmedHandoffReceipt(receipt, { allowQueued?: boolean })`,
+`isDurableQueuedReceipt(receipt)` and
 `isDedupCasDuplicateReceipt(receipt, { allowQueued?: boolean })`. The latter
 recognizes only durable confirmed handoffs (settled by default, queued when
 explicitly allowed). An unknown external outcome is never a confirmed duplicate.
@@ -114,7 +115,16 @@ Dedup watermarks persist `revision` and `status` (`unknown`, `queued`, `settled`
 definite pre-execution failures and non-durable queues release their reservation.
 Runtime DND envelopes persist in `gate-dnd.json` before a durable queued receipt
 is signed. Recovery drains only open mounted networks after project and user
-admission rules have loaded, retaining failed deliveries for reconciliation.
+admission rules have loaded. Only confirmed handoffs clear DND or approval obligations.
+Unconfirmed results park the full signed DND envelope with attempts, lastError and
+updatedAt; inspect via `gate.listDndQueue()` and explicitly retry via
+`gate.drainDnd(networkId, { includeParked: true })`. Default drains skip parked
+entries; a strictly newer integer revision resets an entry to queued.
+Legacy numeric watermarks upgrade atomically to unknown unless
+`resolveLegacyWatermarkStatus(key, revision)` supplies durable corroboration.
+Runtime uses verified mailbox envelopes or dispatched/settled delivery records
+for settled status, and durable queued receipts or queued DND entries for queued
+status; failed, dispatching and absent evidence remain unknown.
 
 The factory context includes `projectRoot` (project plugins only), `stateDir`,
 `runtime`, the parsed `userPatch`, and `api`. The `api` bag exposes the built-in

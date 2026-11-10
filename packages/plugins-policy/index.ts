@@ -46,23 +46,41 @@ export function isDedupCasDuplicateReceipt(
   return handoff === 'settled' || (Boolean(options?.allowQueued) && handoff === 'queued');
 }
 
+export function isConfirmedHandoffReceipt(
+  receipt: HandoffReceipt | null | undefined,
+  options?: { allowQueued?: boolean },
+): boolean {
+  return receipt?.stage === 'dispatched' || receipt?.stage === 'settled' ||
+    (Boolean(options?.allowQueued) && isDurableQueuedReceipt(receipt)) ||
+    isDedupCasDuplicateReceipt(receipt, options);
+}
+
 export interface DedupCasOptions {
   entityKey?: (envelope: MessageEnvelope) => string;
   watermarksPath?: string;
+  resolveLegacyWatermarkStatus?: (key: string, revision: number) => DedupWatermarkStatus;
 }
 
-function loadWatermarks(path: string): Record<string, DedupWatermarkEntry> {
+function loadWatermarks(path: string, options: DedupCasOptions): Record<string, DedupWatermarkEntry> {
   if (!existsSync(path)) return {};
   try {
     const saved: unknown = JSON.parse(readFileSync(path, 'utf8'));
     if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error();
-    return Object.fromEntries(Object.entries(saved).map(([key, value]) => {
-      const entry = typeof value === 'number' ? { revision: value, status: 'settled' } : value;
+    let upgraded = false;
+    const normalized = Object.fromEntries(Object.entries(saved).map(([key, value]) => {
+      const legacy = typeof value === 'number';
+      if (legacy && (!Number.isSafeInteger(value) || value < 0)) throw new Error();
+      upgraded ||= legacy;
+      const entry = legacy
+        ? { revision: value, status: options.resolveLegacyWatermarkStatus?.(key, value) ?? 'unknown' }
+        : value;
       if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
           !Number.isSafeInteger(entry.revision) || entry.revision < 0 ||
           !['unknown', 'queued', 'settled'].includes(entry.status)) throw new Error();
       return [key, { revision: entry.revision, status: entry.status }];
     }));
+    if (upgraded) persistWatermarks(path, new Map(Object.entries(normalized)));
+    return normalized;
   } catch {
     throw new Error('Invalid dedup watermark store');
   }
@@ -89,7 +107,7 @@ function persistWatermarks(path: string, watermarks: ReadonlyMap<string, DedupWa
 
 export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): DispatchPolicyPlugin {
   const watermarks = new Map<string, DedupWatermarkEntry>(
-    options.watermarksPath ? Object.entries(loadWatermarks(options.watermarksPath)) : [],
+    options.watermarksPath ? Object.entries(loadWatermarks(options.watermarksPath, options)) : [],
   );
   const locks = new Map<string, Promise<unknown>>();
   return {

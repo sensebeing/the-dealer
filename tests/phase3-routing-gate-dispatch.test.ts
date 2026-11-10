@@ -15,7 +15,7 @@ import type { NetworkGateService } from '../packages/gate/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
-import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../packages/plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace } from '../packages/plugins-executor/index.ts';
 import { checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
@@ -1039,7 +1039,8 @@ test('CAS durable handoff states distinguish settled, queued, unknown and legacy
   const never = async () => { throw new Error('Must not execute'); };
   await writeFile(watermarksPath, JSON.stringify({ [key]: 2 }));
   let policy = createDedupCasPolicyPlugin({ watermarksPath });
-  assert.equal(isDedupCasDuplicateReceipt(await policy.process(message, never)), true);
+  assert.equal(isDedupCasDuplicateReceipt(await policy.process(message, never)), false);
+  assert.deepEqual(JSON.parse(await readFile(watermarksPath, 'utf8'))[key], { revision: 2, status: 'unknown' });
   for (const stage of ['dispatched', 'settled', 'queued', 'failed', 'dispatching'] as const) {
     await writeFile(watermarksPath, '{}');
     policy = createDedupCasPolicyPlugin({ watermarksPath });
@@ -1140,8 +1141,8 @@ test('DND keeps failures durable, drains later items, and rejects corrupt or ove
   assert.equal(calls.length, 1);
   assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 1);
   dispatcher.registerExecutor({ name: 'missing', async execute() { throw new Error('external failure'); } }, {});
-  await assert.rejects(gate.drainDnd(), /DND drain failed/);
-  await assert.rejects(gate.drainDnd(), /DND drain failed/);
+  await assert.rejects(gate.drainDnd(undefined, { includeParked: true }), /DND drain failed/);
+  await assert.rejects(gate.drainDnd(undefined, { includeParked: true }), /DND drain failed/);
   assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 1);
   const invalid = { ...missing, body: 'tampered' };
   const validKey = JSON.stringify([missing.networkId, missing.from.nodeId, missing.id]);
@@ -1186,4 +1187,99 @@ test('DND rechecks network mode mid-drain and retains approval items across rest
   await second.gate.reject(reject.id);
   assert.equal(second.calls.length, 1);
   assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), { queued: {} });
+});
+
+test('DND and approval retain every unconfirmed handoff and only clear confirmed receipts', async t => {
+  const receipts = [
+    { stage: 'dispatching' as const },
+    { stage: 'failed' as const, detail: 'executor failed' },
+    { stage: 'rejected' as const, detail: DEDUP_CAS_AMBIGUOUS_DETAIL },
+    { stage: 'rejected' as const, detail: 'policy denied' },
+    { stage: 'queued' as const },
+    { stage: 'rejected' as const, detail: DEDUP_CAS_DUPLICATE_DETAIL },
+    { stage: 'dispatched' as const },
+    { stage: 'settled' as const },
+    { stage: 'queued' as const, executionReceipt: { executor: 'test', executionId: 'q', durable: true } },
+    { stage: 'rejected' as const, detail: DEDUP_CAS_DUPLICATE_DETAIL,
+      executionReceipt: { executor: 'dedup-cas', executionId: 'd', durable: true, handoff: 'settled' } },
+    { stage: 'rejected' as const, detail: DEDUP_CAS_DUPLICATE_DETAIL,
+      executionReceipt: { executor: 'dedup-cas', executionId: 'd', durable: true, handoff: 'queued' } },
+    null,
+  ];
+  for (const approval of [false, true]) {
+    for (const [index, receipt] of receipts.entries()) {
+      const dir = await mkdtemp(join(tmpdir(), 'dealer-handoff-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const path = join(dir, 'dnd.json');
+      const { gate, dispatcher } = await setup(t, { mode: 'dnd', dndQueuePath: path });
+      const message = envelope();
+      await gate.evaluate(message);
+      dispatcher.registerPolicy({ name: 'handoff', async process() {
+        if (!receipt) throw new Error('external timeout');
+        return receipt;
+      } });
+      if (approval) {
+        gate.registerRule({ name: 'review', priority: 1, async evaluate() {
+          return { status: 'pending_approval', approvalId: message.id, reason: 'review' };
+        } });
+        await gate.setMode('open');
+      }
+      const operation = approval ? gate.approve(message.id) : gate.setMode('open');
+      const confirmed = index >= 6 && receipt !== null;
+      assert.equal(isConfirmedHandoffReceipt(receipt, { allowQueued: true }), confirmed);
+      if (confirmed) {
+        await operation;
+        assert.equal(gate.listDndQueue().length, 0);
+        assert.equal(gate.listPendingApprovals().length, 0);
+      } else {
+        await assert.rejects(operation);
+        const [item] = gate.listDndQueue();
+        assert.deepEqual(item.envelope, message);
+        assert.equal(item.status, 'parked');
+        assert.equal(item.attempts, 1);
+        assert.ok(item.lastError);
+        assert.equal(JSON.parse(await readFile(path, 'utf8')).queued[item.id].status, 'parked');
+        assert.equal(gate.listPendingApprovals().length, approval ? 1 : 0);
+        await gate.drainDnd();
+        assert.equal(gate.listDndQueue()[0].attempts, 1);
+      }
+    }
+  }
+});
+
+test('DND legacy loading, revision admission and signature CAS preserve newer obligations', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-cas-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'dnd.json');
+  const old = envelope({ idempotencyKey: 'entity', payload: { revision: 2 } });
+  const key = JSON.stringify([old.networkId, old.from.nodeId, 'entity']);
+  await writeFile(path, JSON.stringify({ queued: { [key]: old } }));
+  const { gate, dispatcher } = await setup(t, { mode: 'dnd', dndQueuePath: path });
+  assert.deepEqual(gate.listDndQueue()[0], {
+    id: key, envelope: old, status: 'queued', attempts: 0, updatedAt: old.createdAt,
+  });
+  const failed = dispatcher.registerPolicy({ name: 'fail', async process() { return { stage: 'dispatching' }; } });
+  await assert.rejects(gate.setMode('open'));
+  await gate.setMode('dnd');
+  const parked = gate.listDndQueue()[0];
+  for (const message of [old, envelope({ ...old, id: 'equal' }), envelope({ ...old, payload: { revision: 1 } })]) {
+    await gate.evaluate(message);
+    assert.deepEqual(gate.listDndQueue()[0], parked);
+  }
+  failed.dispose();
+  const newer = envelope({ ...old, id: 'newer', payload: { claimVersion: 3 } });
+  await gate.evaluate(newer);
+  assert.equal(gate.listDndQueue()[0].status, 'queued');
+  assert.equal(gate.listDndQueue()[0].attempts, 0);
+  const newest = envelope({ ...old, id: 'newest', payload: { claimVersion: 4 } });
+  dispatcher.registerPolicy({ name: 'concurrent-newer', async process() {
+    await gate.setMode('dnd');
+    await gate.evaluate(newest);
+    return { stage: 'dispatched' };
+  } });
+  await gate.setMode('open');
+  assert.deepEqual(gate.listDndQueue()[0].envelope, newest);
+  const clone = gate.listDndQueue()[0];
+  clone.envelope.body = 'mutated snapshot';
+  assert.deepEqual(gate.listDndQueue()[0].envelope, newest);
 });

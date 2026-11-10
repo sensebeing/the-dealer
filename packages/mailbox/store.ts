@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { isValidMailboxId, validateSemanticHeader } from '../core-types/index.ts';
+import { isValidMailboxId, validateSemanticHeader, verifyEnvelope } from '../core-types/index.ts';
 import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-types/index.ts';
 
 export const MAILBOX_SCHEMA = 'the-dealer-mailbox/v1';
@@ -1199,6 +1199,15 @@ export class MailboxStore {
       this.events.emit('target', wakeMailbox);
     }
     return result;
+  }
+
+  hasConfirmedEnvelope(networkId: string, senderNodeId: string, entityId: string, minRevision: number): boolean {
+    return this.read().items.some(({ envelope }) => {
+      const revision = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
+      return verifyEnvelope(envelope) && envelope.networkId === networkId &&
+        envelope.from.nodeId === senderNodeId && (envelope.idempotencyKey ?? envelope.id) === entityId &&
+        typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= minRevision;
+    });
   }
 
   list(options: MailboxListOptions = {}): MailboxListResult {

@@ -7,6 +7,9 @@ import { join, resolve as resolvePath } from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   DealerNodeRuntime,
+  generateNodeKeyPair,
+  signEnvelope,
+  isDedupCasDuplicateReceipt,
   runDealerCli,
   getBuiltInProfile,
   readPatch,
@@ -851,6 +854,118 @@ test('Phase 4: failed restored DND delivery stays ledger-fenced without preventi
   const again = new DealerNodeRuntime(options);
   await again.start();
   t.after(() => again.stop());
-  assert.match(again.lastError!, /DND drain failed/);
+  assert.equal(again.lastError, undefined);
+  assert.equal(again.gate.listDndQueue()[0].status, 'parked');
+  assert.equal(again.gate.listDndQueue()[0].attempts, 1);
   assert.deepEqual(calls, ['failure', 'success'], 'unknown external effects are never replayed');
+});
+
+test('Phase 4: both DND crash windows park the signed obligation across restart and newer revision recovers', async t => {
+  for (const crash of ['watermark', 'ledger'] as const) {
+    const root = directory(t);
+    const runtime = await node(t, root, crash, {
+      patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
+    });
+    await cli(runtime, 'network', 'mount', 'sensebeing', '--passphrase', 'team-secret');
+    const keys = generateNodeKeyPair();
+    const message = signEnvelope({
+      id: 'crashed', traceId: 'crash', networkId: 'sensebeing',
+      from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' },
+      routing: { mode: 'unicast', targets: [runtime.node.getSelfCard('sensebeing').nodeId] },
+      kind: 'task', subject: 'recover me', body: 'full obligation', attachments: [],
+      priority: 'normal', createdAt: new Date().toISOString(), payload: { revision: 1 },
+      idempotencyKey: 'crash-entity',
+    }, keys.privateKeyPem);
+    await runtime.gate.evaluate(message);
+    const stateDir = runtime.stateDir;
+    await runtime.stop();
+    if (crash === 'watermark') {
+      const key = JSON.stringify([message.networkId, keys.nodeId, message.idempotencyKey]);
+      writeFileSync(join(stateDir, 'dedup-watermarks.json'), JSON.stringify({ [key]: { revision: 1, status: 'unknown' } }));
+    } else {
+      const key = JSON.stringify([message.networkId, keys.nodeId, message.id]);
+      writeFileSync(join(stateDir, 'deliveries.json'), JSON.stringify({ [key]: { stage: 'dispatching' } }));
+    }
+    const restarted = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'mesh') }, patch: { gateMode: 'open' } });
+    await restarted.start();
+    t.after(() => restarted.stop());
+    assert.match(restarted.lastError!, /DND drain failed/);
+    assert.equal(restarted.mailbox.list().totalCount, 0);
+    const [parked] = restarted.gate.listDndQueue();
+    assert.deepEqual(parked.envelope, message);
+    assert.equal(parked.status, 'parked');
+    assert.equal(parked.attempts, 1);
+    assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')).queued[parked.id].envelope, message);
+    await restarted.gate.drainDnd();
+    assert.equal(restarted.gate.listDndQueue()[0].attempts, 1);
+    await restarted.gate.setMode('dnd');
+    const newer = signEnvelope({ ...message, id: 'recovery', payload: { revision: 2 } }, keys.privateKeyPem);
+    await restarted.gate.evaluate(newer);
+    await restarted.gate.setMode('open');
+    assert.equal(restarted.gate.listDndQueue().length, 0);
+    assert.deepEqual(restarted.mailbox.list().items[0].envelope, newer);
+    await restarted.stop();
+  }
+});
+
+test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists status and fences unknown execution', async t => {
+  for (const evidence of ['mailbox', 'dispatched', 'settled', 'failed', 'dispatching', 'missing', 'queued-receipt', 'dnd', 'parked', 'tampered-mailbox'] as const) {
+    const root = directory(t);
+    const runtime = await node(t, root, evidence, {
+      patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
+    });
+    await cli(runtime, 'network', 'mount', 'sensebeing', '--passphrase', 'team-secret');
+    const keys = generateNodeKeyPair();
+    const message = signEnvelope({
+      id: 'legacy', traceId: 'legacy', networkId: 'sensebeing',
+      from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' },
+      routing: { mode: 'unicast', targets: [runtime.node.getSelfCard('sensebeing').nodeId] },
+      kind: 'task', subject: 'legacy', body: 'legacy obligation', attachments: [],
+      priority: 'normal', createdAt: new Date().toISOString(), payload: { claimVersion: 2 },
+    }, keys.privateKeyPem);
+    const key = JSON.stringify([message.networkId, keys.nodeId, message.id]);
+    if (evidence === 'mailbox' || evidence === 'tampered-mailbox') {
+      runtime.mailbox.enqueue([evidence === 'mailbox' ? message : { ...message, body: 'tampered' }]);
+    }
+    if (evidence === 'dnd' || evidence === 'parked') await runtime.gate.evaluate(message);
+    const stateDir = runtime.stateDir;
+    await runtime.stop();
+    writeFileSync(join(stateDir, 'dedup-watermarks.json'), JSON.stringify({ [key]: 2 }));
+    if (['dispatched', 'settled', 'failed', 'dispatching'].includes(evidence)) {
+      writeFileSync(join(stateDir, 'deliveries.json'), JSON.stringify({ [key]: { stage: evidence } }));
+    }
+    if (evidence === 'queued-receipt') {
+      writeFileSync(join(stateDir, 'deliveries.json'), JSON.stringify({ [key]: {
+        stage: 'queued', executionReceipt: { executor: 'inbox', executionId: 'queued', durable: true },
+      } }));
+    }
+    if (evidence === 'parked') {
+      const path = join(stateDir, 'gate-dnd.json');
+      const saved = JSON.parse(readFileSync(path, 'utf8'));
+      saved.queued[key].status = 'parked';
+      writeFileSync(path, JSON.stringify(saved));
+    }
+    const options = { stateDir, transport: { discoveryDir: join(root, 'mesh') } };
+    const restarted = new DealerNodeRuntime(options);
+    await restarted.start();
+    const status = ['mailbox', 'dispatched', 'settled'].includes(evidence) ? 'settled'
+      : ['dnd', 'queued-receipt'].includes(evidence) ? 'queued' : 'unknown';
+    const path = join(stateDir, 'dedup-watermarks.json');
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8'))[key], { revision: 2, status }, evidence);
+    await restarted.stop();
+    const again = new DealerNodeRuntime(options);
+    await again.start();
+    t.after(() => again.stop());
+    const retry = signEnvelope({ ...message, id: 'retry', idempotencyKey: message.id }, keys.privateKeyPem);
+    const receipt = await again.kernel.ctx.services.dispatcher.dispatch(retry);
+    assert.equal(receipt.executionReceipt?.handoff, status, evidence);
+    assert.equal(isDedupCasDuplicateReceipt(receipt), status === 'settled', evidence);
+    assert.equal(isDedupCasDuplicateReceipt(receipt, { allowQueued: true }), status !== 'unknown', evidence);
+    if (status === 'unknown') {
+      const newer = signEnvelope({ ...message, id: 'newer', idempotencyKey: message.id, payload: { claimVersion: 3 } }, keys.privateKeyPem);
+      assert.equal((await again.kernel.ctx.services.dispatcher.dispatch(newer)).stage, 'dispatched', evidence);
+      assert.equal(again.mailbox.hasConfirmedEnvelope(message.networkId, keys.nodeId, message.id, 3), true);
+    }
+    await again.stop();
+  }
 });
