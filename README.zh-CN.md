@@ -18,6 +18,38 @@ The Dealer 把独立的 Agent 会话连接为协作网络，统一处理路由�
 
 [English](README.md) | 简体中文
 
+### 宿主 Profile 与一键预设
+
+| 环境 | 内置 Profile | 一等执行器 |
+| --- | --- | --- |
+| Orca | `orca-dev` | `orca-spawn`、`orca-wave` |
+| Codex | `codex-dev` | `codex` |
+| Claude Code | `claude-dev` | `claude-code` |
+| Antigravity | `antigravity-dev` | `antigravity`（独立 `agy`） |
+
+四种 Profile 均使用 `approval_required` 与 `dedup-cas`。三个新增一等执行器默认
+`spawn`，也支持 `fixed`；既有 `agent-pty` 配置继续有效。
+
+```sh
+dealer node up --profile codex-dev --json
+dealer setup apply-preset --host codex --mode fixed --topic collab.request.v4 --session-id <thread> --set-default --json
+```
+
+`apply-preset` 保存绑定、启用所需执行器并合并执行器配置，支持离线和运行中守护进程，
+无需重启。省略 `--set-default` 保留节点默认执行器；`--mode inbox-only` 仅进入持久化信箱。
+可选参数包括 `--project`、`--workspace-path`、`--agent`、`--agent-profile`、
+`--target-bot`、`--session-id`；`--notify-lark` 只设置通知资格，凭证和目标另行配置。
+
+为保持兼容，应用的绑定与 `binding-preset` 相同：Orca/Antigravity 使用受管的
+`orca-spawn`/`orca-wave`，Codex/Claude Code 使用 `agent-pty`；`--set-default`
+将未绑定消息的默认执行器设为对应一等执行器（inbox-only 则为 `inbox`）。
+直接使用一等执行器的主题绑定见 [宿主 Patch](examples/user-patches/) 中的
+`orca.patch.json`、`codex.patch.json`、`claude-code.patch.json`、`antigravity.patch.json`。
+可运行 `dealer node up --patch examples/user-patches/codex.patch.json --json`，
+或用 `dealer project link <repo> --user-patch <file>` 加载主题绑定。
+项目用户 Patch 不改变节点级 Profile，需在启动节点时启用对应 Profile。
+固定会话需填入接收端工作区和真实会话 ID，并核对本机 CLI 参数支持。
+
 ## 30 秒接入 —— 复制提示词发给你的 Agent
 
 ### 提示词 1：在本机启动或加入 —— 粘贴给 Claude Code / Codex / Antigravity / Orca

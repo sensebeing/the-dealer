@@ -19,7 +19,7 @@ export * from './runtime.ts';
 export * from './config.ts';
 export * from './setup.ts';
 
-const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait'] as const;
+const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread',
@@ -680,7 +680,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
-    if (group === 'setup') {
+    if (group === 'setup' && action !== 'apply-preset') {
       let result: unknown;
       if (action === 'probe') {
         result = probeDealerSetup({ stateDir, cwd: v.root });
@@ -768,7 +768,16 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     await runtime.start();
     let result: unknown;
     const network = v.network as string | undefined;
-    if (group === 'ask' || group === 'reply' || group === 'settle') {
+    if (group === 'setup' && action === 'apply-preset') {
+      result = runtime.applyAgentPreset({
+        host: required(v.host, '--host') as SupportedAgentHost,
+        conversationMode: v.mode as AgentConversationMode | undefined,
+        topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
+        agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
+        targetBot: v['target-bot'], sessionId: v['session-id'],
+        notifyLark: v['notify-lark'], setDefault: v['set-default'],
+      });
+    } else if (group === 'ask' || group === 'reply' || group === 'settle') {
       result = await runSessionCommand(runtime, group, action, v);
     } else if (group === 'project') {
       if (action === 'link') {

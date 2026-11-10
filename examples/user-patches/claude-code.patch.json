@@ -1,0 +1,17 @@
+{
+  "profile": "claude-dev",
+  "defaultExecutor": "claude-code",
+  "topicBindings": {
+    "collab.request.v4": {
+      "executor": "claude-code",
+      "conversationMode": "spawn"
+    }
+  },
+  "executors": [
+    "claude-code",
+    "agent-pty",
+    "notify",
+    "inbox"
+  ],
+  "gateMode": "approval_required"
+}

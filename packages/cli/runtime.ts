@@ -20,6 +20,9 @@ import { createDedupCasPolicyPlugin, isConfirmedHandoffReceipt, isDedupCasDuplic
 import {
   createOrcaSpawnExecutorPlugin,
   createOrcaWaveExecutorPlugin,
+  createCodexExecutorPlugin,
+  createClaudeCodeExecutorPlugin,
+  createAntigravityExecutorPlugin,
   createAgentPtyExecutorPlugin,
   createNotifyExecutorPlugin,
   createInboxExecutorPlugin,
@@ -40,6 +43,7 @@ import {
   validatePluginRefs,
   validateTopicBindings,
 } from './config.ts';
+import { buildAgentBindingPreset } from './setup.ts';
 import type { RuntimeConfig, TopicBindingConfig, PluginSpec, DealerProjectPluginRef, DealerProjectManifest } from './config.ts';
 
 export interface ExternalPluginContext {
@@ -65,6 +69,9 @@ export interface ExternalPluginContext {
     isDurableQueuedReceipt: typeof isDurableQueuedReceipt;
     createOrcaSpawnExecutorPlugin: typeof createOrcaSpawnExecutorPlugin;
     createOrcaWaveExecutorPlugin: typeof createOrcaWaveExecutorPlugin;
+    createCodexExecutorPlugin: typeof createCodexExecutorPlugin;
+    createClaudeCodeExecutorPlugin: typeof createClaudeCodeExecutorPlugin;
+    createAntigravityExecutorPlugin: typeof createAntigravityExecutorPlugin;
     createAgentPtyExecutorPlugin: typeof createAgentPtyExecutorPlugin;
     createNotifyExecutorPlugin: typeof createNotifyExecutorPlugin;
     createInboxExecutorPlugin: typeof createInboxExecutorPlugin;
@@ -145,6 +152,7 @@ export class DealerNodeRuntime {
   private loadedUserPlugins = new Map<string, LoadedExternalPlugin>();
   private externalChanges: Promise<unknown> = Promise.resolve();
   private server?: Server;
+  private registerBuiltinExecutor?: (name: string) => void;
   private started = false;
   private ownsLock = false;
   lastError?: string;
@@ -241,8 +249,9 @@ export class DealerNodeRuntime {
         this.config.executors = [...this.config.executors, 'inbox'];
       }
       if (this.config.profile === 'personal-dev' && this.options.patch?.executors === undefined
-        && Array.isArray(this.config.executors) && !this.config.executors.includes('agent-pty')) {
-        this.config.executors = [...this.config.executors, 'agent-pty'];
+        && Array.isArray(this.config.executors)
+        && this.config.executors.every(name => ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'].includes(name))) {
+        this.config.executors = [...new Set([...this.config.executors, 'agent-pty', 'codex', 'claude-code', 'antigravity'])];
       }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config);
@@ -301,8 +310,7 @@ export class DealerNodeRuntime {
       await this.kernel.use(
         createDispatcherPlugin({
           ledgerPath: join(this.stateDir, 'deliveries.json'),
-          defaultExecutor: this.config.defaultExecutor,
-          resolveKindExecutor: (kind, streamKey) => this.resolveTopicDefaultExecutor(kind, streamKey),
+          resolveKindExecutor: (kind, streamKey) => this.resolveTopicDefaultExecutor(kind, streamKey) ?? this.config.defaultExecutor,
         }),
       );
       await this.kernel.use(
@@ -395,6 +403,9 @@ export class DealerNodeRuntime {
         isDurableQueuedReceipt,
         createOrcaSpawnExecutorPlugin,
         createOrcaWaveExecutorPlugin,
+        createCodexExecutorPlugin,
+        createClaudeCodeExecutorPlugin,
+        createAntigravityExecutorPlugin,
         createAgentPtyExecutorPlugin,
         createNotifyExecutorPlugin,
         createInboxExecutorPlugin,
@@ -612,6 +623,26 @@ export class DealerNodeRuntime {
     return resolved ? { ...resolved.binding, repoRoot: resolved.projectRoot } : undefined;
   };
 
+  applyAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { setDefault?: boolean }) {
+    const preset = buildAgentBindingPreset(options);
+    const host = options.host === 'claude' ? 'claude-code' : options.host;
+    const mode = options.conversationMode ?? 'fixed';
+    const defaultExecutor = !options.setDefault ? this.config.defaultExecutor
+      : mode === 'inbox-only' ? 'inbox'
+      : host === 'orca' ? 'orca-spawn'
+      : ['codex', 'claude-code', 'antigravity'].includes(host) ? host : preset.binding.executor;
+    this.config.executors = [...new Set([...this.config.executors, preset.binding.executor, defaultExecutor])];
+    this.config.topicBindings = { ...this.config.topicBindings, [preset.topic]: preset.binding };
+    for (const [name, config] of Object.entries(preset.executorConfig)) {
+      this.config.executorConfig[name] = { ...this.config.executorConfig[name], ...config };
+    }
+    this.config.defaultExecutor = defaultExecutor;
+    for (const name of this.config.executors) this.registerBuiltinExecutor?.(name);
+    this.refreshTopicBindings();
+    this.persist();
+    return { applied: preset.topic, host, mode, defaultExecutor, binding: preset.binding, executorConfig: preset.executorConfig };
+  }
+
   private refreshTopicBindings(): void {
     const kinds = new Set(Object.keys(this.config.topicBindings ?? {}));
     for (const project of this.loadedProjects.values()) {
@@ -623,7 +654,7 @@ export class DealerNodeRuntime {
       const mailboxId = resolveBoundMailboxId(kind, binding);
       const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
-          ['orca-wave', 'orca-spawn', 'agent-pty'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
+          ['orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'claude-code', 'antigravity'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
       if (notifyLark) mailboxes.push(mailboxId);
       if (binding.executor !== 'orca-wave' || !(binding.workspacePath || binding.runId || binding.terminalHandle)) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
@@ -727,6 +758,24 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: runner,
           }),
+          'codex': createCodexExecutorPlugin({
+            ...this.config.executorConfig['codex'],
+            store: this.mailbox,
+            resolveTopicBinding: this.executorTopicBinding,
+            commandRunner: this.options.commandRunner,
+          }),
+          'claude-code': createClaudeCodeExecutorPlugin({
+            ...this.config.executorConfig['claude-code'],
+            store: this.mailbox,
+            resolveTopicBinding: this.executorTopicBinding,
+            commandRunner: this.options.commandRunner,
+          }),
+          'antigravity': createAntigravityExecutorPlugin({
+            ...this.config.executorConfig['antigravity'],
+            store: this.mailbox,
+            resolveTopicBinding: this.executorTopicBinding,
+            commandRunner: this.options.commandRunner,
+          }),
           'agent-pty': createAgentPtyExecutorPlugin({
             ...this.config.executorConfig['agent-pty'],
             store: this.mailbox,
@@ -748,7 +797,9 @@ export class DealerNodeRuntime {
         for (const executor of this.options.executorOverrides ?? []) {
           executors[executor.name] = executor;
         }
-        for (const name of this.config.executors) {
+        const registered = new Set<string>();
+        this.registerBuiltinExecutor = name => {
+          if (registered.has(name)) return;
           const executor = executors[name];
           const wrapped: ExecutorPlugin = {
             ...executor,
@@ -768,7 +819,7 @@ export class DealerNodeRuntime {
                   : envelope;
                 local.push(localEnvelope);
               }
-              return executor.execute(local, context, config);
+              return executor.execute(local, context, { ...config, ...this.config.executorConfig[name] });
             },
           };
           const registration = ctx.services.dispatcher.registerExecutor(
@@ -789,7 +840,9 @@ export class DealerNodeRuntime {
                 : (this.config.executorConfig[name] ?? {}),
           );
           ctx.effect(() => () => registration.dispose());
-        }
+          registered.add(name);
+        };
+        for (const name of this.config.executors) this.registerBuiltinExecutor(name);
         if (this.config.policies.includes('dedup-cas')) {
           let legacyLedger: DeliveryLedger | undefined;
           const registration = ctx.services.dispatcher.registerPolicy(

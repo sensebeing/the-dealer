@@ -17,15 +17,43 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     name: 'personal-dev',
     gateMode: 'approval_required',
     policies: ['dedup-cas'],
-    executors: ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
+    executors: ['orca-spawn', 'orca-wave', 'codex', 'claude-code', 'antigravity', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'dedicated-worker': {
     name: 'dedicated-worker',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['orca-spawn', 'orca-wave', 'agent-pty', 'inbox'],
+    executors: ['orca-spawn', 'orca-wave', 'codex', 'claude-code', 'antigravity', 'agent-pty', 'inbox'],
     defaultExecutor: 'orca-spawn',
+  },
+  'orca-dev': {
+    name: 'orca-dev',
+    gateMode: 'approval_required',
+    policies: ['dedup-cas'],
+    executors: ['orca-spawn', 'orca-wave', 'notify', 'inbox'],
+    defaultExecutor: 'orca-spawn',
+  },
+  'codex-dev': {
+    name: 'codex-dev',
+    gateMode: 'approval_required',
+    policies: ['dedup-cas'],
+    executors: ['codex', 'agent-pty', 'notify', 'inbox'],
+    defaultExecutor: 'codex',
+  },
+  'claude-dev': {
+    name: 'claude-dev',
+    gateMode: 'approval_required',
+    policies: ['dedup-cas'],
+    executors: ['claude-code', 'agent-pty', 'notify', 'inbox'],
+    defaultExecutor: 'claude-code',
+  },
+  'antigravity-dev': {
+    name: 'antigravity-dev',
+    gateMode: 'approval_required',
+    policies: ['dedup-cas'],
+    executors: ['antigravity', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
+    defaultExecutor: 'antigravity',
   },
   'headless-relay': {
     name: 'headless-relay',
@@ -323,7 +351,7 @@ export function readPatch(path: string): Partial<RuntimeConfig> {
   return root;
 }
 
-const BUILTIN_EXECUTORS = ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'];
+export const BUILTIN_EXECUTORS = ['orca-spawn', 'orca-wave', 'codex', 'claude-code', 'antigravity', 'agent-pty', 'notify', 'inbox'];
 
 export function validateConfig(config: RuntimeConfig): void {
   validatePluginRefs(config.userPlugins);

@@ -1,0 +1,19 @@
+{
+  "profile": "orca-dev",
+  "defaultExecutor": "orca-spawn",
+  "topicBindings": {
+    "collab.request.v4": {
+      "executor": "orca-spawn",
+      "conversationMode": "spawn",
+      "agent": "codex",
+      "noParent": true
+    }
+  },
+  "executors": [
+    "orca-spawn",
+    "orca-wave",
+    "notify",
+    "inbox"
+  ],
+  "gateMode": "approval_required"
+}

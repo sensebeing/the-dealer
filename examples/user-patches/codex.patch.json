@@ -1,0 +1,17 @@
+{
+  "profile": "codex-dev",
+  "defaultExecutor": "codex",
+  "topicBindings": {
+    "collab.request.v4": {
+      "executor": "codex",
+      "conversationMode": "spawn"
+    }
+  },
+  "executors": [
+    "codex",
+    "agent-pty",
+    "notify",
+    "inbox"
+  ],
+  "gateMode": "approval_required"
+}

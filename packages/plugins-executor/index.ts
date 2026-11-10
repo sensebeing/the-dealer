@@ -104,15 +104,31 @@ function orcaAgent(value: unknown): SupportedOrcaAgent {
 }
 
 export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('agent-pty', options);
+}
+
+export function createCodexExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('codex', options, 'codex');
+}
+
+export function createClaudeCodeExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('claude-code', options, 'claude-code');
+}
+
+export function createAntigravityExecutorPlugin(options: Omit<AgentOptions, 'agent'> & { agySettingsPath?: string } = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('antigravity', options, 'antigravity', options.agySettingsPath);
+}
+
+function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: SupportedAgentHost, agySettingsPath?: string): ExecutorPlugin {
   return {
-    name: 'agent-pty',
+    name,
     async execute(batch, context, runtimeConfig) {
       const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
       const first = batch[0];
       const payload = first?.payload ?? {};
       const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined) : undefined;
-      const agent = payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
-      const mode = payload.conversationMode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode;
+      const agent = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
+      const mode = payload.conversationMode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
       const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
       let request;
       if (!hostMode) {
@@ -138,6 +154,9 @@ export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): Execut
           targetBot: payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot,
           sessionId: payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId,
         });
+        if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || options.commandRunner === undefined)) {
+          trustAntigravityWorkspace(cwd, agySettingsPath);
+        }
         if (store) store.enqueue(batch, { mailboxId, wakeTarget: { mode: 'passive' } });
         request = { ...invocation, cwd };
       }
@@ -148,7 +167,7 @@ export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): Execut
       } catch {
         structuredOutput = output.stdout;
       }
-      return { executor: 'agent-pty', executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '' };
+      return { executor: name, executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '' };
     },
   };
 }

@@ -91,9 +91,48 @@ selectors: Orca inner agent/workspace; Codex profile/thread; Claude role/session
 Dot agent; Grok targetBot. See [agent-app-matrix](references/agent-app-matrix.md).
 
 Generate `binding-preset`, show its topic, executor and receiver workspace, then
-apply through the same validated receiver configuration lane. Grok execution
+apply with `dealer setup apply-preset --host <host> --mode <mode>` and the same
+selectors. Add `--set-default` only when the user wants the node default changed. Grok execution
 requires a nonempty targetBot. Optional `notifyLark` controls mailbox eligibility;
 configure `larkNotify` credentials/target separately, never infer them.
 Generate `invite-prompt --peer-member <colleague>` and share `teammatePrompt`.
 Keep approval-required admission until the intended peer is verified. Check
 mailbox readback and an actual host receipt before reporting onboarding complete.
+
+
+### Host profiles and one-command presets
+
+| Environment | Built-in profile | First-class executor |
+| --- | --- | --- |
+| Orca | `orca-dev` | `orca-spawn`, `orca-wave` |
+| Codex | `codex-dev` | `codex` |
+| Claude Code | `claude-dev` | `claude-code` |
+| Antigravity | `antigravity-dev` | `antigravity` (standalone `agy`) |
+
+All four profiles use `approval_required` and `dedup-cas`. The named Codex,
+Claude Code and Antigravity executors default to `spawn` and support `fixed`;
+`agent-pty` remains available for existing configurations and other bridges.
+
+```sh
+dealer node up --profile codex-dev --json
+dealer setup apply-preset --host codex --mode fixed --topic collab.request.v4 --session-id <thread> --set-default --json
+```
+
+`apply-preset` persists the topic binding, enables required executors and merges
+executor settings. It works offline or through the running daemon, taking effect
+without a restart. Omit `--set-default` to preserve the node's current default.
+`--mode inbox-only` selects durable manual intake. Supported selectors include
+`--project`, `--workspace-path`, `--agent`, `--agent-profile`, `--target-bot`,
+and `--session-id`; `--notify-lark` enables mailbox eligibility, not Lark credentials.
+
+For compatibility, `apply-preset` applies the same bindings as `binding-preset`:
+Orca and Antigravity use managed `orca-spawn`/`orca-wave`; Codex and Claude Code
+use `agent-pty`. `--set-default` selects the named host executor for unbound
+messages (or `inbox` for inbox-only). For direct named-executor topic bindings,
+use the ready-to-use [host patches](../../examples/user-patches/): `orca.patch.json`,
+`codex.patch.json`, `claude-code.patch.json`, and `antigravity.patch.json`.
+Start a node with `dealer node up --patch examples/user-patches/codex.patch.json --json`,
+or link its topic bindings with `dealer project link <repo> --user-patch <file>`.
+Project user patches do not change node-wide profiles; enable the corresponding
+profile at node startup. Add receiver-owned workspace paths and real session IDs
+when selecting fixed conversations; verify the installed CLI's argv contract.

@@ -1,0 +1,19 @@
+{
+  "profile": "antigravity-dev",
+  "defaultExecutor": "antigravity",
+  "topicBindings": {
+    "collab.request.v4": {
+      "executor": "antigravity",
+      "conversationMode": "spawn"
+    }
+  },
+  "executors": [
+    "antigravity",
+    "orca-spawn",
+    "orca-wave",
+    "agent-pty",
+    "notify",
+    "inbox"
+  ],
+  "gateMode": "approval_required"
+}

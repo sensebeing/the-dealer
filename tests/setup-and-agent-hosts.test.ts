@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { P2PTransportService, defaultAdvertisedHost } from '../packages/transport/index.ts';
 import { join } from 'node:path';
@@ -9,6 +9,8 @@ import {
   AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli,
   decodeNetworkInvite, DealerNodeRuntime, MailboxStore, createAgentPtyExecutorPlugin,
   createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin,
+  createCodexExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin,
+  BUILTIN_EXECUTORS, getBuiltInProfile,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
 } from '../packages/index.ts';
 import type { CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
@@ -236,7 +238,9 @@ for (const scenario of [
     });
     await runtime.start();
     t.after(() => runtime.stop());
-    assert.equal(runtime.config.executors.includes('agent-pty'), scenario.expected);
+    for (const executor of ['agent-pty', 'codex', 'claude-code', 'antigravity']) {
+      assert.equal(runtime.config.executors.includes(executor), scenario.expected);
+    }
     assert.equal(runtime.config.gateMode, 'approval_required');
   });
 }
@@ -377,4 +381,163 @@ test('TCP seed probes are bounded across 50ms ticks for discovered and unavailab
   await peer['discover']();
   assert.equal(connections, 4, 'both known and failed seeds are retried at the bounded interval');
   assert.equal(attempts.mock.callCount(), 6, 'unreachable seed is retried at the bounded interval');
+});
+
+
+for (const [name, factory, command] of [
+  ['codex', createCodexExecutorPlugin, 'codex'],
+  ['claude-code', createClaudeCodeExecutorPlugin, 'claude'],
+  ['antigravity', createAntigravityExecutorPlugin, 'agy'],
+] as const) {
+  for (const mode of ['spawn', 'fixed'] as const) {
+    test(`first-class ${name} ${mode} uses durable host invocation and isolates trust`, async t => {
+      const root = directory(t);
+      const settings = join(root, 'agy-settings.json');
+      const store = new MailboxStore(join(root, 'mailbox.json'));
+      const calls: CommandRequest[] = [];
+      const mailboxId = mode === 'spawn' ? 'task:test' : 'stream:review';
+      const options = {
+        store, conversationMode: mode,
+        resolveTopicBinding: () => ({ executor: name, mailboxId: 'stream:review', workspacePath: root, sessionId: 'session' }),
+        commandRunner: async (request: CommandRequest) => {
+          assert.equal(store.getWakeTarget(mailboxId)?.mode, 'passive');
+          calls.push(request);
+          return { stdout: '{"accepted":true}', stderr: 'diagnostic' };
+        },
+      };
+      const hostSettings = join(homedir(), '.gemini/antigravity-cli/settings.json');
+      const beforeSettings = existsSync(hostSettings) ? readFileSync(hostSettings, 'utf8') : undefined;
+      const plugin = factory(options);
+      assert.equal(plugin.name, name);
+      const result = await plugin.execute([message('test', { agent: 'grok-bot' })], context, {});
+      assert.equal(result.executor, name);
+      assert.ok(result.executionId);
+      assert.deepEqual(result.output, { accepted: true });
+      assert.equal(result.stderr, 'diagnostic');
+      assert.equal(calls[0].command, command);
+      assert.equal(calls[0].cwd, root);
+      assert.match(calls[0].args.at(-1)!, new RegExp(mailboxId));
+      assert.equal(existsSync(settings), false);
+      assert.equal(existsSync(hostSettings) ? readFileSync(hostSettings, 'utf8') : undefined, beforeSettings);
+      if (name === 'codex') assert.equal(calls[0].args[0], mode === 'spawn' ? 'exec' : 'queue');
+      if (name === 'claude-code') assert.equal(calls[0].args[1], mode === 'spawn' ? '--name' : '--resume');
+      if (name === 'antigravity') {
+        await createAntigravityExecutorPlugin({ ...options, agySettingsPath: settings,
+          commandRunner: async request => {
+            assert.ok(JSON.parse(readFileSync(settings, 'utf8')).trustedWorkspaces.includes(root));
+            return options.commandRunner(request);
+          },
+        }).execute([message()], context, {});
+      }
+    });
+  }
+}
+
+test('named executors default to spawn and preserve conversation-mode precedence', async () => {
+  const calls: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => { calls.push(request); return { stdout: 'plain output' }; };
+  for (const factory of [createCodexExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin]) {
+    const result = await factory({ commandRunner }).execute([message()], context, {});
+    assert.equal(result.output, 'plain output');
+    assert.match(calls.at(-1)!.args.at(-1)!, /Task/);
+  }
+  for (const source of ['options', 'config', 'binding', 'payload']) {
+    const result = await createCodexExecutorPlugin({ commandRunner,
+      conversationMode: source === 'options' ? 'fixed' : 'spawn',
+      resolveTopicBinding: () => ({ executor: 'codex', ...(source === 'binding' ? { conversationMode: 'fixed' as const } : {}) }),
+    }).execute([message('test', source === 'payload' ? { conversationMode: 'fixed' } : {})], context,
+      source === 'config' ? { conversationMode: 'fixed' } : {});
+    assert.equal(result.executor, 'codex');
+    assert.equal(calls.at(-1)!.args[0], 'queue');
+  }
+  await assert.rejects(createCodexExecutorPlugin({ commandRunner }).execute([message('bad', { conversationMode: 'inbox-only' })], context, {}), /Invalid agent conversationMode/);
+  await assert.rejects(createCodexExecutorPlugin({ commandRunner: async () => ({ stdout: '', exitCode: 2 }) }).execute([message()], context, {}), /exited 2/);
+});
+
+for (const [host, profileName, defaultExecutor, executors] of [
+  ['orca', 'orca-dev', 'orca-spawn', ['orca-spawn', 'orca-wave', 'notify', 'inbox']],
+  ['codex', 'codex-dev', 'codex', ['codex', 'agent-pty', 'notify', 'inbox']],
+  ['claude-code', 'claude-dev', 'claude-code', ['claude-code', 'agent-pty', 'notify', 'inbox']],
+  ['antigravity', 'antigravity-dev', 'antigravity', ['antigravity', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox']],
+] as const) {
+  test(`${profileName} and ${host} patch validate`, () => {
+    const profile = getBuiltInProfile(profileName);
+    assert.equal(profile.defaultExecutor, defaultExecutor);
+    assert.equal(profile.gateMode, 'approval_required');
+    assert.deepEqual(profile.policies, ['dedup-cas']);
+    assert.deepEqual(profile.executors, executors);
+    const patch = JSON.parse(readFileSync(new URL(`../examples/user-patches/${host}.patch.json`, import.meta.url), 'utf8'));
+    validateTopicBindings(patch.topicBindings, BUILTIN_EXECUTORS);
+    validateTopicBindings(patch.topicBindings, profile.executors);
+    assert.equal(patch.defaultExecutor, defaultExecutor);
+  });
+  for (const live of [false, true]) {
+    test(`apply-preset ${host} ${live ? 'RPC' : 'offline'} preserves or sets defaults across modes`, async t => {
+      const root = directory(t);
+      writeFileSync(join(root, 'config.json'), JSON.stringify({ profile: 'headless-relay', executors: ['notify', 'inbox'], defaultExecutor: 'notify' }));
+      let runtime: DealerNodeRuntime | undefined;
+      if (live) {
+        runtime = await new DealerNodeRuntime({ stateDir: root, transport: { discoveryDir: join(root, 'discovery') }, commandRunner: async () => ({ stdout: '{}' }) }).start();
+        t.after(() => runtime!.stop());
+        await runtime.serveControl(async argv => {
+          const stdout: string[] = [];
+          const stderr: string[] = [];
+          const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+          return { code, stdout, stderr };
+        });
+      }
+      let previousDefault = 'notify';
+      for (const mode of ['spawn', 'fixed', 'inbox-only'] as const) {
+        for (const setDefault of [false, true]) {
+          const result = await cli(['setup', 'apply-preset', '--host', host, '--mode', mode,
+            '--topic', 'review', '--agent-profile', 'reviewer', '--session-id', 'review-session', '--notify-lark',
+            ...(setDefault ? ['--set-default'] : [])], root);
+          const expected = setDefault ? mode === 'inbox-only' ? 'inbox' : defaultExecutor : previousDefault;
+          assert.equal(result.defaultExecutor, expected);
+          assert.equal(result.applied, 'review');
+          assert.equal(result.binding.notifyLark, true);
+          const saved = JSON.parse(readFileSync(join(root, 'config.json'), 'utf8'));
+          assert.equal(saved.defaultExecutor, expected);
+          assert.deepEqual(saved.topicBindings.review, result.binding);
+          assert.ok(saved.executors.includes(result.binding.executor));
+          assert.ok(saved.executors.includes(expected));
+          if (runtime) assert.equal(runtime.config.defaultExecutor, expected);
+          previousDefault = expected;
+        }
+      }
+    });
+  }
+}
+
+test('live applied preset enables dispatch immediately and changes unbound default without restart', async t => {
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({ stateDir: root, profile: 'headless-relay', member: 'solo',
+    transport: { discoveryDir: join(root, 'discovery') }, commandRunner: async request => { calls.push(request); return { stdout: '{}' }; },
+  }).start();
+  t.after(() => runtime.stop());
+  await runtime.serveControl(async argv => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+  await cli(['setup', 'apply-preset', '--host', 'codex', '--mode', 'fixed', '--topic', 'review', '--session-id', 'review-session', '--set-default'], root);
+  const modulePath = join(root, 'host-api.mjs');
+  writeFileSync(modulePath, `export default (_config, { api }) => {
+    for (const [factory, name] of [['createCodexExecutorPlugin', 'codex'], ['createClaudeCodeExecutorPlugin', 'claude-code'], ['createAntigravityExecutorPlugin', 'antigravity']]) {
+      if (api[factory]().name !== name) throw new Error('Missing named executor API: ' + factory);
+    }
+    return { name: 'host-api', apply() {} };
+  };`);
+  await runtime.installUserPlugin({ name: 'host-api', module: modulePath });
+  for (const kind of ['review', 'unbound']) {
+    const result = await runtime.emitter.emit({ networkId: 'local', kind, routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check change', payload: {} });
+    assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
+  }
+  assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 'review-session', '--resume']);
+  assert.deepEqual(calls[1].args.slice(0, 2), ['exec', '--worktree']);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:review')?.mode, 'passive');
+  runtime.applyAgentPreset({ host: 'claude', conversationMode: 'inbox-only', topic: 'manual', setDefault: true });
+  assert.equal(runtime.config.defaultExecutor, 'inbox');
 });
