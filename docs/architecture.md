@@ -497,3 +497,28 @@ the-dealer/                                 # 独立开源仓库根目录（建�
 4. **Phase 4 — CLI、`dealer` 配套 Skill 与 `alter-service` 真实场景迁移验证**：
    - 交付 `dealer` / `dealerd` CLI 与 `skills/the-dealer/SKILL.md`；
    - 在本机实跑双节点/多节点 P2P 自动发现、权限审批（`open` vs `approval_required`）、智能路由判断、大文件传输及自动唤醒 Orca 工作区端到端验收。
+
+
+### Lark Human Copilot Mirror
+
+`packages/plugins-lark-notifier` exports the first-class Kernel plugin
+`lark-mirror` (`createLarkMirrorPlugin`). Gate remains the sole admission owner:
+it emits `gate/pending-approval` only when adding a new pending item. The mirror
+seeds existing approvals on activation and renders actionable human approval
+knocks, observes mailbox arrivals, and mirrors local `emitter/sent` messages into
+existing Lark threads. It never approves or dispatches work itself. Kernel effects
+own notifier startup/shutdown, including cancellation of retries and commands.
+
+One serialized notifier owns Lark delivery, bounded exponential retries, and
+atomic `the-dealer-lark-notify/v1` state. Mailbox catch-up precedes outbound
+mirroring, so a watched local loopback is not sent twice. Thread roots and
+idempotency keys are shared across approval, mailbox, and outbound delivery;
+deleted roots use a distinct fallback key. Pending event queues are in-memory,
+not a durable outbound replay log. The local `notify` executor only owns OS
+notification or file sinks, with no Lark webhook transport.
+
+`notifyGateApprovals` and `mirrorOutboundThreads` default to true. Default watched
+mailboxes omit compound topic/stream bindings and project topics with background
+`orca-wave`, `orca-spawn`, or `agent-pty` defaults; explicit `notifyLark` overrides
+that choice. Inbox topics and top-level request bindings remain included. See
+[request threading](request-threading.md) for filters and configuration.

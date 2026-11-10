@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, statSync 
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  DealerNodeRuntime, MailboxStore, LarkMailboxNotifier, WakeupRedriveService,
+  DealerNodeRuntime, MailboxStore, LarkMailboxNotifier, WakeupRedriveService, createLarkMirrorPlugin,
   signEnvelope, generateNodeKeyPair, verifyEnvelope, runDealerCli,
   ensureOrcaWorkspace, checkOrcaWorkspaceIdle, resolveOrSpawnOrcaWorkspaceTerminal, defaultAntigravityLaunchCommand,
   validateTopicBindings, validateLarkNotify, initProjectScaffold,
@@ -128,6 +128,10 @@ test('linked bindings override defaults, validate conflicts and refresh on unlin
   assert.throws(() => validateTopicBindings({ request: { executor: 'inbox', autoCreateWorkspace: 'yes' } }, ['inbox']));
   assert.throws(() => validateLarkNotify({ enabled: true, target: { chatId: 'a', userId: 'b' } }));
   assert.throws(() => validateLarkNotify({ enabled: true, includeKinds: [3] }));
+  for (const option of ['notifyGateApprovals', 'mirrorOutboundThreads']) {
+    assert.throws(() => validateLarkNotify({ enabled: true, [option]: 'yes' }));
+    assert.doesNotThrow(() => validateLarkNotify({ enabled: true, [option]: false }));
+  }
 });
 
 test('fixed workspaces bootstrap once and orphaned terminals neither block nor win resolution', async t => {
@@ -466,4 +470,183 @@ test('temporary workspace bootstrap does not modify default Antigravity settings
   assert.equal((await ensureOrcaWorkspace(runner, 'orca', { workspacePath: path, repoRoot: root })).created, true);
   const after = existsSync(settings) ? readFileSync(settings) : undefined;
   assert.deepEqual(after, before);
+});
+
+test('lark-mirror turns gate knocks into roots and approval delivery into thread replies', async t => {
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({ stateDir: root, member: 'bob', profile: 'personal-dev',
+    patch: { gateMode: 'approval_required', topicBindings: { request: { executor: 'inbox' } }, larkNotify: { enabled: true, target: { chatId: 'copilot' } } },
+    commandRunner: async call => {
+      calls.push(call);
+      return { stdout: JSON.stringify({ message_id: `lark-${calls.length}` }) };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  const request = envelope('knock', { semantic: { type: 'message', threadId: 'approval-thread' } });
+  const verdict = await runtime.gate.evaluate(request);
+  assert.equal(verdict.status, 'pending_approval');
+  if (verdict.status !== 'pending_approval') throw new Error('Expected pending approval');
+  await runtime.larkNotifier!.flush();
+  assert.equal(calls.length, 1);
+  assert.match(argument(calls[0], '--markdown'), /\[gate · pending_approval\]/);
+  assert.ok(argument(calls[0], '--markdown').includes(`dealer gate approve ${verdict.approvalId} --trust-sender --json`));
+  await runtime.gate.evaluate(request);
+  await runtime.larkNotifier!.flush();
+  assert.equal(calls.length, 1, 'repeated gate evaluation emits no duplicate knock');
+  await runtime.gate.approve(verdict.approvalId);
+  await runtime.larkNotifier!.flush();
+  assert.equal(calls.length, 2);
+  assert.equal(argument(calls[1], '--message-id'), 'lark-1');
+  assert.ok(calls[1].args.includes('--reply-in-thread'));
+  const state = JSON.parse(readFileSync(join(root, 'lark-notify.json'), 'utf8'));
+  assert.ok(state.deliveredItems[`approval:${verdict.approvalId}`]);
+  assert.equal(state.threadRoots['approval-thread'].messageId, 'lark-1');
+});
+
+test('lark-mirror mirrors outbound thread events and deduplicates local loopback arrivals', async t => {
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({ stateDir: root, member: 'bob', profile: 'personal-dev',
+    patch: { gateMode: 'open', larkNotify: { enabled: true, target: { chatId: 'copilot' } } },
+    commandRunner: async call => {
+      calls.push(call);
+      return { stdout: JSON.stringify({ message_id: `lark-${calls.length}` }) };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  runtime.mailbox.enqueue([envelope('remote-root')]);
+  await runtime.larkNotifier!.flush();
+  for (const type of ['reply', 'question', 'settle'] as const) {
+    const outgoing = envelope(`out-${type}`, { from: { nodeId: runtime.transport.localNodeId, member: 'bob', nodeName: 'desktop' },
+      semantic: { type, threadId: 'remote-root', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } });
+    runtime.kernel.ctx.emit('emitter/sent', { envelope: outgoing, targetNodeIds: [key.nodeId], receipts: [] });
+    await runtime.larkNotifier!.flush();
+    assert.equal(argument(calls.at(-1)!, '--message-id'), 'lark-1');
+    assert.equal(argument(calls.at(-1)!, '--markdown'), `**[${type} · outbound] bob**\n\nDetails`);
+    runtime.kernel.ctx.emit('emitter/sent', { envelope: outgoing, targetNodeIds: [key.nodeId], receipts: [] });
+    await runtime.larkNotifier!.flush();
+  }
+  assert.equal(calls.length, 4);
+  await runtime.emitter.emit({ networkId: 'local', routing: { mode: 'unicast', targets: ['member:bob'] }, kind: 'request',
+    subject: 'loopback', body: 'local reply', payload: {}, semantic: { type: 'reply', threadId: 'remote-root' } });
+  await runtime.larkNotifier!.flush();
+  assert.equal(calls.length, 5, 'local mailbox delivery is mirrored exactly once');
+  assert.equal(argument(calls[4], '--markdown'), '**[reply] bob**\n\nlocal reply');
+  const unrooted = envelope('unrooted', { from: { nodeId: runtime.transport.localNodeId, member: 'bob', nodeName: 'desktop' } });
+  runtime.kernel.ctx.emit('emitter/sent', { envelope: unrooted, targetNodeIds: [key.nodeId], receipts: [] });
+  await runtime.larkNotifier!.flush();
+  assert.equal(calls.length, 5, 'outbound messages never create unsolicited roots');
+});
+
+test('smart Lark defaults omit compound and project background bindings but permit explicit opt-in', async t => {
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), member: 'bob', profile: 'personal-dev',
+    patch: { gateMode: 'open', larkNotify: { enabled: true, target: { chatId: 'copilot' } } },
+    commandRunner: async call => { calls.push(call); return { stdout: '{"message_id":"root"}' }; },
+  }).start();
+  t.after(() => runtime.stop());
+  const project = join(root, 'project');
+  const manifest = initProjectScaffold(project, { projectId: 'background', defaultNetworkId: 'local' });
+  writeFileSync(join(project, '.dealer/project.json'), JSON.stringify({ ...manifest, topics: {
+    wave: { description: 'Background wave', defaultExecutor: 'orca-wave' },
+    spawn: { description: 'Background spawn', defaultExecutor: 'orca-spawn' },
+    pty: { description: 'Background PTY', defaultExecutor: 'agent-pty' },
+    inbox: { description: 'Inbox', defaultExecutor: 'inbox' },
+  } }));
+  const patch = join(root, 'binding.json');
+  const bindings = Object.fromEntries(['wave:stream', 'wave', 'spawn', 'pty', 'inbox', 'request'].map(kind =>
+    [kind, { executor: 'inbox', mailboxId: `bound-${kind.replace(':', '-')}` }]));
+  writeFileSync(patch, JSON.stringify({ topicBindings: bindings }));
+  await runtime.linkProject(project, patch);
+  for (const kind of Object.keys(bindings)) runtime.mailbox.enqueue([envelope(`default-${kind}`, { kind })], { mailboxId: bindings[kind].mailboxId });
+  await runtime.larkNotifier!.flush();
+  assert.equal(calls.length, 2, 'only inbox and top-level request defaults notify');
+  writeFileSync(patch, JSON.stringify({ topicBindings: Object.fromEntries(Object.entries(bindings).map(([kind, binding]) =>
+    [kind, { ...binding, notifyLark: kind !== 'request' }])) }));
+  await runtime.linkProject(project, patch);
+  for (const kind of Object.keys(bindings)) runtime.mailbox.enqueue([envelope(`explicit-${kind}`, { kind })], { mailboxId: bindings[kind].mailboxId });
+  await runtime.larkNotifier!.flush();
+  assert.equal(calls.length, 7, 'explicit true opts background mailboxes in; false opts request out');
+});
+
+test('lark-mirror seeds existing approvals and retries failed persistence with the same idempotency key', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'node'), member: 'bob', profile: 'personal-dev',
+    patch: { gateMode: 'approval_required' },
+  }).start();
+  t.after(() => runtime.stop());
+  const verdict = await runtime.gate.evaluate(envelope('seeded-knock'));
+  assert.equal(verdict.status, 'pending_approval');
+  if (verdict.status !== 'pending_approval') throw new Error('Expected approval');
+  const blocked = join(root, 'blocked');
+  writeFileSync(blocked, 'prevent atomic state write');
+  const calls: CommandRequest[] = [];
+  let resolveRetry!: () => void;
+  const retried = new Promise<void>(resolve => { resolveRetry = resolve; });
+  const options = { store: runtime.mailbox, stateDir: blocked, localNodeId: runtime.transport.localNodeId, localMember: 'bob',
+    config: { enabled: true, target: { chatId: 'copilot' }, retryBaseMs: 5 },
+    commandRunner: async (call: CommandRequest) => {
+      calls.push(call);
+      if (calls.length === 2) resolveRetry();
+      return { stdout: '{"message_id":"seeded-root"}' };
+    },
+    onError: () => rmSync(blocked),
+  };
+  const notifier = new LarkMailboxNotifier(options);
+  await runtime.kernel.use(createLarkMirrorPlugin({ ...options, notifier }));
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    await Promise.race([retried, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Approval retry never arrived')), 2000);
+    })]);
+  } finally {
+    clearTimeout(timer!);
+  }
+  await notifier.flush();
+  assert.equal(calls.length, 2);
+  assert.equal(argument(calls[0], '--idempotency-key'), argument(calls[1], '--idempotency-key'));
+  const state = JSON.parse(readFileSync(join(blocked, 'lark-notify.json'), 'utf8'));
+  assert.equal(state.schema, 'the-dealer-lark-notify/v1');
+  assert.ok(state.deliveredItems[`approval:${verdict.approvalId}`]);
+  await runtime.stop();
+  notifier.notifyApproval({ id: 'after-stop', envelope: envelope('after-stop'), reason: 'test', createdAt: new Date().toISOString() });
+  await notifier.flush();
+  assert.equal(calls.length, 2, 'Kernel shutdown stops notifier delivery');
+});
+
+test('Lark mirror flags and envelope filters suppress gate and outbound events independently of mailbox selection', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const options = { store, stateDir: root, localNodeId: 'local', localMember: 'bob',
+    config: { enabled: true, target: { chatId: 'copilot' }, mailboxes: [], includeKinds: ['request'], excludeKinds: ['blocked'], skipSelfMessages: true },
+    commandRunner: async (call: CommandRequest) => { calls.push(call); return { stdout: '{"message_id":"root"}' }; },
+  };
+  const notifier = new LarkMailboxNotifier(options);
+  t.after(() => notifier.stop());
+  notifier.start();
+  for (const [id, message] of [
+    ['self', envelope('self', { from: { nodeId: 'local', member: 'bob', nodeName: 'local' } })],
+    ['excluded', envelope('excluded', { kind: 'blocked' })],
+    ['not-included', envelope('not-included', { kind: 'other' })],
+    ['allowed', envelope('allowed')],
+  ] as const) notifier.notifyApproval({ id, envelope: message, reason: 'test', createdAt: new Date().toISOString() });
+  await notifier.flush();
+  assert.equal(calls.length, 1, 'mailboxes: [] does not suppress allowed gate knocks');
+  const outgoing = envelope('outgoing', { from: { nodeId: 'local', member: 'bob', nodeName: 'local' }, semantic: { type: 'reply', threadId: 'allowed' } });
+  notifier.notifyOutbound(outgoing);
+  notifier.notifyOutbound(envelope('remote', { semantic: { type: 'reply', threadId: 'allowed' } }));
+  notifier.notifyOutbound({ ...outgoing, id: 'excluded-out', kind: 'blocked' });
+  await notifier.flush();
+  assert.equal(calls.length, 2, 'outbound local thread replies ignore skipSelfMessages but honor origin and kinds');
+  await notifier.stop();
+  const disabled = new LarkMailboxNotifier({ ...options, config: { ...options.config, notifyGateApprovals: false, mirrorOutboundThreads: false } });
+  t.after(() => disabled.stop());
+  disabled.start();
+  disabled.notifyApproval({ id: 'disabled', envelope: envelope('disabled'), reason: 'test', createdAt: new Date().toISOString() });
+  disabled.notifyOutbound({ ...outgoing, id: 'disabled-out' });
+  await disabled.flush();
+  assert.equal(calls.length, 2);
 });

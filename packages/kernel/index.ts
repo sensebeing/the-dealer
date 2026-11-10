@@ -9,6 +9,7 @@ import type {
   NodeCard,
   MessageEnvelope,
   GateVerdict,
+  PendingApprovalItem,
   DispatchReceipt,
   DeliveryReceipt,
   InboundFrameEvent,
@@ -28,6 +29,7 @@ export interface Services {
 
 /** Extend these interfaces via module augmentation for application services and events. */
 export interface Events {
+  'gate/pending-approval': (item: PendingApprovalItem) => void;
   'transport/inbound': (
     event: InboundFrameEvent,
   ) => Uint8Array | void | Promise<Uint8Array | void>;

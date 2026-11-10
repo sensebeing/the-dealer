@@ -182,6 +182,8 @@ export interface LarkNotifyConfig {
   includeKinds?: string[];
   excludeKinds?: string[];
   skipSelfMessages?: boolean;
+  notifyGateApprovals?: boolean;
+  mirrorOutboundThreads?: boolean;
   statePath?: string;
   retryBaseMs?: number;
 }
@@ -214,13 +216,14 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
 export function validateLarkNotify(config: unknown): asserts config is LarkNotifyConfig {
   const strings = ['command', 'profile', 'statePath'];
   const arrays = ['mailboxes', 'excludeMailboxes', 'includeKinds', 'excludeKinds'];
-  const allowed = new Set(['enabled', 'as', 'target', 'skipSelfMessages', 'retryBaseMs', ...strings, ...arrays]);
+  const booleans = ['skipSelfMessages', 'notifyGateApprovals', 'mirrorOutboundThreads'];
+  const allowed = new Set(['enabled', 'as', 'target', 'retryBaseMs', ...booleans, ...strings, ...arrays]);
   if (!isRecord(config) || typeof config.enabled !== 'boolean' ||
       Object.keys(config).some(key => !allowed.has(key)) ||
       strings.some(key => config[key] !== undefined && !nonempty(config[key])) ||
       arrays.some(key => config[key] !== undefined && (!Array.isArray(config[key]) || config[key].some((value: unknown) => !nonempty(value)))) ||
       (config.as !== undefined && !['bot', 'user'].includes(config.as)) ||
-      (config.skipSelfMessages !== undefined && typeof config.skipSelfMessages !== 'boolean') ||
+      booleans.some(key => config[key] !== undefined && typeof config[key] !== 'boolean') ||
       (config.retryBaseMs !== undefined && (!Number.isSafeInteger(config.retryBaseMs) || config.retryBaseMs < 1))) {
     throw new Error('Invalid larkNotify');
   }

@@ -253,12 +253,14 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             if (pending.has(verdict.approvalId)) {
               throw new Error('Approval ID collision');
             }
-            pending.set(verdict.approvalId, {
+            const item: PendingApprovalItem = {
               id: verdict.approvalId,
               envelope: structuredClone(envelope),
               reason: verdict.reason,
               createdAt: new Date().toISOString(),
-            });
+            };
+            pending.set(item.id, item);
+            ctx.emit('gate/pending-approval', structuredClone(item));
           } else if (verdict.status === 'queued_dnd') {
             const id = dndKey(envelope);
             if (!dnd.has(id) && dnd.size >= maxDndItems) {

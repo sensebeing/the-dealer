@@ -57,7 +57,7 @@ A newly spawned terminal must report `tui-idle` before receiving any pointer or
 rotation command. Orphaned terminals cannot satisfy terminal resolution or
 poison an otherwise observable idle inventory.
 
-## Optional Lark notification
+## Optional Lark Human Copilot Mirror
 
 ```json
 {
@@ -76,8 +76,12 @@ uses `lark-cli auth status` to discover the authenticated user's open ID and
 prefers an available bot identity. `as` can explicitly select `bot` or `user`.
 The CLI is invoked as an argument array without a shell.
 
-By default, notification covers `default` plus bound mailboxes whose binding does
-not set `notifyLark: false`. Explicit `mailboxes` replaces that default set (an
+The first-class Kernel plugin `lark-mirror` owns the notifier lifecycle and
+observes gate, mailbox, and emitter events without changing admission or routing.
+By default, mailbox notification covers `default` plus top-level bound mailboxes.
+Compound `<topic>:<stream>` bindings and linked-project topics whose manifest
+`defaultExecutor` is `orca-wave`, `orca-spawn`, or `agent-pty` are excluded.
+An explicit `notifyLark: true` opts those bindings in; `false` opts any binding out. Explicit `mailboxes` replaces that default set (an
 empty array disables all mailbox notifications). `excludeMailboxes`,
 `includeKinds`, `excludeKinds`, and `skipSelfMessages` provide further filtering.
 Linking or unlinking projects refreshes the default set for subsequent arrivals.
@@ -88,9 +92,26 @@ subject, sender, mailbox, priority, thread ID, body, and attachment names.
 Follow-ups reply in the first Lark message's thread. A deleted root permits one
 new-root send with a distinct deterministic idempotency key.
 
-The notifier observes mailbox events and performs a startup catch-up. A failed
+`notifyGateApprovals` and `mirrorOutboundThreads` both default to true.
+Pending approvals generate a knock containing the approval ID and CLI approve /
+trust-member commands, then the approved mailbox delivery replies in that same
+thread. The plugin seeds approvals already pending when mounted. Kind filters
+and `skipSelfMessages` also apply to knocks; mailbox filters apply only to mailbox
+arrivals. Outbound local replies, questions, and settlements mirror into existing
+Lark roots, honoring kind filters, even when `skipSelfMessages` suppresses local
+mailbox arrivals. Outbound events are processed after mailbox catch-up and skipped
+if that envelope was already mirrored locally; they do not start new threads.
+The `notify` executor remains a local OS notification / file sink.
+
+The notifier observes events and performs a startup mailbox catch-up. A failed
 item fences later sequence numbers until a bounded retry succeeds; filtered
 items still advance the cursor. State is stored in `lark-notify.json` with mode
 0600 and atomic replacement. Mailbox sequence numbers start at zero, so a fresh
 notifier uses cursor -1. Restart retries reuse the same idempotency key. Stopping
 the runtime cancels notifier retries and aborts pending commands.
+
+The on-disk schema stays `the-dealer-lark-notify/v1`: approval and outbound
+receipts use `approval:<id>` and `outbound:<id>` keys alongside mailbox receipts.
+Pending event queues are in memory and are removed only after successful send
+and atomic persistence (or filtering/deduplication); failures retry with the same
+idempotency key. They are not a durable outbound replay log across process exits.

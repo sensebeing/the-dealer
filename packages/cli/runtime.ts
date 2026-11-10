@@ -24,7 +24,7 @@ import {
   createNotifyExecutorPlugin,
   createInboxExecutorPlugin,
 } from '../plugins-executor/index.ts';
-import { LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
+import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
 import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
@@ -339,15 +339,18 @@ export class DealerNodeRuntime {
         }
       }
       if (this.config.larkNotify?.enabled) {
-        this.larkNotifier = new LarkMailboxNotifier({
+        const options = {
           store: this.mailbox, config: this.config.larkNotify, stateDir: this.stateDir,
           localNodeId: this.transport.localNodeId, localMember: this.config.member,
           commandRunner: this.options.commandRunner ?? runCommand,
-          onError: error => { this.lastError = String(error); },
-        });
+          onError: (error: unknown) => { this.lastError = String(error); },
+        };
+        this.larkNotifier = new LarkMailboxNotifier(options);
+        this.refreshTopicBindings();
+        await this.kernel.use(createLarkMirrorPlugin({ ...options, notifier: this.larkNotifier }));
+      } else {
+        this.refreshTopicBindings();
       }
-      this.refreshTopicBindings();
-      this.larkNotifier?.start();
       this.persist();
       this.started = true;
       return this;
@@ -618,7 +621,10 @@ export class DealerNodeRuntime {
     for (const kind of kinds) {
       const { binding, projectRoot } = this.resolveTopicBinding(kind)!;
       const mailboxId = resolveBoundMailboxId(kind, binding);
-      if (binding.notifyLark !== false) mailboxes.push(mailboxId);
+      const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
+        : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
+          ['orca-wave', 'orca-spawn', 'agent-pty'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
+      if (notifyLark) mailboxes.push(mailboxId);
       if (binding.executor !== 'orca-wave' || !(binding.workspacePath || binding.runId || binding.terminalHandle)) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
       this.mailbox.upsertWakeTarget(mailboxId, {
@@ -1071,12 +1077,11 @@ export class DealerNodeRuntime {
     }
     this.server = undefined;
     try {
-      await this.larkNotifier?.stop();
-      this.larkNotifier = undefined;
       await this.wakeups?.stop();
     } finally {
       try {
         await this.kernel.stop();
+        this.larkNotifier = undefined;
       } finally {
         if (this.ownsLock) {
           rmSync(this.socketPath, { force: true });

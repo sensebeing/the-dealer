@@ -745,8 +745,6 @@ export interface NotifyOptions {
   inboxPath?: string;
   notify?: (batch: readonly MessageEnvelope[], context: ExecutionContext) => Promise<void>;
   commandRunner?: CommandRunner;
-  larkWebhookUrl?: string;
-  fetchFn?: typeof fetch;
 }
 
 export function createNotifyExecutorPlugin(options: NotifyOptions = {}): ExecutorPlugin {
@@ -763,20 +761,6 @@ export function createNotifyExecutorPlugin(options: NotifyOptions = {}): Executo
       }
       if (options.notify) {
         await options.notify(batch, context);
-      } else if (options.larkWebhookUrl) {
-        const response = await (options.fetchFn ?? fetch)(options.larkWebhookUrl, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ msg_type: 'text', content: { text: renderWave(batch) } }),
-          signal: context.signal,
-        });
-        if (!response.ok) {
-          throw new Error(`Lark notification failed: ${response.status}`);
-        }
-        const data = (await response.json()) as { code?: number; StatusCode?: number };
-        if ((data.code ?? data.StatusCode ?? 0) !== 0) {
-          throw new Error('Lark notification rejected');
-        }
       } else if (!options.inboxPath) {
         await checkedCommand(options.commandRunner ?? runCommand, {
           command: 'osascript',
