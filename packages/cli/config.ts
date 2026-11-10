@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { isValidMailboxId } from '../core-types/index.ts';
 import type { AdmissionMode, NetworkMountConfig } from '../core-types/index.ts';
 
 export interface BuiltInProfile {
@@ -145,7 +146,86 @@ export function initProjectScaffold(
   return manifest;
 }
 
+export interface TopicBindingConfig {
+  executor: string;
+  streamKey?: string;
+  mailboxId?: string;
+  projectId?: string;
+  workspacePath?: string;
+  worktreeId?: string;
+  runId?: string;
+  terminalHandle?: string;
+  autoCreateWorkspace?: boolean;
+  workspaceComment?: string;
+  wakeupPrefix?: string;
+  coalesceMs?: number;
+  rotateAfterWaves?: number;
+  notifyLark?: boolean;
+}
+
+export interface LarkNotifyConfig {
+  enabled: boolean;
+  command?: string;
+  profile?: string;
+  as?: 'bot' | 'user';
+  target?: { chatId?: string; userId?: string };
+  mailboxes?: string[];
+  excludeMailboxes?: string[];
+  includeKinds?: string[];
+  excludeKinds?: string[];
+  skipSelfMessages?: boolean;
+  statePath?: string;
+  retryBaseMs?: number;
+}
+
+export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[]): asserts bindings is Record<string, TopicBindingConfig> {
+  if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
+  const strings = ['streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
+  const booleans = ['autoCreateWorkspace', 'notifyLark'];
+  const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves']);
+  for (const [kind, binding] of Object.entries(bindings)) {
+    if (!nonempty(kind) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
+        Object.keys(binding).some(key => !allowed.has(key)) ||
+        strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||
+        booleans.some(key => binding[key] !== undefined && typeof binding[key] !== 'boolean') ||
+        (binding.coalesceMs !== undefined && (!Number.isSafeInteger(binding.coalesceMs) || binding.coalesceMs < 0)) ||
+        (binding.rotateAfterWaves !== undefined && (!Number.isSafeInteger(binding.rotateAfterWaves) || binding.rotateAfterWaves < 1)) ||
+        (binding.mailboxId !== undefined && !isValidMailboxId(binding.mailboxId)) ||
+        (binding.streamKey !== undefined && !isValidMailboxId(`stream:${binding.streamKey}`)) ||
+        (binding.executor === 'orca-wave' && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? kind}`)) ||
+        (binding.projectId !== undefined && !validProjectId(binding.projectId))) {
+      throw new Error(`Invalid topic binding: ${kind}`);
+    }
+  }
+}
+
+export function validateLarkNotify(config: unknown): asserts config is LarkNotifyConfig {
+  const strings = ['command', 'profile', 'statePath'];
+  const arrays = ['mailboxes', 'excludeMailboxes', 'includeKinds', 'excludeKinds'];
+  const allowed = new Set(['enabled', 'as', 'target', 'skipSelfMessages', 'retryBaseMs', ...strings, ...arrays]);
+  if (!isRecord(config) || typeof config.enabled !== 'boolean' ||
+      Object.keys(config).some(key => !allowed.has(key)) ||
+      strings.some(key => config[key] !== undefined && !nonempty(config[key])) ||
+      arrays.some(key => config[key] !== undefined && (!Array.isArray(config[key]) || config[key].some((value: unknown) => !nonempty(value)))) ||
+      (config.as !== undefined && !['bot', 'user'].includes(config.as)) ||
+      (config.skipSelfMessages !== undefined && typeof config.skipSelfMessages !== 'boolean') ||
+      (config.retryBaseMs !== undefined && (!Number.isSafeInteger(config.retryBaseMs) || config.retryBaseMs < 1))) {
+    throw new Error('Invalid larkNotify');
+  }
+  if (config.target !== undefined && (!isRecord(config.target) ||
+      Object.keys(config.target).some(key => !['chatId', 'userId'].includes(key)) ||
+      ['chatId', 'userId'].some(key => config.target[key] !== undefined && !nonempty(config.target[key])) ||
+      (config.target.chatId !== undefined && config.target.userId !== undefined))) {
+    throw new Error('Invalid larkNotify target');
+  }
+  for (const key of ['mailboxes', 'excludeMailboxes']) {
+    if (config[key]?.some((id: string) => !isValidMailboxId(id))) throw new Error('Invalid notification mailbox');
+  }
+}
+
 export interface RuntimeConfig {
+  topicBindings?: Record<string, TopicBindingConfig>;
+  larkNotify?: LarkNotifyConfig;
   profile: string;
   member: string;
   name: string;
@@ -232,6 +312,8 @@ const BUILTIN_EXECUTORS = ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'in
 
 export function validateConfig(config: RuntimeConfig): void {
   validatePluginRefs(config.userPlugins);
+  validateTopicBindings(config.topicBindings === undefined ? {} : config.topicBindings, config.executors);
+  if (config.larkNotify !== undefined) validateLarkNotify(config.larkNotify);
   if (!Array.isArray(config.projects)) {
     throw new Error('Projects must be an array');
   }

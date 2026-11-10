@@ -2,15 +2,13 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
-  writeFileSync,
 } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
 import { resolveMailboxId } from '../mailbox/index.ts';
 import { MailboxStore } from '../mailbox/index.ts';
@@ -18,6 +16,7 @@ import { buildTaskPreamble } from '../mailbox/index.ts';
 import type { WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
+  trustAntigravityWorkspace,
   runCommand,
   sendOrcaTerminalText,
 } from '../orca-workspace/index.ts';
@@ -160,38 +159,6 @@ export const SEA_CREATURE_POOL = [
   'amphipod',
   'anglerfish',
 ] as const;
-
-/**
- * Trust a workspace in Antigravity by adding it to trustedWorkspaces.
- * Missing settings files start from an empty object, then the file is replaced atomically.
- */
-export function trustAntigravityWorkspace(workspacePath: string, settingsPath?: string): void {
-  const file = settingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
-  let settings: Record<string, unknown> = {};
-  if (existsSync(file)) {
-    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw new Error(`Antigravity settings at ${file} must be a JSON object`);
-    }
-    settings = parsed as Record<string, unknown>;
-  }
-  const trusted = Array.isArray(settings.trustedWorkspaces)
-    ? settings.trustedWorkspaces.filter((entry): entry is string => typeof entry === 'string')
-    : [];
-  const candidates = existsSync(workspacePath)
-    ? [workspacePath, realpathSync(workspacePath)]
-    : [workspacePath];
-  for (const candidate of candidates) {
-    if (!trusted.includes(candidate)) {
-      trusted.push(candidate);
-    }
-  }
-  settings.trustedWorkspaces = trusted;
-  mkdirSync(dirname(file), { recursive: true });
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, file);
-}
 
 async function pickSeaCreatureName(
   runner: CommandRunner,
@@ -534,6 +501,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
 }
 
 export interface OrcaWaveOptions {
+  resolveTopicBinding?: (kind: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   runId?: string;
   terminalHandle?: string;
   cwd?: string;
@@ -577,29 +545,32 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
       }
       const command = options.orcaCommand ?? 'orca';
       const payload = (first.payload ?? {}) as Record<string, unknown>;
-      const mailboxId = resolveMailboxId(first, 'orca-wave');
+      const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind);
+      const mailboxId = resolveMailboxId(first, 'orca-wave', binding);
       const cwd =
         optionalString(payload.workspacePath) ??
         optionalString(payload.cwd) ??
+        binding?.workspacePath ??
         config.cwd ??
         options.cwd;
       const runId =
-        optionalString(payload.runId) ?? config.runId ?? options.runId;
+        optionalString(payload.runId) ?? binding?.runId ?? config.runId ?? options.runId;
       const terminalHandle =
         optionalString(payload.terminalHandle) ??
+        binding?.terminalHandle ??
         config.terminalHandle ??
         options.terminalHandle;
       const waveConfig = config.wave ?? options.wave;
       const requestedMinAge =
         typeof payload.minAgeMs === 'number' && Number.isFinite(payload.minAgeMs)
           ? Math.max(0, payload.minAgeMs)
-          : Math.max(0, waveConfig?.minAgeMs ?? 0);
+          : Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
       const rotateAfterWaves =
         optionalPositiveInteger(payload.rotateAfterWaves) ??
-        optionalPositiveInteger(waveConfig?.rotateAfterWaves);
-      const worktreeId = optionalString(payload.worktreeId);
+        binding?.rotateAfterWaves ?? optionalPositiveInteger(waveConfig?.rotateAfterWaves);
+      const worktreeId = optionalString(payload.worktreeId) ?? binding?.worktreeId;
       const workspaceComment = String(
-        batch.at(-1)?.payload?.workspaceComment || `Dealer: ${mailboxId} pending`,
+        batch.at(-1)?.payload?.workspaceComment || binding?.workspaceComment || `Dealer: ${mailboxId} pending`,
       );
       const enqueued = store.enqueue(batch, {
         mailboxId,
@@ -607,6 +578,9 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           mode: runId ? 'orca-run' : 'orca-terminal',
           orcaCommand: command,
           coalesceMs: requestedMinAge,
+          ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
+          ...(binding?.autoCreateWorkspace !== undefined ? { autoCreateWorkspace: binding.autoCreateWorkspace } : {}),
+          ...(binding?.wakeupPrefix ? { wakeupPrefix: binding.wakeupPrefix } : {}),
           ...(runId ? { runId } : {}),
           ...(cwd ? { workspacePath: cwd } : {}),
           ...(worktreeId ? { worktreeId } : {}),
@@ -693,6 +667,7 @@ export function createNotifyExecutorPlugin(options: NotifyOptions = {}): Executo
 }
 
 export interface InboxExecutorOptions {
+  resolveTopicBinding?: (kind: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   inboxPath?: string;
   store?: MailboxStore;
   /** Reactive redrive for replies/questions/settlements landing in a live wake target. */
@@ -706,10 +681,11 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
   const store = options.store ?? new MailboxStore(options.inboxPath!);
   return {
     name: 'inbox',
-    async execute(batch) {
+    async execute(batch, _context, runtimeConfig) {
+      const config = (runtimeConfig ?? {}) as InboxExecutorOptions;
       const groups = new Map<string, MessageEnvelope[]>();
       for (const envelope of batch) {
-        const mailboxId = resolveMailboxId(envelope, 'inbox');
+        const mailboxId = resolveMailboxId(envelope, 'inbox', (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(envelope.kind));
         const group = groups.get(mailboxId) ?? [];
         group.push(envelope);
         groups.set(mailboxId, group);
@@ -731,3 +707,5 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
     },
   };
 }
+
+export { trustAntigravityWorkspace } from '../orca-workspace/index.ts';

@@ -67,6 +67,9 @@ export interface WakeTargetState {
   readonly worktreeId?: string;
   readonly workspacePath?: string;
   readonly terminalHandle?: string;
+  readonly repoRoot?: string;
+  readonly autoCreateWorkspace?: boolean;
+  readonly wakeupPrefix?: string;
   readonly workspaceComment?: string;
   readonly coalesceMs: number;
   readonly rotateAfterWaves?: number;
@@ -78,6 +81,7 @@ export interface WakeTargetState {
 }
 
 export interface ThreadRouteRecord {
+  readonly envelope?: MessageEnvelope;
   readonly threadId: string;
   readonly messageId: string;
   readonly direction: 'inbound' | 'outbound';
@@ -97,6 +101,23 @@ export interface ThreadRouteRecord {
   };
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+export interface ThreadSummaryRecord {
+  threadId: string;
+  rootMessageId: string;
+  latestMessageId: string;
+  kind: string;
+  subject: string;
+  state: ThreadRouteRecord['state'];
+  settlement?: ThreadRouteRecord['settlement'];
+  localMailbox: string;
+  peerNodeIds: string[];
+  hopCount: number;
+  createdAt: string;
+  updatedAt: string;
+  rootEnvelope?: MessageEnvelope;
+  latestEnvelope?: MessageEnvelope;
 }
 
 export interface ResolvedReplyTarget {
@@ -238,8 +259,25 @@ export function normalizeMailboxId(value: unknown, label = 'mailbox id'): string
  * Deterministic logical mailbox resolution shared by the inbox executor, wake targets and
  * thread reverse routes: semantic target, explicit payload mailbox, executor channel, default.
  */
-export function resolveMailboxId(envelope: MessageEnvelope, executorName?: string): string {
+export interface MailboxTopicBinding {
+  executor: string;
+  mailboxId?: string;
+  streamKey?: string;
+}
+
+export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding): string {
+  if (binding.mailboxId !== undefined) return normalizeMailboxId(binding.mailboxId);
+  return binding.executor === 'orca-wave'
+    ? normalizeMailboxId(`stream:${binding.streamKey ?? kind}`) : 'default';
+}
+
+export function resolveMailboxId(envelope: MessageEnvelope, executorName?: string, binding?: MailboxTopicBinding): string {
   const semantic = envelope.semantic;
+  const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
+  if (binding && control && (semantic?.targetMailbox === undefined || semantic.targetMailbox === 'default')) {
+    const bound = resolveBoundMailboxId(envelope.kind, binding);
+    if (bound !== 'default') return bound;
+  }
   if (semantic?.targetMailbox !== undefined) {
     return normalizeMailboxId(semantic.targetMailbox, 'semantic targetMailbox');
   }
@@ -249,6 +287,12 @@ export function resolveMailboxId(envelope: MessageEnvelope, executorName?: strin
   const explicit = payload?.mailbox;
   if (isNonEmptyString(explicit)) {
     return normalizeMailboxId(explicit, 'payload mailbox');
+  }
+  if (binding && !control && !isNonEmptyString(payload?.executor)) {
+    if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
+      return normalizeMailboxId(`stream:${payload.streamKey}`);
+    }
+    return resolveBoundMailboxId(envelope.kind, binding);
   }
   if (executorName === 'orca-wave') {
     return normalizeMailboxId(`stream:${String(payload?.streamKey ?? envelope.kind)}`, 'stream mailbox');
@@ -295,6 +339,9 @@ function mergeWakeTarget(
   const worktreeId = optional('worktreeId');
   const workspacePath = optional('workspacePath');
   const terminalHandle = optional('terminalHandle');
+  const repoRoot = optional('repoRoot');
+  const autoCreateWorkspace = optional('autoCreateWorkspace');
+  const wakeupPrefix = optional('wakeupPrefix');
   const workspaceComment = optional('workspaceComment');
   const rotateAfterWaves = optional('rotateAfterWaves');
   const lastWakeError = optional('lastWakeError');
@@ -311,6 +358,9 @@ function mergeWakeTarget(
     ...(worktreeId !== undefined ? { worktreeId } : {}),
     ...(workspacePath !== undefined ? { workspacePath } : {}),
     ...(terminalHandle !== undefined ? { terminalHandle } : {}),
+    ...(repoRoot !== undefined ? { repoRoot } : {}),
+    ...(autoCreateWorkspace !== undefined ? { autoCreateWorkspace } : {}),
+    ...(wakeupPrefix !== undefined ? { wakeupPrefix } : {}),
     ...(workspaceComment !== undefined ? { workspaceComment } : {}),
     ...(rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
     ...(lastWakeError !== undefined ? { lastWakeError } : {}),
@@ -356,11 +406,16 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     'workspacePath',
     'terminalHandle',
     'workspaceComment',
+    'repoRoot',
+    'wakeupPrefix',
     'lastWakeError',
   ] as const) {
     if (target[field] !== undefined && typeof target[field] !== 'string') {
       throw invalidStore();
     }
+  }
+  if (target.autoCreateWorkspace !== undefined && typeof target.autoCreateWorkspace !== 'boolean') {
+    throw invalidStore();
   }
   return target;
 }
@@ -403,6 +458,7 @@ function validateThreadRecord(value: unknown): ThreadRouteRecord {
       throw invalidStore();
     }
   }
+  if (record.envelope !== undefined) validateStoredEnvelope(record.envelope);
   return {
     ...record,
     createdAt: record.createdAt ?? record.updatedAt,
@@ -1421,6 +1477,7 @@ export class MailboxStore {
       {
         threadId,
         messageId: envelope.id,
+        envelope: structuredClone(envelope),
         direction: 'inbound',
         peerNodeId: envelope.from.nodeId,
         peerNodeIds: [envelope.from.nodeId],
@@ -1462,6 +1519,7 @@ export class MailboxStore {
       {
         threadId,
         messageId: envelope.id,
+        envelope: structuredClone(envelope),
         direction: 'outbound',
         peerNodeId: peers[0] ?? '',
         peerNodeIds: peers,
@@ -1482,6 +1540,48 @@ export class MailboxStore {
       },
       settlement,
     );
+  }
+
+  listItemsAfterSequence(afterSequence: number): MailboxItem[] {
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < -1) {
+      throw new Error('Invalid sequence');
+    }
+    return this.read().items.filter(item => item.sequence > afterSequence)
+      .sort((a, b) => a.sequence - b.sequence).map(cloneItem);
+  }
+
+  listThreads(options: { kind?: string; state?: ThreadRouteRecord['state']; limit?: number } = {}): ThreadSummaryRecord[] {
+    if (options.state !== undefined && !THREAD_STATES.includes(options.state)) {
+      throw new Error('Invalid thread state');
+    }
+    if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 1)) {
+      throw new Error('Invalid thread limit');
+    }
+    const groups = new Map<string, ThreadRouteRecord[]>();
+    for (const record of Object.values(this.read().threads)) {
+      const group = groups.get(record.threadId) ?? [];
+      group.push(record);
+      groups.set(record.threadId, group);
+    }
+    const summaries = [...groups.values()].map(records => {
+      records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const root = records.find(record => record.messageId === record.threadId) ?? records[0];
+      const latest = records.at(-1)!;
+      return {
+        threadId: root.threadId, rootMessageId: root.messageId, latestMessageId: latest.messageId,
+        kind: root.kind, subject: root.subject,
+        state: records.reduce((state, record) => mergeThreadState(state, record.state), 'open' as ThreadRouteRecord['state']),
+        settlement: records.findLast(record => record.settlement)?.settlement,
+        localMailbox: latest.localMailbox,
+        peerNodeIds: [...new Set(records.flatMap(record => [...record.peerNodeIds]))],
+        hopCount: records.length, createdAt: records[0].createdAt,
+        updatedAt: records.reduce((time, record) => record.updatedAt > time ? record.updatedAt : time, root.updatedAt),
+        rootEnvelope: root.envelope, latestEnvelope: latest.envelope,
+      };
+    }).filter(record => (options.kind === undefined || record.kind === options.kind) &&
+      (options.state === undefined || record.state === options.state))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.threadId.localeCompare(b.threadId));
+    return structuredClone(options.limit === undefined ? summaries : summaries.slice(0, options.limit));
   }
 
   getThread(messageOrThreadId: string): ThreadRouteRecord | undefined {

@@ -1,3 +1,7 @@
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync, openSync, closeSync, fsyncSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { basename, dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 
 /** A single external command invocation; always executed with shell: false. */
@@ -60,6 +64,7 @@ export interface OrcaTerminalRow {
   handle: string;
   connected: boolean;
   writable?: boolean;
+  orphaned?: boolean;
   preview?: unknown;
   agentIdentity?: unknown;
   lastOutputAt?: unknown;
@@ -133,10 +138,11 @@ export async function checkOrcaWorkspaceIdle(
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
-    if (handles.length < row.agents.length) {
+    const activeHandles = handles.filter(t => t.orphaned !== true);
+    if (activeHandles.length < row.agents.length) {
       return false;
     }
-    for (const terminal of handles) {
+    for (const terminal of activeHandles) {
       if (!terminal.connected || !terminal.writable) {
         return false;
       }
@@ -242,26 +248,30 @@ export async function probeOrcaTerminalIdle(
 }
 
 /** Resolve the freshest connected antigravity terminal in an Orca workspace, spawning one if needed. */
-export async function resolveOrcaWorkspaceTerminal(
+export async function resolveOrSpawnOrcaWorkspaceTerminal(
   runner: CommandRunner,
   command: string,
   cwd: string,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<{ handle: string; spawned: boolean }> {
   const listed = await checkedCommand(runner, {
     command,
     args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
     cwd,
     signal,
   });
-  const terminals = (JSON.parse(listed.stdout)?.result?.terminals ?? []) as OrcaTerminalRow[];
-  const connected = terminals.filter(t => t && t.connected && t.writable !== false);
+  const inventory = JSON.parse(listed.stdout);
+  if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
+    throw new Error('Incomplete Orca terminal inventory');
+  }
+  const terminals = inventory.result.terminals as OrcaTerminalRow[];
+  const connected = terminals.filter(t => t && t.orphaned !== true && t.connected && t.writable !== false);
   const preferred = connected.filter(t => t.agentIdentity === 'antigravity');
   const matched = (preferred.length ? preferred : connected).sort(
     (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
   );
   if (matched.length) {
-    return String(matched[0].handle);
+    return { handle: String(matched[0].handle), spawned: false };
   }
   const spawned = await checkedCommand(runner, {
     command,
@@ -283,7 +293,7 @@ export async function resolveOrcaWorkspaceTerminal(
   if (handle === undefined || handle === null || handle === '') {
     throw new Error('Orca terminal spawn returned no handle');
   }
-  return String(handle);
+  return { handle: String(handle), spawned: true };
 }
 
 /** Send one line (plus Enter) to a terminal; the caller must have proven it idle first. */
@@ -343,4 +353,76 @@ export async function setOrcaWorkspaceComment(
   if (JSON.parse(output.stdout).ok === false) {
     throw new Error('Orca workspace comment update failed');
   }
+}
+
+/**
+ * Trust a workspace in Antigravity by adding it to trustedWorkspaces.
+ * Missing settings files start from an empty object, then the file is replaced atomically.
+ */
+export function trustAntigravityWorkspace(workspacePath: string, settingsPath?: string): void {
+  const file = settingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
+  let settings: Record<string, unknown> = {};
+  if (existsSync(file)) {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`Antigravity settings at ${file} must be a JSON object`);
+    }
+    settings = parsed as Record<string, unknown>;
+  }
+  const trusted = Array.isArray(settings.trustedWorkspaces)
+    ? settings.trustedWorkspaces.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const candidates = existsSync(workspacePath)
+    ? [workspacePath, realpathSync(workspacePath)]
+    : [workspacePath];
+  for (const candidate of candidates) {
+    if (!trusted.includes(candidate)) {
+      trusted.push(candidate);
+    }
+  }
+  settings.trustedWorkspaces = trusted;
+  mkdirSync(dirname(file), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, 'wx', 0o600);
+  try {
+    writeFileSync(fd, `${JSON.stringify(settings, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+export async function ensureOrcaWorkspace(
+  runner: CommandRunner,
+  command: string,
+  options: { workspacePath: string; repoRoot?: string; comment?: string; trustAntigravity?: boolean; agySettingsPath?: string; signal?: AbortSignal },
+): Promise<{ workspacePath: string; created: boolean }> {
+  const cwd = options.repoRoot ?? dirname(options.workspacePath);
+  const listed = await checkedCommand(runner, { command, args: ['worktree', 'list', '--json'], cwd: existsSync(cwd) ? cwd : undefined, signal: options.signal });
+  const raw = JSON.parse(listed.stdout);
+  const rows = raw.result?.worktrees ?? raw.worktrees ?? (Array.isArray(raw.result) ? raw.result : undefined);
+  if (raw.ok === false || !Array.isArray(rows) || raw.result?.truncated) throw new Error('Incomplete Orca workspace inventory');
+  const canonical = (path: string) => existsSync(path) ? realpathSync(path) : path;
+  const found = rows.find(row => typeof row.path === 'string' && canonical(row.path) === canonical(options.workspacePath));
+  if (found) return { workspacePath: found.path, created: false };
+  if (!options.repoRoot) throw new Error('Creating a fixed Orca workspace requires a receiver-local repoRoot');
+  const created = await checkedCommand(runner, {
+    command, args: ['worktree', 'create', '--no-parent', '--name', basename(options.workspacePath), ...(options.comment ? ['--comment', options.comment] : []), '--json'],
+    cwd: options.repoRoot, signal: options.signal,
+  });
+  const response = JSON.parse(created.stdout);
+  const path = response.result?.path ?? response.result?.worktree?.path;
+  if (response.ok === false || typeof path !== 'string' || !path.trim()) throw new Error('Orca workspace creation returned no path');
+  const settings = options.agySettingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
+  if (options.trustAntigravity !== false && (options.agySettingsPath !== undefined || existsSync(settings))) trustAntigravityWorkspace(path, settings);
+  return { workspacePath: path, created: true };
+}
+
+export async function resolveOrcaWorkspaceTerminal(runner: CommandRunner, command: string, cwd: string, signal?: AbortSignal): Promise<string> {
+  return (await resolveOrSpawnOrcaWorkspaceTerminal(runner, command, cwd, signal)).handle;
 }

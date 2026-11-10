@@ -13,8 +13,10 @@ import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, ini
 export * from './runtime.ts';
 export * from './config.ts';
 
-const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait'];
+const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait'] as const;
 const stringFlags = [
+  'thread',
+  'state',
   'limit',
   'root',
   'id',
@@ -62,7 +64,7 @@ const stringFlags = [
   'reply-mailbox',
   'target-mailbox',
   'subject',
-];
+] as const;
 
 function parse(argv: string[]) {
   return parseArgs({
@@ -70,8 +72,8 @@ function parse(argv: string[]) {
     allowPositionals: true,
     strict: true,
     options: {
-      ...Object.fromEntries(booleanFlags.map(k => [k, { type: 'boolean' as const }])),
-      ...Object.fromEntries(stringFlags.map(k => [k, { type: 'string' as const }])),
+      ...Object.fromEntries(booleanFlags.map(k => [k, { type: 'boolean' as const }])) as Record<typeof booleanFlags[number], { type: 'boolean' }>,
+      ...Object.fromEntries(stringFlags.map(k => [k, { type: 'string' as const }])) as Record<typeof stringFlags[number], { type: 'string' }>,
       attach: { type: 'string', multiple: true },
     },
   });
@@ -421,6 +423,9 @@ function runThreadCommand(
   target: string | undefined,
   v: Record<string, any>,
 ) {
+  if (action === 'list') {
+    return store.listThreads({ kind: v.topic, state: v.state, limit: v.limit === undefined ? undefined : Number(v.limit) });
+  }
   if (action !== 'show') {
     throw new Error('Unknown thread command; use thread show <id>');
   }
@@ -731,7 +736,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       });
     } else if (group === 'node') {
       if (action === 'up' || action === 'status') {
-        if (action === 'up' && ['profile', 'patch', 'member', 'name', 'skills', 'port'].some(key => v[key] !== undefined)) {
+        if (action === 'up' && (['profile', 'patch', 'member', 'name', 'skills', 'port'] as const).some(key => v[key] !== undefined)) {
           throw new Error('Node already running; stop it before changing startup configuration');
         }
         result = runtime.status();
@@ -823,6 +828,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
           : undefined;
+      const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
       result = await runtime.emitter.emit({
         networkId: required(v.network, '--network'),
         kind: topic,
@@ -835,10 +841,11 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           ...(v.to ? { targets: [String(v.to)] } : {}),
           topic,
         },
-        ...(targetMailbox !== undefined || replyMailbox !== undefined
+        ...(threadId !== undefined || targetMailbox !== undefined || replyMailbox !== undefined
           ? {
               semantic: {
                 type: 'message' as const,
+                ...(threadId !== undefined ? { threadId } : {}),
                 ...(targetMailbox !== undefined ? { targetMailbox } : {}),
                 ...(replyMailbox !== undefined ? { replyMailbox } : {}),
               },
@@ -852,7 +859,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         throw new Error('Start dealer node up before adding a live source');
       }
       const config = v.config ? JSON.parse(readFileSync(String(v.config), 'utf8')) : {};
-      for (const key of ['command', 'endpoint', 'model', 'url', 'cwd', 'path']) {
+      for (const key of ['command', 'endpoint', 'model', 'url', 'cwd', 'path'] as const) {
         if (v[key]) {
           config[key] = v[key];
         }

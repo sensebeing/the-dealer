@@ -109,10 +109,6 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       });
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
       const select = (e: MessageEnvelope) => {
-        const explicit = e.payload?.executor;
-        if (typeof explicit === 'string' && explicit.trim().length > 0) {
-          return explicit;
-        }
         // Session control always lands in a mailbox; it must never spawn new worktrees.
         const semanticType = e.semantic?.type;
         if (
@@ -121,6 +117,10 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           semanticType === 'settle'
         ) {
           return 'inbox';
+        }
+        const explicit = e.payload?.executor;
+        if (typeof explicit === 'string' && explicit.trim().length > 0) {
+          return explicit;
         }
         return (
           config.resolveKindExecutor?.(e.kind) ??

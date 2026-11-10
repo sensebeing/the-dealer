@@ -13,3 +13,4 @@ export * from './plugins-router/index.ts';
 export * from './plugins-policy/index.ts';
 export * from './plugins-executor/index.ts';
 export * from './cli/index.ts';
+export * from './plugins-lark-notifier/index.ts';

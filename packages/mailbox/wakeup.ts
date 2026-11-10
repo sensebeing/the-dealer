@@ -1,7 +1,8 @@
 import {
   checkOrcaWorkspaceIdle,
+  ensureOrcaWorkspace,
+  resolveOrSpawnOrcaWorkspaceTerminal,
   probeOrcaTerminalIdle,
-  resolveOrcaWorkspaceTerminal,
   runCommand,
   sendOrcaTerminalText,
   setOrcaWorkspaceComment,
@@ -275,6 +276,14 @@ export class WakeupRedriveService {
             : 'No queued mail',
         );
       }
+      if (!this.idleCheck && target.mode === 'orca-terminal' && target.workspacePath && target.autoCreateWorkspace === true) {
+        const workspace = await ensureOrcaWorkspace(this.runner, target.orcaCommand ?? this.command, {
+          workspacePath: target.workspacePath, repoRoot: target.repoRoot, comment: target.workspaceComment,
+        });
+        if (workspace.workspacePath !== target.workspacePath) {
+          target = this.store.upsertWakeTarget(mailboxId, { workspacePath: workspace.workspacePath });
+        }
+      }
       const idle = await this.authoritativeIdle(target);
       if (!idle.idle) {
         return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
@@ -341,7 +350,12 @@ export class WakeupRedriveService {
     return noWake(mailboxId, target.mode, reason);
   }
 
-  private buildPointer(
+  private buildPointer(mailboxId: string, target: WakeTargetState, preview: MailboxCheckResult): string | undefined {
+    const body = this.buildPointerBody(mailboxId, target, preview);
+    return body && target.wakeupPrefix?.trim() ? `${singleLine(target.wakeupPrefix)} ${body}` : body;
+  }
+
+  private buildPointerBody(
     mailboxId: string,
     target: WakeTargetState,
     preview: MailboxCheckResult,
@@ -369,22 +383,6 @@ export class WakeupRedriveService {
     return singleLine(
       `You have ${preview.items.length} Dealer message(s) in ${mailboxId}${latestHint ? ` [${latestHint}]` : ''}. Run \`dealer inbox check --mailbox ${mailboxId} --json\`.`,
     );
-  }
-
-  private async resolveRotationTerminal(
-    target: WakeTargetState,
-  ): Promise<string | undefined> {
-    if (target.terminalHandle) {
-      return target.terminalHandle;
-    }
-    if (target.workspacePath) {
-      return resolveOrcaWorkspaceTerminal(
-        this.runner,
-        target.orcaCommand ?? this.command,
-        target.workspacePath,
-      );
-    }
-    return undefined;
   }
 
   private async postRotationIdle(
@@ -417,14 +415,20 @@ export class WakeupRedriveService {
     preview: MailboxCheckResult,
   ): Promise<WakeupFlushResult> {
     const command = target.orcaCommand ?? this.command;
+    let terminalHandle = target.terminalHandle;
+    const needsRotation = !preview.deliveryId && target.rotateAfterWaves !== undefined && target.completedWaves >= target.rotateAfterWaves;
+    if (!terminalHandle && target.workspacePath && (target.mode === 'orca-terminal' || needsRotation)) {
+      const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath);
+      terminalHandle = resolved.handle;
+      if (resolved.spawned) {
+        const idle = this.idleCheck ? await this.idleCheck() : await waitOrcaTerminalIdle(this.runner, command, terminalHandle, target.workspacePath, 5000);
+        if (!idle.idle) return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
+      }
+    }
     let rotated = false;
     let rotationTerminal: string | undefined;
-    if (
-      !preview.deliveryId &&
-      target.rotateAfterWaves !== undefined &&
-      target.completedWaves >= target.rotateAfterWaves
-    ) {
-      rotationTerminal = await this.resolveRotationTerminal(target);
+    if (needsRotation) {
+      rotationTerminal = terminalHandle;
       if (rotationTerminal) {
         await sendOrcaTerminalText(
           this.runner,
@@ -490,15 +494,6 @@ export class WakeupRedriveService {
         throw new Error('Orca wakeup delivery failed');
       }
     } else {
-      const terminalHandle =
-        target.terminalHandle ??
-        (target.workspacePath
-          ? await resolveOrcaWorkspaceTerminal(
-              this.runner,
-              command,
-              target.workspacePath,
-            )
-          : undefined);
       if (!terminalHandle) {
         throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
       }
