@@ -17,7 +17,7 @@ import {
   decodeNetworkInvite, DealerNodeRuntime, MailboxStore, createAgentPtyExecutorPlugin,
   createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin,
   createCodexExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin,
-  BUILTIN_EXECUTORS, getBuiltInProfile,
+  BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
 } from '../packages/index.ts';
 import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
@@ -55,6 +55,100 @@ test('setup probe is read-only, detects CLI/project and redacts network secrets'
   assert.equal(existsSync(join(root, 'private-key.pem')), false);
 });
 
+test('project onboarding validates fields and probe normalizes defaults without exposing Lark targets', t => {
+  const root = directory(t);
+  mkdirSync(join(root, '.dealer'));
+  const path = join(root, '.dealer/project.json');
+  const manifest = { schema: 'the-dealer-project/v1', projectId: 'demo', defaultNetworkId: 'team' };
+  const probe = () => probeDealerSetup({ cwd: root, stateDir: root, env: { PATH: '' } });
+  const onboarding = { networkTopology: 'fixed', networkId: 'invited', requireLarkCli: true,
+    notifyLark: true, defaultTopic: 'review', defaultConversationMode: 'spawn', teamRegistryPath: 'team.json' };
+  writeFileSync(path, JSON.stringify({ ...manifest, onboarding }));
+  assert.deepEqual(readProjectManifest(root).onboarding, onboarding);
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ larkNotify: { enabled: true, command: '/custom/lark-cli', userId: 'private-target' } }));
+  assert.deepEqual(probe().onboarding, onboarding);
+  assert.deepEqual(probe().node.larkNotify, { enabled: true, command: '/custom/lark-cli' });
+  assert.ok(!JSON.stringify(probe()).includes('private-target'));
+  for (const invalid of [null, [], 'fixed', { networkTopology: 'other' }, { requireLarkCli: 'true' },
+    { notifyLark: 1 }, { networkId: '' }, { defaultTopic: ' ' }, { teamRegistryPath: '' }, { defaultConversationMode: 'other' }]) {
+    writeFileSync(path, JSON.stringify({ ...manifest, onboarding: invalid }));
+    assert.throws(() => readProjectManifest(root), /onboarding/);
+  }
+  for (const defaultNetworkId of ['team', 'local']) {
+    writeFileSync(path, JSON.stringify({ ...manifest, defaultNetworkId }));
+    assert.deepEqual(probe().onboarding, { networkTopology: defaultNetworkId === 'local' ? 'selectable' : 'fixed',
+      networkId: defaultNetworkId, requireLarkCli: false, notifyLark: false,
+      defaultTopic: 'collab.request.v4', defaultConversationMode: 'fixed' });
+  }
+  rmSync(path);
+  rmSync(join(root, 'config.json'));
+  assert.equal(probe().onboarding, null);
+  assert.equal(probe().node.larkNotify, null);
+});
+
+test('preset enables live Lark delivery and inherits only the selected project default', async t => {
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  const runtime = new DealerNodeRuntime({ stateDir: join(root, 'state'), member: 'solo',
+    transport: { discoveryDir: join(root, 'discovery') },
+    patch: { larkNotify: { enabled: false, target: { userId: 'receiver' } } },
+    commandRunner: async call => { calls.push(call); return { stdout: '{"data":{"message_id":"lark-1"}}' }; },
+  });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  for (const id of ['one', 'two']) {
+    const projectRoot = join(root, id);
+    mkdirSync(join(projectRoot, '.dealer'), { recursive: true });
+    writeFileSync(join(projectRoot, '.dealer/project.json'), JSON.stringify({ schema: 'the-dealer-project/v1',
+      projectId: id, defaultNetworkId: 'local', onboarding: { notifyLark: true } }));
+    await runtime.linkProject(projectRoot);
+    if (id === 'one') {
+      const disabled = await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', notifyLark: false });
+      assert.equal(disabled.binding.notifyLark, false);
+      assert.equal(runtime.config.larkNotify?.enabled, false);
+      const inherited = await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only' });
+      assert.equal(inherited.binding.notifyLark, true);
+      assert.equal(runtime.config.larkNotify?.enabled, true);
+      assert.ok(runtime.larkNotifier);
+    }
+  }
+  assert.equal((await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', topic: 'ambiguous' })).binding.notifyLark, undefined);
+  assert.equal((await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', topic: 'selected', projectId: 'two' })).binding.notifyLark, true);
+  const notifier = runtime.larkNotifier;
+  await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', topic: 'explicit', notifyLark: true });
+  assert.equal(runtime.larkNotifier, notifier, 'repeated activation reuses the notifier');
+  runtime.mailbox.enqueue([message('live')], { mailboxId: 'stream:explicit' });
+  await runtime.larkNotifier!.flush();
+  assert.ok(calls.some(call => call.command === 'lark-cli' && call.args.includes('+messages-send')));
+  const config = JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8'));
+  assert.equal(config.larkNotify.enabled, true);
+  assert.equal(config.larkNotify.target.userId, 'receiver');
+  assert.equal(config.topicBindings.explicit.notifyLark, true);
+});
+
+test('CLI notify-lark activates an existing daemon and survives restart', async t => {
+  const root = directory(t);
+  const options = { stateDir: join(root, 'state'), transport: { discoveryDir: join(root, 'discovery') },
+    commandRunner: async () => ({ stdout: '{}' }) };
+  const runtime = new DealerNodeRuntime(options);
+  await runtime.start();
+  t.after(() => runtime.stop());
+  assert.equal(runtime.larkNotifier, undefined);
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  assert.equal(await runDealerCli(['setup', 'apply-preset', '--host', 'codex', '--mode', 'inbox-only', '--notify-lark', '--json'],
+    { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) }), 0, stderr.join(''));
+  assert.equal(JSON.parse(stdout.join('')).binding.notifyLark, true);
+  assert.equal(runtime.config.larkNotify?.enabled, true);
+  assert.ok(runtime.larkNotifier);
+  await runtime.stop();
+  const restarted = new DealerNodeRuntime(options);
+  await restarted.start();
+  t.after(() => restarted.stop());
+  assert.equal(restarted.config.larkNotify?.enabled, true);
+  assert.ok(restarted.larkNotifier);
+});
+
 test('setup invite prompts reuse configured network, encode seeds, and do not mutate state', async t => {
   const root = directory(t);
   const config = JSON.stringify({ member: 'alice', networks: [{ networkId: 'team', passphrase: 'shared', bootstrapPeers: ['localhost:4000'] }] });
@@ -79,7 +173,17 @@ test('setup invite prompts reuse configured network, encode seeds, and do not mu
       assert.match(prompt, /Never overwrite ~\/\.dealer\/identity.json/);
     }
     assert.match(result.teammatePrompt, /Ask for the teammate’s member handle/);
-    assert.match(result.teammatePrompt, /dealer setup binding-preset/);
+    assert.match(result.teammatePrompt, /dealer setup binding-preset.*--notify-lark/);
+    assert.match(result.teammatePrompt, /dealer setup apply-preset.*--notify-lark/);
+    for (const prompt of [result.crossMachinePrompt, result.teammatePrompt]) {
+      assert.ok(prompt.includes('Network topology is fixed to team; do not ask to choose local or another network topology.'));
+      for (const command of ['command -v lark-cli', '~/.local/bin/lark-cli', 'npx @larksuite/cli@latest install',
+        'lark-cli config init --new', 'lark-cli auth login --recommend',
+        'LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 lark-cli auth status --json --verify']) assert.ok(prompt.includes(command));
+    }
+    const projectPrompt = buildOnboardingPrompts({ networkId: 'team', inviteUri: result.inviteUri, projectId: 'demo' }).teammatePrompt;
+    assert.match(projectPrompt, /binding-preset.*--notify-lark --project 'demo'/);
+    assert.match(projectPrompt, /apply-preset.*--notify-lark --project 'demo'/);
   }
 });
 
@@ -563,7 +667,7 @@ test('live applied preset enables dispatch immediately and changes unbound defau
   assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 'review-session', '--resume']);
   assert.deepEqual(calls[1].args.slice(0, 2), ['exec', '--worktree']);
   assert.equal(runtime.mailbox.getWakeTarget('stream:review')?.mode, 'passive');
-  runtime.applyAgentPreset({ host: 'claude', conversationMode: 'inbox-only', topic: 'manual', setDefault: true });
+  await runtime.applyAgentPreset({ host: 'claude', conversationMode: 'inbox-only', topic: 'manual', setDefault: true });
   assert.equal(runtime.config.defaultExecutor, 'inbox');
 });
 

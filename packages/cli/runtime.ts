@@ -346,19 +346,8 @@ export class DealerNodeRuntime {
           this.lastError = String(error);
         }
       }
-      if (this.config.larkNotify?.enabled) {
-        const options = {
-          store: this.mailbox, config: this.config.larkNotify, stateDir: this.stateDir,
-          localNodeId: this.transport.localNodeId, localMember: this.config.member,
-          commandRunner: this.options.commandRunner ?? runCommand,
-          onError: (error: unknown) => { this.lastError = String(error); },
-        };
-        this.larkNotifier = new LarkMailboxNotifier(options);
-        this.refreshTopicBindings();
-        await this.kernel.use(createLarkMirrorPlugin({ ...options, notifier: this.larkNotifier }));
-      } else {
-        this.refreshTopicBindings();
-      }
+      await this.activateLarkNotifier();
+      this.refreshTopicBindings();
       this.persist();
       this.started = true;
       return this;
@@ -623,8 +612,25 @@ export class DealerNodeRuntime {
     return resolved ? { ...resolved.binding, repoRoot: resolved.projectRoot } : undefined;
   };
 
-  applyAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { setDefault?: boolean }) {
-    const preset = buildAgentBindingPreset(options);
+  private async activateLarkNotifier(): Promise<void> {
+    if (!this.config.larkNotify?.enabled || this.larkNotifier) return;
+    const options = {
+      store: this.mailbox, config: this.config.larkNotify, stateDir: this.stateDir,
+      localNodeId: this.transport.localNodeId, localMember: this.config.member,
+      commandRunner: this.options.commandRunner ?? runCommand,
+      onError: (error: unknown) => { this.lastError = String(error); },
+    };
+    this.larkNotifier = new LarkMailboxNotifier(options);
+    this.refreshTopicBindings();
+    await this.kernel.use(createLarkMirrorPlugin({ ...options, notifier: this.larkNotifier }));
+  }
+
+  async applyAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { setDefault?: boolean }) {
+    const project = options.projectId ? this.loadedProjects.get(options.projectId)
+      : this.loadedProjects.size === 1 ? [...this.loadedProjects.values()][0] : undefined;
+    const preset = buildAgentBindingPreset({ ...options,
+      notifyLark: options.notifyLark ?? (project?.manifest.onboarding?.notifyLark === true ? true : undefined),
+    });
     const host = options.host === 'claude' ? 'claude-code' : options.host;
     const mode = options.conversationMode ?? 'fixed';
     const defaultExecutor = !options.setDefault ? this.config.defaultExecutor
@@ -637,6 +643,10 @@ export class DealerNodeRuntime {
       this.config.executorConfig[name] = { ...this.config.executorConfig[name], ...config };
     }
     this.config.defaultExecutor = defaultExecutor;
+    if (preset.binding.notifyLark === true) {
+      this.config.larkNotify = { ...this.config.larkNotify, enabled: true };
+      if (this.started) await this.activateLarkNotifier();
+    }
     for (const name of this.config.executors) this.registerBuiltinExecutor?.(name);
     this.refreshTopicBindings();
     this.persist();

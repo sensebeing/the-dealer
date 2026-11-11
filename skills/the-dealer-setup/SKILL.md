@@ -42,7 +42,13 @@ Never replace an existing identity or copy another machine's private key.
 
 ## 2. Choose network topology
 
-Ask whether the user wants **same-machine local** (default), **connect their own machines**, or **join/create
+If `.dealer/project.json` declares `onboarding.networkTopology: "fixed"` or a
+non-local `defaultNetworkId` such as `alter-service-team`, use that project's
+network. An invite also fixes the topology to its invited network. This applies
+to both the user's own node and teammates; do not ask whether to use local.
+Use the normalized `onboarding` metadata from the probe for project defaults.
+
+Otherwise, ask whether the user wants **same-machine local** (default), **connect their own machines**, or **join/create
 a teammate network**. Reuse prior answers.
 
 - Local needs no network mount, invite or passphrase.
@@ -57,17 +63,29 @@ passphrase; its expiry limits importing, not continued network access.
 
 Run `dealer node up --profile personal-dev --member <member> --name <node> --json`.
 If the project has no manifest, run `dealer project init --root <repo> --id <id>
---network local --json`; then `dealer project link <repo> --json`.
+--network <chosen-network> --json`; then `dealer project link <repo> --json`.
 The default local scope supports `send`, `ask`, `reply`, `settle` and durable
 mailboxes without a remote network. Choose the receiver's host and bind its
 project root; never accept sender-supplied filesystem paths as project identity.
 
+When `onboarding.requireLarkCli` is true or Lark notifications are requested,
+prepare Lark before applying a preset. Check `command -v lark-cli` and
+`~/.local/bin/lark-cli`; if absent, install with `npx @larksuite/cli@latest install`.
+Use the discovered executable for subsequent commands. Verify authentication:
+
+```sh
+LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 lark-cli auth status --json --verify
+```
+
+For `not_configured`, run `lark-cli config init --new`. If not logged in or
+expired, run `lark-cli auth login --recommend`, then repeat the status command.
+Use the project's `defaultTopic` and `defaultConversationMode` when supplied.
+
 Generate a preset with `dealer setup binding-preset --host orca --mode spawn
 --topic task --project <id> --workspace-path <receiver-repo> --agent codex --json`.
-This prints a proposal, not an applied configuration. Merge `binding` under
-`topicBindings[topic]`, merge `executorConfig` into the receiver's config, and
-ensure the executor is enabled. Use the project's existing patch/configuration
-lane, validate it, and reload/restart the node through its normal lifecycle.
+This prints a proposal. Apply it with `dealer setup apply-preset` and the same
+options. Include `--notify-lark` when the project requests notifications; this
+enables both `binding.notifyLark` and node-level `larkNotify.enabled`.
 For Orca, spawn creates a child worktree; fixed uses an idle-gated workspace.
 
 ## 4. Connect another machine
@@ -101,11 +119,16 @@ or **inbox-only** (manual processing). Ask only for the selected host's required
 selectors: Orca inner agent/workspace; Codex profile/thread; Claude role/session;
 Dot agent; Grok targetBot. See [agent-app-matrix](references/agent-app-matrix.md).
 
+For teammates with Lark notifications, follow Step 3's installation,
+configuration and login checks by default before applying the preset. Pass
+`--notify-lark` to both preset commands and `--project <id>` for a linked project.
+
 Generate `binding-preset`, show its topic, executor and receiver workspace, then
 apply with `dealer setup apply-preset --host <host> --mode <mode>` and the same
 selectors. Add `--set-default` only when the user wants the node default changed. Grok execution
-requires a nonempty targetBot. Optional `notifyLark` controls mailbox eligibility;
-configure `larkNotify` credentials/target separately, never infer them.
+requires a nonempty targetBot. `--notify-lark` enables both mailbox eligibility
+and node notifications immediately. Configure credentials/target separately,
+never infer them.
 Generate `invite-prompt --peer-member <colleague>` and share `teammatePrompt`.
 Keep approval-required admission until the intended peer is verified. Check
 mailbox readback and an actual host receipt before reporting onboarding complete.
@@ -134,7 +157,8 @@ executor settings. It works offline or through the running daemon, taking effect
 without a restart. Omit `--set-default` to preserve the node's current default.
 `--mode inbox-only` selects durable manual intake. Supported selectors include
 `--project`, `--workspace-path`, `--agent`, `--agent-profile`, `--target-bot`,
-and `--session-id`; `--notify-lark` enables mailbox eligibility, not Lark credentials.
+and `--session-id`; `--notify-lark` enables mailbox eligibility and node notifications,
+but does not configure Lark credentials.
 
 For compatibility, `apply-preset` applies the same bindings as `binding-preset`:
 Orca and Antigravity use managed `orca-spawn`/`orca-wave`; Codex and Claude Code

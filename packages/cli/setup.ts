@@ -38,7 +38,11 @@ export function probeDealerSetup(options: {
   env?: NodeJS.ProcessEnv;
   pathLookup?: (command: string, env: NodeJS.ProcessEnv) => string | undefined;
 } = {}) {
-  const env = options.env ?? process.env;
+  let env = options.env ?? process.env;
+  const localBin = join(homedir(), '.local/bin');
+  if (!options.pathLookup && !options.env && !(env.PATH ?? '').split(delimiter).includes(localBin)) {
+    env = { ...env, PATH: [env.PATH, localBin].filter(Boolean).join(delimiter) };
+  }
   const cwd = resolve(options.cwd ?? process.cwd());
   const stateDir = resolve(options.stateDir ?? env.DEALER_STATE_DIR ?? join(env.HOME ?? homedir(), '.dealer'));
   const lookup = options.pathLookup ?? pathLookup;
@@ -52,11 +56,24 @@ export function probeDealerSetup(options: {
   const recommendedHost = clis.orca ? 'orca' : AGENT_HOST_CATALOG.find(host => host.host !== 'antigravity' && clis[host.command])?.host ?? (clis.agy ? 'antigravity' : null);
   return {
     cwd, stateDir, clis, apps, recommendedHost, agentCatalog: AGENT_HOST_CATALOG, project,
+    onboarding: project ? {
+      networkTopology: project.onboarding?.networkTopology ?? (typeof project.defaultNetworkId === 'string' && project.defaultNetworkId !== 'local' ? 'fixed' : 'selectable'),
+      networkId: project.onboarding?.networkId ?? project.defaultNetworkId ?? 'local',
+      requireLarkCli: Boolean(project.onboarding?.requireLarkCli),
+      notifyLark: Boolean(project.onboarding?.notifyLark),
+      defaultTopic: project.onboarding?.defaultTopic ?? 'collab.request.v4',
+      defaultConversationMode: project.onboarding?.defaultConversationMode ?? 'fixed',
+      ...(project.onboarding?.teamRegistryPath ? { teamRegistryPath: project.onboarding.teamRegistryPath } : {}),
+    } : null,
     node: {
       configured: Boolean(config), controlSocketPresent: existsSync(join(stateDir, 'control.sock')),
       member: config?.member, name: config?.name, profile: config?.profile,
       networks: config?.networks?.map((network: { networkId: string }) => network.networkId) ?? [],
       projects: config?.projects ?? {},
+      larkNotify: config?.larkNotify ? {
+        enabled: Boolean(config.larkNotify.enabled),
+        ...(config.larkNotify.command ? { command: config.larkNotify.command } : {}),
+      } : null,
     },
   };
 }
@@ -78,15 +95,19 @@ export function buildOnboardingPrompts(options: {
   const nodeName = options.nodeName ?? 'other-machine';
   const seeds = Array.isArray(options.seed) ? options.seed.join(',') : options.seed;
   const mount = `dealer network mount ${quote(inviteUri)}${seeds ? ` --seed ${quote(String(seeds))}` : ''} --json`;
+  const presetOptions = `--host <chosen-app> --mode <chosen-mode> --notify-lark${options.projectId ? ` --project ${quote(options.projectId)}` : ''}`;
   const common = (identity: string, teammate = false) => [
     'Set up the-dealer on this machine. Never overwrite ~/.dealer/identity.json or copy another machine’s private key. First check command -v dealer and node --version (Node >=22.15 required).',
     'If dealer is absent, run npm install -g git+https://github.com/sensebeing/the-dealer. For a local checkout, clone https://github.com/sensebeing/the-dealer.git into ~/the-dealer, or update it with git -C ~/the-dealer pull --ff-only after checking for local changes; then run npm --prefix ~/the-dealer link. Preserve existing installations and configuration.',
     "Install skills with npx skills add sensebeing/the-dealer --global --agent '*'. Preserve existing skill configuration.",
     'For checkout-based skill installation, create ~/.agents/skills/ and ~/.claude/skills/. Symlink each of ~/the-dealer/skills/the-dealer, ~/the-dealer/skills/the-dealer-setup, and ~/the-dealer/skills/the-dealer-extend into both directories, and into ~/.gemini/config/skills/ if that directory exists. Preserve unrelated existing files and resolve conflicting skill links before changing them.',
     'Read the installed the-dealer-setup/SKILL.md, then run dealer setup probe --json before configuring anything.',
-    ...(teammate ? [`Ask for the teammate’s member handle before continuing; replace ${quote(peerMember)} below with their chosen handle. Ask for their Agent App (orca, antigravity, claude-code, codex, chatgpt-dot, grok-bot) and mode (spawn, fixed, inbox-only); generate dealer setup binding-preset --host <chosen-app> --mode <chosen-mode> --json (add --target-bot for grok-bot execution), then apply the reviewed preset with dealer setup apply-preset using the same options (add --set-default only to change the node default).`] : []),
+    `Network topology is fixed to ${networkId}; do not ask to choose local or another network topology.`,
+    'Before applying presets, check command -v lark-cli or ~/.local/bin/lark-cli. If missing, install with npx @larksuite/cli@latest install. Use the discovered executable for all subsequent lark-cli commands. Run LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 lark-cli auth status --json --verify. If not_configured, run lark-cli config init --new. If not logged in or expired, run lark-cli auth login --recommend, then re-verify auth status with the same environment flags.',
+    ...(teammate ? [`Ask for the teammate’s member handle before continuing; replace ${quote(peerMember)} below with their chosen handle. Ask for their Agent App (orca, antigravity, claude-code, codex, chatgpt-dot, grok-bot) and mode (spawn, fixed, inbox-only).`] : []),
     `dealer node up --member ${quote(identity)} --name ${quote(nodeName)} --json`, mount,
     ...(options.projectId ? [`Link this local repository using dealer project link . --json; verify its projectId is ${quote(options.projectId)}.`] : []),
+    ...(teammate ? [`Generate dealer setup binding-preset ${presetOptions} --json (add --target-bot for grok-bot execution), then apply the reviewed preset with dealer setup apply-preset ${presetOptions} --json using the same options (add --set-default only to change the node default).`] : []),
     `dealer peers list --network ${quote(networkId)} --json`,
     `dealer send --network ${quote(networkId)} --to ${quote(`member:${member}`)} --topic setup.ping --body 'Please reply to verify connectivity' --json`,
     'Verify a reply in both directions; a dispatch receipt alone is not task completion. Keep approval_required until the intended peer is verified.',

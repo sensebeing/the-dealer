@@ -769,7 +769,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     let result: unknown;
     const network = v.network as string | undefined;
     if (group === 'setup' && action === 'apply-preset') {
-      result = runtime.applyAgentPreset({
+      result = await runtime.applyAgentPreset({
         host: required(v.host, '--host') as SupportedAgentHost,
         conversationMode: v.mode as AgentConversationMode | undefined,
         topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Disposable, MessageEnvelope, PendingApprovalItem } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
@@ -218,8 +219,10 @@ export class LarkMailboxNotifier {
   }
   private async invoke(args: string[]): Promise<any> {
     const config = this.options.config;
+    const localCommand = join(homedir(), '.local/bin/lark-cli');
+    const command = config.command ?? ((!this.options.commandRunner || this.options.commandRunner === runCommand) && existsSync(localCommand) ? localCommand : 'lark-cli');
     const result = await checkedCommand(this.options.commandRunner ?? runCommand, {
-      command: config.command ?? 'lark-cli', args: [...(config.profile ? ['--profile', config.profile] : []), ...args], signal: this.controller.signal,
+      command, args: [...(config.profile ? ['--profile', config.profile] : []), ...args], signal: this.controller.signal,
     });
     const parsed = JSON.parse(result.stdout.trim());
     if (parsed?.ok === false || (typeof parsed?.code === 'number' && parsed.code !== 0)) throw new Error(`Lark notification rejected: ${JSON.stringify(parsed)}`);

@@ -89,6 +89,16 @@ export interface DealerTopicSpec {
   streamKey?: string;
 }
 
+export interface DealerProjectOnboardingPreset {
+  networkTopology?: 'fixed' | 'selectable';
+  networkId?: string;
+  requireLarkCli?: boolean;
+  notifyLark?: boolean;
+  defaultTopic?: string;
+  defaultConversationMode?: 'spawn' | 'fixed' | 'inbox-only';
+  teamRegistryPath?: string;
+}
+
 export interface DealerProjectManifest {
   schema: 'the-dealer-project/v1';
   projectId: string;
@@ -97,6 +107,7 @@ export interface DealerProjectManifest {
   skills?: string[];
   plugins?: DealerProjectPluginRef[];
   topics?: Record<string, DealerTopicSpec>;
+  onboarding?: DealerProjectOnboardingPreset;
 }
 
 export interface LinkedProjectConfig {
@@ -145,6 +156,16 @@ function validateManifest(manifest: DealerProjectManifest): void {
   if (manifest.skills !== undefined &&
       (!Array.isArray(manifest.skills) || manifest.skills.some(skill => !nonempty(skill)))) {
     throw new Error('Invalid project skills');
+  }
+  if (manifest.onboarding !== undefined) {
+    const preset = manifest.onboarding;
+    if (!isRecord(preset) ||
+        (preset.networkTopology !== undefined && !['fixed', 'selectable'].includes(preset.networkTopology)) ||
+        ['requireLarkCli', 'notifyLark'].some(key => preset[key] !== undefined && typeof preset[key] !== 'boolean') ||
+        ['networkId', 'defaultTopic', 'teamRegistryPath'].some(key => preset[key] !== undefined && !nonempty(preset[key])) ||
+        (preset.defaultConversationMode !== undefined && !['spawn', 'fixed', 'inbox-only'].includes(preset.defaultConversationMode))) {
+      throw new Error('Invalid project onboarding preset');
+    }
   }
   validatePluginRefs(manifest.plugins === undefined ? [] : manifest.plugins);
   if (manifest.topics !== undefined) {
