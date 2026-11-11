@@ -339,12 +339,7 @@ async function runInboxCommand(
 ) {
   const command = action ?? 'list';
   const caller = resolveCallerOrcaBinding(v);
-  let mailboxId = v.mailbox as string | undefined;
-  if (command === 'check' && mailboxId === undefined && caller) {
-    const defaultItems = store.check({ mailboxId: 'default', peek: true }).items.length;
-    const callerItems = store.check({ mailboxId: caller.mailboxId, peek: true }).items.length;
-    if (defaultItems === 0 && callerItems > 0) mailboxId = caller.mailboxId;
-  }
+  const mailboxId = (v.mailbox as string | undefined) ?? caller?.mailboxId;
   if (caller && (mailboxId ?? 'default') === caller.mailboxId) bindCallerWakeTarget(store, caller.mailboxId, caller);
   const checkOnlyFlags =
     v.ack !== undefined || v.peek === true || v.wait === true || v['timeout-ms'] !== undefined;
@@ -701,7 +696,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action] = p;
-    const callerEnv = options.env ?? (options.runtime ? {} : process.env);
+    const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
     if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '')) {
       if (v['terminal-handle'] === undefined && callerEnv.ORCA_TERMINAL_HANDLE?.trim()) v['terminal-handle'] = callerEnv.ORCA_TERMINAL_HANDLE.trim();
       if (v['worktree-id'] === undefined && (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)?.trim()) v['worktree-id'] = (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)!.trim();

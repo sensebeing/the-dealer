@@ -975,8 +975,6 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             store: this.mailbox,
             wakeup: this.wakeups,
-            ...(!this.options.wakeupIdleCheck ? { commandRunner: runner } : {}),
-            orcaCommand: 'orca',
           }),
           notify: createNotifyExecutorPlugin({
             inboxPath: join(this.stateDir, 'notifications.jsonl'),

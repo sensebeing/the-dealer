@@ -19,7 +19,6 @@ import {
   defaultAgentLaunchCommand,
   singleLine,
   runCommand,
-  findOrcaWorktreeByName,
 } from '../orca-workspace/index.ts';
 import type { CommandRunner, SupportedOrcaAgent } from '../orca-workspace/index.ts';
 
@@ -743,8 +742,6 @@ export interface InboxExecutorOptions {
   store?: MailboxStore;
   /** Reactive redrive for replies/questions/settlements landing in a live wake target. */
   wakeup?: WakeupRedriveService;
-  commandRunner?: CommandRunner;
-  orcaCommand?: string;
 }
 
 export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): ExecutorPlugin {
@@ -765,16 +762,7 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
       }
       const inserted: string[] = [];
       for (const [mailboxId, envelopes] of groups) {
-        let wakeTarget: Partial<WakeTargetState> | undefined;
-        if (!store.getWakeTarget(mailboxId)) {
-          if (mailboxId.startsWith('terminal:') && mailboxId.length > 9) {
-            wakeTarget = { mode: 'orca-terminal', terminalHandle: mailboxId.slice(9) };
-          } else if (mailboxId.startsWith('worktree:') && mailboxId.length > 9 && (options.commandRunner ?? config.commandRunner)) {
-            const found = await findOrcaWorktreeByName(options.commandRunner ?? config.commandRunner!, options.orcaCommand ?? config.orcaCommand ?? 'orca', mailboxId.slice(9));
-            if (found) wakeTarget = { mode: 'orca-terminal', ...found };
-          }
-        }
-        const result = store.enqueue(envelopes, { mailboxId, ...(wakeTarget ? { wakeTarget } : {}) });
+        const result = store.enqueue(envelopes, { mailboxId });
         inserted.push(...result.inserted);
         if (result.inserted.length > 0) {
           options.wakeup?.notifyMailbox(mailboxId);
