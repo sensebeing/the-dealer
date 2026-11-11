@@ -18,7 +18,7 @@ import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
-import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL } from '../packages/plugins-executor/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
 import { checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/orca-workspace/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
@@ -243,7 +243,7 @@ test('orca-spawn honors receiver parent worktrees, explicit names and sea-creatu
     { parentWorktree: 'path:/runtime' },
   );
   assert.equal(flagValue(createdArgs(), '--parent-worktree'), 'path:/runtime');
-  assert.equal(flagValue(createdArgs(), '--name'), 'starfish');
+  assertSeaCreatureName(flagValue(createdArgs(), '--name'));
   assert.ok(requests.some(r => r.args[0] === 'worktree' && r.args[1] === 'list'));
 
   requests.length = 0;
@@ -299,73 +299,54 @@ test('orca-spawn runs orca inside a path parent worktree when no cwd is configur
   assert.equal(request('create').args.includes('--parent-worktree'), false);
 });
 
-test('sea-creature naming treats Orca worktree branches as taken', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dealer-branch-collision-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const requests: CommandRequest[] = [];
-  const commandRunner: CommandRunner = async request => {
-    requests.push(request);
-    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
-      return {
-        stdout: JSON.stringify({
-          ok: true,
-          result: {
-            worktrees: [
-              { path: '/scratch/first', branch: 'refs/heads/ben.xu/nautilus' },
-              { path: '/scratch/second', branch: 'refs/heads/seahorse' },
-            ],
-          },
-        }),
-      };
-    }
-    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
-      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/child' } } }) };
-    }
-    return { stdout: '{"ok":true}' };
-  };
-  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex', seaCreatureNaming: true });
-  await executor.execute(
-    [envelope({ payload: { seaCreatureNaming: true } })],
-    { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' },
-    // A never-created parent skips the local git scan; only Orca branch rows can collide.
-    { parentWorktree: `path:${join(root, 'parent')}` },
-  );
-  const created = requests.find(r => r.args[0] === 'worktree' && r.args[1] === 'create')!;
-  assert.equal(created.args[created.args.indexOf('--name') + 1], 'starfish');
-});
+function assertSeaCreatureName(name: string): void {
+  const match = /^([a-z]+)-([1-9]\d{5})$/.exec(name);
+  assert.ok(match, `Expected a creature with a six-digit suffix, got ${name}`);
+  assert.ok(SEA_CREATURE_POOL.includes(match[1] as typeof SEA_CREATURE_POOL[number]));
+}
 
-test('sea-creature naming treats existing local git branches as taken', async t => {
+test('sea-creature naming skips every active collision source before reserving a name', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-git-branches-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const git = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore' });
   git('init', '--quiet');
-  git(
-    '-c', 'user.name=dealer',
-    '-c', 'user.email=dealer@example.test',
-    '-c', 'commit.gpgsign=false',
-    'commit', '--allow-empty', '--quiet', '-m', 'init',
-  );
-  git('branch', 'nautilus');
-  git('branch', 'ben.xu/seahorse');
-  const requests: CommandRequest[] = [];
-  const commandRunner: CommandRunner = async request => {
-    requests.push(request);
-    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
-      return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
-    }
-    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
-      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/child' } } }) };
-    }
-    return { stdout: '{"ok":true}' };
-  };
-  const executor = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'codex', cwd: dir, seaCreatureNaming: true });
-  await executor.execute(
-    [envelope({ payload: { seaCreatureNaming: true } })],
-    { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' },
-    {},
-  );
-  const created = requests.find(r => r.args[0] === 'worktree' && r.args[1] === 'create')!;
-  assert.equal(created.args[created.args.indexOf('--name') + 1], 'starfish');
+  git('-c', 'user.name=dealer', '-c', 'user.email=dealer@example.test',
+    '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '--quiet', '-m', 'init');
+  git('branch', 'NAUTILUS-100003');
+  git('branch', 'ben.xu/NAUTILUS-100004');
+  const issuedNames = new Set(['NAUTILUS-100005']);
+  let suffix = 0;
+  const name = await pickSeaCreatureName({
+    command: 'orca', cwd: dir, issuedNames,
+    runner: async () => ({ stdout: JSON.stringify({ ok: true, result: { worktrees: [
+      { path: '/scratch/NAUTILUS-100000' },
+      { displayName: 'NAUTILUS-100001' },
+      { branch: 'refs/heads/ben.xu/NAUTILUS-100002' },
+    ] } }) }),
+    randomBelow: max => max === SEA_CREATURE_POOL.length ? 0 : suffix++,
+  });
+  assert.equal(name, 'nautilus-100006');
+  assert.ok(issuedNames.has(name));
+  assertSeaCreatureName(name);
+  const upper = await pickSeaCreatureName({
+    command: 'orca', runner: cleanedWorktreeRunner([]), randomBelow: max => max - 1,
+  });
+  assert.equal(upper, `${SEA_CREATURE_POOL.at(-1)}-999999`);
+});
+
+test('sea-creature naming surfaces listing failure and bounds collision attempts', async () => {
+  await assert.rejects(pickSeaCreatureName({
+    command: 'orca', runner: async () => ({ stdout: '{"ok":false}' }),
+  }), /Orca worktree listing failed/);
+  let draws = 0;
+  await assert.rejects(pickSeaCreatureName({
+    command: 'orca', runner: cleanedWorktreeRunner([]), issuedNames: new Set(['nautilus-100000']),
+    randomBelow: () => {
+      draws += 1;
+      return 0;
+    },
+  }), /Sea-creature worktree names exhausted/);
+  assert.equal(draws, 20_000);
 });
 
 test('command failures surface stdout when the CLI writes errors there', async () => {
@@ -1308,85 +1289,55 @@ function cleanedWorktreeRunner(names: string[], resolvedName?: string): CommandR
 
 const spawnContext = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
 
-test('sea-creature names remain issued after worktree cleanup, including resolved paths', async () => {
-  const names: string[] = [];
-  const executor = createOrcaSpawnExecutorPlugin({
-    commandRunner: cleanedWorktreeRunner(names, 'seahorse'), command: 'codex', seaCreatureNaming: true,
-  });
-  await executor.execute([envelope()], spawnContext, {});
-  await executor.execute([envelope()], spawnContext, {});
-  assert.deepEqual(names, ['nautilus', 'starfish']);
-});
-
-test('sea-creature naming skips each durable workspace history source after restart', async t => {
-  for (const source of ['wakeTargets', 'retiredWorkspacePaths', 'deliveries', 'trustedWorkspaces']) {
-    await t.test(source, async t => {
-      const dir = await mkdtemp(join(tmpdir(), 'dealer-retired-'));
-      t.after(() => rm(dir, { recursive: true, force: true }));
-      const mailboxPath = join(dir, 'mailbox.json');
-      const settingsPath = join(dir, 'settings.json');
-      await writeFile(settingsPath, JSON.stringify({ trustedWorkspaces: [] }));
-      let store = new MailboxStore(mailboxPath);
-      if (source === 'wakeTargets') {
-        store.upsertWakeTarget('historical', { workspacePath: '/old/NAUTILUS' });
-        const state = JSON.parse(await readFile(mailboxPath, 'utf8'));
-        assert.deepEqual(state.retiredWorkspacePaths, ['/old/NAUTILUS']);
-        delete state.retiredWorkspacePaths;
-        await writeFile(mailboxPath, JSON.stringify(state));
-      } else if (source === 'retiredWorkspacePaths') {
-        store.recordSpawnedWorkspace(' /old/NAUTILUS ');
-        store.recordSpawnedWorkspace('/old/NAUTILUS');
-        store.recordSpawnedWorkspace(' ');
-        assert.deepEqual(store.listKnownWorkspacePaths(), ['/old/NAUTILUS']);
-      } else if (source === 'deliveries') {
-        await writeFile(join(dir, 'deliveries.json'), JSON.stringify({ records: [
-          { executionReceipt: { worktreePath: '/old/NAUTILUS' } }, {},
-        ] }));
-      } else {
-        await writeFile(settingsPath, JSON.stringify({ trustedWorkspaces: ['/old/NAUTILUS'] }));
-      }
-      store = new MailboxStore(mailboxPath);
-      const names: string[] = [];
-      const executor = createOrcaSpawnExecutorPlugin({
-        commandRunner: cleanedWorktreeRunner(names), command: 'codex', seaCreatureNaming: true,
-        store, agySettingsPath: settingsPath,
-      });
-      await executor.execute([envelope()], spawnContext, {});
-      assert.deepEqual(names, ['seahorse']);
-      assert.ok(new MailboxStore(mailboxPath).listKnownWorkspacePaths().includes('/retired/seahorse'));
-      const restarted = createOrcaSpawnExecutorPlugin({
-        commandRunner: cleanedWorktreeRunner(names), command: 'codex', seaCreatureNaming: true,
-        store: new MailboxStore(mailboxPath), agySettingsPath: settingsPath,
-      });
-      await restarted.execute([envelope()], spawnContext, {});
-      assert.deepEqual(names, ['seahorse', 'starfish']);
-    });
-  }
-});
-
-test('sea-creature naming advances through numeric tiers using receiver settings without a store', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dealer-tiers-'));
+test('sea-creature spawn ignores workspace history and disabled trust settings', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-history-isolation-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
+  const mailboxPath = join(dir, 'mailbox.json');
+  const deliveriesPath = join(dir, 'deliveries.json');
   const settingsPath = join(dir, 'settings.json');
-  await writeFile(settingsPath, JSON.stringify({ trustedWorkspaces: SEA_CREATURE_POOL.map(name => `/old/${name}`) }));
+  for (const path of [mailboxPath, deliveriesPath, settingsPath]) {
+    await writeFile(path, 'not JSON');
+  }
   const names: string[] = [];
   const executor = createOrcaSpawnExecutorPlugin({
     commandRunner: cleanedWorktreeRunner(names), command: 'codex', seaCreatureNaming: true,
-    agySettingsPath: settingsPath,
+    store: new MailboxStore(mailboxPath), agySettingsPath: settingsPath,
   });
-  await executor.execute([envelope()], spawnContext, {});
-  await executor.execute([envelope()], spawnContext, {});
-  assert.deepEqual(names, ['nautilus-2', 'seahorse-2']);
-  for (const name of names) {
-    assert.match(name, /^[a-z-]+-\d+$/);
+  await executor.execute([envelope({ payload: { trustAntigravity: false } })], spawnContext, {});
+  assert.equal(names.length, 1);
+  assertSeaCreatureName(names[0]);
+  for (const path of [mailboxPath, deliveriesPath, settingsPath]) {
+    assert.equal(await readFile(path, 'utf8'), 'not JSON');
   }
 });
 
+test('mailbox loads legacy workspace history without losing mailbox obligations and omits it on save', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-legacy-history-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'mailbox.json');
+  const store = new MailboxStore(path);
+  const message = envelope();
+  store.enqueue([message], { mailboxId: 'historical' });
+  store.recordInboundEnvelope(message, 'historical');
+  store.upsertWakeTarget('historical', { workspacePath: '/old/nautilus' });
+  const original = JSON.parse(await readFile(path, 'utf8'));
+  await writeFile(path, JSON.stringify({ ...original, retiredWorkspacePaths: ['/old/nautilus'] }));
+  const loaded = new MailboxStore(path);
+  assert.equal(loaded.listItemsAfterSequence(-1).length, 1);
+  assert.deepEqual(loaded.getThread(message.id), store.getThread(message.id));
+  assert.deepEqual(loaded.getWakeTarget('historical'), original.wakeTargets.historical);
+  loaded.upsertWakeTarget('new', {});
+  const saved = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal('retiredWorkspacePaths' in saved, false);
+  assert.deepEqual(saved.items, original.items);
+  assert.deepEqual(saved.threads, original.threads);
+  assert.deepEqual(saved.mailboxes, original.mailboxes);
+  assert.deepEqual(saved.wakeTargets.historical, original.wakeTargets.historical);
+});
 
-test('mock Orca with a store uses durable history without reading or changing default host settings', async t => {
+test('mock interactive Orca never reads or changes default host trust settings', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-settings-isolation-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  // Redirect only the home lookup so this test never touches the real host settings.
   const homeMock = t.mock.method(os, 'homedir', () => dir);
   syncBuiltinESMExports();
   t.after(() => {
@@ -1396,10 +1347,11 @@ test('mock Orca with a store uses durable history without reading or changing de
   const settingsDir = join(dir, '.gemini/antigravity-cli');
   await mkdir(settingsDir, { recursive: true });
   const settingsPath = join(settingsDir, 'settings.json');
-  const originalSettings = JSON.stringify({ trustedWorkspaces: ['/host/seahorse'] });
-  await writeFile(settingsPath, originalSettings);
-  const store = new MailboxStore(join(dir, 'mailbox.json'));
-  store.recordSpawnedWorkspace('/retired/nautilus');
+  await writeFile(settingsPath, 'not JSON');
+  const deliveriesPath = join(dir, 'deliveries.json');
+  await writeFile(deliveriesPath, 'not JSON');
+  const mailboxPath = join(dir, 'mailbox.json');
+  const store = new MailboxStore(mailboxPath);
   const names: string[] = [];
   const baseRunner = cleanedWorktreeRunner(names);
   const commandRunner: CommandRunner = async request => {
@@ -1412,13 +1364,9 @@ test('mock Orca with a store uses durable history without reading or changing de
     commandRunner, store, seaCreatureNaming: true, agent: 'antigravity',
   });
   await executor.execute([envelope({ payload: { interactive: true } })], spawnContext, {});
-  assert.deepEqual(names, ['seahorse']);
-  assert.equal(await readFile(settingsPath, 'utf8'), originalSettings);
-  assert.ok(store.listKnownWorkspacePaths().includes('/retired/seahorse'));
-
-  // Invalid host JSON must also be irrelevant to mocked execution.
-  await writeFile(settingsPath, 'not JSON');
-  await executor.execute([envelope({ payload: { interactive: true } })], spawnContext, {});
-  assert.deepEqual(names, ['seahorse', 'starfish']);
+  assert.equal(names.length, 1);
+  assertSeaCreatureName(names[0]);
   assert.equal(await readFile(settingsPath, 'utf8'), 'not JSON');
+  assert.equal(await readFile(deliveriesPath, 'utf8'), 'not JSON');
+  assert.equal('retiredWorkspacePaths' in JSON.parse(await readFile(mailboxPath, 'utf8')), false);
 });
