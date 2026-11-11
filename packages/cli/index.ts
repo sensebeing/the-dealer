@@ -672,7 +672,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       v.root = resolve(String(v.root ?? process.cwd()));
     }
     // Preserve caller-relative paths when the daemon has a different cwd.
-    if (group === 'project' || group === 'plugin' || (group === 'setup' && action === 'apply-preset')) {
+    if (group === 'project' || group === 'plugin' || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
       argv = [...p];
       for (const [key, value] of Object.entries(v)) {
         if (value === true) {
@@ -683,6 +683,13 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
+    const localSetup = group === 'setup' && !['binding-preset', 'apply-preset'].includes(action);
+    if (!localSetup && !options.runtime && existsSync(join(stateDir, 'control.sock'))) {
+      const result = await rpc(join(stateDir, 'control.sock'), argv);
+      result.stdout.forEach(line => stdout(line));
+      result.stderr.forEach(line => stderr(line));
+      return result.code;
+    }
     if (group === 'setup' && action !== 'apply-preset') {
       let result: unknown;
       if (action === 'probe') {
@@ -733,12 +740,6 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
       stdout(JSON.stringify(result, null, v.json ? undefined : 2));
       return 0;
-    }
-    if (!options.runtime && existsSync(join(stateDir, 'control.sock'))) {
-      const result = await rpc(join(stateDir, 'control.sock'), argv);
-      result.stdout.forEach(line => stdout(line));
-      result.stderr.forEach(line => stderr(line));
-      return result.code;
     }
     if (group === 'inbox') {
       // Offline access is serialized by the mailbox file lock, so it stays coherent even if

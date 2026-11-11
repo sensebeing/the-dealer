@@ -166,10 +166,18 @@ test('preset preview and application agree for explicit and project-default Lark
       writeFileSync(join(root, '.dealer/project.json'), JSON.stringify(manifest));
       if (scenario !== 'cwd') await runtime.linkProject(root);
     }
+    await runtime.serveControl(async argv => {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+      return { code, stdout, stderr };
+    });
+    if (scenario === 'sole' || scenario === 'selected') {
+      writeFileSync(join(root, '.dealer/project.json'), JSON.stringify({ ...manifest, onboarding: { notifyLark: false } }));
+    }
     const flags = scenario === 'explicit' ? ['--notify-lark'] : scenario === 'selected' ? ['--project', 'demo'] : scenario === 'cwd' ? ['--root', root] : [];
     const preview = await cli(['setup', 'binding-preset', '--host', 'codex', '--mode', 'inbox-only', ...flags], stateDir);
-    const applied = await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only',
-      ...(scenario === 'explicit' ? { notifyLark: true } : scenario === 'selected' ? { projectId: 'demo' } : scenario === 'cwd' ? { cwd: root } : {}) });
+    const applied = await cli(['setup', 'apply-preset', '--host', 'codex', '--mode', 'inbox-only', ...flags], stateDir);
     for (const key of ['binding', 'executorConfig', 'larkNotify']) assert.deepEqual(preview[key], applied[key], scenario + ': ' + key);
     assert.equal(preview.larkNotify.enabled, true);
     assert.equal(preview.larkNotify.target.userId, 'verified-user');
