@@ -757,9 +757,10 @@ export class P2PTransportService implements TransportService {
         }
       }
     }
-    await Promise.allSettled((m.config.bootstrapPeers ?? []).filter(seed => seed !== this.endpointAddr).map(async seed => {
+    await Promise.allSettled([...new Set(m.config.bootstrapPeers ?? [])].filter(seed => seed !== this.endpointAddr).map(async seed => {
       // The persistent tunnel lets the seed push relayed requests back; the probe
       // below exchanges sealed beacons so isolated peers can discover each other.
+      const prior = [...m.outboundTunnels.entries()].find(([, entry]) => entry.seed === seed && entry.acked);
       const socket = this.track(createConnection(parseEndpoint(seed)));
       socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
       try {
@@ -778,7 +779,7 @@ export class P2PTransportService implements TransportService {
         }
         const seedNodeId = response.frame.senderNodeId;
         if (seedNodeId === this.localNodeId) return;
-        this.ensureOutboundTunnel(m, seedNodeId, seed, response.tunneled === true);
+        this.ensureOutboundTunnel(m, seedNodeId, seed, response.tunneled === true, prior?.[1]);
         const activeTunnel = m.outboundTunnels.get(seedNodeId);
         if (!activeTunnel || activeTunnel.seed === seed) {
           m.relays.set(seedNodeId, seed);
@@ -793,11 +794,9 @@ export class P2PTransportService implements TransportService {
           }
         }
       } catch {
-        for (const [nodeId, entry] of m.outboundTunnels) {
-          if (entry.seed === seed) {
-            entry.socket.destroy();
-            m.outboundTunnels.delete(nodeId);
-          }
+        if (prior && m.outboundTunnels.get(prior[0]) === prior[1]) {
+          prior[1].socket.destroy();
+          m.outboundTunnels.delete(prior[0]);
         }
       } finally {
         socket.destroy();
@@ -1130,10 +1129,16 @@ export class P2PTransportService implements TransportService {
    * seed uses it to push relayed frames back through the seed's address, which
    * stays reachable even when this node advertises a NAT-bound endpoint.
    */
-  private ensureOutboundTunnel(m: Mount, seedNodeId: string, seed: string, seedHasTunnel: boolean): void {
+  private ensureOutboundTunnel(
+    m: Mount,
+    seedNodeId: string,
+    seed: string,
+    seedHasTunnel: boolean,
+    priorEntry?: { socket: Socket; seed: string; acked: boolean },
+  ): void {
     const existing = m.outboundTunnels.get(seedNodeId);
     if (existing && !existing.socket.destroyed) {
-      if (existing.seed !== seed || !existing.acked || seedHasTunnel) return;
+      if (existing !== priorEntry || !existing.acked || seedHasTunnel) return;
       existing.socket.destroy();
       m.outboundTunnels.delete(seedNodeId);
     }

@@ -159,12 +159,13 @@ test('bootstrap tunnel identity deduplicates aliases, ignores self, and replaces
   const { isolated, relay, seed } = await relayMesh(t, root);
   const alice = await isolated('alice');
   const mount = (alice.transport as any).mounts.get('relay-net');
-  mount.config.bootstrapPeers.push(seed.replace('127.0.0.1', 'localhost'), alice.transport.endpointAddr);
+  mount.config.bootstrapPeers.push(seed, seed.replace('127.0.0.1', 'localhost'), '127.0.0.1:1', alice.transport.endpointAddr);
   mount.lastSeedProbeAt = Number.NEGATIVE_INFINITY;
   await alice.transport['discover']();
   const outbound = mount.outboundTunnels as Map<string, { socket: Socket; seed: string; acked: boolean }>;
   assert.equal(outbound.size, 1, 'seed aliases share one verified outbound tunnel');
   assert.equal(outbound.has(alice.transport.localNodeId), false, 'self discovery never creates a tunnel');
+  await until(() => outbound.get(relay.localNodeId)?.acked === true);
   const oldSocket = outbound.get(relay.localNodeId)!.socket;
   const relayMount = (relay as any).mounts.get('relay-net');
   relayMount.inboundTunnels.delete(alice.transport.localNodeId);
