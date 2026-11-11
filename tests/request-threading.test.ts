@@ -139,6 +139,8 @@ test('fixed workspaces bootstrap once and orphaned terminals neither block nor w
   const path = join(root, 'fixed');
   const calls: CommandRequest[] = [];
   let created = false;
+  let orphanConnected = false;
+  let agentCount = 1;
   const runner: CommandRunner = async call => {
     calls.push(call);
     if (call.args[0] === 'worktree' && call.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { worktrees: created ? [{ path }] : [] } }) };
@@ -146,9 +148,9 @@ test('fixed workspaces bootstrap once and orphaned terminals neither block nor w
       created = true;
       return { stdout: JSON.stringify({ ok: true, result: { worktree: { path } } }) };
     }
-    if (call.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path, worktreeId: 'fixed', agents: [{ state: 'done' }], unverifiableTerminalCount: 0 }] } }) };
+    if (call.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path, worktreeId: 'fixed', agents: Array.from({ length: agentCount }, () => ({ state: 'done' })), unverifiableTerminalCount: 0 }] } }) };
     return { stdout: JSON.stringify({ ok: true, result: { terminals: [
-      { handle: 'orphan', orphaned: true, connected: false, writable: false, lastOutputAt: 100 },
+      { handle: 'orphan', orphaned: true, connected: orphanConnected, writable: orphanConnected, lastOutputAt: 100 },
       { handle: 'live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '>', lastOutputAt: 1 },
     ] } }) };
   };
@@ -157,6 +159,11 @@ test('fixed workspaces bootstrap once and orphaned terminals neither block nor w
   assert.ok(calls[1].args.includes('--no-parent'));
   assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')).trustedWorkspaces, [path]);
   assert.equal((await ensureOrcaWorkspace(runner, 'orca', { workspacePath: path })).created, false);
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', path)).idle, true);
+  assert.deepEqual(await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', path), { handle: 'live', spawned: false });
+  agentCount = 2;
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', path)).idle, false);
+  orphanConnected = true;
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', path)).idle, true);
   assert.deepEqual(await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', path), { handle: 'live', spawned: false });
   const missing: CommandRunner = async () => ({ stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) });

@@ -310,6 +310,35 @@ test('wake targets coalesce, survive restarts, clear on lease and count complete
   );
 });
 
+test('lowering coalescing releases pending wakes without shortening retry backoff', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const before = Date.now();
+  store.enqueue([envelope('initial')], { wakeTarget: { coalesceMs: 86_400_000 } });
+  assert.ok(store.getWakeTarget('default')!.earliestWakeAt >= before + 86_400_000);
+  assert.deepEqual(store.listPendingWakeTargets(Date.now()), []);
+  store.upsertWakeTarget('default', { coalesceMs: 1000 });
+  assert.ok(store.getWakeTarget('default')!.earliestWakeAt <= Date.now() + 1000);
+  store.upsertWakeTarget('default', { coalesceMs: 0 });
+  assert.equal(store.getWakeTarget('default')!.earliestWakeAt, 0);
+  assert.equal(store.listPendingWakeTargets(Date.now()).length, 1);
+
+  store.enqueue([envelope('large-window')], { wakeTarget: { coalesceMs: 86_400_000 } });
+  assert.deepEqual(store.listPendingWakeTargets(Date.now()), []);
+  store.enqueue([envelope('lower-window')], { wakeTarget: { coalesceMs: 0 } });
+  assert.equal(store.listPendingWakeTargets(Date.now()).length, 1);
+
+  const retryAt = Date.now() + 60_000;
+  store.upsertWakeTarget('default', { attemptCount: 1, earliestWakeAt: retryAt, coalesceMs: 1000 });
+  store.upsertWakeTarget('default', { coalesceMs: 0 });
+  assert.equal(store.getWakeTarget('default')!.earliestWakeAt, retryAt);
+  store.enqueue([envelope('retry-window')], { wakeTarget: { coalesceMs: 0 } });
+  assert.equal(store.getWakeTarget('default')!.earliestWakeAt, retryAt);
+  assert.deepEqual(store.listPendingWakeTargets(Date.now()), []);
+  store.upsertWakeTarget('default', { attemptCount: 0, coalesceMs: 0, earliestWakeAt: retryAt });
+  assert.equal(store.getWakeTarget('default')!.earliestWakeAt, retryAt);
+});
+
 test('thread routes reverse-route replies and track settlement on both directions', t => {
   const { path } = workspace(t);
   const store = new MailboxStore(path);

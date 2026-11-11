@@ -368,14 +368,21 @@ function mergeWakeTarget(
   const rotateAfterWaves = optional('rotateAfterWaves');
   const lastWakeError = optional('lastWakeError');
   const deliveryInDoubt = optional('deliveryInDoubt');
+  const nextCoalesceMs = patch.coalesceMs ?? current.coalesceMs;
+  const nextAttemptCount = patch.attemptCount ?? current.attemptCount;
+  let earliestWakeAt = patch.earliestWakeAt ?? current.earliestWakeAt;
+  if (patch.earliestWakeAt === undefined && patch.coalesceMs !== undefined &&
+      nextAttemptCount === 0 && current.earliestWakeAt > 0) {
+    earliestWakeAt = nextCoalesceMs === 0 ? 0 : Math.min(current.earliestWakeAt, Date.now() + nextCoalesceMs);
+  }
   return {
     mailboxId: current.mailboxId,
     mode: patch.mode ?? current.mode,
-    coalesceMs: patch.coalesceMs ?? current.coalesceMs,
+    coalesceMs: nextCoalesceMs,
     completedWaves: patch.completedWaves ?? current.completedWaves,
     pendingWake: patch.pendingWake ?? current.pendingWake,
-    earliestWakeAt: patch.earliestWakeAt ?? current.earliestWakeAt,
-    attemptCount: patch.attemptCount ?? current.attemptCount,
+    earliestWakeAt,
+    attemptCount: nextAttemptCount,
     ...(hostAgent !== undefined ? { hostAgent } : {}),
     ...(conversationMode !== undefined ? { conversationMode } : {}),
     ...(agentProfile !== undefined ? { agentProfile } : {}),
@@ -1095,10 +1102,9 @@ export class MailboxStore {
               pendingWake: true,
               earliestWakeAt: conversationalByMailbox.get(mailboxId) && target.attemptCount === 0
                 ? nowMs
-                : Math.max(
-                  previous?.earliestWakeAt ?? 0,
-                  nowMs + target.coalesceMs,
-                ),
+                : target.attemptCount > 0
+                  ? Math.max(previous?.earliestWakeAt ?? 0, nowMs + target.coalesceMs)
+                  : nowMs + target.coalesceMs,
             });
           }
         }
