@@ -152,8 +152,9 @@ const GROUP = '239.255.42.99';
 // instead of waiting the full request timeout on every unicast.
 const RELAY_CONNECT_TIMEOUT_MS = 1_500;
 const BEACON_EXPIRY_GRACE_MS = 30_000;
-// Relay responses carry base64 JSON; keep one oversized blob from wedging the tunnel.
-const RELAY_BLOB_LIMIT = MAX_FRAME - 4096;
+// Relay responses carry one base64 blob inside a JSON packet, so the raw blob may only
+// fill three quarters of the frame budget minus the packet envelope.
+const RELAY_BLOB_LIMIT = Math.floor((MAX_FRAME - 4096) * 3 / 4);
 const PRIVATE_IPV4 = /^(100\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/;
 const TAILSCALE_COMMANDS = ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale'];
 const TAILSCALE_CACHE_MS = 30_000;
@@ -332,7 +333,7 @@ interface Mount {
   keys: DerivedNetworkKeys;
   peers: Map<string, string>;
   /** Latest valid sealed discovery beacon per sender, including this node; gossiped to seeds. */
-  beacons: Map<string, SealedNetworkFrame>;
+  beacons: Map<string, { frame: SealedNetworkFrame; expires: number }>;
   /** Peer node -> seed endpoint that introduced or can relay to that peer. */
   relays: Map<string, string>;
   /** Tunnels peers opened towards this node, keyed by peer node, so relays can push back. */
@@ -519,7 +520,7 @@ export class P2PTransportService implements TransportService {
       config: structuredClone(config),
       keys,
       peers: new Map<string, string>(),
-      beacons: new Map<string, SealedNetworkFrame>(),
+      beacons: new Map<string, { frame: SealedNetworkFrame; expires: number }>(),
       relays: new Map<string, string>(),
       inboundTunnels: new Map<string, Tunnel>(),
       outboundTunnels: new Map<string, Socket>(),
@@ -638,6 +639,12 @@ export class P2PTransportService implements TransportService {
     ) {
       return { reply: false };
     }
+    const current = m.beacons.get(frame.senderNodeId);
+    if (current && beacon.expires <= current.expires) {
+      // Beacons travel by gossip, so a delayed frame from the same or an older
+      // generation must never rewrite this peer's endpoint or relay mapping.
+      return { mount: m, reply: beacon.reply === true };
+    }
     this.registerPeerEndpoint(
       m.config.networkId,
       frame.senderNodeId,
@@ -646,10 +653,13 @@ export class P2PTransportService implements TransportService {
     if (frame.senderNodeId !== this.localNodeId) {
       // Sealed discovery frames are the only beacon form a seed can gossip without
       // being able to forge endpoints; keep the freshest one per sender.
-      m.beacons.set(frame.senderNodeId, frame);
+      m.beacons.set(frame.senderNodeId, { frame, expires: beacon.expires });
       if (viaSeed !== undefined) {
         // Remember who can relay to this peer when its advertised endpoint is unreachable.
         m.relays.set(frame.senderNodeId, viaSeed);
+      } else if (remoteHost && remoteHost !== '127.0.0.1' && remoteHost !== '0.0.0.0') {
+        // A fresher beacon that reached us directly makes an obsolete relay seed mapping wrong.
+        m.relays.delete(frame.senderNodeId);
       }
     }
     return { mount: m, reply: beacon.reply === true };
@@ -680,22 +690,30 @@ export class P2PTransportService implements TransportService {
     return endpointAddr;
   }
 
+  private localBeacon(m: Mount, reply = false): { frame: SealedNetworkFrame; expires: number } {
+    const expires = Date.now() + 10_000;
+    return {
+      frame: sealNetworkFrame(
+        {
+          type: 'discovery',
+          endpointAddr: this.endpointAddr,
+          expires,
+          ...(reply ? { reply: true } : {}),
+        },
+        m.keys,
+        this.localNodeId,
+      ),
+      expires,
+    };
+  }
+
   private discoveryFrame(m: Mount, reply = false): SealedNetworkFrame {
-    return sealNetworkFrame(
-      {
-        type: 'discovery',
-        endpointAddr: this.endpointAddr,
-        expires: Date.now() + 10_000,
-        ...(reply ? { reply: true } : {}),
-      },
-      m.keys,
-      this.localNodeId,
-    );
+    return this.localBeacon(m, reply).frame;
   }
 
   private async announce(m: Mount): Promise<void> {
-    const frame = this.discoveryFrame(m);
-    m.beacons.set(this.localNodeId, frame);
+    const { frame, expires } = this.localBeacon(m);
+    m.beacons.set(this.localNodeId, { frame, expires });
     this.pruneBeacons(m);
     const bytes = Buffer.from(JSON.stringify(frame));
     const port = m.config.mDnsPort ?? this.options.mDnsPort ?? 45873;
@@ -743,7 +761,11 @@ export class P2PTransportService implements TransportService {
       const socket = this.track(createConnection(parseEndpoint(seed)));
       socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
       try {
-        socket.write(packet({ type: 'discovery', frame, peers: [...m.beacons.values()] }));
+        socket.write(packet({
+          type: 'discovery',
+          frame,
+          peers: [...m.beacons.values()].map(entry => entry.frame),
+        }));
         const response = await new SocketReader(socket).json();
         if (response.frame?.swarmTopicId !== m.keys.swarmTopicId) {
           throw new Error('Invalid discovery response');
@@ -1033,14 +1055,8 @@ export class P2PTransportService implements TransportService {
   /** Drop beacons whose discovery frame expired beyond the gossip grace window. */
   private pruneBeacons(m: Mount): void {
     const cutoff = Date.now() - BEACON_EXPIRY_GRACE_MS;
-    for (const [nodeId, frame] of m.beacons) {
-      let expires: unknown;
-      try {
-        expires = unsealNetworkFrame<{ expires?: unknown }>(frame, m.keys).expires;
-      } catch {
-        expires = undefined;
-      }
-      if (typeof expires !== 'number' || expires < cutoff) {
+    for (const [nodeId, entry] of m.beacons) {
+      if (entry.expires < cutoff) {
         m.beacons.delete(nodeId);
       }
     }
@@ -1242,7 +1258,10 @@ export class P2PTransportService implements TransportService {
           // One unreadable gossiped frame must not fail the reply.
         }
       }
-      socket.end(packet({ frame: this.discoveryFrame(mount), peers: [...mount.beacons.values()] }));
+      socket.end(packet({
+        frame: this.discoveryFrame(mount),
+        peers: [...mount.beacons.values()].map(entry => entry.frame),
+      }));
       return;
     }
     if (request.type === 'tunnel') {
