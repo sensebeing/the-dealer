@@ -16,7 +16,7 @@ macOS Apps, redacted node configuration and `.dealer/project.json`. Probe is
 read-only. A socket's presence is not proof of a live daemon; run
 `dealer node status --json` to verify it. An installed CLI is not proof it
 supports this integration's flags; inspect its help before enabling delivery.
-If Dealer is missing, check Node >=22.6 and install the CLI without a manual clone:
+If Dealer is missing, check Node >=22.15 and install the CLI without a manual clone:
 
 ```sh
 npm install -g git+https://github.com/sensebeing/the-dealer

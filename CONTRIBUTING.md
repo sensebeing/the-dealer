@@ -6,7 +6,7 @@ before implementation. Report vulnerabilities privately through [SECURITY.md](SE
 
 ## Set up
 
-Use Git and Node.js >=22.6. The JavaScript runtime has zero external npm dependencies;
+Use Git and Node.js >=22.15. The JavaScript runtime has zero external npm dependencies;
 Node runs the TypeScript sources directly. Rust/Cargo is optional for the native Iroh engine.
 
 ```sh

@@ -261,7 +261,7 @@ async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> 
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ['--experimental-strip-types', new URL('../../bin/dealerd.js', import.meta.url).pathname, ...argv],
+      ['--no-warnings', '--experimental-strip-types', new URL('../../bin/dealerd.js', import.meta.url).pathname, ...argv],
       {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],

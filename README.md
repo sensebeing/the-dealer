@@ -1,7 +1,7 @@
 # The Dealer
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node.js >=22.6](https://img.shields.io/badge/node-%3E%3D22.6-blue.svg)](package.json)
+[![Node.js >=22.15](https://img.shields.io/badge/node-%3E%3D22.15-blue.svg)](package.json)
 [![Zero runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-green.svg)](package.json)
 [![Rust Iroh Engine](https://img.shields.io/badge/native_transport-Rust_Iroh-orange.svg)](native/dealer-iroh-engine/Cargo.toml)
 [![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--dealer-black)](https://skills.sh/sensebeing/the-dealer)
@@ -28,7 +28,7 @@ Paste either prompt into Claude Code, Codex, Cursor, Antigravity, or Orca.
 
 ```text
 Install and set up https://github.com/sensebeing/the-dealer on this machine.
-Check existing installs and Node.js >=22.6 first. If the CLI is missing, run
+Check existing installs and Node.js >=22.15 first. If the CLI is missing, run
 `npm install -g git+https://github.com/sensebeing/the-dealer`; if I already have
 a trusted ~/the-dealer checkout, use `npm --prefix ~/the-dealer link`.
 Install the skills with `npx skills add sensebeing/the-dealer --global --agent '*'`,
@@ -193,7 +193,7 @@ See [the-dealer-extend](skills/the-dealer-extend/SKILL.md) and the [plugin guide
 
 Ed25519 keys sign node cards, envelopes, and delivery receipts. Per-network keys derived with HKDF-SHA256 and AES-256-GCM authenticate and encrypt frames, and streaming BLAKE3 hashes verify content-addressed file attachments. Receivers enforce `open`, `approval_required`, `dnd`, or `closed` gates and resolve project IDs to local roots on the receiving machine.
 
-Requires Node.js >=22.6 (TypeScript runs directly via Node's built-in type stripping). Building the optional Rust Iroh engine requires Rust/Cargo:
+Requires Node.js >=22.15 (TypeScript runs directly via Node's built-in type stripping). Building the optional Rust Iroh engine requires Rust/Cargo:
 
 ```sh
 npm test

@@ -99,7 +99,7 @@ rules:
 
 ## 3. 开发、验证与文档索引
 
-- **运行环境**：Node.js `>=22.6.0`（原生支持 `--experimental-strip-types` 直接运行 `.ts`，无需编译构建步骤；零外部 npm 依赖）。可选 Rust 原生引擎源码位于 [`native/dealer-iroh-engine/`](native/dealer-iroh-engine/Cargo.toml)。
+- **运行环境**：Node.js `>=22.15.0`（原生支持 `--experimental-strip-types` 直接运行 `.ts`，无需编译构建步骤；零外部 npm 依赖）。可选 Rust 原生引擎源码位于 [`native/dealer-iroh-engine/`](native/dealer-iroh-engine/Cargo.toml)。
 - **测试与架构门禁命令**：
   ```bash
   npm test

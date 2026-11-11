@@ -1,5 +1,6 @@
-#!/usr/bin/env -S node --experimental-strip-types
-import { runDealerDaemon } from '../packages/cli/index.ts';
+#!/usr/bin/env -S node --no-warnings --experimental-strip-types
+import './register-ts.js';
+const { runDealerDaemon } = await import('../packages/cli/index.ts');
 
 try {
   const runtime = await runDealerDaemon(process.argv.slice(2));

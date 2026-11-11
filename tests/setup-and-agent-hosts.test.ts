@@ -2,8 +2,12 @@ import { runCommand, CommandNotStartedError } from '../packages/orca-workspace/i
 import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/agent-host/index.ts';
 import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
 import test from 'node:test';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { P2PTransportService, defaultAdvertisedHost } from '../packages/transport/index.ts';
@@ -65,7 +69,9 @@ test('setup invite prompts reuse configured network, encode seeds, and do not mu
     assert.match(result.teammatePrompt, /collab.request.v4/);
     for (const prompt of [result.crossMachinePrompt, result.teammatePrompt]) {
       assert.match(prompt, /https:\/\/github.com\/sensebeing\/the-dealer.git/);
-      assert.match(prompt, /npm install && npm link/);
+      assert.ok(prompt.includes('npm install -g git+https://github.com/sensebeing/the-dealer'));
+      assert.ok(prompt.includes("npx skills add sensebeing/the-dealer --global --agent '*'"));
+      assert.ok(prompt.includes('npm --prefix ~/the-dealer link'));
       assert.match(prompt, /~\/\.agents\/skills\//);
       assert.match(prompt, /~\/\.claude\/skills\//);
       assert.match(prompt, /the-dealer-setup\/SKILL.md/);
@@ -842,4 +848,45 @@ test('plugin and agent manifests match package metadata', () => {
     }
     assert.ok(agent.includes('$' + skill));
   }
+});
+
+test('installed CLI and daemon run from node_modules with clean JSON output', { timeout: 15_000 }, async t => {
+  const root = directory(t);
+  const installed = join(root, 'node_modules', 'the-dealer');
+  mkdirSync(installed, { recursive: true });
+  for (const path of ['bin', 'packages', 'package.json']) {
+    cpSync(new URL('../' + path, import.meta.url), join(installed, path), { recursive: true });
+  }
+  const stateDir = join(root, 'state');
+  const run = (args: string[]) => promisify(execFile)(join(installed, 'bin/dealer.js'), [...args, '--json'], {
+    cwd: root, env: { ...process.env, DEALER_STATE_DIR: stateDir },
+  });
+  const probe = await run(['setup', 'probe', '--root', root]);
+  assert.equal(probe.stderr, '');
+  assert.ok(JSON.parse(probe.stdout));
+
+  const daemon = spawn(join(installed, 'bin/dealerd.js'), [
+    '--profile', 'headless-relay', '--member', 'installed-user',
+  ], { cwd: root, env: { ...process.env, DEALER_STATE_DIR: stateDir }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = once(daemon, 'exit');
+  const lines = createInterface({ input: daemon.stdout });
+  let errors = '';
+  daemon.stderr.on('data', chunk => { errors += chunk; });
+  t.after(async () => {
+    daemon.kill('SIGTERM');
+    await exited;
+    lines.close();
+  });
+  const ready = await Promise.race([
+    once(lines, 'line').then(([line]) => JSON.parse(line)),
+    exited.then(() => { throw new Error('Daemon exited before ready: ' + errors); }),
+  ]);
+  assert.equal(ready.running, true);
+  const status = await run(['node', 'status']);
+  assert.equal(status.stderr, '');
+  assert.equal(JSON.parse(status.stdout).member, 'installed-user');
+  daemon.kill('SIGTERM');
+  const [code] = await exited;
+  assert.equal(code, 0, errors);
+  assert.equal(errors, '');
 });

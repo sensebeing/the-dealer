@@ -1,7 +1,7 @@
 # The Dealer
 
 [![MIT 许可证](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Node.js >=22.6](https://img.shields.io/badge/node-%3E%3D22.6-blue.svg)](package.json)
+[![Node.js >=22.15](https://img.shields.io/badge/node-%3E%3D22.15-blue.svg)](package.json)
 [![零 npm 运行时依赖](https://img.shields.io/badge/runtime_dependencies-0-green.svg)](package.json)
 [![原生传输层 Rust_Iroh](https://img.shields.io/badge/native_transport-Rust_Iroh-orange.svg)](native/dealer-iroh-engine/Cargo.toml)
 [![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--dealer-black)](https://skills.sh/sensebeing/the-dealer)
@@ -28,7 +28,7 @@
 
 ```text
 请为本机安装并配置 https://github.com/sensebeing/the-dealer。
-先检查现有安装和 Node.js >=22.6。缺少 CLI 时运行
+先检查现有安装和 Node.js >=22.15。缺少 CLI 时运行
 `npm install -g git+https://github.com/sensebeing/the-dealer`；
 如果已有可信的 ~/the-dealer 检出，则可运行 `npm --prefix ~/the-dealer link`。
 运行 `npx skills add sensebeing/the-dealer --global --agent '*'` 安装技能，
@@ -191,7 +191,7 @@ dealer setup apply-preset --host orca --mode spawn --project <project-id> --work
 
 Ed25519 密钥签署节点名片、信封和投递回执；基于 HKDF-SHA256 派生的网络密钥与 AES-256-GCM 对传输帧做认证加密，流式 BLAKE3 校验内容寻址附件。接收端控制 `open`、`approval_required`、`dnd` 与 `closed` 准入门禁，并将项目 ID 映射到本地可信目录。
 
-运行环境要求 Node.js >=22.6（通过 Node 内置类型剥离直接运行 TypeScript）。构建可选的 Rust Iroh 原生引擎需要安装 Rust/Cargo：
+运行环境要求 Node.js >=22.15（通过 Node 内置类型剥离直接运行 TypeScript）。构建可选的 Rust Iroh 原生引擎需要安装 Rust/Cargo：
 
 ```sh
 npm test
