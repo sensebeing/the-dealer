@@ -459,6 +459,7 @@ test('single-machine loopback send -> ask -> reply -> settle keeps both thread l
     transport: { discoveryDir: join(root, 'mesh') },
     commandRunner: async request => {
       calls.push(request);
+      if (request.args[0] === 'worktree' && request.args[1] === 'ps') return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
       return { stdout: '{"ok":true}' };
     },
     wakeupIdleCheck: async () => ({ idle: true }),
@@ -599,7 +600,9 @@ test('session commands honor an explicit --mailbox when acknowledging a lease', 
     name: 'alice',
     profile: 'headless-relay',
     transport: { discoveryDir: join(root, 'mesh') },
-    commandRunner: async () => ({ stdout: '{"ok":true}' }),
+    commandRunner: async request => request.args[0] === 'worktree' && request.args[1] === 'ps'
+      ? { stdout: '{"ok":true,"result":{"worktrees":[]}}' }
+      : { stdout: '{"ok":true}' },
     wakeupIdleCheck: async () => ({ idle: true }),
     patch: { defaultExecutor: 'inbox', gateMode: 'open' },
   }).start();
@@ -673,6 +676,7 @@ test('two-node P2P closed loop verifies signatures and keeps unapproved knocks r
   const calls: CommandRequest[] = [];
   const runner: CommandRunner = async request => {
     calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
     return { stdout: '{"ok":true}' };
   };
   const alice = await makeNode(t, root, 'alice', { commandRunner: runner });
@@ -886,6 +890,7 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
 
   await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{' }), 'orca', 'alice-wt'), /Unexpected end|JSON/);
   await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{"ok":false}' }), 'orca', 'alice-wt'), /Orca worktree ps failed/);
+  await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{"ok":true}' }), 'orca', 'alice-wt'), /Incomplete Orca workspace inventory/);
 });
 
 test('thread show fails loudly for an unknown thread', async t => {

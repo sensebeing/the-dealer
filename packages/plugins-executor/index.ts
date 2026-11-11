@@ -756,6 +756,8 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
     name: 'inbox',
     async execute(batch, _context, runtimeConfig) {
       const config = (runtimeConfig ?? {}) as InboxExecutorOptions;
+      const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
+      const orcaCommand = options.orcaCommand ?? config.orcaCommand ?? 'orca';
       const groups = new Map<string, MessageEnvelope[]>();
       for (const envelope of batch) {
         const mailboxId = resolveMailboxId(envelope, 'inbox', (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(envelope.kind, typeof envelope?.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined));
@@ -769,8 +771,8 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
         if (!store.getWakeTarget(mailboxId)) {
           if (mailboxId.startsWith('terminal:') && mailboxId.length > 9) {
             wakeTarget = { mode: 'orca-terminal', terminalHandle: mailboxId.slice(9) };
-          } else if (mailboxId.startsWith('worktree:') && mailboxId.length > 9 && (options.commandRunner ?? config.commandRunner)) {
-            const found = await findOrcaWorktreeByName(options.commandRunner ?? config.commandRunner!, options.orcaCommand ?? config.orcaCommand ?? 'orca', mailboxId.slice(9));
+          } else if (mailboxId.startsWith('worktree:') && mailboxId.length > 9) {
+            const found = await findOrcaWorktreeByName(runner, orcaCommand, mailboxId.slice(9));
             if (found) wakeTarget = { mode: 'orca-terminal', ...found };
           }
         }

@@ -30,8 +30,7 @@ export async function findOrcaWorktreeByName(
   });
   const raw = JSON.parse(result.stdout);
   if (raw?.ok !== true) throw new Error('Orca worktree ps failed');
-  if (raw.result === undefined) return undefined;
-  if (raw.result?.truncated || !Array.isArray(raw.result?.worktrees)) {
+  if (!raw.result || raw.result.truncated || !Array.isArray(raw.result.worktrees)) {
     throw new Error('Incomplete Orca workspace inventory');
   }
   const row = raw.result.worktrees.find((item: any) =>
