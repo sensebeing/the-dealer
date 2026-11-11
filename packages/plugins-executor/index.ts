@@ -115,7 +115,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
             agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
             command, agentProfile, targetBot, sessionId: effectiveSessionId,
           });
-          if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || options.commandRunner === undefined)) {
+          if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || (options.commandRunner === undefined || options.commandRunner === runCommand))) {
             trustAntigravityWorkspace(cwd, agySettingsPath);
           }
           claim = (options.wakeup ?? config.wakeup)?.claim(mailboxId);
@@ -479,6 +479,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           optionSettingsPath ??
           join(homedir(), '.gemini/antigravity-cli/settings.json');
         const mayTrust = !options.commandRunner ||
+          options.commandRunner === runCommand ||
           explicitSettingsPath !== undefined || optionSettingsPath !== undefined;
         if (
           mayTrust &&

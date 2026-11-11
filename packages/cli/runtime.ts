@@ -780,12 +780,12 @@ export class DealerNodeRuntime {
               ...linkedProjectRoots,
               ...(spawnConfig.projectRoots ?? {}),
             },
-            commandRunner: runner,
+            commandRunner: this.options.commandRunner,
           }),
           'orca-wave': createOrcaWaveExecutorPlugin({
             ...this.config.executorConfig['orca-wave'],
             resolveTopicBinding: this.executorTopicBinding,
-            commandRunner: runner,
+            commandRunner: this.options.commandRunner,
           }),
           'codex': createCodexExecutorPlugin({
             ...this.config.executorConfig['codex'],

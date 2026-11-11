@@ -507,7 +507,8 @@ export async function ensureOrcaWorkspace(
   if (response.ok === false || typeof path !== 'string' || !path.trim()) throw new Error('Orca workspace creation returned no path');
   const settings = options.agySettingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
   const temporaryRoot = tmpdir();
-  const mayTrust = options.agySettingsPath !== undefined || !temporaryRoot || !canonical(path).startsWith(canonical(temporaryRoot));
+  const mayTrust = options.agySettingsPath !== undefined ||
+    (runner === runCommand && (!temporaryRoot || !canonical(path).startsWith(canonical(temporaryRoot))));
   if (options.trustAntigravity !== false && mayTrust && (options.agySettingsPath !== undefined || existsSync(settings))) {
     trustAntigravityWorkspace(path, settings);
   }

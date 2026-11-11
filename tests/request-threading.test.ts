@@ -183,6 +183,21 @@ test('fixed workspaces bootstrap once and orphaned terminals neither block nor w
   await assert.rejects(ensureOrcaWorkspace(missing, 'orca', { workspacePath: path }), /repoRoot/);
 });
 
+test('mock Orca runner never mutates default Antigravity settings during workspace ensure', async t => {
+  const root = directory(t);
+  const path = join(root, 'mock-workspace');
+  const settings = join(homedir(), '.gemini/antigravity-cli/settings.json');
+  const before = existsSync(settings) ? readFileSync(settings) : undefined;
+  const runner: CommandRunner = async call => {
+    if (call.args[0] === 'worktree' && call.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path } } }) };
+    }
+    return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
+  };
+  assert.deepEqual(await ensureOrcaWorkspace(runner, 'orca', { workspacePath: path, repoRoot: root }), { workspacePath: path, created: true });
+  if (before) assert.deepEqual(readFileSync(settings), before);
+});
+
 test('spawned terminals wait for idle before a prefixed pointer is injected', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
