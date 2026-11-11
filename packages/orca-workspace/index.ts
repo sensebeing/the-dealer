@@ -173,12 +173,11 @@ export async function checkOrcaWorkspaceIdle(
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
-    const activeHandles = handles.filter(t => t.orphaned !== true);
     const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
     if (observableHandles.length < row.agents.length) {
       return false;
     }
-    for (const terminal of activeHandles) {
+    for (const terminal of observableHandles) {
       if (!terminal.connected || !terminal.writable) {
         return false;
       }
