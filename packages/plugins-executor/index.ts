@@ -4,7 +4,6 @@ import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
 import {
   existsSync,
-  readFileSync,
   realpathSync,
 } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
@@ -12,9 +11,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { resolveMailboxId } from '../mailbox/index.ts';
-import { MailboxStore } from '../mailbox/index.ts';
-import { buildTaskPreamble, buildWakeupPointer, maxPreviewSequence, settleWakeDeliveryFailure } from '../mailbox/index.ts';
+import { MailboxStore, resolveMailboxId, buildTaskPreamble, buildWakeupPointer, maxPreviewSequence, settleWakeDeliveryFailure } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
@@ -321,9 +318,16 @@ export async function pickSeaCreatureName(options: PickSeaCreatureNameOptions): 
   for (const name of issuedNames ?? []) {
     existing.add(name.trim().toLowerCase());
   }
+  const checkedRandomBelow = (max: number): number => {
+    const value = randomBelow(max);
+    if (!Number.isInteger(value) || value < 0 || value >= max) {
+      throw new RangeError(`randomBelow(${max}) must return an integer in [0, ${max})`);
+    }
+    return value;
+  };
   for (let attempt = 0; attempt < 10_000; attempt += 1) {
-    const creature = SEA_CREATURE_POOL[randomBelow(SEA_CREATURE_POOL.length)];
-    const suffix = 100_000 + randomBelow(900_000);
+    const creature = SEA_CREATURE_POOL[checkedRandomBelow(SEA_CREATURE_POOL.length)];
+    const suffix = 100_000 + checkedRandomBelow(900_000);
     const candidate = `${creature}-${suffix}`;
     if (!existing.has(candidate)) {
       issuedNames?.add(candidate);

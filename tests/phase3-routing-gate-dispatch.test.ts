@@ -334,7 +334,7 @@ test('sea-creature naming skips every active collision source before reserving a
   assert.equal(upper, `${SEA_CREATURE_POOL.at(-1)}-999999`);
 });
 
-test('sea-creature naming surfaces listing failure and bounds collision attempts', async () => {
+test('sea-creature naming rejects invalid randomness, surfaces listing failure and bounds collision attempts', async () => {
   await assert.rejects(pickSeaCreatureName({
     command: 'orca', runner: async () => ({ stdout: '{"ok":false}' }),
   }), /Orca worktree listing failed/);
@@ -347,6 +347,16 @@ test('sea-creature naming surfaces listing failure and bounds collision attempts
     },
   }), /Sea-creature worktree names exhausted/);
   assert.equal(draws, 20_000);
+  for (const invalidMax of [SEA_CREATURE_POOL.length, 900_000]) {
+    for (const invalidValue of [NaN, Infinity, -1, 0.5, invalidMax]) {
+      const issuedNames = new Set<string>();
+      await assert.rejects(pickSeaCreatureName({
+        command: 'orca', runner: cleanedWorktreeRunner([]), issuedNames,
+        randomBelow: max => max === invalidMax ? invalidValue : 0,
+      }), { name: 'RangeError', message: `randomBelow(${invalidMax}) must return an integer in [0, ${invalidMax})` });
+      assert.equal(issuedNames.size, 0, 'Invalid randomness must not reserve a malformed name');
+    }
+  }
 });
 
 test('command failures surface stdout when the CLI writes errors there', async () => {
@@ -1273,7 +1283,7 @@ test('DND legacy loading, revision admission and signature CAS preserve newer ob
   assert.deepEqual(gate.listDndQueue()[0].envelope, newest);
 });
 
-function cleanedWorktreeRunner(names: string[], resolvedName?: string): CommandRunner {
+function cleanedWorktreeRunner(names: string[]): CommandRunner {
   return async request => {
     if (request.args[0] === 'worktree' && request.args[1] === 'list') {
       return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
@@ -1281,7 +1291,7 @@ function cleanedWorktreeRunner(names: string[], resolvedName?: string): CommandR
     if (request.args[0] === 'worktree' && request.args[1] === 'create') {
       const name = request.args[request.args.indexOf('--name') + 1];
       names.push(name);
-      return { stdout: JSON.stringify({ ok: true, result: { path: `/retired/${resolvedName ?? name}` } }) };
+      return { stdout: JSON.stringify({ ok: true, result: { path: `/retired/${name}` } }) };
     }
     return { stdout: '{"ok":true}' };
   };
