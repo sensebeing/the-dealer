@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, chmodSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { homedir, hostname } from 'node:os';
@@ -193,32 +193,67 @@ export class DealerNodeRuntime {
     saveJson(join(this.stateDir, 'config.json'), this.config);
   }
 
-  /** Take over runtime.lock only when the recorded owner process is proven gone. */
-  private reclaimStaleLock(lockDir: string): boolean {
-    let pid: unknown;
+  /** Create runtime.lock and claim it for this process before anyone can observe it. */
+  private createLock(lockDir: string): void {
+    mkdirSync(lockDir);
     try {
-      pid = (JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')) as { pid?: unknown }).pid;
+      saveJson(join(lockDir, 'owner.json'), { pid: process.pid });
+    } catch (error) {
+      rmSync(lockDir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  /** Reclaim runtime.lock only when the recorded owner is proven gone. */
+  private reclaimStaleLock(lockDir: string): boolean {
+    const reclaimDir = `${lockDir}.reclaim`;
+    try {
+      // One competitor wins the reclaim gate; the rest report the live-owner error.
+      mkdirSync(reclaimDir);
     } catch {
       return false;
     }
-    if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
-      return false;
-    }
     try {
-      process.kill(pid, 0);
-      return false;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+      let pid: unknown;
+      try {
+        pid = (JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')) as { pid?: unknown }).pid;
+      } catch {
         return false;
       }
-    }
-    try {
-      rmSync(lockDir, { recursive: true, force: true });
-      mkdirSync(lockDir);
+      if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
+        return false;
+      }
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+          return false;
+        }
+      }
+      // Move the stale lock aside and claim the path before releasing the gate, so
+      // no concurrent start can observe a missing or owner-less lock directory.
+      renameSync(lockDir, join(reclaimDir, 'stale'));
+      this.createLock(lockDir);
       return true;
     } catch {
       return false;
+    } finally {
+      rmSync(reclaimDir, { recursive: true, force: true });
     }
+  }
+
+  /** Release runtime.lock only while this process is its recorded owner. */
+  private releaseLock(lockDir: string): void {
+    try {
+      const pid = (JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')) as { pid?: unknown }).pid;
+      if (pid !== process.pid) {
+        return;
+      }
+    } catch {
+      return;
+    }
+    rmSync(lockDir, { recursive: true, force: true });
   }
 
   async start(): Promise<this> {
@@ -229,9 +264,12 @@ export class DealerNodeRuntime {
     chmodSync(this.stateDir, 0o700);
     const lockDir = join(this.stateDir, 'runtime.lock');
     try {
-      mkdirSync(lockDir);
+      this.createLock(lockDir);
       this.ownsLock = true;
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error;
+      }
       // A daemon killed inside its shutdown window leaves runtime.lock behind;
       // reclaim it only when the recorded owner is proven to be gone.
       if (!this.reclaimStaleLock(lockDir)) {
@@ -242,7 +280,6 @@ export class DealerNodeRuntime {
       this.ownsLock = true;
     }
     try {
-      saveJson(join(this.stateDir, 'runtime.lock', 'owner.json'), { pid: process.pid });
       const path = join(this.stateDir, 'config.json');
       const saved = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
       const profile = getBuiltInProfile(this.options.profile ?? saved.profile ?? 'personal-dev');
@@ -1235,7 +1272,7 @@ export class DealerNodeRuntime {
           if (hadServer) {
             rmSync(this.socketPath, { force: true });
           }
-          rmSync(join(this.stateDir, 'runtime.lock'), { recursive: true, force: true });
+          this.releaseLock(join(this.stateDir, 'runtime.lock'));
           this.ownsLock = false;
         }
         this.started = false;

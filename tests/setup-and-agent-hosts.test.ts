@@ -138,6 +138,8 @@ test('runtime start reclaims a lock left by a dead owner but refuses a live owne
   writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: 999999 }));
   const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
   await runtime.start();
+  assert.deepEqual(JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')), { pid: process.pid });
+  assert.equal(existsSync(`${lockDir}.reclaim`), false, 'the reclaim gate is released');
   await runtime.stop();
   assert.equal(existsSync(lockDir), false, 'a dead owner lock is reclaimed and released');
   mkdirSync(lockDir, { recursive: true, mode: 0o700 });
@@ -145,6 +147,17 @@ test('runtime start reclaims a lock left by a dead owner but refuses a live owne
   const blocked = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
   await assert.rejects(blocked.start(), /State directory already owned/);
   assert.equal(existsSync(join(lockDir, 'owner.json')), true, 'a live owner keeps its lock');
+});
+
+test('runtime stop leaves a lock that no longer records this process', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const lockDir = join(stateDir, 'runtime.lock');
+  const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await runtime.start();
+  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.ppid }));
+  await runtime.stop();
+  assert.equal(existsSync(join(lockDir, 'owner.json')), true, 'a foreign owner lock survives stop');
 });
 
 test('project link mounts its onboarding network once and preserves an existing mount', async t => {
