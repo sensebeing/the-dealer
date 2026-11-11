@@ -12,7 +12,7 @@ import { tmpdir, homedir, networkInterfaces } from 'node:os';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { createSocket } from 'node:dgram';
 import { createServer } from 'node:net';
-import { P2PTransportService, defaultAdvertisedHost } from '../packages/transport/index.ts';
+import { P2PTransportService, defaultAdvertisedHost, isTailscaleIpv4Host } from '../packages/transport/index.ts';
 import { join } from 'node:path';
 import {
   AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli,
@@ -22,7 +22,7 @@ import {
   BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts, resolveAgentBindingPreset,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
   Kernel, createTransportPlugin, createNodePlugin, generateNodeKeyPair, deriveNetworkKeys,
-  sealNetworkFrame, unsealNetworkFrame, signNodeCard, isTailscaleIpv4Host,
+  sealNetworkFrame, unsealNetworkFrame, signNodeCard,
 } from '../packages/index.ts';
 import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
 

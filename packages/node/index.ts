@@ -1,4 +1,4 @@
-import { generateNodeKeyPair, isTailscaleIpv4Host, signNodeCard, verifyNodeCard } from '../core-types/index.ts';
+import { generateNodeKeyPair, signNodeCard, verifyNodeCard } from '../core-types/index.ts';
 import type {
   AdmissionMode,
   Disposable,
@@ -112,13 +112,7 @@ export class PeerDirectoryService implements NodeService {
     }
     if (card.endpointAddr) {
       try {
-        // A card's self-reported LAN address must not replace the routed Tailscale
-        // endpoint we observed when the peer was discovered over the tailnet.
-        const existing = this.transport.listPeerEndpoints?.(card.networkId)?.get(card.nodeId);
-        const endpointAddr = existing && isTailscaleIpv4Host(existing) && !isTailscaleIpv4Host(card.endpointAddr)
-          ? `${existing.slice(0, existing.lastIndexOf(':'))}${card.endpointAddr.slice(card.endpointAddr.lastIndexOf(':'))}`
-          : card.endpointAddr;
-        this.transport.registerPeerEndpoint?.(card.networkId, card.nodeId, endpointAddr);
+        this.transport.registerPeerEndpoint?.(card.networkId, card.nodeId, card.endpointAddr);
       } catch {
         return;
       }

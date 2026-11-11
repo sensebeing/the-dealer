@@ -344,11 +344,6 @@ export function generateNodeKeyPair(): {
   return keyPair(generateKeyPairSync('ed25519').privateKey);
 }
 
-/** Tailscale's routed CGNAT range (100.64.0.0/10); these addresses stay reachable across subnets. */
-export function isTailscaleIpv4Host(host: string): boolean {
-  return /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host);
-}
-
 /**
  * JSON data only. Omit the outer signature; nested business fields named signature remain signed.
  * Undefined object properties are omitted and undefined array entries become null, as on the wire.

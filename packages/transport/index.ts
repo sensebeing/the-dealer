@@ -11,7 +11,6 @@ import { createInterface } from 'node:readline';
 import {
   deriveNetworkKeys,
   generateNodeKeyPair,
-  isTailscaleIpv4Host,
   sealNetworkFrame,
   unsealNetworkFrame,
 } from '../core-types/index.ts';
@@ -153,6 +152,11 @@ const PRIVATE_IPV4 = /^(100\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/;
 const TAILSCALE_COMMANDS = ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale'];
 const TAILSCALE_CACHE_MS = 30_000;
 let tailscalePeersCache: { readAt: number; peers: string[] } | undefined;
+
+/** Tailscale's routed CGNAT range (100.64.0.0/10); these addresses stay reachable across subnets. */
+export function isTailscaleIpv4Host(host: string): boolean {
+  return /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host);
+}
 
 function readTailscaleStatus(command: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -551,10 +555,21 @@ export class P2PTransportService implements TransportService {
   }
 
   registerPeerEndpoint(networkId: string, nodeId: string, address: string): void {
-    parseEndpoint(address);
-    if (nodeId !== this.localNodeId) {
-      this.get(networkId).peers.set(nodeId, address);
+    const parsed = parseEndpoint(address);
+    if (nodeId === this.localNodeId) {
+      return;
     }
+    const peers = this.get(networkId).peers;
+    const existing = peers.get(nodeId);
+    const existingHost = existing ? parseEndpoint(existing).host : undefined;
+    // The transport owns endpoint reachability: once a peer is reachable through a
+    // routed Tailscale address, a later LAN address may only update its port.
+    peers.set(
+      nodeId,
+      existingHost && isTailscaleIpv4Host(existingHost) && !isTailscaleIpv4Host(parsed.host)
+        ? `${existingHost}:${parsed.port}`
+        : address,
+    );
   }
 
   private learn(frame: SealedNetworkFrame, remoteHost?: string): Mount | undefined {
@@ -649,7 +664,7 @@ export class P2PTransportService implements TransportService {
     const now = Date.now();
     if (now - m.lastSeedProbeAt < Math.max(this.options.discoveryIntervalMs ?? 50, 2000)) return;
     m.lastSeedProbeAt = now;
-    if (this.udp && this.options.multicast !== false && (!this.options.discoveryDir || this.options.tailscalePeers)) {
+    if (this.udp && this.options.multicast !== false) {
       // Subnet broadcasts cover peers on the same LAN without requiring multicast routing.
       for (const { broadcast } of lanBroadcastAddresses()) {
         try {
