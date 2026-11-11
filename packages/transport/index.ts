@@ -526,7 +526,7 @@ export class P2PTransportService implements TransportService {
       beacons: new Map<string, { frame: SealedNetworkFrame; expires: number }>(),
       relays: new Map<string, string>(),
       inboundTunnels: new Map<string, Tunnel>(),
-      outboundTunnels: new Map<string, { socket: Socket; acked: boolean }>(),
+      outboundTunnels: new Map<string, { socket: Socket; seed: string; acked: boolean }>(),
       file,
       lastSeedProbeAt: Number.NEGATIVE_INFINITY,
     };

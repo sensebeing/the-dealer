@@ -41,6 +41,7 @@ async function relayMesh(t: TestContext, root: string) {
         localNodeId: seedKeys.nodeId,
         discoveryDir: join(root, 'relay'),
         multicast: false,
+        socketTimeoutMs: 400,
       }),
     },
     {
