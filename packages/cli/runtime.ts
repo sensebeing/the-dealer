@@ -324,6 +324,9 @@ export class DealerNodeRuntime {
       await this.kernel.use(this.integrationPlugin());
       for (const network of this.config.networks) {
         await this.transport.mountNetwork(network);
+        if (network.admissionMode) {
+          await this.node.updateNetworkAdmissionMode(network.networkId, network.admissionMode);
+        }
       }
       for (const route of this.config.routes) {
         this.installRoute(route);
@@ -910,19 +913,26 @@ export class DealerNodeRuntime {
     if (network.admissionMode) {
       admissionMode(network.admissionMode);
     }
+    const existing = this.config.networks.find(n => n.networkId === network.networkId);
+    const resolved = {
+      ...network,
+      ...(network.admissionMode ?? existing?.admissionMode ? { admissionMode: network.admissionMode ?? existing?.admissionMode } : {}),
+      ...(network.role ?? existing?.role ? { role: network.role ?? existing?.role } : {}),
+    };
     const previous = this.transport.getNetworkConfig(network.networkId);
     if (previous) await this.transport.unmountNetwork(network.networkId);
     try {
-      await this.transport.mountNetwork(network);
+      await this.transport.mountNetwork(resolved);
     } catch (error) {
       if (previous) await this.transport.mountNetwork(previous);
       throw error;
     }
-    if (network.admissionMode) {
-      await this.gate.setNetworkMode(network.networkId, network.admissionMode);
+    if (resolved.admissionMode) {
+      await this.gate.setNetworkMode(resolved.networkId, resolved.admissionMode);
+      await this.node.updateNetworkAdmissionMode(resolved.networkId, resolved.admissionMode);
     }
-    this.config.networks = this.config.networks.filter(n => n.networkId !== network.networkId);
-    this.config.networks.push(structuredClone(network));
+    this.config.networks = this.config.networks.filter(n => n.networkId !== resolved.networkId);
+    this.config.networks.push(structuredClone(resolved));
     this.persist();
   }
 

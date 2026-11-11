@@ -125,8 +125,16 @@ test('project link mounts its onboarding network once and preserves an existing 
     assert.equal(Object.hasOwn(projects[0].manifest.onboarding, 'passphrase'), false);
     assert.ok(!stdout.join('').includes('default-secret'));
   }
-  const replacement = { networkId: 'fixed-team', passphrase: 'override-secret', bootstrapPeers: ['127.0.0.1:45679'] };
-  await runtime.mountNetwork(replacement);
+  await runtime.mountNetwork({ networkId: 'fixed-team', passphrase: 'project-secret', admissionMode: 'closed', role: 'worker' });
+  assert.equal(runtime.gate.getNetworkMode('fixed-team'), 'closed');
+  assert.equal(runtime.node.getSelfCard('fixed-team').admissionMode, 'closed');
+  await runtime.setGateMode('dnd', 'fixed-team');
+  const replacement = { networkId: 'fixed-team', passphrase: 'override-secret', bootstrapPeers: ['127.0.0.1:45679'],
+    admissionMode: 'dnd', role: 'worker' };
+  await runtime.mountNetwork({ networkId: replacement.networkId, passphrase: replacement.passphrase, bootstrapPeers: replacement.bootstrapPeers });
+  assert.equal(runtime.gate.getNetworkMode('fixed-team'), 'dnd');
+  assert.equal(runtime.node.getSelfCard('fixed-team').admissionMode, 'dnd');
+  assert.deepEqual(JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8')).networks.find(n => n.networkId === 'fixed-team'), replacement);
   assert.deepEqual(runtime.transport.getNetworkConfig('fixed-team'), replacement);
   assert.deepEqual(runtime.config.networks.find(n => n.networkId === 'fixed-team'), replacement);
   const mount = runtime.transport.mountNetwork.bind(runtime.transport);
@@ -147,6 +155,9 @@ test('project link mounts its onboarding network once and preserves an existing 
   assert.equal(restarted.transport.getNetworkConfig('default-team'), undefined);
   assert.equal(restarted.config.networks.some(n => n.networkId === 'default-team'), false);
   assert.deepEqual(restarted.transport.getNetworkConfig('fixed-team'), replacement);
+  assert.deepEqual(restarted.config.networks.find(n => n.networkId === 'fixed-team'), replacement);
+  assert.equal(restarted.gate.getNetworkMode('fixed-team'), 'dnd');
+  assert.equal(restarted.node.getSelfCard('fixed-team').admissionMode, 'dnd');
   await restarted.linkProject(root);
   assert.equal(restarted.transport.getNetworkConfig('default-team')?.passphrase, 'default-secret');
 });
