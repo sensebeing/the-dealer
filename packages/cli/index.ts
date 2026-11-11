@@ -13,7 +13,7 @@ import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { SettlementOutcome } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
-import { admissionMode, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
+import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
@@ -671,8 +671,20 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action)) {
       v.root = resolve(String(v.root ?? process.cwd()));
     }
+    if (group === 'network' && action === 'mount' && target && !target.startsWith('dealer-net:') && v.passphrase === undefined) {
+      const root = resolve(String(v.root ?? process.cwd()));
+      if (existsSync(join(root, '.dealer/project.json'))) {
+        const manifest = readProjectManifest(root);
+        if (manifest.onboarding?.passphrase && (manifest.onboarding.networkId ?? manifest.defaultNetworkId) === target) {
+          v.passphrase = manifest.onboarding.passphrase;
+          if (v.seed === undefined && manifest.onboarding.bootstrapPeers?.length) {
+            v.seed = manifest.onboarding.bootstrapPeers.join(',');
+          }
+        }
+      }
+    }
     // Preserve caller-relative paths when the daemon has a different cwd.
-    if (group === 'project' || group === 'plugin' || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
+    if (group === 'project' || group === 'plugin' || (group === 'network' && action === 'mount') || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
       argv = [...p];
       for (const [key, value] of Object.entries(v)) {
         if (value === true) {

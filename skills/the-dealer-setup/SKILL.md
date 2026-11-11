@@ -47,6 +47,13 @@ Use `probe.onboarding.networkTopology` to choose the project flow. When it is
 teammates, without asking whether to use local. An invite fixes topology to its
 invited network. The probe owns inference from project manifest defaults.
 
+When `probe.onboarding.hasNetworkPassphrase` is true, run
+`dealer project link . --json` from the repository after starting the node.
+This automatically mounts `probe.onboarding.networkId` using the project preset,
+without a separate `dealer-net://` invite URI. You can also run
+`dealer network mount <networkId> --json` from that repository; omitted
+passphrase and seed flags come from the matching project preset.
+
 When topology is `selectable`, or no project or invite is present, ask whether
 the user wants **same-machine local** (default), **connect their own machines**,
 or **join/create a teammate network**. Reuse prior answers.

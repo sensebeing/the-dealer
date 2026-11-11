@@ -39,10 +39,13 @@ export function probeDealerSetup(options: {
   ]));
   const recommendedHost = clis.orca ? 'orca' : AGENT_HOST_CATALOG.find(host => host.host !== 'antigravity' && clis[host.command])?.host ?? (clis.agy ? 'antigravity' : null);
   return {
-    cwd, stateDir, clis, apps, recommendedHost, agentCatalog: AGENT_HOST_CATALOG, project,
+    cwd, stateDir, clis, apps, recommendedHost, agentCatalog: AGENT_HOST_CATALOG,
+    project: project?.onboarding ? { ...project, onboarding: { ...project.onboarding, passphrase: undefined } } : project,
     onboarding: project ? {
       networkTopology: project.onboarding?.networkTopology ?? (typeof project.defaultNetworkId === 'string' && project.defaultNetworkId !== 'local' ? 'fixed' : 'selectable'),
       networkId: project.onboarding?.networkId ?? project.defaultNetworkId ?? 'local',
+      hasNetworkPassphrase: Boolean(project.onboarding?.passphrase),
+      ...(project.onboarding?.bootstrapPeers !== undefined ? { bootstrapPeers: project.onboarding.bootstrapPeers } : {}),
       requireLarkCli: Boolean(project.onboarding?.requireLarkCli),
       notifyLark: Boolean(project.onboarding?.notifyLark),
       defaultTopic: project.onboarding?.defaultTopic ?? 'collab.request.v4',

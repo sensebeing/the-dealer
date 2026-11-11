@@ -91,6 +91,8 @@ export interface DealerTopicSpec {
 
 export interface DealerProjectOnboardingPreset {
   networkTopology?: 'fixed' | 'selectable';
+  passphrase?: string;
+  bootstrapPeers?: string[];
   networkId?: string;
   requireLarkCli?: boolean;
   notifyLark?: boolean;
@@ -162,7 +164,8 @@ function validateManifest(manifest: DealerProjectManifest): void {
     if (!isRecord(preset) ||
         (preset.networkTopology !== undefined && !['fixed', 'selectable'].includes(preset.networkTopology)) ||
         ['requireLarkCli', 'notifyLark'].some(key => preset[key] !== undefined && typeof preset[key] !== 'boolean') ||
-        ['networkId', 'defaultTopic', 'teamRegistryPath'].some(key => preset[key] !== undefined && !nonempty(preset[key])) ||
+        ['networkId', 'defaultTopic', 'teamRegistryPath', 'passphrase'].some(key => preset[key] !== undefined && !nonempty(preset[key])) ||
+        (preset.bootstrapPeers !== undefined && (!Array.isArray(preset.bootstrapPeers) || !preset.bootstrapPeers.every(nonempty))) ||
         (preset.defaultConversationMode !== undefined && !['spawn', 'fixed', 'inbox-only'].includes(preset.defaultConversationMode))) {
       throw new Error('Invalid project onboarding preset');
     }

@@ -66,24 +66,96 @@ test('project onboarding validates fields and probe normalizes defaults without 
   writeFileSync(path, JSON.stringify({ ...manifest, onboarding }));
   assert.deepEqual(readProjectManifest(root).onboarding, onboarding);
   writeFileSync(join(root, 'config.json'), JSON.stringify({ larkNotify: { enabled: true, command: '/custom/lark-cli', userId: 'private-target' } }));
-  assert.deepEqual(probe().onboarding, onboarding);
+  assert.deepEqual(probe().onboarding, { ...onboarding, hasNetworkPassphrase: false });
+  const secretPreset = { ...onboarding, passphrase: 'onboarding-secret', bootstrapPeers: ['127.0.0.1:45678'] };
+  writeFileSync(path, JSON.stringify({ ...manifest, onboarding: secretPreset }));
+  assert.deepEqual(readProjectManifest(root).onboarding, secretPreset);
+  assert.deepEqual(probe().onboarding, { ...onboarding, hasNetworkPassphrase: true, bootstrapPeers: secretPreset.bootstrapPeers });
+  assert.equal(probe().project.onboarding.passphrase, undefined);
+  assert.ok(!JSON.stringify(probe()).includes(secretPreset.passphrase));
   assert.deepEqual(probe().node.larkNotify, { enabled: true, command: '/custom/lark-cli' });
   assert.ok(!JSON.stringify(probe()).includes('private-target'));
   for (const invalid of [null, [], 'fixed', { networkTopology: 'other' }, { requireLarkCli: 'true' },
-    { notifyLark: 1 }, { networkId: '' }, { defaultTopic: ' ' }, { teamRegistryPath: '' }, { defaultConversationMode: 'other' }]) {
+    { passphrase: '' }, { passphrase: ' ' }, { passphrase: 1 }, { bootstrapPeers: 'seed' },
+    { bootstrapPeers: [''] }, { bootstrapPeers: [1] }, { notifyLark: 1 }, { networkId: '' }, { defaultTopic: ' ' }, { teamRegistryPath: '' }, { defaultConversationMode: 'other' }]) {
     writeFileSync(path, JSON.stringify({ ...manifest, onboarding: invalid }));
     assert.throws(() => readProjectManifest(root), /onboarding/);
   }
   for (const defaultNetworkId of ['team', 'local']) {
     writeFileSync(path, JSON.stringify({ ...manifest, defaultNetworkId }));
     assert.deepEqual(probe().onboarding, { networkTopology: defaultNetworkId === 'local' ? 'selectable' : 'fixed',
-      networkId: defaultNetworkId, requireLarkCli: false, notifyLark: false,
+      networkId: defaultNetworkId, hasNetworkPassphrase: false, requireLarkCli: false, notifyLark: false,
       defaultTopic: 'collab.request.v4', defaultConversationMode: 'fixed' });
   }
   rmSync(path);
   rmSync(join(root, 'config.json'));
   assert.equal(probe().onboarding, null);
   assert.equal(probe().node.larkNotify, null);
+});
+
+test('project link mounts its onboarding network once and preserves an existing mount', async t => {
+  const root = directory(t);
+  mkdirSync(join(root, '.dealer'));
+  const path = join(root, '.dealer/project.json');
+  const manifest = { schema: 'the-dealer-project/v1', projectId: 'demo', defaultNetworkId: 'default-team',
+    onboarding: { networkId: 'fixed-team', passphrase: 'project-secret', bootstrapPeers: ['127.0.0.1:45678'] } };
+  writeFileSync(path, JSON.stringify(manifest));
+  const runtime = new DealerNodeRuntime({ stateDir: join(root, 'state'), transport: { discoveryDir: join(root, 'discovery') } });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  await runtime.linkProject(root);
+  assert.ok(runtime.transport.listMountedNetworks().includes('fixed-team'));
+  assert.ok(!runtime.transport.listMountedNetworks().includes('default-team'));
+  assert.deepEqual(runtime.config.networks.find(n => n.networkId === 'fixed-team'), {
+    networkId: 'fixed-team', passphrase: 'project-secret', bootstrapPeers: ['127.0.0.1:45678'],
+  });
+  await runtime.linkProject(root);
+  assert.equal(runtime.config.networks.filter(n => n.networkId === 'fixed-team').length, 1);
+  writeFileSync(path, JSON.stringify({ ...manifest, onboarding: { ...manifest.onboarding, passphrase: 'changed-secret' } }));
+  await runtime.linkProject(root);
+  assert.equal(runtime.config.networks.find(n => n.networkId === 'fixed-team')?.passphrase, 'project-secret');
+  writeFileSync(path, JSON.stringify({ ...manifest, onboarding: { passphrase: 'default-secret' } }));
+  await runtime.linkProject(root);
+  assert.equal(runtime.config.networks.find(n => n.networkId === 'default-team')?.passphrase, 'default-secret');
+});
+
+test('network mount resolves project credentials before daemon forwarding and respects explicit flags', async t => {
+  const root = directory(t);
+  mkdirSync(join(root, '.dealer'));
+  writeFileSync(join(root, '.dealer/project.json'), JSON.stringify({ schema: 'the-dealer-project/v1',
+    projectId: 'demo', defaultNetworkId: 'fixed-team',
+    onboarding: { passphrase: 'project-secret', bootstrapPeers: ['127.0.0.1:45678'] } }));
+  const stateDir = join(root, 'state');
+  const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  const forwarded: string[][] = [];
+  await runtime.serveControl(async argv => {
+    forwarded.push(argv);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+  assert.deepEqual(await cli(['network', 'mount', 'fixed-team', '--root', root], stateDir), { mounted: 'fixed-team' });
+  assert.ok(forwarded[0].includes('project-secret'));
+  assert.ok(forwarded[0].includes('127.0.0.1:45678'));
+  assert.deepEqual(runtime.config.networks.find(n => n.networkId === 'fixed-team'), {
+    networkId: 'fixed-team', passphrase: 'project-secret', bootstrapPeers: ['127.0.0.1:45678'],
+  });
+  await runtime.unmountNetwork('fixed-team');
+  await cli(['network', 'mount', 'fixed-team', '--root', root, '--seed', '127.0.0.1:45679'], stateDir);
+  assert.deepEqual(runtime.config.networks.find(n => n.networkId === 'fixed-team')?.bootstrapPeers, ['127.0.0.1:45679']);
+  await runtime.unmountNetwork('fixed-team');
+  await cli(['network', 'mount', 'fixed-team', '--root', root, '--passphrase', 'explicit-secret'], stateDir);
+  assert.equal(runtime.config.networks.find(n => n.networkId === 'fixed-team')?.passphrase, 'explicit-secret');
+  assert.equal(runtime.config.networks.find(n => n.networkId === 'fixed-team')?.bootstrapPeers, undefined);
+  const stderr: string[] = [];
+  assert.equal(await runDealerCli(['network', 'mount', 'unrelated', '--root', root], {
+    stateDir, stdout: () => {}, stderr: line => stderr.push(line),
+  }), 1);
+  assert.match(stderr.join(''), /passphrase/);
+  assert.ok(!runtime.transport.listMountedNetworks().includes('unrelated'));
 });
 
 test('preset enables live Lark delivery and inherits only the selected project default', async t => {

@@ -467,6 +467,8 @@ export class DealerNodeRuntime {
     return this.changeExternal(async () => {
       const rootPath = resolve(projectRoot);
       const manifest = readProjectManifest(rootPath);
+      const onboardingNetworkId = manifest.onboarding?.networkId ?? manifest.defaultNetworkId;
+      const onboardingPassphrase = manifest.onboarding?.passphrase;
       for (const [kind, topic] of Object.entries(manifest.topics ?? {})) {
         if (topic.defaultExecutor === undefined) {
           continue;
@@ -524,6 +526,13 @@ export class DealerNodeRuntime {
         this.config.skills = [...new Set([...this.config.skills, ...(manifest.skills ?? []), ...(userPatch?.skills ?? [])])];
         await this.publishSkills();
         this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
+        if (onboardingPassphrase && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
+          await this.mountNetwork({
+            networkId: onboardingNetworkId,
+            passphrase: onboardingPassphrase,
+            ...(manifest.onboarding?.bootstrapPeers?.length ? { bootstrapPeers: manifest.onboarding.bootstrapPeers } : {}),
+          });
+        }
       });
       this.loadedProjects.set(manifest.projectId, { manifest, plugins, userPatch, rootPath });
       this.refreshTopicBindings();
