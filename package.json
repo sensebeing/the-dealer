@@ -1,7 +1,7 @@
 {
   "name": "the-dealer",
   "version": "0.1.0",
-  "description": "Plugin-driven Agent Collaboration & Dispatch Mesh — scale from zero-config same-machine multi-agent dispatch to encrypted cross-machine & cross-team P2P networks.",
+  "description": "Plugin-driven agent collaboration and dispatch mesh: scale from zero-config same-machine multi-agent dispatch to encrypted cross-machine and cross-team P2P networks.",
   "license": "MIT",
   "type": "module",
   "engines": {

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "the-dealer",
+  "owner": {
+    "name": "SenseBeing",
+    "url": "https://github.com/sensebeing"
+  },
+  "description": "Install the-dealer skills as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "the-dealer",
+      "source": "./",
+      "description": "Plugin-driven agent collaboration and dispatch mesh: scale from zero-config same-machine multi-agent dispatch to encrypted cross-machine and cross-team P2P networks.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "keywords": [
+        "ai-agents",
+        "multi-agent-systems",
+        "agent-orchestration",
+        "p2p",
+        "iroh",
+        "orca",
+        "codex",
+        "claude-code",
+        "antigravity",
+        "developer-tools"
+      ]
+    }
+  ]
+}

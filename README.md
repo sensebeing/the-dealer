@@ -4,10 +4,19 @@
 [![Node.js >=22.6](https://img.shields.io/badge/node-%3E%3D22.6-blue.svg)](package.json)
 [![Zero runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-green.svg)](package.json)
 [![Rust Iroh Engine](https://img.shields.io/badge/native_transport-Rust_Iroh-orange.svg)](native/dealer-iroh-engine/Cargo.toml)
+[![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--dealer-black)](https://skills.sh/sensebeing/the-dealer)
+[![GitHub stars](https://img.shields.io/github/stars/sensebeing/the-dealer?style=social)](https://github.com/sensebeing/the-dealer/stargazers)
 
 **Connect isolated coding agents into a real-time local and P2P collaboration mesh.**
 
 Developers often run Codex, Claude Code, Antigravity, and Orca on the same machine while their sessions stay isolated. The Dealer gives those agents a shared delivery protocol on one machine, and extends the same workflow to encrypted collaboration across machines and teams. Ed25519 node identities, receiver-owned trust gates, durable JSON mailbox waves, and real-time session wakeups keep handoffs verifiable, while `lark-mirror` and the OS `notify` executor keep human operators in the loop.
+
+| Without the-dealer | With the-dealer |
+| --- | --- |
+| Copy tasks between isolated Codex, Claude Code, Antigravity, and Orca terminals, or hand them off through ad-hoc chat messages. | Unified same-machine task dispatch that extends to encrypted P2P delivery across machines and teams. |
+| Check manually whether each receiver will accept a task. | Receiver-owned trust gates control admission and approval. |
+| Track pending work in chat history and reconcile it after restarts. | Durable JSON mailbox leases preserve unacknowledged batches for recovery. |
+| Keep checking whether a session is idle or has new messages. | Idle-gated real-time session wakeups include inline message previews. |
 
 [中文文档](README.zh-CN.md) · [Get started](#get-started-in-30-seconds-paste-to-your-agent) · [Scenarios](#three-progressive-scenarios) · [Architecture](#architecture-and-real-time-session-delivery) · [Host presets](#host-profiles-agent-apps-and-presets) · [CLI reference](#cli-reference-and-bundled-skills)
 
@@ -19,12 +28,14 @@ Paste either prompt into Claude Code, Codex, Cursor, Antigravity, or Orca.
 
 ```text
 Install and set up https://github.com/sensebeing/the-dealer on this machine.
-Clone or update ~/the-dealer, run `npm --prefix ~/the-dealer link`, and symlink
-skills/the-dealer, skills/the-dealer-setup, and skills/the-dealer-extend into my
-agent skill directories. Then follow skills/the-dealer-setup/SKILL.md to help me
-choose a host profile (orca-dev, codex-dev, claude-dev, or antigravity-dev) and
-conversation mode (spawn, fixed, or inbox-only), start dealerd, and verify a local
-loopback message.
+Check existing installs and Node.js >=22.6 first. If the CLI is missing, run
+`npm install -g git+https://github.com/sensebeing/the-dealer`; if I already have
+a trusted ~/the-dealer checkout, use `npm --prefix ~/the-dealer link`.
+Install the skills with `npx skills add sensebeing/the-dealer --global --agent '*'`,
+preserving existing configuration. Follow the installed the-dealer-setup skill
+to choose a host profile (orca-dev, codex-dev, claude-dev, or antigravity-dev)
+and conversation mode (spawn, fixed, or inbox-only), start dealerd, and verify
+a local loopback message.
 ```
 
 ### Prompt 2: Invite a teammate or your second machine
@@ -34,6 +45,27 @@ Use skills/the-dealer-setup/SKILL.md to generate a Dealer network invitation
 (`dealer setup invite-prompt`) for my second machine or a teammate, and give me
 a ready-to-forward onboarding message with the `dealer-net://v1/...` invite URI
 and verification steps.
+```
+
+### Quick install
+
+Install the CLI without a manual clone:
+
+```sh
+npm install -g git+https://github.com/sensebeing/the-dealer
+```
+
+From an existing checkout, use `npm --prefix ~/the-dealer link`. Install the skills for all supported agents:
+
+```sh
+npx skills add sensebeing/the-dealer --global --agent '*'
+```
+
+In Claude Code, you can also install the skills through its plugin marketplace:
+
+```text
+/plugin marketplace add sensebeing/the-dealer
+/plugin install the-dealer@the-dealer
 ```
 
 ## Three progressive scenarios
@@ -173,3 +205,13 @@ npm run build:native
 ```
 
 See [Contributing](CONTRIBUTING.md), [Security](SECURITY.md), [Changelog](CHANGELOG.md), and the [MIT License](LICENSE).
+
+
+## Related projects
+
+| Project | What it does |
+| --- | --- |
+| [the-guard](https://github.com/sensebeing/the-guard) | Architecture topology checks and independent agent review before merging. |
+| [the-pilot](https://github.com/sensebeing/the-pilot) | Scene-based Turn Autopilot and multi-agent orchestration for coding agents in Orca. |
+
+If the-dealer helps your team coordinate coding agents, a star on GitHub helps other teams find it.

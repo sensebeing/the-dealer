@@ -816,3 +816,30 @@ test('initial host ENOENT is retryable and recovery binds the actual Codex recei
   assert.equal(store.getWakeTarget('task:pre-effect')?.conversationMode, 'fixed');
   assert.equal(store.getWakeTarget('task:pre-effect')?.pendingWake, false);
 });
+
+test('plugin and agent manifests match package metadata', () => {
+  const read = (path: string) => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
+  const metadata = JSON.parse(read('package.json'));
+  const claude = JSON.parse(read('.claude-plugin/plugin.json'));
+  const cursor = JSON.parse(read('.cursor-plugin/plugin.json'));
+  const marketplace = JSON.parse(read('.claude-plugin/marketplace.json'));
+  assert.equal(metadata.name, 'the-dealer');
+  assert.equal(marketplace.name, metadata.name);
+  for (const manifest of [claude, cursor, marketplace.plugins[0]]) {
+    for (const key of ['name', 'version', 'description', 'license', 'keywords']) {
+      assert.deepEqual(manifest[key], metadata[key], key);
+    }
+  }
+  const skills = ['the-dealer', 'the-dealer-setup', 'the-dealer-extend'];
+  for (const manifest of [claude, cursor]) {
+    assert.deepEqual(manifest.skills, skills.map(skill => './skills/' + skill));
+  }
+  for (const skill of skills) {
+    assert.ok(read('skills/' + skill + '/SKILL.md').trim());
+    const agent = read('skills/' + skill + '/agents/openai.yaml');
+    for (const field of ['display_name', 'short_description', 'default_prompt']) {
+      assert.match(agent, new RegExp('^  ' + field + ': \\S.+$', 'm'));
+    }
+    assert.ok(agent.includes('$' + skill));
+  }
+});

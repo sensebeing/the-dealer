@@ -16,17 +16,28 @@ macOS Apps, redacted node configuration and `.dealer/project.json`. Probe is
 read-only. A socket's presence is not proof of a live daemon; run
 `dealer node status --json` to verify it. An installed CLI is not proof it
 supports this integration's flags; inspect its help before enabling delivery.
-If Dealer is missing, check Node >=22.6, clone
-`https://github.com/sensebeing/the-dealer.git` into `~/the-dealer` (or inspect local
-changes and update that checkout with `git -C ~/the-dealer pull --ff-only`), then
-run `cd ~/the-dealer && npm install && npm link`. If already installed, ensure
-that trusted checkout is available for skill files without replacing the install.
-Create `~/.agents/skills/` and `~/.claude/skills/`; symlink each of
+If Dealer is missing, check Node >=22.6 and install the CLI without a manual clone:
+
+```sh
+npm install -g git+https://github.com/sensebeing/the-dealer
+```
+
+Install the skills for all supported agents:
+
+```sh
+npx skills add sensebeing/the-dealer --global --agent '*'
+```
+
+Preserve existing installations and configuration. For a local checkout, clone
+`https://github.com/sensebeing/the-dealer.git` into `~/the-dealer`, or inspect local
+changes before updating it with `git -C ~/the-dealer pull --ff-only`. Link the CLI
+with `npm --prefix ~/the-dealer link`. To install skills from that checkout,
+create `~/.agents/skills/` and `~/.claude/skills/`; symlink each of
 `~/the-dealer/skills/the-dealer`, `~/the-dealer/skills/the-dealer-setup`, and
 `~/the-dealer/skills/the-dealer-extend` into both, and into
 `~/.gemini/config/skills/` if present. Preserve unrelated files and resolve link
-conflicts before changing them. Read `~/the-dealer/skills/the-dealer-setup/SKILL.md`
-and run `dealer setup probe --json` before configuration.
+conflicts before changing them. Read the installed `the-dealer-setup/SKILL.md`
+and run `dealer setup probe --root <repository> --json` before configuration.
 Never replace an existing identity or copy another machine's private key.
 
 ## 2. Choose network topology

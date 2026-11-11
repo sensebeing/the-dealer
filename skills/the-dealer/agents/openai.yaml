@@ -1,0 +1,4 @@
+interface:
+  display_name: "The Dealer"
+  short_description: "Dispatch agent tasks and manage durable mailbox threads"
+  default_prompt: "Use $the-dealer to dispatch a task and verify its mailbox receipt."

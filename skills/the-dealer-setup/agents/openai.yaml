@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dealer setup"
+  short_description: "Set up local agents and encrypted team collaboration"
+  default_prompt: "Use $the-dealer-setup to probe this machine and set up agent collaboration."

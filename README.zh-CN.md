@@ -4,10 +4,19 @@
 [![Node.js >=22.6](https://img.shields.io/badge/node-%3E%3D22.6-blue.svg)](package.json)
 [![零 npm 运行时依赖](https://img.shields.io/badge/runtime_dependencies-0-green.svg)](package.json)
 [![原生传输层 Rust_Iroh](https://img.shields.io/badge/native_transport-Rust_Iroh-orange.svg)](native/dealer-iroh-engine/Cargo.toml)
+[![skills.sh](https://img.shields.io/badge/skills.sh-sensebeing%2Fthe--dealer-black)](https://skills.sh/sensebeing/the-dealer)
+[![GitHub stars](https://img.shields.io/github/stars/sensebeing/the-dealer?style=social)](https://github.com/sensebeing/the-dealer/stargazers)
 
 **将独立运行的 Coding Agent 连成实时、零配置的单机与跨机加密 P2P 协作网络。**
 
 开发者经常在同一台 Mac 上同时运行 Codex、Claude Code、Antigravity 和 Orca，但各个会话彼此隔离。The Dealer 为本机多 Agent 提供统一的投递协议，并将同一套工作流扩展到跨机器、跨团队的加密 P2P 协作。Ed25519 节点身份、接收端信任门禁、持久化 JSON 信箱波次和实时会话唤醒让任务交接可核验，同时通过 `lark-mirror` 与系统 `notify` 执行器让人类协作者同步掌握进展。
+
+| 没有 the-dealer | 接入 the-dealer |
+| --- | --- |
+| 在隔离的 Codex、Claude Code、Antigravity 和 Orca 终端之间手动复制任务，或通过临时聊天消息交接。 | 统一的同机任务调度，并可扩展到跨机器、跨团队的加密 P2P 投递。 |
+| 每次交接都要人工确认接收方是否愿意执行。 | 接收端信任门禁控制任务准入与审批。 |
+| 靠聊天记录追踪待处理任务，重启后还要人工核对。 | 持久化 JSON 信箱租约保留未确认批次，支持恢复处理。 |
+| 反复查看会话是否空闲、有没有新消息。 | 空闲门禁控制实时会话唤醒，并附带消息内联预览。 |
 
 [English](README.md) · [快速开始](#30-秒上手复制给你的-agent) · [协作场景](#三种渐进式协作场景) · [架构与实时唤醒](#架构分层与实时会话投递) · [宿主预设](#宿主预设agent-应用与一键配置) · [命令速查](#常用命令速查与内置技能)
 
@@ -19,9 +28,11 @@
 
 ```text
 请为本机安装并配置 https://github.com/sensebeing/the-dealer。
-将仓库克隆或更新至 ~/the-dealer，运行 `npm --prefix ~/the-dealer link`，并将
-skills/the-dealer、skills/the-dealer-setup 与 skills/the-dealer-extend 软链到我的
-Agent 技能目录。随后按 skills/the-dealer-setup/SKILL.md 引导我选择宿主预设
+先检查现有安装和 Node.js >=22.6。缺少 CLI 时运行
+`npm install -g git+https://github.com/sensebeing/the-dealer`；
+如果已有可信的 ~/the-dealer 检出，则可运行 `npm --prefix ~/the-dealer link`。
+运行 `npx skills add sensebeing/the-dealer --global --agent '*'` 安装技能，
+保留已有配置。随后按已安装的 the-dealer-setup 技能引导我选择宿主预设
 （orca-dev、codex-dev、claude-dev 或 antigravity-dev）与会话模式（spawn、fixed
 或 inbox-only），启动 dealerd 并完成本机自回环验证。
 ```
@@ -32,6 +43,27 @@ Agent 技能目录。随后按 skills/the-dealer-setup/SKILL.md 引导我选择�
 请按 skills/the-dealer-setup/SKILL.md 为我的第二台机器或队友生成 Dealer 网络邀请
 （`dealer setup invite-prompt`），并输出一份包含 `dealer-net://v1/...` 邀请链接与
 验收步骤、可直接转发给对方的完整接入消息。
+```
+
+### 快速安装
+
+无需手动克隆仓库即可安装 CLI：
+
+```sh
+npm install -g git+https://github.com/sensebeing/the-dealer
+```
+
+已有本地检出时，可运行 `npm --prefix ~/the-dealer link`。为所有支持的 Agent 安装技能：
+
+```sh
+npx skills add sensebeing/the-dealer --global --agent '*'
+```
+
+Claude Code 也可通过插件市场安装技能：
+
+```text
+/plugin marketplace add sensebeing/the-dealer
+/plugin install the-dealer@the-dealer
 ```
 
 ## 三种渐进式协作场景
@@ -171,3 +203,13 @@ npm run build:native
 ```
 
 详见[贡献指南](CONTRIBUTING.md)、[安全政策](SECURITY.md)、[更新日志](CHANGELOG.md)与 [MIT 许可证](LICENSE)。
+
+
+## 相关开源项目
+
+| 项目 | 用途 |
+| --- | --- |
+| [the-guard](https://github.com/sensebeing/the-guard) | 架构拓扑检查与合入前独立 Agent 审查。 |
+| [the-pilot](https://github.com/sensebeing/the-pilot) | Orca 中基于场景的 Turn Autopilot 与多 Agent 编排。 |
+
+如果 the-dealer 对你们团队的多 Agent 协作有帮助，欢迎在 GitHub 点一颗 Star，让更多团队看到它。

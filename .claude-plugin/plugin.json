@@ -1,0 +1,29 @@
+{
+  "name": "the-dealer",
+  "description": "Plugin-driven agent collaboration and dispatch mesh: scale from zero-config same-machine multi-agent dispatch to encrypted cross-machine and cross-team P2P networks.",
+  "version": "0.1.0",
+  "author": {
+    "name": "SenseBeing",
+    "url": "https://github.com/sensebeing"
+  },
+  "homepage": "https://github.com/sensebeing/the-dealer",
+  "repository": "https://github.com/sensebeing/the-dealer",
+  "license": "MIT",
+  "keywords": [
+    "ai-agents",
+    "multi-agent-systems",
+    "agent-orchestration",
+    "p2p",
+    "iroh",
+    "orca",
+    "codex",
+    "claude-code",
+    "antigravity",
+    "developer-tools"
+  ],
+  "skills": [
+    "./skills/the-dealer",
+    "./skills/the-dealer-setup",
+    "./skills/the-dealer-extend"
+  ]
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Extend Dealer"
+  short_description: "Add receiver bindings, source plugins, and executors"
+  default_prompt: "Use $the-dealer-extend to choose and implement a Dealer extension."
