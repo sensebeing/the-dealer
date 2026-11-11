@@ -11,6 +11,7 @@
 | 模块路径 | 唯一语义职责（Owner） | 非职责禁区（Forbidden） |
 | :--- | :--- | :--- |
 | [`packages/core-types/index.ts`](packages/core-types/index.ts) | 全部跨层接口契约、确定性 `canonicalJson`、`HKDF-SHA256` 网络密钥派生（`deriveNetworkKeys`）、`AES-256-GCM` 帧加解密（`sealNetworkFrame` / `unsealNetworkFrame`）与 Ed25519 签名验签 | 不持有任何运行时状态、I/O 或插件生命周期 |
+| [`packages/process-lock/index.ts`](packages/process-lock/index.ts) | 崩溃可恢复 owner 文件（`runtime.lock` / `mailbox.json.lock`）的唯一记录格式与存活判定：进程实例 token、容器身份，以及本进程当前持有的目录集（按 realpath 归一） | 不获取或释放具体锁，不决定锁粒度、重试与回收流程 |
 | [`packages/kernel/index.ts`](packages/kernel/index.ts) | Cordis 风格微内核与生命周期引擎：依赖注入拓扑激活（`inject`）、逆序先停消费者再停提供者、LIFO `unwind()`、五种事件派发语义（`emit / parallel / serial / bail / waterfall`）与 `composeProfile` / `applyPatch` | 不包含任何 P2P 网络、路由、门禁或执行器业务逻辑 |
 | [`packages/transport/index.ts`](packages/transport/index.ts) & [`native/dealer-iroh-engine`](native/dealer-iroh-engine/src/lib.rs) | 多网络并发挂载（`mountNetwork`）、基于 `swarmTopicId` 的加密发现信标、带 `requestNonce` 绑定的单播/多播/广播帧收发、流式 `BLAKE3` 校验的大文件分片传输（`shareFile` / `fetchBlobToPath`） | 不解析业务信封语义，不决定路由、门禁或执行 |
 | [`packages/node/index.ts`](packages/node/index.ts) | 本机 Ed25519 身份私钥唯一真源（`privateKeyPem`）、按网络隔离的签名 `NodeCard` 周期发布与版本号单调递增校验、多维 Selector 解析（`ed25519:` / `member:` / `skill:` / `member@node` / `network/selector`） | 不直接管理底层 Socket 或执行入站任务 |

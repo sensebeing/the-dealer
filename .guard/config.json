@@ -47,6 +47,16 @@
         "dependencies": []
       },
       {
+        "path": "packages/process-lock",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": []
+      },
+      {
         "path": "packages/kernel",
         "languages": [
           "TypeScript"
@@ -182,7 +192,8 @@
         "dependencies": [
           "packages/core-types",
           "packages/agent-host",
-          "packages/orca-workspace"
+          "packages/orca-workspace",
+          "packages/process-lock"
         ]
       },
       {
@@ -286,7 +297,8 @@
           "packages/plugins-router",
           "packages/plugins-source",
           "packages/plugins-executor",
-          "packages/plugins-lark-notifier"
+          "packages/plugins-lark-notifier",
+          "packages/process-lock"
         ]
       }
     ],

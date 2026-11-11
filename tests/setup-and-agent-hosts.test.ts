@@ -139,7 +139,9 @@ test('runtime start reclaims a lock left by a dead owner but refuses a live owne
   writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: 999999 }));
   const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
   await runtime.start();
-  assert.deepEqual(JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')), { pid: process.pid });
+  const owner = JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8'));
+  assert.deepEqual(Object.keys(owner).sort(), ['host', 'instanceId', 'pid']);
+  assert.equal(owner.pid, process.pid);
   assert.equal(existsSync(`${lockDir}.reclaim`), false, 'the reclaim gate is released');
   await runtime.stop();
   assert.equal(existsSync(lockDir), false, 'a dead owner lock is reclaimed and released');
@@ -180,7 +182,9 @@ test('runtime start recovers a reclaim gate left by a dead reclaimer', async t =
   seedOwner(reclaimDir, 'owner.999998.json', 999998);
   const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
   await runtime.start();
-  assert.deepEqual(JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')), { pid: process.pid });
+  const owner = JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8'));
+  assert.deepEqual(Object.keys(owner).sort(), ['host', 'instanceId', 'pid']);
+  assert.equal(owner.pid, process.pid);
   assert.equal(existsSync(reclaimDir), false, 'the dead reclaim gate is reclaimed');
   await runtime.stop();
   assert.equal(existsSync(lockDir), false, 'the reclaimed lock is released');

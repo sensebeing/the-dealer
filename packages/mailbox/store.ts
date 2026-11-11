@@ -15,6 +15,7 @@ import {
 import { dirname, join, resolve } from 'node:path';
 import { isValidMailboxId, validateSemanticHeader, verifyEnvelope } from '../core-types/index.ts';
 import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-types/index.ts';
+import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 
 export const MAILBOX_SCHEMA = 'the-dealer-mailbox/v1';
 const LEGACY_INBOX_SCHEMA = 'the-dealer-inbox/v1';
@@ -934,37 +935,27 @@ export class MailboxStore {
       }
     }
     try {
+      holdOwnedDirectory(this.lockDir);
       writeFileSync(
         ownerPath,
-        JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+        JSON.stringify(processOwnerRecord()),
         { mode: 0o600 },
       );
       return operation();
     } finally {
       rmSync(this.lockDir, { recursive: true, force: true });
+      releaseOwnedDirectory(this.lockDir);
     }
   }
 
   private clearStaleLock(ownerPath: string): void {
-    let pid: number | undefined;
-    try {
-      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: unknown };
-      if (typeof owner.pid === 'number' && Number.isSafeInteger(owner.pid) && owner.pid > 0) {
-        pid = owner.pid;
+    const owner = readProcessOwner(ownerPath);
+    if (owner !== undefined) {
+      // A same-PID owner is reclaimed only when its record proves the writer was a
+      // previous incarnation of this container; a live or unprovable owner keeps it.
+      if (isDeadProcessOwner(owner, this.lockDir)) {
+        rmSync(this.lockDir, { recursive: true, force: true });
       }
-    } catch {
-      pid = undefined;
-    }
-    if (pid !== undefined) {
-      try {
-        process.kill(pid, 0);
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
-          return;
-        }
-      }
-      rmSync(this.lockDir, { recursive: true, force: true });
       return;
     }
     try {

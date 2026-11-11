@@ -1,4 +1,5 @@
 export * from './core-types/index.ts';
+export * from './process-lock/index.ts';
 export * from './kernel/index.ts';
 export * from './transport/index.ts';
 export * from './node/index.ts';

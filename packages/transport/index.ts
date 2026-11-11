@@ -329,7 +329,7 @@ interface Tunnel {
 }
 
 /** How this node reaches a peer whose advertised endpoint is not routable from here. */
-type BlobFallback = { tunnel: Tunnel } | { mount: Mount; seed: string };
+type PeerFallback = { tunnel: Tunnel } | { mount: Mount; seed: string };
 
 interface Mount {
   config: NetworkMountConfig;
@@ -856,11 +856,9 @@ export class P2PTransportService implements TransportService {
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
   ): Promise<Uint8Array> {
     const address = m.peers.get(target);
-    // A peer that opened its tunnel towards this node is directly reachable through
-    // it even when the endpoint it advertises is NAT-bound.
-    const tunnel = m.inboundTunnels.get(target);
-    const relays = this.relayCandidates(m, target);
-    const fallback = tunnel !== undefined || relays.length > 0;
+    // Any fallback means the advertised endpoint may be NAT-bound; fail over fast
+    // instead of waiting the full request timeout on the direct attempt.
+    const fallbacks = this.peerFallbacks(target, [m]);
     let lastError: Error = new Error(`Unknown peer: ${target}`);
     if (address) {
       try {
@@ -869,32 +867,48 @@ export class P2PTransportService implements TransportService {
           target,
           address,
           frame,
-          fallback ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs,
+          fallbacks.length ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs,
         );
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        if (!fallback) {
+        if (!fallbacks.length) {
           throw lastError;
         }
       }
-    } else if (!fallback) {
+    } else if (!fallbacks.length) {
       throw lastError;
     }
-    if (tunnel) {
+    for (const fallback of fallbacks) {
       try {
-        return await this.exchangeOverTunnel(m, target, tunnel, frame, timeoutMs);
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-      }
-    }
-    for (const seed of relays) {
-      try {
-        return await this.relayExchange(m, seed, target, frame, timeoutMs);
+        return 'tunnel' in fallback
+          ? await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, timeoutMs)
+          : await this.relayExchange(m, fallback.seed, target, frame, timeoutMs);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
       }
     }
     throw lastError;
+  }
+
+  /**
+   * Ordered ways to reach a peer whose advertised endpoint may be unreachable: the
+   * tunnels it opened towards this node first, then every seed that can relay to it.
+   */
+  private peerFallbacks(target: string, mounts: Iterable<Mount>): PeerFallback[] {
+    const scoped = [...mounts];
+    const fallbacks: PeerFallback[] = [];
+    for (const mount of scoped) {
+      const tunnel = mount.inboundTunnels.get(target);
+      if (tunnel) {
+        fallbacks.push({ tunnel });
+      }
+    }
+    for (const mount of scoped) {
+      for (const seed of this.relayCandidates(mount, target)) {
+        fallbacks.push({ mount, seed });
+      }
+    }
+    return fallbacks;
   }
 
   /** Seeds that may forward to this target: its introducing seed first, then configured seeds. */
@@ -1502,44 +1516,39 @@ export class P2PTransportService implements TransportService {
     if (!address) {
       throw new Error('Transport endpoint unavailable');
     }
-    const relay = nodeId === this.localNodeId ? undefined : this.blobFallbackFor(nodeId);
+    const fallbacks = nodeId === this.localNodeId ? [] : this.peerFallbacks(nodeId, this.mounts.values());
     try {
       try {
-        await this.fetchBlobDirect(address, hash, size, temp, relay !== undefined);
+        await this.fetchBlobDirect(address, hash, size, temp, fallbacks.length > 0);
       } catch (error) {
-        if (!relay) {
+        if (!fallbacks.length) {
           throw error;
         }
-        // The advertised endpoint is NAT-bound; use this node's own inbound tunnel to
-        // the sender, or else the seed that already keeps a tunnel towards it.
-        await rm(temp, { force: true });
-        if ('tunnel' in relay) {
-          await this.writeBlobBytes(await this.blobOverTunnel(relay.tunnel, hash), size, hash, temp);
-        } else {
-          await this.fetchBlobRelay(relay, nodeId, hash, size, temp);
+        // The advertised endpoint is NAT-bound: try the peer's own tunnel to this node,
+        // then every seed that can relay to it, until one transfer walks the hash.
+        let lastError: unknown = error;
+        for (const fallback of fallbacks) {
+          await rm(temp, { force: true });
+          try {
+            if ('tunnel' in fallback) {
+              await this.writeBlobBytes(await this.blobOverTunnel(fallback.tunnel, hash), size, hash, temp);
+            } else {
+              await this.fetchBlobRelay(fallback, nodeId, hash, size, temp);
+            }
+            lastError = undefined;
+            break;
+          } catch (next) {
+            lastError = next;
+          }
+        }
+        if (lastError !== undefined) {
+          throw lastError;
         }
       }
       await rename(temp, destPath);
     } finally {
       await rm(temp, { force: true });
     }
-  }
-
-  /** The most direct way to reach a peer whose advertised endpoint is not routable. */
-  private blobFallbackFor(nodeId: string): BlobFallback | undefined {
-    for (const mount of this.mounts.values()) {
-      const tunnel = mount.inboundTunnels.get(nodeId);
-      if (tunnel) {
-        return { tunnel };
-      }
-    }
-    for (const mount of this.mounts.values()) {
-      const seed = mount.relays.get(nodeId);
-      if (seed && seed !== this.endpointAddr) {
-        return { mount, seed };
-      }
-    }
-    return undefined;
   }
 
   private async fetchBlobDirect(

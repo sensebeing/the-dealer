@@ -31,6 +31,7 @@ import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-not
 import { runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
 import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
+import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
 import {
@@ -118,14 +119,6 @@ export interface ControlServerOptions {
 const CONTROL_BODY_LIMIT = 1_048_576;
 const DEFAULT_KEEPALIVE_MS = 15_000;
 
-/**
- * State directories whose runtime.lock this process currently owns. An owner file that
- * names our own PID is live only while this process holds that state directory: a
- * container restart reuses PID 1/7, so the previous incarnation's file can legitimately
- * record the PID of the process that is now probing it.
- */
-const activeProcessLocks = new Set<string>();
-
 async function readControlBody(request: IncomingMessage): Promise<string> {
   let body = '';
   for await (const chunk of request) {
@@ -209,7 +202,7 @@ export class DealerNodeRuntime {
     rmSync(stageDir, { recursive: true, force: true });
     mkdirSync(stageDir, { mode: 0o700 });
     try {
-      saveJson(join(stageDir, ownerFile), { pid: process.pid });
+      saveJson(join(stageDir, ownerFile), processOwnerRecord());
       // The owner file is staged before the rename, so neither the lock nor its
       // reclaim gate is ever observable without a recorded owner; an existing
       // non-empty directory makes the rename fail instead of merging the claims.
@@ -220,29 +213,10 @@ export class DealerNodeRuntime {
     }
   }
 
-  /** True only when filePath records a valid pid that is proven to be gone. */
+  /** True only when filePath records an owner that is proven to be gone. */
   private hasDeadOwnerFile(filePath: string): boolean {
-    let pid: unknown;
-    try {
-      pid = (JSON.parse(readFileSync(filePath, 'utf8')) as { pid?: unknown }).pid;
-    } catch {
-      return false;
-    }
-    if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
-      return false;
-    }
-    if (pid === process.pid) {
-      // No other OS process can share our PID, so a file that names this process is
-      // live only while this process itself owns that state directory. A container
-      // restart that reuses PID 1/7 finds the previous incarnation's file here.
-      return !activeProcessLocks.has(resolve(this.stateDir));
-    }
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === 'ESRCH';
-    }
+    const owner = readProcessOwner(filePath);
+    return owner !== undefined && isDeadProcessOwner(owner, this.stateDir);
   }
 
   /** True only when dir's owner.json records a valid pid that is proven gone. */
@@ -333,14 +307,10 @@ export class DealerNodeRuntime {
     }
   }
 
-  /** Release runtime.lock only while this process is its recorded owner. */
+  /** Release runtime.lock only while this process incarnation is its recorded owner. */
   private releaseLock(lockDir: string): void {
-    try {
-      const pid = (JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')) as { pid?: unknown }).pid;
-      if (pid !== process.pid) {
-        return;
-      }
-    } catch {
+    const owner = readProcessOwner(join(lockDir, 'owner.json'));
+    if (owner?.instanceId !== processOwnerRecord().instanceId) {
       return;
     }
     rmSync(lockDir, { recursive: true, force: true });
@@ -357,7 +327,7 @@ export class DealerNodeRuntime {
     try {
       this.createLock(lockDir);
       this.ownsLock = true;
-      activeProcessLocks.add(resolve(this.stateDir));
+      holdOwnedDirectory(this.stateDir);
       // A reclaimer killed inside its gate leaves a dead gate that blocks every
       // later reclaim; drop it once this process holds the lock on the fast path.
       if (existsSync(reclaimDir) && this.discardDeadGate(reclaimDir)) {
@@ -380,7 +350,7 @@ export class DealerNodeRuntime {
         );
       }
       this.ownsLock = true;
-      activeProcessLocks.add(resolve(this.stateDir));
+      holdOwnedDirectory(this.stateDir);
     }
     try {
       const path = join(this.stateDir, 'config.json');
@@ -1379,7 +1349,7 @@ export class DealerNodeRuntime {
           }
           this.releaseLock(join(this.stateDir, 'runtime.lock'));
           this.ownsLock = false;
-          activeProcessLocks.delete(resolve(this.stateDir));
+          releaseOwnedDirectory(this.stateDir);
         }
         this.started = false;
       }
