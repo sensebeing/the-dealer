@@ -160,6 +160,46 @@ test('runtime stop leaves a lock that no longer records this process', async t =
   assert.equal(existsSync(join(lockDir, 'owner.json')), true, 'a foreign owner lock survives stop');
 });
 
+test('runtime start recovers a reclaim gate left by a dead reclaimer', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const lockDir = join(stateDir, 'runtime.lock');
+  const reclaimDir = `${lockDir}.reclaim`;
+  const seedOwner = (dir: string, pid: number) => {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, 'owner.json'), JSON.stringify({ pid }));
+  };
+  // A reclaimer killed between claiming the gate and releasing it leaves the dead
+  // lock and its gate behind; the next start must recover both.
+  seedOwner(lockDir, 999999);
+  seedOwner(reclaimDir, 999999);
+  const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await runtime.start();
+  assert.deepEqual(JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')), { pid: process.pid });
+  assert.equal(existsSync(reclaimDir), false, 'the dead reclaim gate is reclaimed');
+  await runtime.stop();
+  assert.equal(existsSync(lockDir), false, 'the reclaimed lock is released');
+
+  // A gate owned by a live process still blocks reclamation of a dead lock.
+  seedOwner(lockDir, 999999);
+  seedOwner(reclaimDir, process.pid);
+  const blocked = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await assert.rejects(blocked.start(), /State directory already owned/);
+  assert.equal(existsSync(join(reclaimDir, 'owner.json')), true, 'a live reclaim gate survives');
+  assert.equal(existsSync(join(lockDir, 'owner.json')), true, 'a blocked start leaves the lock untouched');
+  rmSync(lockDir, { recursive: true, force: true });
+  rmSync(reclaimDir, { recursive: true, force: true });
+
+  // A dead gate left with no lock is cleaned on the fast path instead of blocking
+  // every later reclamation.
+  seedOwner(reclaimDir, 999999);
+  const fast = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await fast.start();
+  assert.equal(existsSync(reclaimDir), false, 'a dead reclaim gate is removed on the fast path');
+  await fast.stop();
+  assert.equal(existsSync(lockDir), false, 'the fast-path lock is released');
+});
+
 test('project link mounts its onboarding network once and preserves an existing mount', async t => {
   const root = directory(t);
   mkdirSync(join(root, '.dealer'));
