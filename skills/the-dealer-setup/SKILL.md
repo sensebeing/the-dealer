@@ -63,6 +63,31 @@ or **join/create a teammate network**. Reuse prior answers.
 - Create: choose networkId and generate a strong secret; mount with
   `dealer network mount <id> --passphrase <secret> --gate approval_required --json`.
 
+When the team's machines share neither one LAN nor full Tailscale coverage,
+configure a self-hosted headless relay yourself instead of asking or leaving
+peers unreachable. Start one always-on node on a host every member can reach:
+
+```sh
+dealer node up --profile headless-relay --member <relay-member> --name <relay-node> --json
+dealer node status --json
+```
+
+Read `endpoint` from the status output and record it as the project seed so every
+member inherits it automatically:
+
+```sh
+dealer project init --root <repo> --id <id> --network <networkId> --bootstrap-peers <relay-host:port> --json
+```
+
+For an existing manifest, add `bootstrapPeers: ["<relay-host:port>"]` under
+`onboarding` in `.dealer/project.json`; `dealer project link` then mounts the
+network with those seeds. Nodes gossip sealed discovery beacons through the
+relay and it forwards frames and attachments whenever direct TCP to an
+advertised endpoint fails; it never reads message payloads. Use
+`dealer node up --advertised-host <host>` or `DEALER_ADVERTISED_HOST` when the
+relay must advertise a fixed address instead of its detected LAN IP. Also
+consider a relay when a teammate's machine is only intermittently reachable.
+
 Keep shared secrets out of logs and source control. An invite contains the
 passphrase; its expiry limits importing, not continued network access.
 
@@ -106,8 +131,12 @@ dealer setup invite-prompt --network <id> --member <self> --name <other-node> --
 With no explicit or configured seeds, invite generation uses the running daemon's
 advertised TCP endpoint, or the primary LAN IPv4 plus a configured offline port.
 Loopback endpoints are not auto-shared. Use `--seed <reachable-host:port>` when a
-VPN/routed address is needed; TCP seeds require reachability and do not bypass
-NAT or firewalls. UDP multicast is not required between seed-connected peers.
+VPN/routed address or a headless-relay seed is needed; a linked project's
+`onboarding.bootstrapPeers` are reused automatically. TCP seeds require
+reachability and do not bypass NAT or firewalls, but a seed also relays frames
+and attachments when the machines cannot reach each other directly, so one
+relay endpoint is enough for machines on unrelated networks. UDP multicast is
+not required between seed-connected peers.
 
 Give `crossMachinePrompt` to the other machine's Agent. See
 [onboarding-prompts](references/onboarding-prompts.md). Verify peer discovery

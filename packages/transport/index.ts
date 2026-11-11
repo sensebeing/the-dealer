@@ -148,6 +148,12 @@ export function blake3(bytes: Uint8Array): string {
 
 const MAX_FRAME = 8 * 1024 * 1024;
 const GROUP = '239.255.42.99';
+// A relay candidate means the advertised endpoint may be NAT-bound; fail over fast
+// instead of waiting the full request timeout on every unicast.
+const RELAY_CONNECT_TIMEOUT_MS = 1_500;
+const BEACON_EXPIRY_GRACE_MS = 30_000;
+// Relay responses carry base64 JSON; keep one oversized blob from wedging the tunnel.
+const RELAY_BLOB_LIMIT = MAX_FRAME - 4096;
 const PRIVATE_IPV4 = /^(100\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/;
 const TAILSCALE_COMMANDS = ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale'];
 const TAILSCALE_CACHE_MS = 30_000;
@@ -310,10 +316,29 @@ export interface TransportPluginOptions {
   tailscalePeers?: () => Promise<readonly string[]> | readonly string[];
 }
 
+interface RelayPending {
+  resolve: (message: any) => void;
+  reject: (error: Error) => void;
+}
+
+/** A live tunnel socket and the relay requests waiting for its owner's replies. */
+interface Tunnel {
+  socket: Socket;
+  pending: Map<string, RelayPending>;
+}
+
 interface Mount {
   config: NetworkMountConfig;
   keys: DerivedNetworkKeys;
   peers: Map<string, string>;
+  /** Latest valid sealed discovery beacon per sender, including this node; gossiped to seeds. */
+  beacons: Map<string, SealedNetworkFrame>;
+  /** Peer node -> seed endpoint that introduced or can relay to that peer. */
+  relays: Map<string, string>;
+  /** Tunnels peers opened towards this node, keyed by peer node, so relays can push back. */
+  inboundTunnels: Map<string, Tunnel>;
+  /** Persistent tunnels this node keeps open towards its seeds, keyed by seed endpoint. */
+  outboundTunnels: Map<string, Socket>;
   file: string;
   lastSeedProbeAt: number;
 }
@@ -494,6 +519,10 @@ export class P2PTransportService implements TransportService {
       config: structuredClone(config),
       keys,
       peers: new Map<string, string>(),
+      beacons: new Map<string, SealedNetworkFrame>(),
+      relays: new Map<string, string>(),
+      inboundTunnels: new Map<string, Tunnel>(),
+      outboundTunnels: new Map<string, Socket>(),
       file,
       lastSeedProbeAt: Number.NEGATIVE_INFINITY,
     };
@@ -541,6 +570,17 @@ export class P2PTransportService implements TransportService {
       return;
     }
     this.mounts.delete(networkId);
+    // A stale mount must not keep serving relay deliveries after it is unmounted.
+    for (const socket of m.outboundTunnels.values()) {
+      socket.destroy();
+    }
+    for (const tunnel of m.inboundTunnels.values()) {
+      tunnel.socket.destroy();
+    }
+    m.outboundTunnels.clear();
+    m.inboundTunnels.clear();
+    m.beacons.clear();
+    m.relays.clear();
     await this.tick;
     await rm(m.file, { force: true });
     await this.notifyMount();
@@ -579,6 +619,7 @@ export class P2PTransportService implements TransportService {
   private learnWithMeta(
     frame: SealedNetworkFrame,
     remoteHost?: string,
+    viaSeed?: string,
   ): { mount?: Mount; reply: boolean } {
     const m = [...this.mounts.values()].find(m => m.keys.swarmTopicId === frame.swarmTopicId);
     if (!m) {
@@ -602,6 +643,15 @@ export class P2PTransportService implements TransportService {
       frame.senderNodeId,
       this.reachableEndpoint(beacon.endpointAddr, remoteHost),
     );
+    if (frame.senderNodeId !== this.localNodeId) {
+      // Sealed discovery frames are the only beacon form a seed can gossip without
+      // being able to forge endpoints; keep the freshest one per sender.
+      m.beacons.set(frame.senderNodeId, frame);
+      if (viaSeed !== undefined) {
+        // Remember who can relay to this peer when its advertised endpoint is unreachable.
+        m.relays.set(frame.senderNodeId, viaSeed);
+      }
+    }
     return { mount: m, reply: beacon.reply === true };
   }
 
@@ -645,6 +695,8 @@ export class P2PTransportService implements TransportService {
 
   private async announce(m: Mount): Promise<void> {
     const frame = this.discoveryFrame(m);
+    m.beacons.set(this.localNodeId, frame);
+    this.pruneBeacons(m);
     const bytes = Buffer.from(JSON.stringify(frame));
     const port = m.config.mDnsPort ?? this.options.mDnsPort ?? 45873;
     const temp = `${m.file}.${randomUUID()}`;
@@ -685,13 +737,30 @@ export class P2PTransportService implements TransportService {
       }
     }
     await Promise.allSettled((m.config.bootstrapPeers ?? []).filter(seed => seed !== this.endpointAddr).map(async seed => {
+      // The persistent tunnel lets the seed push relayed requests back; the probe
+      // below exchanges sealed beacons so isolated peers can discover each other.
+      this.ensureOutboundTunnel(m, seed);
       const socket = this.track(createConnection(parseEndpoint(seed)));
       socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
       try {
-        socket.write(packet({ type: 'discovery', frame }));
+        socket.write(packet({ type: 'discovery', frame, peers: [...m.beacons.values()] }));
         const response = await new SocketReader(socket).json();
-        if (response.frame?.swarmTopicId !== m.keys.swarmTopicId || !this.learn(response.frame)) {
+        if (response.frame?.swarmTopicId !== m.keys.swarmTopicId) {
           throw new Error('Invalid discovery response');
+        }
+        const seedHost = parseEndpoint(seed).host;
+        if (!this.learnWithMeta(response.frame, seedHost).mount) {
+          throw new Error('Invalid discovery response');
+        }
+        m.relays.set(response.frame.senderNodeId, seed);
+        for (const peerFrame of Array.isArray(response.peers) ? response.peers : []) {
+          try {
+            // Gossiped beacons were not reached directly, so keep the advertised
+            // endpoint and remember the seed that can relay to their sender.
+            this.learnWithMeta(peerFrame, undefined, seed);
+          } catch {
+            // One unreadable gossiped frame must not fail the whole probe.
+          }
         }
       } finally {
         socket.destroy();
@@ -762,14 +831,105 @@ export class P2PTransportService implements TransportService {
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
   ): Promise<Uint8Array> {
     const address = m.peers.get(target);
-    if (!address) {
+    const relays = this.relayCandidates(m, target);
+    if (address) {
+      try {
+        return await this.directExchange(
+          m,
+          target,
+          address,
+          frame,
+          relays.length ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs,
+        );
+      } catch (error) {
+        if (!relays.length) {
+          throw error;
+        }
+      }
+    } else if (!relays.length) {
       throw new Error(`Unknown peer: ${target}`);
     }
+    let lastError: Error = new Error(`Unknown peer: ${target}`);
+    for (const seed of relays) {
+      try {
+        return await this.relayExchange(m, seed, target, frame, timeoutMs);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    throw lastError;
+  }
+
+  /** Seeds that may forward to this target: its introducing seed first, then configured seeds. */
+  private relayCandidates(m: Mount, target: string): string[] {
+    const seeds = [m.relays.get(target), ...(m.config.bootstrapPeers ?? [])]
+      .filter((seed): seed is string => typeof seed === 'string' && seed.length > 0 && seed !== this.endpointAddr);
+    return [...new Set(seeds)];
+  }
+
+  private endpointFor(m: Mount, nodeId: string): string {
+    const address = m.peers.get(nodeId);
+    if (!address) {
+      throw new Error('Relay target unreachable');
+    }
+    return address;
+  }
+
+  private async directFrame(
+    m: Mount,
+    target: string,
+    address: string,
+    frame: SealedNetworkFrame,
+    timeoutMs: number,
+  ): Promise<SealedNetworkFrame> {
     const socket = this.track(createConnection(parseEndpoint(address)));
     socket.setTimeout(timeoutMs);
     try {
       socket.write(packet({ type: 'frame', frame }));
       const response = await new SocketReader(socket).json();
+      if (response?.frame?.senderNodeId !== target) {
+        throw new Error('Response binding mismatch');
+      }
+      return response.frame;
+    } finally {
+      socket.destroy();
+    }
+  }
+
+  private async directExchange(
+    m: Mount,
+    target: string,
+    address: string,
+    frame: SealedNetworkFrame,
+    timeoutMs: number,
+  ): Promise<Uint8Array> {
+    const responseFrame = await this.directFrame(m, target, address, frame, timeoutMs);
+    const payload = unsealNetworkFrame<{
+      requestNonce: string;
+      dataBase64: string;
+    }>(responseFrame, m.keys);
+    if (payload.requestNonce !== frame.nonce) {
+      throw new Error('Response binding mismatch');
+    }
+    return Buffer.from(payload.dataBase64, 'base64');
+  }
+
+  /** Blind forward: the seed never reads the payload, only authenticates the sealed frame. */
+  private async relayExchange(
+    m: Mount,
+    seed: string,
+    target: string,
+    frame: SealedNetworkFrame,
+    timeoutMs: number,
+  ): Promise<Uint8Array> {
+    const socket = this.track(createConnection(parseEndpoint(seed)));
+    socket.setTimeout(timeoutMs);
+    try {
+      socket.write(packet({ type: 'relay', target, frame }));
+      const response = await new SocketReader(socket).json();
+      if (response?.error) {
+        throw new Error(String(response.error));
+      }
       const payload = unsealNetworkFrame<{
         requestNonce: string;
         dataBase64: string;
@@ -870,12 +1030,266 @@ export class P2PTransportService implements TransportService {
     await Promise.allSettled([...m.peers.keys()].map(target => this.exchange(m, target, frame)));
   }
 
+  /** Drop beacons whose discovery frame expired beyond the gossip grace window. */
+  private pruneBeacons(m: Mount): void {
+    const cutoff = Date.now() - BEACON_EXPIRY_GRACE_MS;
+    for (const [nodeId, frame] of m.beacons) {
+      let expires: unknown;
+      try {
+        expires = unsealNetworkFrame<{ expires?: unknown }>(frame, m.keys).expires;
+      } catch {
+        expires = undefined;
+      }
+      if (typeof expires !== 'number' || expires < cutoff) {
+        m.beacons.delete(nodeId);
+      }
+    }
+  }
+
+  /**
+   * Keep one persistent tunnel per seed. It carries no requests of its own; the
+   * seed uses it to push relayed frames back through the seed's address, which
+   * stays reachable even when this node advertises a NAT-bound endpoint.
+   */
+  private ensureOutboundTunnel(m: Mount, seed: string): void {
+    const existing = m.outboundTunnels.get(seed);
+    if (existing && !existing.destroyed) {
+      return;
+    }
+    const socket = this.track(createConnection(parseEndpoint(seed)));
+    m.outboundTunnels.set(seed, socket);
+    // A persistent tunnel must outlive the idle window that bounds one-shot requests.
+    socket.setTimeout(0);
+    socket.setKeepAlive(true, 15_000);
+    socket.once('close', () => {
+      if (m.outboundTunnels.get(seed) === socket) {
+        m.outboundTunnels.delete(seed);
+      }
+    });
+    socket.write(packet({ type: 'tunnel', frame: this.discoveryFrame(m) }));
+    void this.serveOutboundTunnel(m, socket).catch(() => socket.destroy());
+  }
+
+  private async serveOutboundTunnel(m: Mount, socket: Socket): Promise<void> {
+    const reader = new SocketReader(socket);
+    while (!socket.destroyed) {
+      const message = await reader.json();
+      if (message?.type === 'relay_deliver' && typeof message.relayId === 'string' && message.frame) {
+        try {
+          const event = this.inboundEvent(m, message.frame);
+          const reply = await this.inboundReply(event);
+          socket.write(packet({
+            type: 'relay_reply',
+            relayId: message.relayId,
+            frame: sealNetworkFrame(
+              {
+                requestNonce: message.frame.nonce,
+                dataBase64: Buffer.from(reply).toString('base64'),
+              },
+              m.keys,
+              this.localNodeId,
+            ),
+          }));
+        } catch (error) {
+          socket.write(packet({
+            type: 'relay_reply',
+            relayId: message.relayId,
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        }
+        continue;
+      }
+      if (message?.type === 'relay_blob_req' && typeof message.relayId === 'string') {
+        const blob = typeof message.hash === 'string' ? this.blobs.get(message.hash) : undefined;
+        if (!blob || blob.size > RELAY_BLOB_LIMIT) {
+          socket.write(packet({ type: 'relay_blob_res', relayId: message.relayId, error: 'Unavailable' }));
+          continue;
+        }
+        try {
+          const bytes = await readFile(blob.path);
+          socket.write(packet({
+            type: 'relay_blob_res',
+            relayId: message.relayId,
+            size: blob.size,
+            dataBase64: bytes.toString('base64'),
+          }));
+        } catch {
+          socket.write(packet({ type: 'relay_blob_res', relayId: message.relayId, error: 'Unavailable' }));
+        }
+      }
+    }
+  }
+
+  /** Register a peer's persistent tunnel and resolve its relay replies until it closes. */
+  private async serveInboundTunnel(socket: Socket, frame: SealedNetworkFrame): Promise<void> {
+    const mount = this.learn(frame, socket.remoteAddress);
+    if (!mount) {
+      throw new Error('Invalid tunnel request');
+    }
+    // A persistent tunnel must outlive the idle window that bounds one-shot requests.
+    socket.setTimeout(0);
+    const peerNodeId = frame.senderNodeId;
+    const tunnel: Tunnel = { socket, pending: new Map() };
+    const previous = mount.inboundTunnels.get(peerNodeId);
+    mount.inboundTunnels.set(peerNodeId, tunnel);
+    if (previous && previous.socket !== socket) {
+      previous.socket.destroy();
+    }
+    socket.once('close', () => {
+      if (mount.inboundTunnels.get(peerNodeId) === tunnel) {
+        mount.inboundTunnels.delete(peerNodeId);
+      }
+      for (const entry of tunnel.pending.values()) {
+        entry.reject(new Error('Relay tunnel closed'));
+      }
+      tunnel.pending.clear();
+    });
+    try {
+      const reader = new SocketReader(socket);
+      while (true) {
+        const message = await reader.json();
+        if (message?.type === 'relay_reply' || message?.type === 'relay_blob_res') {
+          tunnel.pending.get(String(message.relayId))?.resolve(message);
+        }
+      }
+    } catch {
+      // The peer closed the tunnel; its close handler owns cleanup.
+    }
+  }
+
+  /** Send one request down a peer's tunnel; the requester's socket closing aborts it. */
+  private requestOverTunnel(
+    tunnel: Tunnel,
+    body: Record<string, unknown>,
+    requestSocket: Socket,
+  ): Promise<any> {
+    const relayId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const finish = (error?: Error, message?: any) => {
+        tunnel.pending.delete(relayId);
+        requestSocket.off('close', abort);
+        tunnel.socket.off('close', abort);
+        if (error) reject(error); else resolve(message);
+      };
+      const abort = () => finish(new Error('Relay tunnel closed'));
+      tunnel.pending.set(relayId, {
+        resolve: message => finish(undefined, message),
+        reject: error => finish(error),
+      });
+      requestSocket.once('close', abort);
+      tunnel.socket.once('close', abort);
+      try {
+        tunnel.socket.write(packet({ ...body, relayId }));
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  private async blobOverTunnel(tunnel: Tunnel, hash: string, requestSocket: Socket): Promise<Buffer> {
+    const response = await this.requestOverTunnel(tunnel, { type: 'relay_blob_req', hash }, requestSocket);
+    if (response?.error) {
+      throw new Error(String(response.error));
+    }
+    if (typeof response?.size !== 'number' || response.size > RELAY_BLOB_LIMIT ||
+        typeof response.dataBase64 !== 'string') {
+      throw new Error('Invalid relay blob response');
+    }
+    const bytes = Buffer.from(response.dataBase64, 'base64');
+    if (bytes.length !== response.size) {
+      throw new Error('Relay blob size mismatch');
+    }
+    return bytes;
+  }
+
+  private async readBlobAt(address: string, hash: string): Promise<Buffer> {
+    const socket = this.track(createConnection(parseEndpoint(address)));
+    socket.setTimeout(this.options.socketTimeoutMs ?? 90_000);
+    const reader = new SocketReader(socket);
+    try {
+      socket.write(packet({ type: 'blob', hash }));
+      const metadata = await reader.json();
+      if (typeof metadata?.size !== 'number' || metadata.size > RELAY_BLOB_LIMIT) {
+        throw new Error('Relay blob unavailable');
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      for await (const chunk of reader.remaining()) {
+        received += chunk.length;
+        if (received > metadata.size) {
+          throw new Error('Blob size exceeded');
+        }
+        chunks.push(chunk);
+      }
+      if (received !== metadata.size) {
+        throw new Error('Blob size mismatch');
+      }
+      return Buffer.concat(chunks);
+    } finally {
+      socket.destroy();
+    }
+  }
+
   private async receive(socket: Socket): Promise<void> {
     const request = await new SocketReader(socket).json();
     if (request.type === 'discovery') {
       const mount = this.learn(request.frame, socket.remoteAddress);
       if (!mount) throw new Error('Invalid discovery request');
-      socket.end(packet({ frame: this.discoveryFrame(mount) }));
+      for (const peerFrame of Array.isArray(request.peers) ? request.peers : []) {
+        try {
+          this.learnWithMeta(peerFrame, undefined);
+        } catch {
+          // One unreadable gossiped frame must not fail the reply.
+        }
+      }
+      socket.end(packet({ frame: this.discoveryFrame(mount), peers: [...mount.beacons.values()] }));
+      return;
+    }
+    if (request.type === 'tunnel') {
+      await this.serveInboundTunnel(socket, request.frame);
+      return;
+    }
+    if (request.type === 'relay') {
+      const frame: SealedNetworkFrame = request.frame;
+      const mount = [...this.mounts.values()].find(
+        m => m.keys.swarmTopicId === frame?.swarmTopicId,
+      );
+      if (!mount) throw new Error('Unknown swarm');
+      unsealNetworkFrame(frame, mount.keys);
+      const target = typeof request.target === 'string' ? request.target : '';
+      if (!target) throw new Error('Invalid relay target');
+      const tunnel = mount.inboundTunnels.get(target);
+      let replyFrame: SealedNetworkFrame;
+      if (tunnel) {
+        const reply = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, socket);
+        if (reply?.error) throw new Error(String(reply.error));
+        replyFrame = reply.frame;
+      } else {
+        replyFrame = await this.directFrame(
+          mount,
+          target,
+          this.endpointFor(mount, target),
+          frame,
+          this.options.socketTimeoutMs ?? 90_000,
+        );
+      }
+      socket.end(packet({ frame: replyFrame }));
+      return;
+    }
+    if (request.type === 'relay_blob') {
+      const mount = [...this.mounts.values()].find(
+        m => m.keys.swarmTopicId === request.swarmTopicId,
+      );
+      if (!mount) throw new Error('Unknown swarm');
+      const target = typeof request.target === 'string' ? request.target : '';
+      const hash = typeof request.hash === 'string' ? request.hash : '';
+      if (!target || !/^[a-f0-9]{64}$/.test(hash)) throw new Error('Invalid relay blob request');
+      const tunnel = mount.inboundTunnels.get(target);
+      const bytes = tunnel
+        ? await this.blobOverTunnel(tunnel, hash, socket)
+        : await this.readBlobAt(this.endpointFor(mount, target), hash);
+      socket.write(packet({ size: bytes.length }));
+      socket.end(bytes);
       return;
     }
     if (request.type === 'blob') {
@@ -1014,25 +1428,107 @@ export class P2PTransportService implements TransportService {
     } catch {
       throw new Error('Invalid blob ticket');
     }
-    const address = nodeId === this.localNodeId ? this.endpointAddr : url.host;
+    const owner = [...this.mounts.values()].find(mount => mount.peers.has(nodeId));
+    const address = nodeId === this.localNodeId ? this.endpointAddr : owner?.peers.get(nodeId) ?? url.host;
     if (!address) {
       throw new Error('Transport endpoint unavailable');
     }
+    const relay = nodeId === this.localNodeId ? undefined : this.relayMountFor(nodeId);
+    try {
+      try {
+        await this.fetchBlobDirect(address, hash, size, temp, relay !== undefined);
+      } catch (error) {
+        if (!relay) {
+          throw error;
+        }
+        // The advertised endpoint is NAT-bound; fetch through the seed that
+        // already keeps a tunnel towards the sender.
+        await rm(temp, { force: true });
+        await this.fetchBlobRelay(relay, nodeId, hash, size, temp);
+      }
+      await rename(temp, destPath);
+    } finally {
+      await rm(temp, { force: true });
+    }
+  }
+
+  private relayMountFor(nodeId: string): { mount: Mount; seed: string } | undefined {
+    for (const mount of this.mounts.values()) {
+      const seed = mount.relays.get(nodeId);
+      if (seed && seed !== this.endpointAddr) {
+        return { mount, seed };
+      }
+    }
+    return undefined;
+  }
+
+  private async fetchBlobDirect(
+    address: string,
+    hash: string,
+    size: number,
+    temp: string,
+    fastFail: boolean,
+  ): Promise<void> {
     const socket = this.track(createConnection(parseEndpoint(address)));
+    const timeoutMs = this.options.socketTimeoutMs ?? 90_000;
+    socket.setTimeout(fastFail ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs);
     const reader = new SocketReader(socket);
-    const output = createWriteStream(temp, { flags: 'wx', mode: 0o600 });
-    // Keep stream errors handled during network reads; writes observe them below.
-    let outputError: Error | undefined;
-    output.on('error', error => {
-      outputError = error;
-      socket.destroy(error);
-    });
     try {
       socket.write(packet({ type: 'blob', hash }));
       const metadata = await reader.json();
       if (metadata.size !== size) {
         throw new Error('Blob size mismatch');
       }
+      await this.writeBlob(reader, size, hash, temp, error => socket.destroy(error));
+    } finally {
+      socket.destroy();
+    }
+  }
+
+  private async fetchBlobRelay(
+    relay: { mount: Mount; seed: string },
+    nodeId: string,
+    hash: string,
+    size: number,
+    temp: string,
+  ): Promise<void> {
+    const socket = this.track(createConnection(parseEndpoint(relay.seed)));
+    const reader = new SocketReader(socket);
+    try {
+      socket.write(packet({
+        type: 'relay_blob',
+        swarmTopicId: relay.mount.keys.swarmTopicId,
+        target: nodeId,
+        hash,
+      }));
+      const metadata = await reader.json();
+      if (metadata?.error) {
+        throw new Error(String(metadata.error));
+      }
+      if (metadata?.size !== size) {
+        throw new Error('Blob size mismatch');
+      }
+      await this.writeBlob(reader, size, hash, temp, error => socket.destroy(error));
+    } finally {
+      socket.destroy();
+    }
+  }
+
+  private async writeBlob(
+    reader: SocketReader,
+    size: number,
+    hash: string,
+    temp: string,
+    abort: (error: Error) => void,
+  ): Promise<void> {
+    const output = createWriteStream(temp, { flags: 'wx', mode: 0o600 });
+    // Keep stream errors handled during network reads; writes observe them below.
+    let outputError: Error | undefined;
+    output.on('error', error => {
+      outputError = error;
+      abort(error);
+    });
+    try {
       const digest = new Blake3Hasher();
       let received = 0;
       for await (const chunk of reader.remaining()) {
@@ -1056,14 +1552,11 @@ export class P2PTransportService implements TransportService {
       if (outputError) {
         throw outputError;
       }
-      await rename(temp, destPath);
     } finally {
-      socket.destroy();
       output.destroy();
       if (!output.closed) {
         await once(output, 'close').catch(() => {});
       }
-      await rm(temp, { force: true });
     }
   }
 

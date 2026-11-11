@@ -78,6 +78,25 @@ Start with the agents already running on your laptop, then add machines or teamm
 | Personal multi-machine mesh | `dealer network mount` and `dealer network invite` | Encrypted P2P messaging between a MacBook and a Studio or Linux workstation, each with its own Ed25519 key (`member@node`). |
 | Team collaboration and source dispatch | Shared network with `approval_required` admission | Route tasks by member or advertised skill, connect source plugins, and redrive durable waves across restarts. |
 
+### Cross-machine connectivity modes
+
+Peers on one network segment discover each other over encrypted UDP beacons on
+multicast group `239.255.42.99:45873` (plus subnet broadcast). When machines are
+not on one LAN, pick one of these modes:
+
+| Mode | How peers connect | Setup |
+| --- | --- | --- |
+| Same LAN (UDP 45873) | UDP multicast and subnet broadcast carry sealed discovery beacons; TCP carries frames. | Nothing to configure; keep `multicast` on. |
+| Tailscale (UDP 45873) | Each node unicasts discovery to every online `tailscale status` peer on UDP 45873 and dials the routed `100.64.0.0/10` address over TCP. | Run Tailscale on every machine; no seed is required. |
+| Self-hosted headless relay | One always-on node runs `dealer node up --profile headless-relay`. Isolated peers exchange sealed beacons through it, learn which seed can reach each peer, and relay frames and attachments through that seed when direct TCP is impossible. | Give every member the relay endpoint: `dealer project init --bootstrap-peers host:port` writes `onboarding.bootstrapPeers`, or pass `--seed host:port` to `dealer network mount`. |
+
+Relay nodes are blind forwarders: discovery beacons and frames remain sealed with
+the network key, and a seed only verifies that a frame belongs to a network it has
+mounted before delivering it. Each node keeps one persistent tunnel per seed so the
+seed can push relayed requests back through NAT. Use
+`dealer node up --advertised-host <host>` (or `DEALER_ADVERTISED_HOST`) when a
+machine must advertise a specific routable address instead of its detected LAN IP.
+
 ## Architecture and real-time session delivery
 
 ```mermaid
@@ -173,7 +192,9 @@ See [the-dealer-extend](skills/the-dealer-extend/SKILL.md) and the [plugin guide
 | --- | --- |
 | `dealer setup probe --json` | Detect installed agent CLIs and inspect redacted node configuration. |
 | `dealer node up --profile orca-dev --json` / `dealer node status --json` | Start `dealerd` or inspect daemon status. |
+| `dealer node up --advertised-host <host> --json` | Advertise a specific routable host (or set `DEALER_ADVERTISED_HOST`). |
 | `dealer network mount <id> --passphrase '<secret>' --gate approval_required --json` | Mount a network with a shared secret. |
+| `dealer project init --root <repo> --bootstrap-peers <host:port,host:port> --json` | Scaffold a project that publishes self-hosted relay seeds in `onboarding.bootstrapPeers`. |
 | `dealer network invite <id> --ttl 1h --json` | Generate a `dealer-net://v1/...` network invitation URI. |
 | `dealer network mount '<invite>' --json` / `dealer network unmount <id> --json` | Join or detach from a mounted network. |
 | `dealer peers list --network <id> --json` | List discovered peers in a network. |

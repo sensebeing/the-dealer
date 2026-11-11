@@ -197,9 +197,23 @@ export function readProjectManifest(projectRoot: string): DealerProjectManifest 
 
 export function initProjectScaffold(
   projectRoot: string,
-  opts: { projectId: string; defaultNetworkId: string; description?: string; skills?: string[] },
+  opts: {
+    projectId: string;
+    defaultNetworkId: string;
+    description?: string;
+    skills?: string[];
+    /** Seed endpoints published in the manifest so every member joins through them. */
+    bootstrapPeers?: string[];
+  },
 ): DealerProjectManifest {
-  const manifest: DealerProjectManifest = { ...opts, schema: 'the-dealer-project/v1' };
+  const manifest: DealerProjectManifest = {
+    schema: 'the-dealer-project/v1',
+    projectId: opts.projectId,
+    defaultNetworkId: opts.defaultNetworkId,
+    ...(opts.description !== undefined ? { description: opts.description } : {}),
+    ...(opts.skills !== undefined ? { skills: opts.skills } : {}),
+    ...(opts.bootstrapPeers?.length ? { onboarding: { bootstrapPeers: opts.bootstrapPeers } } : {}),
+  };
   validateManifest(manifest);
   mkdirSync(join(projectRoot, '.dealer', 'plugins'), { recursive: true });
   writeFileSync(join(projectRoot, '.dealer', 'project.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });

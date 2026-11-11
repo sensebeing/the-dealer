@@ -61,6 +61,27 @@ dealer peers list --network sensebeing --json
 dealer send --network sensebeing --to member:bob --topic collab.request.v1 --body '{"summary":"Review the release"}' --json
 ```
 
+Pick the connectivity mode before mounting:
+
+- **Same LAN** — UDP multicast and subnet broadcast on port 45873 discover peers
+  automatically. Nothing else is needed.
+- **Tailscale** — each node unicasts encrypted discovery beacons to every online
+  `tailscale status` peer on UDP 45873 and dials the routed `100.64.0.0/10`
+  address. Nothing else is needed once Tailscale runs on both machines.
+- **Self-hosted headless relay** — when machines share neither a LAN nor full
+  Tailscale coverage, run one always-on node with
+  `dealer node up --profile headless-relay --json` and publish its endpoint as a
+  seed: `dealer project init --root . --bootstrap-peers relay-host:port --json`
+  writes `onboarding.bootstrapPeers` for every linked member, or add
+  `--seed relay-host:port` to `dealer network mount`. Nodes gossip sealed
+  discovery beacons through the seed and relay frames and attachments through it
+  whenever direct TCP to the advertised endpoint fails. Relay nodes never read
+  message payloads; frames stay sealed with the network key.
+
+Use `dealer node up --advertised-host <host> --json` (or set
+`DEALER_ADVERTISED_HOST` for `dealerd`) when a machine must advertise a specific
+routable address instead of the detected LAN IP.
+
 ## Inspect and connect
 
 ```sh
@@ -81,11 +102,14 @@ prevents two processes from controlling one stateDir. Following a crash,
 verify the PID in `runtime.lock/owner.json` has stopped before removing that
 lock and restarting. Never remove a live node's lock.
 
-Use `--seed host:port,host:port` for explicit bootstrap endpoints. Network
-mounts can include `--gate approval_required` and a descriptive `--role`;
-role is local metadata, not an authorization grant. Wait for peer discovery
-before resolving a newly connected member. Current transport uses encrypted
-TCP plus local discovery; this is not a claim of production QUIC/NAT traversal.
+Use `--seed host:port,host:port` for explicit bootstrap endpoints. A seed also
+relays frames and attachments when a peer's advertised endpoint is unreachable,
+so one reachable `headless-relay` node connects machines that share no LAN.
+Network mounts can include `--gate approval_required` and a descriptive
+`--role`; role is local metadata, not an authorization grant. Wait for peer
+discovery before resolving a newly connected member. Current transport uses
+encrypted TCP plus local discovery and sealed relay fallback; this is not a
+claim of production QUIC/NAT traversal.
 
 `dealer network invite sensebeing --ttl 1h --json` returns a
 `dealer-net://v1/...` URI. Mount the quoted URI as the network argument. It
@@ -169,6 +193,7 @@ personal configuration/modules. Only load trusted local code.
 
 ```sh
 dealer project init --root ./project --id project --network team --skills triage --json
+dealer project init --root ./project --id project --network team --bootstrap-peers relay-host:45874 --json
 dealer project link ./project --json
 dealer project list --json
 dealer project status --project project --json
@@ -178,7 +203,9 @@ dealer plugin add --name personal-hook --module plugins/personal-hook.ts --confi
 
 `init` creates `.dealer/project.json` and `.dealer/plugins/`, refusing overwrite.
 Without flags it uses the current directory, its basename as project ID, and
-that ID as default network. Put project TypeScript/ESM plugins in
+that ID as default network. `--bootstrap-peers host:port,...` writes
+`onboarding.bootstrapPeers`, so every machine that links the project mounts the
+network with those relay seeds. Put project TypeScript/ESM plugins in
 `.dealer/plugins/*.ts` and list their root-relative paths in manifest `plugins`.
 `link` defaults to the caller's current directory. It loads modules immediately
 and persists the link for restart; it does not mount the default network.

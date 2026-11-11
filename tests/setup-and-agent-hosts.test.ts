@@ -14,6 +14,7 @@ import { createSocket } from 'node:dgram';
 import { createServer } from 'node:net';
 import { P2PTransportService, defaultAdvertisedHost, isTailscaleIpv4Host } from '../packages/transport/index.ts';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli,
   decodeNetworkInvite, DealerNodeRuntime, MailboxStore, createAgentPtyExecutorPlugin,
@@ -837,6 +838,52 @@ test('advertised host prefers overrides, explicit listeners, then the primary LA
   assert.equal(defaultAdvertisedHost({ listenHost: '127.0.0.1', advertisedHost: 'reachable.example' }), 'reachable.example');
 });
 
+test('project init publishes relay seeds and node startup advertises the override host', { timeout: 15_000 }, async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const projectRoot = join(root, 'project');
+  const manifest = await cli(['project', 'init', '--root', projectRoot, '--id', 'team', '--network', 'team',
+    '--bootstrap-peers', 'relay.example:45874, other.example:45874'], stateDir);
+  assert.deepEqual(manifest.onboarding?.bootstrapPeers, ['relay.example:45874', 'other.example:45874']);
+  assert.deepEqual(readProjectManifest(projectRoot).onboarding?.bootstrapPeers, ['relay.example:45874', 'other.example:45874']);
+  assert.equal((await cli(['project', 'init', '--root', join(root, 'plain'), '--id', 'plain'], stateDir)).onboarding, undefined);
+
+  process.env.DEALER_ADVERTISED_HOST = '198.51.100.9';
+  try {
+    const runtime = await new DealerNodeRuntime({
+      stateDir: join(root, 'env-state'),
+      transport: { discoveryDir: join(root, 'env-mesh'), multicast: false },
+    }).start();
+    t.after(() => runtime.stop());
+    await runtime.transport.mountNetwork({ networkId: 'team', passphrase: 'shared' });
+    assert.ok(String(runtime.status().endpoint).startsWith('198.51.100.9:'));
+  } finally {
+    delete process.env.DEALER_ADVERTISED_HOST;
+  }
+
+  const daemonState = join(root, 'daemon');
+  mkdirSync(daemonState, { recursive: true });
+  writeFileSync(join(daemonState, 'config.json'), JSON.stringify({ networks: [{ networkId: 'team', passphrase: 'shared' }] }));
+  const daemon = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types',
+    fileURLToPath(new URL('../bin/dealerd.js', import.meta.url)),
+    '--profile', 'headless-relay', '--member', 'relay', '--advertised-host', '192.0.2.7',
+  ], { env: { ...process.env, DEALER_STATE_DIR: daemonState }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = once(daemon, 'exit');
+  const lines = createInterface({ input: daemon.stdout });
+  let errors = '';
+  daemon.stderr.on('data', chunk => { errors += chunk; });
+  t.after(async () => {
+    daemon.kill('SIGTERM');
+    await exited;
+    lines.close();
+  });
+  const ready = await Promise.race([
+    once(lines, 'line').then(([line]) => JSON.parse(line)),
+    exited.then(() => { throw new Error(`Daemon exited before ready: ${errors}`); }),
+  ]);
+  assert.ok(String(ready.endpoint).startsWith('192.0.2.7:'), String(ready.endpoint));
+});
+
 test('invite auto-seeds from live daemon endpoint, preserves explicit seeds and excludes loopback', async t => {
   const root = directory(t);
   const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'),
@@ -902,25 +949,32 @@ test('TCP seed probes are bounded across 50ms ticks for discovered and unavailab
   peer['track'] = attempts;
   let connections = 0;
   seed['server']!.on('connection', () => { connections++; });
+  // Tunnels are fire-and-forget, so the server's accept may land after the awaited probe.
+  const settledConnections = async (expected: number) => {
+    for (let i = 0; i < 200 && connections < expected; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    return connections;
+  };
   t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   // The same seed with a foreign key remains undiscovered, exercising failed probes too.
   await peer.mountNetwork({ networkId: 'foreign', passphrase: 'wrong', bootstrapPeers: [seed.endpointAddr!, '127.0.0.1:1'] });
   await peer.mountNetwork({ networkId: 'team', passphrase: 'shared', bootstrapPeers: [seed.endpointAddr!] });
   clearInterval(peer['timer']);
-  assert.equal(connections, 2, 'one initial probe per mount');
-  assert.equal(attempts.mock.callCount(), 3, 'unreachable seed also probed once');
+  assert.equal(attempts.mock.callCount(), 6, 'one probe and one persistent tunnel per seed');
+  assert.equal(await settledConnections(4), 4, 'two probes and two tunnels reach the seed');
   assert.equal(peer.listPeerEndpoints('team').get(seed.localNodeId), seed.endpointAddr);
   assert.equal(peer.listPeerEndpoints('foreign').size, 0);
   for (let tick = 1; tick < 40; tick++) {
     t.mock.timers.tick(50);
     await peer['discover']();
   }
-  assert.equal(connections, 2, 'no TCP churn during fast discovery ticks');
-  assert.equal(attempts.mock.callCount(), 3, 'unreachable seed retries are also bounded');
+  assert.equal(attempts.mock.callCount(), 6, 'no TCP churn during fast discovery ticks');
+  assert.equal(connections, 4, 'no TCP churn during fast discovery ticks');
   t.mock.timers.tick(50);
   await peer['discover']();
-  assert.equal(connections, 4, 'both known and failed seeds are retried at the bounded interval');
-  assert.equal(attempts.mock.callCount(), 6, 'unreachable seed is retried at the bounded interval');
+  assert.equal(attempts.mock.callCount(), 11, 'known, failed and rejected-tunnel seeds retry at the bounded interval');
+  assert.equal(await settledConnections(7), 7, 'both known and failed seeds are retried at the bounded interval');
 });
 
 test('Tailscale unicast UDP discovery answers once and keeps the routed host through peer cards', async t => {

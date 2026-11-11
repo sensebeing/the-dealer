@@ -71,6 +71,8 @@ const stringFlags = [
   'reply-mailbox',
   'target-mailbox',
   'subject',
+  'bootstrap-peers',
+  'advertised-host',
 ] as const;
 
 function parse(argv: string[]) {
@@ -117,6 +119,9 @@ function runtimeOptions(values: Record<string, any>, stateDir: string) {
     skills: values.skills?.split(',').filter(Boolean),
     port: values.port === undefined ? undefined : Number(values.port),
     patch: values.patch ? readPatch(values.patch) : undefined,
+    ...(values['advertised-host'] !== undefined
+      ? { transport: { advertisedHost: String(values['advertised-host']) } }
+      : {}),
   };
 }
 
@@ -650,11 +655,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'project' && action === 'init') {
       const root = resolve(String(v.root ?? process.cwd()));
       const projectId = String(v.id ?? basename(root));
+      const bootstrapPeers = typeof v['bootstrap-peers'] === 'string'
+        ? String(v['bootstrap-peers']).split(',').map(peer => peer.trim()).filter(Boolean)
+        : [];
       stdout(JSON.stringify(initProjectScaffold(root, {
         projectId,
         defaultNetworkId: String(v.network ?? projectId),
         ...(v.description !== undefined ? { description: String(v.description) } : {}),
         ...(v.skills !== undefined ? { skills: String(v.skills).split(',').filter(Boolean) } : {}),
+        ...(bootstrapPeers.length ? { bootstrapPeers } : {}),
       }), null, v.json ? undefined : 2));
       return 0;
     }
@@ -827,7 +836,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     } else if (group === 'node') {
       if (action === 'up' || action === 'status') {
-        if (action === 'up' && (['profile', 'patch', 'member', 'name', 'skills', 'port'] as const).some(key => v[key] !== undefined)) {
+        if (action === 'up' && (['profile', 'patch', 'member', 'name', 'skills', 'port', 'advertised-host'] as const).some(key => v[key] !== undefined)) {
           throw new Error('Node already running; stop it before changing startup configuration');
         }
         result = runtime.status();

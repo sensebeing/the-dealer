@@ -149,6 +149,12 @@ export interface Services {
    - 该网络内的所有 Gossip 广播（含 `NodeCard` 名片交换）与 QUIC 握手证明均使用 `networkSealedKey` 加密认证。**没有正确口令的外部节点不仅在网络上搜不到你们的牌桌，即使知道你的物理 `NodeId` 也无法向该网络注入任何伪造消息。**
 3. **支持可选种子节点加速（Bootstrap Hint）**：
    - 虽然通过 `networkId + passphrase` 即可经 mDNS / DHT 自动聚拢，命令仍支持可选传入 `--bootstrap <peer_node_id>`（或导出 `dealer://sensebeing?secret=...&bootstrap=...` 一键邀请码）实现亚秒级冷启动入网。
+4. **无 NAT 穿透时的密封中继（Self-hosted headless relay）**：
+   - **连通模式**：同网段靠 UDP `239.255.42.99:45873` 组播与子网广播发现；装有 Tailscale 的机器把加密信标单播到 `tailscale status` 中每个在线节点的 UDP 45873 并走 `100.64.0.0/10` 直连；两者都不满足时，由一台常驻 `headless-relay` 节点充当种子。
+   - **信标 Gossip**：`announce` 把本机已收集的**密封**发现帧（`beacons`，按 `senderNodeId` 只保留最新有效帧，过期超过 30s 清理）随 `discovery` 探测发给 `bootstrapPeers`，种子回送自己的帧与全部已知信标。节点据此学习对端 endpoint 以及 `relays`（哪个种子可以把帧送到该 peer）。
+   - **常驻隧道**：每个挂载网络对每个种子保持一条 `tunnel` 长连接（`keepAlive(15s)`，无空闲超时），种子以 `peerNodeId -> 隧道` 登记。即使对端只宣告了不可直连的 NAT 地址，种子也能沿隧道把 `relay_deliver` 推回去，对端的 `relay_reply` 再沿原路返回。
+   - **盲转发**：`exchange` 先直连；存在中继候选时直连只等 1500ms，失败后改发 `relay` 请求。种子只校验该信封确实属于已挂载网络的 AEAD 密钥（不解析业务载荷），按目标隧道或直连转发。附件拉取同理：直连失败后发 `relay_blob`，由种子向目标按 BLAKE3 内容取回并回传，单次中继载荷上限 `MAX_FRAME - 4096`。
+   - **地址宣告**：`--advertised-host <host>`（或 `DEALER_ADVERTISED_HOST`）覆盖自动探测的 LAN 地址，供反向代理、端口映射或多网卡主机使用。
 
 ```typescript
 export interface NetworkMountConfig {

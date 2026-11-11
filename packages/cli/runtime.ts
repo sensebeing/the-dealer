@@ -434,9 +434,11 @@ export class DealerNodeRuntime {
       if (!existsSync(keyPath)) {
         saveJson(keyPath, keyPair);
       }
+      const advertisedHost = this.options.transport?.advertisedHost ?? process.env.DEALER_ADVERTISED_HOST;
       await this.kernel.use(
         createTransportPlugin({
           ...this.options.transport,
+          ...(advertisedHost ? { advertisedHost } : {}),
           listenPort: this.config.port,
           localNodeId: keyPair.nodeId,
         }),
