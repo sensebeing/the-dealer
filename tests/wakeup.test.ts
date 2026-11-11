@@ -1,4 +1,4 @@
-import { checkOrcaWorkspaceIdle, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
+import { checkOrcaWorkspaceIdle, findOrcaWorktreeByName, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -833,19 +833,21 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   const aliceEnv = { ORCA_TERMINAL_HANDLE: 'term-alice', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` };
   const bobEnv = { ORCA_TERMINAL_HANDLE: 'term-bob', ORCA_WORKTREE_ID: `repo::${bobWtPath}` };
   const askOut: string[] = [];
-  await runDealerCli(['ask', '--network', 'team', '--to', 'member:bob', '--body', 'Please review'], { runtime: alice, env: aliceEnv, stdout: line => askOut.push(line) });
+  await runDealerCli(['ask', '--network', 'team', '--to', 'member:bob', '--target-mailbox', 'worktree:bob-wt', '--body', 'Please review'], { runtime: alice, env: aliceEnv, stdout: line => askOut.push(line) });
   const asked = JSON.parse(askOut.join('\n'));
   assert.equal(asked.replyMailbox, 'worktree:alice-wt');
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.mode, 'orca-terminal');
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-alice');
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.workspacePath, aliceWtPath);
-  await until(() => bob.mailbox.list({ mailboxId: 'default' }).totalCount > 0, 'Bob inbound mailbox');
+  await until(() => bob.mailbox.list({ mailboxId: 'worktree:bob-wt' }).totalCount > 0, 'Bob inbound mailbox');
+  await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-bob')), 'Bob terminal wake');
   const checkOut: string[] = [];
   await runDealerCli(['inbox', 'check'], { runtime: bob, env: bobEnv, stdout: line => checkOut.push(line) });
   const checked = JSON.parse(checkOut.join('\n'));
   assert.equal(checked.mailboxId, 'worktree:bob-wt');
+  assert.equal(checked.items.length, 1);
   const replyOut: string[] = [];
-  await runDealerCli(['reply', asked.questionId, '--body', 'Approved'], { runtime: bob, env: bobEnv, stdout: line => replyOut.push(line) });
+  await runDealerCli(['reply', asked.questionId, '--body', 'Approved', '--ack', checked.deliveryId], { runtime: bob, env: bobEnv, stdout: line => replyOut.push(line) });
   const replied = JSON.parse(replyOut.join('\n'));
   assert.equal(replied.replyMailbox, 'worktree:bob-wt');
   assert.equal(replied.targetMailbox, 'worktree:alice-wt');
@@ -858,6 +860,7 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   await runDealerCli(['inbox', 'check'], { runtime: alice, env: aliceEnv, stdout: line => aliceCheckOut.push(line) });
   const aliceCheck = JSON.parse(aliceCheckOut.join('\n'));
   assert.equal(aliceCheck.mailboxId, 'worktree:alice-wt');
+  assert.equal(aliceCheck.items.length, 1);
   const followUpOut: string[] = [];
   await runDealerCli(['ask', '--reply-to', replied.replyId, '--body', 'Follow-up', '--ack', aliceCheck.deliveryId], { runtime: alice, env: aliceEnv, stdout: line => followUpOut.push(line) });
   await until(() => bob.mailbox.list({ mailboxId: 'worktree:bob-wt' }).totalCount > 0, 'Bob follow-up mailbox');
@@ -866,6 +869,7 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   await runDealerCli(['inbox', 'check'], { runtime: bob, env: bobEnv, stdout: line => bobCheckOut.push(line) });
   const bobCheck = JSON.parse(bobCheckOut.join('\n'));
   assert.equal(bobCheck.mailboxId, 'worktree:bob-wt');
+  assert.equal(bobCheck.items.length, 1);
   const settleOut: string[] = [];
   await runDealerCli(['settle', asked.questionId, '--outcome', 'succeeded', '--summary', 'Done', '--ack', bobCheck.deliveryId], { runtime: bob, env: bobEnv, stdout: line => settleOut.push(line) });
   await until(() => calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-alice')).length >= 2, 'Alice terminal settle wake');
@@ -879,6 +883,9 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   });
   await runDealerCli(['inbox', 'check', '--json'], { stateDir: alice.stateDir, env: { ORCA_TERMINAL_HANDLE: 'term-rpc', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` }, stdout: () => {} });
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-rpc');
+
+  await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{' }), 'orca', 'alice-wt'), /Unexpected end|JSON/);
+  await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{"ok":false}' }), 'orca', 'alice-wt'), /Orca worktree ps failed/);
 });
 
 test('thread show fails loudly for an unknown thread', async t => {

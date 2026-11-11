@@ -17,6 +17,32 @@ export type CommandRunner = (
   request: CommandRequest,
 ) => Promise<{ stdout: string; stderr?: string; exitCode?: number }>;
 
+export async function findOrcaWorktreeByName(
+  runner: CommandRunner,
+  command: string,
+  name: string,
+  cwd?: string,
+): Promise<{ workspacePath: string; worktreeId: string } | undefined> {
+  const result = await checkedCommand(runner, {
+    command,
+    args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'],
+    ...(cwd ? { cwd } : {}),
+  });
+  const raw = JSON.parse(result.stdout);
+  if (raw?.ok !== true) throw new Error('Orca worktree ps failed');
+  if (raw.result === undefined) return undefined;
+  if (raw.result?.truncated || !Array.isArray(raw.result?.worktrees)) {
+    throw new Error('Incomplete Orca workspace inventory');
+  }
+  const row = raw.result.worktrees.find((item: any) =>
+    item && item.isArchived !== true && item.archived !== true &&
+    ((typeof item.displayName === 'string' && item.displayName === name) ||
+     (typeof item.path === 'string' && basename(item.path) === name)),
+  );
+  if (!row || typeof row.path !== 'string' || typeof row.worktreeId !== 'string') return undefined;
+  return { workspacePath: row.path, worktreeId: row.worktreeId };
+}
+
 /** Only the process boundary may prove that no external process was started. */
 export class CommandNotStartedError extends Error {
   constructor(cause: unknown) {
