@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { probeDealerSetup, buildOnboardingPrompts, buildAgentBindingPreset } from './setup.ts';
+import { probeDealerSetup, buildOnboardingPrompts, resolveAgentBindingPreset, readAgentPresetContext } from './setup.ts';
 import type { SupportedAgentHost, AgentConversationMode } from '../plugins-executor/index.ts';
 import type { SupportedOrcaAgent } from '../orca-workspace/index.ts';
 import { existsSync, readFileSync } from 'node:fs';
@@ -668,8 +668,11 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'plugin' && action === 'add' && v.config !== undefined) {
       v.config = resolve(String(v.config));
     }
+    if (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action)) {
+      v.root = resolve(String(v.root ?? process.cwd()));
+    }
     // Preserve caller-relative paths when the daemon has a different cwd.
-    if (group === 'project' || group === 'plugin') {
+    if (group === 'project' || group === 'plugin' || (group === 'setup' && action === 'apply-preset')) {
       argv = [...p];
       for (const [key, value] of Object.entries(v)) {
         if (value === true) {
@@ -685,13 +688,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       if (action === 'probe') {
         result = probeDealerSetup({ stateDir, cwd: v.root });
       } else if (action === 'binding-preset') {
-        result = buildAgentBindingPreset({
+        const presetOptions = {
           host: required(v.host, '--host') as SupportedAgentHost,
           conversationMode: v.mode as AgentConversationMode | undefined,
           topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
           agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
-          targetBot: v['target-bot'], sessionId: v['session-id'],
-        });
+          targetBot: v['target-bot'], sessionId: v['session-id'], notifyLark: v['notify-lark'], cwd: v.root,
+        };
+        result = options.runtime ? options.runtime.previewAgentPreset(presetOptions)
+          : resolveAgentBindingPreset(presetOptions, { ...readAgentPresetContext(stateDir), cwd: v.root });
       } else if (action === 'invite-prompt') {
         const networkId = required(v.network, '--network');
         const configFile = join(stateDir, 'config.json');
@@ -775,7 +780,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
         agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
         targetBot: v['target-bot'], sessionId: v['session-id'],
-        notifyLark: v['notify-lark'], setDefault: v['set-default'],
+        notifyLark: v['notify-lark'], setDefault: v['set-default'], cwd: v.root,
       });
     } else if (group === 'ask' || group === 'reply' || group === 'settle') {
       result = await runSessionCommand(runtime, group, action, v);

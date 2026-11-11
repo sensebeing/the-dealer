@@ -42,14 +42,14 @@ Never replace an existing identity or copy another machine's private key.
 
 ## 2. Choose network topology
 
-If `.dealer/project.json` declares `onboarding.networkTopology: "fixed"` or a
-non-local `defaultNetworkId` such as `alter-service-team`, use that project's
-network. An invite also fixes the topology to its invited network. This applies
-to both the user's own node and teammates; do not ask whether to use local.
-Use the normalized `onboarding` metadata from the probe for project defaults.
+Use `probe.onboarding.networkTopology` to choose the project flow. When it is
+`fixed`, use `probe.onboarding.networkId` for both the user's own node and
+teammates, without asking whether to use local. An invite fixes topology to its
+invited network. The probe owns inference from project manifest defaults.
 
-Otherwise, ask whether the user wants **same-machine local** (default), **connect their own machines**, or **join/create
-a teammate network**. Reuse prior answers.
+When topology is `selectable`, or no project or invite is present, ask whether
+the user wants **same-machine local** (default), **connect their own machines**,
+or **join/create a teammate network**. Reuse prior answers.
 
 - Local needs no network mount, invite or passphrase.
 - Join: mount the quoted `dealer-net://v1/...` invite supplied by the user.

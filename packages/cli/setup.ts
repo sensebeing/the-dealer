@@ -1,8 +1,9 @@
-import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, join, resolve } from 'node:path';
-import { validateTopicBindings } from './config.ts';
-import type { TopicBindingConfig } from './config.ts';
+import { join, resolve } from 'node:path';
+import { readProjectManifest, validateTopicBindings } from './config.ts';
+import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, TopicBindingConfig } from './config.ts';
+import { findExecutable } from '../orca-workspace/executable.ts';
 import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
 
 export const AGENT_HOST_CATALOG = [
@@ -13,19 +14,6 @@ export const AGENT_HOST_CATALOG = [
   { host: 'chatgpt-dot', command: 'dot', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT Dot bridge with explicit session keys.' },
   { host: 'grok-bot', command: 'grok-bot', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['targetBot', 'sessionId'], description: 'Grok bridge dispatch to a selected bot.' },
 ] as const;
-
-function pathLookup(command: string, env: NodeJS.ProcessEnv): string | undefined {
-  for (const dir of (env.PATH ?? '').split(delimiter).filter(Boolean)) {
-    const path = join(dir, command);
-    try {
-      accessSync(path, constants.X_OK);
-      if (statSync(path).isFile()) return path;
-    } catch (error) {
-      if (!['ENOENT', 'EACCES', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-    }
-  }
-  return undefined;
-}
 
 function readOptionalJson(path: string): any {
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
@@ -38,14 +26,10 @@ export function probeDealerSetup(options: {
   env?: NodeJS.ProcessEnv;
   pathLookup?: (command: string, env: NodeJS.ProcessEnv) => string | undefined;
 } = {}) {
-  let env = options.env ?? process.env;
-  const localBin = join(homedir(), '.local/bin');
-  if (!options.pathLookup && !options.env && !(env.PATH ?? '').split(delimiter).includes(localBin)) {
-    env = { ...env, PATH: [env.PATH, localBin].filter(Boolean).join(delimiter) };
-  }
+  const env = options.env ?? process.env;
   const cwd = resolve(options.cwd ?? process.cwd());
   const stateDir = resolve(options.stateDir ?? env.DEALER_STATE_DIR ?? join(env.HOME ?? homedir(), '.dealer'));
-  const lookup = options.pathLookup ?? pathLookup;
+  const lookup = options.pathLookup ?? ((command, environment) => findExecutable(command, environment, !options.env));
   const commands = ['orca', 'agy', 'claude', 'codex', 'dot', 'grok-bot', 'lark-cli'];
   const clis = Object.fromEntries(commands.map(command => [command, lookup(command, env) ?? null]));
   const config = readOptionalJson(join(stateDir, 'config.json'));
@@ -155,4 +139,36 @@ export function buildAgentBindingPreset(options: {
     ? { [executor]: { agent: binding.agent, interactive: true, ...(binding.workspacePath ? { cwd: binding.workspacePath } : {}) } }
     : {};
   return { topic, binding, executorConfig, summary: `${host}: ${mode} via ${executor}; configure receiver project roots and host CLI before enabling delivery.` };
+}
+
+/** Project defaults and node notification effects shared by preview and application. */
+export function resolveAgentBindingPreset(
+  options: Parameters<typeof buildAgentBindingPreset>[0],
+  context: { projects?: DealerProjectManifest[]; larkNotify?: LarkNotifyConfig; cwd?: string } = {},
+) {
+  const projects = context.projects ?? [];
+  let project = options.projectId ? projects.find(project => project.projectId === options.projectId) : undefined;
+  if (!project) {
+    const cwd = context.cwd ?? process.cwd();
+    const localProject = existsSync(join(cwd, '.dealer/project.json')) ? readProjectManifest(cwd) : undefined;
+    if (localProject && (!options.projectId || localProject.projectId === options.projectId)) {
+      project = projects.find(project => project.projectId === localProject.projectId) ?? localProject;
+    }
+  }
+  if (!project && !options.projectId && projects.length === 1) project = projects[0];
+  const preset = buildAgentBindingPreset({ ...options,
+    notifyLark: options.notifyLark ?? (project?.onboarding?.notifyLark === true ? true : undefined),
+  });
+  return { ...preset,
+    ...(preset.binding.notifyLark === true ? { larkNotify: { ...context.larkNotify, enabled: true } } : {}),
+  };
+}
+
+/** Offline previews read receiver-owned linked manifests without starting a node. */
+export function readAgentPresetContext(stateDir: string) {
+  const config = readOptionalJson(join(stateDir, 'config.json'));
+  return {
+    projects: (config?.projects ?? []).map((project: LinkedProjectConfig) => readProjectManifest(project.rootPath)),
+    larkNotify: config?.larkNotify as LarkNotifyConfig | undefined,
+  };
 }

@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Disposable, MessageEnvelope, PendingApprovalItem } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 import type { MailboxItem, MailboxStore } from '../mailbox/store.ts';
+import { findExecutable } from '../orca-workspace/executable.ts';
 import { checkedCommand, runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
 import type { LarkNotifyConfig } from '../cli/config.ts';
@@ -219,8 +219,7 @@ export class LarkMailboxNotifier {
   }
   private async invoke(args: string[]): Promise<any> {
     const config = this.options.config;
-    const localCommand = join(homedir(), '.local/bin/lark-cli');
-    const command = config.command ?? ((!this.options.commandRunner || this.options.commandRunner === runCommand) && existsSync(localCommand) ? localCommand : 'lark-cli');
+    const command = config.command ?? ((!this.options.commandRunner || this.options.commandRunner === runCommand) ? findExecutable('lark-cli') ?? 'lark-cli' : 'lark-cli');
     const result = await checkedCommand(this.options.commandRunner ?? runCommand, {
       command, args: [...(config.profile ? ['--profile', config.profile] : []), ...args], signal: this.controller.signal,
     });

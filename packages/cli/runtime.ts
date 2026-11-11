@@ -43,7 +43,7 @@ import {
   validatePluginRefs,
   validateTopicBindings,
 } from './config.ts';
-import { buildAgentBindingPreset } from './setup.ts';
+import { buildAgentBindingPreset, resolveAgentBindingPreset } from './setup.ts';
 import type { RuntimeConfig, TopicBindingConfig, PluginSpec, DealerProjectPluginRef, DealerProjectManifest } from './config.ts';
 
 export interface ExternalPluginContext {
@@ -625,12 +625,15 @@ export class DealerNodeRuntime {
     await this.kernel.use(createLarkMirrorPlugin({ ...options, notifier: this.larkNotifier }));
   }
 
-  async applyAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { setDefault?: boolean }) {
-    const project = options.projectId ? this.loadedProjects.get(options.projectId)
-      : this.loadedProjects.size === 1 ? [...this.loadedProjects.values()][0] : undefined;
-    const preset = buildAgentBindingPreset({ ...options,
-      notifyLark: options.notifyLark ?? (project?.manifest.onboarding?.notifyLark === true ? true : undefined),
+  previewAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { cwd?: string }) {
+    return resolveAgentBindingPreset(options, {
+      projects: [...this.loadedProjects.values()].map(project => project.manifest),
+      larkNotify: this.config.larkNotify, cwd: options.cwd,
     });
+  }
+
+  async applyAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { setDefault?: boolean; cwd?: string }) {
+    const preset = this.previewAgentPreset(options);
     const host = options.host === 'claude' ? 'claude-code' : options.host;
     const mode = options.conversationMode ?? 'fixed';
     const defaultExecutor = !options.setDefault ? this.config.defaultExecutor
@@ -643,14 +646,14 @@ export class DealerNodeRuntime {
       this.config.executorConfig[name] = { ...this.config.executorConfig[name], ...config };
     }
     this.config.defaultExecutor = defaultExecutor;
-    if (preset.binding.notifyLark === true) {
-      this.config.larkNotify = { ...this.config.larkNotify, enabled: true };
+    if (preset.larkNotify) {
+      this.config.larkNotify = preset.larkNotify;
       if (this.started) await this.activateLarkNotifier();
     }
     for (const name of this.config.executors) this.registerBuiltinExecutor?.(name);
     this.refreshTopicBindings();
     this.persist();
-    return { applied: preset.topic, host, mode, defaultExecutor, binding: preset.binding, executorConfig: preset.executorConfig };
+    return { applied: preset.topic, host, mode, defaultExecutor, binding: preset.binding, executorConfig: preset.executorConfig, ...(preset.larkNotify ? { larkNotify: preset.larkNotify } : {}) };
   }
 
   private refreshTopicBindings(): void {

@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { P2PTransportService, defaultAdvertisedHost } from '../packages/transport/index.ts';
@@ -17,7 +17,7 @@ import {
   decodeNetworkInvite, DealerNodeRuntime, MailboxStore, createAgentPtyExecutorPlugin,
   createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin,
   createCodexExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin,
-  BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts,
+  BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts, resolveAgentBindingPreset,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
 } from '../packages/index.ts';
 import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
@@ -147,6 +147,66 @@ test('CLI notify-lark activates an existing daemon and survives restart', async 
   t.after(() => restarted.stop());
   assert.equal(restarted.config.larkNotify?.enabled, true);
   assert.ok(restarted.larkNotifier);
+});
+
+test('preset preview and application agree for explicit and project-default Lark activation', async t => {
+  for (const scenario of ['explicit', 'sole', 'selected', 'cwd'] as const) {
+    const root = directory(t);
+    const stateDir = join(root, 'state');
+    const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') },
+      patch: { larkNotify: { enabled: false, target: { userId: 'verified-user' } } },
+      commandRunner: async () => ({ stdout: '{}' }),
+    });
+    await runtime.start();
+    t.after(() => runtime.stop());
+    const manifest = { schema: 'the-dealer-project/v1', projectId: 'demo', defaultNetworkId: 'team',
+      onboarding: { networkTopology: 'selectable', notifyLark: true } };
+    if (scenario !== 'explicit') {
+      mkdirSync(join(root, '.dealer'));
+      writeFileSync(join(root, '.dealer/project.json'), JSON.stringify(manifest));
+      if (scenario !== 'cwd') await runtime.linkProject(root);
+    }
+    const flags = scenario === 'explicit' ? ['--notify-lark'] : scenario === 'selected' ? ['--project', 'demo'] : scenario === 'cwd' ? ['--root', root] : [];
+    const preview = await cli(['setup', 'binding-preset', '--host', 'codex', '--mode', 'inbox-only', ...flags], stateDir);
+    const applied = await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only',
+      ...(scenario === 'explicit' ? { notifyLark: true } : scenario === 'selected' ? { projectId: 'demo' } : scenario === 'cwd' ? { cwd: root } : {}) });
+    for (const key of ['binding', 'executorConfig', 'larkNotify']) assert.deepEqual(preview[key], applied[key], scenario + ': ' + key);
+    assert.equal(preview.larkNotify.enabled, true);
+    assert.equal(preview.larkNotify.target.userId, 'verified-user');
+    if (scenario === 'cwd') {
+      const local = resolveAgentBindingPreset({ host: 'codex', conversationMode: 'inbox-only' }, { cwd: root, larkNotify: runtime.config.larkNotify });
+      assert.deepEqual(local.binding, applied.binding);
+      assert.deepEqual(local.larkNotify, applied.larkNotify);
+      assert.equal(probeDealerSetup({ cwd: root, stateDir, env: {} }).onboarding.networkTopology, 'selectable');
+    }
+  }
+});
+
+test('executable discovery prefers executable PATH entries and falls back to executable local bin', async t => {
+  const root = directory(t);
+  const pathBin = join(root, 'path-bin');
+  const localBin = join(root, '.local/bin');
+  mkdirSync(pathBin);
+  mkdirSync(localBin, { recursive: true });
+  const pathCommand = join(pathBin, 'lark-cli');
+  const localCommand = join(localBin, 'lark-cli');
+  for (const file of [pathCommand, localCommand]) { writeFileSync(file, '#!/bin/sh\nexit 0\n'); chmodSync(file, 0o755); }
+  const module = new URL('../packages/orca-workspace/executable.ts', import.meta.url).href;
+  const setup = new URL('../packages/cli/setup.ts', import.meta.url).href;
+  const inspect = async () => {
+    const result = await promisify(execFile)(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e',
+      `import { findExecutable } from ${JSON.stringify(module)};
+       import { probeDealerSetup } from ${JSON.stringify(setup)};
+       console.log(JSON.stringify({ resolved: findExecutable('lark-cli') ?? null,
+         probe: probeDealerSetup().clis['lark-cli'], isolated: probeDealerSetup({ env: { PATH: '' } }).clis['lark-cli'] }));`],
+      { cwd: root, env: { ...process.env, HOME: root, PATH: pathBin, DEALER_STATE_DIR: join(root, 'state') } });
+    return JSON.parse(result.stdout);
+  };
+  assert.deepEqual(await inspect(), { resolved: pathCommand, probe: pathCommand, isolated: null });
+  chmodSync(pathCommand, 0o644);
+  assert.deepEqual(await inspect(), { resolved: localCommand, probe: localCommand, isolated: null });
+  chmodSync(localCommand, 0o644);
+  assert.deepEqual(await inspect(), { resolved: null, probe: null, isolated: null });
 });
 
 test('setup invite prompts reuse configured network, encode seeds, and do not mutate state', async t => {
