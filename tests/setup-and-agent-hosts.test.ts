@@ -1045,11 +1045,14 @@ test('Tailscale unicast UDP discovery answers once and keeps the routed host thr
   });
   assert.equal(transport.listPeerEndpoints(networkId).get(remote.nodeId), routedEndpoint,
     'a card advertising the LAN address must not replace the routed Tailscale endpoint');
-  assert.equal(transport['reachableEndpoint']('43.110.36.140:8880', tailscaleAddress), '43.110.36.140:8880',
-    'a public relay endpoint must not be rewritten to a Tailscale interface');
-  transport.registerPeerEndpoint(networkId, remote.nodeId, '43.110.36.140:8880');
-  assert.equal(transport.listPeerEndpoints(networkId).get(remote.nodeId), '43.110.36.140:8880',
-    'a public relay endpoint can replace a Tailscale endpoint');
+  for (const endpoint of ['43.110.36.140:8880', '10.relay.example:8880', '192.168.relay.example:8880', '172.16.relay.example:8880']) {
+    transport.registerPeerEndpoint(networkId, remote.nodeId, routedEndpoint);
+    assert.equal(transport['reachableEndpoint'](endpoint, tailscaleAddress), endpoint,
+      'public IPv4 and DNS relay endpoints must not be rewritten to a Tailscale interface');
+    transport.registerPeerEndpoint(networkId, remote.nodeId, endpoint);
+    assert.equal(transport.listPeerEndpoints(networkId).get(remote.nodeId), endpoint,
+      'public IPv4 and DNS relay endpoints can replace a Tailscale endpoint');
+  }
 });
 
 test('project linking merges newly published onboarding bootstrap peers into a mounted network', async t => {
