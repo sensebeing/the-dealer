@@ -342,7 +342,7 @@ interface Mount {
   /** Tunnels peers opened towards this node, keyed by peer node, so relays can push back. */
   inboundTunnels: Map<string, Tunnel>;
   /** Persistent tunnels this node keeps open towards its seeds, keyed by verified seed node. */
-  outboundTunnels: Map<string, { socket: Socket; acked: boolean }>;
+  outboundTunnels: Map<string, { socket: Socket; seed: string; acked: boolean }>;
   file: string;
   lastSeedProbeAt: number;
 }
@@ -778,8 +778,11 @@ export class P2PTransportService implements TransportService {
         }
         const seedNodeId = response.frame.senderNodeId;
         if (seedNodeId === this.localNodeId) return;
-        m.relays.set(seedNodeId, seed);
         this.ensureOutboundTunnel(m, seedNodeId, seed, response.tunneled === true);
+        const activeTunnel = m.outboundTunnels.get(seedNodeId);
+        if (!activeTunnel || activeTunnel.seed === seed) {
+          m.relays.set(seedNodeId, seed);
+        }
         for (const peerFrame of Array.isArray(response.peers) ? response.peers : []) {
           try {
             // Gossiped beacons were not reached directly, so keep the advertised
@@ -787,6 +790,13 @@ export class P2PTransportService implements TransportService {
             this.learnWithMeta(peerFrame, undefined, seed);
           } catch {
             // One unreadable gossiped frame must not fail the whole probe.
+          }
+        }
+      } catch {
+        for (const [nodeId, entry] of m.outboundTunnels) {
+          if (entry.seed === seed) {
+            entry.socket.destroy();
+            m.outboundTunnels.delete(nodeId);
           }
         }
       } finally {
@@ -1123,12 +1133,12 @@ export class P2PTransportService implements TransportService {
   private ensureOutboundTunnel(m: Mount, seedNodeId: string, seed: string, seedHasTunnel: boolean): void {
     const existing = m.outboundTunnels.get(seedNodeId);
     if (existing && !existing.socket.destroyed) {
-      if (!existing.acked || seedHasTunnel) return;
+      if (existing.seed !== seed || !existing.acked || seedHasTunnel) return;
       existing.socket.destroy();
       m.outboundTunnels.delete(seedNodeId);
     }
     const socket = this.track(createConnection(parseEndpoint(seed)));
-    const entry = { socket, acked: false };
+    const entry = { socket, seed, acked: false };
     m.outboundTunnels.set(seedNodeId, entry);
     // A persistent tunnel must outlive the idle window that bounds one-shot requests.
     socket.setTimeout(0);
@@ -1147,7 +1157,7 @@ export class P2PTransportService implements TransportService {
     void this.serveOutboundTunnel(m, entry, seed, () => clearTimeout(ackTimer)).catch(() => socket.destroy());
   }
 
-  private async serveOutboundTunnel(m: Mount, entry: { socket: Socket; acked: boolean }, seed: string, onAck?: () => void): Promise<void> {
+  private async serveOutboundTunnel(m: Mount, entry: { socket: Socket; seed: string; acked: boolean }, seed: string, onAck?: () => void): Promise<void> {
     const socket = entry.socket;
     const reader = new SocketReader(socket);
     while (!socket.destroyed) {

@@ -161,7 +161,7 @@ test('bootstrap tunnel identity deduplicates aliases, ignores self, and replaces
   mount.config.bootstrapPeers.push(seed.replace('127.0.0.1', 'localhost'), alice.transport.endpointAddr);
   mount.lastSeedProbeAt = Number.NEGATIVE_INFINITY;
   await alice.transport['discover']();
-  const outbound = mount.outboundTunnels as Map<string, { socket: Socket; acked: boolean }>;
+  const outbound = mount.outboundTunnels as Map<string, { socket: Socket; seed: string; acked: boolean }>;
   assert.equal(outbound.size, 1, 'seed aliases share one verified outbound tunnel');
   assert.equal(outbound.has(alice.transport.localNodeId), false, 'self discovery never creates a tunnel');
   const oldSocket = outbound.get(relay.localNodeId)!.socket;
@@ -170,6 +170,14 @@ test('bootstrap tunnel identity deduplicates aliases, ignores self, and replaces
   mount.lastSeedProbeAt = Number.NEGATIVE_INFINITY;
   await alice.transport['discover']();
   assert.notEqual(outbound.get(relay.localNodeId)!.socket, oldSocket, 'a relay restart replaces the stale acknowledged tunnel');
+  let delivered = false;
+  alice.kernel.ctx.on('transport/inbound', event => {
+    const payload = event.payload as { ping?: string };
+    if (payload?.ping === 'after-restart') delivered = true;
+  });
+  await until(() => relayMount.inboundTunnels.has(alice.transport.localNodeId));
+  await relay.sendUnicast('relay-net', alice.transport.localNodeId, encode({ ping: 'after-restart' }));
+  assert.equal(delivered, true, 'the replacement tunnel delivers frames to the peer');
 });
 
 test('the relay packet budget bounds blobs: the largest legal one crosses the seed tunnel', async t => {
