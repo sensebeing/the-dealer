@@ -323,7 +323,15 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
     throw new Error('Incomplete Orca terminal inventory');
   }
   const terminals = inventory.result.terminals as OrcaTerminalRow[];
-  const connected = terminals.filter(t => t && t.orphaned !== true && t.connected && t.writable !== false);
+  const nonOrphanConnected = terminals.filter(
+    t => t && t.orphaned !== true && t.connected && t.writable !== false,
+  );
+  const connected = nonOrphanConnected.length > 0
+    ? nonOrphanConnected
+    : terminals.filter(
+      t => t && t.connected && t.writable !== false &&
+        typeof t.agentIdentity === 'string' && t.agentIdentity.trim().length > 0,
+    );
   const freshest = (rows: OrcaTerminalRow[]) => rows.sort(
     (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
   )[0];

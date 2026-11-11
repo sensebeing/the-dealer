@@ -141,6 +141,8 @@ test('fixed workspaces bootstrap once and orphaned terminals neither block nor w
   let created = false;
   let orphanConnected = false;
   let orphanPreview = "";
+  let orphanIdentity: string | undefined;
+  let onlyOrphan = false;
   let agentCount = 1;
   const runner: CommandRunner = async call => {
     calls.push(call);
@@ -150,10 +152,12 @@ test('fixed workspaces bootstrap once and orphaned terminals neither block nor w
       return { stdout: JSON.stringify({ ok: true, result: { worktree: { path } } }) };
     }
     if (call.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path, worktreeId: 'fixed', agents: Array.from({ length: agentCount }, () => ({ state: 'done' })), unverifiableTerminalCount: 0 }] } }) };
-    return { stdout: JSON.stringify({ ok: true, result: { terminals: [
-      { handle: 'orphan', orphaned: true, connected: orphanConnected, writable: orphanConnected, preview: orphanPreview, lastOutputAt: 100 },
-      { handle: 'live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '>', lastOutputAt: 1 },
-    ] } }) };
+    if (call.args[0] === 'terminal' && call.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { handle: 'spawned' } }) };
+    }
+    const terminals = [{ handle: 'orphan', orphaned: true, connected: orphanConnected, writable: orphanConnected, preview: orphanPreview, ...(orphanIdentity ? { agentIdentity: orphanIdentity } : {}), lastOutputAt: 100 }];
+    if (!onlyOrphan) terminals.push({ handle: 'live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '>', lastOutputAt: 1 });
+    return { stdout: JSON.stringify({ ok: true, result: { terminals } }) };
   };
   const settings = join(root, 'settings.json');
   assert.deepEqual(await ensureOrcaWorkspace(runner, 'orca', { workspacePath: path, repoRoot: root, agySettingsPath: settings }), { workspacePath: path, created: true });
@@ -170,6 +174,11 @@ test('fixed workspaces bootstrap once and orphaned terminals neither block nor w
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', path)).idle, false);
   orphanPreview = '';
   assert.deepEqual(await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', path), { handle: 'live', spawned: false });
+  onlyOrphan = true;
+  orphanIdentity = 'antigravity';
+  assert.deepEqual(await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', path), { handle: 'orphan', spawned: false });
+  orphanIdentity = undefined;
+  assert.deepEqual(await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', path), { handle: 'spawned', spawned: true });
   const missing: CommandRunner = async () => ({ stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) });
   await assert.rejects(ensureOrcaWorkspace(missing, 'orca', { workspacePath: path }), /repoRoot/);
 });
