@@ -6,11 +6,12 @@ import { tmpdir, networkInterfaces } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import {
   deriveNetworkKeys,
   generateNodeKeyPair,
+  isTailscaleIpv4Host,
   sealNetworkFrame,
   unsealNetworkFrame,
 } from '../core-types/index.ts';
@@ -148,6 +149,93 @@ export function blake3(bytes: Uint8Array): string {
 
 const MAX_FRAME = 8 * 1024 * 1024;
 const GROUP = '239.255.42.99';
+const PRIVATE_IPV4 = /^(100\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/;
+const TAILSCALE_COMMANDS = ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale'];
+const TAILSCALE_CACHE_MS = 30_000;
+let tailscalePeersCache: { readAt: number; peers: string[] } | undefined;
+
+function readTailscaleStatus(command: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, ['status', '--json'], { timeout: 1500, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(stdout);
+      }
+    });
+  });
+}
+
+/** Online Tailscale peers as IPv4 addresses; cached so announcements do not spawn the CLI each tick. */
+export async function discoverTailscaleIpv4Peers(): Promise<string[]> {
+  const now = Date.now();
+  if (tailscalePeersCache && now - tailscalePeersCache.readAt < TAILSCALE_CACHE_MS) {
+    return [...tailscalePeersCache.peers];
+  }
+  const peers = new Set<string>();
+  for (const command of TAILSCALE_COMMANDS) {
+    let status: { Peer?: Record<string, { Online?: boolean; TailscaleIPs?: unknown[] }> };
+    try {
+      status = JSON.parse(await readTailscaleStatus(command));
+    } catch {
+      // Tailscale is optional; a missing binary or a stopped backend falls through.
+      continue;
+    }
+    for (const peer of Object.values(status?.Peer ?? {})) {
+      if (peer?.Online !== true || !Array.isArray(peer.TailscaleIPs)) {
+        continue;
+      }
+      for (const address of peer.TailscaleIPs) {
+        if (typeof address === 'string' && PRIVATE_IPV4.test(address)) {
+          peers.add(address);
+        }
+      }
+    }
+    break;
+  }
+  tailscalePeersCache = { readAt: now, peers: [...peers] };
+  return [...peers];
+}
+
+/** IPv4 broadcast targets for the LAN links that carry unicast discovery frames. */
+export function lanBroadcastAddresses(
+  interfaces = networkInterfaces(),
+): { address: string; broadcast: string }[] {
+  const targets: { address: string; broadcast: string }[] = [];
+  for (const [name, addresses] of Object.entries(interfaces)) {
+    if (!/^(en|eth|wlan)/.test(name)) {
+      continue;
+    }
+    for (const address of addresses ?? []) {
+      if (
+        address.family !== 'IPv4' ||
+        address.internal ||
+        !address.netmask ||
+        address.netmask === '255.255.255.255'
+      ) {
+        continue;
+      }
+      const broadcast = ipv4Broadcast(address.address, address.netmask);
+      if (broadcast) {
+        targets.push({ address: address.address, broadcast });
+      }
+    }
+  }
+  return targets;
+}
+
+function ipv4Broadcast(address: string, netmask: string): string | undefined {
+  const parts = address.split('.').map(Number);
+  const mask = netmask.split('.').map(Number);
+  if (
+    parts.length !== 4 ||
+    mask.length !== 4 ||
+    [...parts, ...mask].some(part => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
+    return undefined;
+  }
+  return parts.map((part, index) => part | (~mask[index] & 255)).join('.');
+}
 
 function packet(value: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(value));
@@ -214,6 +302,8 @@ export interface TransportPluginOptions {
   mDnsPort?: number;
   discoveryIntervalMs?: number;
   socketTimeoutMs?: number;
+  /** Deterministic Tailscale peer source for tests; defaults to the local `tailscale status` CLI. */
+  tailscalePeers?: () => Promise<readonly string[]> | readonly string[];
 }
 
 interface Mount {
@@ -256,6 +346,7 @@ export class P2PTransportService implements TransportService {
   private server?: Server;
   private starting?: Promise<void>;
   private udp?: DatagramSocket;
+  private discoveryReplyAt = new Map<string, number>();
   private timer?: ReturnType<typeof setInterval>;
   private tick?: Promise<void>;
   private closed = false;
@@ -307,20 +398,53 @@ export class P2PTransportService implements TransportService {
         const udp = createSocket({ type: 'udp4', reuseAddr: true });
         this.udp = udp;
         udp.on('error', () => {}); // Registry discovery remains available on hosts disabling multicast.
-        udp.on('message', bytes => {
+        udp.on('message', (bytes, rinfo) => {
           try {
-            this.learn(JSON.parse(bytes.toString()));
+            const frame = JSON.parse(bytes.toString());
+            const { mount, reply } = this.learnWithMeta(frame, rinfo?.address);
+            if (mount && frame.senderNodeId !== this.localNodeId && !reply && rinfo?.address && rinfo?.port) {
+              // Answer the sender directly so unicast discovery over Tailscale or LAN
+              // completes a bidirectional handshake in one round trip. Never answer a
+              // reply frame: that would start an endless discovery ping-pong. Multicast
+              // announces arrive every tick, so bound one answer per host per probe
+              // window instead of multiplying traffic by the peer count.
+              const now = Date.now();
+              const lastReply = this.discoveryReplyAt.get(rinfo.address) ?? Number.NEGATIVE_INFINITY;
+              if (now - lastReply >= Math.max(this.options.discoveryIntervalMs ?? 50, 2000)) {
+                this.discoveryReplyAt.set(rinfo.address, now);
+                udp.send(Buffer.from(JSON.stringify(this.discoveryFrame(mount, true))), rinfo.port, rinfo.address);
+              }
+            }
           } catch {
             // Unauthenticated discovery
           }
         });
         udp.bind(this.options.mDnsPort ?? 45873, () => {
           try {
-            udp.addMembership(GROUP, this.options.discoveryInterface ?? '127.0.0.1');
-            udp.setMulticastInterface(this.options.discoveryInterface ?? '127.0.0.1');
+            udp.setBroadcast(true);
+          } catch {
+            // Hosts without broadcast support keep unicast seeds.
+          }
+          try {
             udp.setMulticastLoopback(true);
           } catch {
             // Multicast unavailable
+          }
+          if (this.options.discoveryInterface) {
+            try {
+              udp.addMembership(GROUP, this.options.discoveryInterface);
+              udp.setMulticastInterface(this.options.discoveryInterface);
+            } catch {
+              // A configured interface without multicast support must not fail startup.
+            }
+            return;
+          }
+          for (const address of ['127.0.0.1', ...lanBroadcastAddresses().map(target => target.address)]) {
+            try {
+              udp.addMembership(GROUP, address);
+            } catch {
+              // An interface without multicast support must not fail startup.
+            }
           }
         });
       }
@@ -433,33 +557,71 @@ export class P2PTransportService implements TransportService {
     }
   }
 
-  private learn(frame: SealedNetworkFrame): Mount | undefined {
+  private learn(frame: SealedNetworkFrame, remoteHost?: string): Mount | undefined {
+    return this.learnWithMeta(frame, remoteHost).mount;
+  }
+
+  private learnWithMeta(
+    frame: SealedNetworkFrame,
+    remoteHost?: string,
+  ): { mount?: Mount; reply: boolean } {
     const m = [...this.mounts.values()].find(m => m.keys.swarmTopicId === frame.swarmTopicId);
     if (!m) {
-      return;
+      return { reply: false };
     }
     const beacon = unsealNetworkFrame<{
       type: string;
       endpointAddr: string;
       expires: number;
+      reply?: boolean;
     }>(frame, m.keys);
     if (
       beacon.type !== 'discovery' ||
       beacon.expires < Date.now() ||
       beacon.expires > Date.now() + 30_000
     ) {
-      return;
+      return { reply: false };
     }
-    this.registerPeerEndpoint(m.config.networkId, frame.senderNodeId, beacon.endpointAddr);
-    return m;
+    this.registerPeerEndpoint(
+      m.config.networkId,
+      frame.senderNodeId,
+      this.reachableEndpoint(beacon.endpointAddr, remoteHost),
+    );
+    return { mount: m, reply: beacon.reply === true };
   }
 
-  private discoveryFrame(m: Mount): SealedNetworkFrame {
+  /**
+   * Prefer the address we actually reached the peer on when it is routable across
+   * subnets. A peer reached over Tailscale advertises whatever LAN address it sees
+   * locally, which is useless to us; its observed 100.64/10 address is not.
+   */
+  private reachableEndpoint(endpointAddr: string, remoteHost?: string): string {
+    const host = remoteHost?.replace(/^::ffff:/, '');
+    if (!host || host === '127.0.0.1' || host === '0.0.0.0' || this.options.advertisedHost) {
+      return endpointAddr;
+    }
+    let parsed: { host: string; port: number };
+    try {
+      parsed = parseEndpoint(endpointAddr);
+    } catch {
+      return endpointAddr;
+    }
+    if (parsed.host === '127.0.0.1') {
+      return endpointAddr;
+    }
+    if (isTailscaleIpv4Host(host) || parsed.host === host) {
+      return `${host.includes(':') ? `[${host}]` : host}:${parsed.port}`;
+    }
+    return endpointAddr;
+  }
+
+  private discoveryFrame(m: Mount, reply = false): SealedNetworkFrame {
     return sealNetworkFrame(
       {
         type: 'discovery',
         endpointAddr: this.endpointAddr,
         expires: Date.now() + 10_000,
+        ...(reply ? { reply: true } : {}),
       },
       m.keys,
       this.localNodeId,
@@ -469,6 +631,7 @@ export class P2PTransportService implements TransportService {
   private async announce(m: Mount): Promise<void> {
     const frame = this.discoveryFrame(m);
     const bytes = Buffer.from(JSON.stringify(frame));
+    const port = m.config.mDnsPort ?? this.options.mDnsPort ?? 45873;
     const temp = `${m.file}.${randomUUID()}`;
     try {
       await writeFile(temp, bytes, { mode: 0o600 });
@@ -477,7 +640,7 @@ export class P2PTransportService implements TransportService {
       await rm(temp, { force: true });
     }
     try {
-      this.udp?.send(bytes, m.config.mDnsPort ?? this.options.mDnsPort ?? 45873, GROUP);
+      this.udp?.send(bytes, port, GROUP);
     } catch {
       // TCP seeds and the local registry remain available without multicast.
     }
@@ -486,6 +649,26 @@ export class P2PTransportService implements TransportService {
     const now = Date.now();
     if (now - m.lastSeedProbeAt < Math.max(this.options.discoveryIntervalMs ?? 50, 2000)) return;
     m.lastSeedProbeAt = now;
+    if (this.udp && this.options.multicast !== false && (!this.options.discoveryDir || this.options.tailscalePeers)) {
+      // Subnet broadcasts cover peers on the same LAN without requiring multicast routing.
+      for (const { broadcast } of lanBroadcastAddresses()) {
+        try {
+          this.udp.send(bytes, port, broadcast);
+        } catch {
+          // A link without broadcast support must not stop seed probes.
+        }
+      }
+      const peers = this.options.tailscalePeers
+        ? await this.options.tailscalePeers()
+        : await discoverTailscaleIpv4Peers();
+      for (const host of peers) {
+        try {
+          this.udp.send(bytes, port, host);
+        } catch {
+          // Unreachable peers are retried on the next probe.
+        }
+      }
+    }
     await Promise.allSettled((m.config.bootstrapPeers ?? []).filter(seed => seed !== this.endpointAddr).map(async seed => {
       const socket = this.track(createConnection(parseEndpoint(seed)));
       socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
@@ -675,7 +858,7 @@ export class P2PTransportService implements TransportService {
   private async receive(socket: Socket): Promise<void> {
     const request = await new SocketReader(socket).json();
     if (request.type === 'discovery') {
-      const mount = this.learn(request.frame);
+      const mount = this.learn(request.frame, socket.remoteAddress);
       if (!mount) throw new Error('Invalid discovery request');
       socket.end(packet({ frame: this.discoveryFrame(mount) }));
       return;

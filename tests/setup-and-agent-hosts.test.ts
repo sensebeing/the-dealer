@@ -8,8 +8,10 @@ import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import assert from 'node:assert/strict';
 import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync } from 'node:fs';
-import { tmpdir, homedir } from 'node:os';
+import { tmpdir, homedir, networkInterfaces } from 'node:os';
 import type { NetworkInterfaceInfo } from 'node:os';
+import { createSocket } from 'node:dgram';
+import { createServer } from 'node:net';
 import { P2PTransportService, defaultAdvertisedHost } from '../packages/transport/index.ts';
 import { join } from 'node:path';
 import {
@@ -19,6 +21,8 @@ import {
   createCodexExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin,
   BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts, resolveAgentBindingPreset,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
+  Kernel, createTransportPlugin, createNodePlugin, generateNodeKeyPair, deriveNetworkKeys,
+  sealNetworkFrame, unsealNetworkFrame, signNodeCard, isTailscaleIpv4Host,
 } from '../packages/index.ts';
 import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
 
@@ -32,6 +36,39 @@ function directory(t: { after: (fn: () => void) => void }) {
   const dir = mkdtempSync(join(tmpdir(), 'dealer-hosts-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
+}
+async function eventually(check: () => void | Promise<void>, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      await check();
+      return;
+    } catch (error) {
+      if (Date.now() > deadline) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+async function freeUdpPorts(count: number): Promise<number[]> {
+  const sockets: ReturnType<typeof createSocket>[] = [];
+  try {
+    for (let index = 0; index < count; index++) {
+      const socket = createSocket('udp4');
+      socket.bind(0, '127.0.0.1');
+      await once(socket, 'listening');
+      sockets.push(socket);
+    }
+    return sockets.map(socket => (socket.address() as { port: number }).port);
+  } finally {
+    for (const socket of sockets) socket.close();
+  }
+}
+async function freeTcpPort(t: { after: (fn: () => void) => void }): Promise<number> {
+  const server = createServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+  return (server.address() as { port: number }).port;
 }
 async function cli(args: string[], stateDir: string) {
   const stdout: string[] = [];
@@ -809,6 +846,100 @@ test('TCP seed probes are bounded across 50ms ticks for discovered and unavailab
   await peer['discover']();
   assert.equal(connections, 4, 'both known and failed seeds are retried at the bounded interval');
   assert.equal(attempts.mock.callCount(), 6, 'unreachable seed is retried at the bounded interval');
+});
+
+test('Tailscale unicast UDP discovery answers once and keeps the routed host through peer cards', async t => {
+  const tailscaleAddress = Object.values(networkInterfaces()).flat()
+    .find(info => info?.family === 'IPv4' && !info.internal && isTailscaleIpv4Host(info.address))?.address;
+  if (!tailscaleAddress) {
+    t.skip('No local Tailscale IPv4 interface (100.64.0.0/10)');
+    return;
+  }
+  const root = directory(t);
+  const networkId = 'tailscale-discovery';
+  const passphrase = 'tailscale-secret';
+  const keys = deriveNetworkKeys(networkId, passphrase);
+  const local = generateNodeKeyPair();
+  const remote = generateNodeKeyPair();
+  const [udpPort, remotePort] = await freeUdpPorts(2);
+  const peerPort = await freeTcpPort(t);
+  const advertisedLanAddress = `10.165.36.130:${peerPort}`;
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: join(root, 'mesh'),
+      mDnsPort: udpPort, tailscalePeers: () => [tailscaleAddress] }) },
+    { plugin: createNodePlugin({ keyPair: local, member: 'alice', nodeName: 'alice-mbp', exchangeIntervalMs: 60_000 }) },
+  ]);
+  t.after(() => kernel.stop());
+  await kernel.start();
+  const transport = kernel.ctx.services.transport as P2PTransportService;
+  // A raw UDP peer stands in for a Tailscale host: it receives the announce over the
+  // routed 100.64/10 address and replies with a beacon advertising its LAN address.
+  const announcements: { type: string; endpointAddr: string; reply?: boolean }[] = [];
+  const remoteSocket = createSocket('udp4');
+  t.after(() => remoteSocket.close());
+  remoteSocket.on('message', (bytes, rinfo) => {
+    if (rinfo.address !== tailscaleAddress) {
+      return; // Ignore the same-host LAN broadcast copy; this test exercises the routed unicast path.
+    }
+    announcements.push(unsealNetworkFrame(JSON.parse(bytes.toString()), keys));
+    const reply = sealNetworkFrame(
+      { type: 'discovery', endpointAddr: advertisedLanAddress, expires: Date.now() + 10_000, reply: true },
+      keys,
+      remote.nodeId,
+    );
+    remoteSocket.send(Buffer.from(JSON.stringify(reply)), rinfo.port, rinfo.address);
+  });
+  await new Promise<void>(resolve => remoteSocket.bind(remotePort, () => resolve()));
+  await transport.mountNetwork({ networkId, passphrase, mDnsPort: remotePort });
+  const routedEndpoint = `${tailscaleAddress}:${peerPort}`;
+  await eventually(() => assert.equal(transport.listPeerEndpoints(networkId).get(remote.nodeId), routedEndpoint));
+  clearInterval(transport['timer']);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(announcements.length, 1, 'one announce, one reply, no discovery ping-pong');
+  assert.equal(announcements[0].type, 'discovery');
+  assert.equal(announcements[0].reply, undefined);
+  const card = signNodeCard({
+    nodeId: remote.nodeId, networkId, revision: 1,
+    identity: { member: 'ben', nodeName: 'ben-mac-mini' },
+    admissionMode: 'open', capabilities: { summary: 'remote', skills: [] },
+    runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+    endpointAddr: advertisedLanAddress, updatedAt: new Date().toISOString(),
+  }, remote.privateKeyPem);
+  kernel.ctx.emit('transport/inbound', {
+    networkId, senderNodeId: remote.nodeId, mode: 'unicast', payload: { type: 'peer.card', card },
+  });
+  assert.equal(transport.listPeerEndpoints(networkId).get(remote.nodeId), routedEndpoint,
+    'a card advertising the LAN address must not replace the routed Tailscale endpoint');
+});
+
+test('project linking merges newly published onboarding bootstrap peers into a mounted network', async t => {
+  const root = directory(t);
+  mkdirSync(join(root, '.dealer'));
+  const path = join(root, '.dealer/project.json');
+  const manifest = { schema: 'the-dealer-project/v1', projectId: 'merge', defaultNetworkId: 'merge-team',
+    onboarding: { passphrase: 'merge-secret', bootstrapPeers: ['127.0.0.1:45671'] } };
+  writeFileSync(path, JSON.stringify(manifest));
+  const runtime = new DealerNodeRuntime({ stateDir: join(root, 'state'), transport: { discoveryDir: join(root, 'discovery') } });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  await runtime.linkProject(root);
+  assert.deepEqual(runtime.transport.getNetworkConfig('merge-team')?.bootstrapPeers, ['127.0.0.1:45671']);
+  writeFileSync(path, JSON.stringify({ ...manifest,
+    onboarding: { ...manifest.onboarding, bootstrapPeers: ['127.0.0.1:45671', '127.0.0.1:45672'] } }));
+  await runtime.linkProject(root);
+  assert.deepEqual(runtime.transport.getNetworkConfig('merge-team')?.bootstrapPeers, ['127.0.0.1:45671', '127.0.0.1:45672']);
+  assert.deepEqual(runtime.config.networks.find(network => network.networkId === 'merge-team')?.bootstrapPeers,
+    ['127.0.0.1:45671', '127.0.0.1:45672']);
+  await runtime.linkProject(root);
+  assert.deepEqual(runtime.transport.getNetworkConfig('merge-team')?.bootstrapPeers, ['127.0.0.1:45671', '127.0.0.1:45672']);
+  await runtime.stop();
+  writeFileSync(path, JSON.stringify({ ...manifest, onboarding: { ...manifest.onboarding,
+    bootstrapPeers: ['127.0.0.1:45671', '127.0.0.1:45672', '127.0.0.1:45673'] } }));
+  const restored = new DealerNodeRuntime({ stateDir: runtime.stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await restored.start();
+  t.after(() => restored.stop());
+  assert.deepEqual(restored.transport.getNetworkConfig('merge-team')?.bootstrapPeers,
+    ['127.0.0.1:45671', '127.0.0.1:45672', '127.0.0.1:45673']);
 });
 
 

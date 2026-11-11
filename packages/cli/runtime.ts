@@ -530,12 +530,21 @@ export class DealerNodeRuntime {
         this.config.skills = [...new Set([...this.config.skills, ...(manifest.skills ?? []), ...(userPatch?.skills ?? [])])];
         await this.publishSkills();
         this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
-        if (!options.restore && onboardingPassphrase && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
+        if (onboardingPassphrase && !options.restore && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
           await this.mountNetwork({
             networkId: onboardingNetworkId,
             passphrase: onboardingPassphrase,
             ...(manifest.onboarding?.bootstrapPeers?.length ? { bootstrapPeers: manifest.onboarding.bootstrapPeers } : {}),
           });
+        } else if (onboardingPassphrase && this.transport.listMountedNetworks().includes(onboardingNetworkId) &&
+                   manifest.onboarding?.bootstrapPeers?.length) {
+          // Linking or restoring a project also adds newly published project seeds to
+          // an already-mounted network instead of requiring a manual remount.
+          const current = this.transport.getNetworkConfig(onboardingNetworkId);
+          const mergedSeeds = [...new Set([...(current?.bootstrapPeers ?? []), ...manifest.onboarding.bootstrapPeers])];
+          if (current && mergedSeeds.length > (current.bootstrapPeers?.length ?? 0)) {
+            await this.mountNetwork({ ...current, bootstrapPeers: mergedSeeds });
+          }
         }
       });
       this.loadedProjects.set(manifest.projectId, { manifest, plugins, userPatch, rootPath });
