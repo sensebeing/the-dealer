@@ -1096,6 +1096,74 @@ test('spawned terminal handles persist across deferral and completion', async t 
   assert.equal(store.getWakeTarget('stream:direct')!.pendingWake, false);
 });
 
+test('a retry rebinds a closed persisted terminal to the live one before delivering', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'fixed');
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees: [
+        { path: workspacePath, worktreeId: 'fixed', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: [
+        { handle: 'term-live', connected: true, writable: true, agentIdentity: 'antigravity' },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'send') {
+      const handle = String(request.args[request.args.indexOf('--terminal') + 1]);
+      return { stdout: JSON.stringify({ ok: handle !== 'term-dead' }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+  t.after(() => service.stop());
+  store.enqueue([alert('heal')], { mailboxId: 'box', wakeTarget: {
+    mode: 'orca-terminal', workspacePath, terminalHandle: 'term-dead',
+  } });
+
+  // Attempt 0 trusts the persisted binding: no re-resolution, and the closed handle rejects it.
+  const failed = await service.flushMailbox('box');
+  assert.equal(failed.woke, false);
+  assert.match(failed.reason!, /Orca terminal send failed/);
+  const firstSends = terminalSends(calls);
+  assert.equal(firstSends.length, 1);
+  assert.equal(firstSends[0].args[firstSends[0].args.indexOf('--terminal') + 1], 'term-dead');
+  assert.equal(
+    calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list').length,
+    1,
+    'attempt 0 uses the persisted handle without resolving a replacement',
+  );
+  assert.equal(store.getWakeTarget('box')!.attemptCount, 1);
+
+  // The retry re-resolves with the persisted handle as preference; the closed handle is gone, so
+  // the live connected terminal is bound and persisted instead of injecting into the dead one.
+  calls.length = 0;
+  const healed = await service.flushMailbox('box', { force: true });
+  assert.equal(healed.woke, true, healed.reason);
+  const sends = terminalSends(calls);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].args[sends[0].args.indexOf('--terminal') + 1], 'term-live');
+  assert.match(textOf(sends[0]), /^You have 1 Dealer message\(s\) in box/);
+  assert.equal(
+    calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list').length,
+    2,
+    'idle proof plus retry-time terminal resolution',
+  );
+  assert.equal(
+    calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'create').length,
+    0,
+    'the live terminal is reused instead of spawning another',
+  );
+  const target = store.getWakeTarget('box')!;
+  assert.equal(target.terminalHandle, 'term-live');
+  assert.equal(target.pendingWake, false);
+  assert.equal(target.attemptCount, 0);
+});
+
 for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
   test(`${mode} uncertain external delivery retries with backoff and self-heals`, async t => {
     t.mock.timers.enable({ apis: ['Date'], now: 20_000 });
