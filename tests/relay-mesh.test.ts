@@ -34,13 +34,32 @@ async function until(check: () => boolean, timeoutMs = 30_000) {
 async function relayMesh(t: TestContext, root: string) {
   // The seed is reached over TCP bootstrap peers only; skipping multicast keeps these
   // tests off the UDP discovery port that other suites bind in parallel.
-  const relay = new P2PTransportService({ discoveryDir: join(root, 'relay'), multicast: false });
-  const kernels: Kernel[] = [];
+  const seedKeys = generateNodeKeyPair();
+  const seedKernel = new Kernel([
+    {
+      plugin: createTransportPlugin({
+        localNodeId: seedKeys.nodeId,
+        discoveryDir: join(root, 'relay'),
+        multicast: false,
+      }),
+    },
+    {
+      plugin: createNodePlugin({
+        keyPair: seedKeys,
+        member: 'seed',
+        nodeName: 'node-seed',
+        capabilities: { summary: 'seed', skills: [] },
+        exchangeIntervalMs: 100,
+      }),
+    },
+  ]);
+  const kernels: Kernel[] = [seedKernel];
   t.after(async () => {
     await Promise.all(kernels.map(kernel => kernel.stop()));
-    await relay.dispose();
     await rm(root, { recursive: true, force: true });
   });
+  await seedKernel.start();
+  const relay = seedKernel.ctx.services.transport as P2PTransportService;
   await relay.mountNetwork({ networkId: 'relay-net', passphrase: 'secret' });
   const seed = relay.endpointAddr!;
 
@@ -74,12 +93,12 @@ async function relayMesh(t: TestContext, root: string) {
     await transport.mountNetwork({ networkId: 'relay-net', passphrase: 'secret', bootstrapPeers: [seed] });
     return { kernel, transport, node: kernel.ctx.services.node as PeerDirectoryService };
   };
-  return { seed, isolated };
+  return { seed, relay, isolated };
 }
 
 test('isolated nodes discover and exchange through a sealed relay seed', async t => {
   const root = await mkdtemp(join(tmpdir(), 'dealer-relay-'));
-  const { isolated } = await relayMesh(t, root);
+  const { isolated, relay } = await relayMesh(t, root);
 
   const alice = await isolated('alice');
   const bob = await isolated('bob');
@@ -92,6 +111,12 @@ test('isolated nodes discover and exchange through a sealed relay seed', async t
   // NodeCards travel as broadcast frames over the relay.
   await until(() => alice.node.listPeers({ networkId: 'relay-net' }).some(card => card.identity.member === 'bob'));
   await until(() => bob.node.listPeers({ networkId: 'relay-net' }).some(card => card.identity.member === 'alice'));
+  // The seed's own NodeCard can only reach either peer down that peer's tunnel to the
+  // seed: their advertised TEST-NET-1 endpoints are not reachable from the seed.
+  await until(() =>
+    alice.node.listPeers({ networkId: 'relay-net' }).some(card => card.nodeId === relay.localNodeId));
+  await until(() =>
+    bob.node.listPeers({ networkId: 'relay-net' }).some(card => card.nodeId === relay.localNodeId));
 
   const received: string[] = [];
   bob.kernel.ctx.on('transport/inbound', event => {
@@ -120,6 +145,12 @@ test('isolated nodes discover and exchange through a sealed relay seed', async t
   const destination = join(root, 'bob-received', 'report.bin');
   await bob.transport.fetchBlobToPath(blob.ticket, destination);
   assert.deepEqual(await readFile(destination), bytes);
+
+  // The seed is just another peer: Alice's advertised endpoint is unreachable from it
+  // as well, so the blob must come back down Alice's own tunnel to the seed.
+  const seedCopy = join(root, 'seed-received', 'report.bin');
+  await relay.fetchBlobToPath(blob.ticket, seedCopy);
+  assert.deepEqual(await readFile(seedCopy), bytes);
 });
 
 test('the relay packet budget bounds blobs: the largest legal one crosses the seed tunnel', async t => {

@@ -143,8 +143,10 @@ test('runtime start reclaims a lock left by a dead owner but refuses a live owne
   assert.equal(existsSync(`${lockDir}.reclaim`), false, 'the reclaim gate is released');
   await runtime.stop();
   assert.equal(existsSync(lockDir), false, 'a dead owner lock is reclaimed and released');
+  // A live foreign process keeps its lock; a same-PID file with no active in-process
+  // owner is a previous incarnation (container PID reuse) and is covered separately.
   mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid }));
+  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.ppid }));
   const blocked = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
   await assert.rejects(blocked.start(), /State directory already owned/);
   assert.equal(existsSync(join(lockDir, 'owner.json')), true, 'a live owner keeps its lock');
@@ -166,7 +168,7 @@ test('runtime start recovers a reclaim gate left by a dead reclaimer', async t =
   const stateDir = join(root, 'state');
   const lockDir = join(stateDir, 'runtime.lock');
   const reclaimDir = `${lockDir}.reclaim`;
-  const liveOwnerFile = `owner.${process.pid}.json`;
+  const liveOwnerFile = `owner.${process.ppid}.json`;
   const seedOwner = (dir: string, ownerFile: string, pid: number) => {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     writeFileSync(join(dir, ownerFile), JSON.stringify({ pid }));
@@ -187,7 +189,7 @@ test('runtime start recovers a reclaim gate left by a dead reclaimer', async t =
   // unlink a file it cannot prove dead, nor the dead files next to it.
   seedOwner(lockDir, 'owner.json', 999999);
   seedOwner(reclaimDir, 'owner.999999.json', 999999);
-  seedOwner(reclaimDir, liveOwnerFile, process.pid);
+  seedOwner(reclaimDir, liveOwnerFile, process.ppid);
   const blocked = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
   await assert.rejects(blocked.start(), /State directory already owned/);
   assert.equal(existsSync(join(reclaimDir, liveOwnerFile)), true, 'a live reclaim gate survives');

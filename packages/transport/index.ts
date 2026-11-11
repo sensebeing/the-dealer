@@ -328,6 +328,9 @@ interface Tunnel {
   pending: Map<string, RelayPending>;
 }
 
+/** How this node reaches a peer whose advertised endpoint is not routable from here. */
+type BlobFallback = { tunnel: Tunnel } | { mount: Mount; seed: string };
+
 interface Mount {
   config: NetworkMountConfig;
   keys: DerivedNetworkKeys;
@@ -853,7 +856,12 @@ export class P2PTransportService implements TransportService {
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
   ): Promise<Uint8Array> {
     const address = m.peers.get(target);
+    // A peer that opened its tunnel towards this node is directly reachable through
+    // it even when the endpoint it advertises is NAT-bound.
+    const tunnel = m.inboundTunnels.get(target);
     const relays = this.relayCandidates(m, target);
+    const fallback = tunnel !== undefined || relays.length > 0;
+    let lastError: Error = new Error(`Unknown peer: ${target}`);
     if (address) {
       try {
         return await this.directExchange(
@@ -861,17 +869,24 @@ export class P2PTransportService implements TransportService {
           target,
           address,
           frame,
-          relays.length ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs,
+          fallback ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs,
         );
       } catch (error) {
-        if (!relays.length) {
-          throw error;
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (!fallback) {
+          throw lastError;
         }
       }
-    } else if (!relays.length) {
-      throw new Error(`Unknown peer: ${target}`);
+    } else if (!fallback) {
+      throw lastError;
     }
-    let lastError: Error = new Error(`Unknown peer: ${target}`);
+    if (tunnel) {
+      try {
+        return await this.exchangeOverTunnel(m, target, tunnel, frame, timeoutMs);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
     for (const seed of relays) {
       try {
         return await this.relayExchange(m, seed, target, frame, timeoutMs);
@@ -963,6 +978,28 @@ export class P2PTransportService implements TransportService {
     } finally {
       socket.destroy();
     }
+  }
+
+  /** Push one frame down the target's own inbound tunnel and bind its sealed reply. */
+  private async exchangeOverTunnel(
+    m: Mount,
+    target: string,
+    tunnel: Tunnel,
+    frame: SealedNetworkFrame,
+    timeoutMs: number,
+  ): Promise<Uint8Array> {
+    const response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs);
+    if (response?.error) {
+      throw new Error(String(response.error));
+    }
+    const payload = unsealNetworkFrame<{
+      requestNonce: string;
+      dataBase64: string;
+    }>(response.frame, m.keys);
+    if (response.frame.senderNodeId !== target || payload.requestNonce !== frame.nonce) {
+      throw new Error('Response binding mismatch');
+    }
+    return Buffer.from(payload.dataBase64, 'base64');
   }
 
   async sendUnicast(
@@ -1083,16 +1120,21 @@ export class P2PTransportService implements TransportService {
       }
     });
     socket.write(packet({ type: 'tunnel', frame: this.discoveryFrame(m) }));
-    void this.serveOutboundTunnel(m, socket).catch(() => socket.destroy());
+    void this.serveOutboundTunnel(m, socket, seed).catch(() => socket.destroy());
   }
 
-  private async serveOutboundTunnel(m: Mount, socket: Socket): Promise<void> {
+  private async serveOutboundTunnel(m: Mount, socket: Socket, seed: string): Promise<void> {
     const reader = new SocketReader(socket);
     while (!socket.destroyed) {
       const message = await reader.json();
       if (message?.type === 'relay_deliver' && typeof message.relayId === 'string' && message.frame) {
         try {
           const event = this.inboundEvent(m, message.frame);
+          // A frame this seed carried down our tunnel proves the seed can relay back
+          // to its sender even when the sender's advertised endpoint is NAT-bound.
+          if (!m.relays.has(event.senderNodeId)) {
+            m.relays.set(event.senderNodeId, seed);
+          }
           const reply = await this.inboundReply(event);
           socket.write(packet({
             type: 'relay_reply',
@@ -1173,17 +1215,20 @@ export class P2PTransportService implements TransportService {
     }
   }
 
-  /** Send one request down a peer's tunnel; the requester's socket closing aborts it. */
+  /** Send one request down a peer's tunnel; a request socket closing aborts it. */
   private requestOverTunnel(
     tunnel: Tunnel,
     body: Record<string, unknown>,
-    requestSocket: Socket,
+    requestSocket?: Socket,
+    timeoutMs = this.options.socketTimeoutMs ?? 90_000,
   ): Promise<any> {
     const relayId = randomUUID();
     return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const finish = (error?: Error, message?: any) => {
+        clearTimeout(timer);
         tunnel.pending.delete(relayId);
-        requestSocket.off('close', abort);
+        requestSocket?.off('close', abort);
         tunnel.socket.off('close', abort);
         if (error) reject(error); else resolve(message);
       };
@@ -1192,8 +1237,13 @@ export class P2PTransportService implements TransportService {
         resolve: message => finish(undefined, message),
         reject: error => finish(error),
       });
-      requestSocket.once('close', abort);
+      requestSocket?.once('close', abort);
       tunnel.socket.once('close', abort);
+      // The persistent tunnel socket itself never times out: a locally issued request
+      // needs its own deadline, while a forwarded one is bounded by its requester.
+      if (!requestSocket) {
+        timer = setTimeout(() => finish(new Error('Relay tunnel timeout')), timeoutMs);
+      }
       try {
         tunnel.socket.write(packet({ ...body, relayId }));
       } catch (error) {
@@ -1202,7 +1252,7 @@ export class P2PTransportService implements TransportService {
     });
   }
 
-  private async blobOverTunnel(tunnel: Tunnel, hash: string, requestSocket: Socket): Promise<Buffer> {
+  private async blobOverTunnel(tunnel: Tunnel, hash: string, requestSocket?: Socket): Promise<Buffer> {
     const response = await this.requestOverTunnel(tunnel, { type: 'relay_blob_req', hash }, requestSocket);
     if (response?.error) {
       throw new Error(String(response.error));
@@ -1452,7 +1502,7 @@ export class P2PTransportService implements TransportService {
     if (!address) {
       throw new Error('Transport endpoint unavailable');
     }
-    const relay = nodeId === this.localNodeId ? undefined : this.relayMountFor(nodeId);
+    const relay = nodeId === this.localNodeId ? undefined : this.blobFallbackFor(nodeId);
     try {
       try {
         await this.fetchBlobDirect(address, hash, size, temp, relay !== undefined);
@@ -1460,10 +1510,14 @@ export class P2PTransportService implements TransportService {
         if (!relay) {
           throw error;
         }
-        // The advertised endpoint is NAT-bound; fetch through the seed that
-        // already keeps a tunnel towards the sender.
+        // The advertised endpoint is NAT-bound; use this node's own inbound tunnel to
+        // the sender, or else the seed that already keeps a tunnel towards it.
         await rm(temp, { force: true });
-        await this.fetchBlobRelay(relay, nodeId, hash, size, temp);
+        if ('tunnel' in relay) {
+          await this.writeBlobBytes(await this.blobOverTunnel(relay.tunnel, hash), size, hash, temp);
+        } else {
+          await this.fetchBlobRelay(relay, nodeId, hash, size, temp);
+        }
       }
       await rename(temp, destPath);
     } finally {
@@ -1471,7 +1525,14 @@ export class P2PTransportService implements TransportService {
     }
   }
 
-  private relayMountFor(nodeId: string): { mount: Mount; seed: string } | undefined {
+  /** The most direct way to reach a peer whose advertised endpoint is not routable. */
+  private blobFallbackFor(nodeId: string): BlobFallback | undefined {
+    for (const mount of this.mounts.values()) {
+      const tunnel = mount.inboundTunnels.get(nodeId);
+      if (tunnel) {
+        return { tunnel };
+      }
+    }
     for (const mount of this.mounts.values()) {
       const seed = mount.relays.get(nodeId);
       if (seed && seed !== this.endpointAddr) {
@@ -1577,6 +1638,16 @@ export class P2PTransportService implements TransportService {
         await once(output, 'close').catch(() => {});
       }
     }
+  }
+
+  /** Persist a blob received as one packet under the same size/hash contract as streaming. */
+  private async writeBlobBytes(bytes: Buffer, size: number, hash: string, temp: string): Promise<void> {
+    const digest = new Blake3Hasher();
+    digest.update(bytes);
+    if (bytes.length !== size || digest.digest() !== hash) {
+      throw new Error('Blob hash or size mismatch');
+    }
+    await writeFile(temp, bytes, { flags: 'wx', mode: 0o600 });
   }
 
   async dispose(): Promise<void> {
