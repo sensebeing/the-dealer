@@ -411,7 +411,14 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   if (!isRecord(value)) {
     throw invalidStore();
   }
-  const target = value as unknown as WakeTargetState;
+  if (value.deliveryInDoubt !== undefined && typeof value.deliveryInDoubt !== 'boolean') {
+    throw invalidStore();
+  }
+  // `deliveryInDoubt` is retired: pre-self-heal stores parked targets behind this fence. Strip it
+  // on every validation so a loaded target is never written back with the legacy field.
+  const fields: Record<string, unknown> = { ...value };
+  delete fields.deliveryInDoubt;
+  const target = fields as unknown as WakeTargetState;
   if (target.hostAgent !== undefined && !['codex', 'claude', 'claude-code', 'antigravity', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
   if (target.conversationMode !== undefined && !['spawn', 'fixed'].includes(target.conversationMode)) throw invalidStore();
   if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
@@ -672,10 +679,19 @@ function loadState(raw: string): MailboxFileState {
   for (const [key, value] of Object.entries(mailboxes)) {
     validateMailboxRecord(key, value);
   }
+  const normalizedWakeTargets: Record<string, WakeTargetState> = {};
   for (const [key, value] of Object.entries(wakeTargets)) {
-    if (validateWakeTarget(value).mailboxId !== key) {
+    const target = validateWakeTarget(value);
+    if (target.mailboxId !== key) {
       throw invalidStore();
     }
+    // A legacy target was parked permanently after an unknown external delivery outcome. The
+    // fence is retired, so re-arm the wake whenever the mailbox still holds queued mail: an
+    // upgrade must self-heal those mailboxes instead of leaving them silent forever.
+    const legacyParked = isRecord(value) && value.deliveryInDoubt === true;
+    normalizedWakeTargets[key] = legacyParked && items.some(
+      item => item.mailboxId === key && item.status === 'queued',
+    ) ? { ...target, pendingWake: true } : target;
   }
   const normalizedThreads: Record<string, ThreadRouteRecord> = {};
   for (const [key, value] of Object.entries(threads)) {
@@ -696,7 +712,7 @@ function loadState(raw: string): MailboxFileState {
     sequence,
     items,
     mailboxes: mailboxes as Record<string, MailboxStateRecord>,
-    wakeTargets: wakeTargets as Record<string, WakeTargetState>,
+    wakeTargets: normalizedWakeTargets,
     threads: normalizedThreads,
   };
 }

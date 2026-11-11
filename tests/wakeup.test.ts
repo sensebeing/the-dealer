@@ -2,7 +2,7 @@ import { checkOrcaWorkspaceIdle, isAutopilotComposerPrefill, sendOrcaTerminalTex
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -1162,6 +1162,41 @@ test('a retry rebinds a closed persisted terminal to the live one before deliver
   assert.equal(target.terminalHandle, 'term-live');
   assert.equal(target.pendingWake, false);
   assert.equal(target.attemptCount, 0);
+});
+
+test('a legacy delivery-in-doubt target self-heals when the store loads', async t => {
+  const root = directory(t);
+  const path = join(root, 'mailbox.json');
+  new MailboxStore(path).enqueue([alert('legacy')], { mailboxId: 'box', wakeTarget: {
+    mode: 'orca-run', runId: 'run-legacy',
+  } });
+  // Reproduce the pre-self-heal shape: a parked target fenced by a persisted doubt flag.
+  const raw = JSON.parse(readFileSync(path, 'utf8'));
+  raw.wakeTargets.box = {
+    ...raw.wakeTargets.box, deliveryInDoubt: true, pendingWake: false, earliestWakeAt: 0,
+  };
+  writeFileSync(path, JSON.stringify(raw));
+
+  const store = new MailboxStore(path);
+  const loaded = store.getWakeTarget('box')!;
+  assert.equal(loaded.pendingWake, true);
+  assert.equal(Object.hasOwn(loaded, 'deliveryInDoubt'), false);
+
+  const calls: CommandRequest[] = [];
+  const service = new WakeupRedriveService({ store, flushIntervalMs: 100_000, commandRunner: async request => {
+    calls.push(request);
+    return { stdout: '{"ok":true}' };
+  } });
+  t.after(() => service.stop());
+  const flushed = await service.flushReady();
+  assert.equal(flushed.length, 1);
+  assert.equal(flushed[0].woke, true, flushed[0].reason);
+  const sent = calls.find(call => call.args[0] === 'orchestration');
+  assert.ok(sent, 'legacy wake delivered through Orca');
+  assert.match(bodyOf(sent), /^You have 1 Dealer message\(s\) in box/);
+  assert.equal(store.getWakeTarget('box')!.pendingWake, false);
+  // The retired field must not leak back into the store on the next write.
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).wakeTargets.box.deliveryInDoubt, undefined);
 });
 
 for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
