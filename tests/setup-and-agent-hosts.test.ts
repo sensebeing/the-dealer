@@ -967,20 +967,20 @@ test('TCP seed probes are bounded across 50ms ticks for discovered and unavailab
   await peer.mountNetwork({ networkId: 'foreign', passphrase: 'wrong', bootstrapPeers: [seed.endpointAddr!, '127.0.0.1:1'] });
   await peer.mountNetwork({ networkId: 'team', passphrase: 'shared', bootstrapPeers: [seed.endpointAddr!] });
   clearInterval(peer['timer']);
-  assert.equal(attempts.mock.callCount(), 6, 'one probe and one persistent tunnel per seed');
-  assert.equal(await settledConnections(4), 4, 'two probes and two tunnels reach the seed');
+  assert.equal(attempts.mock.callCount(), 4, 'foreign and unavailable seeds do not open wasted tunnels');
+  assert.equal(await settledConnections(3), 3, 'only the verified team seed gets a persistent tunnel');
   assert.equal(peer.listPeerEndpoints('team').get(seed.localNodeId), seed.endpointAddr);
   assert.equal(peer.listPeerEndpoints('foreign').size, 0);
   for (let tick = 1; tick < 40; tick++) {
     t.mock.timers.tick(50);
     await peer['discover']();
   }
-  assert.equal(attempts.mock.callCount(), 6, 'no TCP churn during fast discovery ticks');
-  assert.equal(connections, 4, 'no TCP churn during fast discovery ticks');
+  assert.equal(attempts.mock.callCount(), 4, 'no TCP churn during fast discovery ticks');
+  assert.equal(connections, 3, 'no TCP churn during fast discovery ticks');
   t.mock.timers.tick(50);
   await peer['discover']();
-  assert.equal(attempts.mock.callCount(), 11, 'known, failed and rejected-tunnel seeds retry at the bounded interval');
-  assert.equal(await settledConnections(7), 7, 'both known and failed seeds are retried at the bounded interval');
+  assert.equal(attempts.mock.callCount(), 7, 'known, failed and rejected-tunnel seeds retry at the bounded interval');
+  assert.equal(await settledConnections(5), 5, 'only verified seeds open tunnels on retry');
 });
 
 test('Tailscale unicast UDP discovery answers once and keeps the routed host through peer cards', async t => {
