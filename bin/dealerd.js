@@ -12,6 +12,8 @@ try {
     }
     stopping = true;
     await runtime.stop();
+    // Residue from external plugins must not keep a stopping daemon alive.
+    process.exit(0);
   };
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);

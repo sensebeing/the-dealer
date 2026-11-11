@@ -130,6 +130,23 @@ test('project onboarding validates fields and probe normalizes defaults without 
   assert.equal(probe().node.larkNotify, null);
 });
 
+test('runtime start reclaims a lock left by a dead owner but refuses a live owner', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const lockDir = join(stateDir, 'runtime.lock');
+  mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: 999999 }));
+  const runtime = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await runtime.start();
+  await runtime.stop();
+  assert.equal(existsSync(lockDir), false, 'a dead owner lock is reclaimed and released');
+  mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid }));
+  const blocked = new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'discovery') } });
+  await assert.rejects(blocked.start(), /State directory already owned/);
+  assert.equal(existsSync(join(lockDir, 'owner.json')), true, 'a live owner keeps its lock');
+});
+
 test('project link mounts its onboarding network once and preserves an existing mount', async t => {
   const root = directory(t);
   mkdirSync(join(root, '.dealer'));

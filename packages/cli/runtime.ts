@@ -193,19 +193,53 @@ export class DealerNodeRuntime {
     saveJson(join(this.stateDir, 'config.json'), this.config);
   }
 
+  /** Take over runtime.lock only when the recorded owner process is proven gone. */
+  private reclaimStaleLock(lockDir: string): boolean {
+    let pid: unknown;
+    try {
+      pid = (JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')) as { pid?: unknown }).pid;
+    } catch {
+      return false;
+    }
+    if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
+      return false;
+    }
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+        return false;
+      }
+    }
+    try {
+      rmSync(lockDir, { recursive: true, force: true });
+      mkdirSync(lockDir);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async start(): Promise<this> {
     if (this.started) {
       return this;
     }
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     chmodSync(this.stateDir, 0o700);
+    const lockDir = join(this.stateDir, 'runtime.lock');
     try {
-      mkdirSync(join(this.stateDir, 'runtime.lock'));
+      mkdirSync(lockDir);
       this.ownsLock = true;
     } catch {
-      throw new Error(
-        'State directory already owned; use the running daemon (remove runtime.lock only after verifying its process stopped)',
-      );
+      // A daemon killed inside its shutdown window leaves runtime.lock behind;
+      // reclaim it only when the recorded owner is proven to be gone.
+      if (!this.reclaimStaleLock(lockDir)) {
+        throw new Error(
+          'State directory already owned; use the running daemon (remove runtime.lock only after verifying its process stopped)',
+        );
+      }
+      this.ownsLock = true;
     }
     try {
       saveJson(join(this.stateDir, 'runtime.lock', 'owner.json'), { pid: process.pid });
@@ -1179,10 +1213,14 @@ export class DealerNodeRuntime {
   }
 
   async stop(): Promise<void> {
-    if (this.server?.listening) {
-      await new Promise<void>((resolve, reject) => {
-        this.server!.close(error => (error ? reject(error) : resolve()));
-      });
+    const hadServer = this.server !== undefined;
+    if (this.server) {
+      this.server.closeAllConnections?.();
+      if (this.server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          this.server!.close(error => (error ? reject(error) : resolve()));
+        });
+      }
     }
     this.server = undefined;
     try {
@@ -1193,7 +1231,10 @@ export class DealerNodeRuntime {
         this.larkNotifier = undefined;
       } finally {
         if (this.ownsLock) {
-          rmSync(this.socketPath, { force: true });
+          // Only the instance that created the control server may remove its socket.
+          if (hadServer) {
+            rmSync(this.socketPath, { force: true });
+          }
           rmSync(join(this.stateDir, 'runtime.lock'), { recursive: true, force: true });
           this.ownsLock = false;
         }
