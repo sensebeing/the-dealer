@@ -406,6 +406,10 @@ export class P2PTransportService implements TransportService {
   }
 
   private track(socket: Socket): Socket {
+    if (this.closed) {
+      socket.destroy();
+      return socket;
+    }
     this.sockets.add(socket);
     socket.once('close', () => this.sockets.delete(socket));
     socket.setTimeout(this.options.socketTimeoutMs ?? 90_000, () =>
@@ -727,6 +731,9 @@ export class P2PTransportService implements TransportService {
   }
 
   private async announce(m: Mount): Promise<void> {
+    if (this.closed || !this.mounts.has(m.config.networkId)) {
+      return;
+    }
     const { frame, expires } = this.localBeacon(m);
     m.beacons.set(this.localNodeId, { frame, expires });
     this.pruneBeacons(m);
@@ -1148,6 +1155,9 @@ export class P2PTransportService implements TransportService {
     seedHasTunnel: boolean,
     priorEntry?: { socket: Socket; seed: string; acked: boolean },
   ): void {
+    if (this.closed || !this.mounts.has(m.config.networkId)) {
+      return;
+    }
     const existing = m.outboundTunnels.get(seedNodeId);
     if (existing && !existing.socket.destroyed) {
       if (existing !== priorEntry || !existing.acked || seedHasTunnel) return;
@@ -1711,7 +1721,11 @@ export class P2PTransportService implements TransportService {
     this.closed = true;
     await this.starting?.catch(() => {});
     clearInterval(this.timer);
-    await this.tick;
+    const serverClose = this.server?.listening
+      ? new Promise<void>((resolve, reject) =>
+          this.server!.close(error => (error ? reject(error) : resolve())),
+        )
+      : undefined;
     for (const socket of this.sockets) {
       socket.destroy();
     }
@@ -1722,11 +1736,8 @@ export class P2PTransportService implements TransportService {
         // Not bound
       }
     }
-    if (this.server?.listening) {
-      await new Promise<void>((resolve, reject) =>
-        this.server!.close(error => (error ? reject(error) : resolve())),
-      );
-    }
+    await this.tick;
+    await serverClose;
     await Promise.all([...this.mounts.values()].map(m => rm(m.file, { force: true })));
     this.mounts.clear();
     this.handlers.clear();

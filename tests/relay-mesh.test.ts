@@ -41,7 +41,7 @@ async function relayMesh(t: TestContext, root: string) {
         localNodeId: seedKeys.nodeId,
         discoveryDir: join(root, 'relay'),
         multicast: false,
-        socketTimeoutMs: 400,
+        socketTimeoutMs: 10_000,
       }),
     },
     {
@@ -55,7 +55,9 @@ async function relayMesh(t: TestContext, root: string) {
     },
   ]);
   const kernels: Kernel[] = [seedKernel];
+  const transports: P2PTransportService[] = [];
   t.after(async () => {
+    await Promise.all(transports.map(transport => transport.dispose()));
     await Promise.all(kernels.map(kernel => kernel.stop()));
     await rm(root, { recursive: true, force: true });
   });
@@ -94,7 +96,7 @@ async function relayMesh(t: TestContext, root: string) {
     await transport.mountNetwork({ networkId: 'relay-net', passphrase: 'secret', bootstrapPeers: [seed] });
     return { kernel, transport, node: kernel.ctx.services.node as PeerDirectoryService };
   };
-  return { seed, relay, isolated };
+  return { seed, relay, isolated, transports };
 }
 
 test('isolated nodes discover and exchange through a sealed relay seed', async t => {
@@ -184,7 +186,7 @@ test('bootstrap tunnel identity deduplicates aliases, ignores self, and replaces
 
 test('the relay packet budget bounds blobs: the largest legal one crosses the seed tunnel', async t => {
   const root = await mkdtemp(join(tmpdir(), 'dealer-relay-blob-'));
-  const { seed } = await relayMesh(t, root);
+  const { seed, transports } = await relayMesh(t, root);
   // Blob transfers need no node-card exchange, so they run on bare transports and
   // leave the relay tunnel to the attachment.
   const peer = async (member: string) => {
@@ -196,7 +198,7 @@ test('the relay packet budget bounds blobs: the largest legal one crosses the se
       advertisedHost: '192.0.2.1',
       socketTimeoutMs: 10_000,
     });
-    t.after(() => transport.dispose());
+    transports.push(transport);
     await transport.mountNetwork({ networkId: 'relay-net', passphrase: 'secret', bootstrapPeers: [seed] });
     return transport;
   };
@@ -302,7 +304,6 @@ function framedPacket(value: unknown): Buffer {
 
 test('only a strictly newer gossiped beacon can overwrite a peer endpoint or relay seed', async t => {
   const root = await mkdtemp(join(tmpdir(), 'dealer-beacon-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
   const keys = deriveNetworkKeys('beacon-net', 'secret');
   const alice = generateNodeKeyPair().nodeId;
   const expires = Date.now() + 20_000;
@@ -339,7 +340,10 @@ test('only a strictly newer gossiped beacon can overwrite a peer endpoint or rel
     multicast: false,
     socketTimeoutMs: 2_000,
   });
-  t.after(() => transport.dispose());
+  t.after(async () => {
+    await transport.dispose();
+    await rm(root, { recursive: true, force: true });
+  });
   await transport.mountNetwork({
     networkId: 'beacon-net',
     passphrase: 'secret',
