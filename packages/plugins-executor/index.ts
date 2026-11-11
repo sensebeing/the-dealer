@@ -386,9 +386,9 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
     name: 'orca-spawn',
     async execute(batch, context, runtimeConfig) {
       const runner = options.commandRunner ?? runCommand;
-      const command = options.orcaCommand ?? 'orca';
       const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
+      const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
       const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(batch[0]?.kind, typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined);
       const interactive = payload.interactive === true || binding?.conversationMode === 'spawn' || config.interactive === true || options.interactive === true;
       const store = options.store ?? config.store;
@@ -437,12 +437,15 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           ? payload.worktreeName.trim()
           : undefined;
       const seaCreatureNaming =
-        payload.seaCreatureNaming === true || options.seaCreatureNaming === true;
+        typeof payload.seaCreatureNaming === 'boolean' ? payload.seaCreatureNaming
+          : typeof config.seaCreatureNaming === 'boolean' ? config.seaCreatureNaming
+            : options.seaCreatureNaming === true;
+      const namePrefix = config.namePrefix?.trim() || options.namePrefix?.trim() || 'dealer';
       const name = explicitName
         ? explicitName
         : seaCreatureNaming
           ? await pickSeaCreatureName({ runner, command, cwd: worktreeCwd, issuedNames, signal: context.signal })
-          : `${options.namePrefix ?? 'dealer'}-${randomUUID()}`;
+          : `${namePrefix}-${randomUUID()}`;
       const createArgs = parentWorktree
         ? ['worktree', 'create', '--parent-worktree', parentWorktree, '--name', name, '--json']
         : ['worktree', 'create', '--no-parent', '--name', name, '--json'];

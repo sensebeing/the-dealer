@@ -220,6 +220,8 @@ test('orca-spawn honors receiver parent worktrees, explicit names and sea-creatu
     commandRunner,
     command: 'codex',
     cwd: '/workspace',
+    orcaCommand: 'option-orca',
+    namePrefix: 'option-prefix',
     seaCreatureNaming: true,
   });
   const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
@@ -247,10 +249,40 @@ test('orca-spawn honors receiver parent worktrees, explicit names and sea-creatu
   assert.ok(requests.some(r => r.args[0] === 'worktree' && r.args[1] === 'list'));
 
   requests.length = 0;
-  const fallback = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'claude', cwd: '/workspace' });
+  await executor.execute([envelope()], context, {
+    seaCreatureNaming: false, namePrefix: ' runtime-prefix ', orcaCommand: ' runtime-orca ',
+  });
+  assert.match(flagValue(createdArgs(), '--name'), /^runtime-prefix-/);
+  assert.equal(requests.some(r => r.args[1] === 'list'), false);
+  assert.ok(requests.every(r => r.command === 'runtime-orca'));
+
+  requests.length = 0;
+  await executor.execute([envelope({ payload: { seaCreatureNaming: false } })], context, {
+    seaCreatureNaming: true,
+  });
+  assert.match(flagValue(createdArgs(), '--name'), /^option-prefix-/);
+  assert.equal(requests.some(r => r.args[1] === 'list'), false);
+
+  requests.length = 0;
+  await executor.execute([envelope({ payload: { seaCreatureNaming: true } })], context, {
+    seaCreatureNaming: false,
+  });
+  assertSeaCreatureName(flagValue(createdArgs(), '--name'));
+  assert.ok(requests.every(r => r.command === 'option-orca'));
+
+  requests.length = 0;
+  const fallback = createOrcaSpawnExecutorPlugin({ commandRunner, command: 'claude', cwd: '/workspace', seaCreatureNaming: false });
   await fallback.execute([envelope()], context, {});
   assert.equal(flagValue(createdArgs(), '--parent-worktree'), 'path:/workspace');
   assert.match(String(flagValue(createdArgs(), '--name')), /^dealer-/);
+
+  requests.length = 0;
+  await fallback.execute([envelope()], context, {
+    seaCreatureNaming: true, orcaCommand: 'reloaded-orca',
+  });
+  assertSeaCreatureName(flagValue(createdArgs(), '--name'));
+  assert.ok(requests.some(r => r.args[1] === 'list'));
+  assert.ok(requests.every(r => r.command === 'reloaded-orca'));
 });
 
 test('orca-spawn runs orca inside a path parent worktree when no cwd is configured', async t => {
