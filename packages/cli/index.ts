@@ -70,6 +70,8 @@ const stringFlags = [
   'reply-to',
   'reply-mailbox',
   'target-mailbox',
+  'terminal-handle',
+  'worktree-id',
   'subject',
   'bootstrap-peers',
   'advertised-host',
@@ -132,6 +134,7 @@ export interface DealerCliOptions {
   stderr?: (line: string) => void;
   /** Aborted when the calling control request disconnects, so long waits release listeners. */
   signal?: AbortSignal;
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface ControlRpcOptions {
@@ -335,7 +338,14 @@ async function runInboxCommand(
   signal?: AbortSignal,
 ) {
   const command = action ?? 'list';
-  const mailboxId = v.mailbox as string | undefined;
+  const caller = resolveCallerOrcaBinding(v);
+  let mailboxId = v.mailbox as string | undefined;
+  if (command === 'check' && mailboxId === undefined && caller) {
+    const defaultItems = store.check({ mailboxId: 'default', peek: true }).items.length;
+    const callerItems = store.check({ mailboxId: caller.mailboxId, peek: true }).items.length;
+    if (defaultItems === 0 && callerItems > 0) mailboxId = caller.mailboxId;
+  }
+  if (caller && (mailboxId ?? 'default') === caller.mailboxId) bindCallerWakeTarget(store, caller.mailboxId, caller);
   const checkOnlyFlags =
     v.ack !== undefined || v.peek === true || v.wait === true || v['timeout-ms'] !== undefined;
   if (command === 'check') {
@@ -422,6 +432,40 @@ function replyTargetOrThrow(store: MailboxStore, messageId: string): ResolvedRep
   return route;
 }
 
+interface CallerOrcaBinding {
+  mailboxId: string;
+  terminalHandle?: string;
+  worktreeId?: string;
+  workspacePath?: string;
+}
+
+function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | undefined {
+  const terminalHandle = typeof v['terminal-handle'] === 'string' && v['terminal-handle'].trim()
+    ? v['terminal-handle'].trim() : undefined;
+  const worktreeId = typeof v['worktree-id'] === 'string' && v['worktree-id'].trim()
+    ? v['worktree-id'].trim() : undefined;
+  const explicitPath = typeof v['workspace-path'] === 'string' && v['workspace-path'].trim()
+    ? resolve(v['workspace-path'].trim()) : undefined;
+  const suffixPath = worktreeId?.includes('::') ? worktreeId.slice(worktreeId.indexOf('::') + 2) : undefined;
+  const workspacePath = explicitPath ?? (suffixPath ? resolve(suffixPath) : undefined);
+  if (!terminalHandle && !worktreeId && !workspacePath) return undefined;
+  const mailboxId = workspacePath ? `worktree:${basename(workspacePath)}`
+    : worktreeId ? `worktree:${basename(worktreeId)}` : `terminal:${terminalHandle}`;
+  return { mailboxId, ...(terminalHandle ? { terminalHandle } : {}), ...(worktreeId ? { worktreeId } : {}), ...(workspacePath ? { workspacePath } : {}) };
+}
+
+function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): void {
+  if (!caller) return;
+  const existing = store.getWakeTarget(mailboxId);
+  if (existing?.mode === 'orca-run' || (existing?.mode === 'passive' && existing.hostAgent !== undefined)) return;
+  store.upsertWakeTarget(mailboxId, {
+    mode: 'orca-terminal',
+    ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
+    ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
+    ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
+  });
+}
+
 function settlementOutcome(value: unknown): SettlementOutcome {
   if (value === 'succeeded' || value === 'failed' || value === 'cancelled') {
     return value;
@@ -476,6 +520,7 @@ async function runSessionCommand(
   group: 'ask' | 'reply' | 'settle',
   positional: string | undefined,
   v: Record<string, any>,
+  caller?: CallerOrcaBinding,
 ) {
   const store = runtime.mailbox;
   const callerMailboxFlag =
@@ -488,11 +533,12 @@ async function runSessionCommand(
       : undefined;
     if (replyTo !== undefined) {
       const route = replyTargetOrThrow(store, replyTo);
+      const replyMailbox = callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default');
+      bindCallerWakeTarget(store, replyMailbox, caller);
       if (ackId) {
-        store.ack(ackId, callerMailboxFlag ?? route.localMailbox);
+        store.ack(ackId, replyMailbox);
       }
       const body = required(v.body, '--body');
-      const replyMailbox = callerMailboxFlag ?? route.localMailbox;
       const targetMailbox =
         typeof v['target-mailbox'] === 'string' && v['target-mailbox']
           ? String(v['target-mailbox'])
@@ -528,14 +574,16 @@ async function runSessionCommand(
       };
     }
     const networkId = required(v.network, '--network');
-    const topic = required(v.topic, '--topic');
+    const topic = typeof v.topic === 'string' && v.topic ? v.topic : 'collab.question.v1';
     const body = required(v.body, '--body');
     if (Boolean(v.to) === Boolean(v['auto-route'])) {
       throw new Error('Choose exactly one of --to or --auto-route');
     }
     if (ackId) {
-      store.ack(ackId, callerMailboxFlag ?? 'default');
+      store.ack(ackId, callerMailboxFlag ?? caller?.mailboxId ?? 'default');
     }
+    const replyMailbox = callerMailboxFlag ?? caller?.mailboxId ?? 'default';
+    bindCallerWakeTarget(store, replyMailbox, caller);
     const targetMailbox =
       typeof v['target-mailbox'] === 'string' && v['target-mailbox']
         ? String(v['target-mailbox'])
@@ -555,7 +603,7 @@ async function runSessionCommand(
       semantic: {
         type: 'question',
         ...(targetMailbox ? { targetMailbox } : {}),
-        ...(callerMailboxFlag ? { replyMailbox: callerMailboxFlag } : {}),
+        ...(replyMailbox !== 'default' ? { replyMailbox } : {}),
       },
       filePaths: v.attach as string[] | undefined,
     });
@@ -564,7 +612,7 @@ async function runSessionCommand(
       threadId: emitted.messageId,
       targetNodeId: emitted.receipts[0]?.fromNodeId,
       targetMailbox: targetMailbox ?? 'default',
-      replyMailbox: callerMailboxFlag ?? 'default',
+      replyMailbox,
       receipts: emitted.receipts,
       next: 'End your turn now; Dealer will wake this mailbox when the reply arrives.',
     };
@@ -572,10 +620,11 @@ async function runSessionCommand(
 
   const messageId = required(positional, 'message-id');
   const route = replyTargetOrThrow(store, messageId);
+  const replyMailbox = callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default');
+  bindCallerWakeTarget(store, replyMailbox, caller);
   if (ackId) {
-    store.ack(ackId, callerMailboxFlag ?? route.localMailbox);
+    store.ack(ackId, replyMailbox);
   }
-  const replyMailbox = callerMailboxFlag ?? route.localMailbox;
 
   if (group === 'reply') {
     const body = required(v.body, '--body');
@@ -604,6 +653,7 @@ async function runSessionCommand(
       threadId: route.threadId,
       targetNodeId: route.peerNodeId,
       targetMailbox: route.targetMailbox,
+      replyMailbox,
       receipts: emitted.receipts,
     };
   }
@@ -651,6 +701,11 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action] = p;
+    const callerEnv = options.env ?? (options.runtime ? {} : process.env);
+    if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '')) {
+      if (v['terminal-handle'] === undefined && callerEnv.ORCA_TERMINAL_HANDLE?.trim()) v['terminal-handle'] = callerEnv.ORCA_TERMINAL_HANDLE.trim();
+      if (v['worktree-id'] === undefined && (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)?.trim()) v['worktree-id'] = (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)!.trim();
+    }
     let target = p[2];
     if (group === 'project' && action === 'init') {
       const root = resolve(String(v.root ?? process.cwd()));
@@ -693,11 +748,13 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     }
     // Preserve caller-relative paths when the daemon has a different cwd.
-    if (group === 'project' || group === 'plugin' || (group === 'network' && action === 'mount') || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
+    if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '') || group === 'project' || group === 'plugin' || (group === 'network' && action === 'mount') || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
       argv = [...p];
       for (const [key, value] of Object.entries(v)) {
         if (value === true) {
           argv.push(`--${key}`);
+        } else if (Array.isArray(value)) {
+          for (const item of value) argv.push(`--${key}`, String(item));
         } else if (typeof value === 'string') {
           argv.push(`--${key}`, value);
         }
@@ -793,6 +850,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     }
     const runtime = options.runtime ?? (owned = new DealerNodeRuntime({ stateDir }));
     await runtime.start();
+    const caller = resolveCallerOrcaBinding(v);
     let result: unknown;
     const network = v.network as string | undefined;
     if (group === 'setup' && action === 'apply-preset') {
@@ -805,7 +863,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         notifyLark: v['notify-lark'], setDefault: v['set-default'], cwd: v.root,
       });
     } else if (group === 'ask' || group === 'reply' || group === 'settle') {
-      result = await runSessionCommand(runtime, group, action, v);
+      result = await runSessionCommand(runtime, group, action, v, caller);
     } else if (group === 'project') {
       if (action === 'link') {
         result = await runtime.linkProject(target!, v['user-patch'] as string | undefined);
@@ -924,10 +982,12 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
       const targetMailbox =
         typeof v.mailbox === 'string' && v.mailbox ? String(v.mailbox) : undefined;
+      const callerBinding = caller;
       const replyMailbox =
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
-          : undefined;
+          : (group === 'send' && !runtime.resolveTopicBinding(topic, undefined) ? callerBinding?.mailboxId : undefined);
+      if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
       result = await runtime.emitter.emit({
         networkId: required(v.network, '--network'),

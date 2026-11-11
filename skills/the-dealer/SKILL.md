@@ -278,7 +278,7 @@ dispatched. The other side is woken by the durable mailbox pointer, so never
 poll or wait for a reply in the same turn.
 
 ```sh
-dealer ask --network local --to member:bob --topic collab.question.v1 \
+dealer ask --network local --to member:bob --target-mailbox worktree:bob-wt \
   --subject 'Runtime boundary' --body '{"question":"Who owns retries?"}' --json
 dealer ask --reply-to <inbound-envelope-id> --body 'Follow-up question' --json
 dealer reply <inbound-envelope-id> --body 'The dispatcher owns retries' --json
@@ -292,5 +292,10 @@ the local lease by passing `--ack <dlv_id>`. `dealer settle` requires
 `--outcome` (`succeeded`, `failed`, or `cancelled`) and a `--summary` (or body
 fallback). `thread show` returns the merged thread state and both directional
 records; it works through the daemon or directly against the saved mailbox.
+Inside Orca, `ORCA_WORKTREE_ID`/`ORCA_TERMINAL_HANDLE` bind the caller's
+worktree or terminal automatically. Omit `--mailbox` for two-way ask/reply/
+settle conversations; each side wakes the other's Orca terminal. `dealer ask`
+defaults to `collab.question.v1` when `--topic` is omitted, and
+`--target-mailbox worktree:<name>` addresses a named Orca worktree.
 For plain messages, address a logical mailbox with
 `dealer send --mailbox <id> --reply-mailbox <id> --subject '...'`.
