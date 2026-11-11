@@ -351,6 +351,8 @@ type Handler = (
   event: InboundFrameEvent & { rawBytes?: Uint8Array },
 ) => Promise<Uint8Array | void> | Uint8Array | void;
 
+const PRIVATE_LAN_IPV4 = /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/;
+
 /** Shared by the listener and offline invite generation. */
 export function defaultAdvertisedHost(
   options: TransportPluginOptions = {},
@@ -363,7 +365,7 @@ export function defaultAdvertisedHost(
       !/^(169\.254|198\.(18|19))\./.test(address.address)).map(address => ({ name, address: address.address })),
   );
   const lan = candidates.find(({ name, address }) => /^(en|eth|wlan)/.test(name) &&
-    /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(address));
+    PRIVATE_LAN_IPV4.test(address));
   return lan?.address ?? candidates[0]?.address ?? '127.0.0.1';
 }
 
@@ -607,10 +609,10 @@ export class P2PTransportService implements TransportService {
     const existing = peers.get(nodeId);
     const existingHost = existing ? parseEndpoint(existing).host : undefined;
     // The transport owns endpoint reachability: once a peer is reachable through a
-    // routed Tailscale address, a later LAN address may only update its port.
+    // routed Tailscale address, a later private LAN address may only update its port.
     peers.set(
       nodeId,
-      existingHost && isTailscaleIpv4Host(existingHost) && !isTailscaleIpv4Host(parsed.host)
+      existingHost && isTailscaleIpv4Host(existingHost) && PRIVATE_LAN_IPV4.test(parsed.host)
         ? `${existingHost}:${parsed.port}`
         : address,
     );
@@ -687,7 +689,7 @@ export class P2PTransportService implements TransportService {
     if (parsed.host === '127.0.0.1') {
       return endpointAddr;
     }
-    if (isTailscaleIpv4Host(host) || parsed.host === host) {
+    if ((isTailscaleIpv4Host(host) && PRIVATE_LAN_IPV4.test(parsed.host)) || parsed.host === host) {
       return `${host.includes(':') ? `[${host}]` : host}:${parsed.port}`;
     }
     return endpointAddr;
