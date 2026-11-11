@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, chmodSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { homedir, hostname } from 'node:os';
@@ -156,6 +156,8 @@ export class DealerNodeRuntime {
   private registerBuiltinExecutor?: (name: string) => void;
   private started = false;
   private ownsLock = false;
+  /** Per-process owner file: a gate contender never touches another process's file. */
+  private readonly reclaimOwnerFile = `owner.${process.pid}.json`;
   lastError?: string;
 
   constructor(options: DealerRuntimeOptions = {}) {
@@ -194,15 +196,15 @@ export class DealerNodeRuntime {
   }
 
   /** Claim dir for this process atomically, so it never exists without an owner. */
-  private createLock(lockDir: string): void {
+  private createLock(lockDir: string, ownerFile = 'owner.json'): void {
     const stageDir = `${lockDir}.stage.${process.pid}`;
     rmSync(stageDir, { recursive: true, force: true });
     mkdirSync(stageDir, { mode: 0o700 });
     try {
-      saveJson(join(stageDir, 'owner.json'), { pid: process.pid });
-      // owner.json is staged before the rename, so neither the lock nor its reclaim
-      // gate is ever observable without a recorded owner; an existing non-empty
-      // directory makes the rename fail instead of merging the two claims.
+      saveJson(join(stageDir, ownerFile), { pid: process.pid });
+      // The owner file is staged before the rename, so neither the lock nor its
+      // reclaim gate is ever observable without a recorded owner; an existing
+      // non-empty directory makes the rename fail instead of merging the claims.
       renameSync(stageDir, lockDir);
     } catch (error) {
       rmSync(stageDir, { recursive: true, force: true });
@@ -210,11 +212,11 @@ export class DealerNodeRuntime {
     }
   }
 
-  /** True only when dir records a valid pid that is proven to be gone. */
-  private hasDeadOwner(dir: string): boolean {
+  /** True only when filePath records a valid pid that is proven to be gone. */
+  private hasDeadOwnerFile(filePath: string): boolean {
     let pid: unknown;
     try {
-      pid = (JSON.parse(readFileSync(join(dir, 'owner.json'), 'utf8')) as { pid?: unknown }).pid;
+      pid = (JSON.parse(readFileSync(filePath, 'utf8')) as { pid?: unknown }).pid;
     } catch {
       return false;
     }
@@ -229,10 +231,36 @@ export class DealerNodeRuntime {
     }
   }
 
+  /** True only when dir's owner.json records a valid pid that is proven gone. */
+  private hasDeadOwner(dir: string): boolean {
+    return this.hasDeadOwnerFile(join(dir, 'owner.json'));
+  }
+
+  /** Unlink a gate that only records dead owners; leave any live or unreadable entry. */
+  private discardDeadGate(reclaimDir: string): boolean {
+    let entries: string[];
+    try {
+      entries = readdirSync(reclaimDir);
+    } catch {
+      return false;
+    }
+    if (entries.some(entry => !this.hasDeadOwnerFile(join(reclaimDir, entry)))) {
+      return false;
+    }
+    try {
+      for (const entry of entries) {
+        rmSync(join(reclaimDir, entry), { force: true });
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Take the reclaim gate, replacing one whose reclaimer died before releasing it. */
   private acquireReclaimGate(reclaimDir: string): boolean {
     try {
-      this.createLock(reclaimDir);
+      this.createLock(reclaimDir, this.reclaimOwnerFile);
       return true;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -240,23 +268,34 @@ export class DealerNodeRuntime {
         return false;
       }
     }
-    // A process killed inside the gate leaves it behind forever; replace it only
-    // when its recorded owner is proven gone.
-    if (!this.hasDeadOwner(reclaimDir)) {
+    // Unlink only files proven to belong to dead processes: that can never remove a
+    // concurrent winner's live owner file, and the staged rename only succeeds once
+    // the gate holds no live owner.
+    if (!this.discardDeadGate(reclaimDir)) {
       return false;
     }
     try {
-      rmSync(reclaimDir, { recursive: true, force: true });
-      this.createLock(reclaimDir);
+      this.createLock(reclaimDir, this.reclaimOwnerFile);
       return true;
     } catch {
       return false;
     }
   }
 
+  /** Release the reclaim gate once this process's owner file is gone. */
+  private releaseReclaimGate(reclaimDir: string): void {
+    rmSync(join(reclaimDir, this.reclaimOwnerFile), { force: true });
+    try {
+      rmdirSync(reclaimDir);
+    } catch {
+      // A concurrent reclaimer re-created the gate; its own owner file keeps it.
+    }
+  }
+
   /** Reclaim runtime.lock only while no live process owns the lock or its gate. */
   private reclaimStaleLock(lockDir: string): boolean {
     const reclaimDir = `${lockDir}.reclaim`;
+    const staleDir = `${lockDir}.stale.${process.pid}`;
     if (!this.acquireReclaimGate(reclaimDir)) {
       return false;
     }
@@ -266,15 +305,17 @@ export class DealerNodeRuntime {
       if (!this.hasDeadOwner(lockDir)) {
         return false;
       }
-      // Move the stale lock aside and claim the path before releasing the gate, so
-      // no concurrent start can observe a missing or owner-less lock directory.
-      renameSync(lockDir, join(reclaimDir, 'stale'));
+      // Move the stale lock out of the gate and claim the path before releasing the
+      // gate, so no concurrent start can observe a missing or owner-less lock.
+      rmSync(staleDir, { recursive: true, force: true });
+      renameSync(lockDir, staleDir);
       this.createLock(lockDir);
       return true;
     } catch {
       return false;
     } finally {
-      this.releaseLock(reclaimDir);
+      rmSync(staleDir, { recursive: true, force: true });
+      this.releaseReclaimGate(reclaimDir);
     }
   }
 
@@ -304,8 +345,12 @@ export class DealerNodeRuntime {
       this.ownsLock = true;
       // A reclaimer killed inside its gate leaves a dead gate that blocks every
       // later reclaim; drop it once this process holds the lock on the fast path.
-      if (existsSync(reclaimDir) && this.hasDeadOwner(reclaimDir)) {
-        rmSync(reclaimDir, { recursive: true, force: true });
+      if (existsSync(reclaimDir) && this.discardDeadGate(reclaimDir)) {
+        try {
+          rmdirSync(reclaimDir);
+        } catch {
+          // A concurrent reclaimer re-created the gate; its own owner file keeps it.
+        }
       }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
