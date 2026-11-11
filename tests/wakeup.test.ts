@@ -805,6 +805,68 @@ test('two-node P2P closed loop verifies signatures and keeps unapproved knocks r
   );
 });
 
+test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC forwarding', async t => {
+  const root = directory(t);
+  const aliceWtPath = join(root, 'alice-wt');
+  const bobWtPath = join(root, 'bob-wt');
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees: [
+        { path: aliceWtPath, worktreeId: `repo::${aliceWtPath}`, displayName: 'alice-wt', isArchived: false, unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+        { path: bobWtPath, worktreeId: `repo::${bobWtPath}`, displayName: 'bob-wt', isArchived: false, unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      const path = request.args[request.args.indexOf('--worktree') + 1]?.replace(/^path:/, '');
+      const handle = path === bobWtPath ? 'term-bob' : 'term-alice';
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle, connected: true, writable: true, preview: '' }] } }) };
+    }
+    return { stdout: JSON.stringify({ ok: true }) };
+  };
+  const alice = await makeNode(t, root, 'alice', { commandRunner: runner });
+  const bob = await makeNode(t, root, 'bob', { commandRunner: runner });
+  await alice.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
+  await bob.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
+  await until(() => alice.node.listPeers().length === 1 && bob.node.listPeers().length === 1, 'peer discovery');
+  const aliceEnv = { ORCA_TERMINAL_HANDLE: 'term-alice', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` };
+  const bobEnv = { ORCA_TERMINAL_HANDLE: 'term-bob', ORCA_WORKTREE_ID: `repo::${bobWtPath}` };
+  const askOut: string[] = [];
+  await runDealerCli(['ask', '--network', 'team', '--to', 'member:bob', '--target-mailbox', 'worktree:bob-wt', '--body', 'Please review'], { runtime: alice, env: aliceEnv, stdout: line => askOut.push(line) });
+  const asked = JSON.parse(askOut.join('\n'));
+  assert.equal(asked.replyMailbox, 'worktree:alice-wt');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.mode, 'orca-terminal');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-alice');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.workspacePath, aliceWtPath);
+  await until(() => bob.mailbox.list({ mailboxId: 'worktree:bob-wt' }).totalCount > 0, 'Bob inbound mailbox');
+  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.terminalHandle, 'term-bob');
+  assert.ok(calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-bob')));
+  const checkOut: string[] = [];
+  await runDealerCli(['inbox', 'check'], { runtime: bob, env: bobEnv, stdout: line => checkOut.push(line) });
+  const checked = JSON.parse(checkOut.join('\n'));
+  assert.equal(checked.mailboxId, 'worktree:bob-wt');
+  const replyOut: string[] = [];
+  await runDealerCli(['reply', asked.questionId, '--body', 'Approved', '--ack', checked.deliveryId], { runtime: bob, env: bobEnv, stdout: line => replyOut.push(line) });
+  const replied = JSON.parse(replyOut.join('\n'));
+  assert.equal(replied.replyMailbox, 'worktree:bob-wt');
+  await until(() => alice.mailbox.list({ mailboxId: 'worktree:alice-wt' }).totalCount > 0, 'Alice reply mailbox');
+  assert.ok(calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-alice')));
+  const aliceReply = alice.mailbox.check({ mailboxId: 'worktree:alice-wt' });
+  const settleOut: string[] = [];
+  await runDealerCli(['settle', asked.questionId, '--outcome', 'succeeded', '--summary', 'Done', '--ack', aliceReply.deliveryId!], { runtime: alice, env: aliceEnv, stdout: line => settleOut.push(line) });
+
+  alice.mailbox.enqueue([alert('rpc-mail')], { mailboxId: 'worktree:alice-wt' });
+  await alice.serveControl(async (argv, context) => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime: alice, signal: context.signal, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+  await runDealerCli(['inbox', 'check', '--json'], { stateDir: alice.stateDir, env: { ORCA_TERMINAL_HANDLE: 'term-rpc', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` }, stdout: () => {} });
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-rpc');
+});
+
 test('thread show fails loudly for an unknown thread', async t => {
   const root = directory(t);
   const runtime = await makeNode(t, root, 'solo');

@@ -32,7 +32,7 @@ export async function findOrcaWorktreeByName(
     const raw = JSON.parse(result.stdout);
     const rows = raw?.result?.worktrees;
     if (raw?.ok !== true || raw?.result?.truncated || !Array.isArray(rows)) return undefined;
-    const row = rows.find((item: any) => item && item.archived !== true &&
+    const row = rows.find((item: any) => item && item.isArchived !== true && item.archived !== true &&
       ((typeof item.displayName === 'string' && item.displayName === name) ||
        (typeof item.path === 'string' && basename(item.path) === name)));
     if (!row || typeof row.path !== 'string' || typeof row.worktreeId !== 'string') return undefined;
