@@ -39,6 +39,7 @@ import {
   validateConfig,
   admissionMode,
   readProjectManifest,
+  redactProjectManifest,
   readPatch,
   validatePluginRefs,
   validateTopicBindings,
@@ -331,7 +332,7 @@ export class DealerNodeRuntime {
         await this.installSource(source);
       }
       for (const project of [...this.config.projects]) {
-        await this.linkProject(project.rootPath, project.userPatchPath);
+        await this.linkProject(project.rootPath, project.userPatchPath, { restore: true });
       }
       for (const ref of [...this.config.userPlugins]) {
         await this.installUserPlugin(ref);
@@ -458,7 +459,7 @@ export class DealerNodeRuntime {
     });
   }
 
-  async linkProject(projectRoot: string, userPatchPath?: string): Promise<{
+  async linkProject(projectRoot: string, userPatchPath?: string, options: { restore?: boolean } = {}): Promise<{
     projectId: string;
     defaultNetworkId: string;
     loadedPlugins: string[];
@@ -526,7 +527,7 @@ export class DealerNodeRuntime {
         this.config.skills = [...new Set([...this.config.skills, ...(manifest.skills ?? []), ...(userPatch?.skills ?? [])])];
         await this.publishSkills();
         this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
-        if (onboardingPassphrase && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
+        if (!options.restore && onboardingPassphrase && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
           await this.mountNetwork({
             networkId: onboardingNetworkId,
             passphrase: onboardingPassphrase,
@@ -587,11 +588,14 @@ export class DealerNodeRuntime {
 
   projectStatus(projectId?: string) {
     return {
-      projects: this.config.projects.filter(project => !projectId || project.projectId === projectId).map(project => ({
-        ...project,
-        manifest: this.loadedProjects.get(project.projectId)?.manifest,
-        loadedPlugins: (this.loadedProjects.get(project.projectId)?.plugins ?? []).map(entry => entry.plugin.name),
-      })),
+      projects: this.config.projects.filter(project => !projectId || project.projectId === projectId).map(project => {
+        const loaded = this.loadedProjects.get(project.projectId);
+        return {
+          ...project,
+          manifest: loaded ? redactProjectManifest(loaded.manifest) : undefined,
+          loadedPlugins: (loaded?.plugins ?? []).map(entry => entry.plugin.name),
+        };
+      }),
       userPlugins: this.config.userPlugins.filter(ref => this.loadedUserPlugins.has(ref.name)).map(ref => ({
         ...ref,
         loadedName: this.loadedUserPlugins.get(ref.name)!.plugin.name,
@@ -906,7 +910,14 @@ export class DealerNodeRuntime {
     if (network.admissionMode) {
       admissionMode(network.admissionMode);
     }
-    await this.transport.mountNetwork(network);
+    const previous = this.transport.getNetworkConfig(network.networkId);
+    if (previous) await this.transport.unmountNetwork(network.networkId);
+    try {
+      await this.transport.mountNetwork(network);
+    } catch (error) {
+      if (previous) await this.transport.mountNetwork(previous);
+      throw error;
+    }
     if (network.admissionMode) {
       await this.gate.setNetworkMode(network.networkId, network.admissionMode);
     }

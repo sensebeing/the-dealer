@@ -671,10 +671,10 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action)) {
       v.root = resolve(String(v.root ?? process.cwd()));
     }
-    if (group === 'network' && action === 'mount' && target && !target.startsWith('dealer-net:') && v.passphrase === undefined) {
-      const root = resolve(String(v.root ?? process.cwd()));
-      if (existsSync(join(root, '.dealer/project.json'))) {
-        const manifest = readProjectManifest(root);
+    if (group === 'network' && action === 'mount' && target && !target.startsWith('dealer-net:')) {
+      v.root = resolve(String(v.root ?? process.cwd()));
+      if (v.passphrase === undefined && existsSync(join(v.root, '.dealer/project.json'))) {
+        const manifest = readProjectManifest(v.root);
         if (manifest.onboarding?.passphrase && (manifest.onboarding.networkId ?? manifest.defaultNetworkId) === target) {
           v.passphrase = manifest.onboarding.passphrase;
           if (v.seed === undefined && manifest.onboarding.bootstrapPeers?.length) {

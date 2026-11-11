@@ -112,6 +112,14 @@ export interface DealerProjectManifest {
   onboarding?: DealerProjectOnboardingPreset;
 }
 
+export function redactProjectManifest(manifest: DealerProjectManifest): DealerProjectManifest {
+  const redacted = structuredClone(manifest);
+  if (redacted.onboarding) {
+    delete redacted.onboarding.passphrase;
+  }
+  return redacted;
+}
+
 export interface LinkedProjectConfig {
   projectId: string;
   rootPath: string;

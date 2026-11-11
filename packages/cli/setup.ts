@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { readProjectManifest, validateTopicBindings } from './config.ts';
+import { redactProjectManifest, readProjectManifest, validateTopicBindings } from './config.ts';
 import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, TopicBindingConfig } from './config.ts';
 import { findExecutable } from '../orca-workspace/executable.ts';
 import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
@@ -40,7 +40,7 @@ export function probeDealerSetup(options: {
   const recommendedHost = clis.orca ? 'orca' : AGENT_HOST_CATALOG.find(host => host.host !== 'antigravity' && clis[host.command])?.host ?? (clis.agy ? 'antigravity' : null);
   return {
     cwd, stateDir, clis, apps, recommendedHost, agentCatalog: AGENT_HOST_CATALOG,
-    project: project?.onboarding ? { ...project, onboarding: { ...project.onboarding, passphrase: undefined } } : project,
+    project: project ? redactProjectManifest(project) : project,
     onboarding: project ? {
       networkTopology: project.onboarding?.networkTopology ?? (typeof project.defaultNetworkId === 'string' && project.defaultNetworkId !== 'local' ? 'fixed' : 'selectable'),
       networkId: project.onboarding?.networkId ?? project.defaultNetworkId ?? 'local',
