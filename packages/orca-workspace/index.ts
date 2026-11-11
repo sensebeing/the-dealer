@@ -308,7 +308,7 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string },
 ): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
   const targetAgent = options?.agent ?? 'antigravity';
   const launchCommand = options?.interactiveCommand?.trim() || defaultAgentLaunchCommand(targetAgent);
@@ -323,6 +323,15 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
     throw new Error('Incomplete Orca terminal inventory');
   }
   const terminals = inventory.result.terminals as OrcaTerminalRow[];
+  // A workspace already bound to a terminal reuses exactly that terminal: orphaned only means the
+  // workspace registry lost track of it, not that its live TUI stopped accepting wakeups.
+  const preferredHandle = options?.preferredHandle;
+  if (preferredHandle) {
+    const bound = terminals.find(
+      t => t && String(t.handle) === preferredHandle && t.connected && t.writable !== false,
+    );
+    if (bound) return { handle: String(bound.handle), spawned: false };
+  }
   const nonOrphanConnected = terminals.filter(
     t => t && t.orphaned !== true && t.connected && t.writable !== false,
   );

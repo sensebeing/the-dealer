@@ -86,8 +86,6 @@ export interface WakeTargetState {
   readonly earliestWakeAt: number;
   readonly attemptCount: number;
   readonly lastWakeError?: string;
-  /** Persisted before external delivery; remains fenced if its outcome is unknown. */
-  readonly deliveryInDoubt?: boolean;
 }
 
 export interface ThreadRouteRecord {
@@ -367,7 +365,6 @@ function mergeWakeTarget(
   const workspaceComment = optional('workspaceComment');
   const rotateAfterWaves = optional('rotateAfterWaves');
   const lastWakeError = optional('lastWakeError');
-  const deliveryInDoubt = optional('deliveryInDoubt');
   const nextCoalesceMs = patch.coalesceMs ?? current.coalesceMs;
   const nextAttemptCount = patch.attemptCount ?? current.attemptCount;
   let earliestWakeAt = patch.earliestWakeAt ?? current.earliestWakeAt;
@@ -401,7 +398,6 @@ function mergeWakeTarget(
     ...(workspaceComment !== undefined ? { workspaceComment } : {}),
     ...(rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
     ...(lastWakeError !== undefined ? { lastWakeError } : {}),
-    ...(deliveryInDoubt !== undefined ? { deliveryInDoubt } : {}),
   };
 }
 
@@ -416,7 +412,6 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     throw invalidStore();
   }
   const target = value as unknown as WakeTargetState;
-  if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
   if (target.hostAgent !== undefined && !['codex', 'claude', 'claude-code', 'antigravity', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
   if (target.conversationMode !== undefined && !['spawn', 'fixed'].includes(target.conversationMode)) throw invalidStore();
   if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
@@ -1443,25 +1438,6 @@ export class MailboxStore {
     return merged;
   }
 
-  /** Fence before invoking an external effect so a crash cannot silently replay it. */
-  beginWakeDelivery(mailboxId: string): void {
-    const id = normalizeMailboxId(mailboxId);
-    this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
-      if (current.deliveryInDoubt) throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
-      state.wakeTargets[id] = validateWakeTarget(mergeWakeTarget(current, {
-        deliveryInDoubt: true, pendingWake: false,
-        lastWakeError: 'External wake delivery outcome is not yet confirmed',
-      }));
-    });
-  }
-
-  parkWakeDelivery(mailboxId: string, error: unknown): void {
-    this.upsertWakeTarget(mailboxId, {
-      deliveryInDoubt: true, pendingWake: false, lastWakeError: String(error),
-    });
-  }
-
   /** Settle only the observed wave; messages arriving during delivery retain their wake. */
   completeWakeDelivery(
     mailboxId: string,
@@ -1477,7 +1453,6 @@ export class MailboxStore {
       const next = validateWakeTarget(mergeWakeTarget(current, {
         ...patch, pendingWake, attemptCount: 0,
         earliestWakeAt: pendingWake ? current.earliestWakeAt : 0, lastWakeError: undefined,
-        deliveryInDoubt: undefined,
       }));
       state.wakeTargets[id] = next;
       return structuredClone(next);
@@ -1509,7 +1484,7 @@ export class MailboxStore {
       throw new Error('Invalid wake target instant');
     }
     return Object.values(this.read().wakeTargets)
-      .filter(target => target.pendingWake && !target.deliveryInDoubt && target.earliestWakeAt <= nowMs)
+      .filter(target => target.pendingWake && target.earliestWakeAt <= nowMs)
       .sort(
         (a, b) =>
           a.earliestWakeAt - b.earliestWakeAt || a.mailboxId.localeCompare(b.mailboxId),

@@ -1,4 +1,4 @@
-import { buildAgentHostInvocation, resolveAgentSessionId, resolveAgentHostContinuation } from '../agent-host/index.ts';
+import { buildAgentHostInvocation, resolveAgentSessionId } from '../agent-host/index.ts';
 import type { SupportedAgentHost } from '../agent-host/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
@@ -11,7 +11,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveMailboxId, buildTaskPreamble, buildWakeupPointer, maxPreviewSequence, settleWakeDeliveryFailure } from '../mailbox/index.ts';
+import { MailboxStore, resolveMailboxId, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
@@ -19,7 +19,6 @@ import {
   defaultAgentLaunchCommand,
   singleLine,
   runCommand,
-  sendOrcaTerminalText,
 } from '../orca-workspace/index.ts';
 import type { CommandRunner, SupportedOrcaAgent } from '../orca-workspace/index.ts';
 
@@ -89,10 +88,10 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
       let request;
       let mailboxId: string | undefined;
-      let deliveredSequence = -1;
       let effectiveSessionId: string | undefined;
       let wakeDelivered = false;
       const store = options.store ?? config.store;
+      const runner = options.commandRunner ?? runCommand;
       let claim: ReturnType<WakeupRedriveService['claim']> | undefined;
       try {
         if (!hostMode) {
@@ -104,54 +103,41 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           const conversationMode = mode ?? 'spawn';
           mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
           const terminalPrompt = optionalString(typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined);
-          let promptText = singleLine(terminalPrompt ?? renderWave(batch));
           const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
           const command = config.command ?? options.command;
           const agentProfile = payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile;
           const targetBot = payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot;
           const sessionId = payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId;
           effectiveSessionId = resolveAgentSessionId(mailboxId, sessionId, agent ?? 'codex');
-          let invocation = buildAgentHostInvocation({
-            agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
-            command, agentProfile, targetBot, sessionId: effectiveSessionId,
-          });
           if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || (options.commandRunner === undefined || options.commandRunner === runCommand))) {
             trustAntigravityWorkspace(cwd, agySettingsPath);
           }
           claim = (options.wakeup ?? config.wakeup)?.claim(mailboxId);
-          if (store) store.enqueue(batch, { mailboxId, wakeTarget: {
-            mode: 'passive', hostAgent: (agent ?? 'codex') as WakeTargetState['hostAgent'], conversationMode,
-            ...(cwd ? { workspacePath: cwd } : {}),
-            ...(command ? { interactiveCommand: command } : {}),
-            ...(agentProfile ? { agentProfile } : {}),
-            ...(targetBot ? { targetBot } : {}),
-            sessionId: effectiveSessionId,
-          } });
           if (store) {
-            const preview = store.check({ mailboxId, peek: true });
-            deliveredSequence = maxPreviewSequence(preview);
-            const target = store.getWakeTarget(mailboxId)!;
-            promptText = buildWakeupPointer(mailboxId, target, preview) ?? '';
-            if (!promptText) throw new Error(`No pending Dealer messages in ${mailboxId}`);
-            invocation = buildAgentHostInvocation({
-              agent: agent ?? 'codex', conversationMode, mailboxId, promptText, cwd,
-              command, agentProfile, targetBot, sessionId: effectiveSessionId,
-            });
+            store.enqueue(batch, { mailboxId, wakeTarget: {
+              mode: 'passive', hostAgent: (agent ?? 'codex') as WakeTargetState['hostAgent'], conversationMode,
+              ...(cwd ? { workspacePath: cwd } : {}),
+              ...(command ? { interactiveCommand: command } : {}),
+              ...(agentProfile ? { agentProfile } : {}),
+              ...(targetBot ? { targetBot } : {}),
+              sessionId: effectiveSessionId,
+            } });
+          } else {
+            request = { ...buildAgentHostInvocation({
+              agent: agent ?? 'codex', conversationMode, mailboxId,
+              promptText: singleLine(terminalPrompt ?? renderWave(batch)),
+              cwd, command, agentProfile, targetBot, sessionId: effectiveSessionId,
+            }), cwd };
           }
-          request = { ...invocation, cwd };
         }
-        if (store && mailboxId) store.beginWakeDelivery(mailboxId);
         let output;
-        try {
-          output = await checkedCommand(options.commandRunner ?? runCommand, { ...request, signal: context.signal });
-        } catch (error) {
-          if (store && mailboxId) settleWakeDeliveryFailure(store, mailboxId, error);
-          throw error;
-        }
         if (store && mailboxId) {
-          store.completeWakeDelivery(mailboxId, deliveredSequence,
-            resolveAgentHostContinuation(agent ?? 'codex', mailboxId, effectiveSessionId, output.stdout, mode === 'fixed' ? 'fixed' : 'spawn'));
+          // The mailbox owner builds the pointer and settles the lease for both initial and redrive paths.
+          const delivered = await deliverPassiveWakeTarget(store, runner, mailboxId, { signal: context.signal });
+          output = { stdout: delivered.stdout, stderr: delivered.stderr };
           wakeDelivered = true;
+        } else {
+          output = await checkedCommand(runner, { ...request, signal: context.signal });
         }
         let structuredOutput: unknown;
         try {
@@ -554,50 +540,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
                     : {}),
                 },
               });
-              const deliveredSequence = maxPreviewSequence(store.check({ mailboxId, peek: true }));
-              let idle = false;
-              try {
-                const waited = await checkedCommand(runner, {
-                  command,
-                  args: [
-                    'terminal',
-                    'wait',
-                    '--terminal',
-                    handle,
-                    '--for',
-                    'tui-idle',
-                    '--timeout-ms',
-                    '5000',
-                    '--json',
-                  ],
-                  cwd: path,
-                  signal: context.signal,
-                });
-                idle = JSON.parse(waited.stdout).ok === true;
-              } catch {
-                idle = false;
-              }
-              if (idle) {
-                const rawPrompt =
-                  typeof payload.terminalPrompt === 'string' && payload.terminalPrompt.trim()
-                    ? payload.terminalPrompt
-                    : (batch[0].body || batch[0].subject);
-                store.beginWakeDelivery(mailboxId);
-                await sendOrcaTerminalText(
-                  runner,
-                  command,
-                  handle,
-                  buildTaskPreamble(mailboxId, batch[0].id, undefined, rawPrompt),
-                  { cwd: path, signal: context.signal, waitSubmit: 5 },
-                );
-                store.completeWakeDelivery(mailboxId, deliveredSequence);
-              } else {
-                // Never inject into a busy or unverifiable terminal; the redrive service will.
-                store.upsertWakeTarget(mailboxId, { pendingWake: true });
-              }
-            } catch (error) {
-              if (store.getWakeTarget(mailboxId)?.deliveryInDoubt) settleWakeDeliveryFailure(store, mailboxId, error);
-              throw error;
+              await deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId, { signal: context.signal });
             } finally {
               claim?.dispose();
               wakeup?.notifyMailbox(mailboxId);
@@ -646,13 +589,14 @@ export interface OrcaWaveOptions {
   resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   runId?: string;
   terminalHandle?: string;
+  worktreeId?: string;
   cwd?: string;
   orcaCommand?: string;
   commandRunner?: CommandRunner;
   /** Durable mailbox ledger; always supplied by DealerNodeRuntime. */
   store?: MailboxStore;
   wakeup?: WakeupRedriveService;
-  /** Default coalescing/rotation settings; payload values take precedence. */
+  /** Default coalescing/rotation settings; receiver binding values take precedence. */
   wave?: { minAgeMs?: number; rotateAfterWaves?: number };
 }
 
@@ -689,28 +633,26 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
       const payload = (first.payload ?? {}) as Record<string, unknown>;
       const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined);
       const mailboxId = resolveMailboxId(first, 'orca-wave', binding);
+      // The receiver owns workspace, terminal and scheduling configuration; inbound payload values
+      // are only a fallback for deployments that have no local binding or executor config.
       const cwd =
-        optionalString(payload.workspacePath) ??
-        optionalString(payload.cwd) ??
         binding?.workspacePath ??
         config.cwd ??
-        options.cwd;
+        options.cwd ??
+        optionalString(payload.workspacePath) ??
+        optionalString(payload.cwd);
       const runId =
-        optionalString(payload.runId) ?? binding?.runId ?? config.runId ?? options.runId;
+        binding?.runId ?? config.runId ?? options.runId ?? optionalString(payload.runId);
       const terminalHandle =
-        optionalString(payload.terminalHandle) ??
-        binding?.terminalHandle ??
-        config.terminalHandle ??
-        options.terminalHandle;
+        binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle ?? optionalString(payload.terminalHandle);
       const waveConfig = config.wave ?? options.wave;
-      const requestedMinAge =
-        typeof payload.minAgeMs === 'number' && Number.isFinite(payload.minAgeMs)
-          ? Math.max(0, payload.minAgeMs)
-          : Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
+      const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
       const rotateAfterWaves =
-        optionalPositiveInteger(payload.rotateAfterWaves) ??
-        binding?.rotateAfterWaves ?? optionalPositiveInteger(waveConfig?.rotateAfterWaves);
-      const worktreeId = optionalString(payload.worktreeId) ?? binding?.worktreeId;
+        binding?.rotateAfterWaves ??
+        optionalPositiveInteger(waveConfig?.rotateAfterWaves) ??
+        optionalPositiveInteger(payload.rotateAfterWaves);
+      const worktreeId =
+        binding?.worktreeId ?? config.worktreeId ?? options.worktreeId ?? optionalString(payload.worktreeId);
       const workspaceComment = String(
         batch.at(-1)?.payload?.workspaceComment || binding?.workspaceComment || `Dealer: ${mailboxId} pending`,
       );
@@ -718,10 +660,10 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         mailboxId,
         wakeTarget: {
           mode: runId ? 'orca-run' : 'orca-terminal',
-          agent: orcaAgent(payload.agent ?? binding?.agent ?? config.agent ?? options.agent),
-          interactiveCommand: optionalString(payload.interactiveCommand) ?? binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
+          agent: orcaAgent(binding?.agent ?? config.agent ?? options.agent ?? payload.agent),
+          interactiveCommand: binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
           orcaCommand: command,
-          coalesceMs: requestedMinAge,
+          coalesceMs,
           ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
           ...(binding?.autoCreateWorkspace !== undefined ? { autoCreateWorkspace: binding.autoCreateWorkspace } : {}),
           ...(binding?.wakeupPrefix ? { wakeupPrefix: binding.wakeupPrefix } : {}),

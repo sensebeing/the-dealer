@@ -1043,56 +1043,109 @@ test('in-flight ordinary arrivals retain enqueue coalescing deadline while repli
   assert.equal(store.getWakeTarget('box')?.pendingWake, false);
 });
 
+test('spawned terminal handles persist across deferral and completion', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let idleChecks = 0;
+  let created = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: [] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      created += 1;
+      return { stdout: JSON.stringify({ ok: true, result: { handle: `term-${created}` } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({
+    store, commandRunner: runner,
+    idleCheck: async () => ({ idle: ++idleChecks !== 2 }),
+    flushIntervalMs: 100_000,
+  });
+  t.after(() => service.stop());
+
+  store.enqueue([alert('deferred')], { mailboxId: 'stream:deferred', wakeTarget: {
+    mode: 'orca-terminal', workspacePath: '/fixed',
+  } });
+  const deferred = await service.flushMailbox('stream:deferred');
+  assert.equal(deferred.woke, false);
+  assert.match(deferred.reason!, /Terminal spawned/);
+  assert.equal(store.getWakeTarget('stream:deferred')!.terminalHandle, 'term-1');
+  const delivered = await service.flushMailbox('stream:deferred', { force: true });
+  assert.equal(delivered.woke, true);
+  assert.equal(store.getWakeTarget('stream:deferred')!.terminalHandle, 'term-1');
+  assert.equal(store.getWakeTarget('stream:deferred')!.pendingWake, false);
+  const send = calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'send').at(-1)!;
+  assert.equal(send.args[send.args.indexOf('--terminal') + 1], 'term-1');
+  assert.equal(
+    calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'create').length,
+    1,
+    'the deferred terminal is reused instead of respawned',
+  );
+
+  idleChecks = 10;
+  store.enqueue([alert('direct')], { mailboxId: 'stream:direct', wakeTarget: {
+    mode: 'orca-terminal', workspacePath: '/fixed-direct',
+  } });
+  const direct = await service.flushMailbox('stream:direct');
+  assert.equal(direct.woke, true);
+  assert.equal(store.getWakeTarget('stream:direct')!.terminalHandle, 'term-2');
+  assert.equal(store.getWakeTarget('stream:direct')!.pendingWake, false);
+});
+
 for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
-  test(`${mode} uncertain external delivery is fenced against retries, later mail and restart`, async t => {
+  test(`${mode} uncertain external delivery retries with backoff and self-heals`, async t => {
+    t.mock.timers.enable({ apis: ['Date'], now: 20_000 });
     const file = join(directory(t), 'mailbox.json');
     const store = new MailboxStore(file);
     store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
       mode, ...(mode === 'passive' ? { hostAgent: 'claude-code' as const, conversationMode: 'spawn' as const } : {}), runId: 'run', terminalHandle: 'term',
     } });
     let effects = 0;
-    const wakeup = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async call => {
+    const failing = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async call => {
       if (mode !== 'orca-terminal' || call.args[1] === 'send') {
         effects++;
         throw new Error('accepted then result lost');
       }
       return { stdout: '{"ok":true}' };
     } });
-    t.after(() => wakeup.stop());
-    assert.equal((await wakeup.flushMailbox('box')).woke, false);
-    assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
-    assert.equal(store.getWakeTarget('box')?.pendingWake, false);
-    assert.match(store.getWakeTarget('box')!.lastWakeError!, /result lost/);
-    await wakeup.stop();
+    t.after(() => failing.stop());
+    assert.equal((await failing.flushMailbox('box')).woke, false);
+    const failed = store.getWakeTarget('box')!;
+    assert.equal(failed.pendingWake, true);
+    assert.equal(failed.attemptCount, 1);
+    assert.equal(failed.earliestWakeAt, 21_000);
+    assert.match(failed.lastWakeError!, /result lost/);
+    assert.equal(effects, 1);
+    await failing.stop();
     const restarted = new MailboxStore(file);
-    const recovery = new WakeupRedriveService({ store: restarted, commandRunner: async () => {
-      effects++;
-      return { stdout: '{}' };
+    let healed = 0;
+    const recovery = new WakeupRedriveService({ store: restarted, idleCheck: async () => ({ idle: true }), commandRunner: async () => {
+      healed++;
+      return { stdout: '{"ok":true}' };
     } });
     t.after(() => recovery.stop());
     restarted.enqueue([alert('next')], { mailboxId: 'box' });
-    await recovery.flushReady();
-    assert.equal((await recovery.flushMailbox('box', { force: true })).woke, false);
-    assert.equal(effects, 1);
+    // Later mail keeps the backoff deadline instead of bypassing an unconfirmed delivery.
+    assert.deepEqual(await recovery.flushReady(), []);
+    assert.equal(healed, 0);
+    t.mock.timers.setTime(21_000);
+    const recovered = await recovery.flushMailbox('box', { force: true });
+    assert.equal(recovered.woke, true);
+    const settled = restarted.getWakeTarget('box')!;
+    assert.equal(settled.pendingWake, false);
+    assert.equal(settled.attemptCount, 0);
+    assert.equal(settled.earliestWakeAt, 0);
+    assert.equal(settled.lastWakeError, undefined);
+    assert.equal(healed, 1);
   });
 }
 
-test('a restart with an unfinished external wake remains fenced even without a failure callback', async t => {
-  const file = join(directory(t), 'mailbox.json');
-  const store = new MailboxStore(file);
-  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: { mode: 'passive', hostAgent: 'claude-code' } });
-  store.beginWakeDelivery('box');
-  const restarted = new MailboxStore(file);
-  const service = new WakeupRedriveService({ store: restarted, commandRunner: async () => {
-    assert.fail('unknown delivery must not be replayed');
-  } });
-  t.after(() => service.stop());
-  assert.equal((await service.flushMailbox('box', { force: true })).woke, false);
-  assert.equal(restarted.getWakeTarget('box')?.deliveryInDoubt, true);
-});
-
 for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
-  test(`${mode} pre-effect command failure backs off and resumes safely after repair`, async t => {
+  test(`${mode} command failure backs off and resumes safely after repair`, async t => {
     const root = directory(t);
     const store = new MailboxStore(join(root, 'mailbox.json'));
     store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
@@ -1103,10 +1156,10 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
     t.after(() => failing.stop());
     assert.equal((await failing.flushMailbox('box')).woke, false);
     const failed = store.getWakeTarget('box')!;
-    assert.equal(failed.deliveryInDoubt, undefined);
     assert.equal(failed.pendingWake, true);
     assert.equal(failed.attemptCount, 1);
     assert.ok(failed.earliestWakeAt > Date.now());
+    assert.match(failed.lastWakeError!, /did not start|ENOENT/);
     await failing.stop();
     const repaired = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async () => ({ stdout: '{"ok":true}' }) });
     t.after(() => repaired.stop());
@@ -1115,7 +1168,7 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
   });
 }
 
-test('local Orca target validation does not create an unknown-effect fence', async t => {
+test('local Orca target validation backs off without external effects', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   let effects = 0;
   const service = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async () => {
@@ -1128,7 +1181,8 @@ test('local Orca target validation does not create an unknown-effect fence', asy
   claim.dispose();
   assert.equal((await service.flushMailbox('box')).woke, false);
   assert.equal(effects, 0);
-  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
+  assert.equal(store.getWakeTarget('box')?.pendingWake, true);
+  assert.equal(store.getWakeTarget('box')?.attemptCount, 1);
   store.upsertWakeTarget('box', { runId: 'repaired' });
   assert.equal((await service.flushMailbox('box', { force: true })).woke, true);
   assert.equal(effects, 1);

@@ -533,6 +533,77 @@ test('Orca terminal resolution prefers target host then other agents, boots shel
   assert.ok(calls.at(-1)!.args.includes('custom'));
 });
 
+test('orca-wave ignores inbound scheduling and prefers receiver binding or config over payload', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const binding = {
+    executor: 'orca-wave', workspacePath: '/receiver/binding', runId: 'bound-run',
+    terminalHandle: 'bound-terminal', worktreeId: 'bound-worktree', rotateAfterWaves: 3,
+    coalesceMs: 60_000, interactiveCommand: 'bound-command', agent: 'claude' as const,
+  };
+  const bound = createOrcaWaveExecutorPlugin({
+    store, agent: 'codex', cwd: '/receiver/options', runId: 'option-run',
+    terminalHandle: 'option-terminal', interactiveCommand: 'option-command',
+    wave: { minAgeMs: 5_000, rotateAfterWaves: 2 }, resolveTopicBinding: () => binding,
+  });
+  await bound.execute([message('bound', {
+    minAgeMs: -1, interactiveCommand: 'sender-command', workspacePath: '/sender/workspace',
+    cwd: '/sender/cwd', runId: 'sender-run', terminalHandle: 'sender-terminal',
+    worktreeId: 'sender-worktree', rotateAfterWaves: 1, agent: 'codex',
+  })], context, {});
+  const boundTarget = store.getWakeTarget('stream:collab.request.v4')!;
+  assert.equal(boundTarget.coalesceMs, 60_000);
+  assert.equal(boundTarget.interactiveCommand, 'bound-command');
+  assert.equal(boundTarget.workspacePath, '/receiver/binding');
+  assert.equal(boundTarget.runId, 'bound-run');
+  assert.equal(boundTarget.terminalHandle, 'bound-terminal');
+  assert.equal(boundTarget.worktreeId, 'bound-worktree');
+  assert.equal(boundTarget.rotateAfterWaves, 3);
+  assert.equal(boundTarget.agent, 'claude');
+
+  const configured = createOrcaWaveExecutorPlugin({
+    store, cwd: '/receiver/options', runId: 'option-run', terminalHandle: 'option-terminal',
+    worktreeId: 'option-worktree', interactiveCommand: 'option-command',
+    wave: { minAgeMs: 5_000 }, resolveTopicBinding: () => ({ executor: 'orca-wave', streamKey: 'configured' }),
+  });
+  await configured.execute([message('configured', {
+    minAgeMs: 99_999, interactiveCommand: 'sender-command', workspacePath: '/sender/workspace',
+    cwd: '/sender/cwd', runId: 'sender-run', terminalHandle: 'sender-terminal', worktreeId: 'sender-worktree',
+  })], context, {
+    cwd: '/receiver/config', runId: 'config-run', terminalHandle: 'config-terminal',
+    worktreeId: 'config-worktree', interactiveCommand: 'config-command', wave: { minAgeMs: 2_500 },
+  });
+  const configuredTarget = store.getWakeTarget('stream:configured')!;
+  assert.equal(configuredTarget.coalesceMs, 2_500);
+  assert.equal(configuredTarget.interactiveCommand, 'config-command');
+  assert.equal(configuredTarget.workspacePath, '/receiver/config');
+  assert.equal(configuredTarget.runId, 'config-run');
+  assert.equal(configuredTarget.terminalHandle, 'config-terminal');
+  assert.equal(configuredTarget.worktreeId, 'config-worktree');
+});
+
+test('preferred terminal handle reuses a connected orphan over a fresher live terminal', async () => {
+  let terminals: object[] = [
+    { handle: 'bound', orphaned: true, connected: true, writable: true, lastOutputAt: 1 },
+    { handle: 'live', connected: true, writable: true, agentIdentity: 'antigravity', lastOutputAt: 9 },
+  ];
+  const runner: CommandRunner = async () => ({ stdout: JSON.stringify({ ok: true, result: { terminals } }) });
+  const resolve = (preferredHandle: string) =>
+    resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, { preferredHandle });
+  assert.deepEqual(await resolve('bound'), { handle: 'bound', spawned: false });
+  terminals = [
+    { handle: 'bound', orphaned: true, connected: false, writable: true },
+    { handle: 'live', connected: true, writable: true, agentIdentity: 'antigravity' },
+  ];
+  assert.deepEqual(await resolve('bound'), { handle: 'live', spawned: false });
+  terminals = [
+    { handle: 'bound', connected: true, writable: false },
+    { handle: 'live', connected: true, writable: true, agentIdentity: 'antigravity' },
+  ];
+  assert.deepEqual(await resolve('bound'), { handle: 'live', spawned: false });
+  assert.equal((await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, {})).handle, 'live');
+});
+
 test('runtime uses a generated fixed binding, persists mailbox and supports setup while running', async t => {
   const root = directory(t);
   const calls: CommandRequest[] = [];
@@ -594,8 +665,11 @@ test('failed host execution leaves durable mail and does not report success', as
     commandRunner: async () => ({ stdout: '', stderr: 'host rejected command', exitCode: 2 }) });
   await assert.rejects(plugin.execute([message('failed')], context, {}), /exited 2/);
   assert.equal(new MailboxStore(join(root, 'mailbox.json')).getWakeTarget('task:failed')?.mode, 'passive');
-  assert.equal(store.getWakeTarget('task:failed')?.pendingWake, false);
-  assert.equal(store.getWakeTarget('task:failed')?.deliveryInDoubt, true);
+  const failed = store.getWakeTarget('task:failed')!;
+  assert.equal(failed.pendingWake, true);
+  assert.equal(failed.attemptCount, 1);
+  assert.ok(failed.earliestWakeAt > Date.now());
+  assert.match(failed.lastWakeError!, /exited 2/);
 });
 
 test('wake target host options merge, clear and validate after reload', t => {
@@ -953,9 +1027,11 @@ test('host-bound passive mailboxes redrive inbox conversation frames after initi
     fail = true;
     await inbox.execute([{ ...message('failure'), semantic: { type: 'reply', threadId: 'conversation', targetMailbox: 'stream:session' } }], context, {});
     assert.equal((await wakeup.flushMailbox('stream:session')).woke, false);
-    assert.equal(store.getWakeTarget('stream:session')?.pendingWake, false);
-    assert.equal(store.getWakeTarget('stream:session')?.deliveryInDoubt, true);
-    assert.match(store.getWakeTarget('stream:session')!.lastWakeError!, /exited 2/);
+    const failed = store.getWakeTarget('stream:session')!;
+    assert.equal(failed.pendingWake, true);
+    assert.equal(failed.attemptCount, 1);
+    assert.ok(failed.earliestWakeAt > Date.now());
+    assert.match(failed.lastWakeError!, /exited 2/);
     await wakeup.stop();
   }
 });
@@ -1022,14 +1098,16 @@ test('agent executor preserves an in-flight arrival and releases its claim for i
   assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
 });
 
-test('ambiguous host launch remains parked across restart and later arrivals', async t => {
+test('ambiguous host launch failure retries after restart and heals once the host recovers', async t => {
   const file = join(directory(t), 'mailbox.json');
   const store = new MailboxStore(file);
   await assert.rejects(createClaudeCodeExecutorPlugin({ store, commandRunner: async () => {
     throw new Error('accepted then connection lost');
   } }).execute([message('recover')], context, {}), /connection lost/);
-  assert.equal(store.getWakeTarget('task:recover')?.deliveryInDoubt, true);
-  assert.equal(store.getWakeTarget('task:recover')?.pendingWake, false);
+  const failed = store.getWakeTarget('task:recover')!;
+  assert.equal(failed.pendingWake, true);
+  assert.equal(failed.attemptCount, 1);
+  assert.match(failed.lastWakeError!, /connection lost/);
   const restarted = new MailboxStore(file);
   const calls: CommandRequest[] = [];
   const wakeup = new WakeupRedriveService({ store: restarted, commandRunner: async call => {
@@ -1038,11 +1116,12 @@ test('ambiguous host launch remains parked across restart and later arrivals', a
   } });
   t.after(() => wakeup.stop());
   restarted.enqueue([message('late')], { mailboxId: 'task:recover' });
-  assert.equal((await wakeup.flushMailbox('task:recover', { force: true })).woke, false);
-  await wakeup.flushReady();
-  assert.equal(calls.length, 0);
-  assert.equal(restarted.getWakeTarget('task:recover')?.deliveryInDoubt, true);
-  assert.match(restarted.getWakeTarget('task:recover')!.lastWakeError!, /connection lost/);
+  assert.equal((await wakeup.flushMailbox('task:recover', { force: true })).woke, true);
+  assert.equal(calls.length, 1);
+  const healed = restarted.getWakeTarget('task:recover')!;
+  assert.equal(healed.pendingWake, false);
+  assert.equal(healed.attemptCount, 0);
+  assert.equal(healed.lastWakeError, undefined);
 });
 
 
@@ -1087,7 +1166,7 @@ for (const agent of ['codex', 'antigravity'] as const) {
   });
 }
 
-test('aborted host launch retains its unknown-effect fence without claim-release replay', async t => {
+test('aborted host launch backs off and remains retryable', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   const controller = new AbortController();
   let calls = 0;
@@ -1100,9 +1179,16 @@ test('aborted host launch retains its unknown-effect fence without claim-release
   t.after(() => wakeup.stop());
   await assert.rejects(createClaudeCodeExecutorPlugin({ store, wakeup, commandRunner: runner })
     .execute([message('aborted')], { ...context, signal: controller.signal }, {}), /accepted before abort/);
+  const failed = store.getWakeTarget('task:aborted')!;
+  assert.equal(failed.pendingWake, true);
+  assert.equal(failed.attemptCount, 1);
+  assert.match(failed.lastWakeError!, /accepted before abort/);
   await wakeup.flushMailbox('task:aborted', { force: true });
-  assert.equal(calls, 1);
-  assert.equal(store.getWakeTarget('task:aborted')?.deliveryInDoubt, true);
+  assert.equal(calls, 2);
+  const retried = store.getWakeTarget('task:aborted')!;
+  assert.equal(retried.pendingWake, true);
+  assert.equal(retried.attemptCount, 2);
+  assert.ok(retried.earliestWakeAt > Date.now());
 });
 
 test('command boundary distinguishes absent executables, synchronous validation and pre-abort from post-spawn failures', async t => {
@@ -1135,7 +1221,6 @@ test('initial host ENOENT is retryable and recovery binds the actual Codex recei
   await assert.rejects(createCodexExecutorPlugin({ store, command: join(root, 'missing'), sessionId: 'not-created' })
     .execute([message('pre-effect')], context, {}), CommandNotStartedError);
   const target = store.getWakeTarget('task:pre-effect')!;
-  assert.equal(target.deliveryInDoubt, undefined);
   assert.equal(target.pendingWake, true);
   assert.equal(target.attemptCount, 1);
   assert.equal(target.conversationMode, 'spawn');

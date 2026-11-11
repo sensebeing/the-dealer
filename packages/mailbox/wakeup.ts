@@ -1,7 +1,6 @@
 import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import {
   checkedCommand,
-  CommandNotStartedError,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
   resolveOrSpawnOrcaWorkspaceTerminal,
@@ -135,15 +134,90 @@ export function wakeupBackoffDelay(attemptCount: number): number {
 }
 
 /** Share failure classification between initial executors and background redrive. */
-export function settleWakeDeliveryFailure(store: MailboxStore, mailboxId: string, error: unknown, now = Date.now()): void {
-  if (error instanceof CommandNotStartedError) {
-    const attemptCount = (store.getWakeTarget(mailboxId)?.attemptCount ?? 0) + 1;
-    store.upsertWakeTarget(mailboxId, {
-      deliveryInDoubt: undefined, pendingWake: true, attemptCount,
-      earliestWakeAt: now + wakeupBackoffDelay(attemptCount), lastWakeError: String(error),
+export function settleWakeDeliveryFailure(
+  store: MailboxStore,
+  mailboxId: string,
+  error: unknown,
+  now = Date.now(),
+  patch: Partial<WakeTargetState> = {},
+): void {
+  const attemptCount = (store.getWakeTarget(mailboxId)?.attemptCount ?? 0) + 1;
+  store.upsertWakeTarget(mailboxId, {
+    ...patch,
+    pendingWake: true,
+    attemptCount,
+    earliestWakeAt: now + wakeupBackoffDelay(attemptCount),
+    lastWakeError: String(error),
+  });
+}
+
+/**
+ * Single owner for one passive host delivery attempt. A wakeup is an idempotent notification and
+ * message consumption is guarded by the mailbox's single outstanding lease, so every failure
+ * returns the target to the backoff ledger instead of fencing the mailbox permanently.
+ */
+export async function deliverPassiveWakeTarget(
+  store: MailboxStore,
+  runner: CommandRunner,
+  mailboxId: string,
+  options: { signal?: AbortSignal; now?: number } = {},
+): Promise<{ pointer: string; stdout: string; stderr?: string }> {
+  try {
+    const target = store.getWakeTarget(mailboxId);
+    if (!target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
+    const preview = store.check({ mailboxId, peek: true });
+    const pointer = buildWakeupPointer(mailboxId, target, preview);
+    if (!pointer) throw new Error(`No pending Dealer messages in ${mailboxId}`);
+    const invocation = buildAgentHostInvocation({
+      agent: target.hostAgent,
+      conversationMode: target.conversationMode ?? 'fixed',
+      mailboxId, promptText: pointer, cwd: target.workspacePath,
+      command: target.interactiveCommand, agentProfile: target.agentProfile,
+      targetBot: target.targetBot, sessionId: target.sessionId,
     });
-  } else {
-    store.parkWakeDelivery(mailboxId, error);
+    const output = await checkedCommand(runner, { ...invocation, cwd: target.workspacePath, signal: options.signal });
+    store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview),
+      resolveAgentHostContinuation(target.hostAgent, mailboxId, target.sessionId, output.stdout, target.conversationMode ?? 'fixed'));
+    return { pointer, stdout: output.stdout, stderr: output.stderr };
+  } catch (error) {
+    settleWakeDeliveryFailure(store, mailboxId, error, options.now);
+    throw error;
+  }
+}
+
+/**
+ * Single owner for the spawned terminal's initial wake. A busy or unverifiable terminal is never
+ * injected; it keeps `pendingWake` and the persisted handle so the redrive service resumes it.
+ */
+export async function deliverSpawnedOrcaTerminalWakeup(
+  store: MailboxStore,
+  runner: CommandRunner,
+  mailboxId: string,
+  options: { signal?: AbortSignal; now?: number } = {},
+): Promise<{ pointer?: string; terminalHandle?: string; sent: boolean }> {
+  try {
+    const target = store.getWakeTarget(mailboxId);
+    if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
+    const command = target.orcaCommand ?? 'orca';
+    const preview = store.check({ mailboxId, peek: true });
+    const idle = await waitOrcaTerminalIdle(runner, command, target.terminalHandle, target.workspacePath, 5000, options.signal);
+    if (!idle.idle) {
+      store.upsertWakeTarget(mailboxId, { pendingWake: true, terminalHandle: target.terminalHandle });
+      return { terminalHandle: target.terminalHandle, sent: false };
+    }
+    const pointer = buildWakeupPointer(mailboxId, target, preview);
+    if (!pointer) {
+      store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), { terminalHandle: target.terminalHandle });
+      return { terminalHandle: target.terminalHandle, sent: false };
+    }
+    await sendOrcaTerminalText(runner, command, target.terminalHandle, pointer, {
+      cwd: target.workspacePath, signal: options.signal, waitSubmit: 5,
+    });
+    store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), { terminalHandle: target.terminalHandle });
+    return { pointer, terminalHandle: target.terminalHandle, sent: true };
+  } catch (error) {
+    settleWakeDeliveryFailure(store, mailboxId, error, options.now);
+    throw error;
   }
 }
 
@@ -255,7 +329,7 @@ export class WakeupRedriveService {
       return;
     }
     const target = this.store.getWakeTarget(id);
-    if (!target?.pendingWake || target.deliveryInDoubt || target.earliestWakeAt > this.now()) {
+    if (!target?.pendingWake || target.earliestWakeAt > this.now()) {
       return;
     }
     void this.flushMailbox(id).catch(error => this.report(error));
@@ -333,7 +407,6 @@ export class WakeupRedriveService {
       if (!target) {
         return noWake(mailboxId, 'passive', 'No wake target');
       }
-      if (target.deliveryInDoubt) return noWake(mailboxId, target.mode, target.lastWakeError ?? 'Wake delivery requires reconciliation');
       if (!target.pendingWake) {
         return noWake(mailboxId, target.mode, 'No pending wake');
       }
@@ -371,19 +444,14 @@ export class WakeupRedriveService {
         );
       }
       if (target.mode === 'passive' && target.hostAgent) {
-        const pointer = buildWakeupPointer(mailboxId, target, preview)!;
-        const invocation = buildAgentHostInvocation({
-          agent: target.hostAgent,
-          conversationMode: target.conversationMode ?? 'fixed',
-          mailboxId, promptText: pointer, cwd: target.workspacePath,
-          command: target.interactiveCommand, agentProfile: target.agentProfile,
-          targetBot: target.targetBot, sessionId: target.sessionId,
-        });
-        this.store.beginWakeDelivery(mailboxId);
-        const output = await checkedCommand(this.runner, { ...invocation, cwd: target.workspacePath });
-        this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview),
-          resolveAgentHostContinuation(target.hostAgent, mailboxId, target.sessionId, output.stdout, target.conversationMode ?? 'fixed'));
-        return { mailboxId, mode: target.mode, woke: true, pointer, reason: 'Agent host wakeup delivered' };
+        try {
+          const delivered = await deliverPassiveWakeTarget(this.store, this.runner, mailboxId, { now: this.now() });
+          return { mailboxId, mode: target.mode, woke: true, pointer: delivered.pointer, reason: 'Agent host wakeup delivered' };
+        } catch (error) {
+          // The delivery helper owns its own settlement; re-settling here would double the backoff.
+          this.report(error);
+          return noWake(mailboxId, target.mode, String(error));
+        }
       }
       if (!this.idleCheck && target.mode === 'orca-terminal' && target.workspacePath && target.autoCreateWorkspace === true) {
         const workspace = await ensureOrcaWorkspace(this.runner, target.orcaCommand ?? this.command, {
@@ -404,13 +472,10 @@ export class WakeupRedriveService {
         return noWake(mailboxId, 'passive', String(error));
       }
       try {
-        if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
-          settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
-          return noWake(mailboxId, target.mode, String(error));
-        }
-        return this.defer(mailboxId, target, String(error));
-      } catch (deferError) {
-        this.report(deferError);
+        settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
+        return noWake(mailboxId, target.mode, String(error));
+      } catch (settleError) {
+        this.report(settleError);
         return noWake(mailboxId, target.mode, String(error));
       }
     }
@@ -459,6 +524,7 @@ export class WakeupRedriveService {
       attemptCount,
       earliestWakeAt: this.now() + wakeupBackoffDelay(attemptCount),
       lastWakeError: reason,
+      ...(target.terminalHandle !== undefined ? { terminalHandle: target.terminalHandle } : {}),
     });
     return noWake(mailboxId, target.mode, reason);
   }
@@ -497,8 +563,9 @@ export class WakeupRedriveService {
     let terminalHandle = target.terminalHandle;
     const needsRotation = !preview.deliveryId && target.rotateAfterWaves !== undefined && target.completedWaves >= target.rotateAfterWaves;
     if (!terminalHandle && target.workspacePath && (target.mode === 'orca-terminal' || needsRotation)) {
-      const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, { agent: target.agent, interactiveCommand: target.interactiveCommand });
+      const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, { agent: target.agent, interactiveCommand: target.interactiveCommand, preferredHandle: target.terminalHandle });
       terminalHandle = resolved.handle;
+      target = { ...target, terminalHandle };
       if (resolved.spawned) {
         if (resolved.shellBootstrapped === true) {
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
@@ -548,7 +615,6 @@ export class WakeupRedriveService {
 
     if (target.mode === 'orca-run' && !target.runId) throw new Error('orca-run wake target requires runId');
     if (target.mode === 'orca-terminal' && !terminalHandle) throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
-    this.store.beginWakeDelivery(mailboxId);
     if (target.mode === 'orca-run') {
       const output = await this.runner({
         command,
@@ -600,7 +666,7 @@ export class WakeupRedriveService {
       }
     }
 
-    this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview));
+    this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), terminalHandle ? { terminalHandle } : {});
     return {
       mailboxId,
       mode: target.mode,
