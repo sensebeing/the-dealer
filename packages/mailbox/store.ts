@@ -86,6 +86,8 @@ export interface WakeTargetState {
   readonly earliestWakeAt: number;
   readonly attemptCount: number;
   readonly lastWakeError?: string;
+  /** Persisted before an external delivery; remains fenced while its outcome is unknown. */
+  readonly deliveryInDoubt?: boolean;
 }
 
 export interface ThreadRouteRecord {
@@ -365,6 +367,7 @@ function mergeWakeTarget(
   const workspaceComment = optional('workspaceComment');
   const rotateAfterWaves = optional('rotateAfterWaves');
   const lastWakeError = optional('lastWakeError');
+  const deliveryInDoubt = optional('deliveryInDoubt');
   const nextCoalesceMs = patch.coalesceMs ?? current.coalesceMs;
   const nextAttemptCount = patch.attemptCount ?? current.attemptCount;
   let earliestWakeAt = patch.earliestWakeAt ?? current.earliestWakeAt;
@@ -398,6 +401,7 @@ function mergeWakeTarget(
     ...(workspaceComment !== undefined ? { workspaceComment } : {}),
     ...(rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
     ...(lastWakeError !== undefined ? { lastWakeError } : {}),
+    ...(deliveryInDoubt !== undefined ? { deliveryInDoubt } : {}),
   };
 }
 
@@ -411,14 +415,8 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   if (!isRecord(value)) {
     throw invalidStore();
   }
-  if (value.deliveryInDoubt !== undefined && typeof value.deliveryInDoubt !== 'boolean') {
-    throw invalidStore();
-  }
-  // `deliveryInDoubt` is retired: pre-self-heal stores parked targets behind this fence. Strip it
-  // on every validation so a loaded target is never written back with the legacy field.
-  const fields: Record<string, unknown> = { ...value };
-  delete fields.deliveryInDoubt;
-  const target = fields as unknown as WakeTargetState;
+  const target = value as unknown as WakeTargetState;
+  if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
   if (target.hostAgent !== undefined && !['codex', 'claude', 'claude-code', 'antigravity', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
   if (target.conversationMode !== undefined && !['spawn', 'fixed'].includes(target.conversationMode)) throw invalidStore();
   if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
@@ -679,19 +677,10 @@ function loadState(raw: string): MailboxFileState {
   for (const [key, value] of Object.entries(mailboxes)) {
     validateMailboxRecord(key, value);
   }
-  const normalizedWakeTargets: Record<string, WakeTargetState> = {};
   for (const [key, value] of Object.entries(wakeTargets)) {
-    const target = validateWakeTarget(value);
-    if (target.mailboxId !== key) {
+    if (validateWakeTarget(value).mailboxId !== key) {
       throw invalidStore();
     }
-    // A legacy target was parked permanently after an unknown external delivery outcome. The
-    // fence is retired, so re-arm the wake whenever the mailbox still holds queued mail: an
-    // upgrade must self-heal those mailboxes instead of leaving them silent forever.
-    const legacyParked = isRecord(value) && value.deliveryInDoubt === true;
-    normalizedWakeTargets[key] = legacyParked && items.some(
-      item => item.mailboxId === key && item.status === 'queued',
-    ) ? { ...target, pendingWake: true } : target;
   }
   const normalizedThreads: Record<string, ThreadRouteRecord> = {};
   for (const [key, value] of Object.entries(threads)) {
@@ -712,7 +701,7 @@ function loadState(raw: string): MailboxFileState {
     sequence,
     items,
     mailboxes: mailboxes as Record<string, MailboxStateRecord>,
-    wakeTargets: normalizedWakeTargets,
+    wakeTargets: wakeTargets as Record<string, WakeTargetState>,
     threads: normalizedThreads,
   };
 }
@@ -1454,6 +1443,40 @@ export class MailboxStore {
     return merged;
   }
 
+  /**
+   * Fence before an external delivery so a crash or an unknown outcome cannot silently replay it.
+   * Only `completeWakeDelivery` (confirmed receipt) or an explicit listener patch clears the fence.
+   */
+  beginWakeDelivery(mailboxId: string): WakeTargetState {
+    const id = normalizeMailboxId(mailboxId);
+    return this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      if (current.deliveryInDoubt) {
+        throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
+      }
+      const next = validateWakeTarget(mergeWakeTarget(current, {
+        deliveryInDoubt: true, pendingWake: false,
+        lastWakeError: 'External wake delivery outcome is not yet confirmed',
+      }));
+      state.wakeTargets[id] = next;
+      return structuredClone(next);
+    });
+  }
+
+  /** Keep an unconfirmed external outcome fenced; later mail, forced flushes and restarts never replay it. */
+  parkWakeDelivery(mailboxId: string, error: unknown): WakeTargetState {
+    const id = normalizeMailboxId(mailboxId);
+    return this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const next = validateWakeTarget(mergeWakeTarget(current, {
+        deliveryInDoubt: true, pendingWake: false, earliestWakeAt: 0,
+        attemptCount: current.attemptCount + 1, lastWakeError: String(error),
+      }));
+      state.wakeTargets[id] = next;
+      return structuredClone(next);
+    });
+  }
+
   /** Settle only the observed wave; messages arriving during delivery retain their wake. */
   completeWakeDelivery(
     mailboxId: string,
@@ -1469,6 +1492,7 @@ export class MailboxStore {
       const next = validateWakeTarget(mergeWakeTarget(current, {
         ...patch, pendingWake, attemptCount: 0,
         earliestWakeAt: pendingWake ? current.earliestWakeAt : 0, lastWakeError: undefined,
+        deliveryInDoubt: undefined,
       }));
       state.wakeTargets[id] = next;
       return structuredClone(next);
@@ -1500,7 +1524,7 @@ export class MailboxStore {
       throw new Error('Invalid wake target instant');
     }
     return Object.values(this.read().wakeTargets)
-      .filter(target => target.pendingWake && target.earliestWakeAt <= nowMs)
+      .filter(target => target.pendingWake && !target.deliveryInDoubt && target.earliestWakeAt <= nowMs)
       .sort(
         (a, b) =>
           a.earliestWakeAt - b.earliestWakeAt || a.mailboxId.localeCompare(b.mailboxId),

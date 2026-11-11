@@ -666,9 +666,8 @@ test('failed host execution leaves durable mail and does not report success', as
   await assert.rejects(plugin.execute([message('failed')], context, {}), /exited 2/);
   assert.equal(new MailboxStore(join(root, 'mailbox.json')).getWakeTarget('task:failed')?.mode, 'passive');
   const failed = store.getWakeTarget('task:failed')!;
-  assert.equal(failed.pendingWake, true);
-  assert.equal(failed.attemptCount, 1);
-  assert.ok(failed.earliestWakeAt > Date.now());
+  assert.equal(failed.pendingWake, false);
+  assert.equal(failed.deliveryInDoubt, true);
   assert.match(failed.lastWakeError!, /exited 2/);
 });
 
@@ -1028,9 +1027,8 @@ test('host-bound passive mailboxes redrive inbox conversation frames after initi
     await inbox.execute([{ ...message('failure'), semantic: { type: 'reply', threadId: 'conversation', targetMailbox: 'stream:session' } }], context, {});
     assert.equal((await wakeup.flushMailbox('stream:session')).woke, false);
     const failed = store.getWakeTarget('stream:session')!;
-    assert.equal(failed.pendingWake, true);
-    assert.equal(failed.attemptCount, 1);
-    assert.ok(failed.earliestWakeAt > Date.now());
+    assert.equal(failed.pendingWake, false);
+    assert.equal(failed.deliveryInDoubt, true);
     assert.match(failed.lastWakeError!, /exited 2/);
     await wakeup.stop();
   }
@@ -1098,16 +1096,14 @@ test('agent executor preserves an in-flight arrival and releases its claim for i
   assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
 });
 
-test('ambiguous host launch failure retries after restart and heals once the host recovers', async t => {
+test('ambiguous host launch remains parked across restart and later arrivals', async t => {
   const file = join(directory(t), 'mailbox.json');
   const store = new MailboxStore(file);
   await assert.rejects(createClaudeCodeExecutorPlugin({ store, commandRunner: async () => {
     throw new Error('accepted then connection lost');
   } }).execute([message('recover')], context, {}), /connection lost/);
-  const failed = store.getWakeTarget('task:recover')!;
-  assert.equal(failed.pendingWake, true);
-  assert.equal(failed.attemptCount, 1);
-  assert.match(failed.lastWakeError!, /connection lost/);
+  assert.equal(store.getWakeTarget('task:recover')?.deliveryInDoubt, true);
+  assert.equal(store.getWakeTarget('task:recover')?.pendingWake, false);
   const restarted = new MailboxStore(file);
   const calls: CommandRequest[] = [];
   const wakeup = new WakeupRedriveService({ store: restarted, commandRunner: async call => {
@@ -1116,12 +1112,13 @@ test('ambiguous host launch failure retries after restart and heals once the hos
   } });
   t.after(() => wakeup.stop());
   restarted.enqueue([message('late')], { mailboxId: 'task:recover' });
-  assert.equal((await wakeup.flushMailbox('task:recover', { force: true })).woke, true);
-  assert.equal(calls.length, 1);
-  const healed = restarted.getWakeTarget('task:recover')!;
-  assert.equal(healed.pendingWake, false);
-  assert.equal(healed.attemptCount, 0);
-  assert.equal(healed.lastWakeError, undefined);
+  assert.equal((await wakeup.flushMailbox('task:recover', { force: true })).woke, false);
+  await wakeup.flushReady();
+  assert.equal(calls.length, 0);
+  assert.equal(restarted.getWakeTarget('task:recover')?.deliveryInDoubt, true);
+  // A later attempt is refused before the boundary and keeps the original unknown-outcome reason.
+  assert.throws(() => restarted.beginWakeDelivery('task:recover'), /requires reconciliation/);
+  assert.match(restarted.getWakeTarget('task:recover')!.lastWakeError!, /connection lost/);
 });
 
 
@@ -1166,7 +1163,7 @@ for (const agent of ['codex', 'antigravity'] as const) {
   });
 }
 
-test('aborted host launch backs off and remains retryable', async t => {
+test('aborted host launch retains its unknown-effect fence without claim-release replay', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   const controller = new AbortController();
   let calls = 0;
@@ -1179,16 +1176,9 @@ test('aborted host launch backs off and remains retryable', async t => {
   t.after(() => wakeup.stop());
   await assert.rejects(createClaudeCodeExecutorPlugin({ store, wakeup, commandRunner: runner })
     .execute([message('aborted')], { ...context, signal: controller.signal }, {}), /accepted before abort/);
-  const failed = store.getWakeTarget('task:aborted')!;
-  assert.equal(failed.pendingWake, true);
-  assert.equal(failed.attemptCount, 1);
-  assert.match(failed.lastWakeError!, /accepted before abort/);
   await wakeup.flushMailbox('task:aborted', { force: true });
-  assert.equal(calls, 2);
-  const retried = store.getWakeTarget('task:aborted')!;
-  assert.equal(retried.pendingWake, true);
-  assert.equal(retried.attemptCount, 2);
-  assert.ok(retried.earliestWakeAt > Date.now());
+  assert.equal(calls, 1);
+  assert.equal(store.getWakeTarget('task:aborted')?.deliveryInDoubt, true);
 });
 
 test('command boundary distinguishes absent executables, synchronous validation and pre-abort from post-spawn failures', async t => {
@@ -1221,6 +1211,7 @@ test('initial host ENOENT is retryable and recovery binds the actual Codex recei
   await assert.rejects(createCodexExecutorPlugin({ store, command: join(root, 'missing'), sessionId: 'not-created' })
     .execute([message('pre-effect')], context, {}), CommandNotStartedError);
   const target = store.getWakeTarget('task:pre-effect')!;
+  assert.equal(target.deliveryInDoubt, undefined);
   assert.equal(target.pendingWake, true);
   assert.equal(target.attemptCount, 1);
   assert.equal(target.conversationMode, 'spawn');

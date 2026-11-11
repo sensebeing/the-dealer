@@ -1,5 +1,6 @@
 import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import {
+  CommandNotStartedError,
   checkedCommand,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
@@ -133,8 +134,11 @@ export function wakeupBackoffDelay(attemptCount: number): number {
   return MAX_BACKOFF_MS;
 }
 
-/** Share failure classification between initial executors and background redrive. */
-export function settleWakeDeliveryFailure(
+/**
+ * Record a pre-effect failure: the external boundary was never crossed, so the target stays
+ * retryable and returns to the exponential backoff ledger.
+ */
+export function recordWakeFailure(
   store: MailboxStore,
   mailboxId: string,
   error: unknown,
@@ -144,6 +148,7 @@ export function settleWakeDeliveryFailure(
   const attemptCount = (store.getWakeTarget(mailboxId)?.attemptCount ?? 0) + 1;
   store.upsertWakeTarget(mailboxId, {
     ...patch,
+    deliveryInDoubt: undefined,
     pendingWake: true,
     attemptCount,
     earliestWakeAt: now + wakeupBackoffDelay(attemptCount),
@@ -151,10 +156,26 @@ export function settleWakeDeliveryFailure(
   });
 }
 
+/** Share failure classification between initial executors and background redrive. */
+export function settleWakeDeliveryFailure(
+  store: MailboxStore,
+  mailboxId: string,
+  error: unknown,
+  now = Date.now(),
+): void {
+  // A command that never started cannot have had an effect. Anything else crossed the external
+  // boundary and must stay fenced until the owner confirms the outcome.
+  if (error instanceof CommandNotStartedError) {
+    recordWakeFailure(store, mailboxId, error, now);
+    return;
+  }
+  store.parkWakeDelivery(mailboxId, error);
+}
+
 /**
- * Single owner for one passive host delivery attempt. A wakeup is an idempotent notification and
- * message consumption is guarded by the mailbox's single outstanding lease, so every failure
- * returns the target to the backoff ledger instead of fencing the mailbox permanently.
+ * Single owner for one passive host delivery attempt. Validation, pointer construction and
+ * invocation building happen before `beginWakeDelivery`; only the host invocation itself crosses
+ * the external boundary, so unknown outcomes stay fenced while never-started commands retry.
  */
 export async function deliverPassiveWakeTarget(
   store: MailboxStore,
@@ -162,6 +183,8 @@ export async function deliverPassiveWakeTarget(
   mailboxId: string,
   options: { signal?: AbortSignal; now?: number } = {},
 ): Promise<{ pointer: string; stdout: string; stderr?: string }> {
+  const now = options.now ?? Date.now();
+  let deliveryBegun = false;
   try {
     const target = store.getWakeTarget(mailboxId);
     if (!target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
@@ -175,12 +198,21 @@ export async function deliverPassiveWakeTarget(
       command: target.interactiveCommand, agentProfile: target.agentProfile,
       targetBot: target.targetBot, sessionId: target.sessionId,
     });
+    store.beginWakeDelivery(mailboxId);
+    deliveryBegun = true;
     const output = await checkedCommand(runner, { ...invocation, cwd: target.workspacePath, signal: options.signal });
     store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview),
       resolveAgentHostContinuation(target.hostAgent, mailboxId, target.sessionId, output.stdout, target.conversationMode ?? 'fixed'));
     return { pointer, stdout: output.stdout, stderr: output.stderr };
   } catch (error) {
-    settleWakeDeliveryFailure(store, mailboxId, error, options.now);
+    const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
+    if (fenced) {
+      // A pre-existing fence refuses the attempt before the boundary; it keeps the original
+      // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
+      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now);
+    } else {
+      recordWakeFailure(store, mailboxId, error, now);
+    }
     throw error;
   }
 }
@@ -188,6 +220,7 @@ export async function deliverPassiveWakeTarget(
 /**
  * Single owner for the spawned terminal's initial wake. A busy or unverifiable terminal is never
  * injected; it keeps `pendingWake` and the persisted handle so the redrive service resumes it.
+ * Only the terminal send crosses the external boundary and can create an unknown-outcome fence.
  */
 export async function deliverSpawnedOrcaTerminalWakeup(
   store: MailboxStore,
@@ -195,6 +228,8 @@ export async function deliverSpawnedOrcaTerminalWakeup(
   mailboxId: string,
   options: { signal?: AbortSignal; now?: number } = {},
 ): Promise<{ pointer?: string; terminalHandle?: string; sent: boolean }> {
+  const now = options.now ?? Date.now();
+  let deliveryBegun = false;
   try {
     const target = store.getWakeTarget(mailboxId);
     if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
@@ -210,13 +245,22 @@ export async function deliverSpawnedOrcaTerminalWakeup(
       store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), { terminalHandle: target.terminalHandle });
       return { terminalHandle: target.terminalHandle, sent: false };
     }
+    store.beginWakeDelivery(mailboxId);
+    deliveryBegun = true;
     await sendOrcaTerminalText(runner, command, target.terminalHandle, pointer, {
       cwd: target.workspacePath, signal: options.signal, waitSubmit: 5,
     });
     store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), { terminalHandle: target.terminalHandle });
     return { pointer, terminalHandle: target.terminalHandle, sent: true };
   } catch (error) {
-    settleWakeDeliveryFailure(store, mailboxId, error, options.now);
+    const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
+    if (fenced) {
+      // A pre-existing fence refuses the attempt before the boundary; it keeps the original
+      // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
+      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now);
+    } else {
+      recordWakeFailure(store, mailboxId, error, now);
+    }
     throw error;
   }
 }
@@ -248,7 +292,9 @@ export function buildTaskPreamble(
 /**
  * Durable wakeup redrive backed by the mailbox ledger. A wave or task is committed before any
  * pointer is sent, so a busy workspace or a daemon restart can never lose it. Text is injected
- * only after an authoritative idle proof; busy targets keep `pendingWake` and retry with backoff.
+ * only after an authoritative idle proof; busy targets keep `pendingWake` and retry with backoff,
+ * while a send whose external outcome is unknown stays fenced as `deliveryInDoubt` and is never
+ * replayed by later mail, a forced flush or a restart.
  */
 export class WakeupRedriveService {
   private readonly store: MailboxStore;
@@ -329,7 +375,7 @@ export class WakeupRedriveService {
       return;
     }
     const target = this.store.getWakeTarget(id);
-    if (!target?.pendingWake || target.earliestWakeAt > this.now()) {
+    if (!target?.pendingWake || target.deliveryInDoubt || target.earliestWakeAt > this.now()) {
       return;
     }
     void this.flushMailbox(id).catch(error => this.report(error));
@@ -407,6 +453,9 @@ export class WakeupRedriveService {
       if (!target) {
         return noWake(mailboxId, 'passive', 'No wake target');
       }
+      if (target.deliveryInDoubt) {
+        return noWake(mailboxId, target.mode, target.lastWakeError ?? 'Wake delivery requires reconciliation');
+      }
       if (!target.pendingWake) {
         return noWake(mailboxId, target.mode, 'No pending wake');
       }
@@ -472,8 +521,11 @@ export class WakeupRedriveService {
         return noWake(mailboxId, 'passive', String(error));
       }
       try {
-        settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
-        return noWake(mailboxId, target.mode, String(error));
+        if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
+          settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
+          return noWake(mailboxId, target.mode, String(error));
+        }
+        return this.defer(mailboxId, target, String(error));
       } catch (settleError) {
         this.report(settleError);
         return noWake(mailboxId, target.mode, String(error));
@@ -518,14 +570,13 @@ export class WakeupRedriveService {
     target: WakeTargetState,
     reason: string,
   ): WakeupFlushResult {
-    const attemptCount = target.attemptCount + 1;
-    this.store.upsertWakeTarget(mailboxId, {
-      pendingWake: true,
-      attemptCount,
-      earliestWakeAt: this.now() + wakeupBackoffDelay(attemptCount),
-      lastWakeError: reason,
-      ...(target.terminalHandle !== undefined ? { terminalHandle: target.terminalHandle } : {}),
-    });
+    recordWakeFailure(
+      this.store,
+      mailboxId,
+      reason,
+      this.now(),
+      target.terminalHandle !== undefined ? { terminalHandle: target.terminalHandle } : {},
+    );
     return noWake(mailboxId, target.mode, reason);
   }
 
@@ -562,7 +613,11 @@ export class WakeupRedriveService {
     const command = target.orcaCommand ?? this.command;
     let terminalHandle = target.terminalHandle;
     const needsRotation = !preview.deliveryId && target.rotateAfterWaves !== undefined && target.completedWaves >= target.rotateAfterWaves;
-    if ((!terminalHandle || (target.attemptCount > 0 && !this.idleCheck)) && target.workspacePath && (target.mode === 'orca-terminal' || needsRotation)) {
+    // Real Orca mode re-resolves before every send so a terminal closed since the last delivery
+    // is rebound (or respawned) before the external boundary is crossed; `preferredHandle` keeps
+    // a live binding without spawning a second terminal. Tests that inject an authoritative idle
+    // check only resolve when no handle exists yet.
+    if ((!terminalHandle || !this.idleCheck) && target.workspacePath && (target.mode === 'orca-terminal' || needsRotation)) {
       const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, { agent: target.agent, interactiveCommand: target.interactiveCommand, preferredHandle: target.terminalHandle });
       terminalHandle = resolved.handle;
       target = { ...target, terminalHandle };
@@ -615,6 +670,9 @@ export class WakeupRedriveService {
 
     if (target.mode === 'orca-run' && !target.runId) throw new Error('orca-run wake target requires runId');
     if (target.mode === 'orca-terminal' && !terminalHandle) throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
+    // The pointer is the only external effect left; fence it so a crash or an unconfirmed send
+    // stays parked instead of being replayed by the next tick or restart.
+    this.store.beginWakeDelivery(mailboxId);
     if (target.mode === 'orca-run') {
       const output = await this.runner({
         command,
