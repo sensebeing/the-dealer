@@ -1315,8 +1315,22 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       if (rawUrgency && !['normal', 'high', 'critical'].includes(String(rawUrgency))) {
         throw new Error('Invalid urgency');
       }
+      const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
+      // A message on an existing thread belongs to the session that started it: the thread's
+      // recorded routes take precedence over the topic's generic binding.
+      const threadRoute =
+        threadId === undefined ? undefined : runtime.mailbox.resolveReplyTarget(threadId);
+      const explicitTargetMailbox =
+        typeof v['target-mailbox'] === 'string' && v['target-mailbox']
+          ? String(v['target-mailbox'])
+          : typeof v.mailbox === 'string' && v.mailbox
+            ? String(v.mailbox)
+            : undefined;
       const targetMailbox =
-        typeof v.mailbox === 'string' && v.mailbox ? String(v.mailbox) : undefined;
+        explicitTargetMailbox ??
+        (threadRoute?.targetMailbox !== undefined && threadRoute.targetMailbox !== 'default'
+          ? threadRoute.targetMailbox
+          : undefined);
       const callerBinding = caller;
       const payload = payloadFromBody(body);
       const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
@@ -1338,11 +1352,12 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const replyMailbox =
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
-          : (group === 'send' && callerBinding?.mailboxId && !callerMatchesBoundTopic
+          : (callerBinding?.mailboxId && !callerMatchesBoundTopic
             ? callerBinding.mailboxId
-            : undefined);
+            : (threadRoute?.localMailbox !== undefined && threadRoute.localMailbox !== 'default'
+              ? threadRoute.localMailbox
+              : undefined));
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
-      const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
       result = await runtime.emitter.emit({
         networkId: required(v.network, '--network'),
         kind: topic,

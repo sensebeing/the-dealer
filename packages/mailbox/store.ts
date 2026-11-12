@@ -285,30 +285,44 @@ export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding
     ? normalizeMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`) : 'default';
 }
 
-export function resolveMailboxId(envelope: MessageEnvelope, executorName?: string, binding?: MailboxTopicBinding): string {
-  const bindingKind = typeof envelope.payload?.streamKey === 'string'
-    ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
+export function resolveMailboxId(
+  envelope: MessageEnvelope,
+  executorName?: string,
+  binding?: MailboxTopicBinding,
+  threadLocalMailbox?: string,
+): string {
   const semantic = envelope.semantic;
-  const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
-  if (binding && control && (semantic?.targetMailbox === undefined || semantic.targetMailbox === 'default')) {
-    const bound = resolveBoundMailboxId(bindingKind, binding);
-    if (bound !== 'default') return bound;
-  }
-  if (semantic?.targetMailbox !== undefined) {
+  // An explicit session mailbox always owns its message, including control frames: a generic
+  // topic binding must never rewrite a session-specific destination. `default` means unspecified.
+  if (semantic?.targetMailbox !== undefined && semantic.targetMailbox !== 'default') {
     return normalizeMailboxId(semantic.targetMailbox, 'semantic targetMailbox');
+  }
+  // An established thread stays with the mailbox already handling it, so replies wake the
+  // originating worktree/terminal session instead of opening work in the topic's generic binding.
+  if (threadLocalMailbox !== undefined && threadLocalMailbox !== 'default') {
+    return normalizeMailboxId(threadLocalMailbox, 'thread local mailbox');
   }
   const payload = isRecord(envelope.payload)
     ? (envelope.payload as Record<string, unknown>)
     : undefined;
+  const bindingKind = typeof payload?.streamKey === 'string'
+    ? `${envelope.kind}:${payload.streamKey}` : envelope.kind;
+  const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
+  if (binding && (control || !isNonEmptyString(payload?.executor))) {
+    if (!control) {
+      if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
+        return normalizeMailboxId(`stream:${payload.streamKey}`);
+      }
+      return resolveBoundMailboxId(bindingKind, binding);
+    }
+    const bound = resolveBoundMailboxId(bindingKind, binding);
+    if (bound !== 'default') {
+      return bound;
+    }
+  }
   const explicit = payload?.mailbox;
   if (isNonEmptyString(explicit)) {
     return normalizeMailboxId(explicit, 'payload mailbox');
-  }
-  if (binding && !control && !isNonEmptyString(payload?.executor)) {
-    if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
-      return normalizeMailboxId(`stream:${payload.streamKey}`);
-    }
-    return resolveBoundMailboxId(bindingKind, binding);
   }
   if (executorName === 'orca-wave') {
     return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
@@ -1072,7 +1086,9 @@ export class MailboxStore {
         state.sequence += 1;
         conversationalByMailbox.set(mailboxId,
           (conversationalByMailbox.get(mailboxId) ?? true) &&
-          ['question', 'reply', 'settle'].includes(envelope.semantic?.type ?? ''),
+          (['question', 'reply', 'settle'].includes(envelope.semantic?.type ?? '') ||
+            Boolean(envelope.semantic?.threadId &&
+              threadRecordsFor(state, envelope.semantic.threadId).length > 0)),
         );
         inserted.push(cloned.id);
         insertedByMailbox.set(mailboxId, (insertedByMailbox.get(mailboxId) ?? 0) + 1);
@@ -1709,6 +1725,25 @@ export class MailboxStore {
     const exact = exactThreadRecord(state, messageOrThreadId);
     const threadId = exact?.threadId ?? messageOrThreadId;
     return threadRecordsFor(state, threadId).map(record => structuredClone(record));
+  }
+
+  /**
+   * The session mailbox an existing thread is already handled in: the newest non-default local
+   * leg. This is the durable thread-affinity record that keeps replies with the worktree/terminal
+   * session that owns the thread instead of the topic's generic binding.
+   */
+  resolveThreadLocalMailbox(threadId?: string): string | undefined {
+    if (typeof threadId !== 'string' || threadId.length === 0) {
+      return undefined;
+    }
+    const records = threadRecordsFor(this.read(), threadId);
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const localMailbox = records[index].localMailbox;
+      if (localMailbox !== 'default') {
+        return normalizeMailboxId(localMailbox, 'thread local mailbox');
+      }
+    }
+    return undefined;
   }
 
   resolveReplyTarget(messageOrThreadId: string): ResolvedReplyTarget | undefined {
