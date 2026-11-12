@@ -1773,13 +1773,24 @@ export class MailboxStore {
     return undefined;
   }
 
-  resolveReplyTarget(messageOrThreadId: string): ResolvedReplyTarget | undefined {
+  /**
+   * Resolve the reply route of a message or thread. `networkId` scopes the lookup to that
+   * network's records: a colliding thread id can accumulate a newer leg on another network, and
+   * that leg must not shadow the route recorded for the network being sent on.
+   */
+  resolveReplyTarget(
+    messageOrThreadId: string,
+    networkId?: string,
+  ): ResolvedReplyTarget | undefined {
     if (!isNonEmptyString(messageOrThreadId)) {
       throw new Error('Invalid thread reference');
     }
+    const onNetwork = (candidate: ThreadRouteRecord): boolean =>
+      networkId === undefined || candidate.networkId === networkId;
     const state = this.read();
-    const exact = exactThreadRecord(state, messageOrThreadId);
-    const record = exact ?? threadRecordsFor(state, messageOrThreadId).at(-1);
+    const exactRecord = exactThreadRecord(state, messageOrThreadId);
+    const exact = exactRecord !== undefined && onNetwork(exactRecord) ? exactRecord : undefined;
+    const record = exact ?? threadRecordsFor(state, messageOrThreadId).filter(onNetwork).at(-1);
     if (!record) {
       return undefined;
     }

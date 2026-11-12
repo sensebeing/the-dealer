@@ -713,8 +713,12 @@ async function mailboxStoreFor(
   return offlineMailboxStore(stateDir);
 }
 
-function replyTargetOrThrow(store: MailboxStore, messageId: string): ResolvedReplyTarget {
-  const route = store.resolveReplyTarget(messageId);
+function replyTargetOrThrow(
+  store: MailboxStore,
+  messageId: string,
+  networkId?: string,
+): ResolvedReplyTarget {
+  const route = store.resolveReplyTarget(messageId, networkId);
   if (!route) {
     throw new Error(`Unknown message or thread: ${messageId}`);
   }
@@ -824,7 +828,11 @@ async function runSessionCommand(
       ? String(v['reply-to'])
       : undefined;
     if (replyTo !== undefined) {
-      const route = replyTargetOrThrow(store, replyTo);
+      const route = replyTargetOrThrow(
+        store,
+        replyTo,
+        typeof v.network === 'string' && v.network ? String(v.network) : undefined,
+      );
       const replyMailbox = callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default');
       bindCallerWakeTarget(store, replyMailbox, caller);
       if (ackId) {
@@ -1318,11 +1326,10 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const networkId = required(v.network, '--network');
       const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
       // A message on an existing thread belongs to the session that started it: the thread's
-      // recorded routes take precedence over the topic's generic binding. A route recorded on a
-      // different network never applies to this send.
-      const rawRoute =
-        threadId === undefined ? undefined : runtime.mailbox.resolveReplyTarget(threadId);
-      const threadRoute = rawRoute?.networkId === networkId ? rawRoute : undefined;
+      // recorded routes take precedence over the topic's generic binding. Resolution is scoped to
+      // the send's network, so a newer leg of the same thread on another network never applies.
+      const threadRoute =
+        threadId === undefined ? undefined : runtime.mailbox.resolveReplyTarget(threadId, networkId);
       const explicitTargetMailbox =
         typeof v['target-mailbox'] === 'string' && v['target-mailbox']
           ? String(v['target-mailbox'])

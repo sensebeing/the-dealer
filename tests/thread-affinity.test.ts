@@ -288,6 +288,65 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
   assert.equal(foreign?.envelope.semantic?.targetMailbox, undefined);
 });
 
+test('dealer send --thread resolves the route recorded on the sending network', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'node'),
+    member: 'bob',
+    name: 'bob',
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+    commandRunner: async request =>
+      request.args[0] === 'worktree' && request.args[1] === 'ps'
+        ? { stdout: JSON.stringify({ ok: true, result: { truncated: false, worktrees: [] } }) }
+        : { stdout: '{"ok":true}' },
+    wakeupIdleCheck: async () => ({ idle: true }),
+    patch: { defaultExecutor: 'inbox', gateMode: 'open' },
+  }).start();
+  t.after(() => runtime.stop());
+  const threadId = 'thread-cross-network';
+  // The same thread id accumulated an older local route and a newer team route. `--network local`
+  // must follow the local leg instead of the newer leg shadowing it.
+  runtime.mailbox.recordInboundEnvelope(
+    envelope('peer-reply-local', {
+      networkId: 'local',
+      from: peer,
+      semantic: { type: 'reply', threadId, replyMailbox: 'task:local' },
+    }),
+    'worktree:origin',
+  );
+  runtime.mailbox.recordInboundEnvelope(
+    envelope('peer-reply-team', {
+      networkId: 'team',
+      from: peer,
+      semantic: { type: 'reply', threadId, replyMailbox: 'task:team' },
+    }),
+    'worktree:origin',
+  );
+  // The unscoped lookup follows the newest record; the network-scoped lookup must not.
+  assert.equal(runtime.mailbox.resolveReplyTarget(threadId)?.networkId, 'team');
+  const localRoute = runtime.mailbox.resolveReplyTarget(threadId, 'local')!;
+  assert.equal(localRoute.networkId, 'local');
+  assert.equal(localRoute.targetMailbox, 'task:local');
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await runDealerCli(
+    ['send', '--network', 'local', '--to', 'member:bob', '--topic', 'collab.request.v4', '--body', 'follow-up', '--thread', threadId, '--json'],
+    { runtime, stdout: line => out.push(line), stderr: line => err.push(line) },
+  );
+  assert.equal(code, 0, err.join('\n'));
+  assert.equal(runtime.mailbox.list({ mailboxId: 'task:team' }).totalCount, 0);
+  const [delivered] = runtime.mailbox.list({ mailboxId: 'task:local' }).items;
+  assert.ok(delivered, 'the route recorded on the sending network must receive the follow-up');
+  assert.deepEqual(delivered.envelope.semantic, {
+    type: 'message',
+    threadId,
+    targetMailbox: 'task:local',
+    replyMailbox: 'worktree:origin',
+  });
+});
+
 test('dealer send --thread follows the newest inbound leg of a thread we originated', async t => {
   const root = directory(t);
   const runtime = await new DealerNodeRuntime({
