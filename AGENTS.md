@@ -100,6 +100,8 @@ rules:
 
 ## 3. 开发、验证与文档索引
 
+`dealer node down` drains and stops the daemon, while `dealer node restart` performs the same drain before starting a fresh process. `dealer self-update` updates a clean main checkout and repairs skill links. The daemon records `runtimeFingerprint`; disk changes trigger an idle-gated drain and restart, preserving in-flight dispatches.
+
 - **运行环境**：Node.js `>=22.15.0`（原生支持 `--experimental-strip-types` 直接运行 `.ts`，无需编译构建步骤；零外部 npm 依赖）。可选 Rust 原生引擎源码位于 [`native/dealer-iroh-engine/`](native/dealer-iroh-engine/Cargo.toml)。
 - **测试与架构门禁命令**：
   ```bash

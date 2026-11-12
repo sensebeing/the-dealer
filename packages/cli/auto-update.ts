@@ -1,11 +1,15 @@
 import { spawn, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { blake3Digest, canonicalJson } from '../core-types/index.ts';
+import { canonicalJson } from '../core-types/index.ts';
 import { isDeadProcessOwner, processOwnerRecord } from '../process-lock/index.ts';
 
 export type FingerprintRecord = { pid: number; instanceId: string; fingerprint: string; startedAt: string };
+function sha256Hex(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
 const dealerRootFor = (checkoutDir?: string) => resolve(checkoutDir ?? fileURLToPath(new URL('../..', import.meta.url)));
 function fileList(root: string, predicate: (name: string) => boolean, output: string[] = []): string[] {
   if (!existsSync(root)) return output;
@@ -23,7 +27,9 @@ function fileList(root: string, predicate: (name: string) => boolean, output: st
 }
 function addEntry(entries: Array<[string, string]>, logical: string, path: string): void {
   let value = '<missing>';
-  if (existsSync(path)) { try { value = blake3Digest(readFileSync(path)); } catch { value = '<unreadable>'; } }
+  if (existsSync(path)) {
+    try { value = sha256Hex(readFileSync(path)); } catch { value = '<unreadable>'; }
+  }
   entries.push([logical, value]);
 }
 export function computeRuntimeFingerprint(stateDir: string, checkoutDir?: string): string {
@@ -47,7 +53,7 @@ export function computeRuntimeFingerprint(stateDir: string, checkoutDir?: string
     if (typeof modulePath === 'string') addEntry(entries, `userPlugin/${modulePath}`, resolve(modulePath));
   }
   entries.sort((a, b) => a[0].localeCompare(b[0]));
-  return blake3Digest(Buffer.from(canonicalJson(entries)));
+  return sha256Hex(Buffer.from(canonicalJson(entries)));
 }
 function atomicJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });

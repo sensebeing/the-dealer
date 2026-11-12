@@ -11,13 +11,6 @@ import {
   verify,
 } from 'node:crypto';
 
-/** Stable content digest used by runtime fingerprints. Node's built-in digest
- * set does not expose BLAKE3 on all supported versions, so keep the primitive
- * behind this owner and use the strongest portable fallback. */
-export function blake3Digest(value: string | Buffer): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
 export interface Disposable {
   dispose(): void | Promise<void>;
 }

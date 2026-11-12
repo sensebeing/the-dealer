@@ -1197,6 +1197,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   let restartTriggered = false;
   let debounce: ReturnType<typeof setTimeout> | undefined;
   const watchers: Array<{ close(): void }> = [];
+  const watchedPaths = new Set<string>();
   const maybeSpawnSelfRestart = () => {
     if (!reloadPending || restartTriggered || process.env.DEALER_AUTO_RESTART === '0' || !runtime.isIdleForRestart()) return;
     restartTriggered = true;
@@ -1214,17 +1215,26 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     debounce.unref();
   };
   const addWatch = (path: string, recursive = true) => {
+    if (watchedPaths.has(path)) return;
+    watchedPaths.add(path);
     if (!existsSync(path)) return;
     try { watchers.push(watch(path, { recursive, persistent: false }, schedule)); }
     catch { try { watchers.push(watch(path, { persistent: false }, schedule)); } catch { /* missing optional paths */ } }
   };
   const dealerRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-  addWatch(join(dealerRoot, 'bin')); addWatch(join(dealerRoot, 'packages')); addWatch(join(dealerRoot, 'package.json'), false); addWatch(runtime.stateDir);
+  addWatch(join(dealerRoot, 'bin'));
+  addWatch(join(dealerRoot, 'packages'));
+  addWatch(join(dealerRoot, 'package.json'), false);
+  addWatch(runtime.stateDir);
   for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
   const dispatcher = runtime.kernel.ctx.services.dispatcher as any;
   dispatcher?.onIdle?.(maybeSpawnSelfRestart);
-  runtime.onConfigPersisted = schedule;
+  runtime.onConfigPersisted = () => {
+    for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
+    schedule();
+  };
   runtime.onControlIdle = maybeSpawnSelfRestart;
+  // Remote Git updates cannot emit local filesystem events, so check upstream every six hours.
   const timer = setInterval(() => maybeTriggerBackgroundAutoUpdate({ stateDir: runtime.stateDir }), 6 * 3600_000);
   timer.unref();
   return runtime;

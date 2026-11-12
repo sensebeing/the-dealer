@@ -530,3 +530,7 @@ mailboxes omit compound topic/stream bindings and project topics with background
 `orca-wave`, `orca-spawn`, or `agent-pty` defaults; explicit `notifyLark` overrides
 that choice. Inbox topics and top-level request bindings remain included. See
 [request threading](request-threading.md) for filters and configuration.
+
+### Automatic upgrades and restart
+
+`dealer self-update` synchronizes a clean main checkout and skill links. `dealer node down` drains active work before shutdown and `dealer node restart` combines that drain with startup. A daemon `runtimeFingerprint` covers host and linked project code; external changes trigger a background restart only after active dispatches and control requests become idle.
