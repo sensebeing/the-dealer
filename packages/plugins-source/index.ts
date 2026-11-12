@@ -145,7 +145,8 @@ export interface PollWatermarkSourceConfig<T, Cursor> {
   cursorPath?: string;
   settlementMode?: 'settled' | 'queued-or-settled';
   wake?: { port?: number; host?: string; path?: string; allowedOrigins?: readonly string[] };
-  poll: (cursor: Cursor) => Promise<{ items: readonly T[]; cursor: Cursor }>;
+  /** Read-only fetch phase. The signal aborts the fetch; the cursor is only touched after it resolves. */
+  poll: (cursor: Cursor, signal: AbortSignal) => Promise<{ items: readonly T[]; cursor: Cursor }>;
   toInput: (item: T) => EmitMessageInput | Promise<EmitMessageInput>;
   advanceItemCursor?: (
     cursor: Cursor,
@@ -176,63 +177,80 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
   let emitter: EmitterService | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let active: Promise<void> | undefined;
+  let settling: Promise<void> | undefined;
+  let pollController: AbortController | undefined;
   let stopped = true;
   const pollOnce = (): Promise<void> => {
     if (active) {
       return active;
     }
-    if (!emitter || stopped) {
+    if (!emitter || stopped || !pollController) {
       return Promise.reject(new Error('Poll source not started'));
     }
     const target = emitter;
-    active = (async () => {
-      const page = await config.poll(cursor);
-      const advance = config.advanceItemCursor;
-      let firstError: unknown;
-      if (advance) {
-        // Bootstrap or baseline cursor updates must survive a later item failure.
-        if (JSON.stringify(page.cursor) !== JSON.stringify(cursor)) {
-          await saveCursor?.(page.cursor);
-          cursor = page.cursor;
-        }
-        for (const item of page.items) {
-          try {
-            const result = await target.emit(await config.toInput(item));
-            const nextCursor = advance(cursor, item, result.receipts);
-            if (nextCursor !== undefined) {
-              await saveCursor?.(nextCursor);
-              cursor = nextCursor;
-            } else {
-              firstError ??= new Error('Poll item delivery failed; cursor retained');
+    const runController = pollController;
+    const signal = runController.signal;
+    const run = (async () => {
+      const page = await config.poll(cursor, signal);
+      // A page that arrives after this run was cancelled is read-only data: dropping it
+      // keeps the cursor and delivery state untouched.
+      if (stopped || signal.aborted || pollController !== runController) {
+        return;
+      }
+      let settlePromise: Promise<void> | undefined;
+      settlePromise = (async () => {
+        const advance = config.advanceItemCursor;
+        let firstError: unknown;
+        if (advance) {
+          // Bootstrap or baseline cursor updates must survive a later item failure.
+          if (JSON.stringify(page.cursor) !== JSON.stringify(cursor)) {
+            await saveCursor?.(page.cursor);
+            cursor = page.cursor;
+          }
+          for (const item of page.items) {
+            try {
+              const result = await target.emit(await config.toInput(item));
+              const nextCursor = advance(cursor, item, result.receipts);
+              if (nextCursor !== undefined) {
+                await saveCursor?.(nextCursor);
+                cursor = nextCursor;
+              } else {
+                firstError ??= new Error('Poll item delivery failed; cursor retained');
+              }
+            } catch (error) {
+              firstError ??= error;
             }
-          } catch (error) {
-            firstError ??= error;
+          }
+        } else {
+          // Attempt every item so one failure cannot starve independent items behind it.
+          for (const item of page.items) {
+            try {
+              const result = await target.emit(await config.toInput(item));
+              if (!everyReceiptSettled(result.receipts, receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: config.settlementMode === 'queued-or-settled' }))) {
+                firstError ??= new Error('Poll item delivery failed; cursor retained');
+              }
+            } catch (error) {
+              firstError ??= error;
+            }
+          }
+          if (firstError === undefined) {
+            await saveCursor?.(page.cursor);
+            cursor = page.cursor;
           }
         }
-      } else {
-        // Attempt every item so one failure cannot starve independent items behind it.
-        for (const item of page.items) {
-          try {
-            const result = await target.emit(await config.toInput(item));
-            if (!everyReceiptSettled(result.receipts, receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: config.settlementMode === 'queued-or-settled' }))) {
-              firstError ??= new Error('Poll item delivery failed; cursor retained');
-            }
-          } catch (error) {
-            firstError ??= error;
-          }
+        if (firstError !== undefined) {
+          throw firstError;
         }
-        if (firstError === undefined) {
-          await saveCursor?.(page.cursor);
-          cursor = page.cursor;
-        }
-      }
-      if (firstError !== undefined) {
-        throw firstError;
-      }
+      })().finally(() => {
+        if (settling === settlePromise) settling = undefined;
+      });
+      settling = settlePromise;
+      await settlePromise;
     })().finally(() => {
-      active = undefined;
+      if (active === run) active = undefined;
     });
-    return active;
+    active = run;
+    return run;
   };
   const run = () => {
     void pollOnce().catch(error => config.onError?.(error));
@@ -249,6 +267,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       if (config.cursorPath && existsSync(config.cursorPath)) cursor = loadCursor();
       emitter = value;
       stopped = false;
+      pollController = new AbortController();
       if (config.wake) {
         const wake = config.wake;
         wakeServer = createServer((request, response) => {
@@ -289,6 +308,8 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
         } catch (error) {
           wakeServer = undefined;
           stopped = true;
+          pollController?.abort();
+          pollController = undefined;
           emitter = undefined;
           throw error;
         } finally {
@@ -316,14 +337,22 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       if (timer) {
         clearInterval(timer);
       }
+      // Abort the read-only fetch phase first: a signal-aware poll cancels immediately, and a
+      // legacy poll that ignores it must not hold shutdown open before any external effect.
+      pollController?.abort();
+      pollController = undefined;
       await wakeStarting?.catch(() => {});
       const server = wakeServer;
       wakeServer = undefined;
       if (server?.listening) {
         await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
       }
+      if (!settling) {
+        active = undefined;
+      }
+      // Item emission and cursor persistence are one atomic settlement that stop must await.
       // Poll failures are reported through onError; stop only waits for quiescence.
-      await active?.catch(() => {});
+      await settling?.catch(() => {});
       emitter = undefined;
     },
   };

@@ -562,3 +562,140 @@ test('node restart waits for a lock-owning replacement that is still cold-starti
   assert.equal(restarted.runtimeFingerprint, readDaemonFingerprint(stateDir)?.fingerprint);
   assert.ok(elapsed >= 3_500, `node restart returned after ${elapsed}ms without waiting for the cold start`);
 });
+
+/** A project plugin that registers a never-finishing executor and keeps one dispatch active. */
+const busyDispatchPlugin = `
+export default function createPlugin() {
+  return {
+    name: 'busy-dispatch',
+    inject: ['dispatcher'],
+    apply(ctx) {
+      const dispatcher = ctx.services.dispatcher;
+      ctx.effect(() => {
+        const registration = dispatcher.registerExecutor({
+          name: 'busy-test',
+          execute(_batch, execution) {
+            return new Promise((_resolve, reject) => {
+              if (execution.signal.aborted) {
+                reject(new Error('dispatch aborted'));
+                return;
+              }
+              execution.signal.addEventListener('abort', () => reject(new Error('dispatch aborted')), { once: true });
+            });
+          },
+        }, {});
+        return () => registration.dispose();
+      });
+      void dispatcher.dispatch({
+        id: 'busy-dispatch-envelope',
+        networkId: 'local',
+        traceId: 'busy-dispatch-envelope',
+        from: { nodeId: 'ed25519:' + 'a'.repeat(64), member: 'tester', nodeName: 'busy' },
+        routing: { mode: 'unicast' },
+        kind: 'busy.test.v1',
+        priority: 'normal',
+        subject: 'busy',
+        body: 'keep the dispatcher busy',
+        payload: { executor: 'busy-test' },
+        attachments: [],
+        createdAt: new Date().toISOString(),
+        signature: '',
+      }).catch(() => {});
+    },
+  };
+}
+`;
+
+/** A project plugin whose kernel cleanup outlives the legacy 2s shutdown assumption. */
+const slowStopPlugin = `
+export default function createPlugin() {
+  return {
+    name: 'slow-stop',
+    apply(ctx) {
+      ctx.effect(() => async () => {
+        await new Promise(resolve => setTimeout(resolve, 2500));
+      });
+    },
+  };
+}
+`;
+
+async function linkProjectPlugin(
+  stateDir: string,
+  projectRoot: string,
+  projectId: string,
+  plugin: { name: string; source: string },
+): Promise<void> {
+  mkdirSync(projectRoot, { recursive: true });
+  assert.equal((await dealer(['project', 'init', '--root', projectRoot, '--id', projectId], stateDir)).projectId, projectId);
+  writeFileSync(join(projectRoot, '.dealer', 'plugins', `${plugin.name}.ts`), plugin.source);
+  const manifestPath = join(projectRoot, '.dealer', 'project.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  writeFileSync(manifestPath, `${JSON.stringify({
+    ...manifest,
+    plugins: [{ name: plugin.name, module: `./.dealer/plugins/${plugin.name}.ts`, config: {} }],
+  }, null, 2)}\n`);
+  assert.equal((await dealer(['project', 'link', projectRoot], stateDir)).projectId, projectId);
+}
+
+test('node restart reports the daemon\'s drain deferral and --force ends that verified incarnation', { timeout: 180_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  t.after(async () => {
+    await stopDaemonIfRunning(stateDir, { force: true }).catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  });
+  await bootDaemon(stateDir);
+  await linkProjectPlugin(stateDir, join(root, 'busy-project'), 'busy', { name: 'busy-dispatch', source: busyDispatchPlugin });
+  const serving = readDaemonOwner(stateDir);
+
+  const began = Date.now();
+  const restarted = await restartDaemon(stateDir) as {
+    running?: boolean;
+    stopped?: boolean;
+    restarted?: boolean;
+    deferred?: boolean;
+  };
+  const elapsed = Date.now() - began;
+  // The daemon itself decided its drain could not quiesce; restart must report that decision
+  // instead of guessing from a timeout after the fact.
+  assert.deepEqual(
+    {
+      running: restarted.running,
+      stopped: restarted.stopped,
+      restarted: restarted.restarted,
+      deferred: restarted.deferred,
+    },
+    { running: true, stopped: false, restarted: false, deferred: true },
+  );
+  assert.ok(elapsed >= 14_000, `restart returned after ${elapsed}ms without waiting for the drain budget`);
+  assert.ok(elapsed < 60_000, `restart waited ${elapsed}ms after the daemon reported its decision`);
+  // The deferred daemon kept serving as the same incarnation.
+  assert.equal(readDaemonOwner(stateDir).instanceId, serving.instanceId);
+  const status = await dealer(['node', 'status'], stateDir);
+  assert.equal(status.running, true);
+
+  const forced = await stopDaemonIfRunning(stateDir, { force: true });
+  assert.deepEqual({ stopped: forced.stopped, running: forced.running }, { stopped: true, running: false });
+  await until(() => !existsSync(join(stateDir, 'control.sock')), 'forced shutdown to remove the control socket');
+});
+
+test('a completed drain waits out a slow stop hook without reporting a false deferral', { timeout: 120_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  t.after(async () => {
+    await stopDaemonIfRunning(stateDir, { force: true }).catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  });
+  await bootDaemon(stateDir);
+  await linkProjectPlugin(stateDir, join(root, 'slow-stop-project'), 'slow-stop', { name: 'slow-stop', source: slowStopPlugin });
+  const before = readDaemonOwner(stateDir);
+
+  const began = Date.now();
+  const restarted = await restartDaemon(stateDir) as { running?: boolean; deferred?: boolean };
+  const elapsed = Date.now() - began;
+  assert.equal(restarted.deferred, undefined);
+  assert.equal(restarted.running, true);
+  assert.ok(elapsed >= 2_500, `restart returned after ${elapsed}ms without waiting for the slow stop hook`);
+  assert.notEqual(readDaemonOwner(stateDir).instanceId, before.instanceId);
+  const status = await dealer(['node', 'status'], stateDir);
+  assert.equal(status.running, true);
+});

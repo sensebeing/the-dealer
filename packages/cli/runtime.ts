@@ -175,6 +175,14 @@ export class DealerNodeRuntime {
   private ownsLock = false;
   private activeMutatingControlRequests = 0;
   private draining = false;
+  /** Drain waits woken by every control-request completion; the dispatcher wakes its own. */
+  private drainWakeups = new Set<() => void>();
+  /** One in-flight drain decision shared by every concurrent shutdown request. */
+  private drainDecision?: Promise<boolean>;
+  /** Sum of control-request slots held by every caller waiting on the shared drain decision. */
+  private shutdownControlSlots = 0;
+  /** One teardown owner: concurrent stop callers await the same stop. */
+  private stopPromise?: Promise<void>;
   private daemonInstanceId?: string;
   private daemonFingerprint?: string;
   private daemonStartedAt?: string;
@@ -387,6 +395,10 @@ export class DealerNodeRuntime {
     if (this.started) {
       return this;
     }
+    // A fresh lifecycle must not inherit a previous teardown decision.
+    this.drainDecision = undefined;
+    this.stopPromise = undefined;
+    this.shutdownControlSlots = 0;
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     chmodSync(this.stateDir, 0o700);
     const lockDir = join(this.stateDir, 'runtime.lock');
@@ -1259,12 +1271,14 @@ export class DealerNodeRuntime {
           ? JSON.parse(readFileSync(cursorPath, 'utf8'))
           : spec.config.initialCursor ?? null,
         intervalMs: spec.config.intervalMs ?? 10000,
-        poll: async cursor => {
+        poll: async (cursor, signal) => {
           const url = new URL(spec.config.url);
           if (cursor !== null) {
             url.searchParams.set('cursor', JSON.stringify(cursor));
           }
-          const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
+          const response = await fetch(url, {
+            signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+          });
           if (!response.ok) {
             throw new Error(`Poll HTTP ${response.status}`);
           }
@@ -1321,12 +1335,114 @@ export class DealerNodeRuntime {
     return this.kernel.ctx.services.dispatcher.activeCount() === 0 && this.activeMutatingControlRequests === 0;
   }
 
+  /**
+   * Wait for the daemon to quiesce without polling: the dispatcher's idle transition and every
+   * control request's completion wake the wait. A timeout leaves the daemon fully serving,
+   * including in-flight dispatches that still need control.sock to settle. Only a confirmed
+   * drain synchronously fences new control requests and commits the daemon to stopping.
+   *
+   * The decision is single-flight. A concurrent shutdown request joins the running drain
+   * instead of opening a second one, and the control slot it holds joins the allowance the
+   * drain tolerates, so two `node down` callers can neither block each other nor commit twice.
+   * A caller holding no control slot (`gracefulStop`) widens nothing: unrelated control work
+   * still blocks the commit.
+   */
+  async drainForStop(
+    options: { drainTimeoutMs?: number; callerControlRequests?: number } = {},
+  ): Promise<boolean> {
+    const callerControlRequests = options.callerControlRequests ?? 0;
+    this.shutdownControlSlots += callerControlRequests;
+    // The joined caller widens the allowance it is part of; re-evaluate now instead of leaving
+    // the running drain to wait on the request that just joined it.
+    this.wakeDrainWaiters();
+    try {
+      if (!this.drainDecision) {
+        const decision = this.waitForDrain(
+          options.drainTimeoutMs ?? 15_000,
+          () =>
+            this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
+            this.activeMutatingControlRequests <= this.shutdownControlSlots,
+        );
+        this.drainDecision = decision.then(
+          drained => {
+            if (drained) {
+              // Node.js runs this turn to completion before a new request can be admitted, so
+              // the fence opens exactly at the commit point, never during a drain that may defer.
+              this.draining = true;
+            } else {
+              // A deferred drain leaves no decision behind: a later shutdown may try again.
+              this.drainDecision = undefined;
+            }
+            return drained;
+          },
+          error => {
+            // A failed drain decision must not poison every later shutdown attempt.
+            this.drainDecision = undefined;
+            throw error;
+          },
+        );
+      }
+      return await this.drainDecision;
+    } finally {
+      this.shutdownControlSlots -= callerControlRequests;
+    }
+  }
+
+  private async waitForDrain(timeoutMs: number, drained: () => boolean): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!drained()) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      await this.waitForDrainWake(remaining);
+    }
+    return drained();
+  }
+
+  private wakeDrainWaiters(): void {
+    for (const wake of [...this.drainWakeups]) {
+      wake();
+    }
+  }
+
+  private waitForDrainWake(timeoutMs: number): Promise<void> {
+    const dispatcher = this.kernel.ctx.services.dispatcher;
+    return new Promise<void>(resolve => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let idle: Disposable | undefined;
+      const wake = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        idle?.dispose();
+        this.drainWakeups.delete(wake);
+        resolve();
+      };
+      // The bounded wait is real work; an unref'd timer would let the event loop exit
+      // under a drain that is still pending.
+      timer = setTimeout(wake, timeoutMs);
+      this.drainWakeups.add(wake);
+      idle = dispatcher.onIdle(wake);
+    });
+  }
+
+  /** One owner for decrementing in-flight control work and waking drain waiters. */
+  private controlRequestSettled(): void {
+    this.activeMutatingControlRequests--;
+    this.wakeDrainWaiters();
+    if (this.activeMutatingControlRequests === 0) {
+      this.onControlIdle?.();
+    }
+  }
+
   async gracefulStop(options: { drainTimeoutMs?: number } = {}): Promise<void> {
-    this.draining = true;
-    const wait = this.kernel.ctx.services.dispatcher.waitForIdle();
-    await Promise.race([wait, new Promise(resolve => setTimeout(resolve, options.drainTimeoutMs ?? 15_000))]);
-    if (!this.isIdleForRestart()) {
-      this.draining = false;
+    if (!(await this.drainForStop(options))) {
       throw new Error('Daemon drain timed out with active work; restart deferred');
     }
     await this.stop();
@@ -1378,8 +1494,7 @@ export class DealerNodeRuntime {
           }
         }
         finally {
-          this.activeMutatingControlRequests--;
-          if (this.activeMutatingControlRequests === 0) this.onControlIdle?.();
+          this.controlRequestSettled();
         }
         return;
       }
@@ -1444,8 +1559,7 @@ export class DealerNodeRuntime {
           }
         }
       } finally {
-        this.activeMutatingControlRequests--;
-        if (this.activeMutatingControlRequests === 0) this.onControlIdle?.();
+        this.controlRequestSettled();
         completed = true;
         if (keepalive) {
           clearInterval(keepalive);
@@ -1466,7 +1580,13 @@ export class DealerNodeRuntime {
     this.writeDaemonFingerprintRecord();
   }
 
-  async stop(): Promise<void> {
+  /** Single owner of the irreversible teardown: every concurrent caller awaits one stop. */
+  stop(): Promise<void> {
+    this.stopPromise ??= this.finishStop();
+    return this.stopPromise;
+  }
+
+  private async finishStop(): Promise<void> {
     const hadServer = this.server !== undefined;
     try {
       await this.wakeups?.stop();
@@ -1493,6 +1613,8 @@ export class DealerNodeRuntime {
           releaseOwnedDirectory(this.stateDir);
         }
         this.started = false;
+        // Only once the control socket is gone may a stopped in-process runtime admit work again.
+        this.draining = false;
       }
     }
   }

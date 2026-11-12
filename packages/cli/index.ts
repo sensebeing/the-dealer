@@ -400,7 +400,7 @@ async function waitForDaemonStopped(
 export async function stopDaemonIfRunning(
   stateDir: string,
   options: { force?: boolean } = {},
-): Promise<{ running: boolean; stopped: boolean; pid?: number; respawned?: boolean }> {
+): Promise<{ running: boolean; stopped: boolean; pid?: number; respawned?: boolean; deferred?: boolean }> {
   const probe = await probeDaemonState(stateDir);
   if (probe === 'absent') {
     return { running: false, stopped: false };
@@ -414,9 +414,12 @@ export async function stopDaemonIfRunning(
   const targetInstanceId = targetOwner?.instanceId;
   let pid: number | undefined = targetOwner?.pid;
   let targetAlreadyStopped = false;
+  let drainDeferred = false;
   try {
+    // The daemon answers only after its own drain decision, which can take several seconds;
+    // /cli-stream keepalives reset this inactivity window while it drains.
     const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], {
-      inactivityMs: 2_000,
+      inactivityMs: 20_000,
       ...(targetInstanceId ? { expectedInstance: targetInstanceId } : {}),
     });
     const parsed = JSON.parse(result.stdout.join('') || '{}');
@@ -424,11 +427,28 @@ export async function stopDaemonIfRunning(
       // The socket is served by another incarnation, so the captured target already stopped
       // and the replacement must never honor this shutdown.
       targetAlreadyStopped = true;
-    } else if (typeof parsed.pid === 'number') {
-      pid = parsed.pid;
+    } else {
+      if (parsed.deferred === true) {
+        drainDeferred = true;
+      }
+      if (typeof parsed.pid === 'number') {
+        pid = parsed.pid;
+      }
     }
   } catch { /* the daemon may remove the socket while responding */ }
-  let stopped = targetAlreadyStopped || await waitForDaemonStopped(stateDir, targetInstanceId, pid);
+  if (drainDeferred && !options.force) {
+    // The daemon reported that its drain could not quiesce and it is still serving. Waiting
+    // for a shutdown it never committed to only fabricates a deferral.
+    return { running: true, stopped: false, ...(pid ? { pid } : {}), deferred: true };
+  }
+  // A deferred drain under --force never committed to a graceful stop: skip that wait and
+  // escalate immediately against the verified incarnation.
+  let stopped = targetAlreadyStopped || (!drainDeferred && await waitForDaemonStopped(
+    stateDir,
+    targetInstanceId,
+    pid,
+    DAEMON_STARTUP_TIMEOUT_MS,
+  ));
   if (!stopped && options.force) {
     const owner = liveDaemonOwner(stateDir);
     // Escalate only against the exact incarnation captured before the shutdown request: a
@@ -577,12 +597,19 @@ export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
 
 export async function restartDaemon(stateDir: string, options: { force?: boolean } = {}): Promise<unknown> {
   const stopped = await stopDaemonIfRunning(stateDir, options);
-  // Only a drain that could not quiesce leaves the target serving. A supervisor that already
-  // started a replacement counts as a completed stop, so confirm that live instance instead
-  // of reporting a false deferral for the incarnation that really did exit.
   if (!stopped.stopped && stopped.running) {
-    return { ...stopped, restarted: false, deferred: true };
+    // Only a drain the daemon itself deferred leaves it serving and is reported as deferred.
+    if (stopped.deferred === true) {
+      return { ...stopped, restarted: false, deferred: true };
+    }
+    // A drain that completed but never exited is a real shutdown failure, not a deferral.
+    // --force already escalated against the verified incarnation; confirm what still serves.
+    if (!options.force) {
+      throw new Error('Daemon shutdown timed out after drain completed');
+    }
   }
+  // A supervisor that already started a replacement counts as a completed stop, so confirm
+  // that live instance instead of reporting a false deferral for the incarnation that exited.
   return ensureDaemonRunning(stateDir);
 }
 
@@ -1192,12 +1219,19 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           // A replacement daemon must never honor a shutdown addressed to an earlier incarnation.
           result = { ok: false, instanceMismatch: true, pid: process.pid, instanceId };
         } else {
-          result = { ok: true, stopping: true, pid: process.pid, instanceId };
-          setImmediate(() => {
-            void runtime.gracefulStop().then(() => process.exit(0)).catch(error => {
-              runtime.lastError = String(error);
+          // The daemon owns the drain decision: only a drain it actually completed commits it
+          // to stopping. A deferred drain answers while the daemon keeps serving.
+          const drained = await runtime.drainForStop({ callerControlRequests: 1 });
+          if (!drained) {
+            result = { ok: false, stopping: false, deferred: true, pid: process.pid, instanceId };
+          } else {
+            result = { ok: true, stopping: true, pid: process.pid, instanceId };
+            setImmediate(() => {
+              void runtime.stop().then(() => process.exit(0)).catch(error => {
+                runtime.lastError = String(error);
+              });
             });
-          });
+          }
         }
       } else if (action === 'card') {
         result = network
