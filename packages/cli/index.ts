@@ -12,11 +12,11 @@ import { parseArgs } from 'node:util';
 import { MailboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { SettlementOutcome } from '../core-types/index.ts';
-import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
+import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
 import { computeRuntimeFingerprint, readDaemonFingerprint, readAutoUpdateStatus, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
-import { isDeadProcessOwner, readProcessOwner } from '../process-lock/index.ts';
+import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
@@ -141,12 +141,16 @@ export interface DealerCliOptions {
   stderr?: (line: string) => void;
   /** Aborted when the calling control request disconnects, so long waits release listeners. */
   signal?: AbortSignal;
+  /** Incarnation the requesting peer captured; a mismatched daemon must not act on the command. */
+  expectedInstance?: string;
   env?: NodeJS.ProcessEnv;
 }
 
 export interface ControlRpcOptions {
   /** Inactivity window reset by every NDJSON line; defaults to 45000ms. */
   inactivityMs?: number;
+  /** Incarnation the caller believes serves this socket; the daemon rejects a mismatch. */
+  expectedInstance?: string;
 }
 
 const DEFAULT_RPC_INACTIVITY_MS = 45_000;
@@ -201,7 +205,12 @@ export async function rpc(
         socketPath,
         path: '/cli-stream',
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...(options.expectedInstance === undefined
+            ? {}
+            : { [EXPECTED_INSTANCE_HEADER]: options.expectedInstance }),
+        },
       },
       res => {
         if (res.statusCode !== 200) {
@@ -399,15 +408,24 @@ export async function stopDaemonIfRunning(
   // Capture the incarnation being shut down before asking it to stop; the RPC pid is only
   // a fallback witness when the lock owner could not be read.
   const targetOwner = liveDaemonOwner(stateDir);
+  const targetInstanceId = targetOwner?.instanceId;
   let pid: number | undefined = targetOwner?.pid;
+  let targetAlreadyStopped = false;
   try {
-    const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], { inactivityMs: 2_000 });
+    const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], {
+      inactivityMs: 2_000,
+      ...(targetInstanceId ? { expectedInstance: targetInstanceId } : {}),
+    });
     const parsed = JSON.parse(result.stdout.join('') || '{}');
-    if (typeof parsed.pid === 'number') {
+    if (parsed.instanceMismatch === true) {
+      // The socket is served by another incarnation, so the captured target already stopped
+      // and the replacement must never honor this shutdown.
+      targetAlreadyStopped = true;
+    } else if (typeof parsed.pid === 'number') {
       pid = parsed.pid;
     }
   } catch { /* the daemon may remove the socket while responding */ }
-  let stopped = await waitForDaemonStopped(stateDir, targetOwner?.instanceId, pid);
+  let stopped = targetAlreadyStopped || await waitForDaemonStopped(stateDir, targetInstanceId, pid);
   if (!stopped && options.force) {
     const owner = liveDaemonOwner(stateDir);
     // Escalate only against the exact incarnation captured before the shutdown request: a
@@ -1064,12 +1082,18 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         }
         result = runtime.status();
       } else if (action === 'down') {
-        result = { ok: true, stopping: true, pid: process.pid };
-        setImmediate(() => {
-          void runtime.gracefulStop().then(() => process.exit(0)).catch(error => {
-            runtime.lastError = String(error);
+        const instanceId = processOwnerRecord().instanceId;
+        if (options.expectedInstance !== undefined && options.expectedInstance !== instanceId) {
+          // A replacement daemon must never honor a shutdown addressed to an earlier incarnation.
+          result = { ok: false, instanceMismatch: true, pid: process.pid, instanceId };
+        } else {
+          result = { ok: true, stopping: true, pid: process.pid, instanceId };
+          setImmediate(() => {
+            void runtime.gracefulStop().then(() => process.exit(0)).catch(error => {
+              runtime.lastError = String(error);
+            });
           });
-        });
+        }
       } else if (action === 'card') {
         result = network
           ? runtime.node.getSelfCard(network)
@@ -1267,6 +1291,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
         stdout: line => stdout.push(line),
         stderr: line => stderr.push(line),
         signal: context.signal,
+        expectedInstance: context.expectedInstance,
       });
       return { code, stdout, stderr };
     });

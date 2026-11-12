@@ -100,7 +100,7 @@ rules:
 
 ## 3. 开发、验证与文档索引
 
-`dealer node down` drains and stops the daemon, while `dealer node restart` performs the same drain before starting a fresh process; a drain that cannot quiesce leaves the daemon serving and reports `stopped:false`, with `--force` as the explicit override. A shutdown targets the lock-owner incarnation, so a supervisor-started replacement (for example `launchd` `KeepAlive`) counts as the target having stopped instead of a pending drain. `dealer self-update` updates a clean main checkout and repairs skill links. The daemon records `runtimeFingerprint`; its own watcher is the sole automatic reload owner, triggering an idle-gated drain and restart that preserves in-flight dispatches.
+`dealer node down` drains and stops the daemon, while `dealer node restart` performs the same drain before starting a fresh process; a drain that cannot quiesce leaves the daemon serving and reports `stopped:false`, with `--force` as the explicit override. A shutdown targets the lock-owner incarnation and carries that identity in the control request, so a supervisor-started replacement (for example `launchd` `KeepAlive`) rejects the command and counts as the target having stopped instead of a pending drain. `dealer self-update` updates a clean main checkout and repairs skill links. The daemon records `runtimeFingerprint`; its own watcher is the sole automatic reload owner, triggering an idle-gated drain and restart that preserves in-flight dispatches.
 
 - **运行环境**：Node.js `>=22.15.0`（原生支持 `--experimental-strip-types` 直接运行 `.ts`，无需编译构建步骤；零外部 npm 依赖）。可选 Rust 原生引擎源码位于 [`native/dealer-iroh-engine/`](native/dealer-iroh-engine/Cargo.toml)。
 - **测试与架构门禁命令**：

@@ -4,7 +4,7 @@
 // the instant the supervised daemon releases it. That keeps the replacement live inside the
 // CLI's 100ms shutdown probe window, which is the race a real KeepAlive supervisor creates;
 // a cold `dealer node up` would leave a visible absence window and never exercise it.
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -20,7 +20,8 @@ while (existsSync(ownerPath)) {
 }
 
 const runtime = await runDealerDaemon([]);
-process.stdout.write(`respawned ${process.pid}\n`);
+const owner = JSON.parse(readFileSync(ownerPath, 'utf8'));
+process.stdout.write(`respawned ${owner.pid} ${owner.instanceId}\n`);
 const stop = () => {
   void runtime.stop().then(() => process.exit(0), () => process.exit(1));
 };

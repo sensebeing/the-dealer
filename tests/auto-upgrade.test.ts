@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -78,7 +78,7 @@ function readDaemonOwner(stateDir: string): { pid: number; instanceId: string } 
 
 interface KeepAliveSupervisor {
   armed: Promise<void>;
-  respawned: Promise<number>;
+  respawned: Promise<{ pid: number; instanceId: string }>;
   kill(): Promise<void>;
 }
 
@@ -99,13 +99,13 @@ function startKeepAliveSupervisor(stateDir: string): KeepAliveSupervisor {
   let respawnSettled = false;
   let resolveArmed!: () => void;
   let rejectArmed!: (error: Error) => void;
-  let resolveRespawned!: (pid: number) => void;
+  let resolveRespawned!: (owner: { pid: number; instanceId: string }) => void;
   let rejectRespawned!: (error: Error) => void;
   const armed = new Promise<void>((resolve, reject) => {
     resolveArmed = resolve;
     rejectArmed = reject;
   });
-  const respawned = new Promise<number>((resolve, reject) => {
+  const respawned = new Promise<{ pid: number; instanceId: string }>((resolve, reject) => {
     resolveRespawned = resolve;
     rejectRespawned = reject;
   });
@@ -126,10 +126,10 @@ function startKeepAliveSupervisor(stateDir: string): KeepAliveSupervisor {
         resolveArmed();
         continue;
       }
-      const match = /^respawned (\d+)$/.exec(line);
+      const match = /^respawned (\d+) (\S+)$/.exec(line);
       if (match) {
         respawnSettled = true;
-        resolveRespawned(Number(match[1]));
+        resolveRespawned({ pid: Number(match[1]), instanceId: match[2] });
       }
     }
   });
@@ -412,53 +412,63 @@ test('dealer node restart tolerates concurrent ensureDaemonRunning and node down
   assert.equal(existsSync(join(stateDir, 'control.sock')), false);
 });
 
-test('node down witnesses a KeepAlive replacement instead of waiting for the target to stay gone', { timeout: 120_000 }, async t => {
-  // The witness is only observable when a shutdown probe samples the handoff after the
-  // target released its lock and before the warm replacement claimed it. That window is a
-  // few milliseconds, so the probe order occasionally samples absence first; each such run
-  // still proves the target stopped, and the attempt is repeated to hit the identity race
-  // rather than weakening the assertion.
-  for (let attempt = 1; attempt <= 5; attempt += 1) {
-    const { root, stateDir } = isolatedState();
-    let supervisor: KeepAliveSupervisor | undefined;
-    let witnessed = false;
-    t.after(async () => {
-      await supervisor?.kill();
-      await stopDaemonIfRunning(stateDir, { force: true });
-      rmSync(root, { recursive: true, force: true });
-    });
-    await bootDaemon(stateDir);
-    const target = readDaemonOwner(stateDir);
-    supervisor = startKeepAliveSupervisor(stateDir);
-    await supervisor.armed;
-    const startedAt = Date.now();
-    const result = await stopDaemonIfRunning(stateDir);
-    const elapsed = Date.now() - startedAt;
-    assert.equal(result.stopped, true, `attempt ${attempt}: node down did not stop the target`);
-    assert.ok(elapsed < 10_000, `attempt ${attempt}: node down waited ${elapsed}ms instead of witnessing the replacement`);
-    const replacement = await until(() => {
+test('node down binds shutdown to the captured incarnation and never stops a live replacement', { timeout: 90_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  let witness: ReturnType<typeof spawn> | undefined;
+  let serving: { pid: number; instanceId: string; fingerprint: string } | undefined;
+  t.after(async () => {
+    if (witness?.pid) {
       try {
-        return readDaemonOwner(stateDir);
-      } catch {
-        return undefined;
-      }
-    }, `attempt ${attempt}: supervisor replacement to own the state directory`);
-    assert.notEqual(replacement.instanceId, target.instanceId, `attempt ${attempt}: replacement kept the target incarnation`);
-    if (result.respawned === true) {
-      assert.equal(result.running, true);
-      assert.equal(replacement.pid, await supervisor.respawned);
-      const status = await dealer(['node', 'status'], stateDir);
-      assert.equal(status.running, true);
-      witnessed = true;
+        process.kill(witness.pid, 'SIGKILL');
+      } catch { /* exited */ }
     }
-    await supervisor.kill();
+    if (serving) {
+      try {
+        process.kill(serving.pid, 'SIGTERM');
+      } catch { /* exited */ }
+      await until(() => {
+        try {
+          process.kill(serving!.pid, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      }, 'serving daemon to exit');
+    }
     await stopDaemonIfRunning(stateDir, { force: true });
     rmSync(root, { recursive: true, force: true });
-    if (witnessed) {
-      return;
-    }
-  }
-  assert.fail('node down never witnessed a supervisor replacement across 5 attempts');
+  });
+  await bootDaemon(stateDir);
+  serving = readDaemonFingerprint(stateDir)!;
+  assert.ok(serving);
+  // Deterministic handoff barrier: the lock still records an earlier incarnation (its process
+  // is alive) while the replacement already serves the socket. Shutdown must be bound to the
+  // recorded target, so the replacement rejects it and keeps serving.
+  witness = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { stdio: 'ignore' });
+  assert.ok(witness.pid);
+  const lockDir = join(stateDir, 'runtime.lock');
+  const stagedOwner = join(lockDir, 'owner.json.next');
+  writeFileSync(stagedOwner, JSON.stringify({ pid: witness.pid, instanceId: 'prior-incarnation', host: 'supervisor-host' }));
+  renameSync(stagedOwner, join(lockDir, 'owner.json'));
+
+  const startedAt = Date.now();
+  const result = await stopDaemonIfRunning(stateDir);
+  const elapsed = Date.now() - startedAt;
+  assert.deepEqual(
+    { stopped: result.stopped, running: result.running, respawned: result.respawned },
+    { stopped: true, running: true, respawned: true },
+  );
+  assert.ok(elapsed < 10_000, `node down waited ${elapsed}ms instead of witnessing the replacement`);
+  const status = await dealer(['node', 'status'], stateDir);
+  assert.equal(status.running, true);
+  assert.equal(readDaemonFingerprint(stateDir)?.instanceId, serving.instanceId);
+
+  // Restart takes the same rejected-shutdown path and confirms the surviving replacement.
+  const restarted = await restartDaemon(stateDir) as { running?: boolean; deferred?: boolean; runtimeFingerprint?: string };
+  assert.equal(restarted.deferred, undefined);
+  assert.equal(restarted.running, true);
+  assert.equal(restarted.runtimeFingerprint, serving.fingerprint);
+  assert.equal(readDaemonFingerprint(stateDir)?.instanceId, serving.instanceId);
 });
 
 test('node restart confirms a KeepAlive replacement instead of reporting a false deferral', { timeout: 90_000 }, async t => {
@@ -476,10 +486,15 @@ test('node restart confirms a KeepAlive replacement instead of reporting a false
   const startedAt = Date.now();
   const restarted = await restartDaemon(stateDir) as { running?: boolean; deferred?: boolean };
   const elapsed = Date.now() - startedAt;
+  // The fixture's report is a real barrier: it has claimed the lock and finished serving.
+  const replacement = await supervisor.respawned;
   assert.equal(restarted.deferred, undefined);
   assert.equal(restarted.running, true);
   assert.ok(elapsed < 10_000, `node restart waited ${elapsed}ms instead of confirming the replacement`);
-  const replacement = readDaemonOwner(stateDir);
   assert.notEqual(replacement.instanceId, target.instanceId);
-  assert.equal(replacement.pid, await supervisor.respawned);
+  // The replacement survived the restart's shutdown phase: the live owner is still that exact
+  // incarnation, not a daemon launched after terminating it.
+  assert.equal(readDaemonOwner(stateDir).instanceId, replacement.instanceId);
+  const status = await dealer(['node', 'status'], stateDir);
+  assert.equal(status.running, true);
 });
