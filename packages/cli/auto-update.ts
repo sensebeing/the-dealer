@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../core-types/index.ts';
@@ -217,28 +217,45 @@ function claimStagedLock(stage: string, lock: string): boolean {
   }
 }
 
-function acquireReclaimGate(reclaim: string, stateDir: string): boolean {
+/** Claim the reclaim gate with the staged-owner protocol, so it is never ownerless. */
+function claimReclaimGate(reclaim: string): boolean {
+  const stage = `${reclaim}.stage.${process.pid}`;
+  rmSync(stage, { recursive: true, force: true });
+  mkdirSync(stage, { mode: 0o700 });
   try {
-    mkdirSync(reclaim, { mode: 0o700 });
-  } catch {
-    const gateOwner = readProcessOwner(join(reclaim, 'owner.json'));
-    if (gateOwner && !isDeadProcessOwner(gateOwner, stateDir)) {
+    atomicJson(join(stage, 'owner.json'), processOwnerRecord());
+    if (existsSync(reclaim)) {
       return false;
     }
-    rmSync(reclaim, { recursive: true, force: true });
-    try {
-      mkdirSync(reclaim, { mode: 0o700 });
-    } catch {
-      return false;
-    }
+    return claimStagedLock(stage, reclaim);
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
   }
+}
+
+function acquireReclaimGate(reclaim: string, stateDir: string): 'acquired' | 'busy' | 'corrupt' {
+  if (claimReclaimGate(reclaim)) {
+    return 'acquired';
+  }
+  if (!existsSync(reclaim)) {
+    return claimReclaimGate(reclaim) ? 'acquired' : 'busy';
+  }
+  const gateOwner = readProcessOwner(join(reclaim, 'owner.json'));
+  if (!gateOwner) {
+    // Never delete an ownerless gate: absence of proof is not proof of death.
+    return 'corrupt';
+  }
+  if (!isDeadProcessOwner(gateOwner, stateDir)) {
+    return 'busy';
+  }
+  // Only a gate whose recorded owner is proven dead may be discarded.
+  rmSync(join(reclaim, 'owner.json'), { force: true });
   try {
-    atomicJson(join(reclaim, 'owner.json'), processOwnerRecord());
+    rmdirSync(reclaim);
   } catch {
-    rmSync(reclaim, { recursive: true, force: true });
-    return false;
+    return 'busy';
   }
-  return true;
+  return claimReclaimGate(reclaim) ? 'acquired' : 'busy';
 }
 
 /**
@@ -275,7 +292,16 @@ function acquireUpdateLock(stateDir: string): UpdateLockResult {
   }
   const reclaim = `${lock}.reclaim`;
   const stale = `${lock}.stale.${process.pid}`;
-  if (!acquireReclaimGate(reclaim, stateDir)) {
+  let gate: 'acquired' | 'busy' | 'corrupt';
+  try {
+    gate = acquireReclaimGate(reclaim, stateDir);
+  } catch (error) {
+    return { error: `Unable to claim auto-update reclaim gate: ${String(error)}` };
+  }
+  if (gate === 'corrupt') {
+    return { error: `Auto-update reclaim gate ${reclaim} has no readable owner record` };
+  }
+  if (gate === 'busy') {
     return { locked: true };
   }
   try {
