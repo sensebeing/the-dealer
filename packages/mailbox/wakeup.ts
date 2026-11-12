@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import {
   CommandNotStartedError,
@@ -512,6 +513,23 @@ export class WakeupRedriveService {
       }
       const idle = await this.authoritativeIdle(target);
       if (!idle.idle) {
+        // A workspace whose directory is gone can never become idle again; retrying it forever
+        // would only inflate the backoff ledger. The mail stays queued for a human or a rebind.
+        if (
+          !this.idleCheck &&
+          idle.reason === 'Workspace not found' &&
+          target.autoCreateWorkspace !== true &&
+          target.workspacePath &&
+          !existsSync(target.workspacePath)
+        ) {
+          this.store.upsertWakeTarget(mailboxId, {
+            pendingWake: false,
+            attemptCount: 0,
+            earliestWakeAt: 0,
+            lastWakeError: undefined,
+          });
+          return noWake(mailboxId, target.mode, 'Workspace not found');
+        }
         return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
       }
       return await this.deliver(mailboxId, target, preview, idle.composerPrefilled === true);

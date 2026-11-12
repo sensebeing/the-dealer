@@ -59,7 +59,9 @@ export const runCommand: CommandRunner = request =>
     let child;
     try {
       child = spawn(request.command, [...request.args], {
-        cwd: request.cwd,
+        // A cleaned-up workspace path must not turn a valid command into spawn ENOENT; the OS
+        // falls back to the daemon's own cwd when the requested directory is gone.
+        cwd: request.cwd && existsSync(request.cwd) ? request.cwd : undefined,
         signal: request.signal,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: false,

@@ -1,8 +1,8 @@
-import { checkOrcaWorkspaceIdle, findOrcaWorktreeByName, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
+import { checkOrcaWorkspaceIdle, findOrcaWorktreeByName, isAutopilotComposerPrefill, runCommand, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -1307,6 +1307,68 @@ test('a closed persisted terminal is rebound to the live one before the pointer 
   assert.equal(target.terminalHandle, 'term-live');
   assert.equal(target.pendingWake, false);
   assert.equal(target.deliveryInDoubt, undefined);
+});
+
+test('runCommand spawns from the inherited cwd when the requested directory is gone', async t => {
+  const missing = join(directory(t), 'removed-worktree');
+  const output = await runCommand({
+    command: process.execPath,
+    args: ['-e', 'process.stdout.write(process.cwd())'],
+    cwd: missing,
+  });
+  assert.equal(output.exitCode, 0);
+  assert.equal(output.stdout, process.cwd());
+});
+
+test('a removed non-auto-created workspace disarms wake retries but keeps the queued mail', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const gonePath = join(root, 'removed-worktree');
+  const livePath = join(root, 'live-workspace');
+  mkdirSync(livePath);
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees: [] } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({
+    store, commandRunner: runner, flushIntervalMs: 100_000,
+  });
+  t.after(() => service.stop());
+
+  store.enqueue([alert('gone-reply', { semantic: { type: 'reply', threadId: 'gone-task' } })], {
+    mailboxId: 'worktree:gone',
+    wakeTarget: { mode: 'orca-terminal', terminalHandle: 'term-gone', workspacePath: gonePath, coalesceMs: 0 },
+  });
+  const results = await service.flushWakeups();
+  assert.equal(results.length, 1);
+  assert.equal(results[0].woke, false);
+  assert.equal(results[0].reason, 'Workspace not found');
+  const disarmed = store.getWakeTarget('worktree:gone')!;
+  assert.equal(disarmed.pendingWake, false);
+  assert.equal(disarmed.attemptCount, 0);
+  assert.equal(disarmed.earliestWakeAt, 0);
+  assert.equal(disarmed.lastWakeError, undefined);
+  assert.equal(store.list({ mailboxId: 'worktree:gone' }).queuedCount, 1);
+  assert.equal(terminalSends(calls).length, 0);
+  const probes = calls.length;
+  assert.deepEqual(await service.flushWakeups(), []);
+  assert.equal(calls.length, probes, 'a disarmed target is never probed again');
+
+  // A workspace whose directory still exists keeps its durable retry ledger even while Orca's
+  // inventory is incomplete; only a path that is truly gone is disarmed.
+  store.enqueue([alert('live-reply', { semantic: { type: 'reply', threadId: 'live-task' } })], {
+    mailboxId: 'worktree:live',
+    wakeTarget: { mode: 'orca-terminal', terminalHandle: 'term-live', workspacePath: livePath, coalesceMs: 0 },
+  });
+  const deferred = await service.flushMailbox('worktree:live', { force: true });
+  assert.equal(deferred.woke, false);
+  assert.equal(store.getWakeTarget('worktree:live')!.pendingWake, true);
+  assert.equal(store.getWakeTarget('worktree:live')!.attemptCount, 1);
+  assert.match(store.getWakeTarget('worktree:live')!.lastWakeError!, /Workspace not found/);
 });
 
 test('a persisted unknown-effect fence survives reload and blocks delivery', async t => {
