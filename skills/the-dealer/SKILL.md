@@ -298,4 +298,7 @@ settle conversations; each side wakes the other's Orca terminal. `dealer ask`
 defaults to `collab.question.v1` when `--topic` is omitted, and
 `--target-mailbox worktree:<name>` addresses a named Orca worktree.
 For plain messages, address a logical mailbox with
-`dealer send --mailbox <id> --reply-mailbox <id> --subject '...'`.
+`dealer send --mailbox <id> --reply-mailbox <id> --subject '...'`. When
+`dealer send` runs inside Orca without an explicit `--reply-mailbox`, it binds
+replies to the caller's worktree mailbox unless that caller is already the
+topic's bound mailbox; non-Orca callers continue to use the topic binding.

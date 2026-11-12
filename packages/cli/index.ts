@@ -8,7 +8,7 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { MailboxStore } from '../mailbox/index.ts';
+import { MailboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { SettlementOutcome } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
@@ -978,10 +978,18 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const targetMailbox =
         typeof v.mailbox === 'string' && v.mailbox ? String(v.mailbox) : undefined;
       const callerBinding = caller;
+      const payload = payloadFromBody(body);
+      const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
+      const resolvedTopic = group === 'send' ? runtime.resolveTopicBinding(topic, streamKey) : undefined;
+      const boundTopicMailbox = resolvedTopic
+        ? resolveBoundMailboxId(streamKey ? `${topic}:${streamKey}` : topic, resolvedTopic.binding)
+        : undefined;
       const replyMailbox =
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
-          : (group === 'send' && !runtime.resolveTopicBinding(topic, undefined) ? callerBinding?.mailboxId : undefined);
+          : (group === 'send' && callerBinding?.mailboxId && callerBinding.mailboxId !== boundTopicMailbox
+            ? callerBinding.mailboxId
+            : undefined);
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
       result = await runtime.emitter.emit({
@@ -990,7 +998,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         subject:
           typeof v.subject === 'string' && v.subject ? String(v.subject) : topic,
         body,
-        payload: payloadFromBody(body),
+        payload,
         routing: {
           mode: group === 'broadcast' ? 'broadcast' : v['auto-route'] ? 'auto' : 'unicast',
           ...(v.to ? { targets: [String(v.to)] } : {}),

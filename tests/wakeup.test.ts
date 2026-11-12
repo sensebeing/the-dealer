@@ -893,6 +893,66 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{"ok":true}' }), 'orca', 'alice-wt'), /Incomplete Orca workspace inventory/);
 });
 
+test('dealer send binds an Orca caller mailbox when the topic is locally bound', async t => {
+  const root = directory(t);
+  const callerPath = join(root, 'caller-wt');
+  const prodPath = join(root, 'prod-release');
+  const calls: CommandRequest[] = [];
+  const runtime = await makeNode(t, root, 'prod', {
+    commandRunner: async request => {
+      calls.push(request);
+      if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+        return { stdout: JSON.stringify({ ok: true, result: { worktrees: [
+          { path: callerPath, worktreeId: `repo::${callerPath}`, displayName: 'caller-wt', isArchived: false, unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+          { path: prodPath, worktreeId: `repo::${prodPath}`, displayName: 'prod-release', isArchived: false, unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+        ] } }) };
+      }
+      if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+        const path = request.args[request.args.indexOf('--worktree') + 1]?.replace(/^path:/, '');
+        return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: path === callerPath ? 'term-caller' : 'term-prod', connected: true, writable: true, preview: '' }] } }) };
+      }
+      return { stdout: JSON.stringify({ ok: true }) };
+    },
+    patch: {
+      gateMode: 'open',
+      executors: ['orca-wave', 'inbox'],
+      topicBindings: {
+        'release.prod.v1': {
+          executor: 'orca-wave', streamKey: 'prod-release', workspacePath: prodPath, terminalHandle: 'term-prod',
+        },
+      },
+    },
+  });
+  const sendOut: string[] = [];
+  await runDealerCli(['send', '--network', 'local', '--to', 'member:prod', '--topic', 'release.prod.v1', '--body', '{}', '--json'], {
+    runtime,
+    env: { ORCA_TERMINAL_HANDLE: 'term-caller', ORCA_WORKTREE_ID: `repo::${callerPath}` },
+    stdout: line => sendOut.push(line),
+    stderr: line => assert.fail(line),
+  });
+  const sent = JSON.parse(sendOut.join('\n')) as { messageId: string };
+  const inbound = runtime.mailbox.listItemsAfterSequence(-1).find(item => item.envelope?.id === sent.messageId);
+  assert.equal(inbound?.mailboxId, 'stream:prod-release');
+  assert.equal(inbound?.envelope?.semantic?.replyMailbox, 'worktree:caller-wt');
+  assert.equal(runtime.mailbox.getWakeTarget('worktree:caller-wt')?.terminalHandle, 'term-caller');
+
+  const checkedOut: string[] = [];
+  await runDealerCli(['inbox', 'check', '--mailbox', 'stream:prod-release', '--json'], {
+    runtime, stdout: line => checkedOut.push(line), stderr: line => assert.fail(line),
+  });
+  const checked = JSON.parse(checkedOut.join('\n')) as { items: Array<{ id: string }>; deliveryId: string };
+  const replyOut: string[] = [];
+  await runDealerCli(['reply', checked.items[0].id, '--body', 'released', '--ack', checked.deliveryId, '--json'], {
+    runtime,
+    env: { ORCA_TERMINAL_HANDLE: 'term-prod', ORCA_WORKTREE_ID: `repo::${prodPath}` },
+    stdout: line => replyOut.push(line),
+    stderr: line => assert.fail(line),
+  });
+  assert.equal(JSON.parse(replyOut.join('\n')).targetMailbox, 'worktree:caller-wt');
+  await until(() => runtime.mailbox.list({ mailboxId: 'worktree:caller-wt' }).totalCount > 0, 'caller reply mailbox');
+  await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-caller')), 'caller terminal wake');
+});
+
 test('thread show fails loudly for an unknown thread', async t => {
   const root = directory(t);
   const runtime = await makeNode(t, root, 'solo');
