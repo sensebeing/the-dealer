@@ -183,7 +183,9 @@ export class PeerDirectoryService implements NodeService {
           networkId,
           'peer.card',
           Buffer.from(JSON.stringify({ type: 'peer.card', card: this.self.get(networkId) })),
-          { timeoutMs: this.config.exchangeTimeoutMs ?? 2_000 },
+          // Presence is best-effort: one direct fast-fail plus a few relay seeds still gets a
+          // useful share of the budget, while a blackholed peer can never stall the node.
+          { timeoutMs: this.config.exchangeTimeoutMs ?? 4_000 },
         );
       }
     });

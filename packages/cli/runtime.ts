@@ -1327,13 +1327,13 @@ export class DealerNodeRuntime {
 
   /**
    * Wait for the daemon to quiesce without polling: the dispatcher's idle transition and every
-   * control request's completion wake the wait. A timeout leaves the daemon serving and clears
-   * the drain flag; a successful drain commits it to stopping, so no later request is admitted.
+   * control request's completion wake the wait. A timeout leaves the daemon fully serving,
+   * including in-flight dispatches that still need control.sock to settle. Only a confirmed
+   * drain synchronously fences new control requests and commits the daemon to stopping.
    */
   async drainForStop(
     options: { drainTimeoutMs?: number; callerControlRequests?: number } = {},
   ): Promise<boolean> {
-    this.draining = true;
     const callerControlRequests = options.callerControlRequests ?? 0;
     const drained = () =>
       this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
@@ -1347,9 +1347,11 @@ export class DealerNodeRuntime {
       await this.waitForDrainWake(remaining);
     }
     if (!drained()) {
-      this.draining = false;
       return false;
     }
+    // Node.js runs this turn to completion before any new request can be admitted, so the
+    // fence opens exactly at the commit point and never during a drain that may defer.
+    this.draining = true;
     return true;
   }
 

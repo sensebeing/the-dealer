@@ -287,16 +287,16 @@ test('presence gossip to a blackholed peer is bounded by the presence budget, no
   await kernel.start();
   const transport = kernel.ctx.services.transport as P2PTransportService;
   const node = kernel.ctx.services.node as PeerDirectoryService;
-  // Bound: the 2s seed probe plus the 2s presence budget. The 90s task-RPC socket timeout
+  // Bound: the 2s seed probe plus the 4s presence budget. The 90s task-RPC socket timeout
   // must never be inherited by ephemeral presence gossip.
   const mountStarted = performance.now();
   await transport.mountNetwork(network);
   const mountElapsed = performance.now() - mountStarted;
-  assert.ok(mountElapsed < 8_000, `mountNetwork took ${Math.round(mountElapsed)}ms for a blackholed peer`);
+  assert.ok(mountElapsed < 10_000, `mountNetwork took ${Math.round(mountElapsed)}ms for a blackholed peer`);
   const publishStarted = performance.now();
   await node.updateSelfProfile({ nodeName: 'renamed' });
   const publishElapsed = performance.now() - publishStarted;
-  assert.ok(publishElapsed < 5_000, `presence publish took ${Math.round(publishElapsed)}ms for a blackholed peer`);
+  assert.ok(publishElapsed < 6_000, `presence publish took ${Math.round(publishElapsed)}ms for a blackholed peer`);
 });
 
 test('exchange spends its timeout as one total budget across the direct attempt and fallback seeds', { timeout: 60_000 }, async t => {
@@ -313,4 +313,45 @@ test('exchange spends its timeout as one total budget across the direct attempt 
   const elapsed = performance.now() - started;
   // Direct (300ms) + first hanging seed drains the budget; the second seed is skipped.
   assert.ok(elapsed < 700, `broadcast spent ${Math.round(elapsed)}ms of a 300ms exchange budget`);
+});
+
+test('exchange splits its remaining budget across fallback seeds so a live relay behind a dead one is reached', { timeout: 60_000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-fallback-'));
+  const network = { networkId: 'fallback-net', passphrase: 'secret' };
+  const peer = async (name: string) => {
+    const transport = new P2PTransportService({
+      discoveryDir: join(dir, name),
+      multicast: false,
+      socketTimeoutMs: 2_000,
+    });
+    t.after(() => transport.dispose());
+    await transport.mountNetwork(network);
+    return transport;
+  };
+  const seed = await peer('seed');
+  const target = await peer('target');
+  // The live seed can reach the target; the sender's own endpoint for the target is dead.
+  seed.registerPeerEndpoint('fallback-net', target.localNodeId, target.endpointAddr!);
+  const deadDirect = await blackholeEndpoint(t);
+  const deadSeed = await blackholeEndpoint(t);
+  const sender = new P2PTransportService({
+    discoveryDir: join(dir, 'sender'),
+    multicast: false,
+    socketTimeoutMs: 2_000,
+  });
+  t.after(() => sender.dispose());
+  await sender.mountNetwork({ ...network, bootstrapPeers: [deadSeed, seed.endpointAddr!] });
+  sender.registerPeerEndpoint('fallback-net', target.localNodeId, deadDirect);
+  const received: string[] = [];
+  target.onInboundFrame(event => {
+    received.push(`${event.senderNodeId}:${event.mode}`);
+    return Buffer.from('relay-pong');
+  });
+  const started = performance.now();
+  await sender.broadcast('fallback-net', 'presence', encode({ ping: true }), { timeoutMs: 3_000 });
+  const elapsed = performance.now() - started;
+  // The dead seed must not consume the whole budget: the live seed behind it still delivers,
+  // and the whole exchange stays inside the caller's deadline.
+  assert.deepEqual(received, [`${sender.localNodeId}:broadcast`]);
+  assert.ok(elapsed < 3_500, `fallback relay took ${Math.round(elapsed)}ms of a 3000ms exchange budget`);
 });

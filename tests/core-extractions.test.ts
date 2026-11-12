@@ -463,7 +463,7 @@ test('daemon drain waits for in-flight control work, wakes on its completion, th
   });
   const held = rpc(runtime.socketPath, ['hold']);
   await holding;
-  // A timed-out drain leaves the daemon serving and clears the fence.
+  // A timed-out drain leaves the daemon fully serving, with control.sock unfenced.
   assert.equal(await runtime.drainForStop({ drainTimeoutMs: 100 }), false);
   assert.deepEqual((await rpc(runtime.socketPath, ['probe'])).stdout, ['done']);
   // The wait is event-driven: control completion wakes it without polling.
@@ -474,6 +474,8 @@ test('daemon drain waits for in-flight control work, wakes on its completion, th
   });
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(drained, false);
+  // An undecided drain never fences the socket: in-flight dispatches keep settling through it.
+  assert.deepEqual((await rpc(runtime.socketPath, ['probe'])).stdout, ['done']);
   release();
   assert.equal(await draining, true);
   assert.deepEqual((await held).stdout, ['done']);

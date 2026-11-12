@@ -912,14 +912,17 @@ export class P2PTransportService implements TransportService {
     } else if (!fallbacks.length) {
       throw lastError;
     }
-    for (const fallback of fallbacks) {
+    for (const [index, fallback] of fallbacks.entries()) {
       if (Date.now() >= deadline) {
         break;
       }
+      // Split what is left across the fallbacks still untried: a blackholed seed must never
+      // starve a live seed behind it, and the total still obeys the caller's deadline.
+      const attemptTimeoutMs = Math.max(1, Math.floor(remaining() / (fallbacks.length - index)));
       try {
         return 'tunnel' in fallback
-          ? await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, remaining())
-          : await this.relayExchange(m, fallback.seed, target, frame, remaining());
+          ? await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, attemptTimeoutMs)
+          : await this.relayExchange(m, fallback.seed, target, frame, attemptTimeoutMs);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
       }
