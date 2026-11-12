@@ -11,7 +11,7 @@ import {
   parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin,
   Kernel, createRouterPlugin, generateNodeKeyPair, signEnvelope, signNodeCard,
   DealerNodeRuntime, resolveBoundMailboxId, resolveMailboxId, validateTopicBindings,
-  createOrcaSpawnExecutorPlugin, initProjectScaffold, runDealerCli,
+  createOrcaSpawnExecutorPlugin, initProjectScaffold, runDealerCli, rpc,
 } from '../packages/index.ts';
 import type { DeliveryReceipt, EmitterService, MessageEnvelope, NodeCard, CommandRequest } from '../packages/index.ts';
 
@@ -133,6 +133,90 @@ test('HTTP wake validates origin and method, coalesces concurrent triggers, repo
   assert.equal(source.wakeAddress(), null);
   await assert.rejects(fetch(url));
   await assert.rejects(source.pollOnce(), /not started/);
+});
+
+test('stopping a poll source aborts the fetch signal and drops a legacy page that ignores it', async t => {
+  const path = join(directory(t), 'cursor.json');
+  writeAtomicCursorFile(path, 7);
+  const emitted: number[] = [];
+  const saved: number[] = [];
+  let signalSeen: AbortSignal | undefined;
+  let release!: () => void;
+  const source = createPollWatermarkSourcePlugin<number, number>({
+    initialCursor: 0,
+    cursorPath: path,
+    poll: (_cursor, signal) => {
+      signalSeen = signal;
+      return new Promise(resolve => {
+        release = () => resolve({ items: [1], cursor: 99 });
+      });
+    },
+    toInput: item => ({ ...input, idempotencyKey: `late-${item}` }),
+    saveCursor: async cursor => { saved.push(cursor); },
+  });
+  await source.start({
+    emit: async () => {
+      emitted.push(1);
+      return { messageId: 'late', traceId: 'late', receipts: [receipt('settled')] };
+    },
+    registerSource() { throw new Error('unused'); },
+  });
+  const pending = source.pollOnce();
+  assert.equal(signalSeen?.aborted, false);
+  const startedAt = performance.now();
+  await source.stop();
+  // The read-only fetch phase holds no external effect: a poll that ignores the signal must
+  // never make stop() wait for it.
+  assert.ok(performance.now() - startedAt < 500, 'stop waited for the read-only poll');
+  assert.equal(signalSeen!.aborted, true);
+  // A page that lands after shutdown is dropped without emitting or touching the cursor.
+  release();
+  await pending;
+  assert.deepEqual(emitted, []);
+  assert.deepEqual(saved, []);
+  assert.equal(source.getCursor(), 7);
+  assert.equal(readJsonCursorFile(path, 0), 7);
+});
+
+test('stopping a poll source finishes an already-resolved page settlement before resolving', async t => {
+  const saved: number[] = [];
+  let emitStarted!: () => void;
+  const started = new Promise<void>(resolve => {
+    emitStarted = resolve;
+  });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const source = createPollWatermarkSourcePlugin<number, number>({
+    initialCursor: 0,
+    poll: async () => ({ items: [1], cursor: 1 }),
+    toInput: () => input,
+    saveCursor: async cursor => { saved.push(cursor); },
+  });
+  await source.start({
+    emit: async () => {
+      emitStarted();
+      await gate;
+      return { messageId: 'settled', traceId: 'settled', receipts: [receipt('settled')] };
+    },
+    registerSource() { throw new Error('unused'); },
+  });
+  const polled = source.pollOnce();
+  await started;
+  let stopResolved = false;
+  const stopping = source.stop().then(() => {
+    stopResolved = true;
+  });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  // Item emission and cursor persistence are already in flight: stop must await them.
+  assert.equal(stopResolved, false);
+  release();
+  await stopping;
+  await polled;
+  assert.equal(stopResolved, true);
+  assert.deepEqual(saved, [1]);
+  assert.equal(source.getCursor(), 1);
 });
 
 const registryYaml = `team:
@@ -356,4 +440,43 @@ test('user plugin CLI add, list and remove unload hooks and persist removal acro
   assert.equal((await runtime.kernel.ctx.waterfall('emitter/prepare', envelope('restarted'))).subject, 'restarted');
   await cli('add', '--name', 'personal', '--module', 'personal.ts');
   assert.deepEqual(await cli('remove', '--name', 'personal'), { removed: 'personal' });
+});
+
+test('daemon drain waits for in-flight control work, wakes on its completion, then fences new requests', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), profile: 'headless-relay' }).start();
+  t.after(() => runtime.stop());
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  let admitted!: () => void;
+  const holding = new Promise<void>(resolve => {
+    admitted = resolve;
+  });
+  await runtime.serveControl(async argv => {
+    if (argv[0] === 'hold') {
+      admitted();
+      await gate;
+    }
+    return { code: 0, stdout: ['done'], stderr: [] };
+  });
+  const held = rpc(runtime.socketPath, ['hold']);
+  await holding;
+  // A timed-out drain leaves the daemon serving and clears the fence.
+  assert.equal(await runtime.drainForStop({ drainTimeoutMs: 100 }), false);
+  assert.deepEqual((await rpc(runtime.socketPath, ['probe'])).stdout, ['done']);
+  // The wait is event-driven: control completion wakes it without polling.
+  let drained = false;
+  const draining = runtime.drainForStop({ drainTimeoutMs: 5_000 }).then(value => {
+    drained = value;
+    return value;
+  });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(drained, false);
+  release();
+  assert.equal(await draining, true);
+  assert.deepEqual((await held).stdout, ['done']);
+  // A completed drain commits the daemon to stopping: no later request is admitted.
+  await assert.rejects(rpc(runtime.socketPath, ['probe']), /Daemon is draining/);
 });

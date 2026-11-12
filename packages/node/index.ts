@@ -19,6 +19,8 @@ export interface NodePluginConfig {
   admissionMode?: AdmissionMode;
   networks?: readonly NetworkMountConfig[];
   exchangeIntervalMs?: number;
+  /** Presence gossip budget per peer; ephemeral beacons never inherit the RPC socket timeout. */
+  exchangeTimeoutMs?: number;
 }
 
 interface ObservableTransport extends TransportService {
@@ -181,6 +183,7 @@ export class PeerDirectoryService implements NodeService {
           networkId,
           'peer.card',
           Buffer.from(JSON.stringify({ type: 'peer.card', card: this.self.get(networkId) })),
+          { timeoutMs: this.config.exchangeTimeoutMs ?? 2_000 },
         );
       }
     });

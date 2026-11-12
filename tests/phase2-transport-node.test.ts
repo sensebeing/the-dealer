@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile, rm, stat, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { createConnection } from 'node:net';
+import { createConnection, createServer } from 'node:net';
+import type { Socket } from 'node:net';
 import { Kernel } from '../packages/kernel/index.ts';
 import { generateNodeKeyPair, deriveNetworkKeys, sealNetworkFrame } from '../packages/core-types/index.ts';
 import type { InboundFrameEvent } from '../packages/core-types/index.ts';
@@ -237,4 +238,79 @@ test('cross-node exchange defaults to socketTimeoutMs instead of a hardcoded sho
   const startedAt = performance.now();
   await assert.rejects(a.sendUnicast('timeout-test', b.localNodeId, encode({ type: 'slow.ping' })), /Transport timeout/);
   assert.ok(performance.now() - startedAt < 3000);
+});
+
+/** A TCP endpoint that accepts connections and never answers: an unreachable, blackholed peer. */
+async function blackholeEndpoint(t: test.TestContext): Promise<string> {
+  const sockets = new Set<Socket>();
+  const server = createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise<void>(resolve => {
+    for (const socket of sockets) socket.destroy();
+    server.close(() => resolve());
+  }));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  return `${address.address}:${address.port}`;
+}
+
+test('presence gossip to a blackholed peer is bounded by the presence budget, not the RPC timeout', { timeout: 60_000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-presence-'));
+  const peerEndpoint = await blackholeEndpoint(t);
+  const seedEndpoint = await blackholeEndpoint(t);
+  const keyPair = generateNodeKeyPair();
+  const network = { networkId: 'presence-net', passphrase: 'secret', bootstrapPeers: [seedEndpoint] };
+  const keys = deriveNetworkKeys(network.networkId, network.passphrase);
+  // A peer beacon already in the shared registry: its advertised endpoint is dead, and the
+  // seed that introduced it can only relay into the same blackhole.
+  const stalePeerId = generateNodeKeyPair().nodeId;
+  const beacon = sealNetworkFrame(
+    { type: 'discovery', endpointAddr: peerEndpoint, expires: Date.now() + 10_000 },
+    keys,
+    stalePeerId,
+  );
+  const registry = join(dir, keys.swarmTopicId);
+  await mkdir(registry, { recursive: true, mode: 0o700 });
+  await writeFile(join(registry, `${createHash('sha256').update(stalePeerId).digest('hex')}.json`), JSON.stringify(beacon));
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: keyPair.nodeId, discoveryDir: dir }) },
+    { plugin: createNodePlugin({ keyPair, member: 'ben.xu', nodeName: 'mbp', exchangeIntervalMs: 600_000 }) },
+  ]);
+  t.after(async () => { await kernel.stop(); await rm(dir, { recursive: true, force: true }); });
+  await kernel.start();
+  const transport = kernel.ctx.services.transport as P2PTransportService;
+  const node = kernel.ctx.services.node as PeerDirectoryService;
+  // Bound: the 2s seed probe plus the 2s presence budget. The 90s task-RPC socket timeout
+  // must never be inherited by ephemeral presence gossip.
+  const mountStarted = performance.now();
+  await transport.mountNetwork(network);
+  const mountElapsed = performance.now() - mountStarted;
+  assert.ok(mountElapsed < 8_000, `mountNetwork took ${Math.round(mountElapsed)}ms for a blackholed peer`);
+  const publishStarted = performance.now();
+  await node.updateSelfProfile({ nodeName: 'renamed' });
+  const publishElapsed = performance.now() - publishStarted;
+  assert.ok(publishElapsed < 5_000, `presence publish took ${Math.round(publishElapsed)}ms for a blackholed peer`);
+});
+
+test('exchange spends its timeout as one total budget across the direct attempt and fallback seeds', { timeout: 60_000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-budget-'));
+  const directEndpoint = await blackholeEndpoint(t);
+  const seedOne = await blackholeEndpoint(t);
+  const seedTwo = await blackholeEndpoint(t);
+  const transport = new P2PTransportService({ discoveryDir: dir, socketTimeoutMs: 1_000 });
+  t.after(async () => { await transport.dispose(); await rm(dir, { recursive: true, force: true }); });
+  await transport.mountNetwork({ networkId: 'budget-net', passphrase: 'secret', bootstrapPeers: [seedOne, seedTwo] });
+  transport.registerPeerEndpoint('budget-net', 'peer-with-dead-endpoint', directEndpoint);
+  const started = performance.now();
+  await transport.broadcast('budget-net', 'peer.card', encode({ type: 'peer.card' }), { timeoutMs: 300 });
+  const elapsed = performance.now() - started;
+  // Direct (300ms) + first hanging seed drains the budget; the second seed is skipped.
+  assert.ok(elapsed < 700, `broadcast spent ${Math.round(elapsed)}ms of a 300ms exchange budget`);
 });

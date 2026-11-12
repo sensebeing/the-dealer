@@ -75,9 +75,11 @@ async function relayMesh(t: TestContext, root: string) {
           discoveryDir: join(root, member),
           multicast: false,
           // TEST-NET-1 is advertised and gossiped but never reachable, so only the
-          // relay seed can carry frames between the two peers.
+          // relay seed can carry frames between the two peers. A request timeout is the
+          // whole direct-plus-relay budget: the dead direct attempt may burn the fast-fail
+          // window, so leave the relay enough of the budget to answer.
           advertisedHost: '192.0.2.1',
-          socketTimeoutMs: 400,
+          socketTimeoutMs: 2_000,
         }),
       },
       {

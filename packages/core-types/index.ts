@@ -172,7 +172,12 @@ export interface TransportService {
     targetNodeIds: readonly string[],
     frame: Uint8Array,
   ): Promise<Map<string, Result<Uint8Array>>>;
-  broadcast(networkId: string, subTopic: string, frame: Uint8Array): Promise<void>;
+  broadcast(
+    networkId: string,
+    subTopic: string,
+    frame: Uint8Array,
+    opts?: { timeoutMs?: number },
+  ): Promise<void>;
   onInboundFrame?(
     handler: (frame: InboundFrameEvent) => Promise<Uint8Array | void> | Uint8Array | void,
   ): Disposable;

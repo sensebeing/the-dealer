@@ -175,6 +175,8 @@ export class DealerNodeRuntime {
   private ownsLock = false;
   private activeMutatingControlRequests = 0;
   private draining = false;
+  /** Drain waits woken by every control-request completion; the dispatcher wakes its own. */
+  private drainWakeups = new Set<() => void>();
   private daemonInstanceId?: string;
   private daemonFingerprint?: string;
   private daemonStartedAt?: string;
@@ -1259,12 +1261,14 @@ export class DealerNodeRuntime {
           ? JSON.parse(readFileSync(cursorPath, 'utf8'))
           : spec.config.initialCursor ?? null,
         intervalMs: spec.config.intervalMs ?? 10000,
-        poll: async cursor => {
+        poll: async (cursor, signal) => {
           const url = new URL(spec.config.url);
           if (cursor !== null) {
             url.searchParams.set('cursor', JSON.stringify(cursor));
           }
-          const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
+          const response = await fetch(url, {
+            signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+          });
           if (!response.ok) {
             throw new Error(`Poll HTTP ${response.status}`);
           }
@@ -1321,12 +1325,73 @@ export class DealerNodeRuntime {
     return this.kernel.ctx.services.dispatcher.activeCount() === 0 && this.activeMutatingControlRequests === 0;
   }
 
-  async gracefulStop(options: { drainTimeoutMs?: number } = {}): Promise<void> {
+  /**
+   * Wait for the daemon to quiesce without polling: the dispatcher's idle transition and every
+   * control request's completion wake the wait. A timeout leaves the daemon serving and clears
+   * the drain flag; a successful drain commits it to stopping, so no later request is admitted.
+   */
+  async drainForStop(
+    options: { drainTimeoutMs?: number; callerControlRequests?: number } = {},
+  ): Promise<boolean> {
     this.draining = true;
-    const wait = this.kernel.ctx.services.dispatcher.waitForIdle();
-    await Promise.race([wait, new Promise(resolve => setTimeout(resolve, options.drainTimeoutMs ?? 15_000))]);
-    if (!this.isIdleForRestart()) {
+    const callerControlRequests = options.callerControlRequests ?? 0;
+    const drained = () =>
+      this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
+      this.activeMutatingControlRequests <= callerControlRequests;
+    const deadline = Date.now() + (options.drainTimeoutMs ?? 15_000);
+    while (!drained()) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      await this.waitForDrainWake(remaining);
+    }
+    if (!drained()) {
       this.draining = false;
+      return false;
+    }
+    return true;
+  }
+
+  private waitForDrainWake(timeoutMs: number): Promise<void> {
+    const dispatcher = this.kernel.ctx.services.dispatcher;
+    return new Promise<void>(resolve => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let idle: Disposable | undefined;
+      const wake = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        idle?.dispose();
+        this.drainWakeups.delete(wake);
+        resolve();
+      };
+      // The bounded wait is real work; an unref'd timer would let the event loop exit
+      // under a drain that is still pending.
+      timer = setTimeout(wake, timeoutMs);
+      this.drainWakeups.add(wake);
+      idle = dispatcher.onIdle(wake);
+    });
+  }
+
+  /** One owner for decrementing in-flight control work and waking drain waiters. */
+  private controlRequestSettled(): void {
+    this.activeMutatingControlRequests--;
+    for (const wake of [...this.drainWakeups]) {
+      wake();
+    }
+    if (this.activeMutatingControlRequests === 0) {
+      this.onControlIdle?.();
+    }
+  }
+
+  async gracefulStop(options: { drainTimeoutMs?: number } = {}): Promise<void> {
+    if (!(await this.drainForStop(options))) {
       throw new Error('Daemon drain timed out with active work; restart deferred');
     }
     await this.stop();
@@ -1378,8 +1443,7 @@ export class DealerNodeRuntime {
           }
         }
         finally {
-          this.activeMutatingControlRequests--;
-          if (this.activeMutatingControlRequests === 0) this.onControlIdle?.();
+          this.controlRequestSettled();
         }
         return;
       }
@@ -1444,8 +1508,7 @@ export class DealerNodeRuntime {
           }
         }
       } finally {
-        this.activeMutatingControlRequests--;
-        if (this.activeMutatingControlRequests === 0) this.onControlIdle?.();
+        this.controlRequestSettled();
         completed = true;
         if (keepalive) {
           clearInterval(keepalive);
@@ -1493,6 +1556,8 @@ export class DealerNodeRuntime {
           releaseOwnedDirectory(this.stateDir);
         }
         this.started = false;
+        // Only once the control socket is gone may a stopped in-process runtime admit work again.
+        this.draining = false;
       }
     }
   }

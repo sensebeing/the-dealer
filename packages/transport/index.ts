@@ -885,6 +885,10 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
   ): Promise<Uint8Array> {
+    // The caller's timeout is the whole exchange budget, not a per-attempt allowance: a
+    // blackholed direct endpoint followed by hanging relay seeds must not multiply it.
+    const deadline = Date.now() + timeoutMs;
+    const remaining = () => Math.max(1, deadline - Date.now());
     const address = m.peers.get(target);
     // Any fallback means the advertised endpoint may be NAT-bound; fail over fast
     // instead of waiting the full request timeout on the direct attempt.
@@ -897,7 +901,7 @@ export class P2PTransportService implements TransportService {
           target,
           address,
           frame,
-          fallbacks.length ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs,
+          fallbacks.length ? Math.min(remaining(), RELAY_CONNECT_TIMEOUT_MS) : remaining(),
         );
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -909,10 +913,13 @@ export class P2PTransportService implements TransportService {
       throw lastError;
     }
     for (const fallback of fallbacks) {
+      if (Date.now() >= deadline) {
+        break;
+      }
       try {
         return 'tunnel' in fallback
-          ? await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, timeoutMs)
-          : await this.relayExchange(m, fallback.seed, target, frame, timeoutMs);
+          ? await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, remaining())
+          : await this.relayExchange(m, fallback.seed, target, frame, remaining());
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
       }
@@ -1127,10 +1134,17 @@ export class P2PTransportService implements TransportService {
     );
   }
 
-  async broadcast(networkId: string, subTopic: string, bytes: Uint8Array): Promise<void> {
+  async broadcast(
+    networkId: string,
+    subTopic: string,
+    bytes: Uint8Array,
+    opts?: { timeoutMs?: number },
+  ): Promise<void> {
     const m = this.get(networkId);
     const frame = this.sealed(m, 'broadcast', bytes, subTopic);
-    await Promise.allSettled([...m.peers.keys()].map(target => this.exchange(m, target, frame)));
+    await Promise.allSettled(
+      [...m.peers.keys()].map(target => this.exchange(m, target, frame, opts?.timeoutMs)),
+    );
   }
 
   /** Drop beacons whose discovery frame expired beyond the gossip grace window. */
