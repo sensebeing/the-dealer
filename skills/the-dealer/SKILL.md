@@ -304,4 +304,4 @@ replies to the caller's worktree mailbox unless that caller is already the
 topic's bound workspace/mailbox; non-Orca callers continue to use the topic binding.
 # Lifecycle and updates
 
-Use `dealer node down` for a graceful drain and shutdown, or `dealer node restart` to drain and start again. `dealer self-update` fast-forwards a clean `main` checkout and repairs installed skill links. Running daemons expose a `runtimeFingerprint`; edits to host or linked project files schedule an idle-gated automatic drain and restart.
+Use `dealer node down` for a graceful drain and shutdown, or `dealer node restart` to drain and start again; if the drain cannot quiesce, the daemon keeps serving and the result reports `stopped:false` (`--force` is the explicit override). `dealer self-update` fast-forwards a clean `main` checkout and repairs installed skill links. Running daemons expose a `runtimeFingerprint`; edits to host or linked project files are detected by the daemon's own watcher, which schedules an idle-gated automatic drain and restart. Ordinary commands never restart the daemon synchronously.

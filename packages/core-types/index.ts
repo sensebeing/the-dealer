@@ -322,6 +322,12 @@ export interface DispatcherService {
   dispatch(envelope: MessageEnvelope): Promise<DispatchReceipt>;
   registerPolicy(policy: DispatchPolicyPlugin): Disposable;
   registerExecutor<C>(executor: ExecutorPlugin<C>, config: C): Disposable;
+  /** In-flight dispatch count; zero means the dispatcher is idle. */
+  activeCount(): number;
+  /** Idle notification used by idle-gated restart owners. */
+  onIdle(listener: () => void): Disposable;
+  /** Resolves once every in-flight dispatch has settled. */
+  waitForIdle(): Promise<void>;
 }
 
 const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');

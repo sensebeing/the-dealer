@@ -34,7 +34,17 @@ import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveSer
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
-import { computeRuntimeFingerprint, writeDaemonFingerprint, removeDaemonFingerprint, readDaemonFingerprint, readAutoUpdateStatus } from './auto-update.ts';
+import {
+  composeRuntimeFingerprint,
+  dealerCodeFingerprintEntries,
+  projectFingerprintEntries,
+  userPluginFingerprintEntries,
+  writeDaemonFingerprint,
+  removeDaemonFingerprint,
+  readDaemonFingerprint,
+  readAutoUpdateStatus,
+} from './auto-update.ts';
+import type { FingerprintEntries } from './auto-update.ts';
 import {
   getBuiltInProfile,
   saveJson,
@@ -163,6 +173,12 @@ export class DealerNodeRuntime {
   private daemonInstanceId?: string;
   private daemonFingerprint?: string;
   private daemonStartedAt?: string;
+  /** Code entries frozen when this process started; never re-read from disk during persist(). */
+  private loadedDealerEntries?: FingerprintEntries;
+  /** Per-project entries frozen when linkProject actually loaded that project. */
+  private loadedProjectEntries = new Map<string, FingerprintEntries>();
+  /** User-plugin entries frozen whenever the loaded user-plugin set changes. */
+  private loadedUserPluginEntries: FingerprintEntries = [];
   onConfigPersisted?: () => void;
   onControlIdle?: () => void;
   /** Per-process owner file: a gate contender never touches another process's file. */
@@ -202,7 +218,7 @@ export class DealerNodeRuntime {
   persist(): void {
     validateConfig(this.config);
     saveJson(join(this.stateDir, 'config.json'), this.config);
-    this.refreshDaemonFingerprint();
+    this.writeDaemonFingerprintRecord();
     this.onConfigPersisted?.();
   }
 
@@ -210,13 +226,34 @@ export class DealerNodeRuntime {
     return this.daemonFingerprint;
   }
 
-  private refreshDaemonFingerprint(): void {
-    if (!this.daemonInstanceId) return;
-    this.daemonFingerprint = computeRuntimeFingerprint(this.stateDir);
+  /**
+   * Compose the fingerprint from what this process actually loaded. persist() must never
+   * recompute it from disk: that would absorb external code edits the daemon never loaded.
+   */
+  private currentMemoryFingerprint(): string | undefined {
+    if (!this.loadedDealerEntries) {
+      return undefined;
+    }
+    return composeRuntimeFingerprint([
+      this.loadedDealerEntries,
+      this.loadedUserPluginEntries,
+      ...[...this.loadedProjectEntries.values()],
+    ]);
+  }
+
+  private writeDaemonFingerprintRecord(): void {
+    if (!this.daemonInstanceId) {
+      return;
+    }
+    const fingerprint = this.currentMemoryFingerprint();
+    if (!fingerprint) {
+      return;
+    }
+    this.daemonFingerprint = fingerprint;
     writeDaemonFingerprint(this.stateDir, {
       pid: process.pid,
       instanceId: this.daemonInstanceId,
-      fingerprint: this.daemonFingerprint,
+      fingerprint,
       startedAt: this.daemonStartedAt ?? new Date().toISOString(),
     });
   }
@@ -377,6 +414,8 @@ export class DealerNodeRuntime {
       this.ownsLock = true;
       holdOwnedDirectory(this.stateDir);
     }
+    // Freeze the loaded code once. Subsequent config writes must not adopt disk edits.
+    this.loadedDealerEntries = dealerCodeFingerprintEntries();
     try {
       const path = join(this.stateDir, 'config.json');
       const saved = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
@@ -697,27 +736,39 @@ export class DealerNodeRuntime {
         rootPath,
         ...(resolvedPatchPath ? { userPatchPath: resolvedPatchPath } : {}),
       };
-      await this.replaceExternal(this.loadedProjects.get(manifest.projectId)?.plugins ?? [], plugins, async () => {
-        this.config.skills = [...new Set([...this.config.skills, ...(manifest.skills ?? []), ...(userPatch?.skills ?? [])])];
-        await this.publishSkills();
-        this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
-        if (onboardingPassphrase && !options.restore && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
-          await this.mountNetwork({
-            networkId: onboardingNetworkId,
-            passphrase: onboardingPassphrase,
-            ...(manifest.onboarding?.bootstrapPeers?.length ? { bootstrapPeers: manifest.onboarding.bootstrapPeers } : {}),
-          });
-        } else if (onboardingPassphrase && this.transport.listMountedNetworks().includes(onboardingNetworkId) &&
-                   manifest.onboarding?.bootstrapPeers?.length) {
-          // Linking or restoring a project also adds newly published project seeds to
-          // an already-mounted network instead of requiring a manual remount.
-          const current = this.transport.getNetworkConfig(onboardingNetworkId);
-          const mergedSeeds = [...new Set([...(current?.bootstrapPeers ?? []), ...manifest.onboarding.bootstrapPeers])];
-          if (current && mergedSeeds.length > (current.bootstrapPeers?.length ?? 0)) {
-            await this.mountNetwork({ ...current, bootstrapPeers: mergedSeeds });
+      const projectEntries = projectFingerprintEntries(manifest.projectId, rootPath, manifest, this.stateDir, resolvedPatchPath);
+      const previousEntries = this.loadedProjectEntries.get(manifest.projectId);
+      try {
+        await this.replaceExternal(this.loadedProjects.get(manifest.projectId)?.plugins ?? [], plugins, async () => {
+          this.config.skills = [...new Set([...this.config.skills, ...(manifest.skills ?? []), ...(userPatch?.skills ?? [])])];
+          await this.publishSkills();
+          this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
+          this.loadedProjectEntries.set(manifest.projectId, projectEntries);
+          if (onboardingPassphrase && !options.restore && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
+            await this.mountNetwork({
+              networkId: onboardingNetworkId,
+              passphrase: onboardingPassphrase,
+              ...(manifest.onboarding?.bootstrapPeers?.length ? { bootstrapPeers: manifest.onboarding.bootstrapPeers } : {}),
+            });
+          } else if (onboardingPassphrase && this.transport.listMountedNetworks().includes(onboardingNetworkId) &&
+                     manifest.onboarding?.bootstrapPeers?.length) {
+            // Linking or restoring a project also adds newly published project seeds to
+            // an already-mounted network instead of requiring a manual remount.
+            const current = this.transport.getNetworkConfig(onboardingNetworkId);
+            const mergedSeeds = [...new Set([...(current?.bootstrapPeers ?? []), ...manifest.onboarding.bootstrapPeers])];
+            if (current && mergedSeeds.length > (current.bootstrapPeers?.length ?? 0)) {
+              await this.mountNetwork({ ...current, bootstrapPeers: mergedSeeds });
+            }
           }
+        });
+      } catch (error) {
+        if (previousEntries) {
+          this.loadedProjectEntries.set(manifest.projectId, previousEntries);
+        } else {
+          this.loadedProjectEntries.delete(manifest.projectId);
         }
-      });
+        throw error;
+      }
       this.loadedProjects.set(manifest.projectId, { manifest, plugins, userPatch, rootPath });
       this.refreshTopicBindings();
       return {
@@ -734,9 +785,18 @@ export class DealerNodeRuntime {
       if (!this.config.projects.some(project => project.projectId === projectId)) {
         throw new Error(`Project not linked: ${projectId}`);
       }
-      await this.replaceExternal(this.loadedProjects.get(projectId)?.plugins ?? [], [], async () => {
-        this.config.projects = this.config.projects.filter(project => project.projectId !== projectId);
-      });
+      const previousEntries = this.loadedProjectEntries.get(projectId);
+      try {
+        await this.replaceExternal(this.loadedProjects.get(projectId)?.plugins ?? [], [], async () => {
+          this.config.projects = this.config.projects.filter(project => project.projectId !== projectId);
+          this.loadedProjectEntries.delete(projectId);
+        });
+      } catch (error) {
+        if (previousEntries) {
+          this.loadedProjectEntries.set(projectId, previousEntries);
+        }
+        throw error;
+      }
       this.loadedProjects.delete(projectId);
       this.refreshTopicBindings();
     });
@@ -747,9 +807,16 @@ export class DealerNodeRuntime {
       validatePluginRefs([ref]);
       const loaded = await this.loadExternalPlugin(ref, ref.config ?? {}, { stateDir: this.stateDir, runtime: this });
       const previous = this.loadedUserPlugins.get(ref.name);
-      await this.replaceExternal(previous ? [previous] : [], [loaded], async () => {
-        this.config.userPlugins = [...this.config.userPlugins.filter(plugin => plugin.name !== ref.name), structuredClone(ref)];
-      });
+      const previousEntries = this.loadedUserPluginEntries;
+      try {
+        await this.replaceExternal(previous ? [previous] : [], [loaded], async () => {
+          this.config.userPlugins = [...this.config.userPlugins.filter(plugin => plugin.name !== ref.name), structuredClone(ref)];
+          this.loadedUserPluginEntries = userPluginFingerprintEntries(this.stateDir, this.config.userPlugins);
+        });
+      } catch (error) {
+        this.loadedUserPluginEntries = previousEntries;
+        throw error;
+      }
       this.loadedUserPlugins.set(ref.name, loaded);
       return { added: ref.name };
     });
@@ -761,9 +828,16 @@ export class DealerNodeRuntime {
         throw new Error(`User plugin not installed: ${name}`);
       }
       const previous = this.loadedUserPlugins.get(name);
-      await this.replaceExternal(previous ? [previous] : [], [], async () => {
-        this.config.userPlugins = this.config.userPlugins.filter(plugin => plugin.name !== name);
-      });
+      const previousEntries = this.loadedUserPluginEntries;
+      try {
+        await this.replaceExternal(previous ? [previous] : [], [], async () => {
+          this.config.userPlugins = this.config.userPlugins.filter(plugin => plugin.name !== name);
+          this.loadedUserPluginEntries = userPluginFingerprintEntries(this.stateDir, this.config.userPlugins);
+        });
+      } catch (error) {
+        this.loadedUserPluginEntries = previousEntries;
+        throw error;
+      }
       this.loadedUserPlugins.delete(name);
       return { removed: name };
     });
@@ -1239,14 +1313,12 @@ export class DealerNodeRuntime {
   }
 
   isIdleForRestart(): boolean {
-    const dispatcher = this.kernel.ctx?.services?.dispatcher as any;
-    return (dispatcher?.activeCount?.() ?? 0) === 0 && this.activeMutatingControlRequests === 0;
+    return this.kernel.ctx.services.dispatcher.activeCount() === 0 && this.activeMutatingControlRequests === 0;
   }
 
   async gracefulStop(options: { drainTimeoutMs?: number } = {}): Promise<void> {
     this.draining = true;
-    const dispatcher = this.kernel.ctx?.services?.dispatcher as any;
-    const wait = dispatcher?.waitForIdle?.() ?? Promise.resolve();
+    const wait = this.kernel.ctx.services.dispatcher.waitForIdle();
     await Promise.race([wait, new Promise(resolve => setTimeout(resolve, options.drainTimeoutMs ?? 15_000))]);
     if (!this.isIdleForRestart()) {
       this.draining = false;
@@ -1382,7 +1454,7 @@ export class DealerNodeRuntime {
     chmodSync(this.socketPath, 0o600);
     this.daemonInstanceId = processOwnerRecord().instanceId;
     this.daemonStartedAt = new Date().toISOString();
-    this.refreshDaemonFingerprint();
+    this.writeDaemonFingerprintRecord();
   }
 
   async stop(): Promise<void> {

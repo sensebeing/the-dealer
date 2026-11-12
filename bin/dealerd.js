@@ -17,6 +17,8 @@ try {
   };
   process.once('SIGTERM', stop);
   process.once('SIGINT', stop);
+  // Only an explicit `dealer node down --force` escalates to SIGTERM. The default
+  // shutdown path is `node down`'s graceful drain, never a signal from this process.
 } catch (error) {
   console.error(String(error));
   process.exitCode = 1;

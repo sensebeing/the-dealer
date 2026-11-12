@@ -78,32 +78,35 @@ function editManifest(projectRoot: string, description: string): void {
   writeFileSync(path, `${JSON.stringify({ ...manifest, description }, null, 2)}\n`);
 }
 
-test('active pre-RPC check automatically restarts dealerd when linked project .dealer manifest changes', { timeout: 90_000 }, async t => {
+test('idle-gated daemon watcher restarts dealerd when a linked project .dealer manifest changes', { timeout: 90_000 }, async t => {
   const { root, stateDir } = isolatedState();
   t.after(async () => {
     await stopDaemonIfRunning(stateDir);
     rmSync(root, { recursive: true, force: true });
   });
-  // The passive fs.watch reload is exercised by the next test; disable it here so the
-  // assertion below isolates the active pre-RPC restart path.
-  await bootDaemon(stateDir, { DEALER_AUTO_RESTART: '0' });
+  await bootDaemon(stateDir);
   const projectRoot = join(root, 'proj');
   mkdirSync(projectRoot, { recursive: true });
   assert.equal((await dealer(['project', 'init', '--root', projectRoot, '--id', 'demo'], stateDir)).projectId, 'demo');
   assert.equal((await dealer(['project', 'link', projectRoot], stateDir)).projectId, 'demo');
   const status1 = await dealer(['node', 'status'], stateDir);
-  const before = readDaemonFingerprint(stateDir);
-  assert.ok(before);
+  const before = await until(() => {
+    const record = readDaemonFingerprint(stateDir);
+    return record && record.fingerprint === computeRuntimeFingerprint(stateDir) ? record : undefined;
+  }, 'daemon fingerprint to settle after project link');
   assert.equal(status1.runtimeFingerprint, before.fingerprint);
   editManifest(projectRoot, 'edited on disk after the project was linked');
+  // No lifecycle command runs here: the daemon's own fs.watch + idle gate must restart it.
+  const after = await until(() => {
+    const record = readDaemonFingerprint(stateDir);
+    return record && record.pid !== before.pid && record.fingerprint !== before.fingerprint ? record : undefined;
+  }, 'idle-gated daemon restart after the manifest edit');
+  assert.equal(after.fingerprint, computeRuntimeFingerprint(stateDir));
+  const status2 = await dealer(['node', 'status'], stateDir);
+  assert.equal(status2.runtimeFingerprint, after.fingerprint);
   const linked = await dealer(['project', 'status', '--root', projectRoot], stateDir);
   assert.equal(linked.projects[0].projectId, 'demo');
-  const status2 = await dealer(['node', 'status'], stateDir);
-  const after = readDaemonFingerprint(stateDir);
-  assert.ok(after);
-  assert.notEqual(after.pid, before.pid);
-  assert.notEqual(status2.runtimeFingerprint, status1.runtimeFingerprint);
-  assert.equal(status2.runtimeFingerprint, after.fingerprint);
+  assert.equal(linked.projects[0].manifest.description, 'edited on disk after the project was linked');
 });
 
 test('passive fs.watch reload and gracefulStop drain in-flight dispatches before stopping', { timeout: 90_000 }, async t => {
@@ -232,12 +235,29 @@ test('dealer self-update fast-forwards clean main, syncs skill symlinks, skips d
     assert.equal(lstatSync(link).isSymbolicLink(), true, link);
     assert.equal(realpathSync(link), realpathSync(join(checkout, 'skills', 'the-dealer')));
   }
+  const updateOptions = { stateDir, checkoutDir: checkout, homeDir: home, geminiDir: gemini };
+  const lockDir = join(stateDir, 'auto-update.lock');
+  const daemonOwner = JSON.parse(readFileSync(join(stateDir, 'runtime.lock', 'owner.json'), 'utf8'));
+  mkdirSync(lockDir);
+  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify(daemonOwner));
+  assert.equal(selfUpdate(updateOptions).sourceStatus, 'skipped_locked');
+  rmSync(lockDir, { recursive: true, force: true });
+  mkdirSync(lockDir);
+  const corrupt = selfUpdate(updateOptions);
+  assert.equal(corrupt.status, 'failed');
+  assert.equal(corrupt.sourceStatus, 'corrupt_lock');
+  assert.match(String(corrupt.error), /owner record/);
+  rmSync(lockDir, { recursive: true, force: true });
+  mkdirSync(lockDir);
+  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: 999999, instanceId: 'dead-incarnation', host: 'test-host' }));
+  assert.equal(selfUpdate(updateOptions).sourceStatus, 'up_to_date');
+  assert.equal(existsSync(lockDir), false);
   writeFileSync(join(checkout, 'untracked.txt'), 'dirty checkout\n');
-  const dirty = selfUpdate({ stateDir, checkoutDir: checkout, homeDir: home, geminiDir: gemini });
+  const dirty = selfUpdate(updateOptions);
   assert.equal(dirty.sourceStatus, 'skipped_dirty_checkout');
   rmSync(join(checkout, 'untracked.txt'), { force: true });
   git(checkout, ['checkout', '-b', 'feat']);
-  const offMain = selfUpdate({ stateDir, checkoutDir: checkout, homeDir: home, geminiDir: gemini });
+  const offMain = selfUpdate(updateOptions);
   assert.equal(offMain.sourceStatus, 'skipped_non_main_branch');
 });
 
@@ -258,8 +278,26 @@ test('dealer node restart tolerates concurrent ensureDaemonRunning and node down
   assert.equal(record.instanceId, owner.instanceId);
   assert.doesNotThrow(() => process.kill(owner.pid, 0));
   const down = await dealer(['node', 'down'], stateDir);
-  assert.equal(down.stopped, true);
+  assert.deepEqual({ running: down.running, stopped: down.stopped }, { running: false, stopped: true });
   const offline = await dealer(['node', 'status'], stateDir);
   assert.equal(offline.running, false);
+  assert.equal(existsSync(join(stateDir, 'control.sock')), false);
+
+  // A killed daemon leaves control.sock behind; down must prove staleness instead of
+  // reporting a live daemon from filesystem residue.
+  await bootDaemon(stateDir);
+  const killed = JSON.parse(readFileSync(join(stateDir, 'runtime.lock', 'owner.json'), 'utf8'));
+  process.kill(killed.pid, 'SIGKILL');
+  await until(() => {
+    try {
+      process.kill(killed.pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  }, 'killed daemon to exit');
+  assert.equal(existsSync(join(stateDir, 'control.sock')), true);
+  const recovered = await dealer(['node', 'down'], stateDir);
+  assert.deepEqual({ running: recovered.running, stopped: recovered.stopped }, { running: false, stopped: true });
   assert.equal(existsSync(join(stateDir, 'control.sock')), false);
 });

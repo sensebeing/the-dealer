@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { probeDealerSetup, buildOnboardingPrompts, resolveAgentBindingPreset, readAgentPresetContext } from './setup.ts';
 import type { SupportedAgentHost, AgentConversationMode } from '../plugins-executor/index.ts';
 import type { SupportedOrcaAgent } from '../orca-workspace/index.ts';
-import { existsSync, readFileSync, watch } from 'node:fs';
+import { existsSync, readFileSync, rmSync, watch } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { request } from 'node:http';
@@ -23,7 +23,7 @@ export * from './config.ts';
 export * from './setup.ts';
 export * from './auto-update.ts';
 
-const booleanFlags = ['json', 'quiet', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
+const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread',
@@ -323,38 +323,80 @@ async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> 
   });
 }
 
+function liveDaemonOwner(stateDir: string) {
+  try {
+    const owner = readProcessOwner(join(stateDir, 'runtime.lock', 'owner.json'));
+    return owner && !isDeadProcessOwner(owner, stateDir) ? owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type DaemonProbe = 'live' | 'absent' | 'stale_recovered';
+
+/**
+ * A control socket file alone is not proof of a live daemon: a process killed without a
+ * graceful shutdown leaves it behind. Probe the listener only while no lock owner is live,
+ * and treat connection refusal as stale residue.
+ */
+async function probeDaemonState(stateDir: string): Promise<DaemonProbe> {
+  if (liveDaemonOwner(stateDir)) {
+    return 'live';
+  }
+  const socket = join(stateDir, 'control.sock');
+  if (!existsSync(socket)) {
+    return 'absent';
+  }
+  try {
+    await rpc(socket, ['node', 'status', '--json'], { inactivityMs: 1_000 });
+    return 'live';
+  } catch {
+    rmSync(socket, { force: true });
+    return 'stale_recovered';
+  }
+}
+
 async function waitForDaemonStopped(stateDir: string, timeoutMs = 20_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  const lock = join(stateDir, 'runtime.lock');
   while (Date.now() < deadline) {
-    let live = false;
-    try {
-      const owner = readProcessOwner(join(lock, 'owner.json'));
-      live = Boolean(owner && !isDeadProcessOwner(owner, stateDir));
-    } catch { /* lock disappeared */ }
-    if (!live && !existsSync(join(stateDir, 'control.sock'))) return true;
+    if ((await probeDaemonState(stateDir)) !== 'live') {
+      return true;
+    }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   return false;
 }
 
-export async function stopDaemonIfRunning(stateDir: string): Promise<{ running: boolean; stopped: boolean; pid?: number }> {
-  if (!existsSync(join(stateDir, 'control.sock'))) return { running: false, stopped: false };
+export async function stopDaemonIfRunning(
+  stateDir: string,
+  options: { force?: boolean } = {},
+): Promise<{ running: boolean; stopped: boolean; pid?: number }> {
+  const probe = await probeDaemonState(stateDir);
+  if (probe === 'absent') {
+    return { running: false, stopped: false };
+  }
+  if (probe === 'stale_recovered') {
+    return { running: false, stopped: true };
+  }
   let pid: number | undefined;
   try {
     const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], { inactivityMs: 2_000 });
     const parsed = JSON.parse(result.stdout.join('') || '{}');
-    pid = parsed.pid;
-  } catch { /* launchd may remove the socket while responding */ }
-  let stopped = await waitForDaemonStopped(stateDir, 15_000);
-  if (!stopped) {
-    const owner = readProcessOwner(join(stateDir, 'runtime.lock', 'owner.json'));
-    if (owner && !isDeadProcessOwner(owner, stateDir)) {
-      try { process.kill(owner.pid, 'SIGTERM'); } catch { /* exited */ }
+    if (typeof parsed.pid === 'number') {
+      pid = parsed.pid;
+    }
+  } catch { /* the daemon may remove the socket while responding */ }
+  let stopped = await waitForDaemonStopped(stateDir);
+  if (!stopped && options.force) {
+    const owner = liveDaemonOwner(stateDir);
+    if (owner) {
+      try {
+        process.kill(owner.pid, 'SIGTERM');
+      } catch { /* exited */ }
       stopped = await waitForDaemonStopped(stateDir, 5_000);
     }
   }
-  return { running: true, stopped, ...(pid ? { pid } : {}) };
+  return { running: !stopped, stopped, ...(pid ? { pid } : {}) };
 }
 
 export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
@@ -364,8 +406,9 @@ export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
       if (status.runtimeFingerprint === computeRuntimeFingerprint(stateDir)) return status;
     } catch { /* stale socket */ }
   }
-  try { return await launchDaemon([], stateDir); }
-  catch (error) {
+  try {
+    return await launchDaemon([], stateDir);
+  } catch (error) {
     const deadline = Date.now() + 3_000;
     while (Date.now() < deadline) {
       try {
@@ -379,8 +422,11 @@ export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
   }
 }
 
-export async function restartDaemon(stateDir: string): Promise<unknown> {
-  await stopDaemonIfRunning(stateDir);
+export async function restartDaemon(stateDir: string, options: { force?: boolean } = {}): Promise<unknown> {
+  const stopped = await stopDaemonIfRunning(stateDir, options);
+  if (!stopped.stopped) {
+    return { ...stopped, restarted: false, deferred: true };
+  }
   return ensureDaemonRunning(stateDir);
 }
 
@@ -827,10 +873,8 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     const localSetup = group === 'setup' && !['binding-preset', 'apply-preset'].includes(action);
     const localLifecycle = group === 'node' && ['down', 'restart', 'up'].includes(action ?? '') || group === 'self-update';
     if (!localSetup && !localLifecycle && !options.runtime && existsSync(join(stateDir, 'control.sock'))) {
-      if (process.env.DEALER_AUTO_RESTART !== '0') {
-        const current = computeRuntimeFingerprint(stateDir);
-        if (readDaemonFingerprint(stateDir)?.fingerprint !== current) await restartDaemon(stateDir);
-      }
+      // The daemon's idle-gated watcher is the sole automatic reload owner; ordinary
+      // commands always forward to the running daemon without a synchronous restart.
       const result = await rpc(join(stateDir, 'control.sock'), argv);
       result.stdout.forEach(line => stdout(line));
       result.stderr.forEach(line => stderr(line));
@@ -918,20 +962,20 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'down') {
-      const result = await stopDaemonIfRunning(stateDir);
+      const result = await stopDaemonIfRunning(stateDir, { force: v.force === true });
       stdout(JSON.stringify(result, null, v.json ? undefined : 2));
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'restart') {
-      const result = await restartDaemon(stateDir);
+      const result = await restartDaemon(stateDir, { force: v.force === true });
       stdout(JSON.stringify(result, null, v.json ? undefined : 2));
       return 0;
     }
     if (!options.runtime && group === 'self-update') {
       const report = selfUpdate({ stateDir, checkoutDir: v['checkout-dir'], homeDir: v['home-dir'], geminiDir: v['gemini-dir'] });
       if (existsSync(join(stateDir, 'control.sock')) && readDaemonFingerprint(stateDir)?.fingerprint !== computeRuntimeFingerprint(stateDir, v['checkout-dir'])) {
-        await restartDaemon(stateDir);
-        report.restartedDaemon = true;
+        const restarted = await restartDaemon(stateDir);
+        report.restartedDaemon = !(restarted as { deferred?: boolean } | null)?.deferred;
       }
       stdout(JSON.stringify(report, null, v.json ? undefined : 2));
       return 0;
@@ -1231,8 +1275,8 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   addWatch(join(dealerRoot, 'package.json'), false);
   addWatch(runtime.stateDir);
   for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
-  const dispatcher = runtime.kernel.ctx.services.dispatcher as any;
-  dispatcher?.onIdle?.(maybeSpawnSelfRestart);
+  const dispatcher = runtime.kernel.ctx.services.dispatcher;
+  dispatcher.onIdle(maybeSpawnSelfRestart);
   runtime.onConfigPersisted = () => {
     for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
     schedule();

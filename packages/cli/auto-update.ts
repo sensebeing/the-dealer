@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../core-types/index.ts';
-import { isDeadProcessOwner, processOwnerRecord } from '../process-lock/index.ts';
+import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
 
 export type FingerprintRecord = {
   pid: number;
@@ -62,43 +62,115 @@ function addEntry(entries: Array<[string, string]>, logical: string, path: strin
   entries.push([logical, value]);
 }
 
-export function computeRuntimeFingerprint(stateDir: string, checkoutDir?: string): string {
+export type FingerprintEntries = Array<[string, string]>;
+
+/** Entries for the code this process actually loaded; the daemon freezes them at startup. */
+export function dealerCodeFingerprintEntries(checkoutDir?: string): FingerprintEntries {
   const root = dealerRootFor(checkoutDir);
-  const entries: Array<[string, string]> = [];
+  const entries: FingerprintEntries = [];
   addEntry(entries, 'dealer/package.json', join(root, 'package.json'));
   for (const folder of ['bin', 'packages']) {
     for (const path of fileList(join(root, folder), name => /\.(ts|js|json)$/.test(name))) {
       addEntry(entries, `dealer/${relative(root, path)}`, path);
     }
   }
+  return entries;
+}
+
+function manifestPlugins(manifest: unknown): Array<{ name: string; module: string }> {
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return [];
+  }
+  const plugins = (manifest as { plugins?: unknown }).plugins;
+  if (!Array.isArray(plugins)) {
+    return [];
+  }
+  const result: Array<{ name: string; module: string }> = [];
+  for (const plugin of plugins) {
+    if (!plugin || typeof plugin !== 'object' || Array.isArray(plugin)) {
+      continue;
+    }
+    const { name, module } = plugin as { name?: unknown; module?: unknown };
+    if (typeof name === 'string' && typeof module === 'string') {
+      result.push({ name, module });
+    }
+  }
+  return result;
+}
+
+/** Entries for one project exactly as the runtime loads it: manifest, project code, patch and plugin modules. */
+export function projectFingerprintEntries(
+  projectId: string,
+  projectRoot: string,
+  manifest: unknown,
+  stateDir: string,
+  userPatchPath?: string,
+): FingerprintEntries {
+  const dealer = join(projectRoot, '.dealer');
+  const entries: FingerprintEntries = [];
+  addEntry(entries, `project/${projectId}/project.json`, join(dealer, 'project.json'));
+  for (const path of fileList(dealer, name => /\.(ts|js|json)$/.test(name))) {
+    const logical = relative(dealer, path);
+    if (logical === 'project.json' || logical.split('/').includes('tests')) {
+      continue;
+    }
+    addEntry(entries, `project/${projectId}/${logical}`, path);
+  }
+  addEntry(entries, `project/${projectId}/userPatch`, userPatchPath ?? join(stateDir, 'projects', `${projectId}.patch.json`));
+  for (const plugin of manifestPlugins(manifest)) {
+    addEntry(entries, `project/${projectId}/plugin/${plugin.name}`, resolve(projectRoot, plugin.module));
+  }
+  return entries;
+}
+
+/** Entries for user plugins, resolved against stateDir exactly like the runtime loader. */
+export function userPluginFingerprintEntries(stateDir: string, userPlugins: unknown): FingerprintEntries {
+  const entries: FingerprintEntries = [];
+  for (const plugin of Array.isArray(userPlugins) ? userPlugins : []) {
+    const modulePath = typeof plugin === 'string' ? plugin : (plugin as { module?: unknown } | null)?.module;
+    if (typeof modulePath !== 'string') {
+      continue;
+    }
+    const name = plugin && typeof plugin === 'object' && typeof (plugin as { name?: unknown }).name === 'string'
+      ? String((plugin as { name: string }).name)
+      : modulePath;
+    addEntry(entries, `userPlugin/${name}`, resolve(stateDir, modulePath));
+  }
+  return entries;
+}
+
+export function composeRuntimeFingerprint(sections: readonly FingerprintEntries[]): string {
+  const entries = sections.flat();
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  return sha256Hex(Buffer.from(canonicalJson(entries)));
+}
+
+/**
+ * Disk view of the runtime fingerprint. Reads config.json only to discover which projects
+ * and user plugins are configured; mutable config fields never participate in the hash.
+ */
+export function computeRuntimeFingerprint(stateDir: string, checkoutDir?: string): string {
+  const sections: FingerprintEntries[] = [dealerCodeFingerprintEntries(checkoutDir)];
   const configPath = join(stateDir, 'config.json');
-  addEntry(entries, 'state/config.json', configPath);
   let config: any = {};
   try {
     config = JSON.parse(readFileSync(configPath, 'utf8'));
   } catch {
-    // The missing/unreadable marker above already covers an unusable config.
+    // Discovery-only read: an unreadable config contributes no configured projects or plugins.
   }
   for (const project of Array.isArray(config.projects) ? config.projects : []) {
     const id = String(project.projectId ?? '');
-    const dealer = typeof project.rootPath === 'string' ? join(project.rootPath, '.dealer') : '';
-    addEntry(entries, `project/${id}/project.json`, join(dealer, 'project.json'));
-    for (const path of fileList(dealer, name => /\.(ts|js|json)$/.test(name))) {
-      if (relative(dealer, path).split('/').includes('tests')) {
-        continue;
-      }
-      addEntry(entries, `project/${id}/${relative(dealer, path)}`, path);
+    const rootPath = typeof project.rootPath === 'string' ? project.rootPath : '';
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(readFileSync(join(rootPath, '.dealer', 'project.json'), 'utf8'));
+    } catch {
+      manifest = undefined;
     }
-    addEntry(entries, `project/${id}/userPatch`, project.userPatchPath ?? join(stateDir, 'projects', `${id}.patch.json`));
+    sections.push(projectFingerprintEntries(id, rootPath, manifest, stateDir, project.userPatchPath));
   }
-  for (const plugin of Array.isArray(config.userPlugins) ? config.userPlugins : []) {
-    const modulePath = typeof plugin === 'string' ? plugin : plugin?.module;
-    if (typeof modulePath === 'string') {
-      addEntry(entries, `userPlugin/${modulePath}`, resolve(modulePath));
-    }
-  }
-  entries.sort((a, b) => a[0].localeCompare(b[0]));
-  return sha256Hex(Buffer.from(canonicalJson(entries)));
+  sections.push(userPluginFingerprintEntries(stateDir, config.userPlugins));
+  return composeRuntimeFingerprint(sections);
 }
 
 function atomicJson(path: string, value: unknown): void {
@@ -127,26 +199,104 @@ export function removeDaemonFingerprint(stateDir: string, instanceId: string): v
   }
 }
 
-function acquireUpdateLock(stateDir: string): string | undefined {
+type UpdateLockResult =
+  | { lock: string; locked?: never; error?: never }
+  | { lock?: never; locked: true; error?: never }
+  | { lock?: never; locked?: never; error: string };
+
+function claimStagedLock(stage: string, lock: string): boolean {
+  try {
+    renameSync(stage, lock);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function acquireReclaimGate(reclaim: string, stateDir: string): boolean {
+  try {
+    mkdirSync(reclaim, { mode: 0o700 });
+  } catch {
+    const gateOwner = readProcessOwner(join(reclaim, 'owner.json'));
+    if (gateOwner && !isDeadProcessOwner(gateOwner, stateDir)) {
+      return false;
+    }
+    rmSync(reclaim, { recursive: true, force: true });
+    try {
+      mkdirSync(reclaim, { mode: 0o700 });
+    } catch {
+      return false;
+    }
+  }
+  try {
+    atomicJson(join(reclaim, 'owner.json'), processOwnerRecord());
+  } catch {
+    rmSync(reclaim, { recursive: true, force: true });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Crash-recoverable claim: the owner record is staged before the rename, so a lock is
+ * never observable without a provable owner. A lock whose owner is dead is reclaimed
+ * through an owner-backed gate; a lock without any readable owner is surfaced as an
+ * error instead of disabling updates silently.
+ */
+function acquireUpdateLock(stateDir: string): UpdateLockResult {
   const lock = join(stateDir, 'auto-update.lock');
+  const stage = `${lock}.stage.${process.pid}`;
+  const prepareStage = () => {
+    rmSync(stage, { recursive: true, force: true });
+    mkdirSync(stage, { mode: 0o700 });
+    atomicJson(join(stage, 'owner.json'), processOwnerRecord());
+  };
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   try {
-    mkdirSync(lock, { mode: 0o700 });
-    atomicJson(join(lock, 'owner.json'), processOwnerRecord());
-    return lock;
-  } catch {
-    try {
-      const owner = JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8'));
-      if (isDeadProcessOwner(owner, stateDir)) {
-        rmSync(lock, { recursive: true, force: true });
-        mkdirSync(lock, { mode: 0o700 });
-        atomicJson(join(lock, 'owner.json'), processOwnerRecord());
-        return lock;
-      }
-    } catch {
-      // Leave a lock whose owner cannot be proven dead.
+    prepareStage();
+    if (!existsSync(lock) && claimStagedLock(stage, lock)) {
+      return { lock };
     }
-    return undefined;
+  } catch (error) {
+    rmSync(stage, { recursive: true, force: true });
+    return { error: `Unable to prepare auto-update lock: ${String(error)}` };
+  }
+  rmSync(stage, { recursive: true, force: true });
+  const owner = readProcessOwner(join(lock, 'owner.json'));
+  if (!owner) {
+    return { error: `Auto-update lock ${lock} has no readable owner record` };
+  }
+  if (!isDeadProcessOwner(owner, stateDir)) {
+    return { locked: true };
+  }
+  const reclaim = `${lock}.reclaim`;
+  const stale = `${lock}.stale.${process.pid}`;
+  if (!acquireReclaimGate(reclaim, stateDir)) {
+    return { locked: true };
+  }
+  try {
+    // Re-read the owner while holding the gate: a competitor may have claimed the
+    // lock after this process failed to create it.
+    const current = readProcessOwner(join(lock, 'owner.json'));
+    if (current && !isDeadProcessOwner(current, stateDir)) {
+      return { locked: true };
+    }
+    // Move the stale lock out of the claim path before staging the replacement, so
+    // the path is never observably missing while this process holds the gate.
+    rmSync(stale, { recursive: true, force: true });
+    renameSync(lock, stale);
+    prepareStage();
+    return claimStagedLock(stage, lock) ? { lock } : { locked: true };
+  } catch (error) {
+    return { error: `Unable to reclaim auto-update lock: ${String(error)}` };
+  } finally {
+    rmSync(stale, { recursive: true, force: true });
+    rmSync(stage, { recursive: true, force: true });
+    rmSync(reclaim, { recursive: true, force: true });
   }
 }
 
@@ -211,10 +361,14 @@ function syncSkills(root: string, options: SelfUpdateOptions): string[] {
 
 export function selfUpdate(options: SelfUpdateOptions): any {
   const checkedAt = new Date().toISOString();
-  const lock = acquireUpdateLock(options.stateDir);
-  if (!lock) {
+  const acquired = acquireUpdateLock(options.stateDir);
+  if (acquired.error) {
+    return { status: 'failed', sourceStatus: 'corrupt_lock', lastCheckedAt: checkedAt, syncedSkills: [], restartedDaemon: false, error: acquired.error };
+  }
+  if (!acquired.lock) {
     return { status: 'skipped_locked', sourceStatus: 'skipped_locked', lastCheckedAt: checkedAt, syncedSkills: [], restartedDaemon: false };
   }
+  const lock = acquired.lock;
   const previous = readAutoUpdateStatus(options.stateDir) ?? {};
   let status = 'skipped';
   let sourceStatus = 'missing_checkout';
