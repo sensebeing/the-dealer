@@ -238,7 +238,6 @@ test('unacked recovery pointer suppresses rotation, and the acknowledged wave op
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
   const workspacePath = join(root, 'workspace');
-  mkdirSync(workspacePath);
   const { runner, state } = fakeOrcaWorkspace(workspacePath, [
     { handle: 'term-alerts', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
   ]);
@@ -356,7 +355,6 @@ test(`the per-wave default opens a session tab and never hijacks a retained comp
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
   const workspacePath = join(root, 'wave');
-  mkdirSync(workspacePath, { recursive: true });
   const { runner, state } = fakeOrcaWorkspace(workspacePath, [
     { handle: 'term-human', connected: true, writable: true, agentIdentity: 'antigravity', preview: retainedComposer },
   ]);
@@ -444,6 +442,67 @@ test('an explicit rotateAfterWaves above one reuses the bound tab until the thre
   assert.match(textOf(sendsTo(state.calls, 'term-new-1')[0]), /^You have 1 Dealer message\(s\) in stream:alerts/);
   assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
 });
+
+for (const rotateAfterWaves of [1, 2] as const) {
+  test(`rotation opens a new session tab despite an unsent draft in the retained tab (rotateAfterWaves: ${rotateAfterWaves})`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const workspacePath = join(root, 'retained');
+    const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+      { handle: 'term-retained', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    ]);
+    const service = new WakeupRedriveService({
+      store,
+      commandRunner: runner,
+      flushIntervalMs: 100_000,
+    });
+    t.after(() => service.stop());
+    const enqueue = (id: string) =>
+      store.enqueue([alert(id)], {
+        mailboxId: 'stream:retained',
+        wakeTarget: {
+          mode: 'orca-terminal', terminalHandle: 'term-retained', workspacePath,
+          coalesceMs: 0, rotateAfterWaves,
+        },
+      });
+    const ack = () => {
+      const lease = store.check({ mailboxId: 'stream:retained' });
+      store.ack(lease.deliveryId!);
+    };
+
+    // Fill the bound tab's rotation window; every wave is acknowledged before the next arrives.
+    for (let wave = 1; wave <= rotateAfterWaves; wave += 1) {
+      enqueue(`wave-${wave}`);
+      const delivered = await service.flushMailbox('stream:retained');
+      assert.equal(delivered.woke, true, delivered.reason);
+      ack();
+    }
+    assert.equal(store.getWakeTarget('stream:retained')!.completedWaves, rotateAfterWaves);
+    const retainedSends = sendsTo(state.calls, 'term-retained').length;
+    assert.equal(retainedSends, rotateAfterWaves);
+
+    // A human leaves an unsent draft in the retained tab after acknowledging the wave.
+    state.terminals = state.terminals.map(terminal =>
+      terminal.handle === 'term-retained' ? { ...terminal, preview: '> unsent draft' } : terminal);
+
+    enqueue('after-ack');
+    const rotated = await service.flushMailbox('stream:retained');
+    assert.equal(rotated.woke, true, rotated.reason);
+    assert.equal(rotated.rotated, true);
+    assert.equal(state.created, 1, 'the retained draft must not block rotation');
+    assert.equal(
+      sendsTo(state.calls, 'term-retained').length,
+      retainedSends,
+      'the retained tab is never written to again',
+    );
+    assert.equal(store.getWakeTarget('stream:retained')!.terminalHandle, 'term-new-1');
+    assert.equal(store.getWakeTarget('stream:retained')!.completedWaves, 0);
+    const fresh = sendsTo(state.calls, 'term-new-1');
+    assert.equal(fresh.length, 1);
+    assert.match(textOf(fresh[0]), /^You have 1 Dealer message\(s\) in stream:retained/);
+    assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
+  });
+}
 
 test('orca-spawn never injects after a failed idle wait and redrive sends the task preamble', async t => {
   const root = directory(t);
@@ -1256,6 +1315,37 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
     host: 'orca', conversationMode: 'fixed', topic: 'collab.request.v4', workspacePath: join(root, 'other'),
   });
   assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle, undefined);
+
+  // Reconfiguring the binding to an explicitly pinned tab or an Orca Run clears the stale
+  // rotation default; any preset application re-reads every binding.
+  second.config.topicBindings = {
+    ...second.config.topicBindings,
+    'collab.request.v4': {
+      executor: 'orca-wave', mailboxId: 'stream:collab.request.v4',
+      workspacePath, terminalHandle: 'explicit-tab',
+    },
+  };
+  await second.applyAgentPreset({
+    host: 'codex', conversationMode: 'inbox-only', topic: 'reconfiguration.trigger',
+  });
+  const pinned = second.mailbox.getWakeTarget('stream:collab.request.v4')!;
+  assert.equal(pinned.terminalHandle, 'explicit-tab');
+  assert.equal(pinned.rotateAfterWaves, undefined, 'an explicitly pinned tab never rotates');
+
+  second.config.topicBindings = {
+    ...second.config.topicBindings,
+    'collab.request.v4': {
+      executor: 'orca-wave', mailboxId: 'stream:collab.request.v4',
+      workspacePath, runId: 'run-owner',
+    },
+  };
+  await second.applyAgentPreset({
+    host: 'codex', conversationMode: 'inbox-only', topic: 'reconfiguration.trigger',
+  });
+  const runBound = second.mailbox.getWakeTarget('stream:collab.request.v4')!;
+  assert.equal(runBound.mode, 'orca-run');
+  assert.equal(runBound.terminalHandle, undefined, 'an Orca Run clears the stale pinned tab');
+  assert.equal(runBound.rotateAfterWaves, undefined, 'an Orca Run owns its coordinator session');
 });
 
 test('inline wakeup previews include bounded latest body, semantic sender and thread on one line', async t => {

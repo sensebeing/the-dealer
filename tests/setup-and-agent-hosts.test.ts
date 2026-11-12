@@ -714,6 +714,21 @@ test('orca-wave defaults fixed workspaces to one fresh session tab per wave', as
   const defaulted = store.getWakeTarget('stream:default')!;
   assert.equal(defaulted.rotateAfterWaves, 1);
   assert.equal(defaulted.workspacePath, '/receiver/default');
+  assert.equal(defaulted.terminalHandle, undefined);
+
+  // An inbound sender can never pin a tab or stretch the rotation window of a receiver-owned
+  // workspace, even when the receiver only configured `cwd`.
+  await createOrcaWaveExecutorPlugin({ store, cwd: '/receiver/default' }).execute(
+    [message('default-inbound', {
+      streamKey: 'default', terminalHandle: 'sender-tab', rotateAfterWaves: 99,
+    })],
+    context,
+    {},
+  );
+  const inbound = store.getWakeTarget('stream:default')!;
+  assert.equal(inbound.workspacePath, '/receiver/default');
+  assert.equal(inbound.terminalHandle, undefined, 'payload terminalHandle must not rebind the receiver');
+  assert.equal(inbound.rotateAfterWaves, 1, 'payload rotateAfterWaves must not override the receiver default');
 
   await execute('explicit', { store, cwd: '/receiver/explicit', wave: { rotateAfterWaves: 3 } });
   assert.equal(store.getWakeTarget('stream:explicit')!.rotateAfterWaves, 3);

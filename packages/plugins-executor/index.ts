@@ -635,30 +635,37 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
       const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined);
       const mailboxId = resolveMailboxId(first, 'orca-wave', binding);
       // The receiver owns workspace, terminal and scheduling configuration; inbound payload values
-      // are only a fallback for deployments that have no local binding or executor config.
-      const cwd =
-        binding?.workspacePath ??
-        config.cwd ??
-        options.cwd ??
-        optionalString(payload.workspacePath) ??
-        optionalString(payload.cwd);
-      const runId =
-        binding?.runId ?? config.runId ?? options.runId ?? optionalString(payload.runId);
-      const terminalHandle =
-        binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle ?? optionalString(payload.terminalHandle);
-      const waveConfig = config.wave ?? options.wave;
-      const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
+      // are only a fallback for deployments that have no local binding or executor config, so a
+      // sender can never rebind the receiver's runtime-managed workspace state.
+      const receiverCwd = binding?.workspacePath ?? config.cwd ?? options.cwd;
+      const receiverRunId = binding?.runId ?? config.runId ?? options.runId;
       const receiverTerminalHandle =
         binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle;
+      const hasReceiverTarget = Boolean(receiverCwd || receiverRunId || receiverTerminalHandle);
+      const cwd =
+        receiverCwd ??
+        (hasReceiverTarget
+          ? undefined
+          : optionalString(payload.workspacePath) ?? optionalString(payload.cwd));
+      const runId =
+        receiverRunId ?? (hasReceiverTarget ? undefined : optionalString(payload.runId));
+      const terminalHandle =
+        receiverTerminalHandle ??
+        (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
+      const waveConfig = config.wave ?? options.wave;
+      const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
       const rotateAfterWaves =
         binding?.rotateAfterWaves ??
         optionalPositiveInteger(waveConfig?.rotateAfterWaves) ??
-        optionalPositiveInteger(payload.rotateAfterWaves) ??
+        (hasReceiverTarget ? undefined : optionalPositiveInteger(payload.rotateAfterWaves)) ??
         // Fixed Orca workspaces default to one fresh session tab per wave; an explicitly bound
         // terminal or an Orca Run (which owns its coordinator session) keeps the unset default.
         (cwd && !runId && !receiverTerminalHandle ? 1 : undefined);
       const worktreeId =
-        binding?.worktreeId ?? config.worktreeId ?? options.worktreeId ?? optionalString(payload.worktreeId);
+        binding?.worktreeId ??
+        config.worktreeId ??
+        options.worktreeId ??
+        (hasReceiverTarget ? undefined : optionalString(payload.worktreeId));
       const workspaceComment = String(
         batch.at(-1)?.payload?.workspaceComment || binding?.workspaceComment || `Dealer: ${mailboxId} pending`,
       );

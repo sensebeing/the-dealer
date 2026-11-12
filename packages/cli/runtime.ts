@@ -965,20 +965,21 @@ export class DealerNodeRuntime {
         // Fixed Orca workspaces default to one fresh session tab per wave.
         (workspacePath && !runId && !terminalHandle ? 1 : undefined);
       // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
-      // handle or a workspace switch may replace it, so a restart never erases the live tab.
-      const preserveRuntimeHandle = terminalHandle === undefined && current?.workspacePath === workspacePath;
-      const clearRuntimeHandle = terminalHandle === undefined && current !== undefined && current.workspacePath !== workspacePath;
+      // handle, an Orca Run, or a workspace switch may replace or clear it. Passing every optional
+      // field as an own property is what lets a reconfiguration erase a stale rotation default.
+      const nextTerminalHandle =
+        terminalHandle !== undefined
+          ? terminalHandle
+          : !runId && current?.mode === 'orca-terminal' && current.workspacePath === workspacePath
+            ? current.terminalHandle
+            : undefined;
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
         workspacePath, worktreeId, runId, repoRoot: projectRoot,
         agent: binding.agent as 'antigravity' | 'claude' | 'codex' | undefined, interactiveCommand,
         autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
-        ...(resolvedRotateAfterWaves !== undefined ? { rotateAfterWaves: resolvedRotateAfterWaves } : {}),
-        ...(terminalHandle !== undefined ? { terminalHandle } : {}),
-        ...(preserveRuntimeHandle && current?.terminalHandle !== undefined
-          ? { terminalHandle: current.terminalHandle }
-          : {}),
-        ...(clearRuntimeHandle ? { terminalHandle: undefined } : {}),
+        rotateAfterWaves: resolvedRotateAfterWaves,
+        terminalHandle: nextTerminalHandle,
       });
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);
