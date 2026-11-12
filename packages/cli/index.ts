@@ -18,6 +18,7 @@ import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, dec
 export * from './runtime.ts';
 export * from './config.ts';
 export * from './setup.ts';
+export * from './auto-update.ts';
 
 const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [

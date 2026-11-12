@@ -102,6 +102,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       >();
       const ledger = new DeliveryLedger(config.ledgerPath);
       const active = new Map<string, Promise<DispatchReceipt>>();
+      const idleListeners = new Set<() => void>();
       const controller = new AbortController();
       ctx.effect(() => async () => {
         controller.abort();
@@ -164,6 +165,18 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         }
       };
       ctx.provide('dispatcher', {
+        activeCount() { return active.size; },
+        onIdle(listener: () => void) {
+          idleListeners.add(listener);
+          return { dispose() { idleListeners.delete(listener); } };
+        },
+        waitForIdle() {
+          if (active.size === 0) return Promise.resolve();
+          return new Promise<void>(resolve => {
+            const listener = () => { if (active.size === 0) { idleListeners.delete(listener); resolve(); } };
+            idleListeners.add(listener);
+          });
+        },
         registerPolicy(policy) {
           policies.add(policy);
           return {
@@ -253,7 +266,10 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               }
               return result;
             })
-            .finally(() => active.delete(id));
+            .finally(() => {
+              active.delete(id);
+              if (active.size === 0) for (const listener of idleListeners) listener();
+            });
           active.set(id, promise);
           return promise;
         },

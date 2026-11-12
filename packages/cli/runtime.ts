@@ -34,6 +34,7 @@ import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveSer
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
+import { computeRuntimeFingerprint, writeDaemonFingerprint, removeDaemonFingerprint, readDaemonFingerprint } from './auto-update.ts';
 import {
   getBuiltInProfile,
   saveJson,
@@ -157,6 +158,9 @@ export class DealerNodeRuntime {
   private registerBuiltinExecutor?: (name: string) => void;
   private started = false;
   private ownsLock = false;
+  private activeMutatingControlRequests = 0;
+  private draining = false;
+  private daemonInstanceId?: string;
   /** Per-process owner file: a gate contender never touches another process's file. */
   private readonly reclaimOwnerFile = `owner.${process.pid}.json`;
   lastError?: string;
@@ -1208,7 +1212,21 @@ export class DealerNodeRuntime {
       networks: this.transport.listMountedNetworks(),
       gateMode: this.gate.getMode(),
       lastError: this.lastError,
+      runtimeFingerprint: readDaemonFingerprint(this.stateDir)?.fingerprint,
     };
+  }
+
+  isIdleForRestart(): boolean {
+    const dispatcher = this.kernel.ctx?.services?.dispatcher as any;
+    return (dispatcher?.activeCount?.() ?? 0) === 0 && this.activeMutatingControlRequests === 0;
+  }
+
+  async gracefulStop(options: { drainTimeoutMs?: number } = {}): Promise<void> {
+    this.draining = true;
+    const dispatcher = this.kernel.ctx?.services?.dispatcher as any;
+    const wait = dispatcher?.waitForIdle?.() ?? Promise.resolve();
+    await Promise.race([wait, new Promise(resolve => setTimeout(resolve, options.drainTimeoutMs ?? 15_000))]);
+    await this.stop();
   }
 
   async serveControl(
@@ -1236,6 +1254,7 @@ export class DealerNodeRuntime {
         return;
       }
       if (request.url === '/cli') {
+        this.activeMutatingControlRequests++;
         try {
           const argv = parseControlArgv(await readControlBody(request));
           const result = await handler(argv, { signal: new AbortController().signal });
@@ -1247,6 +1266,7 @@ export class DealerNodeRuntime {
             response.writeHead(400).end(JSON.stringify({ error: String(error) }));
           }
         }
+        finally { this.activeMutatingControlRequests--; }
         return;
       }
       const controller = new AbortController();
@@ -1268,6 +1288,7 @@ export class DealerNodeRuntime {
       response.on('close', abortIfActive);
       response.on('error', abortIfActive);
       try {
+        this.activeMutatingControlRequests++;
         const argv = parseControlArgv(await readControlBody(request));
         if (!response.destroyed && !response.writableEnded) {
           response.writeHead(200, { 'content-type': 'application/x-ndjson' });
@@ -1309,6 +1330,7 @@ export class DealerNodeRuntime {
           }
         }
       } finally {
+        this.activeMutatingControlRequests--;
         completed = true;
         if (keepalive) {
           clearInterval(keepalive);
@@ -1324,6 +1346,8 @@ export class DealerNodeRuntime {
       });
     });
     chmodSync(this.socketPath, 0o600);
+    this.daemonInstanceId = processOwnerRecord().instanceId;
+    writeDaemonFingerprint(this.stateDir, { pid: process.pid, instanceId: this.daemonInstanceId, fingerprint: computeRuntimeFingerprint(this.stateDir), startedAt: new Date().toISOString() });
   }
 
   async stop(): Promise<void> {
@@ -1350,6 +1374,7 @@ export class DealerNodeRuntime {
             rmSync(this.socketPath, { force: true });
           }
           this.releaseLock(join(this.stateDir, 'runtime.lock'));
+          if (this.daemonInstanceId) removeDaemonFingerprint(this.stateDir, this.daemonInstanceId);
           this.ownsLock = false;
           releaseOwnedDirectory(this.stateDir);
         }
