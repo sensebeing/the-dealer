@@ -2,8 +2,9 @@ import { randomBytes } from 'node:crypto';
 import { probeDealerSetup, buildOnboardingPrompts, resolveAgentBindingPreset, readAgentPresetContext } from './setup.ts';
 import type { SupportedAgentHost, AgentConversationMode } from '../plugins-executor/index.ts';
 import type { SupportedOrcaAgent } from '../orca-workspace/index.ts';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, watch } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
@@ -12,15 +13,17 @@ import { MailboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { SettlementOutcome } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
+import { computeRuntimeFingerprint, readDaemonFingerprint, readAutoUpdateStatus, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
+import { isDeadProcessOwner, readProcessOwner } from '../process-lock/index.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
 export * from './setup.ts';
 export * from './auto-update.ts';
 
-const booleanFlags = ['json', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
+const booleanFlags = ['json', 'quiet', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread',
@@ -76,6 +79,9 @@ const stringFlags = [
   'subject',
   'bootstrap-peers',
   'advertised-host',
+  'checkout-dir',
+  'home-dir',
+  'gemini-dir',
 ] as const;
 
 function parse(argv: string[]) {
@@ -315,6 +321,57 @@ async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> 
       }
     });
   });
+}
+
+async function waitForDaemonStopped(stateDir: string, timeoutMs = 20_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const lock = join(stateDir, 'runtime.lock');
+  while (Date.now() < deadline) {
+    let live = false;
+    try {
+      const owner = readProcessOwner(join(lock, 'owner.json'));
+      live = Boolean(owner && !isDeadProcessOwner(owner, stateDir));
+    } catch { /* lock disappeared */ }
+    if (!live && !existsSync(join(stateDir, 'control.sock'))) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+export async function stopDaemonIfRunning(stateDir: string): Promise<{ running: boolean; stopped: boolean; pid?: number }> {
+  if (!existsSync(join(stateDir, 'control.sock'))) return { running: false, stopped: false };
+  let pid: number | undefined;
+  try {
+    const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], { inactivityMs: 2_000 });
+    const parsed = JSON.parse(result.stdout.join('') || '{}');
+    pid = parsed.pid;
+  } catch { /* launchd may remove the socket while responding */ }
+  const stopped = await waitForDaemonStopped(stateDir);
+  return { running: true, stopped, ...(pid ? { pid } : {}) };
+}
+
+export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
+  if (existsSync(join(stateDir, 'control.sock'))) {
+    try { return (await rpc(join(stateDir, 'control.sock'), ['node', 'status', '--json'], { inactivityMs: 2_000 })).stdout.join(''); } catch { /* stale socket */ }
+  }
+  try { return await launchDaemon([], stateDir); }
+  catch (error) {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      try {
+        const result = await rpc(join(stateDir, 'control.sock'), ['node', 'status', '--json'], { inactivityMs: 500 });
+        const status = JSON.parse(result.stdout.join(''));
+        if (status.runtimeFingerprint === computeRuntimeFingerprint(stateDir)) return status;
+      } catch { /* concurrent launch still settling */ }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw error;
+  }
+}
+
+export async function restartDaemon(stateDir: string): Promise<unknown> {
+  await stopDaemonIfRunning(stateDir);
+  return ensureDaemonRunning(stateDir);
 }
 
 function positiveInteger(value: unknown, flag: string): number | undefined {
@@ -758,10 +815,16 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
     const localSetup = group === 'setup' && !['binding-preset', 'apply-preset'].includes(action);
-    if (!localSetup && !options.runtime && existsSync(join(stateDir, 'control.sock'))) {
+    const localLifecycle = group === 'node' && ['down', 'restart', 'up'].includes(action ?? '') || group === 'self-update';
+    if (!localSetup && !localLifecycle && !options.runtime && existsSync(join(stateDir, 'control.sock'))) {
+      if (process.env.DEALER_AUTO_RESTART !== '0') {
+        const current = computeRuntimeFingerprint(stateDir);
+        if (readDaemonFingerprint(stateDir)?.fingerprint !== current) await restartDaemon(stateDir);
+      }
       const result = await rpc(join(stateDir, 'control.sock'), argv);
       result.stdout.forEach(line => stdout(line));
       result.stderr.forEach(line => stderr(line));
+      maybeTriggerBackgroundAutoUpdate({ stateDir });
       return result.code;
     }
     if (group === 'setup' && action !== 'apply-preset') {
@@ -844,6 +907,25 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       );
       return 0;
     }
+    if (!options.runtime && group === 'node' && action === 'down') {
+      const result = await stopDaemonIfRunning(stateDir);
+      stdout(JSON.stringify(result, null, v.json ? undefined : 2));
+      return 0;
+    }
+    if (!options.runtime && group === 'node' && action === 'restart') {
+      const result = await restartDaemon(stateDir);
+      stdout(JSON.stringify(result, null, v.json ? undefined : 2));
+      return 0;
+    }
+    if (!options.runtime && group === 'self-update') {
+      const report = selfUpdate({ stateDir, checkoutDir: v['checkout-dir'], homeDir: v['home-dir'], geminiDir: v['gemini-dir'] });
+      if (existsSync(join(stateDir, 'control.sock')) && readDaemonFingerprint(stateDir)?.fingerprint !== computeRuntimeFingerprint(stateDir, v['checkout-dir'])) {
+        await restartDaemon(stateDir);
+        report.restartedDaemon = true;
+      }
+      stdout(JSON.stringify(report, null, v.json ? undefined : 2));
+      return 0;
+    }
     const runtime = options.runtime ?? (owned = new DealerNodeRuntime({ stateDir }));
     await runtime.start();
     const caller = resolveCallerOrcaBinding(v);
@@ -894,6 +976,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           throw new Error('Node already running; stop it before changing startup configuration');
         }
         result = runtime.status();
+      } else if (action === 'down') {
+        result = { ok: true, stopping: true, pid: process.pid };
+        setImmediate(() => { void runtime.gracefulStop().catch(() => {}); });
       } else if (action === 'card') {
         result = network
           ? runtime.node.getSelfCard(network)
@@ -1098,5 +1183,38 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     await runtime.stop();
     throw error;
   }
+  const startupFingerprint = computeRuntimeFingerprint(runtime.stateDir);
+  let reloadPending = false;
+  let restartTriggered = false;
+  let debounce: ReturnType<typeof setTimeout> | undefined;
+  const watchers: Array<{ close(): void }> = [];
+  const maybeSpawnSelfRestart = () => {
+    if (!reloadPending || restartTriggered || process.env.DEALER_AUTO_RESTART === '0' || !runtime.isIdleForRestart()) return;
+    restartTriggered = true;
+    for (const item of watchers) item.close();
+    const bin = new URL('../../bin/dealer.js', import.meta.url).pathname;
+    const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, 'node', 'restart', '--json'], { detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: runtime.stateDir } });
+    child.unref();
+  };
+  const schedule = () => {
+    if (debounce) clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      if (computeRuntimeFingerprint(runtime.stateDir) !== startupFingerprint) reloadPending = true;
+      maybeSpawnSelfRestart();
+    }, 400);
+    debounce.unref();
+  };
+  const addWatch = (path: string, recursive = true) => {
+    if (!existsSync(path)) return;
+    try { watchers.push(watch(path, { recursive, persistent: false }, schedule)); }
+    catch { try { watchers.push(watch(path, { persistent: false }, schedule)); } catch { /* missing optional paths */ } }
+  };
+  const dealerRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+  addWatch(join(dealerRoot, 'bin')); addWatch(join(dealerRoot, 'packages')); addWatch(join(dealerRoot, 'package.json'), false); addWatch(runtime.stateDir);
+  for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
+  const dispatcher = runtime.kernel.ctx.services.dispatcher as any;
+  dispatcher?.onIdle?.(maybeSpawnSelfRestart);
+  const timer = setInterval(() => maybeTriggerBackgroundAutoUpdate({ stateDir: runtime.stateDir }), 6 * 3600_000);
+  timer.unref();
   return runtime;
 }

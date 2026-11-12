@@ -34,7 +34,7 @@ import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveSer
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
-import { computeRuntimeFingerprint, writeDaemonFingerprint, removeDaemonFingerprint, readDaemonFingerprint } from './auto-update.ts';
+import { computeRuntimeFingerprint, writeDaemonFingerprint, removeDaemonFingerprint, readDaemonFingerprint, readAutoUpdateStatus } from './auto-update.ts';
 import {
   getBuiltInProfile,
   saveJson,
@@ -1213,6 +1213,7 @@ export class DealerNodeRuntime {
       gateMode: this.gate.getMode(),
       lastError: this.lastError,
       runtimeFingerprint: readDaemonFingerprint(this.stateDir)?.fingerprint,
+      autoUpdate: readAutoUpdateStatus(this.stateDir),
     };
   }
 
@@ -1352,15 +1353,6 @@ export class DealerNodeRuntime {
 
   async stop(): Promise<void> {
     const hadServer = this.server !== undefined;
-    if (this.server) {
-      this.server.closeAllConnections?.();
-      if (this.server.listening) {
-        await new Promise<void>((resolve, reject) => {
-          this.server!.close(error => (error ? reject(error) : resolve()));
-        });
-      }
-    }
-    this.server = undefined;
     try {
       await this.wakeups?.stop();
     } finally {
@@ -1371,6 +1363,13 @@ export class DealerNodeRuntime {
         if (this.ownsLock) {
           // Only the instance that created the control server may remove its socket.
           if (hadServer) {
+            this.server?.closeAllConnections?.();
+            if (this.server?.listening) {
+              await new Promise<void>((resolve, reject) => {
+                this.server!.close(error => (error ? reject(error) : resolve()));
+              });
+            }
+            this.server = undefined;
             rmSync(this.socketPath, { force: true });
           }
           this.releaseLock(join(this.stateDir, 'runtime.lock'));
