@@ -1275,9 +1275,10 @@ export class MailboxStore {
       mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
     let wakeMailbox: string | undefined;
     const result = this.mutate(state => {
-      const candidates = requestedMailbox
-        ? [requestedMailbox]
-        : Object.keys(state.mailboxes);
+      const requestedRecord = requestedMailbox ? state.mailboxes[requestedMailbox] : undefined;
+      const leaseMailbox = requestedRecord?.outstanding?.leaseId === leaseId ? requestedMailbox :
+        Object.entries(state.mailboxes).find(([, record]) => record.outstanding?.leaseId === leaseId)?.[0];
+      const candidates = leaseMailbox ? [leaseMailbox] : Object.keys(state.mailboxes);
       for (const candidate of candidates) {
         const record = state.mailboxes[candidate];
         if (!record) {
@@ -1520,6 +1521,22 @@ export class MailboxStore {
         deliveryInDoubt: undefined,
       }));
       state.wakeTargets[id] = next;
+      if (current.mode === 'orca-terminal' && current.rotateAfterWaves !== undefined &&
+          typeof next.terminalHandle === 'string' && next.terminalHandle.trim()) {
+        const termMailbox = `terminal:${next.terminalHandle.trim()}`;
+        const delivered = state.items.filter(item => item.mailboxId === id && item.sequence <= deliveredSequence);
+        const keys = new Set(delivered.flatMap(item => [item.envelope.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
+        const matching = Object.entries(state.threads).filter(([key, record]) =>
+          record.localMailbox === id && (keys.has(key) || keys.has(record.threadId) || keys.has(record.messageId)),
+        );
+        if (matching.length) {
+          const updatedAt = new Date().toISOString();
+          for (const [key, record] of matching) state.threads[key] = { ...record, localMailbox: termMailbox, updatedAt };
+          const existingTermTarget = state.wakeTargets[termMailbox];
+          const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
+          state.wakeTargets[termMailbox] = validateWakeTarget({ ...current, ...(existingTermTarget ?? {}), mailboxId: termMailbox, mode: 'orca-terminal', terminalHandle: next.terminalHandle.trim(), rotateAfterWaves: undefined, completedWaves: 0, wakeupPrefix: prefix ?? current.wakeupPrefix, pendingWake: existingTermTarget?.pendingWake ?? false, deliveryInDoubt: existingTermTarget?.deliveryInDoubt ?? false } as any);
+        }
+      }
       return structuredClone(next);
     });
     if (completed.pendingWake) this.events.emit('target', id);

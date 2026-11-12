@@ -23,7 +23,7 @@ export * from './config.ts';
 export * from './setup.ts';
 export * from './auto-update.ts';
 
-const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
+const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'include-acked', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread',
@@ -68,6 +68,7 @@ const stringFlags = [
   'path',
   'mailbox',
   'ack',
+  'lease',
   'timeout-ms',
   'outcome',
   'summary',
@@ -666,7 +667,7 @@ async function runInboxCommand(
     if (v.all === true) {
       throw new Error('--all is only valid with inbox list');
     }
-    return store.ack(required(target, 'delivery-id'), mailboxId);
+    return store.ack(required(target ?? v.lease ?? v.ack, 'delivery-id'), mailboxId);
   }
   if (command === 'list') {
     if (checkOnlyFlags) {
@@ -675,7 +676,7 @@ async function runInboxCommand(
     const limit = positiveInteger(v.limit, '--limit');
     return store.list({
       ...(mailboxId !== undefined ? { mailboxId } : {}),
-      ...(v.all === true ? { includeAcked: true } : {}),
+      ...(v.all === true || v['include-acked'] === true ? { includeAcked: true } : {}),
       ...(limit !== undefined ? { limit } : {}),
     });
   }
@@ -750,6 +751,17 @@ function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | u
   return { mailboxId, ...(terminalHandle ? { terminalHandle } : {}), ...(worktreeId ? { worktreeId } : {}), ...(workspacePath ? { workspacePath } : {}) };
 }
 
+function resolveSessionMailbox(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): string {
+  if (!caller?.terminalHandle) return mailboxId;
+  const target = store.getWakeTarget(mailboxId);
+  if (target?.mode === 'orca-terminal' && target.rotateAfterWaves !== undefined) {
+    const pinned = `terminal:${caller.terminalHandle}`;
+    bindCallerWakeTarget(store, pinned, caller);
+    return pinned;
+  }
+  return mailboxId;
+}
+
 function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): void {
   if (!caller) return;
   const existing = store.getWakeTarget(mailboxId);
@@ -804,6 +816,8 @@ function runThreadCommand(
     state,
     ...(settlement ? { settlement } : {}),
     records,
+    messages: records,
+    envelopes: records.map(record => record.envelope).filter(Boolean),
   };
 }
 
@@ -833,7 +847,7 @@ async function runSessionCommand(
         replyTo,
         typeof v.network === 'string' && v.network ? String(v.network) : undefined,
       );
-      const replyMailbox = callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default');
+      const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller);
       bindCallerWakeTarget(store, replyMailbox, caller);
       if (ackId) {
         store.ack(ackId, replyMailbox);
@@ -882,7 +896,7 @@ async function runSessionCommand(
     if (ackId) {
       store.ack(ackId, callerMailboxFlag ?? caller?.mailboxId ?? 'default');
     }
-    const replyMailbox = callerMailboxFlag ?? caller?.mailboxId ?? 'default';
+    const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller);
     bindCallerWakeTarget(store, replyMailbox, caller);
     const targetMailbox =
       typeof v['target-mailbox'] === 'string' && v['target-mailbox']
@@ -920,7 +934,7 @@ async function runSessionCommand(
 
   const messageId = required(positional, 'message-id');
   const route = replyTargetOrThrow(store, messageId);
-  const replyMailbox = callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default');
+  const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller);
   bindCallerWakeTarget(store, replyMailbox, caller);
   if (ackId) {
     store.ack(ackId, replyMailbox);
@@ -1359,7 +1373,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
             callerBinding.terminalHandle === resolvedTopic.binding.terminalHandle)
         ),
       );
-      const replyMailbox =
+      let replyMailbox =
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
           : (callerBinding?.mailboxId && !callerMatchesBoundTopic
@@ -1367,6 +1381,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
             : (threadRoute?.localMailbox !== undefined && threadRoute.localMailbox !== 'default'
               ? threadRoute.localMailbox
               : undefined));
+      if (callerBinding && replyMailbox) replyMailbox = resolveSessionMailbox(runtime.mailbox, replyMailbox, callerBinding);
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       result = await runtime.emitter.emit({
         networkId,
@@ -1393,6 +1408,8 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         filePaths: v.attach as string[] | undefined,
         priority: rawUrgency === 'critical' ? 'urgent' : (rawUrgency as 'normal' | 'high' | undefined),
       });
+      const published = result as any;
+      result = { ...published, ok: true, mode: group, published, threadId: published.envelope?.threadId ?? threadId ?? published.messageId, targetMailbox: targetMailbox ?? null, replyMailbox: published.envelope?.semantic?.replyMailbox ?? replyMailbox ?? null, next: `Wait for wakeup in this session, or inspect thread via: dealer thread show ${published.envelope?.threadId ?? threadId ?? published.messageId} --json` };
     } else if ((group === 'route' || group === 'source') && action === 'add') {
       if (owned && group === 'source') {
         throw new Error('Start dealer node up before adding a live source');

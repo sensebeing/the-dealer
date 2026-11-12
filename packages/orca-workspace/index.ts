@@ -205,6 +205,7 @@ export async function checkOrcaWorkspaceIdle(
   if (!root) {
     return { idle: false, reason: 'Workspace not found' };
   }
+  if (options?.targetTerminalHandle === null) return { idle: true, reason: undefined };
   let composerPrefilled = false;
   const visited = new Set<string>();
   const idleTree = async (row: Workspace): Promise<boolean> => {
@@ -535,12 +536,13 @@ export async function sendOrcaTerminalText(
       : []),
     '--json',
   ];
-  const output = await checkedCommand(runner, {
-    command,
-    args,
-    cwd: options.cwd,
-    signal: options.signal,
-  });
+  let output;
+  try {
+    output = await checkedCommand(runner, { command, args, cwd: options.cwd, signal: options.signal });
+  } catch (error) {
+    if (!String(error).includes('no_active_sender_terminal')) throw error;
+    output = await checkedCommand(runner, { command, args: [...args, '--allow-self'], cwd: options.cwd, signal: options.signal, env: { ...process.env, ORCA_TERMINAL_ID: terminalHandle } });
+  }
   if (JSON.parse(output.stdout).ok === false) {
     throw new Error('Orca terminal send failed');
   }

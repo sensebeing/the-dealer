@@ -226,7 +226,15 @@ export function settleWakeDeliveryFailure(
 ): void {
   // A command that never started cannot have had an effect. Anything else crossed the external
   // boundary and must stay fenced until the owner confirms the outcome.
-  if (error instanceof CommandNotStartedError) {
+  const message = String(error);
+  const retryable = error instanceof CommandNotStartedError || [
+    'target_terminal_missing', 'busy_descendant_worktree', 'busy_agent_in_worktree',
+    'target_terminal_not_ready', 'no_connected_writable_terminal', 'unverifiable_terminal_count',
+    'worktree_ps_failed', 'terminal_list_failed', 'agent_prompt_blocked', 'no_active_sender_terminal',
+    'tui_not_idle', 'terminal_not_idle', 'terminal_busy', 'terminal_not_connected',
+    'terminal_not_writable', 'terminal_not_found', 'invalid_argument', 'target_worktree_missing',
+  ].some(token => message.includes(token));
+  if (retryable) {
     recordWakeFailure(store, mailboxId, error, now);
     return;
   }
