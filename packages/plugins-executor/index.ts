@@ -613,27 +613,6 @@ function optionalPositiveInteger(value: unknown): number | undefined {
 
 /**
  * A session-scoped mailbox (`terminal:<handle>` / `worktree:<name>`) carries its own wake route.
- * This is only an inference for a mailbox that has no live target yet; an existing target is the
- * authoritative binding and is never replaced here.
- */
-async function inferSessionWakeTarget(
-  runner: CommandRunner,
-  orcaCommand: string,
-  mailboxId: string,
-): Promise<Partial<WakeTargetState> | undefined> {
-  if (mailboxId.startsWith('terminal:') && mailboxId.length > 9) {
-    return { mode: 'orca-terminal', terminalHandle: mailboxId.slice(9) };
-  }
-  if (mailboxId.startsWith('worktree:') && mailboxId.length > 9) {
-    const found = await findOrcaWorktreeByName(runner, orcaCommand, mailboxId.slice(9));
-    if (found) {
-      return { mode: 'orca-terminal', ...found };
-    }
-  }
-  return undefined;
-}
-
-/**
  * Thread affinity keeps a reply with the session that owns the thread. A live session target
  * (including an agent-host target) stays untouched; only an absent or purely passive placeholder
  * target is inferred from the session-scoped mailbox id.
@@ -648,7 +627,16 @@ async function resolveSessionWakeTarget(
   if (existing && (existing.mode !== 'passive' || existing.hostAgent !== undefined)) {
     return undefined;
   }
-  return inferSessionWakeTarget(runner, orcaCommand, mailboxId);
+  if (mailboxId.startsWith('terminal:') && mailboxId.length > 9) {
+    return { mode: 'orca-terminal', terminalHandle: mailboxId.slice(9) };
+  }
+  if (mailboxId.startsWith('worktree:') && mailboxId.length > 9) {
+    const found = await findOrcaWorktreeByName(runner, orcaCommand, mailboxId.slice(9));
+    if (found) {
+      return { mode: 'orca-terminal', ...found };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -887,9 +875,7 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
       }
       const inserted: string[] = [];
       for (const [mailboxId, envelopes] of groups) {
-        const wakeTarget = store.getWakeTarget(mailboxId)
-          ? undefined
-          : await inferSessionWakeTarget(runner, orcaCommand, mailboxId);
+        const wakeTarget = await resolveSessionWakeTarget(store, runner, orcaCommand, mailboxId);
         const result = store.enqueue(envelopes, { mailboxId, ...(wakeTarget ? { wakeTarget } : {}) });
         inserted.push(...result.inserted);
         if (result.inserted.length > 0) {

@@ -231,7 +231,11 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
   // The peer's reply we received asks us to answer in task:peer; we are handling the thread from
   // worktree:origin. Both routes are recorded on the thread's legs.
   runtime.mailbox.recordInboundEnvelope(
-    envelope('peer-reply-3', { from: peer, semantic: { type: 'reply', threadId, replyMailbox: 'task:peer' } }),
+    envelope('peer-reply-3', {
+      networkId: 'local',
+      from: peer,
+      semantic: { type: 'reply', threadId, replyMailbox: 'task:peer' },
+    }),
     'worktree:origin',
   );
 
@@ -261,6 +265,27 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
   const explicit = runtime.mailbox.list({ mailboxId: 'worktree:peer-session' }).items[0];
   assert.ok(explicit, 'the explicit target mailbox must win');
   assert.equal(explicit.envelope.semantic?.targetMailbox, 'worktree:peer-session');
+
+  // A thread route recorded on another network never applies to this send.
+  const foreignThreadId = 'thread-cli-foreign';
+  runtime.mailbox.recordInboundEnvelope(
+    envelope('peer-reply-foreign', {
+      networkId: 'team',
+      from: peer,
+      semantic: { type: 'reply', threadId: foreignThreadId, replyMailbox: 'task:foreign' },
+    }),
+    'worktree:origin',
+  );
+  const foreignOut: string[] = [];
+  const foreignErr: string[] = [];
+  const foreignCode = await runDealerCli(
+    ['send', '--network', 'local', '--to', 'member:bob', '--topic', 'collab.request.v4', '--body', 'foreign', '--thread', foreignThreadId, '--json'],
+    { runtime, stdout: line => foreignOut.push(line), stderr: line => foreignErr.push(line) },
+  );
+  assert.equal(foreignCode, 0, foreignErr.join('\n'));
+  assert.equal(runtime.mailbox.list({ mailboxId: 'task:foreign' }).totalCount, 0);
+  const foreign = runtime.mailbox.list({ mailboxId: 'default' }).items.at(-1);
+  assert.equal(foreign?.envelope.semantic?.targetMailbox, undefined);
 });
 
 test('dealer send --thread follows the newest inbound leg of a thread we originated', async t => {
@@ -284,7 +309,7 @@ test('dealer send --thread follows the newest inbound leg of a thread we origina
   // We started the thread without an explicit target mailbox, so its root outbound leg records
   // `default` as the peer reply mailbox.
   runtime.mailbox.recordOutboundEnvelope(
-    envelope(threadId, { semantic: { type: 'message', threadId } }),
+    envelope(threadId, { networkId: 'local', semantic: { type: 'message', threadId } }),
     [peer.nodeId],
     originMailbox,
   );
@@ -294,6 +319,7 @@ test('dealer send --thread follows the newest inbound leg of a thread we origina
   // The peer answers from its own session mailbox, which the inbound leg records on the thread.
   runtime.mailbox.recordInboundEnvelope(
     envelope('peer-reply-root', {
+      networkId: 'local',
       from: peer,
       semantic: { type: 'reply', threadId, replyMailbox: 'worktree:peer-review' },
     }),

@@ -1070,7 +1070,16 @@ export class MailboxStore {
         if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
           throw new Error('Invalid envelope: missing id');
         }
-        const mailboxId = explicitMailbox ?? resolveMailboxId(envelope, 'inbox');
+        const mailboxId = explicitMailbox ?? resolveMailboxId(
+          envelope,
+          'inbox',
+          undefined,
+          this.threadLocalMailboxFromState(
+            state,
+            envelope.semantic?.threadId,
+            envelope.networkId,
+          ),
+        );
         mailboxIds.add(mailboxId);
         if (state.items.some(item => item.mailboxId === mailboxId && item.id === envelope.id)) {
           duplicateIds.push(envelope.id);
@@ -1742,10 +1751,18 @@ export class MailboxStore {
    * envelope's network so a colliding thread id on another network never inherits this route.
    */
   resolveThreadLocalMailbox(threadId?: string, networkId?: string): string | undefined {
+    return this.threadLocalMailboxFromState(this.read(), threadId, networkId);
+  }
+
+  private threadLocalMailboxFromState(
+    state: MailboxFileState,
+    threadId?: string,
+    networkId?: string,
+  ): string | undefined {
     if (typeof threadId !== 'string' || threadId.length === 0) {
       return undefined;
     }
-    const records = threadRecordsFor(this.read(), threadId)
+    const records = threadRecordsFor(state, threadId)
       .filter(record => networkId === undefined || record.networkId === networkId);
     for (let index = records.length - 1; index >= 0; index -= 1) {
       const localMailbox = records[index].localMailbox;
@@ -1785,7 +1802,8 @@ export class MailboxStore {
         record).peerReplyMailbox;
     const localMailbox = exactLeg !== undefined && exactLeg.localMailbox !== 'default'
       ? exactLeg.localMailbox
-      : this.resolveThreadLocalMailbox(record.threadId, record.networkId) ?? record.localMailbox;
+      : this.threadLocalMailboxFromState(state, record.threadId, record.networkId) ??
+        record.localMailbox;
     return {
       threadId: record.threadId,
       messageId: record.messageId,

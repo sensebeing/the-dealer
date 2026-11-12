@@ -1315,11 +1315,14 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       if (rawUrgency && !['normal', 'high', 'critical'].includes(String(rawUrgency))) {
         throw new Error('Invalid urgency');
       }
+      const networkId = required(v.network, '--network');
       const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
       // A message on an existing thread belongs to the session that started it: the thread's
-      // recorded routes take precedence over the topic's generic binding.
-      const threadRoute =
+      // recorded routes take precedence over the topic's generic binding. A route recorded on a
+      // different network never applies to this send.
+      const rawRoute =
         threadId === undefined ? undefined : runtime.mailbox.resolveReplyTarget(threadId);
+      const threadRoute = rawRoute?.networkId === networkId ? rawRoute : undefined;
       const explicitTargetMailbox =
         typeof v['target-mailbox'] === 'string' && v['target-mailbox']
           ? String(v['target-mailbox'])
@@ -1359,7 +1362,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
               : undefined));
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       result = await runtime.emitter.emit({
-        networkId: required(v.network, '--network'),
+        networkId,
         kind: topic,
         subject:
           typeof v.subject === 'string' && v.subject ? String(v.subject) : topic,
