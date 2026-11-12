@@ -12,11 +12,11 @@ import { parseArgs } from 'node:util';
 import { MailboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { SettlementOutcome } from '../core-types/index.ts';
-import { DealerNodeRuntime, defaultStateDir } from './runtime.ts';
+import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
 import { computeRuntimeFingerprint, readDaemonFingerprint, readAutoUpdateStatus, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
-import { isDeadProcessOwner, readProcessOwner } from '../process-lock/index.ts';
+import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
@@ -141,12 +141,16 @@ export interface DealerCliOptions {
   stderr?: (line: string) => void;
   /** Aborted when the calling control request disconnects, so long waits release listeners. */
   signal?: AbortSignal;
+  /** Incarnation the requesting peer captured; a mismatched daemon must not act on the command. */
+  expectedInstance?: string;
   env?: NodeJS.ProcessEnv;
 }
 
 export interface ControlRpcOptions {
   /** Inactivity window reset by every NDJSON line; defaults to 45000ms. */
   inactivityMs?: number;
+  /** Incarnation the caller believes serves this socket; the daemon rejects a mismatch. */
+  expectedInstance?: string;
 }
 
 const DEFAULT_RPC_INACTIVITY_MS = 45_000;
@@ -201,7 +205,12 @@ export async function rpc(
         socketPath,
         path: '/cli-stream',
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...(options.expectedInstance === undefined
+            ? {}
+            : { [EXPECTED_INSTANCE_HEADER]: options.expectedInstance }),
+        },
       },
       res => {
         if (res.statusCode !== 200) {
@@ -356,10 +365,28 @@ async function probeDaemonState(stateDir: string): Promise<DaemonProbe> {
   }
 }
 
-async function waitForDaemonStopped(stateDir: string, timeoutMs = 20_000): Promise<boolean> {
+/**
+ * A supervisor such as `launchd` (`KeepAlive`) starts a replacement daemon the instant the
+ * target exits, so a live listener is not proof that the shutdown is still pending. Track
+ * the target incarnation by identity: the shutdown is complete once the listener is gone or
+ * the lock owner is a different incarnation than the one asked to stop.
+ */
+async function waitForDaemonStopped(
+  stateDir: string,
+  targetInstanceId?: string,
+  targetPid?: number,
+  timeoutMs = 20_000,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if ((await probeDaemonState(stateDir)) !== 'live') {
+      return true;
+    }
+    const current = liveDaemonOwner(stateDir);
+    const replaced = current !== undefined && (targetInstanceId
+      ? current.instanceId !== targetInstanceId
+      : targetPid !== undefined && current.pid !== targetPid);
+    if (replaced) {
       return true;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -370,7 +397,7 @@ async function waitForDaemonStopped(stateDir: string, timeoutMs = 20_000): Promi
 export async function stopDaemonIfRunning(
   stateDir: string,
   options: { force?: boolean } = {},
-): Promise<{ running: boolean; stopped: boolean; pid?: number }> {
+): Promise<{ running: boolean; stopped: boolean; pid?: number; respawned?: boolean }> {
   const probe = await probeDaemonState(stateDir);
   if (probe === 'absent') {
     return { running: false, stopped: false };
@@ -378,25 +405,46 @@ export async function stopDaemonIfRunning(
   if (probe === 'stale_recovered') {
     return { running: false, stopped: true };
   }
-  let pid: number | undefined;
+  // Capture the incarnation being shut down before asking it to stop; the RPC pid is only
+  // a fallback witness when the lock owner could not be read.
+  const targetOwner = liveDaemonOwner(stateDir);
+  const targetInstanceId = targetOwner?.instanceId;
+  let pid: number | undefined = targetOwner?.pid;
+  let targetAlreadyStopped = false;
   try {
-    const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], { inactivityMs: 2_000 });
+    const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], {
+      inactivityMs: 2_000,
+      ...(targetInstanceId ? { expectedInstance: targetInstanceId } : {}),
+    });
     const parsed = JSON.parse(result.stdout.join('') || '{}');
-    if (typeof parsed.pid === 'number') {
+    if (parsed.instanceMismatch === true) {
+      // The socket is served by another incarnation, so the captured target already stopped
+      // and the replacement must never honor this shutdown.
+      targetAlreadyStopped = true;
+    } else if (typeof parsed.pid === 'number') {
       pid = parsed.pid;
     }
   } catch { /* the daemon may remove the socket while responding */ }
-  let stopped = await waitForDaemonStopped(stateDir);
+  let stopped = targetAlreadyStopped || await waitForDaemonStopped(stateDir, targetInstanceId, pid);
   if (!stopped && options.force) {
     const owner = liveDaemonOwner(stateDir);
-    if (owner) {
+    // Escalate only against the exact incarnation captured before the shutdown request: a
+    // live owner without that identity may be a supervisor-started replacement (or an
+    // unreadable record), so force must leave it serving rather than guess by pid.
+    if (owner && targetOwner && targetOwner.instanceId !== '' && owner.instanceId === targetOwner.instanceId) {
       try {
         process.kill(owner.pid, 'SIGTERM');
       } catch { /* exited */ }
-      stopped = await waitForDaemonStopped(stateDir, 5_000);
+      stopped = await waitForDaemonStopped(stateDir, targetOwner.instanceId, pid, 5_000);
     }
   }
-  return { running: !stopped, stopped, ...(pid ? { pid } : {}) };
+  const stillRunning = stopped ? (await probeDaemonState(stateDir)) === 'live' : true;
+  return {
+    running: stillRunning,
+    stopped,
+    ...(pid ? { pid } : {}),
+    ...(stopped && stillRunning ? { respawned: true } : {}),
+  };
 }
 
 export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
@@ -424,7 +472,10 @@ export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
 
 export async function restartDaemon(stateDir: string, options: { force?: boolean } = {}): Promise<unknown> {
   const stopped = await stopDaemonIfRunning(stateDir, options);
-  if (stopped.running) {
+  // Only a drain that could not quiesce leaves the target serving. A supervisor that already
+  // started a replacement counts as a completed stop, so confirm that live instance instead
+  // of reporting a false deferral for the incarnation that really did exit.
+  if (!stopped.stopped && stopped.running) {
     return { ...stopped, restarted: false, deferred: true };
   }
   return ensureDaemonRunning(stateDir);
@@ -1031,12 +1082,18 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         }
         result = runtime.status();
       } else if (action === 'down') {
-        result = { ok: true, stopping: true, pid: process.pid };
-        setImmediate(() => {
-          void runtime.gracefulStop().then(() => process.exit(0)).catch(error => {
-            runtime.lastError = String(error);
+        const instanceId = processOwnerRecord().instanceId;
+        if (options.expectedInstance !== undefined && options.expectedInstance !== instanceId) {
+          // A replacement daemon must never honor a shutdown addressed to an earlier incarnation.
+          result = { ok: false, instanceMismatch: true, pid: process.pid, instanceId };
+        } else {
+          result = { ok: true, stopping: true, pid: process.pid, instanceId };
+          setImmediate(() => {
+            void runtime.gracefulStop().then(() => process.exit(0)).catch(error => {
+              runtime.lastError = String(error);
+            });
           });
-        });
+        }
       } else if (action === 'card') {
         result = network
           ? runtime.node.getSelfCard(network)
@@ -1234,6 +1291,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
         stdout: line => stdout.push(line),
         stderr: line => stderr.push(line),
         signal: context.signal,
+        expectedInstance: context.expectedInstance,
       });
       return { code, stdout, stderr };
     });

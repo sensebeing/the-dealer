@@ -120,7 +120,12 @@ export interface DealerRuntimeOptions {
 
 export interface ControlRequestContext {
   signal: AbortSignal;
+  /** Incarnation the caller captured for this command; absent when it has no witness. */
+  expectedInstance?: string;
 }
+
+/** Request metadata, not a CLI flag: older daemons ignore it and still receive a plain command. */
+export const EXPECTED_INSTANCE_HEADER = 'x-dealer-expected-instance';
 
 export interface ControlServerOptions {
   /** NDJSON keepalive cadence for POST /cli-stream; defaults to 15000ms. */
@@ -1355,11 +1360,15 @@ export class DealerNodeRuntime {
         response.writeHead(503).end(JSON.stringify({ error: 'Daemon is draining' }));
         return;
       }
+      const expectedInstance = request.headers[EXPECTED_INSTANCE_HEADER];
+      const controlContext = {
+        expectedInstance: typeof expectedInstance === 'string' ? expectedInstance : undefined,
+      };
       if (request.url === '/cli') {
         this.activeMutatingControlRequests++;
         try {
           const argv = parseControlArgv(await readControlBody(request));
-          const result = await handler(argv, { signal: new AbortController().signal });
+          const result = await handler(argv, { ...controlContext, signal: new AbortController().signal });
           response
             .writeHead(200, { 'content-type': 'application/json' })
             .end(JSON.stringify(result));
@@ -1407,7 +1416,7 @@ export class DealerNodeRuntime {
         }
         let line: Record<string, unknown>;
         try {
-          const result = await handler(argv, { signal: controller.signal });
+          const result = await handler(argv, { ...controlContext, signal: controller.signal });
           line = { type: 'result', result };
         } catch (error) {
           line = {
