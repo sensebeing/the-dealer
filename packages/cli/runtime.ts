@@ -30,7 +30,7 @@ import {
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
-import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
+import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
@@ -958,11 +958,30 @@ export class DealerNodeRuntime {
       if (notifyLark) mailboxes.push(mailboxId);
       if (binding.executor !== 'orca-wave' || !(binding.workspacePath || binding.runId || binding.terminalHandle)) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
+      const current = this.mailbox.getWakeTarget(mailboxId);
+      const resolvedRotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
+        bindingRotateAfterWaves: rotateAfterWaves,
+        waveRotateAfterWaves: this.config.wave?.rotateAfterWaves,
+        managesWorkspace: Boolean(workspacePath),
+        runId,
+        pinnedTerminalHandle: terminalHandle,
+      });
+      // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
+      // handle, an Orca Run, or a workspace switch may replace or clear it. Passing every optional
+      // field as an own property is what lets a reconfiguration erase a stale rotation default.
+      const nextTerminalHandle =
+        terminalHandle !== undefined
+          ? terminalHandle
+          : !runId && current?.mode === 'orca-terminal' && current.workspacePath === workspacePath
+            ? current.terminalHandle
+            : undefined;
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
-        workspacePath, worktreeId, runId, terminalHandle, repoRoot: projectRoot,
+        workspacePath, worktreeId, runId, repoRoot: projectRoot,
         agent: binding.agent as 'antigravity' | 'claude' | 'codex' | undefined, interactiveCommand,
-        autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0, rotateAfterWaves,
+        autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
+        rotateAfterWaves: resolvedRotateAfterWaves,
+        terminalHandle: nextTerminalHandle,
       });
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);

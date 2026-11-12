@@ -53,11 +53,15 @@ enqueues the batch into its mailbox and records a wake target, returning
 delay before a pointer (a message's `payload.minAgeMs` overrides it), and
 `wave.flushIntervalMs` controls the redrive timer. `WakeupRedriveService` never
 injects text into a busy, timed-out, or unverifiable terminal. Before the next
-pointer, rotation sends `/new` to the configured terminal only after the
-previous lease is acknowledged and `completedWaves >= rotateAfterWaves`; it
-never rotates an unacknowledged batch. A terminal handle is required for
-rotation even when deliveries target a run. Configure only a terminal whose
-rotation you own. `payload.executor` can select any enabled executor, so
+pointer, rotation opens a new agent session tab in the configured workspace only
+after the previous lease is acknowledged and
+`completedWaves >= rotateAfterWaves`; it never rotates an unacknowledged batch.
+The previous tab is left untouched — the wakeup service never sends `/new` or
+resets an existing TUI. A managed fixed workspace defaults to
+`rotateAfterWaves: 1`, so every wave owns an independent tab and the first
+wakeup never hijacks a conversation tab a human already opened; a terminal
+handle bound without `rotateAfterWaves` keeps delivering to that same terminal.
+`payload.executor` can select any enabled executor, so
 expose only executors permitted for admitted peers.
 
 ## Dependency-free YAML subset

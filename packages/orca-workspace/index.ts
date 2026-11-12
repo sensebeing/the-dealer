@@ -134,16 +134,50 @@ export function isAutopilotComposerPrefill(preview: string): boolean {
   });
 }
 
+export interface OrcaWorkspaceIdleOptions {
+  /**
+   * The terminal this wakeup will write into. `null` means delivery creates an independent session
+   * tab first, so retained tabs must never gate the wakeup; a handle restricts composer inspection
+   * to that terminal (or, when it was closed, to the terminals a rebind could reuse).
+   */
+  targetTerminalHandle?: string | null;
+  /** Preferred target agent when the bound terminal is gone and a rebind picks a replacement. */
+  agent?: SupportedOrcaAgent;
+}
+
+/** Reuse candidates in the same order terminal resolution falls back through them. */
+function reusableTerminalCandidates(
+  terminals: readonly OrcaTerminalRow[],
+  agent?: SupportedOrcaAgent,
+): OrcaTerminalRow[] {
+  const nonOrphaned = terminals.filter(terminal => terminal.orphaned !== true);
+  const pool = nonOrphaned.length > 0 ? nonOrphaned : [...terminals];
+  const matchesAgent = (terminal: OrcaTerminalRow): boolean =>
+    agent !== undefined &&
+    (terminal.agentIdentity === agent || (agent === 'claude' && terminal.agentIdentity === 'claude-code'));
+  const tiers = [
+    pool.filter(matchesAgent),
+    pool.filter(terminal => typeof terminal.agentIdentity === 'string' && terminal.agentIdentity.trim().length > 0),
+    pool.filter(terminal => typeof terminal.preview !== 'string' && typeof terminal.agentIdentity !== 'string'),
+    pool.filter(terminal => typeof terminal.preview === 'string' && !terminal.agentIdentity),
+  ];
+  return tiers.find(tier => tier.length > 0) ?? pool;
+}
+
 /**
  * Authoritative recursive idle inspection: every workspace in the root's subtree must report no
- * unverifiable terminals, every agent must be done, and every connected writable terminal must be
- * free of an unsent composer draft. Synthetic inventories are confirmed with `terminal wait`.
+ * unverifiable terminals, every agent must be done with at least as many connected terminals as
+ * agents, and every terminal the wakeup could write into must be connected, writable and free of
+ * an unsent composer draft. When a fresh session tab will receive the pointer, retained tabs in
+ * the root workspace neither block the wakeup nor mark the composer prefilled. Synthetic
+ * inventories are confirmed with `terminal wait`.
  */
 export async function checkOrcaWorkspaceIdle(
   runner: CommandRunner,
   command: string,
   cwd: string,
   signal?: AbortSignal,
+  options?: OrcaWorkspaceIdleOptions,
 ): Promise<OrcaIdleResult> {
   const output = await checkedCommand(runner, {
     command,
@@ -202,10 +236,31 @@ export async function checkOrcaWorkspaceIdle(
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
     const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
-    if (observableHandles.length < row.agents.length) {
+    if (observableHandles.filter(t => Boolean(t.connected)).length < row.agents.length) {
       return false;
     }
+    // Liveness and composer state only matter for terminals this wakeup may actually write into:
+    // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
+    // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
+    // rebind could reuse when it was closed).
+    const rootTarget = row.path === cwd ? options?.targetTerminalHandle : undefined;
+    const targetPresent = typeof rootTarget === 'string' &&
+      observableHandles.some(t => String(t.handle) === rootTarget);
+    const reuseHandles = typeof rootTarget === 'string' && !targetPresent
+      ? new Set(reusableTerminalCandidates(observableHandles, options?.agent).map(t => String(t.handle)))
+      : undefined;
+    const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
+      if (row.path !== cwd) return true;
+      if (rootTarget === null) return false;
+      if (rootTarget === undefined) return true;
+      if (String(terminal.handle) === rootTarget) return true;
+      // The bound terminal was closed: only the terminals a rebind could reuse are inspected.
+      return reuseHandles?.has(String(terminal.handle)) === true;
+    };
     for (const terminal of observableHandles) {
+      if (!gatesWakeup(terminal)) {
+        continue;
+      }
       if (!terminal.connected || !terminal.writable) {
         return false;
       }
@@ -330,6 +385,65 @@ export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravi
   return defaultAntigravityLaunchCommand();
 }
 
+/**
+ * Create an independent agent terminal tab in an Orca workspace. Session rotation and first-wave
+ * delivery both use this so a retained conversation tab is never reset or written into.
+ */
+export async function spawnOrcaWorkspaceTerminal(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+  options: { agent?: SupportedOrcaAgent; interactiveCommand?: string } = {},
+): Promise<{ handle: string }> {
+  const targetAgent = options.agent ?? 'antigravity';
+  const launchCommand = options.interactiveCommand?.trim() || defaultAgentLaunchCommand(targetAgent);
+  const spawned = await checkedCommand(runner, {
+    command,
+    args: [
+      'terminal',
+      'create',
+      '--worktree',
+      `path:${cwd}`,
+      '--command',
+      launchCommand,
+      '--json',
+    ],
+    cwd,
+    signal,
+  });
+  const raw = JSON.parse(spawned.stdout);
+  const handle = raw.result?.terminal?.handle ?? raw.result?.handle;
+  if (handle === undefined || handle === null || handle === '') {
+    throw new Error('Orca terminal create returned no handle');
+  }
+  return { handle: String(handle) };
+}
+
+/** A persisted handle is reusable only while Orca still reports it connected and writable. */
+export async function isOrcaWorkspaceTerminalLive(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  terminalHandle: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const listed = await checkedCommand(runner, {
+    command,
+    args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
+    cwd,
+    signal,
+  });
+  const inventory = JSON.parse(listed.stdout);
+  if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
+    throw new Error('Incomplete Orca terminal inventory');
+  }
+  const terminal = (inventory.result.terminals as OrcaTerminalRow[]).find(
+    row => row && String(row.handle) === terminalHandle,
+  );
+  return terminal !== undefined && terminal.connected === true && terminal.writable !== false;
+}
+
 /** Resolve the freshest connected target-agent terminal in an Orca workspace, spawning one if needed. */
 export async function resolveOrSpawnOrcaWorkspaceTerminal(
   runner: CommandRunner,
@@ -384,26 +498,11 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
     await sendOrcaTerminalText(runner, command, handle, launchCommand, { cwd, signal });
     return { handle, spawned: true, shellBootstrapped: true };
   }
-  const spawned = await checkedCommand(runner, {
-    command,
-    args: [
-      'terminal',
-      'create',
-      '--worktree',
-      `path:${cwd}`,
-      '--command',
-      launchCommand,
-      '--json',
-    ],
-    cwd,
-    signal,
+  const spawned = await spawnOrcaWorkspaceTerminal(runner, command, cwd, signal, {
+    agent: targetAgent,
+    interactiveCommand: options?.interactiveCommand,
   });
-  const raw = JSON.parse(spawned.stdout);
-  const handle = raw.result?.terminal?.handle ?? raw.result?.handle;
-  if (handle === undefined || handle === null || handle === '') {
-    throw new Error('Orca terminal create returned no handle');
-  }
-  return { handle: String(handle), spawned: true };
+  return { handle: spawned.handle, spawned: true };
 }
 
 /** Send one line (plus Enter) to a terminal; the caller must have proven it idle first. */

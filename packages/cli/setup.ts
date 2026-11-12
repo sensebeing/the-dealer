@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { redactProjectManifest, readProjectManifest, validateTopicBindings } from './config.ts';
 import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, TopicBindingConfig } from './config.ts';
+import { resolveOrcaWaveRotateAfterWaves } from '../mailbox/index.ts';
 import { findExecutable } from '../orca-workspace/executable.ts';
 import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
 
@@ -116,6 +117,8 @@ export function buildAgentBindingPreset(options: {
   targetBot?: string;
   sessionId?: string;
   notifyLark?: boolean;
+  /** Session-tab rotation threshold for a managed fixed workspace; defaults to one wave. */
+  rotateAfterWaves?: number;
 }) {
   const host = options.host === 'claude' ? 'claude-code' : options.host;
   if (!AGENT_HOST_CATALOG.some(entry => entry.host === host)) throw new Error(`Unsupported agent host: ${host}`);
@@ -135,7 +138,15 @@ export function buildAgentBindingPreset(options: {
     ...(options.targetBot ? { targetBot: options.targetBot } : {}),
     ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     ...(options.notifyLark !== undefined ? { notifyLark: options.notifyLark } : {}),
-    ...(managed && mode === 'fixed' ? { autoCreateWorkspace: true } : {}),
+    ...(managed && mode === 'fixed'
+      ? {
+          autoCreateWorkspace: true,
+          rotateAfterWaves: resolveOrcaWaveRotateAfterWaves({
+            bindingRotateAfterWaves: options.rotateAfterWaves,
+            managesWorkspace: true,
+          }),
+        }
+      : {}),
   };
   validateTopicBindings({ [topic]: binding }, [executor]);
   const executorConfig = executor === 'orca-spawn'

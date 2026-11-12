@@ -11,7 +11,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveMailboxId, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup } from '../mailbox/index.ts';
+import { MailboxStore, resolveMailboxId, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
@@ -635,25 +635,40 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
       const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined);
       const mailboxId = resolveMailboxId(first, 'orca-wave', binding);
       // The receiver owns workspace, terminal and scheduling configuration; inbound payload values
-      // are only a fallback for deployments that have no local binding or executor config.
+      // are only a fallback for deployments that have no local binding or executor config, so a
+      // sender can never rebind the receiver's runtime-managed workspace state.
+      const receiverCwd = binding?.workspacePath ?? config.cwd ?? options.cwd;
+      const receiverRunId = binding?.runId ?? config.runId ?? options.runId;
+      const receiverTerminalHandle =
+        binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle;
+      const hasReceiverTarget = Boolean(receiverCwd || receiverRunId || receiverTerminalHandle);
       const cwd =
-        binding?.workspacePath ??
-        config.cwd ??
-        options.cwd ??
-        optionalString(payload.workspacePath) ??
-        optionalString(payload.cwd);
+        receiverCwd ??
+        (hasReceiverTarget
+          ? undefined
+          : optionalString(payload.workspacePath) ?? optionalString(payload.cwd));
       const runId =
-        binding?.runId ?? config.runId ?? options.runId ?? optionalString(payload.runId);
+        receiverRunId ?? (hasReceiverTarget ? undefined : optionalString(payload.runId));
       const terminalHandle =
-        binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle ?? optionalString(payload.terminalHandle);
+        receiverTerminalHandle ??
+        (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
       const waveConfig = config.wave ?? options.wave;
       const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
-      const rotateAfterWaves =
-        binding?.rotateAfterWaves ??
-        optionalPositiveInteger(waveConfig?.rotateAfterWaves) ??
-        optionalPositiveInteger(payload.rotateAfterWaves);
+      const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
+        bindingRotateAfterWaves: binding?.rotateAfterWaves,
+        waveRotateAfterWaves: optionalPositiveInteger(waveConfig?.rotateAfterWaves),
+        fallbackRotateAfterWaves: hasReceiverTarget
+          ? undefined
+          : optionalPositiveInteger(payload.rotateAfterWaves),
+        managesWorkspace: Boolean(cwd),
+        runId,
+        pinnedTerminalHandle: receiverTerminalHandle,
+      });
       const worktreeId =
-        binding?.worktreeId ?? config.worktreeId ?? options.worktreeId ?? optionalString(payload.worktreeId);
+        binding?.worktreeId ??
+        config.worktreeId ??
+        options.worktreeId ??
+        (hasReceiverTarget ? undefined : optionalString(payload.worktreeId));
       const workspaceComment = String(
         batch.at(-1)?.payload?.workspaceComment || binding?.workspaceComment || `Dealer: ${mailboxId} pending`,
       );

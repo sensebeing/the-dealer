@@ -267,9 +267,12 @@ lease instead (`Unacknowledged Dealer batch <dlv> + N newer message(s)`) and
 includes the `--ack <dlv>` recovery command. A busy, timed-out, or unverifiable
 terminal is never typed into: retries use 1s → 2s → 5s → 10s backoff, and a
 daemon restart re-arms every pending target from disk. Acknowledge the batch
-after handling it, then end your turn; `/new` rotation happens only after the
-lease is acknowledged and the mailbox reaches `rotateAfterWaves`. Pending
-Leases, wake targets, and thread routes are not lost on restart.
+after handling it, then end your turn; when the mailbox reaches
+`rotateAfterWaves`, the next wave opens a new agent session tab in the same
+Orca workspace and leaves the previous tab untouched (no `/new` reset). Fixed
+Orca workspaces default to `rotateAfterWaves: 1`, so each wave gets its own tab
+and the first wakeup never takes over a conversation tab you already have open.
+Pending leases, wake targets, and thread routes are not lost on restart.
 
 ## Ask, reply, settle, and inspect a thread
 
