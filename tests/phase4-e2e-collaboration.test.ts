@@ -182,7 +182,7 @@ test('Phase 4: local agent judge routes using discovered live NodeCards', async 
   assert.match(readFileSync(join(bob.stateDir, 'notifications.jsonl'), 'utf8'), /ios-crash/);
 });
 
-test('Phase 4: polling, CAS dedup, durable busy waves and rotation after ack', async t => {
+test('Phase 4: polling, CAS dedup, durable busy waves and run-managed delivery after ack', async t => {
   const root = directory(t);
   const calls: CommandRequest[] = [];
   let idle = false;
@@ -247,14 +247,14 @@ test('Phase 4: polling, CAS dedup, durable busy waves and rotation after ack', a
   bob.mailbox.ack(lease.deliveryId!);
   await source.pollOnce();
   assert.equal(cursor, 3);
-  const rotation = calls.findIndex(c => c.args.includes('/new'));
-  assert.ok(rotation >= 0);
+  // An Orca Run owns its coordinator session: rotateAfterWaves never resets or spawns a terminal.
   const sends = calls.filter(
     c => c.args[0] === 'orchestration' && c.args.includes('--body'),
   );
   assert.equal(sends.length, 2);
-  assert.ok(rotation < calls.indexOf(sends[1]));
   assert.match(String(sends[1].args[sends[1].args.indexOf('--body') + 1]), /^You have 1 Dealer message/);
+  assert.equal(calls.some(c => c.args[0] === 'terminal'), false);
+  assert.equal(calls.some(c => c.args.includes('/new')), false);
   await registration.dispose();
 });
 
@@ -302,7 +302,16 @@ test('Phase 4: wave streams resolve distinct workspace terminals with single-lin
   const root = directory(t);
   const workspaceA = join(root, 'workspace-a');
   const workspaceB = join(root, 'workspace-b');
+  mkdirSync(workspaceA, { recursive: true });
+  mkdirSync(workspaceB, { recursive: true });
   const calls: CommandRequest[] = [];
+  const createdByWorkspace = new Map<string, string[]>([
+    [workspaceA, []],
+    [workspaceB, []],
+  ]);
+  let createdCount = 0;
+  const workspaceOf = (request: CommandRequest): string =>
+    request.args.includes(`path:${workspaceA}`) ? workspaceA : workspaceB;
   const runner = async (request: CommandRequest) => {
     calls.push(request);
     if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
@@ -325,24 +334,39 @@ test('Phase 4: wave streams resolve distinct workspace terminals with single-lin
       };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'list') {
-      const handle = request.args.includes(`path:${workspaceA}`) ? 'term-a' : 'term-b';
+      const workspace = workspaceOf(request);
+      const created = createdByWorkspace.get(workspace)!;
       return {
         stdout: JSON.stringify({
           ok: true,
           result: {
             terminals: [
               {
-                handle,
+                handle: workspace === workspaceA ? 'term-a' : 'term-b',
                 connected: true,
                 writable: true,
                 agentIdentity: 'antigravity',
                 lastOutputAt: 10,
                 preview: 'Idle',
               },
+              ...created.map((handle, index) => ({
+                handle,
+                connected: true,
+                writable: true,
+                agentIdentity: 'antigravity',
+                lastOutputAt: 20 + index,
+                preview: '',
+              })),
             ],
           },
         }),
       };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      createdCount += 1;
+      const handle = `term-created-${createdCount}`;
+      createdByWorkspace.get(workspaceOf(request))!.push(handle);
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle } } }) };
     }
     return { stdout: '{"ok":true}' };
   };
@@ -383,15 +407,24 @@ test('Phase 4: wave streams resolve distinct workspace terminals with single-lin
   const sends = calls.filter(c => c.args[0] === 'terminal' && c.args[1] === 'send');
   const textOf = (call: CommandRequest) => call.args[call.args.indexOf('--text') + 1];
   const handleOf = (call: CommandRequest) => call.args[call.args.indexOf('--terminal') + 1];
-  const aSends = sends.filter(c => handleOf(c) === 'term-a');
-  const bSends = sends.filter(c => handleOf(c) === 'term-b');
+  // `rotateAfterWaves: 1` gives each workspace's first wave its own session tab; the second
+  // message joins that same wave's tab instead of opening another one.
+  const aSends = sends.filter(c => handleOf(c) === 'term-created-1');
+  const bSends = sends.filter(c => handleOf(c) === 'term-created-2');
   assert.equal(aSends.length, 2);
   assert.ok(aSends.every(c => !/[\r\n]/.test(textOf(c))));
   assert.ok(aSends.some(c => /^You have 1 Dealer message\(s\) in stream:/.test(textOf(c))));
   assert.ok(aSends.some(c => /^You have 2 Dealer message\(s\) in stream:/.test(textOf(c))));
   assert.equal(bSends.length, 1);
   assert.match(textOf(bSends[0]), /^You have 1 Dealer message\(s\) in stream:/);
+  assert.equal(
+    calls.filter(c => c.args[0] === 'terminal' && c.args[1] === 'create').length,
+    2,
+    'one independent session tab per workspace wave',
+  );
+  assert.equal(sends.some(c => handleOf(c) === 'term-a' || handleOf(c) === 'term-b'), false);
   assert.equal(sends.some(c => textOf(c) === '/new'), false);
+  assert.equal(sends.some(c => textOf(c) === '\x15'), false);
   assert.ok(
     calls.some(
       c =>

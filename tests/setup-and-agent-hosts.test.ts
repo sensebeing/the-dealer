@@ -701,6 +701,46 @@ test('orca-wave ignores inbound scheduling and prefers receiver binding or confi
   assert.equal(configuredTarget.worktreeId, 'config-worktree');
 });
 
+test('orca-wave defaults fixed workspaces to one fresh session tab per wave', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const execute = (streamKey: string, options: Parameters<typeof createOrcaWaveExecutorPlugin>[0]) =>
+    createOrcaWaveExecutorPlugin(options).execute(
+      [message(streamKey, { streamKey })],
+      context,
+      {},
+    );
+
+  await execute('default', { store, cwd: '/receiver/default' });
+  const defaulted = store.getWakeTarget('stream:default')!;
+  assert.equal(defaulted.rotateAfterWaves, 1);
+  assert.equal(defaulted.workspacePath, '/receiver/default');
+
+  await execute('explicit', { store, cwd: '/receiver/explicit', wave: { rotateAfterWaves: 3 } });
+  assert.equal(store.getWakeTarget('stream:explicit')!.rotateAfterWaves, 3);
+
+  await execute('pinned', { store, cwd: '/receiver/pinned', terminalHandle: 'pinned-tab' });
+  assert.equal(store.getWakeTarget('stream:pinned')!.rotateAfterWaves, undefined);
+  assert.equal(store.getWakeTarget('stream:pinned')!.terminalHandle, 'pinned-tab');
+
+  await execute('run', { store, cwd: '/receiver/run', runId: 'run-owner' });
+  assert.equal(store.getWakeTarget('stream:run')!.rotateAfterWaves, undefined);
+  assert.equal(store.getWakeTarget('stream:run')!.mode, 'orca-run');
+});
+
+test('managed fixed presets default to one session tab per wave and allow an override', () => {
+  for (const host of ['orca', 'antigravity'] as const) {
+    const preset = buildAgentBindingPreset({ host, conversationMode: 'fixed' });
+    assert.equal(preset.binding.autoCreateWorkspace, true);
+    assert.equal(preset.binding.rotateAfterWaves, 1);
+  }
+  assert.equal(
+    buildAgentBindingPreset({ host: 'orca', conversationMode: 'fixed', rotateAfterWaves: 4 }).binding.rotateAfterWaves,
+    4,
+  );
+  assert.equal(buildAgentBindingPreset({ host: 'orca', conversationMode: 'spawn' }).binding.rotateAfterWaves, undefined);
+  assert.equal(buildAgentBindingPreset({ host: 'codex', conversationMode: 'fixed' }).binding.rotateAfterWaves, undefined);
+});
+
 test('preferred terminal handle reuses a connected orphan over a fresher live terminal', async () => {
   let terminals: object[] = [
     { handle: 'bound', orphaned: true, connected: true, writable: true, lastOutputAt: 1 },

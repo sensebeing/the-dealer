@@ -26,3 +26,6 @@ leases, replies and settlement protocol. For standalone Antigravity, agent-pty
 supports `agy run`; it does not guarantee a resumed fixed TUI, so use the managed
 Orca preset for fixed conversations. Only Orca wakeups currently use the persisted
 idle-gated redrive service; passive agent-pty mail remains readable after failure.
+Managed Orca/antigravity fixed presets default to `rotateAfterWaves: 1`: each wave
+opens its own agent session tab in the workspace, and the previous tab stays
+untouched (no `/new` reset).

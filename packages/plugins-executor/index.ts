@@ -648,10 +648,15 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle ?? optionalString(payload.terminalHandle);
       const waveConfig = config.wave ?? options.wave;
       const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
+      const receiverTerminalHandle =
+        binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle;
       const rotateAfterWaves =
         binding?.rotateAfterWaves ??
         optionalPositiveInteger(waveConfig?.rotateAfterWaves) ??
-        optionalPositiveInteger(payload.rotateAfterWaves);
+        optionalPositiveInteger(payload.rotateAfterWaves) ??
+        // Fixed Orca workspaces default to one fresh session tab per wave; an explicitly bound
+        // terminal or an Orca Run (which owns its coordinator session) keeps the unset default.
+        (cwd && !runId && !receiverTerminalHandle ? 1 : undefined);
       const worktreeId =
         binding?.worktreeId ?? config.worktreeId ?? options.worktreeId ?? optionalString(payload.worktreeId);
       const workspaceComment = String(

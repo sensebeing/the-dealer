@@ -958,11 +958,27 @@ export class DealerNodeRuntime {
       if (notifyLark) mailboxes.push(mailboxId);
       if (binding.executor !== 'orca-wave' || !(binding.workspacePath || binding.runId || binding.terminalHandle)) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
+      const current = this.mailbox.getWakeTarget(mailboxId);
+      const resolvedRotateAfterWaves =
+        rotateAfterWaves ??
+        this.config.wave?.rotateAfterWaves ??
+        // Fixed Orca workspaces default to one fresh session tab per wave.
+        (workspacePath && !runId && !terminalHandle ? 1 : undefined);
+      // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
+      // handle or a workspace switch may replace it, so a restart never erases the live tab.
+      const preserveRuntimeHandle = terminalHandle === undefined && current?.workspacePath === workspacePath;
+      const clearRuntimeHandle = terminalHandle === undefined && current !== undefined && current.workspacePath !== workspacePath;
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
-        workspacePath, worktreeId, runId, terminalHandle, repoRoot: projectRoot,
+        workspacePath, worktreeId, runId, repoRoot: projectRoot,
         agent: binding.agent as 'antigravity' | 'claude' | 'codex' | undefined, interactiveCommand,
-        autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0, rotateAfterWaves,
+        autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
+        ...(resolvedRotateAfterWaves !== undefined ? { rotateAfterWaves: resolvedRotateAfterWaves } : {}),
+        ...(terminalHandle !== undefined ? { terminalHandle } : {}),
+        ...(preserveRuntimeHandle && current?.terminalHandle !== undefined
+          ? { terminalHandle: current.terminalHandle }
+          : {}),
+        ...(clearRuntimeHandle ? { terminalHandle: undefined } : {}),
       });
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);

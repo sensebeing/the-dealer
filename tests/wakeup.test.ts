@@ -1,4 +1,4 @@
-import { checkOrcaWorkspaceIdle, findOrcaWorktreeByName, isAutopilotComposerPrefill, runCommand, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
+import { checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAutopilotComposerPrefill, runCommand, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -57,6 +57,64 @@ function bodyOf(call: CommandRequest): string {
 
 function terminalSends(calls: readonly CommandRequest[]): CommandRequest[] {
   return calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'send');
+}
+
+function sendsTo(calls: readonly CommandRequest[], handle: string): CommandRequest[] {
+  return terminalSends(calls).filter(
+    call => String(call.args[call.args.indexOf('--terminal') + 1]) === handle,
+  );
+}
+
+interface FakeTerminalRow {
+  handle: string;
+  connected: boolean;
+  writable: boolean;
+  agentIdentity?: string;
+  preview?: string;
+}
+
+/** Minimal Orca inventory: one fixed workspace whose `terminal create` adds a live tab. */
+function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = []) {
+  const state = {
+    calls: [] as CommandRequest[],
+    terminals: [...initial],
+    waitOk: true,
+    created: 0,
+  };
+  const runner: CommandRunner = async request => {
+    state.calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            truncated: false,
+            worktrees: [{
+              path: workspacePath,
+              worktreeId: 'fake-worktree',
+              childWorktreeIds: [],
+              unverifiableTerminalCount: 0,
+              agents: [{ state: 'done' }],
+            }],
+          },
+        }),
+      };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: state.terminals } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      state.created += 1;
+      const handle = `term-new-${state.created}`;
+      state.terminals.push({ handle, connected: true, writable: true, agentIdentity: 'antigravity', preview: '' });
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle } } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
+      return { stdout: JSON.stringify({ ok: state.waitOk }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  return { runner, state };
 }
 
 async function cli(runtime: DealerNodeRuntime, ...args: string[]) {
@@ -176,18 +234,17 @@ test('daemon restart preserves busy waves and delivers exactly one single-line p
   assert.equal(new Set(lease.items.map(item => item.leaseId)).size, 1);
 });
 
-test('unacked recovery pointer suppresses rotation, and /new follows the ack', async t => {
+test('unacked recovery pointer suppresses rotation, and the acknowledged wave opens a fresh session tab', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
-  const calls: CommandRequest[] = [];
-  const runner: CommandRunner = async request => {
-    calls.push(request);
-    return { stdout: '{"ok":true}' };
-  };
+  const workspacePath = join(root, 'workspace');
+  mkdirSync(workspacePath);
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-alerts', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
   const service = new WakeupRedriveService({
     store,
     commandRunner: runner,
-    idleCheck: async () => ({ idle: true }),
     flushIntervalMs: 100_000,
   });
   t.after(() => service.stop());
@@ -197,7 +254,7 @@ test('unacked recovery pointer suppresses rotation, and /new follows the ack', a
       wakeTarget: {
         mode: 'orca-terminal',
         terminalHandle: 'term-alerts',
-        workspacePath: root,
+        workspacePath,
         coalesceMs: 0,
         rotateAfterWaves: 1,
         workspaceComment: 'Dealer: alerts',
@@ -205,43 +262,50 @@ test('unacked recovery pointer suppresses rotation, and /new follows the ack', a
     });
 
   enqueue(['a', 'b']);
-  await service.flushMailbox('stream:alerts');
-  const firstSends = terminalSends(calls);
-  assert.equal(firstSends.length, 1);
+  const delivered = await service.flushMailbox('stream:alerts');
+  const firstSends = sendsTo(state.calls, 'term-alerts');
+  assert.equal(firstSends.length, 1, JSON.stringify(delivered));
   assert.match(textOf(firstSends[0]), /^You have 2 Dealer message\(s\) in stream:alerts/);
-  assert.equal(calls.some(call => call.args.includes('/new')), false);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
 
   const lease = store.check({ mailboxId: 'stream:alerts' });
   enqueue(['c']);
   await service.flushMailbox('stream:alerts');
-  const dual = terminalSends(calls).at(-1)!;
+  const dual = sendsTo(state.calls, 'term-alerts').at(-1)!;
   assert.match(
     textOf(dual),
     new RegExp(`^Unacknowledged Dealer batch ${lease.deliveryId} \\+ 1 newer message\\(s\\) in stream:alerts \\[`),
   );
-  assert.equal(calls.some(call => call.args.includes('/new')), false);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
+  assert.equal(state.created, 0, 'an unacknowledged batch never rotates');
 
-  const beforeAck = calls.length;
   store.ack(lease.deliveryId!);
   await service.flushMailbox('stream:alerts');
-  await service.flushMailbox('stream:alerts');
-  const afterAck = calls.slice(beforeAck);
-  const rotated = terminalSends(afterAck);
-  assert.equal(rotated.length, 2);
-  assert.equal(textOf(rotated[0]), '/new');
-  assert.match(textOf(rotated[1]), /^You have 1 Dealer message\(s\) in stream:alerts/);
-  assert.equal(/[\r\n]/.test(textOf(rotated[1])), false);
+  assert.equal(state.created, 1, 'the acknowledged wave opens exactly one new session tab');
+  const created = state.calls.find(call => call.args[0] === 'terminal' && call.args[1] === 'create')!;
+  assert.deepEqual(created.args, [
+    'terminal', 'create', '--worktree', `path:${workspacePath}`,
+    '--command', defaultAgentLaunchCommand(), '--json',
+  ]);
+  const rotated = sendsTo(state.calls, 'term-new-1');
+  assert.equal(rotated.length, 1);
+  assert.match(textOf(rotated[0]), /^You have 1 Dealer message\(s\) in stream:alerts/);
+  assert.equal(/[\r\n]/.test(textOf(rotated[0])), false);
+  assert.equal(store.getWakeTarget('stream:alerts')!.terminalHandle, 'term-new-1');
   assert.equal(store.getWakeTarget('stream:alerts')!.completedWaves, 0);
+  // The retained tab keeps its history: it is never reset, cleared or written to again.
+  assert.equal(sendsTo(state.calls, 'term-alerts').length, 2);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '\x15'), false);
 });
 
-test('/new waits for post-rotation tui-idle before delivering the pointer', async t => {
+test('rotation persists the new session tab before tui-idle and the next tick reuses it', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
-  const calls: CommandRequest[] = [];
-  const runner: CommandRunner = async request => {
-    calls.push(request);
-    return { stdout: '{"ok":true}' };
-  };
+  const workspacePath = join(root, 'fixed');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-rotate', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
   const service = new WakeupRedriveService({
     store,
     commandRunner: runner,
@@ -251,8 +315,8 @@ test('/new waits for post-rotation tui-idle before delivering the pointer', asyn
   store.enqueue([alert('rotate-now')], {
     mailboxId: 'stream:rotate',
     wakeTarget: {
-      mode: 'orca-run',
-      runId: 'run-rotate',
+      mode: 'orca-terminal',
+      workspacePath,
       terminalHandle: 'term-rotate',
       coalesceMs: 0,
       rotateAfterWaves: 1,
@@ -260,87 +324,125 @@ test('/new waits for post-rotation tui-idle before delivering the pointer', asyn
     },
   });
 
-  const result = await service.flushMailbox('stream:rotate');
-  assert.equal(result.woke, true);
-  assert.equal(result.rotated, true);
-  const newIndex = calls.findIndex(
-    call => call.args[0] === 'terminal' && call.args[1] === 'send' && textOf(call) === '/new',
-  );
-  const waitIndex = calls.findIndex(
-    call => call.args[0] === 'terminal' && call.args[1] === 'wait',
-  );
-  const pointerIndex = calls.findIndex(call => call.args[0] === 'orchestration');
-  assert.ok(newIndex >= 0);
-  assert.ok(waitIndex > newIndex);
-  assert.equal(calls[waitIndex].args[calls[waitIndex].args.indexOf('--for') + 1], 'tui-idle');
-  assert.equal(calls[waitIndex].args[calls[waitIndex].args.indexOf('--timeout-ms') + 1], '5000');
-  assert.ok(pointerIndex > waitIndex);
-  assert.match(bodyOf(calls[pointerIndex]), /^You have 1 Dealer message\(s\) in stream:rotate/);
+  state.waitOk = false;
+  const first = await service.flushMailbox('stream:rotate');
+  assert.equal(first.woke, false);
+  assert.equal(first.rotated, true);
+  assert.equal(first.reason, 'Session rotated; waiting for tui-idle before wakeup');
+  assert.equal(state.created, 1);
+  assert.equal(store.getWakeTarget('stream:rotate')!.terminalHandle, 'term-new-1');
+  assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
+  assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, true);
+  assert.equal(terminalSends(state.calls).length, 0, 'no pointer is written before the TUI is idle');
+
+  state.waitOk = true;
+  const second = await service.flushMailbox('stream:rotate', { force: true });
+  assert.equal(second.woke, true);
+  assert.equal(second.rotated, false);
+  assert.equal(state.created, 1, 'the persisted tab is reused instead of creating another');
+  const pointer = terminalSends(state.calls).at(-1)!;
+  assert.equal(pointer.args[pointer.args.indexOf('--terminal') + 1], 'term-new-1');
+  assert.match(textOf(pointer), /^You have 1 Dealer message\(s\) in stream:rotate/);
   assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, false);
   assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
 });
 
-test('/new defers the pointer until the rotated terminal reports idle again', async t => {
+for (const retainedComposer of [
+  '> unsent draft',
+  '• ,1（主推）：继续检查剩余任务\n> 继续检查剩余任务',
+]) {
+test(`the per-wave default opens a session tab and never hijacks a retained composer ${JSON.stringify(retainedComposer)}`, async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
-  const calls: CommandRequest[] = [];
-  let waitOk = false;
-  const runner: CommandRunner = async request => {
-    calls.push(request);
-    if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
-      return { stdout: JSON.stringify({ ok: waitOk }) };
-    }
-    return { stdout: '{"ok":true}' };
-  };
+  const workspacePath = join(root, 'wave');
+  mkdirSync(workspacePath, { recursive: true });
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-human', connected: true, writable: true, agentIdentity: 'antigravity', preview: retainedComposer },
+  ]);
   const service = new WakeupRedriveService({
     store,
     commandRunner: runner,
     flushIntervalMs: 100_000,
   });
   t.after(() => service.stop());
-  store.enqueue([alert('rotate-later')], {
-    mailboxId: 'stream:rotate',
-    wakeTarget: {
-      mode: 'orca-run',
-      runId: 'run-rotate',
-      terminalHandle: 'term-rotate',
-      coalesceMs: 0,
-      rotateAfterWaves: 1,
-      completedWaves: 1,
-    },
+  const enqueue = (ids: readonly string[]) =>
+    store.enqueue(ids.map(id => alert(id)), {
+      mailboxId: 'stream:wave',
+      wakeTarget: { mode: 'orca-terminal', workspacePath, coalesceMs: 0, rotateAfterWaves: 1 },
+    });
+
+  enqueue(['a']);
+  const first = await service.flushMailbox('stream:wave');
+  assert.equal(first.woke, true, first.reason);
+  assert.equal(state.created, 1);
+  assert.equal(sendsTo(state.calls, 'term-human').length, 0, 'a human tab is never hijacked');
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '\x15'), false, 'a fresh tab needs no composer clear');
+  assert.equal(store.getWakeTarget('stream:wave')!.terminalHandle, 'term-new-1');
+
+  // Messages merged before the acknowledgement keep using this wave's own tab.
+  enqueue(['b']);
+  await service.flushMailbox('stream:wave', { force: true });
+  assert.equal(state.created, 1, 'the merged message does not open another tab');
+  const merged = sendsTo(state.calls, 'term-new-1').at(-1)!;
+  assert.match(textOf(merged), /^You have 2 Dealer message\(s\) in stream:wave/);
+
+  // A tab the user closed mid-wave is replaced instead of falling back to their other tabs.
+  state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-new-1');
+  enqueue(['c']);
+  await service.flushMailbox('stream:wave', { force: true });
+  assert.equal(state.created, 2);
+  assert.equal(sendsTo(state.calls, 'term-human').length, 0);
+  assert.equal(store.getWakeTarget('stream:wave')!.terminalHandle, 'term-new-2');
+  assert.ok(sendsTo(state.calls, 'term-new-2').length >= 1);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
+});
+}
+
+test('an explicit rotateAfterWaves above one reuses the bound tab until the threshold', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'alerts');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-alerts', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const service = new WakeupRedriveService({
+    store,
+    commandRunner: runner,
+    flushIntervalMs: 100_000,
   });
+  t.after(() => service.stop());
+  const enqueue = (id: string) =>
+    store.enqueue([alert(id)], {
+      mailboxId: 'stream:alerts',
+      wakeTarget: {
+        mode: 'orca-terminal', terminalHandle: 'term-alerts', workspacePath,
+        coalesceMs: 0, rotateAfterWaves: 2,
+      },
+    });
+  const ack = () => {
+    const lease = store.check({ mailboxId: 'stream:alerts' });
+    store.ack(lease.deliveryId!);
+  };
 
-  const first = await service.flushMailbox('stream:rotate');
-  assert.equal(first.woke, false);
-  assert.equal(first.rotated, true);
-  assert.equal(first.reason, 'Session rotated; waiting for tui-idle before wakeup');
-  assert.equal(calls.some(call => call.args[0] === 'orchestration'), false);
-  assert.equal(
-    calls.filter(
-      call => call.args[0] === 'terminal' && call.args[1] === 'send' && textOf(call) === '/new',
-    ).length,
-    1,
-  );
-  assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, true);
-  assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
-
-  waitOk = true;
-  const before = calls.length;
-  const second = await service.flushWakeups();
-  assert.equal(second.length, 1);
-  assert.equal(second[0].woke, true);
-  assert.equal(second[0].rotated, false);
-  const followUp = calls.slice(before);
-  assert.equal(
-    followUp.some(
-      call => call.args[0] === 'terminal' && call.args[1] === 'send' && textOf(call) === '/new',
-    ),
-    false,
-  );
-  const pointer = followUp.find(call => call.args[0] === 'orchestration')!;
-  assert.match(pointer.args[pointer.args.indexOf('--body') + 1], /^You have 1 Dealer message\(s\) in stream:rotate/);
-  assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, false);
-  assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
+  enqueue('one');
+  await service.flushMailbox('stream:alerts');
+  ack();
+  assert.equal(store.getWakeTarget('stream:alerts')!.completedWaves, 1);
+  enqueue('two');
+  await service.flushMailbox('stream:alerts');
+  assert.equal(state.created, 0, 'waves below the threshold reuse the bound tab');
+  assert.equal(sendsTo(state.calls, 'term-alerts').length, 2);
+  ack();
+  assert.equal(store.getWakeTarget('stream:alerts')!.completedWaves, 2);
+  enqueue('three');
+  await service.flushMailbox('stream:alerts');
+  assert.equal(state.created, 1);
+  assert.equal(store.getWakeTarget('stream:alerts')!.terminalHandle, 'term-new-1');
+  assert.equal(store.getWakeTarget('stream:alerts')!.completedWaves, 0);
+  assert.match(textOf(sendsTo(state.calls, 'term-new-1')[0]), /^You have 1 Dealer message\(s\) in stream:alerts/);
+  assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
 });
 
 test('orca-spawn never injects after a failed idle wait and redrive sends the task preamble', async t => {
@@ -1046,6 +1148,114 @@ test('Autopilot composer recognition preserves human drafts and clears only befo
     return { stdout: '{"ok":false}' };
   }, 'orca', 'term', 'pointer', { clearComposer: true }), /clear failed/);
   assert.equal(failedCalls.length, 1);
+});
+
+test('workspace idle inspection scopes composer checks to the terminal the wakeup will write', async t => {
+  const root = directory(t);
+  let terminals = [
+    { handle: 'human', connected: true, writable: true, agentIdentity: 'antigravity', preview: 'history\n> unsent draft' },
+    { handle: 'target', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ];
+  const runner: CommandRunner = async request => {
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: JSON.stringify({ ok: true, result: { truncated: false, worktrees: [
+        { path: root, worktreeId: 'root', childWorktreeIds: [], unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminals } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  // Legacy callers inspect every reachable composer in the root workspace.
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', root)).idle, false);
+  // A bound target ignores drafts in other retained conversation tabs.
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: 'target' }),
+    { idle: true, reason: undefined },
+  );
+  // A fresh session tab has its own empty composer, so no retained tab can block it.
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: null }),
+    { idle: true, reason: undefined },
+  );
+  // A closed bound handle only inspects the terminals a rebind could reuse.
+  assert.equal(
+    (await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: 'closed' })).idle,
+    false,
+  );
+
+  const suggestion = '继续检查剩余任务';
+  terminals = [
+    { handle: 'human', connected: true, writable: true, agentIdentity: 'antigravity', preview: `• ,1（主推）：${suggestion}\n> ${suggestion}` },
+    ...terminals.slice(1),
+  ];
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root),
+    { idle: true, composerPrefilled: true, reason: undefined },
+  );
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: null }),
+    { idle: true, reason: undefined },
+  );
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: 'target' }),
+    { idle: true, reason: undefined },
+  );
+});
+
+test('refreshTopicBindings keeps a runtime-resolved terminal handle across restarts', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const workspacePath = join(root, 'workspace');
+  const patch = {
+    defaultExecutor: 'orca-wave',
+    topicBindings: {
+      'collab.request.v4': {
+        executor: 'orca-wave',
+        mailboxId: 'stream:collab.request.v4',
+        workspacePath,
+      },
+    },
+    wave: { flushIntervalMs: 100_000 },
+  };
+  const make = () =>
+    new DealerNodeRuntime({
+      stateDir,
+      member: 'worker',
+      name: 'worker',
+      profile: 'dedicated-worker',
+      transport: { discoveryDir: join(root, 'mesh') },
+      commandRunner: async () => {
+        throw new Error('Unexpected external command');
+      },
+      patch,
+    });
+  const first = await make().start();
+  t.after(() => first.stop());
+  const target = first.mailbox.getWakeTarget('stream:collab.request.v4')!;
+  assert.equal(target.rotateAfterWaves, 1);
+  first.mailbox.upsertWakeTarget('stream:collab.request.v4', { terminalHandle: 'runtime-tab' });
+  await first.stop();
+
+  const second = await make().start();
+  t.after(() => second.stop());
+  assert.equal(
+    second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle,
+    'runtime-tab',
+    'a restart must not erase the live tab resolved at runtime',
+  );
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.rotateAfterWaves, 1);
+
+  // Refreshing the same binding keeps the runtime handle; switching workspaces clears it.
+  await second.applyAgentPreset({
+    host: 'orca', conversationMode: 'fixed', topic: 'collab.request.v4', workspacePath,
+  });
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle, 'runtime-tab');
+  await second.applyAgentPreset({
+    host: 'orca', conversationMode: 'fixed', topic: 'collab.request.v4', workspacePath: join(root, 'other'),
+  });
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle, undefined);
 });
 
 test('inline wakeup previews include bounded latest body, semantic sender and thread on one line', async t => {

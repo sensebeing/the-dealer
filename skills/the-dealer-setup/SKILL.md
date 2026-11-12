@@ -119,6 +119,10 @@ This prints a proposal. Apply it with `dealer setup apply-preset` and the same
 options. Include `--notify-lark` when the project requests notifications; this
 enables both `binding.notifyLark` and node-level `larkNotify.enabled`.
 For Orca, spawn creates a child worktree; fixed uses an idle-gated workspace.
+Managed fixed presets default to `rotateAfterWaves: 1`, so each wave opens a new
+agent session tab in that workspace and the previous tab is never reset or
+closed; pass an explicit rotation threshold in the binding to reuse one tab for
+several waves.
 
 ## 4. Connect another machine
 

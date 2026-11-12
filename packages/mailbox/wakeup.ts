@@ -5,12 +5,14 @@ import {
   checkedCommand,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
+  isOrcaWorkspaceTerminalLive,
   resolveOrSpawnOrcaWorkspaceTerminal,
   probeOrcaTerminalIdle,
   runCommand,
   sendOrcaTerminalText,
   setOrcaWorkspaceComment,
   singleLine,
+  spawnOrcaWorkspaceTerminal,
   waitOrcaTerminalIdle,
 } from '../orca-workspace/index.ts';
 import type { CommandRunner, OrcaIdleResult } from '../orca-workspace/index.ts';
@@ -58,6 +60,12 @@ const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
 const MAX_BACKOFF_MS = 10_000;
 const MAX_INLINE_BODY_CHARS = 400;
+
+/** Idle verdict plus the delivery plan it was measured against. */
+interface WakeupIdleDecision extends OrcaIdleResult {
+  /** The pointer needs its own session tab, so retained composers were not inspected. */
+  spawnFreshSession?: boolean;
+}
 
 export function maxPreviewSequence(preview: MailboxCheckResult): number {
   return preview.items.reduce((max, item) => Math.max(max, item.sequence),
@@ -511,7 +519,7 @@ export class WakeupRedriveService {
           target = this.store.upsertWakeTarget(mailboxId, { workspacePath: workspace.workspacePath });
         }
       }
-      const idle = await this.authoritativeIdle(target);
+      const idle = await this.authoritativeIdle(target, preview);
       if (!idle.idle) {
         // A workspace whose directory is gone can never become idle again; retrying it forever
         // would only inflate the backoff ledger. The mail stays queued for a human or a rebind.
@@ -532,18 +540,27 @@ export class WakeupRedriveService {
         }
         return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
       }
-      return await this.deliver(mailboxId, target, preview, idle.composerPrefilled === true);
+      return await this.deliver(
+        mailboxId,
+        target,
+        preview,
+        idle.composerPrefilled === true,
+        idle.spawnFreshSession === true,
+      );
     } catch (error) {
       this.report(error);
       if (!target) {
         return noWake(mailboxId, 'passive', String(error));
       }
       try {
-        if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
+        // A rotation may already have persisted a replacement tab before this attempt failed;
+        // defer against the authoritative store state so the retry targets the same tab.
+        const current = this.store.getWakeTarget(mailboxId);
+        if (current?.deliveryInDoubt) {
           settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
           return noWake(mailboxId, target.mode, String(error));
         }
-        return this.defer(mailboxId, target, String(error));
+        return this.defer(mailboxId, current ?? target, String(error));
       } catch (settleError) {
         this.report(settleError);
         return noWake(mailboxId, target.mode, String(error));
@@ -557,30 +574,73 @@ export class WakeupRedriveService {
       : preview.items.length > 0;
   }
 
-  private async authoritativeIdle(target: WakeTargetState): Promise<OrcaIdleResult> {
-    if (this.idleCheck) {
-      return this.idleCheck();
+  /**
+   * `rotateAfterWaves === 1` makes every wave own an independent session tab. Before the first
+   * wakeup, and whenever the bound tab was closed mid-wave, delivery creates a fresh tab instead
+   * of hijacking another conversation already open in the workspace.
+   */
+  private async spawnsFreshSession(
+    target: WakeTargetState,
+    preview: MailboxCheckResult,
+    command: string,
+  ): Promise<boolean> {
+    if (target.mode !== 'orca-terminal' || target.rotateAfterWaves !== 1) {
+      return false;
     }
+    // A completed wave with no outstanding lease belongs to rotation, not first-wave delivery.
+    if (!preview.deliveryId && target.completedWaves >= 1) {
+      return false;
+    }
+    // A removed workspace cannot host a new tab; the workspace probe owns the disarm decision.
+    if (!target.workspacePath || !existsSync(target.workspacePath)) {
+      return false;
+    }
+    if (!target.terminalHandle) {
+      return true;
+    }
+    return !(await isOrcaWorkspaceTerminalLive(
+      this.runner,
+      command,
+      target.workspacePath,
+      target.terminalHandle,
+    ));
+  }
+
+  private async authoritativeIdle(
+    target: WakeTargetState,
+    preview: MailboxCheckResult,
+  ): Promise<WakeupIdleDecision> {
     const command = target.orcaCommand ?? this.command;
+    const spawnFreshSession = await this.spawnsFreshSession(target, preview, command);
+    const withPlan = (idle: OrcaIdleResult): WakeupIdleDecision =>
+      spawnFreshSession ? { ...idle, spawnFreshSession: true } : idle;
+    if (this.idleCheck) {
+      return withPlan(await this.idleCheck());
+    }
     if (target.mode === 'orca-run') {
       if (target.workspacePath) {
-        return checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath);
+        return withPlan(await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath));
       }
       // Orchestration mail queues without touching a TUI composer, so no keystroke race exists.
-      return { idle: true };
+      return withPlan({ idle: true });
     }
     if (target.workspacePath) {
-      return checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath);
+      // A fresh tab is created empty, so its retained siblings must not block the wakeup; a bound
+      // tab is the only composer that can receive the pointer.
+      return withPlan(await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
+        targetTerminalHandle: spawnFreshSession ? null : target.terminalHandle,
+        agent: target.agent,
+      }));
     }
     if (target.terminalHandle) {
-      return probeOrcaTerminalIdle(
+      return withPlan(await probeOrcaTerminalIdle(
         this.runner,
         command,
         target.terminalHandle,
         target.workspacePath,
-      );
+      ));
     }
-    return { idle: false, reason: 'Authoritative terminal idle check required' };
+    return withPlan({ idle: false, reason: 'Authoritative terminal idle check required' });
   }
 
   private defer(
@@ -617,9 +677,29 @@ export class WakeupRedriveService {
       return terminal;
     }
     if (target.workspacePath) {
-      return checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath);
+      return checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
+        targetTerminalHandle: terminalHandle,
+        agent: target.agent,
+      });
     }
     return { idle: true };
+  }
+
+  private async waitSpawnedTerminalIdle(
+    target: WakeTargetState,
+    terminalHandle: string,
+    command: string,
+  ): Promise<OrcaIdleResult> {
+    if (this.idleCheck) {
+      return this.idleCheck();
+    }
+    return waitOrcaTerminalIdle(
+      this.runner,
+      command,
+      terminalHandle,
+      target.workspacePath,
+      5000,
+    );
   }
 
   private async deliver(
@@ -627,15 +707,61 @@ export class WakeupRedriveService {
     target: WakeTargetState,
     preview: MailboxCheckResult,
     composerPrefilled: boolean,
+    freshSession: boolean,
   ): Promise<WakeupFlushResult> {
     const command = target.orcaCommand ?? this.command;
     let terminalHandle = target.terminalHandle;
-    const needsRotation = !preview.deliveryId && target.rotateAfterWaves !== undefined && target.completedWaves >= target.rotateAfterWaves;
-    // Real Orca mode re-resolves before every send so a terminal closed since the last delivery
-    // is rebound (or respawned) before the external boundary is crossed; `preferredHandle` keeps
-    // a live binding without spawning a second terminal. Tests that inject an authoritative idle
-    // check only resolve when no handle exists yet.
-    if ((!terminalHandle || !this.idleCheck) && target.workspacePath && (target.mode === 'orca-terminal' || needsRotation)) {
+    const needsRotation =
+      !preview.deliveryId &&
+      target.mode === 'orca-terminal' &&
+      target.rotateAfterWaves !== undefined &&
+      target.completedWaves >= target.rotateAfterWaves;
+    const spawnFreshSession = !needsRotation && freshSession;
+    let rotated = false;
+
+    if (needsRotation || spawnFreshSession) {
+      // Rotation never resets an existing TUI: it opens a new session tab and leaves every old
+      // tab untouched. A missing workspace makes that impossible and must fail loudly.
+      if (!target.workspacePath) {
+        throw new Error(`Orca session rotation requires a workspacePath: ${mailboxId}`);
+      }
+      const spawned = await spawnOrcaWorkspaceTerminal(
+        this.runner,
+        command,
+        target.workspacePath,
+        undefined,
+        { agent: target.agent, interactiveCommand: target.interactiveCommand },
+      );
+      terminalHandle = spawned.handle;
+      // Persist the fresh tab before any idle wait so a busy tail or a restart reuses this tab
+      // instead of opening another one for the same wave.
+      target = this.store.upsertWakeTarget(
+        mailboxId,
+        needsRotation ? { terminalHandle, completedWaves: 0 } : { terminalHandle },
+      );
+      composerPrefilled = false;
+      if (needsRotation) {
+        rotated = true;
+        const idle = await this.postRotationIdle(target, terminalHandle, command);
+        if (!idle.idle) {
+          const deferred = this.defer(
+            mailboxId,
+            target,
+            'Session rotated; waiting for tui-idle before wakeup',
+          );
+          return { ...deferred, rotated: true };
+        }
+      } else {
+        const idle = await this.waitSpawnedTerminalIdle(target, terminalHandle, command);
+        if (!idle.idle) {
+          return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
+        }
+      }
+    } else if ((!terminalHandle || !this.idleCheck) && target.workspacePath && target.mode === 'orca-terminal') {
+      // Real Orca mode re-resolves before every send so a terminal closed since the last delivery
+      // is rebound (or respawned) before the external boundary is crossed; `preferredHandle` keeps
+      // a live binding without spawning a second terminal. Tests that inject an authoritative idle
+      // check only resolve when no handle exists yet.
       const resolved = await resolveOrSpawnOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, { agent: target.agent, interactiveCommand: target.interactiveCommand, preferredHandle: target.terminalHandle });
       terminalHandle = resolved.handle;
       target = { ...target, terminalHandle };
@@ -645,38 +771,6 @@ export class WakeupRedriveService {
         }
         const idle = this.idleCheck ? await this.idleCheck() : await waitOrcaTerminalIdle(this.runner, command, terminalHandle, target.workspacePath, 5000);
         if (!idle.idle) return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
-      }
-    }
-    let rotated = false;
-    let rotationTerminal: string | undefined;
-    if (needsRotation) {
-      rotationTerminal = terminalHandle;
-      if (rotationTerminal) {
-        await sendOrcaTerminalText(
-          this.runner,
-          command,
-          rotationTerminal,
-          '/new',
-          { cwd: target.workspacePath, ...(composerPrefilled ? { clearComposer: true } : {}) },
-        );
-        // Reset before the pointer so a crash cannot rotate twice for the same completed wave.
-        this.store.upsertWakeTarget(mailboxId, { completedWaves: 0 });
-        rotated = true;
-      }
-    }
-
-    if (rotated && rotationTerminal) {
-      // `/new` tears down and re-initializes the TUI; never race the wakeup pointer into that
-      // transition. A busy target keeps pendingWake so the next idle tick delivers only the pointer.
-      const idle = await this.postRotationIdle(target, rotationTerminal, command);
-      composerPrefilled = idle.composerPrefilled === true;
-      if (!idle.idle) {
-        const deferred = this.defer(
-          mailboxId,
-          { ...target, completedWaves: 0 },
-          'Session rotated; waiting for tui-idle before wakeup',
-        );
-        return { ...deferred, rotated: true };
       }
     }
 

@@ -1267,7 +1267,8 @@ export class MailboxStore {
           const target = state.wakeTargets[candidate];
           if (target) {
             // A completed wave with mail already queued behind it is exactly the safe boundary
-            // for /new: re-arm the target so the wakeup service can rotate and point at it.
+            // for session rotation: re-arm the target so the wakeup service can open the next
+            // wave's session tab and point at it.
             const hasQueued = state.items.some(
               item => item.mailboxId === candidate && item.status === 'queued',
             );
