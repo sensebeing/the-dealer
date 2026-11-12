@@ -177,6 +177,12 @@ export class DealerNodeRuntime {
   private draining = false;
   /** Drain waits woken by every control-request completion; the dispatcher wakes its own. */
   private drainWakeups = new Set<() => void>();
+  /** One in-flight drain decision shared by every concurrent shutdown request. */
+  private drainDecision?: Promise<boolean>;
+  /** Shutdown requests currently waiting on the shared decision, including their caller slot. */
+  private shutdownWaiters = 0;
+  /** One teardown owner: concurrent stop callers await the same stop. */
+  private stopPromise?: Promise<void>;
   private daemonInstanceId?: string;
   private daemonFingerprint?: string;
   private daemonStartedAt?: string;
@@ -389,6 +395,9 @@ export class DealerNodeRuntime {
     if (this.started) {
       return this;
     }
+    // A fresh lifecycle must not inherit a previous teardown decision.
+    this.drainDecision = undefined;
+    this.stopPromise = undefined;
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     chmodSync(this.stateDir, 0o700);
     const lockDir = join(this.stateDir, 'runtime.lock');
@@ -1330,15 +1339,54 @@ export class DealerNodeRuntime {
    * control request's completion wake the wait. A timeout leaves the daemon fully serving,
    * including in-flight dispatches that still need control.sock to settle. Only a confirmed
    * drain synchronously fences new control requests and commits the daemon to stopping.
+   *
+   * The decision is single-flight. A concurrent shutdown request joins the running drain
+   * instead of opening a second one, and its own control slot joins the allowance the drain
+   * tolerates, so two `node down` callers can neither block each other nor commit twice.
    */
   async drainForStop(
     options: { drainTimeoutMs?: number; callerControlRequests?: number } = {},
   ): Promise<boolean> {
-    const callerControlRequests = options.callerControlRequests ?? 0;
-    const drained = () =>
-      this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
-      this.activeMutatingControlRequests <= callerControlRequests;
-    const deadline = Date.now() + (options.drainTimeoutMs ?? 15_000);
+    this.shutdownWaiters++;
+    // The joined caller widens the allowance it is part of; re-evaluate now instead of leaving
+    // the running drain to wait on the request that just joined it.
+    this.wakeDrainWaiters();
+    try {
+      if (!this.drainDecision) {
+        const callerControlRequests = options.callerControlRequests ?? 0;
+        const decision = this.waitForDrain(
+          options.drainTimeoutMs ?? 15_000,
+          () =>
+            this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
+            this.activeMutatingControlRequests <= callerControlRequests + this.shutdownWaiters - 1,
+        );
+        this.drainDecision = decision.then(
+          drained => {
+            if (drained) {
+              // Node.js runs this turn to completion before a new request can be admitted, so
+              // the fence opens exactly at the commit point, never during a drain that may defer.
+              this.draining = true;
+            } else {
+              // A deferred drain leaves no decision behind: a later shutdown may try again.
+              this.drainDecision = undefined;
+            }
+            return drained;
+          },
+          error => {
+            // A failed drain decision must not poison every later shutdown attempt.
+            this.drainDecision = undefined;
+            throw error;
+          },
+        );
+      }
+      return await this.drainDecision;
+    } finally {
+      this.shutdownWaiters--;
+    }
+  }
+
+  private async waitForDrain(timeoutMs: number, drained: () => boolean): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
     while (!drained()) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
@@ -1346,13 +1394,13 @@ export class DealerNodeRuntime {
       }
       await this.waitForDrainWake(remaining);
     }
-    if (!drained()) {
-      return false;
+    return drained();
+  }
+
+  private wakeDrainWaiters(): void {
+    for (const wake of [...this.drainWakeups]) {
+      wake();
     }
-    // Node.js runs this turn to completion before any new request can be admitted, so the
-    // fence opens exactly at the commit point and never during a drain that may defer.
-    this.draining = true;
-    return true;
   }
 
   private waitForDrainWake(timeoutMs: number): Promise<void> {
@@ -1384,9 +1432,7 @@ export class DealerNodeRuntime {
   /** One owner for decrementing in-flight control work and waking drain waiters. */
   private controlRequestSettled(): void {
     this.activeMutatingControlRequests--;
-    for (const wake of [...this.drainWakeups]) {
-      wake();
-    }
+    this.wakeDrainWaiters();
     if (this.activeMutatingControlRequests === 0) {
       this.onControlIdle?.();
     }
@@ -1531,7 +1577,13 @@ export class DealerNodeRuntime {
     this.writeDaemonFingerprintRecord();
   }
 
-  async stop(): Promise<void> {
+  /** Single owner of the irreversible teardown: every concurrent caller awaits one stop. */
+  stop(): Promise<void> {
+    this.stopPromise ??= this.finishStop();
+    return this.stopPromise;
+  }
+
+  private async finishStop(): Promise<void> {
     const hadServer = this.server !== undefined;
     try {
       await this.wakeups?.stop();

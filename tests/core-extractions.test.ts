@@ -482,3 +482,49 @@ test('daemon drain waits for in-flight control work, wakes on its completion, th
   // A completed drain commits the daemon to stopping: no later request is admitted.
   await assert.rejects(rpc(runtime.socketPath, ['probe']), /Daemon is draining/);
 });
+
+test('concurrent shutdown callers share one drain decision and one teardown', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), profile: 'headless-relay' }).start();
+  t.after(() => runtime.stop());
+  let admitted = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  let bothAdmitted!: () => void;
+  const holding = new Promise<void>(resolve => {
+    bothAdmitted = resolve;
+  });
+  await runtime.serveControl(async argv => {
+    if (argv[0] !== 'shutdown') {
+      return { code: 0, stdout: ['done'], stderr: [] };
+    }
+    if (++admitted === 2) {
+      bothAdmitted();
+    }
+    await gate;
+    return { code: 0, stdout: [String(await runtime.drainForStop({ callerControlRequests: 1 }))], stderr: [] };
+  });
+  let teardowns = 0;
+  const wakeups = runtime.wakeups;
+  const stopWakeups = wakeups.stop.bind(wakeups);
+  wakeups.stop = async () => {
+    teardowns += 1;
+    await stopWakeups();
+  };
+  const first = rpc(runtime.socketPath, ['shutdown']);
+  const second = rpc(runtime.socketPath, ['shutdown']);
+  await holding;
+  const began = performance.now();
+  release();
+  const outcomes = await Promise.all([first, second]);
+  // Each shutdown caller counts in the allowance: neither may wait on the other, and both
+  // observe the one shared decision.
+  assert.deepEqual(outcomes.map(result => result.stdout[0]), ['true', 'true']);
+  assert.ok(performance.now() - began < 2_000, 'concurrent shutdown callers waited on each other');
+  // The committed daemon fences new requests and shares one teardown among stop callers.
+  await assert.rejects(rpc(runtime.socketPath, ['probe']), /Daemon is draining/);
+  await Promise.all([runtime.stop(), runtime.stop()]);
+  assert.equal(teardowns, 1);
+});
