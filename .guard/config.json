@@ -31,7 +31,8 @@
     "service_config_roots": [
       "packages",
       "native"
-    ]
+    ],
+    "integration_mode": "github-pr"
   },
   "topology": {
     "modules": [
