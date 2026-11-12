@@ -281,6 +281,9 @@ export async function rpc(
   });
 }
 
+/** One startup budget for every path that waits on a daemon becoming usable. */
+const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
+
 async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -298,7 +301,7 @@ async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> 
     const timer = setTimeout(() => {
       child.kill();
       finish(new Error('Daemon startup timed out'));
-    }, 30000);
+    }, DAEMON_STARTUP_TIMEOUT_MS);
     function finish(error?: Error, value?: unknown) {
       if (settled) {
         return;
@@ -447,24 +450,126 @@ export async function stopDaemonIfRunning(
   };
 }
 
-export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
-  if (existsSync(join(stateDir, 'control.sock'))) {
+type DaemonStatusProbe =
+  | { state: 'not-ready' }
+  /** The socket answered, but as a runtime that does not match the expected fingerprint. */
+  | { state: 'mismatch' }
+  | { state: 'ready'; status: unknown };
+
+/** Connection-level failures that only mean the control socket is not accepting requests yet. */
+const TRANSIENT_CONTROL_SOCKET_CODES = new Set(['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE']);
+
+/**
+ * A live lock owner is not yet a usable daemon: it loads plugins and mounts networks before it
+ * starts serving `control.sock`. Only a status answer carrying the expected fingerprint proves
+ * that cold start finished; a socket answered by another fingerprint is a draining predecessor,
+ * not the daemon this caller is waiting for. A listener that is still coming up is the only
+ * failure treated as not-ready: malformed responses and daemon-reported errors surface as-is.
+ */
+async function probeMatchingDaemonStatus(
+  stateDir: string,
+  expectedFingerprint: string,
+): Promise<DaemonStatusProbe> {
+  const socket = join(stateDir, 'control.sock');
+  if (!existsSync(socket)) {
+    return { state: 'not-ready' };
+  }
+  let result: { code: number; stdout: string[]; stderr: string[] };
+  try {
+    result = await rpc(socket, ['node', 'status', '--json'], { inactivityMs: 2_000 });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === 'string' && TRANSIENT_CONTROL_SOCKET_CODES.has(code)) {
+      return { state: 'not-ready' };
+    }
+    throw error;
+  }
+  if (result.code !== 0) {
+    throw new Error(result.stderr.join('\n') || `Daemon status exited ${result.code}`);
+  }
+  const status = JSON.parse(result.stdout.join(''));
+  return status.runtimeFingerprint === expectedFingerprint
+    ? { state: 'ready', status }
+    : { state: 'mismatch' };
+}
+
+/**
+ * The state directory is the authoritative source of startup events: the daemon creates
+ * `control.sock` only once it is serving, and releases `runtime.lock` only when it stops. Wake
+ * on either change instead of polling; the bounded fallback covers only a missed watch event.
+ */
+function waitForDaemonStateChange(stateDir: string, timeoutMs: number): Promise<void> {
+  return new Promise(resolve => {
+    let watcher: ReturnType<typeof watch> | undefined;
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      watcher?.close();
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
     try {
-      const status = JSON.parse((await rpc(join(stateDir, 'control.sock'), ['node', 'status', '--json'], { inactivityMs: 2_000 })).stdout.join(''));
-      if (status.runtimeFingerprint === computeRuntimeFingerprint(stateDir)) return status;
-    } catch { /* stale socket */ }
+      watcher = watch(stateDir, { persistent: false }, (event, filename) => {
+        if (filename === null || filename === 'control.sock' || filename.startsWith('runtime.lock')) {
+          finish();
+        }
+      });
+      watcher.on('error', finish);
+      watcher.unref();
+    } catch {
+      // Watching is unavailable; the bounded wake-up still releases the wait.
+    }
+  });
+}
+
+/**
+ * Wait for the daemon that currently owns the state directory to finish starting. A supervisor
+ * replacement claims the lock immediately but needs real time before the control socket
+ * appears; spawning a second process in that window only collides with the owner. Give the live
+ * owner the same budget as a fresh `launchDaemon`, and leave early when the owner dies.
+ */
+async function waitForOwnedDaemonReady(
+  stateDir: string,
+  expectedFingerprint: string,
+  timeoutMs = DAEMON_STARTUP_TIMEOUT_MS,
+): Promise<unknown | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && liveDaemonOwner(stateDir)) {
+    const probe = await probeMatchingDaemonStatus(stateDir, expectedFingerprint);
+    if (probe.state === 'ready') {
+      return probe.status;
+    }
+    if (probe.state === 'mismatch') {
+      // The socket belongs to a different runtime; waiting cannot turn it into ours.
+      return undefined;
+    }
+    await waitForDaemonStateChange(stateDir, Math.min(1_000, Math.max(0, deadline - Date.now())));
+  }
+  const final = await probeMatchingDaemonStatus(stateDir, expectedFingerprint);
+  return final.state === 'ready' ? final.status : undefined;
+}
+
+export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
+  // The fingerprint hashes the whole code tree; compute it once so the readiness wait never
+  // re-reads it while a cold start is still loading plugins and mounting networks.
+  const expectedFingerprint = computeRuntimeFingerprint(stateDir);
+  const ready = await waitForOwnedDaemonReady(stateDir, expectedFingerprint);
+  if (ready) {
+    return ready;
   }
   try {
     return await launchDaemon([], stateDir);
   } catch (error) {
-    const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline) {
-      try {
-        const result = await rpc(join(stateDir, 'control.sock'), ['node', 'status', '--json'], { inactivityMs: 500 });
-        const status = JSON.parse(result.stdout.join(''));
-        if (status.runtimeFingerprint === computeRuntimeFingerprint(stateDir)) return status;
-      } catch { /* concurrent launch still settling */ }
-      await new Promise(resolve => setTimeout(resolve, 100));
+    // A supervisor such as launchd may have claimed the lock between the readiness check and
+    // the spawn; wait for that live owner to finish serving instead of failing on the
+    // duplicate process's `State directory already owned`.
+    const concurrent = await waitForOwnedDaemonReady(stateDir, expectedFingerprint);
+    if (concurrent) {
+      return concurrent;
     }
     throw error;
   }
