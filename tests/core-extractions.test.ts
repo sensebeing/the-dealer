@@ -528,3 +528,43 @@ test('concurrent shutdown callers share one drain decision and one teardown', as
   await Promise.all([runtime.stop(), runtime.stop()]);
   assert.equal(teardowns, 1);
 });
+
+test('drain waiters holding no control slot never widen the allowance', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({ stateDir: join(root, 'state'), profile: 'headless-relay' }).start();
+  t.after(() => runtime.stop());
+  let releaseProbe!: () => void;
+  const probeGate = new Promise<void>(resolve => {
+    releaseProbe = resolve;
+  });
+  let probeAdmitted!: () => void;
+  const probeHeld = new Promise<void>(resolve => {
+    probeAdmitted = resolve;
+  });
+  await runtime.serveControl(async argv => {
+    if (argv[0] === 'status') {
+      return { code: 0, stdout: ['ok'], stderr: [] };
+    }
+    probeAdmitted();
+    await probeGate;
+    return { code: 0, stdout: ['probed'], stderr: [] };
+  });
+  const probe = rpc(runtime.socketPath, ['probe']);
+  await probeHeld;
+  // Two gracefulStop() callers hold no control slot of their own, so they tolerate no other
+  // in-flight control work: the unrelated `probe` request must defer the shared decision
+  // instead of being torn down under.
+  const settled = await Promise.allSettled([
+    runtime.gracefulStop({ drainTimeoutMs: 200 }),
+    runtime.gracefulStop({ drainTimeoutMs: 200 }),
+  ]);
+  assert.deepEqual(settled.map(result => result.status), ['rejected', 'rejected']);
+  for (const result of settled) {
+    assert.match(String(result.status === 'rejected' ? result.reason : ''), /timed out/);
+  }
+  // A deferred drain leaves the daemon fully serving, including the request it waited for.
+  assert.deepEqual((await rpc(runtime.socketPath, ['status'])).stdout, ['ok']);
+  releaseProbe();
+  assert.deepEqual((await probe).stdout, ['probed']);
+  assert.equal(await runtime.drainForStop({ drainTimeoutMs: 2_000 }), true);
+});

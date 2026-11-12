@@ -179,8 +179,8 @@ export class DealerNodeRuntime {
   private drainWakeups = new Set<() => void>();
   /** One in-flight drain decision shared by every concurrent shutdown request. */
   private drainDecision?: Promise<boolean>;
-  /** Shutdown requests currently waiting on the shared decision, including their caller slot. */
-  private shutdownWaiters = 0;
+  /** Sum of control-request slots held by every caller waiting on the shared drain decision. */
+  private shutdownControlSlots = 0;
   /** One teardown owner: concurrent stop callers await the same stop. */
   private stopPromise?: Promise<void>;
   private daemonInstanceId?: string;
@@ -398,6 +398,7 @@ export class DealerNodeRuntime {
     // A fresh lifecycle must not inherit a previous teardown decision.
     this.drainDecision = undefined;
     this.stopPromise = undefined;
+    this.shutdownControlSlots = 0;
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     chmodSync(this.stateDir, 0o700);
     const lockDir = join(this.stateDir, 'runtime.lock');
@@ -1341,24 +1342,26 @@ export class DealerNodeRuntime {
    * drain synchronously fences new control requests and commits the daemon to stopping.
    *
    * The decision is single-flight. A concurrent shutdown request joins the running drain
-   * instead of opening a second one, and its own control slot joins the allowance the drain
-   * tolerates, so two `node down` callers can neither block each other nor commit twice.
+   * instead of opening a second one, and the control slot it holds joins the allowance the
+   * drain tolerates, so two `node down` callers can neither block each other nor commit twice.
+   * A caller holding no control slot (`gracefulStop`) widens nothing: unrelated control work
+   * still blocks the commit.
    */
   async drainForStop(
     options: { drainTimeoutMs?: number; callerControlRequests?: number } = {},
   ): Promise<boolean> {
-    this.shutdownWaiters++;
+    const callerControlRequests = options.callerControlRequests ?? 0;
+    this.shutdownControlSlots += callerControlRequests;
     // The joined caller widens the allowance it is part of; re-evaluate now instead of leaving
     // the running drain to wait on the request that just joined it.
     this.wakeDrainWaiters();
     try {
       if (!this.drainDecision) {
-        const callerControlRequests = options.callerControlRequests ?? 0;
         const decision = this.waitForDrain(
           options.drainTimeoutMs ?? 15_000,
           () =>
             this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
-            this.activeMutatingControlRequests <= callerControlRequests + this.shutdownWaiters - 1,
+            this.activeMutatingControlRequests <= this.shutdownControlSlots,
         );
         this.drainDecision = decision.then(
           drained => {
@@ -1381,7 +1384,7 @@ export class DealerNodeRuntime {
       }
       return await this.drainDecision;
     } finally {
-      this.shutdownWaiters--;
+      this.shutdownControlSlots -= callerControlRequests;
     }
   }
 
