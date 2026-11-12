@@ -11,7 +11,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveMailboxId, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup } from '../mailbox/index.ts';
+import { MailboxStore, resolveMailboxId, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
@@ -654,13 +654,16 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
       const waveConfig = config.wave ?? options.wave;
       const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
-      const rotateAfterWaves =
-        binding?.rotateAfterWaves ??
-        optionalPositiveInteger(waveConfig?.rotateAfterWaves) ??
-        (hasReceiverTarget ? undefined : optionalPositiveInteger(payload.rotateAfterWaves)) ??
-        // Fixed Orca workspaces default to one fresh session tab per wave; an explicitly bound
-        // terminal or an Orca Run (which owns its coordinator session) keeps the unset default.
-        (cwd && !runId && !receiverTerminalHandle ? 1 : undefined);
+      const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
+        bindingRotateAfterWaves: binding?.rotateAfterWaves,
+        waveRotateAfterWaves: optionalPositiveInteger(waveConfig?.rotateAfterWaves),
+        fallbackRotateAfterWaves: hasReceiverTarget
+          ? undefined
+          : optionalPositiveInteger(payload.rotateAfterWaves),
+        managesWorkspace: Boolean(cwd),
+        runId,
+        pinnedTerminalHandle: receiverTerminalHandle,
+      });
       const worktreeId =
         binding?.worktreeId ??
         config.worktreeId ??

@@ -72,6 +72,44 @@ export function maxPreviewSequence(preview: MailboxCheckResult): number {
     Math.max(preview.maxQueuedSequence ?? -1, preview.latestQueued?.sequence ?? -1));
 }
 
+/** Fixed Orca workspaces open one independent session tab per wave unless configured otherwise. */
+export const DEFAULT_ORCA_WORKSPACE_ROTATE_AFTER_WAVES = 1;
+
+export interface OrcaWaveRotateAfterWavesInput {
+  /** Threshold configured on the resolved topic binding. */
+  bindingRotateAfterWaves?: number;
+  /** Threshold configured once for the whole wave executor/host. */
+  waveRotateAfterWaves?: number;
+  /** Threshold supplied by a deployment whose receiver configured no local target. */
+  fallbackRotateAfterWaves?: number;
+  /** Whether the receiver manages a fixed Orca workspace that can host session tabs. */
+  managesWorkspace: boolean;
+  /** An Orca Run owns its coordinator session, so it never rotates tabs. */
+  runId?: string;
+  /** An explicitly pinned terminal keeps its conversation instead of rotating. */
+  pinnedTerminalHandle?: string;
+}
+
+/**
+ * The single owner of the managed Orca fixed-workspace rotation policy. Preset generation,
+ * binding refresh, and wave enqueue all resolve their effective threshold here so the rule can
+ * never diverge between entry paths.
+ */
+export function resolveOrcaWaveRotateAfterWaves(
+  input: OrcaWaveRotateAfterWavesInput,
+): number | undefined {
+  const explicit =
+    input.bindingRotateAfterWaves ??
+    input.waveRotateAfterWaves ??
+    input.fallbackRotateAfterWaves;
+  if (explicit !== undefined) {
+    return explicit;
+  }
+  return input.managesWorkspace && !input.runId && !input.pinnedTerminalHandle
+    ? DEFAULT_ORCA_WORKSPACE_ROTATE_AFTER_WAVES
+    : undefined;
+}
+
 /**
  * A completed wave (or rotation window) without an outstanding lease is the single rotation
  * trigger: the next wakeup must open its own session tab instead of reusing the retained one.

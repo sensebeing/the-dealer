@@ -166,10 +166,11 @@ function reusableTerminalCandidates(
 
 /**
  * Authoritative recursive idle inspection: every workspace in the root's subtree must report no
- * unverifiable terminals, every agent must be done, and every connected writable terminal the
- * wakeup could write into must be free of an unsent composer draft. When a fresh session tab will
- * receive the pointer, retained tabs in the root workspace neither block the wakeup nor mark the
- * composer prefilled. Synthetic inventories are confirmed with `terminal wait`.
+ * unverifiable terminals, every agent must be done with at least as many connected terminals as
+ * agents, and every terminal the wakeup could write into must be connected, writable and free of
+ * an unsent composer draft. When a fresh session tab will receive the pointer, retained tabs in
+ * the root workspace neither block the wakeup nor mark the composer prefilled. Synthetic
+ * inventories are confirmed with `terminal wait`.
  */
 export async function checkOrcaWorkspaceIdle(
   runner: CommandRunner,
@@ -235,18 +236,20 @@ export async function checkOrcaWorkspaceIdle(
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
     const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
-    if (observableHandles.length < row.agents.length) {
+    if (observableHandles.filter(t => Boolean(t.connected)).length < row.agents.length) {
       return false;
     }
-    // Composer state only matters for terminals this wakeup may actually write into: a fresh tab
-    // gets its own empty composer, so retained tabs never block it or mark it prefilled.
+    // Liveness and composer state only matter for terminals this wakeup may actually write into:
+    // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
+    // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
+    // rebind could reuse when it was closed).
     const rootTarget = row.path === cwd ? options?.targetTerminalHandle : undefined;
     const targetPresent = typeof rootTarget === 'string' &&
       observableHandles.some(t => String(t.handle) === rootTarget);
     const reuseHandles = typeof rootTarget === 'string' && !targetPresent
       ? new Set(reusableTerminalCandidates(observableHandles, options?.agent).map(t => String(t.handle)))
       : undefined;
-    const inspectComposer = (terminal: OrcaTerminalRow): boolean => {
+    const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
       if (row.path !== cwd) return true;
       if (rootTarget === null) return false;
       if (rootTarget === undefined) return true;
@@ -255,6 +258,9 @@ export async function checkOrcaWorkspaceIdle(
       return reuseHandles?.has(String(terminal.handle)) === true;
     };
     for (const terminal of observableHandles) {
+      if (!gatesWakeup(terminal)) {
+        continue;
+      }
       if (!terminal.connected || !terminal.writable) {
         return false;
       }
@@ -285,9 +291,6 @@ export async function checkOrcaWorkspaceIdle(
         } catch {
           return false;
         }
-        continue;
-      }
-      if (!inspectComposer(terminal)) {
         continue;
       }
       if (typeof terminal.preview === 'string') {

@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { redactProjectManifest, readProjectManifest, validateTopicBindings } from './config.ts';
 import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, TopicBindingConfig } from './config.ts';
+import { resolveOrcaWaveRotateAfterWaves } from '../mailbox/index.ts';
 import { findExecutable } from '../orca-workspace/executable.ts';
 import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
 
@@ -138,7 +139,13 @@ export function buildAgentBindingPreset(options: {
     ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     ...(options.notifyLark !== undefined ? { notifyLark: options.notifyLark } : {}),
     ...(managed && mode === 'fixed'
-      ? { autoCreateWorkspace: true, rotateAfterWaves: options.rotateAfterWaves ?? 1 }
+      ? {
+          autoCreateWorkspace: true,
+          rotateAfterWaves: resolveOrcaWaveRotateAfterWaves({
+            bindingRotateAfterWaves: options.rotateAfterWaves,
+            managesWorkspace: true,
+          }),
+        }
       : {}),
   };
   validateTopicBindings({ [topic]: binding }, [executor]);

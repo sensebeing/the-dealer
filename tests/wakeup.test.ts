@@ -1263,6 +1263,111 @@ test('workspace idle inspection scopes composer checks to the terminal the wakeu
   );
 });
 
+test('fresh-tab and bound-tab plans ignore disconnected or non-writable retained tabs', async t => {
+  const root = directory(t);
+  const { runner, state } = fakeOrcaWorkspace(root, [
+    { handle: 'target', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'dead-human', connected: false, writable: true, agentIdentity: 'antigravity', preview: '> unsent draft' },
+    { handle: 'readonly-human', connected: true, writable: false, agentIdentity: 'antigravity', preview: '> unsent draft' },
+  ]);
+  // A fresh session tab receives the pointer, so no retained tab can gate the wakeup.
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: null }),
+    { idle: true, reason: undefined },
+  );
+  // A bound target gates only itself; unrelated dead or non-writable tabs are irrelevant.
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: 'target' }),
+    { idle: true, reason: undefined },
+  );
+  // Legacy inspection still rejects the disconnected retained tab.
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root),
+    { idle: false, reason: 'Workspace or descendant is busy or unverifiable' },
+  );
+  // The terminal that actually receives the pointer must still be connected and writable.
+  state.terminals = [
+    { handle: 'target', connected: true, writable: false, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'live-human', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ];
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: 'target' }),
+    { idle: false, reason: 'Workspace or descendant is busy or unverifiable' },
+  );
+});
+
+test('fresh-tab delivery is not blocked by a disconnected retained tab', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'fresh');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-dead', connected: false, writable: true, agentIdentity: 'antigravity', preview: '> unsent draft' },
+  ]);
+  const service = new WakeupRedriveService({
+    store,
+    commandRunner: runner,
+    flushIntervalMs: 100_000,
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('fresh-dead')], {
+    mailboxId: 'stream:fresh-dead',
+    wakeTarget: { mode: 'orca-terminal', workspacePath, coalesceMs: 0, rotateAfterWaves: 1 },
+  });
+
+  const delivered = await service.flushMailbox('stream:fresh-dead');
+  assert.equal(delivered.woke, true, delivered.reason);
+  assert.equal(state.created, 1);
+  assert.equal(sendsTo(state.calls, 'term-dead').length, 0);
+  const pointer = sendsTo(state.calls, 'term-new-1')[0];
+  assert.match(textOf(pointer), /^You have 1 Dealer message\(s\) in stream:fresh-dead/);
+});
+
+test('rotation is not blocked by a non-writable retained tab', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'rotate');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-bound', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const service = new WakeupRedriveService({
+    store,
+    commandRunner: runner,
+    flushIntervalMs: 100_000,
+  });
+  t.after(() => service.stop());
+  const enqueue = (id: string) =>
+    store.enqueue([alert(id)], {
+      mailboxId: 'stream:rotate-readonly',
+      wakeTarget: {
+        mode: 'orca-terminal', terminalHandle: 'term-bound', workspacePath,
+        coalesceMs: 0, rotateAfterWaves: 1,
+      },
+    });
+
+  enqueue('wave-one');
+  assert.equal((await service.flushMailbox('stream:rotate-readonly')).woke, true);
+  const lease = store.check({ mailboxId: 'stream:rotate-readonly' });
+  store.ack(lease.deliveryId!);
+  assert.equal(sendsTo(state.calls, 'term-bound').length, 1);
+
+  state.terminals = state.terminals.map(terminal =>
+    terminal.handle === 'term-bound' ? { ...terminal, writable: false } : terminal);
+  enqueue('wave-two');
+  const rotated = await service.flushMailbox('stream:rotate-readonly');
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 1);
+  assert.equal(
+    sendsTo(state.calls, 'term-bound').length,
+    1,
+    'the retained tab is never written to again',
+  );
+  const pointer = sendsTo(state.calls, 'term-new-1')[0];
+  assert.match(textOf(pointer), /^You have 1 Dealer message\(s\) in stream:rotate-readonly/);
+});
+
 test('refreshTopicBindings keeps a runtime-resolved terminal handle across restarts', async t => {
   const root = directory(t);
   const stateDir = join(root, 'state');
