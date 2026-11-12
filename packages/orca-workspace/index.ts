@@ -59,9 +59,7 @@ export const runCommand: CommandRunner = request =>
     let child;
     try {
       child = spawn(request.command, [...request.args], {
-        // A cleaned-up workspace path must not turn a valid command into spawn ENOENT; the OS
-        // falls back to the daemon's own cwd when the requested directory is gone.
-        cwd: request.cwd && existsSync(request.cwd) ? request.cwd : undefined,
+        cwd: request.cwd,
         signal: request.signal,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: false,
@@ -150,7 +148,10 @@ export async function checkOrcaWorkspaceIdle(
   const output = await checkedCommand(runner, {
     command,
     args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'],
-    cwd,
+    // Only this read-only inventory probe narrows a removed workspace directory to the daemon's
+    // cwd: the gone path must be reported as "Workspace not found" before anything is spawned
+    // inside it, while the shared runner keeps strict cwd semantics for every other caller.
+    cwd: runner === runCommand && !existsSync(cwd) ? undefined : cwd,
     signal,
   });
   const raw = JSON.parse(output.stdout);

@@ -1309,15 +1309,35 @@ test('a closed persisted terminal is rebound to the live one before the pointer 
   assert.equal(target.deliveryInDoubt, undefined);
 });
 
-test('runCommand spawns from the inherited cwd when the requested directory is gone', async t => {
-  const missing = join(directory(t), 'removed-worktree');
-  const output = await runCommand({
-    command: process.execPath,
-    args: ['-e', 'process.stdout.write(process.cwd())'],
-    cwd: missing,
-  });
-  assert.equal(output.exitCode, 0);
-  assert.equal(output.stdout, process.cwd());
+test('runCommand keeps strict cwd semantics while only the read-only workspace probe narrows a gone cwd', async t => {
+  const root = directory(t);
+  const missing = join(root, 'removed-worktree');
+
+  // The shared runner still proves the process boundary: requesting a cwd that is gone is a
+  // CommandNotStartedError, never a silent fallback to the daemon's own cwd.
+  await assert.rejects(
+    runCommand({
+      command: process.execPath,
+      args: ['-e', 'process.stdout.write(process.cwd())'],
+      cwd: missing,
+    }),
+    { name: 'CommandNotStartedError' },
+  );
+
+  // Only the read-only global inventory probe narrows the cwd: it runs from the daemon cwd and
+  // reports the removed workspace before anything is spawned inside the gone directory.
+  const fakeOrca = join(root, 'fake-orca');
+  writeFileSync(fakeOrca, [
+    `#!${process.execPath}`,
+    `if (process.cwd() !== ${JSON.stringify(process.cwd())}) process.exit(3);`,
+    `if (process.argv.slice(2).join(' ') !== 'worktree ps --agent-wait --limit 10000 --json') process.exit(4);`,
+    `process.stdout.write(JSON.stringify({ ok: true, result: { worktrees: [] } }));`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runCommand, fakeOrca, missing),
+    { idle: false, reason: 'Workspace not found' },
+  );
 });
 
 test('a removed non-auto-created workspace disarms wake retries but keeps the queued mail', async t => {
