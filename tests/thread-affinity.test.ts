@@ -262,3 +262,63 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
   assert.ok(explicit, 'the explicit target mailbox must win');
   assert.equal(explicit.envelope.semantic?.targetMailbox, 'worktree:peer-session');
 });
+
+test('dealer send --thread follows the newest inbound leg of a thread we originated', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'node'),
+    member: 'bob',
+    name: 'bob',
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+    commandRunner: async request =>
+      request.args[0] === 'worktree' && request.args[1] === 'ps'
+        ? { stdout: JSON.stringify({ ok: true, result: { truncated: false, worktrees: [] } }) }
+        : { stdout: '{"ok":true}' },
+    wakeupIdleCheck: async () => ({ idle: true }),
+    patch: { defaultExecutor: 'inbox', gateMode: 'open' },
+  }).start();
+  t.after(() => runtime.stop());
+  const threadId = 'thread-root-route';
+  const originMailbox = 'worktree:halfbeak-2';
+  // We started the thread without an explicit target mailbox, so its root outbound leg records
+  // `default` as the peer reply mailbox.
+  runtime.mailbox.recordOutboundEnvelope(
+    envelope(threadId, { semantic: { type: 'message', threadId } }),
+    [peer.nodeId],
+    originMailbox,
+  );
+  const rootLeg = runtime.mailbox.getThread(threadId)!;
+  assert.equal(rootLeg.direction, 'outbound');
+  assert.equal(rootLeg.peerReplyMailbox, 'default');
+  // The peer answers from its own session mailbox, which the inbound leg records on the thread.
+  runtime.mailbox.recordInboundEnvelope(
+    envelope('peer-reply-root', {
+      from: peer,
+      semantic: { type: 'reply', threadId, replyMailbox: 'worktree:peer-review' },
+    }),
+    originMailbox,
+  );
+
+  // A thread reference must not fall back to the root's `default` peer mailbox.
+  const route = runtime.mailbox.resolveReplyTarget(threadId)!;
+  assert.equal(route.threadId, threadId);
+  assert.equal(route.targetMailbox, 'worktree:peer-review');
+  assert.equal(route.localMailbox, originMailbox);
+
+  const out: string[] = [];
+  const err: string[] = [];
+  const code = await runDealerCli(
+    ['send', '--network', 'local', '--to', 'member:bob', '--topic', 'collab.request.v4', '--body', 'follow-up', '--thread', threadId, '--json'],
+    { runtime, stdout: line => out.push(line), stderr: line => err.push(line) },
+  );
+  assert.equal(code, 0, err.join('\n'));
+  const [delivered] = runtime.mailbox.list({ mailboxId: 'worktree:peer-review' }).items;
+  assert.ok(delivered, 'the peer reply mailbox recorded on the newest inbound leg must receive the follow-up');
+  assert.deepEqual(delivered.envelope.semantic, {
+    type: 'message',
+    threadId,
+    targetMailbox: 'worktree:peer-review',
+    replyMailbox: originMailbox,
+  });
+});

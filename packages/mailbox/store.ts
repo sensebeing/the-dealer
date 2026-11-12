@@ -1751,20 +1751,37 @@ export class MailboxStore {
       throw new Error('Invalid thread reference');
     }
     const state = this.read();
-    const record =
-      state.threads[`inbound:${messageOrThreadId}`] ??
-      state.threads[`outbound:${messageOrThreadId}`] ??
-      threadRecordsFor(state, messageOrThreadId).at(-1);
+    const exact = exactThreadRecord(state, messageOrThreadId);
+    const record = exact ?? threadRecordsFor(state, messageOrThreadId).at(-1);
     if (!record) {
       return undefined;
     }
+    // A thread reference must not inherit the route of the root we sent: when the thread was
+    // started without an explicit target, its outbound leg records `default` as the peer mailbox.
+    // Follow the conversation's newest inbound leg instead. A message we received keeps its own
+    // recorded leg, which is where that sender asked us to reply.
+    const exactLeg = exact !== undefined &&
+        !(exact.direction === 'outbound' && exact.messageId === exact.threadId)
+      ? exact
+      : undefined;
+    const records = threadRecordsFor(state, exact?.threadId ?? messageOrThreadId);
+    const targetMailbox = exactLeg !== undefined && exactLeg.peerReplyMailbox !== 'default'
+      ? exactLeg.peerReplyMailbox
+      : (records.findLast(candidate =>
+          candidate.direction === 'inbound' && candidate.peerReplyMailbox !== 'default',
+        ) ??
+        records.findLast(candidate => candidate.peerReplyMailbox !== 'default') ??
+        record).peerReplyMailbox;
+    const localMailbox = exactLeg !== undefined && exactLeg.localMailbox !== 'default'
+      ? exactLeg.localMailbox
+      : this.resolveThreadLocalMailbox(record.threadId) ?? record.localMailbox;
     return {
       threadId: record.threadId,
       messageId: record.messageId,
       peerNodeId: record.peerNodeId,
       networkId: record.networkId,
-      targetMailbox: record.peerReplyMailbox,
-      localMailbox: record.localMailbox,
+      targetMailbox,
+      localMailbox,
       traceId: record.traceId,
       kind: record.kind,
       subject: record.subject,
