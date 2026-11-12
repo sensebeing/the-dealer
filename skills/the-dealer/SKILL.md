@@ -301,4 +301,4 @@ For plain messages, address a logical mailbox with
 `dealer send --mailbox <id> --reply-mailbox <id> --subject '...'`. When
 `dealer send` runs inside Orca without an explicit `--reply-mailbox`, it binds
 replies to the caller's worktree mailbox unless that caller is already the
-topic's bound mailbox; non-Orca callers continue to use the topic binding.
+topic's bound workspace/mailbox; non-Orca callers continue to use the topic binding.

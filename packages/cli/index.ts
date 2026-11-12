@@ -984,10 +984,21 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const boundTopicMailbox = resolvedTopic
         ? resolveBoundMailboxId(streamKey ? `${topic}:${streamKey}` : topic, resolvedTopic.binding)
         : undefined;
+      const callerMatchesBoundTopic = Boolean(
+        callerBinding && resolvedTopic && (
+          callerBinding.mailboxId === boundTopicMailbox ||
+          (callerBinding.workspacePath && resolvedTopic.binding.workspacePath &&
+            resolve(callerBinding.workspacePath) === resolve(resolvedTopic.binding.workspacePath)) ||
+          (callerBinding.worktreeId && resolvedTopic.binding.worktreeId &&
+            callerBinding.worktreeId === resolvedTopic.binding.worktreeId) ||
+          (callerBinding.terminalHandle && resolvedTopic.binding.terminalHandle &&
+            callerBinding.terminalHandle === resolvedTopic.binding.terminalHandle)
+        ),
+      );
       const replyMailbox =
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
-          : (group === 'send' && callerBinding?.mailboxId && callerBinding.mailboxId !== boundTopicMailbox
+          : (group === 'send' && callerBinding?.mailboxId && !callerMatchesBoundTopic
             ? callerBinding.mailboxId
             : undefined);
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);

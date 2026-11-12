@@ -951,6 +951,18 @@ test('dealer send binds an Orca caller mailbox when the topic is locally bound',
   assert.equal(JSON.parse(replyOut.join('\n')).targetMailbox, 'worktree:caller-wt');
   await until(() => runtime.mailbox.list({ mailboxId: 'worktree:caller-wt' }).totalCount > 0, 'caller reply mailbox');
   await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-caller')), 'caller terminal wake');
+
+  const boundSendOut: string[] = [];
+  await runDealerCli(['send', '--network', 'local', '--to', 'member:prod', '--topic', 'release.prod.v1', '--body', '{}', '--json'], {
+    runtime,
+    env: { ORCA_TERMINAL_HANDLE: 'term-prod', ORCA_WORKTREE_ID: `repo::${prodPath}` },
+    stdout: line => boundSendOut.push(line),
+    stderr: line => assert.fail(line),
+  });
+  const boundSent = JSON.parse(boundSendOut.join('\n')) as { messageId: string };
+  const boundInbound = runtime.mailbox.listItemsAfterSequence(-1).find(item => item.envelope?.id === boundSent.messageId);
+  assert.equal(boundInbound?.envelope?.semantic?.replyMailbox, 'stream:prod-release');
+  assert.equal(runtime.mailbox.getWakeTarget('worktree:prod-release'), undefined);
 });
 
 test('thread show fails loudly for an unknown thread', async t => {
