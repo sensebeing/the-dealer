@@ -442,10 +442,11 @@ export function maybeTriggerBackgroundAutoUpdate(options: SelfUpdateOptions): vo
   const state = readAutoUpdateStatus(options.stateDir);
   const last = state?.lastCheckedAt ? Date.parse(state.lastCheckedAt) : 0;
   const now = Date.now();
-  const mismatch = existsSync(join(options.stateDir, 'control.sock')) && readDaemonFingerprint(options.stateDir)?.fingerprint !== computeRuntimeFingerprint(options.stateDir, options.checkoutDir);
-  if ((!mismatch && last && now - last < 6 * 3600_000) || (mismatch && last && now - last < 30_000)) {
+  if (last && now - last < 6 * 3600_000) {
     return;
   }
+  // Local file changes are restarted exclusively by runDealerDaemon's idle-gated fs.watch;
+  // this background check only refreshes upstream code on its six-hour cooldown.
   const bin = fileURLToPath(new URL('../../bin/dealer.js', import.meta.url));
   const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, 'self-update', '--quiet', '--json'], { detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: options.stateDir } });
   child.unref();

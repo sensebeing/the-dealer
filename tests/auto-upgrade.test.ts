@@ -300,10 +300,13 @@ test('dealer node restart tolerates concurrent ensureDaemonRunning and node down
   const offline = await dealer(['node', 'status'], stateDir);
   assert.equal(offline.running, false);
   assert.equal(existsSync(join(stateDir, 'control.sock')), false);
+  // Restarting while offline must launch a daemon, not report a deferred drain.
+  const offlineRestart = await dealer(['node', 'restart'], stateDir);
+  assert.equal(offlineRestart.running, true);
+  assert.equal(existsSync(join(stateDir, 'control.sock')), true);
 
   // A killed daemon leaves control.sock behind; down must prove staleness instead of
-  // reporting a live daemon from filesystem residue.
-  await bootDaemon(stateDir);
+  // reporting a live daemon from filesystem residue. Reuse the instance restarted above.
   const killed = JSON.parse(readFileSync(join(stateDir, 'runtime.lock', 'owner.json'), 'utf8'));
   process.kill(killed.pid, 'SIGKILL');
   await until(() => {

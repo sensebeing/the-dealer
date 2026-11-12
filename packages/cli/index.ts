@@ -424,7 +424,7 @@ export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
 
 export async function restartDaemon(stateDir: string, options: { force?: boolean } = {}): Promise<unknown> {
   const stopped = await stopDaemonIfRunning(stateDir, options);
-  if (!stopped.stopped) {
+  if (stopped.running) {
     return { ...stopped, restarted: false, deferred: true };
   }
   return ensureDaemonRunning(stateDir);
