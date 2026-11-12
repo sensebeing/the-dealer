@@ -410,13 +410,14 @@ export async function stopDaemonIfRunning(
   let stopped = await waitForDaemonStopped(stateDir, targetOwner?.instanceId, pid);
   if (!stopped && options.force) {
     const owner = liveDaemonOwner(stateDir);
-    // Never signal a replacement incarnation a supervisor started after the target drained;
-    // only the captured target is ours to escalate.
-    if (owner && (!targetOwner || owner.instanceId === targetOwner.instanceId)) {
+    // Escalate only against the exact incarnation captured before the shutdown request: a
+    // live owner without that identity may be a supervisor-started replacement (or an
+    // unreadable record), so force must leave it serving rather than guess by pid.
+    if (owner && targetOwner && targetOwner.instanceId !== '' && owner.instanceId === targetOwner.instanceId) {
       try {
         process.kill(owner.pid, 'SIGTERM');
       } catch { /* exited */ }
-      stopped = await waitForDaemonStopped(stateDir, targetOwner?.instanceId, pid, 5_000);
+      stopped = await waitForDaemonStopped(stateDir, targetOwner.instanceId, pid, 5_000);
     }
   }
   const stillRunning = stopped ? (await probeDaemonState(stateDir)) === 'live' : true;
