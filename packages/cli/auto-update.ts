@@ -33,14 +33,17 @@ function addEntry(entries: Array<[string, string]>, logical: string, path: strin
   entries.push([logical, value]);
 }
 export function computeRuntimeFingerprint(stateDir: string, checkoutDir?: string): string {
-  const root = dealerRootFor(checkoutDir); const entries: Array<[string, string]> = [];
+  const root = dealerRootFor(checkoutDir);
+  const entries: Array<[string, string]> = [];
   addEntry(entries, 'dealer/package.json', join(root, 'package.json'));
   for (const folder of ['bin', 'packages']) for (const path of fileList(join(root, folder), name => /\.(ts|js|json)$/.test(name))) addEntry(entries, `dealer/${relative(root, path)}`, path);
-  const configPath = join(stateDir, 'config.json'); addEntry(entries, 'state/config.json', configPath);
+  const configPath = join(stateDir, 'config.json');
+  addEntry(entries, 'state/config.json', configPath);
   let config: any = {};
   try { config = JSON.parse(readFileSync(configPath, 'utf8')); } catch { /* marker above */ }
   for (const project of Array.isArray(config.projects) ? config.projects : []) {
-    const id = String(project.projectId ?? ''); const dealer = typeof project.rootPath === 'string' ? join(project.rootPath, '.dealer') : '';
+    const id = String(project.projectId ?? '');
+    const dealer = typeof project.rootPath === 'string' ? join(project.rootPath, '.dealer') : '';
     addEntry(entries, `project/${id}/project.json`, join(dealer, 'project.json'));
     for (const path of fileList(dealer, name => /\.(ts|js|json)$/.test(name))) {
       if (relative(dealer, path).split('/').includes('tests')) continue;
@@ -61,11 +64,19 @@ function atomicJson(path: string, value: unknown): void {
   writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 });
   renameSync(temporary, path);
 }
-export function writeDaemonFingerprint(stateDir: string, value: FingerprintRecord): void { atomicJson(join(stateDir, 'runtime-fingerprint.json'), value); }
-export function readDaemonFingerprint(stateDir: string): FingerprintRecord | undefined { try { return JSON.parse(readFileSync(join(stateDir, 'runtime-fingerprint.json'), 'utf8')); } catch { return undefined; } }
-export function removeDaemonFingerprint(stateDir: string, instanceId: string): void { const path = join(stateDir, 'runtime-fingerprint.json'); if (readDaemonFingerprint(stateDir)?.instanceId === instanceId) rmSync(path, { force: true }); }
+export function writeDaemonFingerprint(stateDir: string, value: FingerprintRecord): void {
+  atomicJson(join(stateDir, 'runtime-fingerprint.json'), value);
+}
+export function readDaemonFingerprint(stateDir: string): FingerprintRecord | undefined {
+  try { return JSON.parse(readFileSync(join(stateDir, 'runtime-fingerprint.json'), 'utf8')); } catch { return undefined; }
+}
+export function removeDaemonFingerprint(stateDir: string, instanceId: string): void {
+  const path = join(stateDir, 'runtime-fingerprint.json');
+  if (readDaemonFingerprint(stateDir)?.instanceId === instanceId) rmSync(path, { force: true });
+}
 function acquireUpdateLock(stateDir: string): string | undefined {
-  const lock = join(stateDir, 'auto-update.lock'); mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const lock = join(stateDir, 'auto-update.lock');
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   try { mkdirSync(lock, { mode: 0o700 }); atomicJson(join(lock, 'owner.json'), processOwnerRecord()); return lock; }
   catch {
     try { const owner = JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')); if (isDeadProcessOwner(owner, stateDir)) { rmSync(lock, { recursive: true, force: true }); mkdirSync(lock, { mode: 0o700 }); atomicJson(join(lock, 'owner.json'), processOwnerRecord()); return lock; } }
