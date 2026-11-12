@@ -1249,6 +1249,7 @@ export class DealerNodeRuntime {
     const wait = dispatcher?.waitForIdle?.() ?? Promise.resolve();
     await Promise.race([wait, new Promise(resolve => setTimeout(resolve, options.drainTimeoutMs ?? 15_000))]);
     if (!this.isIdleForRestart()) {
+      this.draining = false;
       throw new Error('Daemon drain timed out with active work; restart deferred');
     }
     await this.stop();
