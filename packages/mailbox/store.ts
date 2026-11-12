@@ -1275,10 +1275,7 @@ export class MailboxStore {
       mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
     let wakeMailbox: string | undefined;
     const result = this.mutate(state => {
-      const requestedRecord = requestedMailbox ? state.mailboxes[requestedMailbox] : undefined;
-      const leaseMailbox = requestedRecord?.outstanding?.leaseId === leaseId ? requestedMailbox :
-        Object.entries(state.mailboxes).find(([, record]) => record.outstanding?.leaseId === leaseId)?.[0];
-      const candidates = leaseMailbox ? [leaseMailbox] : Object.keys(state.mailboxes);
+      const candidates = requestedMailbox ? [requestedMailbox] : Object.keys(state.mailboxes);
       for (const candidate of candidates) {
         const record = state.mailboxes[candidate];
         if (!record) {

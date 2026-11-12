@@ -116,6 +116,8 @@ export interface OrcaTerminalRow {
   preview?: unknown;
   agentIdentity?: unknown;
   lastOutputAt?: unknown;
+  tabId?: string;
+  leafId?: string;
 }
 
 /** Collapse arbitrary text into exactly one line; wakeup pointers must never span lines. */
@@ -198,7 +200,7 @@ export async function checkOrcaWorkspaceIdle(
     worktreeId: string;
     childWorktreeIds?: string[];
     unverifiableTerminalCount?: number;
-    agents?: { state?: string }[];
+    agents?: { state?: string; paneKey?: string; parentPaneKey?: string }[];
   };
   const rows: Workspace[] = inventory.worktrees;
   const root = rows.find(row => row.path === cwd);
@@ -213,13 +215,6 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     visited.add(row.worktreeId);
-    if (
-      row.unverifiableTerminalCount !== 0 ||
-      !row.agents ||
-      row.agents.some(agent => agent.state !== 'done')
-    ) {
-      return false;
-    }
     const listed = await checkedCommand(runner, {
       command,
       args: ['terminal', 'list', '--worktree', `path:${row.path}`, '--json'],
@@ -235,9 +230,17 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
+    const targetTerm = row.path === cwd && typeof options?.targetTerminalHandle === 'string'
+      ? handles.find(t => String(t.handle) === options.targetTerminalHandle) : undefined;
+    const targetPaneKey = targetTerm?.tabId && targetTerm?.leafId ? `${targetTerm.tabId}:${targetTerm.leafId}` : undefined;
+    if (targetPaneKey === undefined) {
+      if (row.unverifiableTerminalCount !== 0 || !row.agents || row.agents.some(agent => agent.state !== 'done')) return false;
+    } else {
+      if (!row.agents || row.agents.filter(agent => agent.paneKey === targetPaneKey || (!agent.paneKey && handles.length <= 1)).some(agent => agent.state !== 'done')) return false;
+    }
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
     const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
-    if (observableHandles.filter(t => Boolean(t.connected)).length < row.agents.length) {
+    if (targetPaneKey === undefined && observableHandles.filter(t => Boolean(t.connected)).length < (row.agents?.length ?? 0)) {
       return false;
     }
     // Liveness and composer state only matter for terminals this wakeup may actually write into:
@@ -311,6 +314,7 @@ export async function checkOrcaWorkspaceIdle(
     }
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find(item => item.worktreeId === id);
+      if (targetPaneKey && child?.agents?.length && child.agents.every(agent => typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && agent.parentPaneKey !== targetPaneKey)) continue;
       if (!child || !(await idleTree(child))) {
         return false;
       }

@@ -23,7 +23,7 @@ export * from './config.ts';
 export * from './setup.ts';
 export * from './auto-update.ts';
 
-const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'include-acked', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
+const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'include-acked', 'help', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread',
@@ -756,7 +756,8 @@ function resolveSessionMailbox(store: MailboxStore, mailboxId: string, caller: C
   const target = store.getWakeTarget(mailboxId);
   if (target?.mode === 'orca-terminal' && target.rotateAfterWaves !== undefined) {
     const pinned = `terminal:${caller.terminalHandle}`;
-    bindCallerWakeTarget(store, pinned, caller);
+    const prefix = target.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${mailboxId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${pinned}`);
+    store.upsertWakeTarget(pinned, { ...target, mailboxId: pinned, terminalHandle: caller.terminalHandle, rotateAfterWaves: undefined, wakeupPrefix: prefix ?? target.wakeupPrefix, pendingWake: false, deliveryInDoubt: false });
     return pinned;
   }
   return mailboxId;
@@ -850,7 +851,7 @@ async function runSessionCommand(
       const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller);
       bindCallerWakeTarget(store, replyMailbox, caller);
       if (ackId) {
-        store.ack(ackId, replyMailbox);
+        store.ack(ackId, callerMailboxFlag);
       }
       const body = required(v.body, '--body');
       const targetMailbox =
@@ -894,7 +895,7 @@ async function runSessionCommand(
       throw new Error('Choose exactly one of --to or --auto-route');
     }
     if (ackId) {
-      store.ack(ackId, callerMailboxFlag ?? caller?.mailboxId ?? 'default');
+      store.ack(ackId, callerMailboxFlag);
     }
     const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller);
     bindCallerWakeTarget(store, replyMailbox, caller);
@@ -937,7 +938,7 @@ async function runSessionCommand(
   const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller);
   bindCallerWakeTarget(store, replyMailbox, caller);
   if (ackId) {
-    store.ack(ackId, replyMailbox);
+    store.ack(ackId, callerMailboxFlag);
   }
 
   if (group === 'reply') {
@@ -1380,7 +1381,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
             ? callerBinding.mailboxId
             : (threadRoute?.localMailbox !== undefined && threadRoute.localMailbox !== 'default'
               ? threadRoute.localMailbox
-              : undefined));
+              : (callerMatchesBoundTopic && resolvedTopic?.binding.rotateAfterWaves !== undefined
+                ? boundTopicMailbox
+                : undefined)));
       if (callerBinding && replyMailbox) replyMailbox = resolveSessionMailbox(runtime.mailbox, replyMailbox, callerBinding);
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       result = await runtime.emitter.emit({
