@@ -29,7 +29,7 @@
 
 ## 2. Engineering Quality Policy
 
-本仓库接入 `the-guard` 架构拓扑检查与合入前独立 Agent 审查门禁（`guard check` / `guard review`）。除下方 `the-guard-policy/v1` 规则外，密码学与命令执行边界须始终满足：
+本仓库接入 `the-guard` 架构拓扑检查与合入前独立 Agent 审查门禁（`guard check` / `guard review`）。本仓库使用 GitHub PR 模式（`review.integration_mode=github-pr`）：变更须提交在功能分支上并推送到 `origin`，用 `gh pr create` 创建 GitHub PR，以 `guard review --repo-root . --github-pr sensebeing/the-dealer#<number>` 发布独立审查（由 `the-guard-reviewer[bot]` 署名），再用 `gh pr merge` 合入；不得直接推送 `main`，本地 `pre-push` 钩子会拒绝此类推送。除下方 `the-guard-policy/v1` 规则外，密码学与命令执行边界须始终满足：
 - 不同 Network 通过 HKDF 派生的 AEAD 密钥与 Header AAD 严格隔离；
 - 执行外部命令统一使用 `shell: false` 参数数组或严格单引号转义，绝不拼接未认证文本；
 - `orca-spawn` 创建工作区必须显式指定层级策略（`--no-parent` 或 `--parent-worktree`），`projectId` 仅通过接收端 `projectRoots`（`config.projects`）解析，忽略发送端路径；

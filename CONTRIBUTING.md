@@ -44,9 +44,21 @@ Read [AGENTS.md](AGENTS.md), [architecture](docs/architecture.md) and the
 ```sh
 npm test
 guard check --base origin/main
-guard review
+guard review --repo-root .
 git diff --check
 ```
+
+This repository uses GitHub PR mode (`review.integration_mode=github-pr`): commit on a topic
+branch, push it to `origin`, open a PR with `gh pr create`, publish the independent review to the
+PR, and merge with `gh pr merge` rather than pushing directly to `main`:
+
+```sh
+gh pr create --fill
+guard review --repo-root . --github-pr sensebeing/the-dealer#<number>
+```
+
+The review is published as `the-guard-reviewer[bot]`; resolve its findings or supply `--note`
+evidence and rerun until `GO`. The local `pre-push` hook blocks direct pushes to `main`.
 
 `the-dealer` enforces architectural boundaries and pre-merge review via [the-guard](https://github.com/sensebeing/the-guard) (`AGENTS.md` + `.guard/config.json`). For native changes, also build the Rust engine. For host integrations, distinguish mocked argv contracts from a live host receipt and task completion. Do not call a daemon handoff business success. Never include keys, invites, customer data or unredacted private conversations in reports.
 
@@ -55,8 +67,10 @@ git diff --check
 - [ ] Explain the concrete trigger, resulting behavior and responsible owner.
 - [ ] Keep the patch focused and avoid duplicate state or compatibility paths without a need.
 - [ ] Preserve trust, concurrency, idempotency and command-execution boundaries.
-- [ ] Run `npm test`, `guard check --base origin/main`, `guard review`, and `git diff --check`; disclose failures and checks not run.
+- [ ] Run `npm test`, `guard check --base origin/main`, `guard review --github-pr sensebeing/the-dealer#<number>`, and `git diff --check`; disclose failures and checks not run.
 - [ ] Update both READMEs and the changelog when public behavior changes.
-- [ ] Commit on a topic branch and request maintainer review before integration.
+- [ ] Commit on a topic branch, push it, open a GitHub PR, and publish the independent review before merging.
 
 Maintainers decide when to merge; local test success is not authorization to push to `main`.
+Merge the reviewed PR with `gh pr merge`; direct pushes to `main` are blocked by the local
+`pre-push` hook.
