@@ -78,6 +78,8 @@ function readDaemonOwner(stateDir: string): { pid: number; instanceId: string } 
 
 interface KeepAliveSupervisor {
   armed: Promise<void>;
+  /** Resolves once the replacement has claimed the lock, before it starts serving. */
+  locked: Promise<{ pid: number; instanceId: string }>;
   respawned: Promise<{ pid: number; instanceId: string }>;
   kill(): Promise<void>;
 }
@@ -85,25 +87,41 @@ interface KeepAliveSupervisor {
 /**
  * A launchd-style supervisor: once armed, it starts a warm replacement daemon the instant the
  * supervised daemon releases the state-directory lock. See the fixture for why it must stay warm.
+ * `serveDelayMs` keeps the replacement between `runtime.start()` and `serveControl()`, which is
+ * where a real cold start loads plugins and mounts networks.
  */
-function startKeepAliveSupervisor(stateDir: string): KeepAliveSupervisor {
+function startKeepAliveSupervisor(
+  stateDir: string,
+  options: { serveDelayMs?: number } = {},
+): KeepAliveSupervisor {
   const script = fileURLToPath(new URL('./fixtures/keepalive-supervisor.mjs', import.meta.url));
   const repoRoot = fileURLToPath(new URL('../', import.meta.url));
-  const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', script, repoRoot, stateDir], {
+  const args = ['--no-warnings', '--experimental-strip-types', script, repoRoot, stateDir];
+  if (options.serveDelayMs !== undefined) {
+    args.push(String(options.serveDelayMs));
+  }
+  const child = spawn(process.execPath, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, DEALER_STATE_DIR: stateDir },
   });
   let output = '';
   let errors = '';
   let armedSettled = false;
+  let lockedSettled = false;
   let respawnSettled = false;
   let resolveArmed!: () => void;
   let rejectArmed!: (error: Error) => void;
+  let resolveLocked!: (owner: { pid: number; instanceId: string }) => void;
+  let rejectLocked!: (error: Error) => void;
   let resolveRespawned!: (owner: { pid: number; instanceId: string }) => void;
   let rejectRespawned!: (error: Error) => void;
   const armed = new Promise<void>((resolve, reject) => {
     resolveArmed = resolve;
     rejectArmed = reject;
+  });
+  const locked = new Promise<{ pid: number; instanceId: string }>((resolve, reject) => {
+    resolveLocked = resolve;
+    rejectLocked = reject;
   });
   const respawned = new Promise<{ pid: number; instanceId: string }>((resolve, reject) => {
     resolveRespawned = resolve;
@@ -112,6 +130,7 @@ function startKeepAliveSupervisor(stateDir: string): KeepAliveSupervisor {
   // A failed attempt may end before either signal is awaited; keep the rejection handled so
   // cleanup cannot surface as an unhandled rejection.
   void armed.catch(() => {});
+  void locked.catch(() => {});
   void respawned.catch(() => {});
   child.stdout!.setEncoding('utf8');
   child.stderr!.setEncoding('utf8');
@@ -126,6 +145,12 @@ function startKeepAliveSupervisor(stateDir: string): KeepAliveSupervisor {
         resolveArmed();
         continue;
       }
+      const lockedMatch = /^locked (\d+) (\S+)$/.exec(line);
+      if (lockedMatch) {
+        lockedSettled = true;
+        resolveLocked({ pid: Number(lockedMatch[1]), instanceId: lockedMatch[2] });
+        continue;
+      }
       const match = /^respawned (\d+) (\S+)$/.exec(line);
       if (match) {
         respawnSettled = true;
@@ -138,15 +163,18 @@ function startKeepAliveSupervisor(stateDir: string): KeepAliveSupervisor {
   });
   child.once('error', error => {
     rejectArmed(error);
+    rejectLocked(error);
     rejectRespawned(error);
   });
   child.once('exit', code => {
     const error = new Error(`KeepAlive supervisor exited ${code}: ${errors.trim()}`);
     if (!armedSettled) rejectArmed(error);
+    if (!lockedSettled) rejectLocked(error);
     if (!respawnSettled) rejectRespawned(error);
   });
   return {
     armed,
+    locked,
     respawned,
     async kill() {
       if (child.exitCode !== null || child.signalCode !== null) {
@@ -497,4 +525,40 @@ test('node restart confirms a KeepAlive replacement instead of reporting a false
   assert.equal(readDaemonOwner(stateDir).instanceId, replacement.instanceId);
   const status = await dealer(['node', 'status'], stateDir);
   assert.equal(status.running, true);
+});
+
+test('node restart waits for a lock-owning replacement that is still cold-starting', { timeout: 90_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  let supervisor: KeepAliveSupervisor | undefined;
+  t.after(async () => {
+    await supervisor?.kill();
+    await stopDaemonIfRunning(stateDir, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  });
+  await bootDaemon(stateDir);
+  const target = readDaemonOwner(stateDir);
+  // The replacement holds the lock immediately but serves the control socket only after the
+  // cold-start work a real daemon performs (plugin loading, network mounting). 3.5s exceeds the
+  // legacy hard-coded 3s post-spawn budget that made restart fail on a duplicate launch.
+  supervisor = startKeepAliveSupervisor(stateDir, { serveDelayMs: 3_500 });
+  await supervisor.armed;
+  const startedAt = Date.now();
+  const restarted = await restartDaemon(stateDir) as {
+    running?: boolean;
+    deferred?: boolean;
+    runtimeFingerprint?: string;
+  };
+  const elapsed = Date.now() - startedAt;
+  const locked = await supervisor.locked;
+  const replacement = await supervisor.respawned;
+  assert.equal(locked.instanceId, replacement.instanceId);
+  assert.notEqual(replacement.instanceId, target.instanceId);
+  assert.equal(restarted.deferred, undefined);
+  assert.equal(restarted.running, true);
+  // The restart reports the daemon that finished the cold start, and no duplicate launcher
+  // survived: the recorded owner and fingerprint both belong to that exact incarnation.
+  assert.equal(readDaemonOwner(stateDir).instanceId, replacement.instanceId);
+  assert.equal(readDaemonFingerprint(stateDir)?.instanceId, replacement.instanceId);
+  assert.equal(restarted.runtimeFingerprint, readDaemonFingerprint(stateDir)?.fingerprint);
+  assert.ok(elapsed >= 3_500, `node restart returned after ${elapsed}ms without waiting for the cold start`);
 });
