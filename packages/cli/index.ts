@@ -92,6 +92,7 @@ function parse(argv: string[]) {
     strict: true,
     options: {
       ...Object.fromEntries(booleanFlags.map(k => [k, { type: 'boolean' as const }])) as Record<typeof booleanFlags[number], { type: 'boolean' }>,
+      help: { type: 'boolean', short: 'h' },
       ...Object.fromEntries(stringFlags.map(k => [k, { type: 'string' as const }])) as Record<typeof stringFlags[number], { type: 'string' }>,
       attach: { type: 'string', multiple: true },
     },
@@ -1016,6 +1017,21 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action] = p;
+    if (v.help === true || group === 'help') {
+      stdout(JSON.stringify({
+        ok: true,
+        usage: 'dealer <send|reply|ask|settle|inbox|thread|worktree|node|project|setup|route|source> [options]',
+        commands: {
+          send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--attach <path>] [--json]',
+          reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
+          ask: 'dealer ask <messageId> --body <text> [--ack <leaseId>] [--json]',
+          settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
+          inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
+          thread: 'dealer thread <show|list> [<threadId>] [--json]',
+        },
+      }, null, v.json ? undefined : 2));
+      return 0;
+    }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
     if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '')) {
       if (v['terminal-handle'] === undefined && callerEnv.ORCA_TERMINAL_HANDLE?.trim()) v['terminal-handle'] = callerEnv.ORCA_TERMINAL_HANDLE.trim();

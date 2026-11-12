@@ -459,3 +459,13 @@ test('streaming control keeps long waits alive and aborts cleanly on disconnect'
   assert.equal(after.code, 0);
   assert.equal(JSON.parse(after.stdout[0]).totalCount, 1);
 });
+
+
+test('dealer help exposes structured usage', async () => {
+  const out: string[] = [];
+  const code = await runDealerCli(['--help'], { stateDir: join(tmpdir(), 'dealer-help-missing'), stdout: line => out.push(line) });
+  assert.equal(code, 0);
+  const value = JSON.parse(out.join('\n'));
+  assert.equal(value.ok, true);
+  assert.match(value.commands.inbox, /inbox/);
+});

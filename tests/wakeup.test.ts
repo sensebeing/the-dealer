@@ -12,6 +12,7 @@ import {
   createOrcaSpawnExecutorPlugin,
   runDealerCli,
   verifyEnvelope,
+  settleWakeDeliveryFailure,
 } from '../packages/index.ts';
 import type {
   CommandRequest,
@@ -1922,4 +1923,14 @@ test('local Orca target validation does not create an unknown-effect fence', asy
   store.upsertWakeTarget('box', { runId: 'repaired' });
   assert.equal((await service.flushMailbox('box', { force: true })).woke, true);
   assert.equal(effects, 1);
+});
+
+
+test('pre-effect Orca refusals remain retryable', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.upsertWakeTarget('box', { mode: 'orca-terminal', terminalHandle: 'term' });
+  settleWakeDeliveryFailure(store, 'box', new Error('agent_prompt_blocked'));
+  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
+  settleWakeDeliveryFailure(store, 'box', new Error('no_active_sender_terminal'));
+  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
 });
