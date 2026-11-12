@@ -356,10 +356,28 @@ async function probeDaemonState(stateDir: string): Promise<DaemonProbe> {
   }
 }
 
-async function waitForDaemonStopped(stateDir: string, timeoutMs = 20_000): Promise<boolean> {
+/**
+ * A supervisor such as `launchd` (`KeepAlive`) starts a replacement daemon the instant the
+ * target exits, so a live listener is not proof that the shutdown is still pending. Track
+ * the target incarnation by identity: the shutdown is complete once the listener is gone or
+ * the lock owner is a different incarnation than the one asked to stop.
+ */
+async function waitForDaemonStopped(
+  stateDir: string,
+  targetInstanceId?: string,
+  targetPid?: number,
+  timeoutMs = 20_000,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if ((await probeDaemonState(stateDir)) !== 'live') {
+      return true;
+    }
+    const current = liveDaemonOwner(stateDir);
+    const replaced = current !== undefined && (targetInstanceId
+      ? current.instanceId !== targetInstanceId
+      : targetPid !== undefined && current.pid !== targetPid);
+    if (replaced) {
       return true;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -370,7 +388,7 @@ async function waitForDaemonStopped(stateDir: string, timeoutMs = 20_000): Promi
 export async function stopDaemonIfRunning(
   stateDir: string,
   options: { force?: boolean } = {},
-): Promise<{ running: boolean; stopped: boolean; pid?: number }> {
+): Promise<{ running: boolean; stopped: boolean; pid?: number; respawned?: boolean }> {
   const probe = await probeDaemonState(stateDir);
   if (probe === 'absent') {
     return { running: false, stopped: false };
@@ -378,7 +396,10 @@ export async function stopDaemonIfRunning(
   if (probe === 'stale_recovered') {
     return { running: false, stopped: true };
   }
-  let pid: number | undefined;
+  // Capture the incarnation being shut down before asking it to stop; the RPC pid is only
+  // a fallback witness when the lock owner could not be read.
+  const targetOwner = liveDaemonOwner(stateDir);
+  let pid: number | undefined = targetOwner?.pid;
   try {
     const result = await rpc(join(stateDir, 'control.sock'), ['node', 'down', '--json'], { inactivityMs: 2_000 });
     const parsed = JSON.parse(result.stdout.join('') || '{}');
@@ -386,17 +407,25 @@ export async function stopDaemonIfRunning(
       pid = parsed.pid;
     }
   } catch { /* the daemon may remove the socket while responding */ }
-  let stopped = await waitForDaemonStopped(stateDir);
+  let stopped = await waitForDaemonStopped(stateDir, targetOwner?.instanceId, pid);
   if (!stopped && options.force) {
     const owner = liveDaemonOwner(stateDir);
-    if (owner) {
+    // Never signal a replacement incarnation a supervisor started after the target drained;
+    // only the captured target is ours to escalate.
+    if (owner && (!targetOwner || owner.instanceId === targetOwner.instanceId)) {
       try {
         process.kill(owner.pid, 'SIGTERM');
       } catch { /* exited */ }
-      stopped = await waitForDaemonStopped(stateDir, 5_000);
+      stopped = await waitForDaemonStopped(stateDir, targetOwner?.instanceId, pid, 5_000);
     }
   }
-  return { running: !stopped, stopped, ...(pid ? { pid } : {}) };
+  const stillRunning = stopped ? (await probeDaemonState(stateDir)) === 'live' : true;
+  return {
+    running: stillRunning,
+    stopped,
+    ...(pid ? { pid } : {}),
+    ...(stopped && stillRunning ? { respawned: true } : {}),
+  };
 }
 
 export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
@@ -424,7 +453,10 @@ export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
 
 export async function restartDaemon(stateDir: string, options: { force?: boolean } = {}): Promise<unknown> {
   const stopped = await stopDaemonIfRunning(stateDir, options);
-  if (stopped.running) {
+  // Only a drain that could not quiesce leaves the target serving. A supervisor that already
+  // started a replacement counts as a completed stop, so confirm that live instance instead
+  // of reporting a false deferral for the incarnation that really did exit.
+  if (!stopped.stopped && stopped.running) {
     return { ...stopped, restarted: false, deferred: true };
   }
   return ensureDaemonRunning(stateDir);

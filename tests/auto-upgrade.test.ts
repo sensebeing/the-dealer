@@ -72,6 +72,95 @@ async function bootDaemon(stateDir: string, env: NodeJS.ProcessEnv = {}) {
   return status;
 }
 
+function readDaemonOwner(stateDir: string): { pid: number; instanceId: string } {
+  return JSON.parse(readFileSync(join(stateDir, 'runtime.lock', 'owner.json'), 'utf8'));
+}
+
+interface KeepAliveSupervisor {
+  armed: Promise<void>;
+  respawned: Promise<number>;
+  kill(): Promise<void>;
+}
+
+/**
+ * A launchd-style supervisor: once armed, it starts a warm replacement daemon the instant the
+ * supervised daemon releases the state-directory lock. See the fixture for why it must stay warm.
+ */
+function startKeepAliveSupervisor(stateDir: string): KeepAliveSupervisor {
+  const script = fileURLToPath(new URL('./fixtures/keepalive-supervisor.mjs', import.meta.url));
+  const repoRoot = fileURLToPath(new URL('../', import.meta.url));
+  const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', script, repoRoot, stateDir], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, DEALER_STATE_DIR: stateDir },
+  });
+  let output = '';
+  let errors = '';
+  let armedSettled = false;
+  let respawnSettled = false;
+  let resolveArmed!: () => void;
+  let rejectArmed!: (error: Error) => void;
+  let resolveRespawned!: (pid: number) => void;
+  let rejectRespawned!: (error: Error) => void;
+  const armed = new Promise<void>((resolve, reject) => {
+    resolveArmed = resolve;
+    rejectArmed = reject;
+  });
+  const respawned = new Promise<number>((resolve, reject) => {
+    resolveRespawned = resolve;
+    rejectRespawned = reject;
+  });
+  // A failed attempt may end before either signal is awaited; keep the rejection handled so
+  // cleanup cannot surface as an unhandled rejection.
+  void armed.catch(() => {});
+  void respawned.catch(() => {});
+  child.stdout!.setEncoding('utf8');
+  child.stderr!.setEncoding('utf8');
+  child.stdout!.on('data', chunk => {
+    output += chunk;
+    for (let newline = output.indexOf('\n'); newline !== -1; newline = output.indexOf('\n')) {
+      const line = output.slice(0, newline).trim();
+      output = output.slice(newline + 1);
+      if (!line) continue;
+      if (line === 'armed') {
+        armedSettled = true;
+        resolveArmed();
+        continue;
+      }
+      const match = /^respawned (\d+)$/.exec(line);
+      if (match) {
+        respawnSettled = true;
+        resolveRespawned(Number(match[1]));
+      }
+    }
+  });
+  child.stderr!.on('data', chunk => {
+    errors += chunk;
+  });
+  child.once('error', error => {
+    rejectArmed(error);
+    rejectRespawned(error);
+  });
+  child.once('exit', code => {
+    const error = new Error(`KeepAlive supervisor exited ${code}: ${errors.trim()}`);
+    if (!armedSettled) rejectArmed(error);
+    if (!respawnSettled) rejectRespawned(error);
+  });
+  return {
+    armed,
+    respawned,
+    async kill() {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        return;
+      }
+      const exited = new Promise<void>(resolve => child.once('exit', () => resolve()));
+      child.kill('SIGTERM');
+      const timer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+      await exited;
+      clearTimeout(timer);
+    },
+  };
+}
+
 function editManifest(projectRoot: string, description: string): void {
   const path = join(projectRoot, '.dealer', 'project.json');
   const manifest = JSON.parse(readFileSync(path, 'utf8'));
@@ -321,4 +410,76 @@ test('dealer node restart tolerates concurrent ensureDaemonRunning and node down
   const recovered = await dealer(['node', 'down'], stateDir);
   assert.deepEqual({ running: recovered.running, stopped: recovered.stopped }, { running: false, stopped: true });
   assert.equal(existsSync(join(stateDir, 'control.sock')), false);
+});
+
+test('node down witnesses a KeepAlive replacement instead of waiting for the target to stay gone', { timeout: 120_000 }, async t => {
+  // The witness is only observable when a shutdown probe samples the handoff after the
+  // target released its lock and before the warm replacement claimed it. That window is a
+  // few milliseconds, so the probe order occasionally samples absence first; each such run
+  // still proves the target stopped, and the attempt is repeated to hit the identity race
+  // rather than weakening the assertion.
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const { root, stateDir } = isolatedState();
+    let supervisor: KeepAliveSupervisor | undefined;
+    let witnessed = false;
+    t.after(async () => {
+      await supervisor?.kill();
+      await stopDaemonIfRunning(stateDir, { force: true });
+      rmSync(root, { recursive: true, force: true });
+    });
+    await bootDaemon(stateDir);
+    const target = readDaemonOwner(stateDir);
+    supervisor = startKeepAliveSupervisor(stateDir);
+    await supervisor.armed;
+    const startedAt = Date.now();
+    const result = await stopDaemonIfRunning(stateDir);
+    const elapsed = Date.now() - startedAt;
+    assert.equal(result.stopped, true, `attempt ${attempt}: node down did not stop the target`);
+    assert.ok(elapsed < 10_000, `attempt ${attempt}: node down waited ${elapsed}ms instead of witnessing the replacement`);
+    const replacement = await until(() => {
+      try {
+        return readDaemonOwner(stateDir);
+      } catch {
+        return undefined;
+      }
+    }, `attempt ${attempt}: supervisor replacement to own the state directory`);
+    assert.notEqual(replacement.instanceId, target.instanceId, `attempt ${attempt}: replacement kept the target incarnation`);
+    if (result.respawned === true) {
+      assert.equal(result.running, true);
+      assert.equal(replacement.pid, await supervisor.respawned);
+      const status = await dealer(['node', 'status'], stateDir);
+      assert.equal(status.running, true);
+      witnessed = true;
+    }
+    await supervisor.kill();
+    await stopDaemonIfRunning(stateDir, { force: true });
+    rmSync(root, { recursive: true, force: true });
+    if (witnessed) {
+      return;
+    }
+  }
+  assert.fail('node down never witnessed a supervisor replacement across 5 attempts');
+});
+
+test('node restart confirms a KeepAlive replacement instead of reporting a false deferral', { timeout: 90_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  let supervisor: KeepAliveSupervisor | undefined;
+  t.after(async () => {
+    await supervisor?.kill();
+    await stopDaemonIfRunning(stateDir, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  });
+  await bootDaemon(stateDir);
+  const target = readDaemonOwner(stateDir);
+  supervisor = startKeepAliveSupervisor(stateDir);
+  await supervisor.armed;
+  const startedAt = Date.now();
+  const restarted = await restartDaemon(stateDir) as { running?: boolean; deferred?: boolean };
+  const elapsed = Date.now() - startedAt;
+  assert.equal(restarted.deferred, undefined);
+  assert.equal(restarted.running, true);
+  assert.ok(elapsed < 10_000, `node restart waited ${elapsed}ms instead of confirming the replacement`);
+  const replacement = readDaemonOwner(stateDir);
+  assert.notEqual(replacement.instanceId, target.instanceId);
+  assert.equal(replacement.pid, await supervisor.respawned);
 });
