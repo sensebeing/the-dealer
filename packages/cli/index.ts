@@ -451,16 +451,20 @@ export async function stopDaemonIfRunning(
 }
 
 type DaemonStatusProbe =
-  | { state: 'absent' }
+  | { state: 'not-ready' }
   /** The socket answered, but as a runtime that does not match the expected fingerprint. */
   | { state: 'mismatch' }
   | { state: 'ready'; status: unknown };
+
+/** Connection-level failures that only mean the control socket is not accepting requests yet. */
+const TRANSIENT_CONTROL_SOCKET_CODES = new Set(['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE']);
 
 /**
  * A live lock owner is not yet a usable daemon: it loads plugins and mounts networks before it
  * starts serving `control.sock`. Only a status answer carrying the expected fingerprint proves
  * that cold start finished; a socket answered by another fingerprint is a draining predecessor,
- * not the daemon this caller is waiting for.
+ * not the daemon this caller is waiting for. A listener that is still coming up is the only
+ * failure treated as not-ready: malformed responses and daemon-reported errors surface as-is.
  */
 async function probeMatchingDaemonStatus(
   stateDir: string,
@@ -468,16 +472,58 @@ async function probeMatchingDaemonStatus(
 ): Promise<DaemonStatusProbe> {
   const socket = join(stateDir, 'control.sock');
   if (!existsSync(socket)) {
-    return { state: 'absent' };
+    return { state: 'not-ready' };
   }
+  let result: { code: number; stdout: string[]; stderr: string[] };
   try {
-    const status = JSON.parse((await rpc(socket, ['node', 'status', '--json'], { inactivityMs: 2_000 })).stdout.join(''));
-    return status.runtimeFingerprint === expectedFingerprint
-      ? { state: 'ready', status }
-      : { state: 'mismatch' };
-  } catch {
-    return { state: 'absent' };
+    result = await rpc(socket, ['node', 'status', '--json'], { inactivityMs: 2_000 });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === 'string' && TRANSIENT_CONTROL_SOCKET_CODES.has(code)) {
+      return { state: 'not-ready' };
+    }
+    throw error;
   }
+  if (result.code !== 0) {
+    throw new Error(result.stderr.join('\n') || `Daemon status exited ${result.code}`);
+  }
+  const status = JSON.parse(result.stdout.join(''));
+  return status.runtimeFingerprint === expectedFingerprint
+    ? { state: 'ready', status }
+    : { state: 'mismatch' };
+}
+
+/**
+ * The state directory is the authoritative source of startup events: the daemon creates
+ * `control.sock` only once it is serving, and releases `runtime.lock` only when it stops. Wake
+ * on either change instead of polling; the bounded fallback covers only a missed watch event.
+ */
+function waitForDaemonStateChange(stateDir: string, timeoutMs: number): Promise<void> {
+  return new Promise(resolve => {
+    let watcher: ReturnType<typeof watch> | undefined;
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      watcher?.close();
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    try {
+      watcher = watch(stateDir, { persistent: false }, (event, filename) => {
+        if (filename === null || filename === 'control.sock' || filename.startsWith('runtime.lock')) {
+          finish();
+        }
+      });
+      watcher.on('error', finish);
+      watcher.unref();
+    } catch {
+      // Watching is unavailable; the bounded wake-up still releases the wait.
+    }
+  });
 }
 
 /**
@@ -501,14 +547,14 @@ async function waitForOwnedDaemonReady(
       // The socket belongs to a different runtime; waiting cannot turn it into ours.
       return undefined;
     }
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await waitForDaemonStateChange(stateDir, Math.min(1_000, Math.max(0, deadline - Date.now())));
   }
   const final = await probeMatchingDaemonStatus(stateDir, expectedFingerprint);
   return final.state === 'ready' ? final.status : undefined;
 }
 
 export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
-  // The fingerprint hashes the whole code tree; compute it once so the readiness poll never
+  // The fingerprint hashes the whole code tree; compute it once so the readiness wait never
   // re-reads it while a cold start is still loading plugins and mounting networks.
   const expectedFingerprint = computeRuntimeFingerprint(stateDir);
   const ready = await waitForOwnedDaemonReady(stateDir, expectedFingerprint);
