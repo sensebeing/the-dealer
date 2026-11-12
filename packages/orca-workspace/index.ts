@@ -148,7 +148,10 @@ export async function checkOrcaWorkspaceIdle(
   const output = await checkedCommand(runner, {
     command,
     args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'],
-    cwd,
+    // Only this read-only inventory probe narrows a removed workspace directory to the daemon's
+    // cwd: the gone path must be reported as "Workspace not found" before anything is spawned
+    // inside it, while the shared runner keeps strict cwd semantics for every other caller.
+    cwd: runner === runCommand && !existsSync(cwd) ? undefined : cwd,
     signal,
   });
   const raw = JSON.parse(output.stdout);
