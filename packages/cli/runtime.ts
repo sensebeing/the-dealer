@@ -1029,7 +1029,12 @@ export class DealerNodeRuntime {
             return;
           }
           try {
-            const mailboxId = resolveMailboxId(envelope, this.resolveExecutorName(envelope), this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding);
+            const mailboxId = resolveMailboxId(
+              envelope,
+              this.resolveExecutorName(envelope),
+              this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding,
+              this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
+            );
             this.mailbox.recordInboundEnvelope(envelope, mailboxId);
           } catch (error) {
             this.lastError = String(error);

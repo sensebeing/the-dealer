@@ -271,7 +271,8 @@ export function normalizeMailboxId(value: unknown, label = 'mailbox id'): string
 
 /**
  * Deterministic logical mailbox resolution shared by the inbox executor, wake targets and
- * thread reverse routes: semantic target, explicit payload mailbox, executor channel, default.
+ * thread reverse routes. Single-owner precedence: semantic target, thread-local affinity,
+ * explicit payload mailbox, topic binding / executor channel, default.
  */
 export interface MailboxTopicBinding {
   executor: string;
@@ -285,21 +286,41 @@ export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding
     ? normalizeMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`) : 'default';
 }
 
-export function resolveMailboxId(envelope: MessageEnvelope, executorName?: string, binding?: MailboxTopicBinding): string {
-  const bindingKind = typeof envelope.payload?.streamKey === 'string'
-    ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
+export function resolveMailboxId(
+  envelope: MessageEnvelope,
+  executorName?: string,
+  binding?: MailboxTopicBinding,
+  threadLocalMailbox?: string,
+): string {
   const semantic = envelope.semantic;
+  const payload = isRecord(envelope.payload)
+    ? (envelope.payload as Record<string, unknown>)
+    : undefined;
+  const bindingKind = typeof payload?.streamKey === 'string'
+    ? `${envelope.kind}:${payload.streamKey}` : envelope.kind;
   const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
+  // An explicit session mailbox always owns its message, including control frames: a generic
+  // topic binding must never rewrite a session-specific destination. `default` means unspecified.
+  if (semantic?.targetMailbox !== undefined && semantic.targetMailbox !== 'default') {
+    return normalizeMailboxId(semantic.targetMailbox, 'semantic targetMailbox');
+  }
+  // An established thread stays with the mailbox already handling it, so replies wake the
+  // originating worktree/terminal session instead of opening work in the topic's generic binding.
+  if (threadLocalMailbox !== undefined && threadLocalMailbox !== 'default') {
+    return normalizeMailboxId(threadLocalMailbox, 'thread local mailbox');
+  }
+  // Control frames follow the topic binding only when the sender named no destination.
   if (binding && control && (semantic?.targetMailbox === undefined || semantic.targetMailbox === 'default')) {
     const bound = resolveBoundMailboxId(bindingKind, binding);
-    if (bound !== 'default') return bound;
+    if (bound !== 'default') {
+      return bound;
+    }
   }
   if (semantic?.targetMailbox !== undefined) {
     return normalizeMailboxId(semantic.targetMailbox, 'semantic targetMailbox');
   }
-  const payload = isRecord(envelope.payload)
-    ? (envelope.payload as Record<string, unknown>)
-    : undefined;
+  // An explicit payload mailbox names a concrete destination and outranks the generic topic
+  // binding, matching the resolution order that predates thread affinity.
   const explicit = payload?.mailbox;
   if (isNonEmptyString(explicit)) {
     return normalizeMailboxId(explicit, 'payload mailbox');
@@ -1049,7 +1070,16 @@ export class MailboxStore {
         if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
           throw new Error('Invalid envelope: missing id');
         }
-        const mailboxId = explicitMailbox ?? resolveMailboxId(envelope, 'inbox');
+        const mailboxId = explicitMailbox ?? resolveMailboxId(
+          envelope,
+          'inbox',
+          undefined,
+          this.threadLocalMailboxFromState(
+            state,
+            envelope.semantic?.threadId,
+            envelope.networkId,
+          ),
+        );
         mailboxIds.add(mailboxId);
         if (state.items.some(item => item.mailboxId === mailboxId && item.id === envelope.id)) {
           duplicateIds.push(envelope.id);
@@ -1072,7 +1102,10 @@ export class MailboxStore {
         state.sequence += 1;
         conversationalByMailbox.set(mailboxId,
           (conversationalByMailbox.get(mailboxId) ?? true) &&
-          ['question', 'reply', 'settle'].includes(envelope.semantic?.type ?? ''),
+          (['question', 'reply', 'settle'].includes(envelope.semantic?.type ?? '') ||
+            Boolean(envelope.semantic?.threadId &&
+              threadRecordsFor(state, envelope.semantic.threadId)
+                .some(record => record.networkId === envelope.networkId))),
         );
         inserted.push(cloned.id);
         insertedByMailbox.set(mailboxId, (insertedByMailbox.get(mailboxId) ?? 0) + 1);
@@ -1711,25 +1744,84 @@ export class MailboxStore {
     return threadRecordsFor(state, threadId).map(record => structuredClone(record));
   }
 
-  resolveReplyTarget(messageOrThreadId: string): ResolvedReplyTarget | undefined {
+  /**
+   * The session mailbox an existing thread is already handled in: the newest non-default local
+   * leg. This is the durable thread-affinity record that keeps replies with the worktree/terminal
+   * session that owns the thread instead of the topic's generic binding. Records are scoped to the
+   * envelope's network so a colliding thread id on another network never inherits this route.
+   */
+  resolveThreadLocalMailbox(threadId?: string, networkId?: string): string | undefined {
+    return this.threadLocalMailboxFromState(this.read(), threadId, networkId);
+  }
+
+  private threadLocalMailboxFromState(
+    state: MailboxFileState,
+    threadId?: string,
+    networkId?: string,
+  ): string | undefined {
+    if (typeof threadId !== 'string' || threadId.length === 0) {
+      return undefined;
+    }
+    const records = threadRecordsFor(state, threadId)
+      .filter(record => networkId === undefined || record.networkId === networkId);
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const localMailbox = records[index].localMailbox;
+      if (localMailbox !== 'default') {
+        return normalizeMailboxId(localMailbox, 'thread local mailbox');
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolve the reply route of a message or thread. `networkId` scopes the lookup to that
+   * network's records: a colliding thread id can accumulate a newer leg on another network, and
+   * that leg must not shadow the route recorded for the network being sent on.
+   */
+  resolveReplyTarget(
+    messageOrThreadId: string,
+    networkId?: string,
+  ): ResolvedReplyTarget | undefined {
     if (!isNonEmptyString(messageOrThreadId)) {
       throw new Error('Invalid thread reference');
     }
+    const onNetwork = (candidate: ThreadRouteRecord): boolean =>
+      networkId === undefined || candidate.networkId === networkId;
     const state = this.read();
-    const record =
-      state.threads[`inbound:${messageOrThreadId}`] ??
-      state.threads[`outbound:${messageOrThreadId}`] ??
-      threadRecordsFor(state, messageOrThreadId).at(-1);
+    const exactRecord = exactThreadRecord(state, messageOrThreadId);
+    const exact = exactRecord !== undefined && onNetwork(exactRecord) ? exactRecord : undefined;
+    const record = exact ?? threadRecordsFor(state, messageOrThreadId).filter(onNetwork).at(-1);
     if (!record) {
       return undefined;
     }
+    // A thread reference must not inherit the route of the root we sent: when the thread was
+    // started without an explicit target, its outbound leg records `default` as the peer mailbox.
+    // Follow the conversation's newest inbound leg instead. A message we received keeps its own
+    // recorded leg, which is where that sender asked us to reply.
+    const exactLeg = exact !== undefined &&
+        !(exact.direction === 'outbound' && exact.messageId === exact.threadId)
+      ? exact
+      : undefined;
+    const records = threadRecordsFor(state, exact?.threadId ?? messageOrThreadId)
+      .filter(candidate => candidate.networkId === record.networkId);
+    const targetMailbox = exactLeg !== undefined && exactLeg.peerReplyMailbox !== 'default'
+      ? exactLeg.peerReplyMailbox
+      : (records.findLast(candidate =>
+          candidate.direction === 'inbound' && candidate.peerReplyMailbox !== 'default',
+        ) ??
+        records.findLast(candidate => candidate.peerReplyMailbox !== 'default') ??
+        record).peerReplyMailbox;
+    const localMailbox = exactLeg !== undefined && exactLeg.localMailbox !== 'default'
+      ? exactLeg.localMailbox
+      : this.threadLocalMailboxFromState(state, record.threadId, record.networkId) ??
+        record.localMailbox;
     return {
       threadId: record.threadId,
       messageId: record.messageId,
       peerNodeId: record.peerNodeId,
       networkId: record.networkId,
-      targetMailbox: record.peerReplyMailbox,
-      localMailbox: record.localMailbox,
+      targetMailbox,
+      localMailbox,
       traceId: record.traceId,
       kind: record.kind,
       subject: record.subject,

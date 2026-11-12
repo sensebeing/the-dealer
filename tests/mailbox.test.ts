@@ -174,6 +174,74 @@ test('mailbox resolution is deterministic and logically isolated', t => {
   assert.equal(store.list().totalCount, 2);
 });
 
+test('thread affinity outranks topic bindings while explicit session targets outrank both', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  store.recordOutboundEnvelope(
+    envelope('origin-request', {
+      semantic: { type: 'message', threadId: 'thread-affinity', replyMailbox: 'worktree:origin' },
+    }),
+    ['ed25519:' + 'b'.repeat(64)],
+    'worktree:origin',
+  );
+  assert.equal(store.resolveThreadLocalMailbox('thread-affinity'), 'worktree:origin');
+  assert.equal(store.resolveThreadLocalMailbox('thread-affinity', 'team'), 'worktree:origin');
+  assert.equal(store.resolveThreadLocalMailbox('thread-affinity', 'other-network'), undefined);
+  assert.equal(store.resolveThreadLocalMailbox('unknown-thread'), undefined);
+  assert.equal(store.resolveThreadLocalMailbox(), undefined);
+  const binding = { executor: 'orca-wave', mailboxId: 'stream:inbox' };
+  // An explicit payload mailbox is a concrete destination and outranks the generic topic binding.
+  assert.equal(
+    resolveMailboxId(
+      envelope('explicit-payload', { payload: { mailbox: 'task:custom' } }),
+      'inbox',
+      binding,
+    ),
+    'task:custom',
+  );
+  assert.equal(
+    resolveMailboxId(
+      envelope('thread-reply', { semantic: { type: 'message', threadId: 'thread-affinity' } }),
+      'orca-wave',
+      binding,
+      store.resolveThreadLocalMailbox('thread-affinity'),
+    ),
+    'worktree:origin',
+  );
+  assert.equal(
+    resolveMailboxId(
+      envelope('control-reply', { semantic: { type: 'reply', threadId: 'thread-affinity' } }),
+      'inbox',
+      binding,
+      store.resolveThreadLocalMailbox('thread-affinity'),
+    ),
+    'worktree:origin',
+  );
+  assert.equal(
+    resolveMailboxId(
+      envelope('explicit-session', {
+        semantic: { type: 'message', threadId: 'thread-affinity', targetMailbox: 'worktree:explicit' },
+      }),
+      'orca-wave',
+      binding,
+      'worktree:origin',
+    ),
+    'worktree:explicit',
+  );
+  assert.equal(
+    resolveMailboxId(
+      envelope('new-thread', {
+        payload: { streamKey: 'inbox' },
+        semantic: { type: 'question', threadId: 'new-thread', targetMailbox: 'default' },
+      }),
+      'inbox',
+      binding,
+      undefined,
+    ),
+    'stream:inbox',
+  );
+});
+
 test('enqueue deduplicates per mailbox and sanitizes one-line wakeup hints', t => {
   const { path } = workspace(t);
   const store = new MailboxStore(path);
