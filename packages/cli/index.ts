@@ -346,13 +346,23 @@ export async function stopDaemonIfRunning(stateDir: string): Promise<{ running: 
     const parsed = JSON.parse(result.stdout.join('') || '{}');
     pid = parsed.pid;
   } catch { /* launchd may remove the socket while responding */ }
-  const stopped = await waitForDaemonStopped(stateDir);
+  let stopped = await waitForDaemonStopped(stateDir, 15_000);
+  if (!stopped) {
+    const owner = readProcessOwner(join(stateDir, 'runtime.lock', 'owner.json'));
+    if (owner && !isDeadProcessOwner(owner, stateDir)) {
+      try { process.kill(owner.pid, 'SIGTERM'); } catch { /* exited */ }
+      stopped = await waitForDaemonStopped(stateDir, 5_000);
+    }
+  }
   return { running: true, stopped, ...(pid ? { pid } : {}) };
 }
 
 export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
   if (existsSync(join(stateDir, 'control.sock'))) {
-    try { return (await rpc(join(stateDir, 'control.sock'), ['node', 'status', '--json'], { inactivityMs: 2_000 })).stdout.join(''); } catch { /* stale socket */ }
+    try {
+      const status = JSON.parse((await rpc(join(stateDir, 'control.sock'), ['node', 'status', '--json'], { inactivityMs: 2_000 })).stdout.join(''));
+      if (status.runtimeFingerprint === computeRuntimeFingerprint(stateDir)) return status;
+    } catch { /* stale socket */ }
   }
   try { return await launchDaemon([], stateDir); }
   catch (error) {
@@ -978,7 +988,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         result = runtime.status();
       } else if (action === 'down') {
         result = { ok: true, stopping: true, pid: process.pid };
-        setImmediate(() => { void runtime.gracefulStop().catch(() => {}); });
+        setImmediate(() => { void runtime.gracefulStop().finally(() => process.exit(0)); });
       } else if (action === 'card') {
         result = network
           ? runtime.node.getSelfCard(network)
@@ -1183,7 +1193,6 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     await runtime.stop();
     throw error;
   }
-  const startupFingerprint = computeRuntimeFingerprint(runtime.stateDir);
   let reloadPending = false;
   let restartTriggered = false;
   let debounce: ReturnType<typeof setTimeout> | undefined;
@@ -1192,14 +1201,14 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     if (!reloadPending || restartTriggered || process.env.DEALER_AUTO_RESTART === '0' || !runtime.isIdleForRestart()) return;
     restartTriggered = true;
     for (const item of watchers) item.close();
-    const bin = new URL('../../bin/dealer.js', import.meta.url).pathname;
+    const bin = fileURLToPath(new URL('../../bin/dealer.js', import.meta.url));
     const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, 'node', 'restart', '--json'], { detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: runtime.stateDir } });
     child.unref();
   };
   const schedule = () => {
     if (debounce) clearTimeout(debounce);
     debounce = setTimeout(() => {
-      if (computeRuntimeFingerprint(runtime.stateDir) !== startupFingerprint) reloadPending = true;
+      if (computeRuntimeFingerprint(runtime.stateDir) !== runtime.currentDaemonFingerprint()) reloadPending = true;
       maybeSpawnSelfRestart();
     }, 400);
     debounce.unref();
@@ -1214,6 +1223,8 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
   const dispatcher = runtime.kernel.ctx.services.dispatcher as any;
   dispatcher?.onIdle?.(maybeSpawnSelfRestart);
+  runtime.onConfigPersisted = schedule;
+  runtime.onControlIdle = maybeSpawnSelfRestart;
   const timer = setInterval(() => maybeTriggerBackgroundAutoUpdate({ stateDir: runtime.stateDir }), 6 * 3600_000);
   timer.unref();
   return runtime;

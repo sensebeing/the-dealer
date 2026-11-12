@@ -161,6 +161,10 @@ export class DealerNodeRuntime {
   private activeMutatingControlRequests = 0;
   private draining = false;
   private daemonInstanceId?: string;
+  private daemonFingerprint?: string;
+  private daemonStartedAt?: string;
+  onConfigPersisted?: () => void;
+  onControlIdle?: () => void;
   /** Per-process owner file: a gate contender never touches another process's file. */
   private readonly reclaimOwnerFile = `owner.${process.pid}.json`;
   lastError?: string;
@@ -198,6 +202,23 @@ export class DealerNodeRuntime {
   persist(): void {
     validateConfig(this.config);
     saveJson(join(this.stateDir, 'config.json'), this.config);
+    this.refreshDaemonFingerprint();
+    this.onConfigPersisted?.();
+  }
+
+  currentDaemonFingerprint(): string | undefined {
+    return this.daemonFingerprint;
+  }
+
+  private refreshDaemonFingerprint(): void {
+    if (!this.daemonInstanceId) return;
+    this.daemonFingerprint = computeRuntimeFingerprint(this.stateDir);
+    writeDaemonFingerprint(this.stateDir, {
+      pid: process.pid,
+      instanceId: this.daemonInstanceId,
+      fingerprint: this.daemonFingerprint,
+      startedAt: this.daemonStartedAt ?? new Date().toISOString(),
+    });
   }
 
   /** Claim dir for this process atomically, so it never exists without an owner. */
@@ -1267,7 +1288,10 @@ export class DealerNodeRuntime {
             response.writeHead(400).end(JSON.stringify({ error: String(error) }));
           }
         }
-        finally { this.activeMutatingControlRequests--; }
+        finally {
+          this.activeMutatingControlRequests--;
+          if (this.activeMutatingControlRequests === 0) this.onControlIdle?.();
+        }
         return;
       }
       const controller = new AbortController();
@@ -1332,6 +1356,7 @@ export class DealerNodeRuntime {
         }
       } finally {
         this.activeMutatingControlRequests--;
+        if (this.activeMutatingControlRequests === 0) this.onControlIdle?.();
         completed = true;
         if (keepalive) {
           clearInterval(keepalive);
@@ -1348,7 +1373,8 @@ export class DealerNodeRuntime {
     });
     chmodSync(this.socketPath, 0o600);
     this.daemonInstanceId = processOwnerRecord().instanceId;
-    writeDaemonFingerprint(this.stateDir, { pid: process.pid, instanceId: this.daemonInstanceId, fingerprint: computeRuntimeFingerprint(this.stateDir), startedAt: new Date().toISOString() });
+    this.daemonStartedAt = new Date().toISOString();
+    this.refreshDaemonFingerprint();
   }
 
   async stop(): Promise<void> {
