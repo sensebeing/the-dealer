@@ -1,0 +1,19 @@
+name: the-guard review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: sensebeing/the-guard@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          app-id: ${{ secrets.THE_GUARD_APP_ID }}
+          private-key: ${{ secrets.THE_GUARD_PRIVATE_KEY }}
