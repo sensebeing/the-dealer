@@ -96,7 +96,18 @@ function syncSkills(root: string, options: SelfUpdateOptions): string[] {
     for (const skill of ['the-dealer', 'the-dealer-setup', 'the-dealer-extend']) {
       const target = join(root, 'skills', skill); const link = join(destination, skill);
       if (!existsSync(target)) continue;
-      try { if (existsSync(link) || lstatSync(link).isSymbolicLink()) { if (!lstatSync(link).isSymbolicLink()) continue; rmSync(link, { recursive: true, force: true }); } symlinkSync(target, link, 'dir'); synced.push(link); } catch { /* continue */ }
+      try {
+        let existing;
+        try { existing = lstatSync(link); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        if (existing && !existing.isSymbolicLink()) continue;
+        if (existing) rmSync(link, { recursive: true, force: true });
+        symlinkSync(target, link, 'dir');
+        synced.push(link);
+      } catch (error) {
+        throw new Error(`Unable to sync skill link ${link}: ${String(error)}`);
+      }
     }
   }
   return synced;

@@ -1248,6 +1248,9 @@ export class DealerNodeRuntime {
     const dispatcher = this.kernel.ctx?.services?.dispatcher as any;
     const wait = dispatcher?.waitForIdle?.() ?? Promise.resolve();
     await Promise.race([wait, new Promise(resolve => setTimeout(resolve, options.drainTimeoutMs ?? 15_000))]);
+    if (!this.isIdleForRestart()) {
+      throw new Error('Daemon drain timed out with active work; restart deferred');
+    }
     await this.stop();
   }
 
@@ -1273,6 +1276,10 @@ export class DealerNodeRuntime {
         (request.url !== '/cli' && request.url !== '/cli-stream')
       ) {
         response.writeHead(404).end();
+        return;
+      }
+      if (this.draining) {
+        response.writeHead(503).end(JSON.stringify({ error: 'Daemon is draining' }));
         return;
       }
       if (request.url === '/cli') {
