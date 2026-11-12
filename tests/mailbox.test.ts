@@ -185,9 +185,20 @@ test('thread affinity outranks topic bindings while explicit session targets out
     'worktree:origin',
   );
   assert.equal(store.resolveThreadLocalMailbox('thread-affinity'), 'worktree:origin');
+  assert.equal(store.resolveThreadLocalMailbox('thread-affinity', 'team'), 'worktree:origin');
+  assert.equal(store.resolveThreadLocalMailbox('thread-affinity', 'other-network'), undefined);
   assert.equal(store.resolveThreadLocalMailbox('unknown-thread'), undefined);
   assert.equal(store.resolveThreadLocalMailbox(), undefined);
   const binding = { executor: 'orca-wave', mailboxId: 'stream:inbox' };
+  // An explicit payload mailbox is a concrete destination and outranks the generic topic binding.
+  assert.equal(
+    resolveMailboxId(
+      envelope('explicit-payload', { payload: { mailbox: 'task:custom' } }),
+      'inbox',
+      binding,
+    ),
+    'task:custom',
+  );
   assert.equal(
     resolveMailboxId(
       envelope('thread-reply', { semantic: { type: 'message', threadId: 'thread-affinity' } }),

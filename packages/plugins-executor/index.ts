@@ -756,7 +756,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           envelope,
           'orca-wave',
           binding,
-          store.resolveThreadLocalMailbox(envelope.semantic?.threadId),
+          store.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
         );
         const group = groups.get(mailboxId);
         if (group) {
@@ -879,7 +879,7 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
           envelope,
           'inbox',
           (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(envelope.kind, typeof envelope?.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined),
-          store.resolveThreadLocalMailbox(envelope.semantic?.threadId),
+          store.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
         );
         const group = groups.get(mailboxId) ?? [];
         group.push(envelope);

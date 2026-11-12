@@ -1033,7 +1033,7 @@ export class DealerNodeRuntime {
               envelope,
               this.resolveExecutorName(envelope),
               this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding,
-              this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId),
+              this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
             );
             this.mailbox.recordInboundEnvelope(envelope, mailboxId);
           } catch (error) {

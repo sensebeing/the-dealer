@@ -271,7 +271,8 @@ export function normalizeMailboxId(value: unknown, label = 'mailbox id'): string
 
 /**
  * Deterministic logical mailbox resolution shared by the inbox executor, wake targets and
- * thread reverse routes: semantic target, explicit payload mailbox, executor channel, default.
+ * thread reverse routes. Single-owner precedence: semantic target, thread-local affinity,
+ * explicit payload mailbox, topic binding / executor channel, default.
  */
 export interface MailboxTopicBinding {
   executor: string;
@@ -292,6 +293,12 @@ export function resolveMailboxId(
   threadLocalMailbox?: string,
 ): string {
   const semantic = envelope.semantic;
+  const payload = isRecord(envelope.payload)
+    ? (envelope.payload as Record<string, unknown>)
+    : undefined;
+  const bindingKind = typeof payload?.streamKey === 'string'
+    ? `${envelope.kind}:${payload.streamKey}` : envelope.kind;
+  const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
   // An explicit session mailbox always owns its message, including control frames: a generic
   // topic binding must never rewrite a session-specific destination. `default` means unspecified.
   if (semantic?.targetMailbox !== undefined && semantic.targetMailbox !== 'default') {
@@ -302,27 +309,27 @@ export function resolveMailboxId(
   if (threadLocalMailbox !== undefined && threadLocalMailbox !== 'default') {
     return normalizeMailboxId(threadLocalMailbox, 'thread local mailbox');
   }
-  const payload = isRecord(envelope.payload)
-    ? (envelope.payload as Record<string, unknown>)
-    : undefined;
-  const bindingKind = typeof payload?.streamKey === 'string'
-    ? `${envelope.kind}:${payload.streamKey}` : envelope.kind;
-  const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
-  if (binding && (control || !isNonEmptyString(payload?.executor))) {
-    if (!control) {
-      if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
-        return normalizeMailboxId(`stream:${payload.streamKey}`);
-      }
-      return resolveBoundMailboxId(bindingKind, binding);
-    }
+  // Control frames follow the topic binding only when the sender named no destination.
+  if (binding && control && (semantic?.targetMailbox === undefined || semantic.targetMailbox === 'default')) {
     const bound = resolveBoundMailboxId(bindingKind, binding);
     if (bound !== 'default') {
       return bound;
     }
   }
+  if (semantic?.targetMailbox !== undefined) {
+    return normalizeMailboxId(semantic.targetMailbox, 'semantic targetMailbox');
+  }
+  // An explicit payload mailbox names a concrete destination and outranks the generic topic
+  // binding, matching the resolution order that predates thread affinity.
   const explicit = payload?.mailbox;
   if (isNonEmptyString(explicit)) {
     return normalizeMailboxId(explicit, 'payload mailbox');
+  }
+  if (binding && !control && !isNonEmptyString(payload?.executor)) {
+    if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
+      return normalizeMailboxId(`stream:${payload.streamKey}`);
+    }
+    return resolveBoundMailboxId(bindingKind, binding);
   }
   if (executorName === 'orca-wave') {
     return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
@@ -1088,7 +1095,8 @@ export class MailboxStore {
           (conversationalByMailbox.get(mailboxId) ?? true) &&
           (['question', 'reply', 'settle'].includes(envelope.semantic?.type ?? '') ||
             Boolean(envelope.semantic?.threadId &&
-              threadRecordsFor(state, envelope.semantic.threadId).length > 0)),
+              threadRecordsFor(state, envelope.semantic.threadId)
+                .some(record => record.networkId === envelope.networkId))),
         );
         inserted.push(cloned.id);
         insertedByMailbox.set(mailboxId, (insertedByMailbox.get(mailboxId) ?? 0) + 1);
@@ -1730,13 +1738,15 @@ export class MailboxStore {
   /**
    * The session mailbox an existing thread is already handled in: the newest non-default local
    * leg. This is the durable thread-affinity record that keeps replies with the worktree/terminal
-   * session that owns the thread instead of the topic's generic binding.
+   * session that owns the thread instead of the topic's generic binding. Records are scoped to the
+   * envelope's network so a colliding thread id on another network never inherits this route.
    */
-  resolveThreadLocalMailbox(threadId?: string): string | undefined {
+  resolveThreadLocalMailbox(threadId?: string, networkId?: string): string | undefined {
     if (typeof threadId !== 'string' || threadId.length === 0) {
       return undefined;
     }
-    const records = threadRecordsFor(this.read(), threadId);
+    const records = threadRecordsFor(this.read(), threadId)
+      .filter(record => networkId === undefined || record.networkId === networkId);
     for (let index = records.length - 1; index >= 0; index -= 1) {
       const localMailbox = records[index].localMailbox;
       if (localMailbox !== 'default') {
@@ -1764,7 +1774,8 @@ export class MailboxStore {
         !(exact.direction === 'outbound' && exact.messageId === exact.threadId)
       ? exact
       : undefined;
-    const records = threadRecordsFor(state, exact?.threadId ?? messageOrThreadId);
+    const records = threadRecordsFor(state, exact?.threadId ?? messageOrThreadId)
+      .filter(candidate => candidate.networkId === record.networkId);
     const targetMailbox = exactLeg !== undefined && exactLeg.peerReplyMailbox !== 'default'
       ? exactLeg.peerReplyMailbox
       : (records.findLast(candidate =>
@@ -1774,7 +1785,7 @@ export class MailboxStore {
         record).peerReplyMailbox;
     const localMailbox = exactLeg !== undefined && exactLeg.localMailbox !== 'default'
       ? exactLeg.localMailbox
-      : this.resolveThreadLocalMailbox(record.threadId) ?? record.localMailbox;
+      : this.resolveThreadLocalMailbox(record.threadId, record.networkId) ?? record.localMailbox;
     return {
       threadId: record.threadId,
       messageId: record.messageId,
