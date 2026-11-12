@@ -988,7 +988,11 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         result = runtime.status();
       } else if (action === 'down') {
         result = { ok: true, stopping: true, pid: process.pid };
-        setImmediate(() => { void runtime.gracefulStop().finally(() => process.exit(0)); });
+        setImmediate(() => {
+          void runtime.gracefulStop().then(() => process.exit(0)).catch(error => {
+            runtime.lastError = String(error);
+          });
+        });
       } else if (action === 'card') {
         result = network
           ? runtime.node.getSelfCard(network)
