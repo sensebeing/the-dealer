@@ -8,10 +8,10 @@ the executor, and the second level picks how it owns a conversation:
 | `inbox` | Durable mailbox | Durable mailbox | Durable mailbox | Durable mailbox | mailboxId |
 | `claude-app` | `claude-app send --session-mode spawn` | `claude-app send --session-mode wave` | `claude-app send --session-mode fixed` | Durable mailbox | agentProfile, sessionId |
 | `chatgpt-app` | `dot send --session-mode spawn` | `dot send --session-mode wave` | `dot send --session-mode fixed` | Durable mailbox | agentProfile, targetBot, sessionId |
-| `antigravity-app` | App bridge | App bridge | App bridge | Durable mailbox | workspacePath |
+| `antigravity-app` | `antigravity-app send --session-mode spawn` | `antigravity-app send --session-mode wave` | `antigravity-app send --session-mode fixed` | Durable mailbox | workspacePath |
 | `claude-code` | `claude --bg --name <stream-session>` | `claude --bg --name <stream-session>` then `--resume` | `claude --bg --resume session` | Durable mailbox | agentProfile, sessionId |
 | `codex` / `codex-cli` | `codex exec --worktree` | `codex exec --worktree` or `codex queue --thread <session> --resume` | `codex queue --thread <session> --resume` | Durable mailbox | agentProfile, sessionId |
-| `antigravity-cli` | CLI bridge | CLI bridge | CLI bridge | Durable mailbox | workspacePath |
+| `antigravity-cli` | `agy run --dangerously-skip-permissions` | Unsupported (use orca or antigravity-app) | Unsupported (use orca or antigravity-app) | Durable mailbox | workspacePath |
 | `grok-bot` | `grok-bot dispatch --session-mode spawn` | `grok-bot dispatch --session-mode wave` | `grok-bot dispatch --session-mode fixed` | Durable mailbox | targetBot, sessionId |
 | `orca` | Managed child worktree | `orca-wave` with `rotateAfterWaves: 1` | Idle-gated workspace | Durable mailbox | agent: antigravity / claude / codex; workspacePath |
 

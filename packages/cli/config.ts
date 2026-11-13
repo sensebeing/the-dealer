@@ -288,6 +288,8 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
         (binding.conversationMode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
         (binding.mode !== undefined && binding.conversationMode !== undefined && binding.mode !== binding.conversationMode) ||
         (binding.mode === 'inbox-only' && binding.executor !== 'inbox') ||
+        (binding.executor === 'antigravity-cli' && binding.mode !== undefined && binding.mode !== 'spawn' && binding.mode !== 'inbox-only') ||
+        (binding.executor === 'antigravity' && binding.mode === 'wave') ||
         (['orca', 'orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'antigravity-cli', 'claude', 'claude-code', 'codex', 'codex-cli'].includes(binding.agent)) ||
         Object.keys(binding).some(key => !allowed.has(key)) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||

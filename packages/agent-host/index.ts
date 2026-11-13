@@ -32,7 +32,7 @@ export function normalizeAgentHost(agent: SupportedAgentHost): SupportedAgentHos
 export function resolveAgentSessionId(mailboxId: string, sessionId?: string, agent: SupportedAgentHost = 'claude-code'): string | undefined {
   if (sessionId?.trim()) return sessionId;
   const host = normalizeAgentHost(agent);
-  if (host === 'codex' || host === 'antigravity' || host === 'antigravity-app') return undefined;
+  if (host === 'codex' || host === 'antigravity') return undefined;
   if (host === 'claude-code') return mailboxId.replace(/[^A-Za-z0-9.]/gu, char => `_x${char.codePointAt(0)!.toString(16)}_`);
   return mailboxId;
 }
@@ -53,8 +53,8 @@ export function resolveAgentHostContinuation(agent: SupportedAgentHost, mailboxI
       // No receipt was emitted.
     }
   }
-  if (host === 'antigravity' || host === 'antigravity-app' || !resolved) return { hostAgent: undefined, conversationMode: undefined, sessionId: undefined };
-  const bridge = host === 'claude-app' || host === 'chatgpt-app' || host === 'chatgpt-dot' || host === 'grok-bot';
+  if (host === 'antigravity' || !resolved) return { hostAgent: undefined, conversationMode: undefined, sessionId: undefined };
+  const bridge = host === 'claude-app' || host === 'chatgpt-app' || host === 'chatgpt-dot' || host === 'antigravity-app' || host === 'grok-bot';
   return { hostAgent: agent === 'claude-app' ? 'claude-app' : agent, conversationMode: bridge ? (mode === 'wave' ? 'wave' : 'fixed') as ActiveConversationMode : 'fixed', sessionId: resolved };
 }
 
@@ -75,7 +75,11 @@ export function buildAgentHostInvocation(options: {
     case 'claude-app':
       if (!session) throw new Error('Claude app requires a session');
       return { command: options.command ?? 'claude-app', args: ['send', '--session-mode', mode, '--session-key', session, ...(agentProfile ? ['--agent', agentProfile] : []), '--message', promptText] };
-    case 'antigravity': case 'antigravity-cli': case 'antigravity-app':
+    case 'antigravity-app':
+      if (!session) throw new Error('Antigravity app requires a session');
+      return { command: options.command ?? 'antigravity-app', args: ['send', '--session-mode', mode, '--session-key', session, ...(cwd ? ['--workspace', cwd] : []), '--message', promptText] };
+    case 'antigravity': case 'antigravity-cli':
+      if (mode === 'wave' || (agent === 'antigravity-cli' && mode !== 'spawn')) throw new Error('Standalone Antigravity CLI only supports spawn mode; use orca or antigravity-app for wave/fixed sessions');
       return { command: options.command ?? 'agy', args: ['run', '--dangerously-skip-permissions', promptText] };
     case 'chatgpt-dot': case 'chatgpt-app': {
       if (!session) throw new Error('ChatGPT app requires a session');

@@ -534,19 +534,27 @@ test('setup invite prompts reuse configured network, encode seeds, and do not mu
   }
 });
 
-for (const { host } of AGENT_HOST_CATALOG) {
-  for (const mode of ['spawn', 'wave', 'fixed', 'inbox-only'] as const) {
-    test(`setup preset ${host} ${mode} is valid through CLI`, async t => {
+for (const entry of AGENT_HOST_CATALOG) {
+  for (const mode of entry.modes) {
+    test(`setup preset ${entry.host} ${mode} is valid through CLI`, async t => {
       const root = directory(t);
-      const result = await cli(['setup', 'binding-preset', '--host', host, '--mode', mode, '--target-bot', 'review', '--workspace-path', root], root);
+      const result = await cli(['setup', 'binding-preset', '--host', entry.host, '--mode', mode, '--target-bot', 'review', '--workspace-path', root], root);
       validateTopicBindings({ [result.topic]: result.binding }, [result.binding.executor]);
       assert.equal(result.binding.mode, mode);
       if (mode === 'inbox-only') assert.equal(result.binding.executor, 'inbox');
-      else if (host === 'orca' || host === 'antigravity') assert.equal(result.binding.executor, 'orca');
-      else if (host === 'chatgpt-dot') assert.equal(result.binding.executor, 'chatgpt-app');
-      else if (host === 'grok-bot') assert.equal(result.binding.executor, 'agent-pty');
-      else assert.equal(result.binding.executor, host);
+      else if (entry.host === 'orca' || entry.host === 'antigravity') assert.equal(result.binding.executor, 'orca');
+      else if (entry.host === 'chatgpt-dot') assert.equal(result.binding.executor, 'chatgpt-app');
+      else if (entry.host === 'grok-bot') assert.equal(result.binding.executor, 'agent-pty');
+      else assert.equal(result.binding.executor, entry.host);
     });
+  }
+  if (entry.host === 'antigravity-cli') {
+    for (const mode of ['wave', 'fixed'] as const) {
+      test(`setup preset ${entry.host} ${mode} rejects unsupported mode`, () => {
+        assert.throws(() => buildAgentBindingPreset({ host: entry.host, mode }), /Invalid conversation mode/);
+        assert.throws(() => validateTopicBindings({ task: { executor: entry.host, mode } }, [entry.host]), /Invalid topic binding/);
+      });
+    }
   }
 }
 
@@ -1259,7 +1267,7 @@ test('new host executor factories use host invocation mode', async t => {
     [createAntigravityCliExecutorPlugin, 'agy', ['run', '--dangerously-skip-permissions']],
     [createClaudeAppExecutorPlugin, 'claude-app', ['send', '--session-mode', 'spawn']],
     [createChatgptAppExecutorPlugin, 'dot', ['send', '--session-mode', 'spawn']],
-    [createAntigravityAppExecutorPlugin, 'agy', ['run', '--dangerously-skip-permissions']],
+    [createAntigravityAppExecutorPlugin, 'antigravity-app', ['send', '--session-mode', 'spawn']],
   ] as const;
   for (const [factory, command, prefix] of cases) {
     const calls: CommandRequest[] = [];
@@ -1267,6 +1275,9 @@ test('new host executor factories use host invocation mode', async t => {
     await factory({ commandRunner }).execute([message()], context, {});
     assert.equal(calls.at(-1)!.command, command);
     assert.deepEqual(calls.at(-1)!.args.slice(0, prefix.length), prefix);
+  }
+  for (const mode of ['wave', 'fixed'] as const) {
+    await assert.rejects(createAntigravityCliExecutorPlugin({ commandRunner: async () => ({ stdout: '{}' }) }).execute([message(`agy-${mode}`, { mode })], context, {}), /Standalone Antigravity CLI only supports spawn mode/);
   }
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));

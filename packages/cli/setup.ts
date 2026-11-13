@@ -17,9 +17,9 @@ export const AGENT_HOST_CATALOG = [
   { host: 'grok-bot', command: 'grok-bot', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['targetBot', 'sessionId'], description: 'Grok bridge.' },
   { host: 'claude-app', command: 'claude-app', surface: 'app', app: 'Claude', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Claude app bridge.' },
   { host: 'chatgpt-app', command: 'dot', surface: 'app', app: 'ChatGPT', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT app bridge.' },
-  { host: 'antigravity-app', command: 'agy', surface: 'app', app: 'Antigravity', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity app bridge.' },
+  { host: 'antigravity-app', command: 'antigravity-app', surface: 'app', app: 'Antigravity', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity app bridge.' },
   { host: 'codex-cli', command: 'codex', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Codex CLI bridge.' },
-  { host: 'antigravity-cli', command: 'agy', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity CLI bridge.' },
+  { host: 'antigravity-cli', command: 'agy', surface: 'cli', modes: ['spawn', 'inbox-only'] as const, selectors: ['workspacePath'], description: 'Antigravity CLI bridge.' },
 ] as const;
 
 function readOptionalJson(path: string): any {
@@ -136,8 +136,10 @@ export function buildAgentBindingPreset(options: {
   rotateAfterWaves?: number;
 }) {
   const host = options.host === 'claude' ? 'claude-code' : options.host;
-  if (!AGENT_HOST_CATALOG.some(entry => entry.host === host)) throw new Error(`Unsupported agent host: ${host}`);
+  const entry = AGENT_HOST_CATALOG.find(item => item.host === host);
+  if (!entry) throw new Error(`Unsupported agent host: ${host}`);
   const mode = normalizeConversationModeInput(options) ?? 'fixed';
+  if (!(entry.modes as readonly string[]).includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (!['spawn', 'wave', 'fixed', 'inbox-only'].includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (host === 'grok-bot' && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
   const managed = host === 'orca' || host === 'antigravity';
