@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { isValidMailboxId } from '../core-types/index.ts';
 import type { AdmissionMode, NetworkMountConfig } from '../core-types/index.ts';
 import { CONVERSATION_MODES, isStreamConversationBinding } from '../mailbox/index.ts';
+import { normalizeConversationModeInput } from '../agent-host/index.ts';
 
 export interface BuiltInProfile {
   name: string;
@@ -270,12 +271,23 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
   const booleans = ['noParent', 'autoCreateWorkspace', 'notifyLark'];
   const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves']);
   for (const [kind, binding] of Object.entries(bindings)) {
+    if (isRecord(binding)) {
+      try {
+        const normalizedMode = normalizeConversationModeInput(binding);
+        if (normalizedMode !== undefined) {
+          binding.mode = normalizedMode;
+          delete binding.conversationMode;
+        }
+      } catch {
+        throw new Error(`Invalid topic binding: ${kind}`);
+      }
+    }
     if (!nonempty(kind) || (kind.includes(':') && (!nonempty(kind.slice(0, kind.indexOf(':'))) || !nonempty(kind.slice(kind.indexOf(':') + 1)))) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
         (binding.agent !== undefined && !['orca', 'antigravity', 'antigravity-cli', 'antigravity-app', 'claude', 'claude-code', 'claude-app', 'codex', 'codex-cli', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(binding.agent)) ||
         (binding.mode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.mode)) ||
         (binding.conversationMode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
         (binding.mode !== undefined && binding.conversationMode !== undefined && binding.mode !== binding.conversationMode) ||
-        (binding.conversationMode === 'inbox-only' && binding.mode === undefined && binding.executor !== 'inbox') ||
+        (binding.mode === 'inbox-only' && binding.executor !== 'inbox') ||
         (['orca', 'orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'antigravity-cli', 'claude', 'claude-code', 'codex', 'codex-cli'].includes(binding.agent)) ||
         Object.keys(binding).some(key => !allowed.has(key)) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||

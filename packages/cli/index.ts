@@ -1099,7 +1099,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       } else if (action === 'binding-preset') {
         const presetOptions = {
           host: required(v.host, '--host') as SupportedAgentHost,
-          conversationMode: v.mode as AgentConversationMode | undefined,
+          mode: v.mode as AgentConversationMode | undefined,
           topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
           agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
           targetBot: v['target-bot'], sessionId: v['session-id'], notifyLark: v['notify-lark'], cwd: v.root,
@@ -1199,7 +1199,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'setup' && action === 'apply-preset') {
       result = await runtime.applyAgentPreset({
         host: required(v.host, '--host') as SupportedAgentHost,
-        conversationMode: v.mode as AgentConversationMode | undefined,
+        mode: v.mode as AgentConversationMode | undefined,
         topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
         agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
         targetBot: v['target-bot'], sessionId: v['session-id'],

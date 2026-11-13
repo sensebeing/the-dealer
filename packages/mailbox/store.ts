@@ -16,10 +16,11 @@ import { dirname, join, resolve } from 'node:path';
 import { isValidMailboxId, validateSemanticHeader, verifyEnvelope } from '../core-types/index.ts';
 import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-types/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
-import { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../agent-host/index.ts';
+import { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES, normalizeConversationModeInput } from '../agent-host/index.ts';
 import type { AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../agent-host/index.ts';
 export type { AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
+export { normalizeConversationModeInput } from '../agent-host/index.ts';
 
 export const MAILBOX_SCHEMA = 'the-dealer-mailbox/v1';
 const LEGACY_INBOX_SCHEMA = 'the-dealer-inbox/v1';
@@ -291,11 +292,11 @@ export interface MailboxTopicBinding {
   rotateAfterWaves?: number;
 }
 
-export function resolveEffectiveConversationMode(options: { executor?: string; binding?: Partial<MailboxTopicBinding>; payload?: Record<string, unknown>; fallbackMode?: unknown }): AgentConversationMode {
-  const raw = options.payload?.mode ?? options.payload?.conversationMode ?? options.binding?.mode ?? options.binding?.conversationMode ?? options.fallbackMode;
-  if (raw !== undefined) {
-    if (typeof raw !== 'string' || !CONVERSATION_MODES.includes(raw as AgentConversationMode)) throw new Error(`Invalid conversation mode: ${String(raw)}`);
-    return raw as AgentConversationMode;
+export function resolveEffectiveConversationMode(options: { executor?: string; binding?: Partial<MailboxTopicBinding>; payload?: Record<string, unknown>; sources?: ReadonlyArray<{ mode?: unknown; conversationMode?: unknown } | undefined>; fallbackMode?: unknown }): AgentConversationMode {
+  const layers = options.sources ?? [options.payload, options.binding, options.fallbackMode !== undefined ? { mode: options.fallbackMode } : undefined];
+  for (const layer of layers) {
+    const resolved = normalizeConversationModeInput(layer);
+    if (resolved !== undefined) return resolved;
   }
   const executor = options.executor ?? options.binding?.executor;
   if (executor === 'inbox') return 'inbox-only';

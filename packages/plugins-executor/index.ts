@@ -1,4 +1,4 @@
-import { buildAgentHostInvocation, resolveAgentSessionId, normalizeAgentHost } from '../agent-host/index.ts';
+import { buildAgentHostInvocation, resolveAgentSessionId, normalizeAgentHost, normalizeConversationModeInput } from '../agent-host/index.ts';
 import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
@@ -110,7 +110,15 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       const payload = first?.payload ?? {};
       const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined) : undefined;
       const agent = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
-      const rawMode = payload.mode ?? payload.conversationMode ?? binding?.mode ?? binding?.conversationMode ?? config.mode ?? config.conversationMode ?? options.mode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
+      let rawMode: AgentConversationMode | undefined;
+      try {
+        rawMode = [payload, binding, config, options].reduce<AgentConversationMode | undefined>(
+          (acc, layer) => acc ?? normalizeConversationModeInput(layer),
+          undefined,
+        ) ?? (host ? 'spawn' : undefined);
+      } catch {
+        throw new Error('Invalid agent conversationMode');
+      }
       const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
       const hostMode = rawMode !== undefined || Boolean(host) || (canonicalHost !== undefined && ['antigravity', 'antigravity-app', 'claude-code', 'claude-app', 'chatgpt-dot', 'grok-bot'].includes(canonicalHost));
       let request;
@@ -408,7 +416,8 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
       const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
       const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(batch[0]?.kind, typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined);
-      const interactive = payload.interactive === true || (payload.mode ?? payload.conversationMode ?? binding?.mode ?? binding?.conversationMode) === 'spawn' || binding?.executor === 'orca' || config.interactive === true || options.interactive === true;
+      const explicitMode = normalizeConversationModeInput(payload) ?? normalizeConversationModeInput(binding);
+      const interactive = payload.interactive === true || explicitMode === 'spawn' || binding?.executor === 'orca' || config.interactive === true || options.interactive === true;
       const store = options.store ?? config.store;
       const effectiveAgent = orcaAgent(payload.agent ?? binding?.agent ?? config.agent ?? options.agent);
       const wakeup = options.wakeup ?? config.wakeup;
@@ -720,7 +729,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           receiverTerminalHandle ??
           (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
         const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
-        const effectiveMode = resolveEffectiveConversationMode({ executor: binding?.executor ?? 'orca-wave', binding, payload, fallbackMode: (config as { mode?: unknown }).mode ?? (options as { mode?: unknown }).mode });
+        const effectiveMode = resolveEffectiveConversationMode({ executor: binding?.executor ?? 'orca-wave', binding, payload, sources: [payload, binding, config as { mode?: unknown; conversationMode?: unknown }, options as { mode?: unknown; conversationMode?: unknown }] });
         const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
               mode: (payload.mode ?? binding?.mode ?? (config as { mode?: unknown }).mode) === 'fixed' ? 'fixed' : effectiveMode === 'fixed' ? 'fixed' : 'wave',
               bindingRotateAfterWaves: binding?.rotateAfterWaves,
@@ -942,7 +951,7 @@ export function createOrcaExecutorPlugin(options: OrcaSpawnOptions & OrcaWaveOpt
         typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined,
       );
       const payload = batch[0]?.payload;
-      const effectiveMode = resolveEffectiveConversationMode({ executor: 'orca', binding, payload, fallbackMode: config.mode ?? config.conversationMode ?? (options as OrcaSpawnOptions & { mode?: unknown }).mode ?? options.conversationMode });
+      const effectiveMode = resolveEffectiveConversationMode({ executor: 'orca', binding, payload, sources: [payload, binding, config as { mode?: unknown; conversationMode?: unknown }, options as { mode?: unknown; conversationMode?: unknown }] });
       const receipt = effectiveMode === 'inbox-only'
         ? await createInboxExecutorPlugin({ store: options.store ?? (config.store as MailboxStore | undefined) }).execute(batch, context, runtimeConfig)
         : effectiveMode === 'spawn'

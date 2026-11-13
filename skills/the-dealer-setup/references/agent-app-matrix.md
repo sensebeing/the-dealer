@@ -6,13 +6,14 @@ the executor, and the second level picks how it owns a conversation:
 | First-level executor | `spawn` | `wave` | `fixed` | `inbox-only` | Receiver selectors |
 | --- | --- | --- | --- | --- | --- |
 | `inbox` | Durable mailbox | Durable mailbox | Durable mailbox | Durable mailbox | mailboxId |
-| `claude-app` | App bridge | App bridge | App bridge | Durable mailbox | agentProfile, sessionId |
-| `chatgpt-app` | App bridge | App bridge | App bridge | Durable mailbox | agentProfile, targetBot, sessionId |
+| `claude-app` | `claude-app send --session-mode spawn` | `claude-app send --session-mode wave` | `claude-app send --session-mode fixed` | Durable mailbox | agentProfile, sessionId |
+| `chatgpt-app` | `dot send --session-mode spawn` | `dot send --session-mode wave` | `dot send --session-mode fixed` | Durable mailbox | agentProfile, targetBot, sessionId |
 | `antigravity-app` | App bridge | App bridge | App bridge | Durable mailbox | workspacePath |
-| `claude-code` | `claude --bg --name task-ID` | Background conversation | `claude --bg --resume session` | Durable mailbox | agentProfile, sessionId |
-| `codex-cli` | CLI bridge | CLI bridge | CLI bridge | Durable mailbox | agentProfile, sessionId |
+| `claude-code` | `claude --bg --name <stream-session>` | `claude --bg --name <stream-session>` then `--resume` | `claude --bg --resume session` | Durable mailbox | agentProfile, sessionId |
+| `codex` / `codex-cli` | `codex exec --worktree` | `codex exec --worktree` or `codex queue --thread <session> --resume` | `codex queue --thread <session> --resume` | Durable mailbox | agentProfile, sessionId |
 | `antigravity-cli` | CLI bridge | CLI bridge | CLI bridge | Durable mailbox | workspacePath |
-| `orca` | Managed child worktree | Idle-gated workspace wave | Idle-gated workspace | Durable mailbox | agent: antigravity / claude / codex; workspacePath |
+| `grok-bot` | `grok-bot dispatch --session-mode spawn` | `grok-bot dispatch --session-mode wave` | `grok-bot dispatch --session-mode fixed` | Durable mailbox | targetBot, sessionId |
+| `orca` | Managed child worktree | `orca-wave` with `rotateAfterWaves: 1` | Idle-gated workspace | Durable mailbox | agent: antigravity / claude / codex; workspacePath |
 
 The built-in `orca-spawn` and `orca-wave` executors are the managed execution
 implementations used by `orca` bindings. Other legacy bridge hosts remain

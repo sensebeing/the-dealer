@@ -2,9 +2,13 @@
 
 | Profile | Default gate | Policies | Executors | Default executor |
 | --- | --- | --- | --- | --- |
-| personal-dev | open | dedup-cas | orca, orca-spawn, orca-wave, agent-pty, notify, inbox | orca-spawn |
-| dedicated-worker | open | dedup-cas | orca-spawn, orca-wave, agent-pty | orca-spawn |
-| headless-relay | open | none | notify | notify |
+| personal-dev | open | dedup-cas | orca, orca-spawn, orca-wave, codex-cli, codex, claude-code, antigravity-cli, antigravity, claude-app, chatgpt-app, antigravity-app, agent-pty, notify, inbox | orca-spawn |
+| dedicated-worker | open | dedup-cas | orca, orca-spawn, orca-wave, codex-cli, codex, claude-code, antigravity-cli, antigravity, claude-app, chatgpt-app, antigravity-app, agent-pty, inbox | orca-spawn |
+| orca-dev | open | dedup-cas | orca, orca-spawn, orca-wave, notify, inbox | orca-spawn |
+| codex-dev | open | dedup-cas | codex, agent-pty, notify, inbox | codex |
+| claude-dev | open | dedup-cas | claude-code, agent-pty, notify, inbox | claude-code |
+| antigravity-dev | open | dedup-cas | antigravity, orca, orca-spawn, orca-wave, agent-pty, notify, inbox | antigravity |
+| headless-relay | open | none | notify, inbox | notify |
 
 The headless profile receives into a private notification inbox and can route
 outbound messages; it does not automatically forward inbound traffic.

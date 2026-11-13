@@ -152,7 +152,8 @@ network; mount that same invite locally before expecting connectivity.
 
 Keep incoming work in the durable inbox. Ask for the teammate’s member handle;
 replace the generated `teammate` placeholder before starting a new node. Ask for
-the Agent App (`orca`, `antigravity`, `claude-code`, `codex`, `chatgpt-dot`,
+the Agent App (`orca`, `antigravity`, `antigravity-cli`, `antigravity-app`,
+`claude-code`, `claude-app`, `codex`, `codex-cli`, `chatgpt-app`, `chatgpt-dot`,
 `grok-bot`) and one mode:
 **fixed** (recommended for ongoing collaboration), **wave** (per-wave session tab in a shared stream), **spawn** (independent tasks),
 or **inbox-only** (manual processing). Ask only for the selected host's required
@@ -170,7 +171,7 @@ requires a nonempty targetBot. `--notify-lark` enables both mailbox eligibility
 and node notifications immediately. Configure credentials/target separately,
 never infer them.
 Generate `invite-prompt --peer-member <colleague>` and share `teammatePrompt`.
-Keep approval-required admission until the intended peer is verified. Check
+Built-in profiles default to the open gate; pass `--gate approval_required` to dealer node up / dealer network mount or run `dealer gate mode approval_required` when inbound approval is required. Check
 mailbox readback and an actual host receipt before reporting onboarding complete.
 
 

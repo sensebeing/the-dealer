@@ -6,6 +6,7 @@ import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, Topi
 import { CONVERSATION_MODES, resolveOrcaWaveRotateAfterWaves } from '../mailbox/index.ts';
 import { findExecutable } from '../orca-workspace/executable.ts';
 import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
+import { normalizeConversationModeInput } from '../agent-host/index.ts';
 
 export const AGENT_HOST_CATALOG = [
   { host: 'orca', command: 'orca', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agent', 'workspacePath'], description: 'Orca managed worktrees and idle-gated conversations.' },
@@ -105,17 +106,17 @@ export function buildOnboardingPrompts(options: {
     'Read the installed the-dealer-setup/SKILL.md, then run dealer setup probe --json before configuring anything.',
     `Network topology is fixed to ${networkId}; do not ask to choose local or another network topology.`,
     'Before applying presets, check command -v lark-cli or ~/.local/bin/lark-cli. If missing, install with npx @larksuite/cli@latest install. Use the discovered executable for all subsequent lark-cli commands. Run LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 lark-cli auth status --json --verify. If not_configured, run lark-cli config init --new. If not logged in or expired, run lark-cli auth login --recommend, then re-verify auth status with the same environment flags.',
-    ...(teammate ? [`Ask for the teammate’s member handle before continuing; replace ${quote(peerMember)} below with their chosen handle. Ask for their Agent App (orca, antigravity, claude-code, codex, chatgpt-dot, grok-bot) and mode (spawn, fixed, inbox-only).`] : []),
+    ...(teammate ? [`Ask for the teammate’s member handle before continuing; replace ${quote(peerMember)} below with their chosen handle. Ask for their Agent App (${AGENT_HOST_CATALOG.map(entry => entry.host).join(', ')}) and mode (${CONVERSATION_MODES.join(', ')}).`] : []),
     `dealer node up --member ${quote(identity)} --name ${quote(nodeName)} --json`, mount,
     ...(options.projectId ? [`Link this local repository using dealer project link . --json; verify its projectId is ${quote(options.projectId)}.`] : []),
     ...(teammate ? [`Generate dealer setup binding-preset ${presetOptions} --json (add --target-bot for grok-bot execution), then apply the reviewed preset with dealer setup apply-preset ${presetOptions} --json using the same options (add --set-default only to change the node default).`] : []),
     `dealer peers list --network ${quote(networkId)} --json`,
     `dealer send --network ${quote(networkId)} --to ${quote(`member:${member}`)} --topic setup.ping --body 'Please reply to verify connectivity' --json`,
-    'Verify a reply in both directions; a dispatch receipt alone is not task completion. Keep approval_required until the intended peer is verified.',
+    'Verify a reply in both directions; a dispatch receipt alone is not task completion. Built-in profiles default to the open gate; pass --gate approval_required to dealer node up / dealer network mount or run dealer gate mode approval_required when inbound approval is required.',
   ].join('\n');
   return { networkId, inviteUri,
     crossMachinePrompt: common(member),
-    teammatePrompt: `${common(peerMember, true)}\nUse a durable inbox for collab.request.v4 with the chosen conversation mode: spawn (new conversation), fixed (dedicated conversation), or inbox-only.`,
+    teammatePrompt: `${common(peerMember, true)}\nUse a durable inbox for collab.request.v4 with the chosen conversation mode: spawn (new conversation), wave (per-wave session tab in a shared stream), fixed (dedicated conversation), or inbox-only.`,
   };
 }
 
@@ -136,7 +137,7 @@ export function buildAgentBindingPreset(options: {
 }) {
   const host = options.host === 'claude' ? 'claude-code' : options.host;
   if (!AGENT_HOST_CATALOG.some(entry => entry.host === host)) throw new Error(`Unsupported agent host: ${host}`);
-  const mode = options.mode ?? options.conversationMode ?? 'fixed';
+  const mode = normalizeConversationModeInput(options) ?? 'fixed';
   if (!['spawn', 'wave', 'fixed', 'inbox-only'].includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (host === 'grok-bot' && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
   const managed = host === 'orca' || host === 'antigravity';

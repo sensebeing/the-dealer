@@ -1274,8 +1274,14 @@ test('new host executor factories use host invocation mode', async t => {
   await createCodexCliExecutorPlugin({ store, resolveTopicBinding: () => ({ executor: 'codex-cli', mode: 'wave', mailboxId: 'default' }), commandRunner: async request => { calls.push(request); return { stdout: '{"threadId":"wave-thread"}' }; } })
     .execute([message('wave-msg', { mode: 'wave' })], context, {});
   assert.deepEqual(calls.at(-1)!.args.slice(0, 2), ['exec', '--worktree']);
-  assert.equal(store.getWakeTarget('default')?.conversationMode, 'wave');
+  assert.equal(store.getWakeTarget('default')?.conversationMode, 'fixed');
   assert.equal(store.getWakeTarget('default')?.sessionId, 'wave-thread');
+  const claudeCalls: CommandRequest[] = [];
+  const claudeStore = new MailboxStore(join(root, 'claude-mailbox.json'));
+  await createClaudeAppExecutorPlugin({ store: claudeStore, resolveTopicBinding: () => ({ executor: 'claude-app', mode: 'wave', mailboxId: 'default' }), commandRunner: async request => { claudeCalls.push(request); return { stdout: '{}' }; } })
+    .execute([message('claude-wave', { mode: 'wave' })], context, {});
+  assert.deepEqual(claudeCalls.at(-1)!.args.slice(0, 3), ['send', '--session-mode', 'wave']);
+  assert.equal(claudeStore.getWakeTarget('default')?.conversationMode, 'wave');
   const runtime = await new DealerNodeRuntime({ stateDir: directory(t), gateMode: 'approval_required' }).start();
   assert.equal(runtime.config.gateMode, 'approval_required');
   await runtime.stop();
