@@ -501,8 +501,9 @@ function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle
     rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
-    earliestWakeAt: existing?.earliestWakeAt ?? 0, lastWakeError: existing?.lastWakeError,
-    deliveryInDoubt: existing?.deliveryInDoubt,
+    earliestWakeAt: existing?.earliestWakeAt ?? 0,
+    lastWakeError: existing?.lastWakeError ?? (current.deliveryInDoubt ? current.lastWakeError : undefined),
+    deliveryInDoubt: existing?.deliveryInDoubt ?? current.deliveryInDoubt,
   } as any);
   return termMailbox;
 }

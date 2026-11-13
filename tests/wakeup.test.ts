@@ -1957,4 +1957,7 @@ test('pinning a rotating session preserves existing terminal wake fences', async
   const target = store.getWakeTarget('terminal:term-1');
   assert.equal(target?.pendingWake, true);
   assert.ok(notifications.includes('terminal:term-1'));
+  store.upsertWakeTarget('stream:inbox', { deliveryInDoubt: true, lastWakeError: 'fenced' });
+  assert.equal(store.pinRotatingSessionMailbox('stream:inbox', 'term-2'), 'terminal:term-2');
+  assert.equal(store.getWakeTarget('terminal:term-2')?.deliveryInDoubt, true);
 });
