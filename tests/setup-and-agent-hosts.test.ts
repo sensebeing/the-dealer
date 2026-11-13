@@ -829,7 +829,7 @@ for (const scenario of [
 ]) {
   test(`runtime agent-pty migration respects ${scenario.name}`, async t => {
     const root = directory(t);
-    const executors = ['notify', 'inbox'];
+    const executors = scenario.name === 'saved personal-dev' ? ['orca-spawn', 'orca-wave', 'notify', 'inbox', 'agent-pty', 'codex', 'claude-code', 'antigravity'] : ['notify', 'inbox'];
     writeFileSync(join(root, 'config.json'), JSON.stringify({
       profile: scenario.profile, executors, defaultExecutor: 'inbox', gateMode: 'approval_required',
     }));
@@ -1299,10 +1299,10 @@ test('new host executor factories use host invocation mode', async t => {
 });
 
 for (const [host, profileName, defaultExecutor, executors] of [
-  ['orca', 'orca-dev', 'orca-spawn', ['orca', 'orca-spawn', 'orca-wave', 'notify', 'inbox']],
-  ['codex', 'codex-dev', 'codex', ['codex', 'agent-pty', 'notify', 'inbox']],
+  ['orca', 'orca-dev', 'orca', ['orca', 'orca-spawn', 'orca-wave', 'notify', 'inbox']],
+  ['codex', 'codex-dev', 'codex', ['codex-cli', 'codex', 'agent-pty', 'notify', 'inbox']],
   ['claude-code', 'claude-dev', 'claude-code', ['claude-code', 'agent-pty', 'notify', 'inbox']],
-  ['antigravity', 'antigravity-dev', 'antigravity', ['antigravity', 'orca', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox']],
+  ['antigravity', 'antigravity-dev', 'antigravity', ['antigravity', 'antigravity-cli', 'antigravity-app', 'orca', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox']],
 ] as const) {
   test(`${profileName} and ${host} patch validate`, () => {
     const profile = getBuiltInProfile(profileName);

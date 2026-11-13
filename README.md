@@ -132,10 +132,10 @@ See [architecture](docs/architecture.md), [wire protocol](docs/wire-protocol.md)
 
 | Host (`--host`) | Startup profile (`--profile`) | Sample patch | Named executor |
 | --- | --- | --- | --- |
-| `orca` | `orca-dev` | [orca.patch.json](examples/user-patches/orca.patch.json) | `orca-spawn` / `orca-wave` |
-| `codex` | `codex-dev` | [codex.patch.json](examples/user-patches/codex.patch.json) | `codex` |
+| `orca` | `orca-dev` | [orca.patch.json](examples/user-patches/orca.patch.json) | `orca` (`orca-spawn` / `orca-wave`) |
+| `codex` | `codex-dev` | [codex.patch.json](examples/user-patches/codex.patch.json) | `codex-cli` / `codex` |
 | `claude-code` | `claude-dev` | [claude-code.patch.json](examples/user-patches/claude-code.patch.json) | `claude-code` |
-| `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity` |
+| `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity-cli` / `antigravity-app` / `antigravity` |
 
 All four startup profiles use the `open` gate and enable `dedup-cas`; use
 `--gate approval_required` or `dealer gate mode approval_required` when approval
@@ -143,13 +143,12 @@ is required.
 
 ### Supported agent apps and conversation modes
 
-| Host / mode | `spawn` | `wave` | `fixed` | `inbox-only` | Receiver parameters |
-| --- | --- | --- | --- |
-| `orca` | New child worktree | Idle-gated workspace | Receiver project/workspace and inner `--agent` |
-| `codex` | New CLI worktree session | Existing thread queue | Optional `--agent-profile` and fixed `--session-id` |
-| `claude-code` | Background conversation | Resumed session | Optional `--agent-profile` and fixed `--session-id` |
-| `antigravity` | Orca-managed `agy` worktree | Orca-managed `agy` workspace | Orca workspace or standalone `antigravity` executor |
-| `inbox-only` (any host) | No process launch | No process launch | Durable mailbox intake for manual `dealer inbox check` |
+| Host / mode | `spawn` | `wave` | `fixed` | `inbox-only` |
+| --- | --- | --- | --- | --- |
+| `orca` | Child worktree | Workspace wave | Fixed session | Durable mailbox |
+| Desktop Apps: `claude-app` / `chatgpt-app` / `antigravity-app` | New session | Wave queue | Fixed session | Durable mailbox |
+| Terminal CLIs: `claude-code` / `codex-cli` / `antigravity-cli` | New session | Wave queue | Fixed session | Durable mailbox |
+| `inbox` | — | — | — | Manual inbox |
 
 Bridge presets for `chatgpt-dot` and `grok-bot` (`--target-bot`) are also available.
 
@@ -159,14 +158,14 @@ Pass a `--host` and `--mode` pair to `dealer setup binding-preset` or `dealer se
 
 | Preset | Arguments | Generated executor |
 | --- | --- | --- |
-| `orca-fixed` | `--host orca --mode fixed` | `orca-wave` |
-| `orca-spawn` | `--host orca --mode spawn` | `orca-spawn` |
-| `codex-spawn` | `--host codex --mode spawn` | `agent-pty` |
-| `codex-fixed` | `--host codex --mode fixed` | `agent-pty` |
-| `claude-spawn` | `--host claude-code --mode spawn` | `agent-pty` |
-| `claude-fixed` | `--host claude-code --mode fixed` | `agent-pty` |
-| `antigravity-spawn` | `--host antigravity --mode spawn` | `orca-spawn` |
-| `antigravity-fixed` | `--host antigravity --mode fixed` | `orca-wave` |
+| `orca-fixed` | `--host orca --mode fixed` | `orca` (`mode: fixed`) |
+| `orca-spawn` | `--host orca --mode spawn` | `orca` (`mode: spawn`) |
+| `codex-spawn` | `--host codex --mode spawn` | `codex-cli` / `codex` (`mode: spawn`) |
+| `codex-fixed` | `--host codex --mode fixed` | `codex-cli` / `codex` (`mode: fixed`) |
+| `claude-spawn` | `--host claude-code --mode spawn` | `claude-code` (`mode: spawn`) |
+| `claude-fixed` | `--host claude-code --mode fixed` | `claude-code` (`mode: fixed`) |
+| `antigravity-spawn` | `--host antigravity --mode spawn` | `antigravity-cli` (`mode: spawn`) |
+| `antigravity-fixed` | `--host antigravity --mode fixed` | `antigravity-app` (`mode: fixed`) |
 | `lark-mirror` | `apply-preset --notify-lark` | Marks the binding for Lark mirroring (configure `larkNotify` credentials in `~/.dealer/config.json`) |
 
 ```sh

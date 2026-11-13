@@ -111,10 +111,10 @@ flowchart LR
 
 | 宿主（`--host`） | 启动 profile（`--profile`） | 示例 patch | 命名执行器 |
 | --- | --- | --- | --- |
-| `orca` | `orca-dev` | [orca.patch.json](examples/user-patches/orca.patch.json) | `orca-spawn` / `orca-wave` |
-| `codex` | `codex-dev` | [codex.patch.json](examples/user-patches/codex.patch.json) | `codex` |
+| `orca` | `orca-dev` | [orca.patch.json](examples/user-patches/orca.patch.json) | `orca` (`orca-spawn` / `orca-wave`) |
+| `codex` | `codex-dev` | [codex.patch.json](examples/user-patches/codex.patch.json) | `codex-cli` / `codex` |
 | `claude-code` | `claude-dev` | [claude-code.patch.json](examples/user-patches/claude-code.patch.json) | `claude-code` |
-| `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity` |
+| `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity-cli` / `antigravity-app` / `antigravity` |
 
 四个启动 profile 默认使用 `open` 门禁并启用 `dedup-cas`；需要审批时使用
 `--gate approval_required` 或 `dealer gate mode approval_required`。
@@ -137,14 +137,14 @@ flowchart LR
 
 | 预设组合 | 参数 | 生成的执行器 |
 | --- | --- | --- |
-| `orca-fixed` | `--host orca --mode fixed` | `orca-wave` |
-| `orca-spawn` | `--host orca --mode spawn` | `orca-spawn` |
-| `codex-spawn` | `--host codex --mode spawn` | `agent-pty` |
-| `codex-fixed` | `--host codex --mode fixed` | `agent-pty` |
-| `claude-spawn` | `--host claude-code --mode spawn` | `agent-pty` |
-| `claude-fixed` | `--host claude-code --mode fixed` | `agent-pty` |
-| `antigravity-spawn` | `--host antigravity --mode spawn` | `orca-spawn` |
-| `antigravity-fixed` | `--host antigravity --mode fixed` | `orca-wave` |
+| `orca-fixed` | `--host orca --mode fixed` | `orca` (`mode: fixed`) |
+| `orca-spawn` | `--host orca --mode spawn` | `orca` (`mode: spawn`) |
+| `codex-spawn` | `--host codex --mode spawn` | `codex-cli` / `codex` (`mode: spawn`) |
+| `codex-fixed` | `--host codex --mode fixed` | `codex-cli` / `codex` (`mode: fixed`) |
+| `claude-spawn` | `--host claude-code --mode spawn` | `claude-code` (`mode: spawn`) |
+| `claude-fixed` | `--host claude-code --mode fixed` | `claude-code` (`mode: fixed`) |
+| `antigravity-spawn` | `--host antigravity --mode spawn` | `antigravity-cli` (`mode: spawn`) |
+| `antigravity-fixed` | `--host antigravity --mode fixed` | `antigravity-app` (`mode: fixed`) |
 | `lark-mirror` | `apply-preset --notify-lark` | 开启该绑定的飞书镜像（在 `~/.dealer/config.json` 中配置 `larkNotify` 凭证与目标） |
 
 ```sh

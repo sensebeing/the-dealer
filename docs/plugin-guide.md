@@ -40,7 +40,7 @@ export const customAlertSourcePlugin: Plugin<CustomAlertSourceConfig> = {
 2. **`RouteJudgePlugin` (`router.registerJudge`)**: Inspect an outbound `MessageEnvelope` with `routing.mode === "auto"` and the live list of candidate `NodeCard`s in that `Network`, returning a `RouteDecision` (`unicast`, `multicast`, or `broadcast`).
 3. **`GateRulePlugin` (`gate.registerRule`)**: Hook into `gate/evaluate` (`bail` mode) to allow, require human approval (`pending_approval`), queue under DND (`queued_dnd`), or reject inbound messages by sender member, skill, or message kind.
 4. **`DispatchPolicyPlugin` (`dispatcher.registerPolicy`)**: Wrap inbound execution with CAS idempotency watermarks (`policy-dedup-cas`). Durable wave/task wakeup is owned by `MailboxStore` and `WakeupRedriveService`, not by a policy plugin.
-5. **`ExecutorPlugin` (`dispatcher.registerExecutor`)**: Actuate admitted messages locally—e.g., spawning an isolated Orca worktree + agent terminal (`executor-orca-spawn`), delivering a coalesced wave to a resident Orca workspace (`executor-orca-wave`), or running a local CLI agent (`executor-agent-pty`).
+5. **`ExecutorPlugin` (`dispatcher.registerExecutor`)**: Actuate admitted messages locally through first-class `orca`, desktop app (`claude-app`, `chatgpt-app`, `antigravity-app`), terminal CLI (`claude-code`, `codex-cli`, `antigravity-cli`), and `inbox` executors, alongside legacy `orca-spawn`, `orca-wave`, and `agent-pty` aliases.
 
 ## 3. Three-tier onboarding: built-in, project, user
 

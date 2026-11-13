@@ -231,7 +231,7 @@ for the manifest, factory context and lifecycle contracts.
 
 The `inbox` executor retains messages and materialized attachments in the durable
 `mailbox.json` ledger. Each message is routed to a logical mailbox (`default`,
-`stream:<streamKey>` for `orca-wave`, `task:<messageId>` for `orca-spawn`, or an
+`stream:<streamKey>` for wave/fixed bindings (including `orca-wave`), `task:<messageId>` for spawn bindings (including `orca-spawn`), or an
 explicit `semantic.targetMailbox` / `payload.mailbox`). A mailbox has at most one
 unacknowledged delivery lease (`dlv_<12hex>`), so re-running `check` returns the same
 batch until it is acknowledged; newer mail queues behind the lease and is never mixed

@@ -1,15 +1,20 @@
 {
   "profile": "orca-dev",
-  "defaultExecutor": "orca-spawn",
+  "defaultExecutor": "orca",
   "topicBindings": {
     "collab.request.v4": {
-      "executor": "orca-spawn",
-      "conversationMode": "spawn",
+      "executor": "orca",
       "agent": "codex",
-      "noParent": true
+      "noParent": true,
+      "mode": "fixed"
+    },
+    "task.dispatch": {
+      "executor": "orca",
+      "mode": "spawn"
     }
   },
   "executors": [
+    "orca",
     "orca-spawn",
     "orca-wave",
     "notify",
