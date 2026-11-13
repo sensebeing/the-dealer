@@ -11,6 +11,7 @@ export interface CommandRequest {
   cwd?: string;
   input?: string;
   signal?: AbortSignal;
+  env?: NodeJS.ProcessEnv;
 }
 
 export type CommandRunner = (
@@ -61,6 +62,7 @@ export const runCommand: CommandRunner = request =>
       child = spawn(request.command, [...request.args], {
         cwd: request.cwd,
         signal: request.signal,
+        ...(request.env ? { env: request.env } : {}),
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: false,
       });
@@ -116,6 +118,8 @@ export interface OrcaTerminalRow {
   preview?: unknown;
   agentIdentity?: unknown;
   lastOutputAt?: unknown;
+  tabId?: string;
+  leafId?: string;
 }
 
 /** Collapse arbitrary text into exactly one line; wakeup pointers must never span lines. */
@@ -198,13 +202,14 @@ export async function checkOrcaWorkspaceIdle(
     worktreeId: string;
     childWorktreeIds?: string[];
     unverifiableTerminalCount?: number;
-    agents?: { state?: string }[];
+    agents?: { state?: string; paneKey?: string; parentPaneKey?: string }[];
   };
   const rows: Workspace[] = inventory.worktrees;
   const root = rows.find(row => row.path === cwd);
   if (!root) {
     return { idle: false, reason: 'Workspace not found' };
   }
+  if (options?.targetTerminalHandle === null) return { idle: true, reason: undefined };
   let composerPrefilled = false;
   const visited = new Set<string>();
   const idleTree = async (row: Workspace): Promise<boolean> => {
@@ -212,13 +217,6 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     visited.add(row.worktreeId);
-    if (
-      row.unverifiableTerminalCount !== 0 ||
-      !row.agents ||
-      row.agents.some(agent => agent.state !== 'done')
-    ) {
-      return false;
-    }
     const listed = await checkedCommand(runner, {
       command,
       args: ['terminal', 'list', '--worktree', `path:${row.path}`, '--json'],
@@ -234,9 +232,17 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
+    const targetTerm = row.path === cwd && typeof options?.targetTerminalHandle === 'string'
+      ? handles.find(t => String(t.handle) === options.targetTerminalHandle) : undefined;
+    const targetPaneKey = targetTerm?.tabId && targetTerm?.leafId ? `${targetTerm.tabId}:${targetTerm.leafId}` : undefined;
+    if (targetPaneKey === undefined) {
+      if (row.unverifiableTerminalCount !== 0 || !row.agents || row.agents.some(agent => agent.state !== 'done')) return false;
+    } else {
+      if (!row.agents || row.agents.filter(agent => agent.paneKey === targetPaneKey || (!agent.paneKey && handles.length <= 1)).some(agent => agent.state !== 'done')) return false;
+    }
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
     const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
-    if (observableHandles.filter(t => Boolean(t.connected)).length < row.agents.length) {
+    if (targetPaneKey === undefined && observableHandles.filter(t => Boolean(t.connected)).length < (row.agents?.length ?? 0)) {
       return false;
     }
     // Liveness and composer state only matter for terminals this wakeup may actually write into:
@@ -310,6 +316,7 @@ export async function checkOrcaWorkspaceIdle(
     }
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find(item => item.worktreeId === id);
+      if (targetPaneKey && child?.agents?.length && child.agents.every(agent => typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && agent.parentPaneKey !== targetPaneKey)) continue;
       if (!child || !(await idleTree(child))) {
         return false;
       }
@@ -535,12 +542,13 @@ export async function sendOrcaTerminalText(
       : []),
     '--json',
   ];
-  const output = await checkedCommand(runner, {
-    command,
-    args,
-    cwd: options.cwd,
-    signal: options.signal,
-  });
+  let output;
+  try {
+    output = await checkedCommand(runner, { command, args, cwd: options.cwd, signal: options.signal });
+  } catch (error) {
+    if (!String(error).includes('no_active_sender_terminal')) throw error;
+    output = await checkedCommand(runner, { command, args: [...args, '--allow-self'], cwd: options.cwd, signal: options.signal, env: { ...process.env, ORCA_TERMINAL_ID: terminalHandle } });
+  }
   if (JSON.parse(output.stdout).ok === false) {
     throw new Error('Orca terminal send failed');
   }

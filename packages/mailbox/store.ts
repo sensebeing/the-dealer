@@ -488,6 +488,26 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   return target;
 }
 
+function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle: string): string {
+  const current = state.wakeTargets[id];
+  const handle = rawHandle.trim();
+  if (!handle || current?.mode !== 'orca-terminal' || current.rotateAfterWaves === undefined) return id;
+  const termMailbox = `terminal:${handle}`;
+  const existing = state.wakeTargets[termMailbox];
+  const hasQueued = state.items.some(item => item.mailboxId === termMailbox && item.status === 'queued');
+  const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
+  state.wakeTargets[termMailbox] = validateWakeTarget({
+    ...current, ...(existing ?? {}), mailboxId: termMailbox, mode: 'orca-terminal', terminalHandle: handle,
+    rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
+    wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
+    pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
+    earliestWakeAt: existing?.earliestWakeAt ?? 0,
+    lastWakeError: existing?.deliveryInDoubt ? existing.lastWakeError : (current.deliveryInDoubt ? current.lastWakeError : existing?.lastWakeError),
+    deliveryInDoubt: Boolean(existing?.deliveryInDoubt || current.deliveryInDoubt) ? true : undefined,
+  } as any);
+  return termMailbox;
+}
+
 const THREAD_STATES: readonly ThreadRouteRecord['state'][] = ['open', 'replied', 'settled'];
 const SETTLEMENT_OUTCOMES: readonly SettlementOutcome[] = ['succeeded', 'failed', 'cancelled'];
 
@@ -1275,9 +1295,7 @@ export class MailboxStore {
       mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
     let wakeMailbox: string | undefined;
     const result = this.mutate(state => {
-      const candidates = requestedMailbox
-        ? [requestedMailbox]
-        : Object.keys(state.mailboxes);
+      const candidates = requestedMailbox ? [requestedMailbox] : Object.keys(state.mailboxes);
       for (const candidate of candidates) {
         const record = state.mailboxes[candidate];
         if (!record) {
@@ -1509,6 +1527,7 @@ export class MailboxStore {
     patch: Partial<WakeTargetState> = {},
   ): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
+    let pinnedWakeMailbox: string | undefined;
     const completed = this.mutate(state => {
       const pendingWake = state.items.some(item =>
         item.mailboxId === id && item.status === 'queued' && item.sequence > deliveredSequence,
@@ -1520,10 +1539,37 @@ export class MailboxStore {
         deliveryInDoubt: undefined,
       }));
       state.wakeTargets[id] = next;
+      if (current.mode === 'orca-terminal' && current.rotateAfterWaves !== undefined &&
+          typeof next.terminalHandle === 'string' && next.terminalHandle.trim()) {
+        const termMailbox = pinRotatingTargetInState(state, id, next.terminalHandle);
+        if (state.wakeTargets[termMailbox]?.pendingWake && !state.wakeTargets[termMailbox]?.deliveryInDoubt) pinnedWakeMailbox = termMailbox;
+        const delivered = state.items.filter(item => item.mailboxId === id && item.sequence <= deliveredSequence);
+        const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
+        const updatedAt = new Date().toISOString();
+        for (const [key, record] of Object.entries(state.threads)) {
+          if (record.localMailbox === id && (keys.has(key) || keys.has(record.threadId) || keys.has(record.messageId))) {
+            state.threads[key] = { ...record, localMailbox: termMailbox, updatedAt };
+          }
+        }
+      }
       return structuredClone(next);
     });
     if (completed.pendingWake) this.events.emit('target', id);
+    if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return completed;
+  }
+
+  pinRotatingSessionMailbox(mailboxId: string, terminalHandle?: string): string {
+    const id = normalizeMailboxId(mailboxId);
+    if (typeof terminalHandle !== 'string' || !terminalHandle.trim()) return id;
+    let notify = false;
+    const pinned = this.mutate(state => {
+      const mailbox = pinRotatingTargetInState(state, id, terminalHandle);
+      notify = Boolean(state.wakeTargets[mailbox]?.pendingWake && !state.wakeTargets[mailbox]?.deliveryInDoubt);
+      return mailbox;
+    });
+    if (notify) this.events.emit('target', pinned);
+    return pinned;
   }
 
   getWakeTarget(mailboxId: string): WakeTargetState | undefined {
@@ -1601,6 +1647,10 @@ export class MailboxStore {
     localMailbox: string,
   ): ThreadRouteRecord {
     const local = normalizeMailboxId(localMailbox, 'local mailbox');
+    const rotatingTarget = this.read().wakeTargets[local];
+    const effectiveLocal = rotatingTarget?.mode === 'orca-terminal' && rotatingTarget.rotateAfterWaves !== undefined &&
+      typeof rotatingTarget.terminalHandle === 'string' && rotatingTarget.terminalHandle.trim() && !rotatingTarget.pendingWake
+      ? `terminal:${rotatingTarget.terminalHandle.trim()}` : local;
     if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
       throw new Error('Invalid envelope: missing id');
     }
@@ -1624,7 +1674,7 @@ export class MailboxStore {
         peerNodeIds: [envelope.from.nodeId],
         networkId: envelope.networkId,
         peerReplyMailbox,
-        localMailbox: local,
+        localMailbox: effectiveLocal,
         traceId: envelope.traceId,
         kind: envelope.kind,
         subject: envelope.subject,

@@ -12,6 +12,7 @@ import {
   createOrcaSpawnExecutorPlugin,
   runDealerCli,
   verifyEnvelope,
+  settleWakeDeliveryFailure,
 } from '../packages/index.ts';
 import type {
   CommandRequest,
@@ -1922,4 +1923,51 @@ test('local Orca target validation does not create an unknown-effect fence', asy
   store.upsertWakeTarget('box', { runId: 'repaired' });
   assert.equal((await service.flushMailbox('box', { force: true })).woke, true);
   assert.equal(effects, 1);
+});
+
+
+test('Orca sender retry preserves delivery fences', async t => {
+  const calls: CommandRequest[] = [];
+  let attempt = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    attempt += 1;
+    if (attempt === 1) throw new Error('no_active_sender_terminal');
+    return { stdout: '{"ok":true}' };
+  };
+  await sendOrcaTerminalText(runner, 'orca', 'term-1', 'hello');
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1]?.args.includes('--allow-self'));
+  assert.equal(calls[1]?.env?.ORCA_TERMINAL_ID, 'term-1');
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.upsertWakeTarget('box', { mode: 'orca-terminal', terminalHandle: 'term-1' });
+  settleWakeDeliveryFailure(store, 'box', new Error('no_active_sender_terminal'));
+  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
+});
+
+test('rotating inbound delivery preserves terminal thread affinity across call order', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.upsertWakeTarget('stream:inbox', { mode: 'orca-terminal', rotateAfterWaves: 1, terminalHandle: 'term-1', coalesceMs: 0 });
+  const inbound = alert('thread-a', { semantic: { type: 'message', threadId: 'thread-a', replyMailbox: 'default' } });
+  store.enqueue([inbound], { mailboxId: 'stream:inbox' });
+  store.completeWakeDelivery('stream:inbox', 0, { terminalHandle: 'term-1' });
+  store.recordInboundEnvelope(inbound, 'stream:inbox');
+  assert.equal(store.resolveThreadLocalMailbox('thread-a'), 'terminal:term-1');
+  assert.equal(store.getWakeTarget('terminal:term-1')?.rotateAfterWaves, undefined);
+});
+
+test('pinning a rotating session preserves existing terminal wake fences', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.upsertWakeTarget('stream:inbox', { mode: 'orca-terminal', rotateAfterWaves: 1, terminalHandle: 'term-1' });
+  store.upsertWakeTarget('terminal:term-1', { mode: 'orca-terminal', terminalHandle: 'term-1', pendingWake: true });
+  const notifications: string[] = [];
+  const subscription = store.onWakeTarget(mailbox => notifications.push(mailbox));
+  t.after(() => subscription.dispose());
+  assert.equal(store.pinRotatingSessionMailbox('stream:inbox', 'term-1'), 'terminal:term-1');
+  const target = store.getWakeTarget('terminal:term-1');
+  assert.equal(target?.pendingWake, true);
+  assert.ok(notifications.includes('terminal:term-1'));
+  store.upsertWakeTarget('stream:inbox', { deliveryInDoubt: true, lastWakeError: 'fenced' });
+  assert.equal(store.pinRotatingSessionMailbox('stream:inbox', 'term-2'), 'terminal:term-2');
+  assert.equal(store.getWakeTarget('terminal:term-2')?.deliveryInDoubt, true);
 });

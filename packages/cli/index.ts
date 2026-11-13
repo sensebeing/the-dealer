@@ -23,7 +23,7 @@ export * from './config.ts';
 export * from './setup.ts';
 export * from './auto-update.ts';
 
-const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
+const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'include-acked', 'help', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread',
@@ -68,6 +68,7 @@ const stringFlags = [
   'path',
   'mailbox',
   'ack',
+  'lease',
   'timeout-ms',
   'outcome',
   'summary',
@@ -91,6 +92,7 @@ function parse(argv: string[]) {
     strict: true,
     options: {
       ...Object.fromEntries(booleanFlags.map(k => [k, { type: 'boolean' as const }])) as Record<typeof booleanFlags[number], { type: 'boolean' }>,
+      help: { type: 'boolean', short: 'h' },
       ...Object.fromEntries(stringFlags.map(k => [k, { type: 'string' as const }])) as Record<typeof stringFlags[number], { type: 'string' }>,
       attach: { type: 'string', multiple: true },
     },
@@ -666,7 +668,7 @@ async function runInboxCommand(
     if (v.all === true) {
       throw new Error('--all is only valid with inbox list');
     }
-    return store.ack(required(target, 'delivery-id'), mailboxId);
+    return store.ack(required(target ?? v.lease ?? v.ack, 'delivery-id'), mailboxId);
   }
   if (command === 'list') {
     if (checkOnlyFlags) {
@@ -675,7 +677,7 @@ async function runInboxCommand(
     const limit = positiveInteger(v.limit, '--limit');
     return store.list({
       ...(mailboxId !== undefined ? { mailboxId } : {}),
-      ...(v.all === true ? { includeAcked: true } : {}),
+      ...(v.all === true || v['include-acked'] === true ? { includeAcked: true } : {}),
       ...(limit !== undefined ? { limit } : {}),
     });
   }
@@ -804,6 +806,8 @@ function runThreadCommand(
     state,
     ...(settlement ? { settlement } : {}),
     records,
+    messages: records,
+    envelopes: records.map(record => record.envelope).filter(Boolean),
   };
 }
 
@@ -833,10 +837,10 @@ async function runSessionCommand(
         replyTo,
         typeof v.network === 'string' && v.network ? String(v.network) : undefined,
       );
-      const replyMailbox = callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default');
+      const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
       bindCallerWakeTarget(store, replyMailbox, caller);
       if (ackId) {
-        store.ack(ackId, replyMailbox);
+        store.ack(ackId, callerMailboxFlag);
       }
       const body = required(v.body, '--body');
       const targetMailbox =
@@ -880,9 +884,9 @@ async function runSessionCommand(
       throw new Error('Choose exactly one of --to or --auto-route');
     }
     if (ackId) {
-      store.ack(ackId, callerMailboxFlag ?? caller?.mailboxId ?? 'default');
+      store.ack(ackId, callerMailboxFlag);
     }
-    const replyMailbox = callerMailboxFlag ?? caller?.mailboxId ?? 'default';
+    const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller?.terminalHandle);
     bindCallerWakeTarget(store, replyMailbox, caller);
     const targetMailbox =
       typeof v['target-mailbox'] === 'string' && v['target-mailbox']
@@ -920,10 +924,10 @@ async function runSessionCommand(
 
   const messageId = required(positional, 'message-id');
   const route = replyTargetOrThrow(store, messageId);
-  const replyMailbox = callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default');
+  const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
   bindCallerWakeTarget(store, replyMailbox, caller);
   if (ackId) {
-    store.ack(ackId, replyMailbox);
+    store.ack(ackId, callerMailboxFlag);
   }
 
   if (group === 'reply') {
@@ -1001,6 +1005,21 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action] = p;
+    if (v.help === true || group === 'help') {
+      stdout(JSON.stringify({
+        ok: true,
+        usage: 'dealer <send|reply|ask|settle|inbox|thread|worktree|node|project|setup|route|source> [options]',
+        commands: {
+          send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--attach <path>] [--json]',
+          reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
+          ask: 'dealer ask <messageId> --body <text> [--ack <leaseId>] [--json]',
+          settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
+          inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
+          thread: 'dealer thread <show|list> [<threadId>] [--json]',
+        },
+      }, null, v.json ? undefined : 2));
+      return 0;
+    }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
     if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '')) {
       if (v['terminal-handle'] === undefined && callerEnv.ORCA_TERMINAL_HANDLE?.trim()) v['terminal-handle'] = callerEnv.ORCA_TERMINAL_HANDLE.trim();
@@ -1359,14 +1378,17 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
             callerBinding.terminalHandle === resolvedTopic.binding.terminalHandle)
         ),
       );
-      const replyMailbox =
+      let replyMailbox =
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
           : (callerBinding?.mailboxId && !callerMatchesBoundTopic
             ? callerBinding.mailboxId
             : (threadRoute?.localMailbox !== undefined && threadRoute.localMailbox !== 'default'
               ? threadRoute.localMailbox
-              : undefined));
+              : (callerMatchesBoundTopic && resolvedTopic?.binding.rotateAfterWaves !== undefined
+                ? boundTopicMailbox
+                : undefined)));
+      if (callerBinding && replyMailbox) replyMailbox = runtime.mailbox.pinRotatingSessionMailbox(replyMailbox, callerBinding.terminalHandle);
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       result = await runtime.emitter.emit({
         networkId,
@@ -1393,6 +1415,8 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         filePaths: v.attach as string[] | undefined,
         priority: rawUrgency === 'critical' ? 'urgent' : (rawUrgency as 'normal' | 'high' | undefined),
       });
+      const published = result as any;
+      result = { ...published, ok: true, mode: group, published, threadId: published.envelope?.threadId ?? threadId ?? published.messageId, targetMailbox: targetMailbox ?? null, replyMailbox: published.envelope?.semantic?.replyMailbox ?? replyMailbox ?? null, next: `Wait for wakeup in this session, or inspect thread via: dealer thread show ${published.envelope?.threadId ?? threadId ?? published.messageId} --json` };
     } else if ((group === 'route' || group === 'source') && action === 'add') {
       if (owned && group === 'source') {
         throw new Error('Start dealer node up before adding a live source');

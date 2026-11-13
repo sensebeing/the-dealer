@@ -224,8 +224,6 @@ export function settleWakeDeliveryFailure(
   error: unknown,
   now = Date.now(),
 ): void {
-  // A command that never started cannot have had an effect. Anything else crossed the external
-  // boundary and must stay fenced until the owner confirms the outcome.
   if (error instanceof CommandNotStartedError) {
     recordWakeFailure(store, mailboxId, error, now);
     return;
