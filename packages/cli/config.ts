@@ -271,9 +271,11 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
   for (const [kind, binding] of Object.entries(bindings)) {
     if (!nonempty(kind) || (kind.includes(':') && (!nonempty(kind.slice(0, kind.indexOf(':'))) || !nonempty(kind.slice(kind.indexOf(':') + 1)))) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
         (binding.agent !== undefined && !['orca', 'antigravity', 'antigravity-cli', 'antigravity-app', 'claude', 'claude-code', 'claude-app', 'codex', 'codex-cli', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(binding.agent)) ||
+        (binding.mode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.mode)) ||
         (binding.conversationMode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
-        (binding.conversationMode === 'inbox-only' && binding.executor !== 'inbox') ||
-        (['orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(binding.agent)) ||
+        (binding.mode !== undefined && binding.conversationMode !== undefined && binding.mode !== binding.conversationMode) ||
+        ((binding.mode ?? binding.conversationMode) === 'inbox-only' && binding.executor !== 'inbox') ||
+        (['orca', 'orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'antigravity-cli', 'claude', 'claude-code', 'codex', 'codex-cli'].includes(binding.agent)) ||
         Object.keys(binding).some(key => !allowed.has(key)) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||
         booleans.some(key => binding[key] !== undefined && typeof binding[key] !== 'boolean') ||
@@ -281,7 +283,7 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
         (binding.rotateAfterWaves !== undefined && (!Number.isSafeInteger(binding.rotateAfterWaves) || binding.rotateAfterWaves < 1)) ||
         (binding.mailboxId !== undefined && !isValidMailboxId(binding.mailboxId)) ||
         (binding.streamKey !== undefined && !isValidMailboxId(`stream:${binding.streamKey}`)) ||
-        (binding.executor === 'orca-wave' && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
+        (((binding.executor === 'orca-wave' || (binding.executor === 'orca' && (binding.mode ?? binding.conversationMode) !== undefined && (binding.mode ?? binding.conversationMode) !== 'spawn')) || (binding.mode ?? binding.conversationMode) === 'wave') && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
         (binding.projectId !== undefined && !validProjectId(binding.projectId))) {
       throw new Error(`Invalid topic binding: ${kind}`);
     }

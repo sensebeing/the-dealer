@@ -62,6 +62,8 @@ function orcaAgent(value: unknown): SupportedOrcaAgent {
   throw new Error(`Unsupported Orca agent: ${String(value)}`);
 }
 
+export { orcaAgent };
+
 export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): ExecutorPlugin {
   return createAgentExecutorPlugin('agent-pty', options);
 }
@@ -78,11 +80,21 @@ export function createAntigravityExecutorPlugin(options: Omit<AgentOptions, 'age
   return createAgentExecutorPlugin('antigravity', options, 'antigravity', options.agySettingsPath);
 }
 
-export function createCodexCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('codex-cli', options, 'codex'); }
-export function createClaudeAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('claude-app', options, 'claude-app'); }
-export function createChatgptAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('chatgpt-app', options, 'chatgpt-app'); }
-export function createAntigravityCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('antigravity-cli', options, 'antigravity-cli'); }
-export function createAntigravityAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('antigravity-app', options, 'antigravity-app'); }
+export function createCodexCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('codex-cli', options, 'codex');
+}
+export function createClaudeAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('claude-app', options, 'claude-app');
+}
+export function createChatgptAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('chatgpt-app', options, 'chatgpt-app');
+}
+export function createAntigravityCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('antigravity-cli', options, 'antigravity-cli');
+}
+export function createAntigravityAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
+  return createAgentExecutorPlugin('antigravity-app', options, 'antigravity-app');
+}
 
 function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: SupportedAgentHost, agySettingsPath?: string): ExecutorPlugin {
   return {
@@ -94,7 +106,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined) : undefined;
       const agent = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
       const mode = payload.mode ?? payload.conversationMode ?? binding?.mode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
-      const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
+      const hostMode = mode !== undefined || ['antigravity', 'antigravity-cli', 'antigravity-app', 'claude-code', 'claude-app', 'chatgpt-app', 'chatgpt-dot', 'grok-bot', 'codex-cli'].includes(agent);
       let request;
       let mailboxId: string | undefined;
       let effectiveSessionId: string | undefined;
@@ -385,7 +397,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
       const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
       const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(batch[0]?.kind, typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined);
-      const interactive = payload.interactive === true || binding?.conversationMode === 'spawn' || config.interactive === true || options.interactive === true;
+      const interactive = payload.interactive === true || (binding?.mode ?? binding?.conversationMode) === 'spawn' || binding?.executor === 'orca' || config.interactive === true || options.interactive === true;
       const store = options.store ?? config.store;
       const effectiveAgent = orcaAgent(payload.agent ?? binding?.agent ?? config.agent ?? options.agent);
       const wakeup = options.wakeup ?? config.wakeup;
@@ -697,16 +709,18 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           receiverTerminalHandle ??
           (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
         const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
-        const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
-          bindingRotateAfterWaves: binding?.rotateAfterWaves,
-          waveRotateAfterWaves: optionalPositiveInteger(waveConfig?.rotateAfterWaves),
-          fallbackRotateAfterWaves: hasReceiverTarget
-            ? undefined
-            : optionalPositiveInteger(payload.rotateAfterWaves),
-          managesWorkspace: Boolean(cwd),
-          runId,
-          pinnedTerminalHandle: receiverTerminalHandle,
-        });
+        const rotateAfterWaves = binding?.mode === 'fixed' && binding.rotateAfterWaves === undefined
+          ? undefined
+          : resolveOrcaWaveRotateAfterWaves({
+              bindingRotateAfterWaves: binding?.rotateAfterWaves,
+              waveRotateAfterWaves: optionalPositiveInteger(waveConfig?.rotateAfterWaves),
+              fallbackRotateAfterWaves: hasReceiverTarget
+                ? undefined
+                : optionalPositiveInteger(payload.rotateAfterWaves),
+              managesWorkspace: Boolean(cwd),
+              runId,
+              pinnedTerminalHandle: receiverTerminalHandle,
+            });
         const worktreeId =
           binding?.worktreeId ??
           config.worktreeId ??
@@ -904,11 +918,26 @@ export { trustAntigravityWorkspace } from '../orca-workspace/index.ts';
 
 /** Unified Orca executor selecting task or stream semantics from the orthogonal mode. */
 export function createOrcaExecutorPlugin(options: OrcaSpawnOptions & OrcaWaveOptions = {}): ExecutorPlugin {
-  const mode = options.conversationMode ?? 'spawn';
-  if (mode === 'spawn') {
-    const plugin = createOrcaSpawnExecutorPlugin(options);
-    return { ...plugin, name: 'orca' };
-  }
-  const plugin = createOrcaWaveExecutorPlugin(options);
-  return { ...plugin, name: 'orca' };
+  const spawnPlugin = createOrcaSpawnExecutorPlugin(options);
+  const wavePlugin = createOrcaWaveExecutorPlugin(options);
+  return {
+    name: 'orca',
+    async execute(batch, context, runtimeConfig) {
+      const config = (runtimeConfig ?? {}) as Record<string, unknown>;
+      const binding = (options.resolveTopicBinding ?? (config.resolveTopicBinding as OrcaSpawnOptions['resolveTopicBinding']))?.(
+        batch[0]?.kind,
+        typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined,
+      );
+      const payload = batch[0]?.payload;
+      const effectiveMode = payload?.mode ?? payload?.conversationMode ?? binding?.mode ?? binding?.conversationMode ??
+        config.mode ?? config.conversationMode ?? (options as OrcaSpawnOptions & { mode?: string }).mode ?? options.conversationMode ??
+        (binding?.rotateAfterWaves !== undefined || binding?.streamKey !== undefined || binding?.workspacePath !== undefined || binding?.runId !== undefined || binding?.terminalHandle !== undefined
+          ? 'wave'
+          : 'spawn');
+      const receipt = effectiveMode === 'spawn'
+        ? await spawnPlugin.execute(batch, context, runtimeConfig)
+        : await wavePlugin.execute(batch, context, runtimeConfig);
+      return { ...receipt, executor: 'orca' };
+    },
+  };
 }

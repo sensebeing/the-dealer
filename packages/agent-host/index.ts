@@ -20,9 +20,18 @@ export function resolveAgentSessionId(mailboxId: string, sessionId?: string, age
 export function resolveAgentHostContinuation(agent: SupportedAgentHost, mailboxId: string, sessionId: string | undefined, stdout: string, mode: AgentConversationMode) {
   const host = normalizeAgentHost(agent);
   let resolved = resolveAgentSessionId(mailboxId, sessionId, agent);
-  if (host === 'codex' && (mode === 'spawn' || mode === 'wave')) {
+  if (host === 'codex' && mode === 'spawn') {
     resolved = undefined;
-    try { const receipt = JSON.parse(stdout) as { threadId?: unknown; sessionId?: unknown }; const identity = [receipt.threadId, receipt.sessionId].find(id => typeof id === 'string' && id.trim()); if (typeof identity === 'string') resolved = identity; } catch { /* no receipt */ }
+    try {
+      const receipt = JSON.parse(stdout) as { threadId?: unknown; sessionId?: unknown };
+      const identity = [receipt.threadId, receipt.sessionId]
+        .find(id => typeof id === 'string' && id.trim());
+      if (typeof identity === 'string') {
+        resolved = identity;
+      }
+    } catch {
+      // No receipt was emitted.
+    }
   }
   if (host === 'antigravity' || host === 'antigravity-app' || !resolved) return { hostAgent: undefined, conversationMode: undefined, sessionId: undefined };
   return { hostAgent: agent === 'claude-app' ? 'claude-app' : agent, conversationMode: 'fixed' as const, sessionId: resolved };

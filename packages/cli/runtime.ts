@@ -20,6 +20,7 @@ import { createDedupCasPolicyPlugin, isConfirmedHandoffReceipt, isDedupCasDuplic
 import {
   createOrcaSpawnExecutorPlugin,
   createOrcaExecutorPlugin,
+  orcaAgent,
   createOrcaWaveExecutorPlugin,
   createCodexExecutorPlugin,
   createCodexCliExecutorPlugin,
@@ -483,8 +484,8 @@ export class DealerNodeRuntime {
       }
       if (this.config.profile === 'personal-dev' && this.options.patch?.executors === undefined
         && Array.isArray(this.config.executors)
-        && this.config.executors.every(name => ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'].includes(name))) {
-        this.config.executors = [...new Set([...this.config.executors, 'agent-pty', 'codex', 'claude-code', 'antigravity'])];
+        && this.config.executors.every(name => ['orca-spawn', 'orca-wave', 'orca', 'agent-pty', 'notify', 'inbox'].includes(name))) {
+        this.config.executors = [...new Set([...this.config.executors, 'agent-pty', 'codex', 'claude-code', 'antigravity', 'orca', 'codex-cli', 'antigravity-cli', 'claude-app', 'chatgpt-app', 'antigravity-app'])];
       }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config);
@@ -969,16 +970,18 @@ export class DealerNodeRuntime {
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
           ['orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'claude-code', 'antigravity'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
       if (notifyLark) mailboxes.push(mailboxId);
-      if (binding.executor !== 'orca-wave' || !(binding.workspacePath || binding.runId || binding.terminalHandle)) continue;
+      if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && (binding.mode ?? binding.conversationMode ?? 'wave') !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
       const current = this.mailbox.getWakeTarget(mailboxId);
-      const resolvedRotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
-        bindingRotateAfterWaves: rotateAfterWaves,
-        waveRotateAfterWaves: this.config.wave?.rotateAfterWaves,
-        managesWorkspace: Boolean(workspacePath),
-        runId,
-        pinnedTerminalHandle: terminalHandle,
-      });
+      const resolvedRotateAfterWaves = binding.mode === 'fixed' && rotateAfterWaves === undefined
+        ? undefined
+        : resolveOrcaWaveRotateAfterWaves({
+            bindingRotateAfterWaves: rotateAfterWaves,
+            waveRotateAfterWaves: this.config.wave?.rotateAfterWaves,
+            managesWorkspace: Boolean(workspacePath),
+            runId,
+            pinnedTerminalHandle: terminalHandle,
+          });
       // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
       // handle, an Orca Run, or a workspace switch may replace or clear it. Passing every optional
       // field as an own property is what lets a reconfiguration erase a stale rotation default.
@@ -991,7 +994,7 @@ export class DealerNodeRuntime {
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
         workspacePath, worktreeId, runId, repoRoot: projectRoot,
-        agent: binding.agent as 'antigravity' | 'claude' | 'codex' | undefined, interactiveCommand,
+        agent: binding.agent ? orcaAgent(binding.agent) : undefined, interactiveCommand,
         autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
         rotateAfterWaves: resolvedRotateAfterWaves,
         terminalHandle: nextTerminalHandle,
@@ -1174,7 +1177,7 @@ export class DealerNodeRuntime {
           };
           const registration = ctx.services.dispatcher.registerExecutor(
             wrapped,
-            name === 'orca-wave'
+            name === 'orca-wave' || name === 'orca'
               ? {
                   ...this.config.executorConfig[name],
                   store: this.mailbox,

@@ -19,6 +19,8 @@ import {
   AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli,
   decodeNetworkInvite, DealerNodeRuntime, MailboxStore, createAgentPtyExecutorPlugin,
   createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin,
+  createOrcaExecutorPlugin, createCodexCliExecutorPlugin, createAntigravityCliExecutorPlugin,
+  createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityAppExecutorPlugin,
   createCodexExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin,
   BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts, resolveAgentBindingPreset,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
@@ -825,7 +827,7 @@ for (const scenario of [
     });
     await runtime.start();
     t.after(() => runtime.stop());
-    for (const executor of ['agent-pty', 'codex', 'claude-code', 'antigravity']) {
+    for (const executor of ['agent-pty', 'codex', 'claude-code', 'antigravity', 'orca', 'codex-cli', 'antigravity-cli', 'claude-app', 'chatgpt-app', 'antigravity-app']) {
       assert.equal(runtime.config.executors.includes(executor), scenario.expected);
     }
     assert.equal(runtime.config.gateMode, 'approval_required');
@@ -1209,6 +1211,40 @@ test('named executors default to spawn and preserve conversation-mode precedence
   }
   await assert.rejects(createCodexExecutorPlugin({ commandRunner }).execute([message('bad', { conversationMode: 'inbox-only' })], context, {}), /Invalid agent conversationMode/);
   await assert.rejects(createCodexExecutorPlugin({ commandRunner: async () => ({ stdout: '', exitCode: 2 }) }).execute([message()], context, {}), /exited 2/);
+});
+
+test('orca executor resolves spawn, wave and fixed modes per batch', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    return { stdout: request.args.includes('worktree') ? JSON.stringify({ path: root }) : '{}' };
+  };
+  const plugin = createOrcaExecutorPlugin({
+    store,
+    cwd: root,
+    commandRunner: runner,
+    resolveTopicBinding: (_kind, streamKey) => streamKey === 'wave' ? { executor: 'orca', mode: 'wave', workspacePath: root } : undefined,
+  });
+  for (const [id, payload] of [['spawn', { mode: 'spawn', noParent: true }], ['wave', { mode: 'wave', streamKey: 'wave' }], ['fixed', { mode: 'fixed', streamKey: 'wave' }]] as const) {
+    const receipt = await plugin.execute([message(id, payload)], context, {});
+    assert.equal(receipt.executor, 'orca');
+  }
+});
+
+test('new host executor factories use host invocation mode', async () => {
+  const commandRunner: CommandRunner = async request => ({ stdout: JSON.stringify(request.args) });
+  for (const factory of [
+    createCodexCliExecutorPlugin,
+    createAntigravityCliExecutorPlugin,
+    createClaudeAppExecutorPlugin,
+    createChatgptAppExecutorPlugin,
+    createAntigravityAppExecutorPlugin,
+  ]) {
+    const result = await factory({ commandRunner }).execute([message()], context, {});
+    assert.ok(result.output);
+  }
 });
 
 for (const [host, profileName, defaultExecutor, executors] of [
