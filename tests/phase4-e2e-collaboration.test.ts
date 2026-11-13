@@ -92,6 +92,7 @@ test('Phase 4: cross-member P2P attachment, approval and trusted sender dispatch
   const alice = await node(t, root, 'alice');
   const bob = await node(t, root, 'bob', {
     profile: 'personal-dev',
+    patch: { gateMode: 'approval_required' },
     commandRunner: async request => {
       calls.push(request);
       return {
@@ -538,7 +539,7 @@ test('Phase 4: identity/config persistence, exclusive state ownership and privat
   assert.equal(restored.transport.localNodeId, id);
   assert.equal(restored.gate.getNetworkMode('saved'), 'dnd');
   assert.equal(restored.node.getSelfCard('saved').admissionMode, 'dnd');
-  assert.equal(getBuiltInProfile('personal-dev').gateMode, 'approval_required');
+  assert.equal(getBuiltInProfile('personal-dev').gateMode, 'open');
   assert.throws(() => getBuiltInProfile('nope'), /Unknown/);
 });
 

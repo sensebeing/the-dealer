@@ -9,11 +9,16 @@ import type { AgentConversationMode, SupportedAgentHost } from '../plugins-execu
 
 export const AGENT_HOST_CATALOG = [
   { host: 'orca', command: 'orca', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['agent', 'workspacePath'], description: 'Orca managed worktrees and idle-gated fixed conversations.' },
-  { host: 'antigravity', command: 'agy', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity in Orca managed worktrees; standalone agy is also available through agent-pty.' },
-  { host: 'claude-code', command: 'claude', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Claude Code background conversations and resumed sessions.' },
-  { host: 'codex', command: 'codex', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Codex worktree execution and fixed thread queues.' },
-  { host: 'chatgpt-dot', command: 'dot', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT Dot bridge with explicit session keys.' },
-  { host: 'grok-bot', command: 'grok-bot', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['targetBot', 'sessionId'], description: 'Grok bridge dispatch to a selected bot.' },
+  { host: 'antigravity', command: 'agy', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity in Orca managed worktrees; standalone agy is also available through agent-pty.' },
+  { host: 'claude-code', command: 'claude', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Claude Code background conversations and resumed sessions.' },
+  { host: 'codex', command: 'codex', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Codex worktree execution and fixed thread queues.' },
+  { host: 'chatgpt-dot', command: 'dot', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT Dot bridge with explicit session keys.' },
+  { host: 'grok-bot', command: 'grok-bot', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['targetBot', 'sessionId'], description: 'Grok bridge dispatch to a selected bot.' },
+  { host: 'claude-app', command: 'claude-app', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Claude app bridge.' },
+  { host: 'chatgpt-app', command: 'dot', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT app bridge.' },
+  { host: 'antigravity-app', command: 'agy', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity app bridge.' },
+  { host: 'codex-cli', command: 'codex', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Codex CLI bridge.' },
+  { host: 'antigravity-cli', command: 'agy', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity CLI bridge.' },
 ] as const;
 
 function readOptionalJson(path: string): any {
@@ -123,7 +128,7 @@ export function buildAgentBindingPreset(options: {
   const host = options.host === 'claude' ? 'claude-code' : options.host;
   if (!AGENT_HOST_CATALOG.some(entry => entry.host === host)) throw new Error(`Unsupported agent host: ${host}`);
   const mode = options.conversationMode ?? 'fixed';
-  if (!['spawn', 'fixed', 'inbox-only'].includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
+  if (!['spawn', 'wave', 'fixed', 'inbox-only'].includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (host === 'grok-bot' && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
   const managed = host === 'orca' || host === 'antigravity';
   const topic = options.topic ?? 'collab.request.v4';

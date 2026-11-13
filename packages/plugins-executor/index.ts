@@ -40,7 +40,7 @@ export interface AgentOptions {
   store?: MailboxStore;
   resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   agent?: SupportedAgentHost;
-  conversationMode?: 'spawn' | 'fixed';
+  conversationMode?: 'spawn' | 'wave' | 'fixed';
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
@@ -56,7 +56,9 @@ function agentArgs(command: string): string[] {
 
 function orcaAgent(value: unknown): SupportedOrcaAgent {
   if (value === undefined) return 'antigravity';
-  if (value === 'antigravity' || value === 'claude' || value === 'codex') return value;
+  if (value === 'antigravity' || value === 'antigravity-cli') return 'antigravity';
+  if (value === 'claude' || value === 'claude-code') return 'claude';
+  if (value === 'codex' || value === 'codex-cli') return 'codex';
   throw new Error(`Unsupported Orca agent: ${String(value)}`);
 }
 
@@ -76,6 +78,12 @@ export function createAntigravityExecutorPlugin(options: Omit<AgentOptions, 'age
   return createAgentExecutorPlugin('antigravity', options, 'antigravity', options.agySettingsPath);
 }
 
+export function createCodexCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('codex-cli', options, 'codex'); }
+export function createClaudeAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('claude-app', options, 'claude-app'); }
+export function createChatgptAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('chatgpt-app', options, 'chatgpt-app'); }
+export function createAntigravityCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('antigravity-cli', options, 'antigravity-cli'); }
+export function createAntigravityAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin { return createAgentExecutorPlugin('antigravity-app', options, 'antigravity-app'); }
+
 function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: SupportedAgentHost, agySettingsPath?: string): ExecutorPlugin {
   return {
     name,
@@ -85,7 +93,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       const payload = first?.payload ?? {};
       const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined) : undefined;
       const agent = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
-      const mode = payload.conversationMode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
+      const mode = payload.mode ?? payload.conversationMode ?? binding?.mode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
       const hostMode = mode !== undefined || ['antigravity', 'claude-code', 'chatgpt-dot', 'grok-bot'].includes(agent);
       let request;
       let mailboxId: string | undefined;
@@ -100,7 +108,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           request = { command, args: options.args ?? agentArgs(command), cwd: options.cwd, input: renderWave(batch) };
         } else {
           if (!first) throw new Error('Empty agent batch');
-          if (mode !== undefined && mode !== 'spawn' && mode !== 'fixed') throw new Error('Invalid agent conversationMode');
+          if (mode !== undefined && mode !== 'spawn' && mode !== 'wave' && mode !== 'fixed') throw new Error('Invalid agent conversationMode');
           const conversationMode = mode ?? 'spawn';
           mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
           const terminalPrompt = optionalString(typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined);
@@ -893,3 +901,14 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
 }
 
 export { trustAntigravityWorkspace } from '../orca-workspace/index.ts';
+
+/** Unified Orca executor selecting task or stream semantics from the orthogonal mode. */
+export function createOrcaExecutorPlugin(options: OrcaSpawnOptions & OrcaWaveOptions = {}): ExecutorPlugin {
+  const mode = options.conversationMode ?? 'spawn';
+  if (mode === 'spawn') {
+    const plugin = createOrcaSpawnExecutorPlugin(options);
+    return { ...plugin, name: 'orca' };
+  }
+  const plugin = createOrcaWaveExecutorPlugin(options);
+  return { ...plugin, name: 'orca' };
+}

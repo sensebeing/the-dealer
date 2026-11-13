@@ -794,7 +794,7 @@ test('runtime uses a generated fixed binding, persists mailbox and supports setu
   await runtime.start();
   t.after(() => runtime.stop());
   assert.equal(runtime.config.profile, 'personal-dev');
-  assert.equal(runtime.config.gateMode, 'approval_required');
+  assert.equal(runtime.config.gateMode, 'open');
   const result = await runtime.emitter.emit({ networkId: 'local', kind: preset.topic,
     routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check this change', payload: {} });
   assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
@@ -1220,7 +1220,7 @@ for (const [host, profileName, defaultExecutor, executors] of [
   test(`${profileName} and ${host} patch validate`, () => {
     const profile = getBuiltInProfile(profileName);
     assert.equal(profile.defaultExecutor, defaultExecutor);
-    assert.equal(profile.gateMode, 'approval_required');
+    assert.equal(profile.gateMode, 'open');
     assert.deepEqual(profile.policies, ['dedup-cas']);
     assert.deepEqual(profile.executors, executors);
     const patch = JSON.parse(readFileSync(new URL(`../examples/user-patches/${host}.patch.json`, import.meta.url), 'utf8'));

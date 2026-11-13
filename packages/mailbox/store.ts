@@ -278,11 +278,13 @@ export interface MailboxTopicBinding {
   executor: string;
   mailboxId?: string;
   streamKey?: string;
+  mode?: string;
+  conversationMode?: string;
 }
 
 export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding): string {
   if (binding.mailboxId !== undefined) return normalizeMailboxId(binding.mailboxId);
-  return binding.executor === 'orca-wave'
+  return (binding.executor === 'orca-wave' || (binding.executor === 'orca' && (binding.mode ?? binding.conversationMode) !== undefined && (binding.mode ?? binding.conversationMode) !== 'spawn') || (binding.mode ?? binding.conversationMode) === 'wave')
     ? normalizeMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`) : 'default';
 }
 
@@ -331,10 +333,10 @@ export function resolveMailboxId(
     }
     return resolveBoundMailboxId(bindingKind, binding);
   }
-  if (executorName === 'orca-wave') {
+  if (executorName === 'orca-wave' || (executorName === 'orca' && (binding?.mode ?? binding?.conversationMode) !== 'spawn')) {
     return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
   }
-  if (executorName === 'orca-spawn') {
+  if (executorName === 'orca-spawn' || (executorName === 'orca' && (binding?.mode ?? binding?.conversationMode ?? 'spawn') === 'spawn')) {
     return normalizeMailboxId(`task:${envelope.id}`, 'task mailbox');
   }
   return 'default';
@@ -439,8 +441,8 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   }
   const target = value as unknown as WakeTargetState;
   if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
-  if (target.hostAgent !== undefined && !['codex', 'claude', 'claude-code', 'antigravity', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
-  if (target.conversationMode !== undefined && !['spawn', 'fixed'].includes(target.conversationMode)) throw invalidStore();
+  if (target.hostAgent !== undefined && !['codex', 'codex-cli', 'claude', 'claude-code', 'claude-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
+  if (target.conversationMode !== undefined && !['spawn', 'wave', 'fixed'].includes(target.conversationMode)) throw invalidStore();
   if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
   if (!isValidMailboxId(target.mailboxId) || !WAKE_TARGET_MODES.includes(target.mode)) {
     throw invalidStore();

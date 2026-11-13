@@ -98,7 +98,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
   return {
     name: 'gate',
     apply(ctx) {
-      let mode = config.mode ?? 'approval_required';
+      let mode = config.mode ?? 'open';
       const modes = new Map(Object.entries(config.networkModes ?? {}));
       const rules = new Set<GateRulePlugin>();
       const pending = new Map<string, PendingApprovalItem>();

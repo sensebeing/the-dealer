@@ -15,5 +15,5 @@
     "notify",
     "inbox"
   ],
-  "gateMode": "approval_required"
+  "gateMode": "open"
 }

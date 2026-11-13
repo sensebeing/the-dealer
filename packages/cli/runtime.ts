@@ -19,8 +19,14 @@ import { createEmitterPlugin } from '../emitter/index.ts';
 import { createDedupCasPolicyPlugin, isConfirmedHandoffReceipt, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../plugins-policy/index.ts';
 import {
   createOrcaSpawnExecutorPlugin,
+  createOrcaExecutorPlugin,
   createOrcaWaveExecutorPlugin,
   createCodexExecutorPlugin,
+  createCodexCliExecutorPlugin,
+  createClaudeAppExecutorPlugin,
+  createChatgptAppExecutorPlugin,
+  createAntigravityCliExecutorPlugin,
+  createAntigravityAppExecutorPlugin,
   createClaudeCodeExecutorPlugin,
   createAntigravityExecutorPlugin,
   createAgentPtyExecutorPlugin,
@@ -171,6 +177,7 @@ export class DealerNodeRuntime {
   private externalChanges: Promise<unknown> = Promise.resolve();
   private server?: Server;
   private registerBuiltinExecutor?: (name: string) => void;
+  private registeredBuiltinNames = new Set<string>();
   private started = false;
   private ownsLock = false;
   private activeMutatingControlRequests = 0;
@@ -622,8 +629,14 @@ export class DealerNodeRuntime {
         isDedupCasDuplicateReceipt,
         isDurableQueuedReceipt,
         createOrcaSpawnExecutorPlugin,
+  createOrcaExecutorPlugin,
         createOrcaWaveExecutorPlugin,
         createCodexExecutorPlugin,
+  createCodexCliExecutorPlugin,
+  createClaudeAppExecutorPlugin,
+  createChatgptAppExecutorPlugin,
+  createAntigravityCliExecutorPlugin,
+  createAntigravityAppExecutorPlugin,
         createClaudeCodeExecutorPlugin,
         createAntigravityExecutorPlugin,
         createAgentPtyExecutorPlugin,
@@ -1077,11 +1090,13 @@ export class DealerNodeRuntime {
             },
             commandRunner: this.options.commandRunner,
           }),
+          'orca': createOrcaExecutorPlugin({ resolveTopicBinding: this.executorTopicBinding, projectRoots: linkedProjectRoots, commandRunner: this.options.commandRunner }),
           'orca-wave': createOrcaWaveExecutorPlugin({
             ...this.config.executorConfig['orca-wave'],
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
+          'codex-cli': createCodexCliExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'codex': createCodexExecutorPlugin({
             ...this.config.executorConfig['codex'],
             store: this.mailbox,
@@ -1089,6 +1104,8 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
+          'claude-app': createClaudeAppExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'chatgpt-app': createChatgptAppExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'claude-code': createClaudeCodeExecutorPlugin({
             ...this.config.executorConfig['claude-code'],
             store: this.mailbox,
@@ -1096,6 +1113,8 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
+          'antigravity-cli': createAntigravityCliExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'antigravity-app': createAntigravityAppExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'antigravity': createAntigravityExecutorPlugin({
             ...this.config.executorConfig['antigravity'],
             store: this.mailbox,
@@ -1129,8 +1148,9 @@ export class DealerNodeRuntime {
         }
         const registered = new Set<string>();
         this.registerBuiltinExecutor = name => {
-          if (registered.has(name)) return;
+          if (registered.has(name) || this.registeredBuiltinNames.has(name)) return;
           const executor = executors[name];
+          if (!executor) throw new Error(`Unknown executor: ${name}`);
           const wrapped: ExecutorPlugin = {
             ...executor,
             execute: async (batch, context, config) => {
@@ -1171,8 +1191,9 @@ export class DealerNodeRuntime {
           );
           ctx.effect(() => () => registration.dispose());
           registered.add(name);
+          this.registeredBuiltinNames.add(name);
         };
-        for (const name of this.config.executors) this.registerBuiltinExecutor(name);
+        for (const name of new Set(this.config.executors)) this.registerBuiltinExecutor(name);
         if (this.config.policies.includes('dedup-cas')) {
           let legacyLedger: DeliveryLedger | undefined;
           const registration = ctx.services.dispatcher.registerPolicy(

@@ -15,42 +15,42 @@ export interface BuiltInProfile {
 export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Object.freeze({
   'personal-dev': {
     name: 'personal-dev',
-    gateMode: 'approval_required',
+    gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['orca-spawn', 'orca-wave', 'codex', 'claude-code', 'antigravity', 'agent-pty', 'notify', 'inbox'],
+    executors: ['orca', 'orca-spawn', 'orca-wave', 'codex-cli', 'codex', 'claude-code', 'antigravity-cli', 'antigravity', 'claude-app', 'chatgpt-app', 'antigravity-app', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'dedicated-worker': {
     name: 'dedicated-worker',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['orca-spawn', 'orca-wave', 'codex', 'claude-code', 'antigravity', 'agent-pty', 'inbox'],
+    executors: ['orca', 'orca-spawn', 'orca-wave', 'codex-cli', 'codex', 'claude-code', 'antigravity-cli', 'antigravity', 'claude-app', 'chatgpt-app', 'antigravity-app', 'agent-pty', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'orca-dev': {
     name: 'orca-dev',
-    gateMode: 'approval_required',
+    gateMode: 'open',
     policies: ['dedup-cas'],
     executors: ['orca-spawn', 'orca-wave', 'notify', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'codex-dev': {
     name: 'codex-dev',
-    gateMode: 'approval_required',
+    gateMode: 'open',
     policies: ['dedup-cas'],
     executors: ['codex', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'codex',
   },
   'claude-dev': {
     name: 'claude-dev',
-    gateMode: 'approval_required',
+    gateMode: 'open',
     policies: ['dedup-cas'],
     executors: ['claude-code', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'claude-code',
   },
   'antigravity-dev': {
     name: 'antigravity-dev',
-    gateMode: 'approval_required',
+    gateMode: 'open',
     policies: ['dedup-cas'],
     executors: ['antigravity', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'antigravity',
@@ -223,9 +223,10 @@ export function initProjectScaffold(
 export interface TopicBindingConfig {
   noParent?: boolean;
   assignee?: string;
-  agent?: 'orca' | 'antigravity' | 'claude' | 'claude-code' | 'codex' | 'chatgpt-dot' | 'grok-bot';
+  agent?: 'orca' | 'antigravity' | 'antigravity-cli' | 'antigravity-app' | 'claude' | 'claude-code' | 'claude-app' | 'codex' | 'codex-cli' | 'chatgpt-app' | 'chatgpt-dot' | 'grok-bot';
   interactiveCommand?: string;
-  conversationMode?: 'spawn' | 'fixed' | 'inbox-only';
+  mode?: 'spawn' | 'wave' | 'fixed' | 'inbox-only';
+  conversationMode?: 'spawn' | 'wave' | 'fixed' | 'inbox-only';
   targetBot?: string;
   agentProfile?: string;
   sessionId?: string;
@@ -264,13 +265,13 @@ export interface LarkNotifyConfig {
 
 export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[]): asserts bindings is Record<string, TopicBindingConfig> {
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
-  const strings = ['assignee', 'agent', 'interactiveCommand', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
+  const strings = ['assignee', 'agent', 'interactiveCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
   const booleans = ['noParent', 'autoCreateWorkspace', 'notifyLark'];
   const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves']);
   for (const [kind, binding] of Object.entries(bindings)) {
     if (!nonempty(kind) || (kind.includes(':') && (!nonempty(kind.slice(0, kind.indexOf(':'))) || !nonempty(kind.slice(kind.indexOf(':') + 1)))) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
-        (binding.agent !== undefined && !['orca', 'antigravity', 'claude', 'claude-code', 'codex', 'chatgpt-dot', 'grok-bot'].includes(binding.agent)) ||
-        (binding.conversationMode !== undefined && !['spawn', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
+        (binding.agent !== undefined && !['orca', 'antigravity', 'antigravity-cli', 'antigravity-app', 'claude', 'claude-code', 'claude-app', 'codex', 'codex-cli', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(binding.agent)) ||
+        (binding.conversationMode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
         (binding.conversationMode === 'inbox-only' && binding.executor !== 'inbox') ||
         (['orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(binding.agent)) ||
         Object.keys(binding).some(key => !allowed.has(key)) ||
@@ -397,7 +398,7 @@ export function readPatch(path: string): Partial<RuntimeConfig> {
   return root;
 }
 
-export const BUILTIN_EXECUTORS = ['orca-spawn', 'orca-wave', 'codex', 'claude-code', 'antigravity', 'agent-pty', 'notify', 'inbox'];
+export const BUILTIN_EXECUTORS = ['orca', 'orca-spawn', 'orca-wave', 'codex-cli', 'codex', 'claude-code', 'antigravity-cli', 'antigravity', 'claude-app', 'chatgpt-app', 'antigravity-app', 'agent-pty', 'notify', 'inbox'];
 
 export function validateConfig(config: RuntimeConfig): void {
   validatePluginRefs(config.userPlugins);
