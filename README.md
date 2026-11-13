@@ -137,7 +137,9 @@ See [architecture](docs/architecture.md), [wire protocol](docs/wire-protocol.md)
 | `claude-code` | `claude-dev` | [claude-code.patch.json](examples/user-patches/claude-code.patch.json) | `claude-code` |
 | `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity` |
 
-All four startup profiles enable `approval_required` and `dedup-cas`.
+All four startup profiles use the `open` gate and enable `dedup-cas`; use
+`--gate approval_required` or `dealer gate mode approval_required` when approval
+is required.
 
 ### Supported agent apps and conversation modes
 

@@ -1,17 +1,25 @@
 # Agent App matrix
 
-| Host | spawn | fixed | Receiver selectors |
-| --- | --- | --- | --- |
-| orca | orca-spawn child worktree + task mailbox | orca-wave idle-gated workspace | agent: antigravity / claude / codex; workspacePath |
-| antigravity | Orca-managed agy worktree | Orca-managed agy workspace | workspacePath; requires Orca as well as agy |
-| claude-code | claude --bg --name task-ID | claude --bg --resume session | agentProfile, sessionId |
-| codex | codex exec --worktree | codex queue --thread session --resume | agentProfile, sessionId |
-| chatgpt-dot | dot send --session-mode spawn | dot send --session-mode fixed | targetBot or agentProfile, sessionId |
-| grok-bot | grok-bot dispatch --session-mode spawn | grok-bot dispatch --session-mode fixed | required targetBot, sessionId |
+Executor selection and conversation mode are orthogonal. The first level picks
+the executor, and the second level picks how it owns a conversation:
 
-All hosts support inbox-only: durable inbox without external execution. Presets
-return configuration, they do not install CLIs or change gates. `claude` is an
-alias for `claude-code`. Orca's default inner agent is Antigravity.
+| First-level executor | `spawn` | `wave` | `fixed` | `inbox-only` | Receiver selectors |
+| --- | --- | --- | --- | --- | --- |
+| `inbox` | Durable mailbox | Durable mailbox | Durable mailbox | Durable mailbox | mailboxId |
+| `claude-app` | App bridge | App bridge | App bridge | Durable mailbox | agentProfile, sessionId |
+| `chatgpt-app` | App bridge | App bridge | App bridge | Durable mailbox | agentProfile, targetBot, sessionId |
+| `antigravity-app` | App bridge | App bridge | App bridge | Durable mailbox | workspacePath |
+| `claude-code` | `claude --bg --name task-ID` | Background conversation | `claude --bg --resume session` | Durable mailbox | agentProfile, sessionId |
+| `codex-cli` | CLI bridge | CLI bridge | CLI bridge | Durable mailbox | agentProfile, sessionId |
+| `antigravity-cli` | CLI bridge | CLI bridge | CLI bridge | Durable mailbox | workspacePath |
+| `orca` | Managed child worktree | Idle-gated workspace wave | Idle-gated workspace | Durable mailbox | agent: antigravity / claude / codex; workspacePath |
+
+The built-in `orca-spawn` and `orca-wave` executors are the managed execution
+implementations used by `orca` bindings. Other legacy bridge hosts remain
+available in the catalog, and all hosts support `inbox-only` for durable manual
+intake. Presets return configuration, they do not install CLIs or change gates.
+`claude` is an alias for `claude-code`. Orca's default inner agent is
+Antigravity.
 
 Dot and Grok require installed bridges implementing these command contracts.
 Verify the installed Codex/Claude CLI supports the specified queue/background

@@ -936,11 +936,11 @@ export class DealerNodeRuntime {
   async applyAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { setDefault?: boolean; cwd?: string }) {
     const preset = this.previewAgentPreset(options);
     const host = options.host === 'claude' ? 'claude-code' : options.host;
-    const mode = options.conversationMode ?? 'fixed';
+    const mode = options.mode ?? options.conversationMode ?? 'fixed';
     const defaultExecutor = !options.setDefault ? this.config.defaultExecutor
       : mode === 'inbox-only' ? 'inbox'
       : host === 'orca' ? 'orca-spawn'
-      : ['codex', 'claude-code', 'antigravity'].includes(host) ? host : preset.binding.executor;
+      : ['codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(host) ? host : preset.binding.executor;
     this.config.executors = [...new Set([...this.config.executors, preset.binding.executor, defaultExecutor])];
     this.config.topicBindings = { ...this.config.topicBindings, [preset.topic]: preset.binding };
     for (const [name, config] of Object.entries(preset.executorConfig)) {
@@ -968,7 +968,7 @@ export class DealerNodeRuntime {
       const mailboxId = resolveBoundMailboxId(kind, binding);
       const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
-          ['orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'claude-code', 'antigravity'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
+          ['orca', 'orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
       if (notifyLark) mailboxes.push(mailboxId);
       if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && (binding.mode ?? binding.conversationMode ?? 'wave') !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
@@ -1093,13 +1093,20 @@ export class DealerNodeRuntime {
             },
             commandRunner: this.options.commandRunner,
           }),
-          'orca': createOrcaExecutorPlugin({ resolveTopicBinding: this.executorTopicBinding, projectRoots: linkedProjectRoots, commandRunner: this.options.commandRunner }),
+          'orca': createOrcaExecutorPlugin({
+            ...this.config.executorConfig['orca'],
+            store: this.mailbox,
+            wakeup: this.wakeups,
+            resolveTopicBinding: this.executorTopicBinding,
+            projectRoots: linkedProjectRoots,
+            commandRunner: this.options.commandRunner,
+          }),
           'orca-wave': createOrcaWaveExecutorPlugin({
             ...this.config.executorConfig['orca-wave'],
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
-          'codex-cli': createCodexCliExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'codex-cli': createCodexCliExecutorPlugin({ ...this.config.executorConfig['codex-cli'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'codex': createCodexExecutorPlugin({
             ...this.config.executorConfig['codex'],
             store: this.mailbox,
@@ -1107,8 +1114,8 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
-          'claude-app': createClaudeAppExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
-          'chatgpt-app': createChatgptAppExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'claude-app': createClaudeAppExecutorPlugin({ ...this.config.executorConfig['claude-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'chatgpt-app': createChatgptAppExecutorPlugin({ ...this.config.executorConfig['chatgpt-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'claude-code': createClaudeCodeExecutorPlugin({
             ...this.config.executorConfig['claude-code'],
             store: this.mailbox,
@@ -1116,8 +1123,8 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
-          'antigravity-cli': createAntigravityCliExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
-          'antigravity-app': createAntigravityAppExecutorPlugin({ store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'antigravity-cli': createAntigravityCliExecutorPlugin({ ...this.config.executorConfig['antigravity-cli'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'antigravity-app': createAntigravityAppExecutorPlugin({ ...this.config.executorConfig['antigravity-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'antigravity': createAntigravityExecutorPlugin({
             ...this.config.executorConfig['antigravity'],
             store: this.mailbox,

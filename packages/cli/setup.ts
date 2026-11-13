@@ -8,7 +8,7 @@ import { findExecutable } from '../orca-workspace/executable.ts';
 import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
 
 export const AGENT_HOST_CATALOG = [
-  { host: 'orca', command: 'orca', modes: ['spawn', 'fixed', 'inbox-only'], selectors: ['agent', 'workspacePath'], description: 'Orca managed worktrees and idle-gated fixed conversations.' },
+  { host: 'orca', command: 'orca', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agent', 'workspacePath'], description: 'Orca managed worktrees and idle-gated fixed conversations.' },
   { host: 'antigravity', command: 'agy', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity in Orca managed worktrees; standalone agy is also available through agent-pty.' },
   { host: 'claude-code', command: 'claude', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Claude Code background conversations and resumed sessions.' },
   { host: 'codex', command: 'codex', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Codex worktree execution and fixed thread queues.' },
@@ -113,11 +113,12 @@ export function buildOnboardingPrompts(options: {
 
 export function buildAgentBindingPreset(options: {
   host: SupportedAgentHost;
+  mode?: AgentConversationMode;
   conversationMode?: AgentConversationMode;
   topic?: string;
   projectId?: string;
   workspacePath?: string;
-  agent?: 'antigravity' | 'claude' | 'codex';
+  agent?: 'antigravity' | 'antigravity-cli' | 'claude' | 'claude-code' | 'codex' | 'codex-cli';
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
@@ -127,7 +128,7 @@ export function buildAgentBindingPreset(options: {
 }) {
   const host = options.host === 'claude' ? 'claude-code' : options.host;
   if (!AGENT_HOST_CATALOG.some(entry => entry.host === host)) throw new Error(`Unsupported agent host: ${host}`);
-  const mode = options.conversationMode ?? 'fixed';
+  const mode = options.mode ?? options.conversationMode ?? 'fixed';
   if (!['spawn', 'wave', 'fixed', 'inbox-only'].includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (host === 'grok-bot' && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
   const managed = host === 'orca' || host === 'antigravity';
@@ -143,7 +144,7 @@ export function buildAgentBindingPreset(options: {
     ...(options.targetBot ? { targetBot: options.targetBot } : {}),
     ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     ...(options.notifyLark !== undefined ? { notifyLark: options.notifyLark } : {}),
-    ...(managed && mode === 'fixed'
+    ...(managed && (mode === 'fixed' || mode === 'wave')
       ? {
           autoCreateWorkspace: true,
           rotateAfterWaves: resolveOrcaWaveRotateAfterWaves({

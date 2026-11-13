@@ -745,6 +745,9 @@ test('orca-wave defaults fixed workspaces to one fresh session tab per wave', as
 });
 
 test('managed fixed presets default to one session tab per wave and allow an override', () => {
+  const wavePreset = buildAgentBindingPreset({ host: 'orca', mode: 'wave' });
+  assert.equal(wavePreset.binding.autoCreateWorkspace, true);
+  assert.equal(wavePreset.binding.rotateAfterWaves, 1);
   for (const host of ['orca', 'antigravity'] as const) {
     const preset = buildAgentBindingPreset({ host, conversationMode: 'fixed' });
     assert.equal(preset.binding.autoCreateWorkspace, true);

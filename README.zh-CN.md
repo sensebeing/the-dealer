@@ -116,7 +116,8 @@ flowchart LR
 | `claude-code` | `claude-dev` | [claude-code.patch.json](examples/user-patches/claude-code.patch.json) | `claude-code` |
 | `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity` |
 
-四个启动 profile 默认均启用 `approval_required` 与 `dedup-cas`。
+四个启动 profile 默认使用 `open` 门禁并启用 `dedup-cas`；需要审批时使用
+`--gate approval_required` 或 `dealer gate mode approval_required`。
 
 ### 支持的 Agent 应用与会话模式
 

@@ -183,7 +183,8 @@ mailbox readback and an actual host receipt before reporting onboarding complete
 | Claude Code | `claude-dev` | `claude-code` |
 | Antigravity | `antigravity-dev` | `antigravity` (standalone `agy`) |
 
-All four profiles use `approval_required` and `dedup-cas`. The named Codex,
+All four profiles use the `open` gate and `dedup-cas`; use `--gate approval_required`
+or `dealer gate mode approval_required` when approval is required. The named Codex,
 Claude Code and Antigravity executors default to `spawn` and support `fixed`;
 `agent-pty` remains available for existing configurations and other bridges.
 
