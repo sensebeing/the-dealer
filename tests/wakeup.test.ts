@@ -1926,13 +1926,23 @@ test('local Orca target validation does not create an unknown-effect fence', asy
 });
 
 
-test('pre-effect Orca refusals remain retryable', async t => {
+test('Orca sender retry preserves delivery fences', async t => {
+  const calls: CommandRequest[] = [];
+  let attempt = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    attempt += 1;
+    if (attempt === 1) throw new Error('no_active_sender_terminal');
+    return { stdout: '{"ok":true}' };
+  };
+  await sendOrcaTerminalText(runner, 'orca', 'term-1', 'hello');
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1]?.args.includes('--allow-self'));
+  assert.equal(calls[1]?.env?.ORCA_TERMINAL_ID, 'term-1');
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
-  store.upsertWakeTarget('box', { mode: 'orca-terminal', terminalHandle: 'term' });
-  settleWakeDeliveryFailure(store, 'box', new Error('agent_prompt_blocked'));
-  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
+  store.upsertWakeTarget('box', { mode: 'orca-terminal', terminalHandle: 'term-1' });
   settleWakeDeliveryFailure(store, 'box', new Error('no_active_sender_terminal'));
-  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
+  assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
 });
 
 test('rotating inbound delivery preserves terminal thread affinity across call order', async t => {

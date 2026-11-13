@@ -11,6 +11,7 @@ export interface CommandRequest {
   cwd?: string;
   input?: string;
   signal?: AbortSignal;
+  env?: NodeJS.ProcessEnv;
 }
 
 export type CommandRunner = (
@@ -61,6 +62,7 @@ export const runCommand: CommandRunner = request =>
       child = spawn(request.command, [...request.args], {
         cwd: request.cwd,
         signal: request.signal,
+        ...(request.env ? { env: request.env } : {}),
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: false,
       });
