@@ -81,7 +81,7 @@ The first-class Kernel plugin `lark-mirror` owns the notifier lifecycle and
 observes gate, mailbox, and emitter events without changing admission or routing.
 By default, mailbox notification covers `default` plus top-level bound mailboxes.
 Compound `<topic>:<stream>` bindings and linked-project topics whose manifest
-Bindings using `orca`, desktop apps (`claude-app`, `chatgpt-app`, `antigravity-app`), terminal CLIs (`claude-code`, `codex-cli`, `antigravity-cli`), or `inbox` are supported; legacy `orca-wave`, `orca-spawn`, and `agent-pty` remain compatible.
+`defaultExecutor` is an active agent or workspace executor (`orca`, `claude-app`, `chatgpt-app`, `antigravity-app`, `claude-code`, `codex-cli`, `antigravity-cli`, `codex`, `antigravity`, `orca-wave`, `orca-spawn`, or `agent-pty`) are excluded by default.
 An explicit `notifyLark: true` opts those bindings in; `false` opts any binding out. Explicit `mailboxes` replaces that default set (an
 empty array disables all mailbox notifications). `excludeMailboxes`,
 `includeKinds`, `excludeKinds`, and `skipSelfMessages` provide further filtering.

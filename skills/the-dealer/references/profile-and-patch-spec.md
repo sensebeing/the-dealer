@@ -49,8 +49,7 @@ optional `bootstrapPeers`, `admissionMode`, `exposedSkills`, and local `role`.
 Avoid selecting `orca` until its target and authoritative idle check are
 configured. The default check inspects the workspace and descendants.
 
-A wake target applies only to envelopes selecting `orca` with `mode: wave`; other executors
-dispatch immediately after dedup. Stream identity includes network,
+Orca workspace wake targets apply to envelopes selecting `orca` with `mode: wave` or `fixed` (and legacy `orca-wave`); spawn and host executors record passive or spawned-terminal wake targets. Stream identity includes network,
 `payload.streamKey` (or message kind), and executor. `orca` durably
 enqueues the batch into its mailbox and records a wake target, returning
 `dispatched` even when the workspace is busy. `wave.minAgeMs` is the coalescing
@@ -76,7 +75,7 @@ objects. Block lists, anchors, tags, multiline strings, and implicit YAML
 coercions are unsupported and rejected.
 
 ```yaml
-gateMode: approval_required
+gateMode: open
 skills: ["ios-crash", "runtime"]
 defaultExecutor: orca
 executorConfig:

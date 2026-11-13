@@ -147,7 +147,8 @@ is required.
 | --- | --- | --- | --- | --- |
 | `orca` | Child worktree | Workspace wave | Fixed session | Durable mailbox |
 | Desktop Apps: `claude-app` / `chatgpt-app` / `antigravity-app` | New session | Wave queue | Fixed session | Durable mailbox |
-| Terminal CLIs: `claude-code` / `codex-cli` / `antigravity-cli` | New session | Wave queue | Fixed session | Durable mailbox |
+| Terminal CLIs: `claude-code` / `codex-cli` | New session | Wave queue | Fixed session | Durable mailbox |
+| Terminal CLI: `antigravity-cli` | New session | Unsupported (use `orca` or `antigravity-app`) | Unsupported (use `orca` or `antigravity-app`) | Durable mailbox |
 | `inbox` | — | — | — | Manual inbox |
 
 Bridge presets for `chatgpt-dot` and `grok-bot` (`--target-bot`) are also available.
@@ -164,8 +165,8 @@ Pass a `--host` and `--mode` pair to `dealer setup binding-preset` or `dealer se
 | `codex-fixed` | `--host codex --mode fixed` | `codex-cli` / `codex` (`mode: fixed`) |
 | `claude-spawn` | `--host claude-code --mode spawn` | `claude-code` (`mode: spawn`) |
 | `claude-fixed` | `--host claude-code --mode fixed` | `claude-code` (`mode: fixed`) |
-| `antigravity-spawn` | `--host antigravity --mode spawn` | `antigravity-cli` (`mode: spawn`) |
-| `antigravity-fixed` | `--host antigravity --mode fixed` | `antigravity-app` (`mode: fixed`) |
+| `antigravity-spawn` | `--host antigravity --mode spawn` (or `--host antigravity-cli --mode spawn`) | `orca` (`agent: antigravity`, `mode: spawn`) / `antigravity-cli` (`mode: spawn`) |
+| `antigravity-fixed` | `--host antigravity --mode fixed` (or `--host antigravity-app --mode fixed`) | `orca` (`agent: antigravity`, `mode: fixed`) / `antigravity-app` (`mode: fixed`) |
 | `lark-mirror` | `apply-preset --notify-lark` | Marks the binding for Lark mirroring (configure `larkNotify` credentials in `~/.dealer/config.json`) |
 
 ```sh
