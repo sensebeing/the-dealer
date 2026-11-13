@@ -488,6 +488,25 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   return target;
 }
 
+function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle: string): string {
+  const current = state.wakeTargets[id];
+  const handle = rawHandle.trim();
+  if (!handle || current?.mode !== 'orca-terminal' || current.rotateAfterWaves === undefined) return id;
+  const termMailbox = `terminal:${handle}`;
+  const existing = state.wakeTargets[termMailbox];
+  const hasQueued = state.items.some(item => item.mailboxId === termMailbox && item.status === 'queued');
+  const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
+  state.wakeTargets[termMailbox] = validateWakeTarget({
+    ...current, ...(existing ?? {}), mailboxId: termMailbox, mode: 'orca-terminal', terminalHandle: handle,
+    rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
+    wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
+    pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
+    earliestWakeAt: existing?.earliestWakeAt ?? 0, lastWakeError: existing?.lastWakeError,
+    deliveryInDoubt: existing?.deliveryInDoubt,
+  } as any);
+  return termMailbox;
+}
+
 const THREAD_STATES: readonly ThreadRouteRecord['state'][] = ['open', 'replied', 'settled'];
 const SETTLEMENT_OUTCOMES: readonly SettlementOutcome[] = ['succeeded', 'failed', 'cancelled'];
 
@@ -1520,15 +1539,7 @@ export class MailboxStore {
       state.wakeTargets[id] = next;
       if (current.mode === 'orca-terminal' && current.rotateAfterWaves !== undefined &&
           typeof next.terminalHandle === 'string' && next.terminalHandle.trim()) {
-        const termMailbox = `terminal:${next.terminalHandle.trim()}`;
-        const existingTermTarget = state.wakeTargets[termMailbox];
-        const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
-        state.wakeTargets[termMailbox] = validateWakeTarget({
-          ...current, ...(existingTermTarget ?? {}), mailboxId: termMailbox, mode: 'orca-terminal',
-          terminalHandle: next.terminalHandle.trim(), rotateAfterWaves: undefined, completedWaves: 0,
-          wakeupPrefix: prefix ?? current.wakeupPrefix, pendingWake: existingTermTarget?.pendingWake ?? false,
-          deliveryInDoubt: existingTermTarget?.deliveryInDoubt ?? false,
-        } as any);
+        const termMailbox = pinRotatingTargetInState(state, id, next.terminalHandle);
         const delivered = state.items.filter(item => item.mailboxId === id && item.sequence <= deliveredSequence);
         const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
         const updatedAt = new Date().toISOString();
@@ -1542,6 +1553,12 @@ export class MailboxStore {
     });
     if (completed.pendingWake) this.events.emit('target', id);
     return completed;
+  }
+
+  pinRotatingSessionMailbox(mailboxId: string, terminalHandle?: string): string {
+    const id = normalizeMailboxId(mailboxId);
+    if (typeof terminalHandle !== 'string' || !terminalHandle.trim()) return id;
+    return this.mutate(state => pinRotatingTargetInState(state, id, terminalHandle));
   }
 
   getWakeTarget(mailboxId: string): WakeTargetState | undefined {

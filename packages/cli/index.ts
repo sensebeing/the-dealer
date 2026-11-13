@@ -752,18 +752,6 @@ function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | u
   return { mailboxId, ...(terminalHandle ? { terminalHandle } : {}), ...(worktreeId ? { worktreeId } : {}), ...(workspacePath ? { workspacePath } : {}) };
 }
 
-function resolveSessionMailbox(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): string {
-  if (!caller?.terminalHandle) return mailboxId;
-  const target = store.getWakeTarget(mailboxId);
-  if (target?.mode === 'orca-terminal' && target.rotateAfterWaves !== undefined) {
-    const pinned = `terminal:${caller.terminalHandle}`;
-    const prefix = target.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${mailboxId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${pinned}`);
-    store.upsertWakeTarget(pinned, { ...target, mailboxId: pinned, terminalHandle: caller.terminalHandle, rotateAfterWaves: undefined, wakeupPrefix: prefix ?? target.wakeupPrefix, pendingWake: false, deliveryInDoubt: false });
-    return pinned;
-  }
-  return mailboxId;
-}
-
 function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): void {
   if (!caller) return;
   const existing = store.getWakeTarget(mailboxId);
@@ -849,7 +837,7 @@ async function runSessionCommand(
         replyTo,
         typeof v.network === 'string' && v.network ? String(v.network) : undefined,
       );
-      const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller);
+      const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
       bindCallerWakeTarget(store, replyMailbox, caller);
       if (ackId) {
         store.ack(ackId, callerMailboxFlag);
@@ -898,7 +886,7 @@ async function runSessionCommand(
     if (ackId) {
       store.ack(ackId, callerMailboxFlag);
     }
-    const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller);
+    const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller?.terminalHandle);
     bindCallerWakeTarget(store, replyMailbox, caller);
     const targetMailbox =
       typeof v['target-mailbox'] === 'string' && v['target-mailbox']
@@ -936,7 +924,7 @@ async function runSessionCommand(
 
   const messageId = required(positional, 'message-id');
   const route = replyTargetOrThrow(store, messageId);
-  const replyMailbox = resolveSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller);
+  const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
   bindCallerWakeTarget(store, replyMailbox, caller);
   if (ackId) {
     store.ack(ackId, callerMailboxFlag);
@@ -1400,7 +1388,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
               : (callerMatchesBoundTopic && resolvedTopic?.binding.rotateAfterWaves !== undefined
                 ? boundTopicMailbox
                 : undefined)));
-      if (callerBinding && replyMailbox) replyMailbox = resolveSessionMailbox(runtime.mailbox, replyMailbox, callerBinding);
+      if (callerBinding && replyMailbox) replyMailbox = runtime.mailbox.pinRotatingSessionMailbox(replyMailbox, callerBinding.terminalHandle);
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       result = await runtime.emitter.emit({
         networkId,
