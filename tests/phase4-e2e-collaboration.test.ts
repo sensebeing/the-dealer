@@ -92,6 +92,7 @@ test('Phase 4: cross-member P2P attachment, approval and trusted sender dispatch
   const alice = await node(t, root, 'alice');
   const bob = await node(t, root, 'bob', {
     profile: 'personal-dev',
+    patch: { gateMode: 'approval_required' },
     commandRunner: async request => {
       calls.push(request);
       return {
@@ -538,7 +539,7 @@ test('Phase 4: identity/config persistence, exclusive state ownership and privat
   assert.equal(restored.transport.localNodeId, id);
   assert.equal(restored.gate.getNetworkMode('saved'), 'dnd');
   assert.equal(restored.node.getSelfCard('saved').admissionMode, 'dnd');
-  assert.equal(getBuiltInProfile('personal-dev').gateMode, 'approval_required');
+  assert.equal(getBuiltInProfile('personal-dev').gateMode, 'open');
   assert.throws(() => getBuiltInProfile('nope'), /Unknown/);
 });
 
@@ -592,7 +593,7 @@ test('Phase 4: actual dealer node up launches dealerd and CLI talks over socket'
   assert.match(JSON.parse(setupInvite.output).teammatePrompt, /dealer network mount/);
   const setupBinding = await run(['setup', 'binding-preset', '--host', 'codex', '--mode', 'fixed', '--json']);
   assert.equal(setupBinding.code, 0, setupBinding.errors);
-  assert.equal(JSON.parse(setupBinding.output).binding.executor, 'agent-pty');
+  assert.equal(JSON.parse(setupBinding.output).binding.executor, 'codex');
   const projectRoot = join(root, 'daemon-project');
   mkdirSync(projectRoot);
   const scaffold = await run(['project', 'init', '--id', 'daemon-project', '--network', 'daemon-test', '--json'], projectRoot);

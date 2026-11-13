@@ -141,7 +141,7 @@ export class PeerDirectoryService implements NodeService {
           this.modes.get(networkId) ??
           mount?.admissionMode ??
           this.config.admissionMode ??
-          'approval_required',
+          'open',
         capabilities: {
           ...capabilities,
           skills: capabilities.skills.filter(

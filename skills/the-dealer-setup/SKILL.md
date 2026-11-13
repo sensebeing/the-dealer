@@ -152,9 +152,10 @@ network; mount that same invite locally before expecting connectivity.
 
 Keep incoming work in the durable inbox. Ask for the teammate’s member handle;
 replace the generated `teammate` placeholder before starting a new node. Ask for
-the Agent App (`orca`, `antigravity`, `claude-code`, `codex`, `chatgpt-dot`,
+the Agent App (`orca`, `antigravity`, `antigravity-cli`, `antigravity-app`,
+`claude-code`, `claude-app`, `codex`, `codex-cli`, `chatgpt-app`, `chatgpt-dot`,
 `grok-bot`) and one mode:
-**fixed** (recommended for ongoing collaboration), **spawn** (independent tasks),
+**fixed** (recommended for ongoing collaboration), **wave** (per-wave session tab in a shared stream), **spawn** (independent tasks),
 or **inbox-only** (manual processing). Ask only for the selected host's required
 selectors: Orca inner agent/workspace; Codex profile/thread; Claude role/session;
 Dot agent; Grok targetBot. See [agent-app-matrix](references/agent-app-matrix.md).
@@ -170,7 +171,7 @@ requires a nonempty targetBot. `--notify-lark` enables both mailbox eligibility
 and node notifications immediately. Configure credentials/target separately,
 never infer them.
 Generate `invite-prompt --peer-member <colleague>` and share `teammatePrompt`.
-Keep approval-required admission until the intended peer is verified. Check
+Built-in profiles default to the open gate; pass `--gate approval_required` to dealer node up / dealer network mount or run `dealer gate mode approval_required` when inbound approval is required. Check
 mailbox readback and an actual host receipt before reporting onboarding complete.
 
 
@@ -183,8 +184,8 @@ mailbox readback and an actual host receipt before reporting onboarding complete
 | Claude Code | `claude-dev` | `claude-code` |
 | Antigravity | `antigravity-dev` | `antigravity` (standalone `agy`) |
 
-All four profiles use `approval_required` and `dedup-cas`. The named Codex,
-Claude Code and Antigravity executors default to `spawn` and support `fixed`;
+All four profiles use the `open` gate and `dedup-cas`; use `--gate approval_required`
+or `dealer gate mode approval_required` when approval is required. The named Codex, Claude Code, Claude app, ChatGPT app, Codex CLI, Antigravity CLI, and Antigravity app executors default to `spawn` and support `wave`, `fixed`, and `inbox-only`;
 `agent-pty` remains available for existing configurations and other bridges.
 
 ```sh

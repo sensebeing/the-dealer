@@ -19,6 +19,8 @@ import {
   AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli,
   decodeNetworkInvite, DealerNodeRuntime, MailboxStore, createAgentPtyExecutorPlugin,
   createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin,
+  createOrcaExecutorPlugin, createCodexCliExecutorPlugin, createAntigravityCliExecutorPlugin,
+  createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityAppExecutorPlugin,
   createCodexExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin,
   BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts, resolveAgentBindingPreset,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
@@ -532,17 +534,27 @@ test('setup invite prompts reuse configured network, encode seeds, and do not mu
   }
 });
 
-for (const { host } of AGENT_HOST_CATALOG) {
-  for (const mode of ['spawn', 'fixed', 'inbox-only'] as const) {
-    test(`setup preset ${host} ${mode} is valid through CLI`, async t => {
+for (const entry of AGENT_HOST_CATALOG) {
+  for (const mode of entry.modes) {
+    test(`setup preset ${entry.host} ${mode} is valid through CLI`, async t => {
       const root = directory(t);
-      const result = await cli(['setup', 'binding-preset', '--host', host, '--mode', mode, '--target-bot', 'review', '--workspace-path', root], root);
+      const result = await cli(['setup', 'binding-preset', '--host', entry.host, '--mode', mode, '--target-bot', 'review', '--workspace-path', root], root);
       validateTopicBindings({ [result.topic]: result.binding }, [result.binding.executor]);
-      assert.equal(result.binding.conversationMode, mode);
+      assert.equal(result.binding.mode, mode);
       if (mode === 'inbox-only') assert.equal(result.binding.executor, 'inbox');
-      else if (host === 'orca' || host === 'antigravity') assert.equal(result.binding.executor, mode === 'spawn' ? 'orca-spawn' : 'orca-wave');
-      else assert.equal(result.binding.executor, 'agent-pty');
+      else if (entry.host === 'orca' || entry.host === 'antigravity') assert.equal(result.binding.executor, 'orca');
+      else if (entry.host === 'chatgpt-dot') assert.equal(result.binding.executor, 'chatgpt-app');
+      else if (entry.host === 'grok-bot') assert.equal(result.binding.executor, 'agent-pty');
+      else assert.equal(result.binding.executor, entry.host);
     });
+  }
+  if (entry.host === 'antigravity-cli') {
+    for (const mode of ['wave', 'fixed'] as const) {
+      test(`setup preset ${entry.host} ${mode} rejects unsupported mode`, () => {
+        assert.throws(() => buildAgentBindingPreset({ host: entry.host, mode }), /Invalid conversation mode/);
+        assert.throws(() => validateTopicBindings({ task: { executor: entry.host, mode } }, [entry.host]), /Invalid topic binding/);
+      });
+    }
   }
 }
 
@@ -743,6 +755,9 @@ test('orca-wave defaults fixed workspaces to one fresh session tab per wave', as
 });
 
 test('managed fixed presets default to one session tab per wave and allow an override', () => {
+  const wavePreset = buildAgentBindingPreset({ host: 'orca', mode: 'wave' });
+  assert.equal(wavePreset.binding.autoCreateWorkspace, true);
+  assert.equal(wavePreset.binding.rotateAfterWaves, 1);
   for (const host of ['orca', 'antigravity'] as const) {
     const preset = buildAgentBindingPreset({ host, conversationMode: 'fixed' });
     assert.equal(preset.binding.autoCreateWorkspace, true);
@@ -794,7 +809,7 @@ test('runtime uses a generated fixed binding, persists mailbox and supports setu
   await runtime.start();
   t.after(() => runtime.stop());
   assert.equal(runtime.config.profile, 'personal-dev');
-  assert.equal(runtime.config.gateMode, 'approval_required');
+  assert.equal(runtime.config.gateMode, 'open');
   const result = await runtime.emitter.emit({ networkId: 'local', kind: preset.topic,
     routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check this change', payload: {} });
   assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
@@ -825,7 +840,7 @@ for (const scenario of [
     });
     await runtime.start();
     t.after(() => runtime.stop());
-    for (const executor of ['agent-pty', 'codex', 'claude-code', 'antigravity']) {
+    for (const executor of ['agent-pty', 'codex', 'claude-code', 'antigravity', 'orca', 'codex-cli', 'antigravity-cli', 'claude-app', 'chatgpt-app', 'antigravity-app']) {
       assert.equal(runtime.config.executors.includes(executor), scenario.expected);
     }
     assert.equal(runtime.config.gateMode, 'approval_required');
@@ -1211,16 +1226,88 @@ test('named executors default to spawn and preserve conversation-mode precedence
   await assert.rejects(createCodexExecutorPlugin({ commandRunner: async () => ({ stdout: '', exitCode: 2 }) }).execute([message()], context, {}), /exited 2/);
 });
 
+test('orca executor resolves spawn, wave and fixed modes per batch', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    return {
+      stdout: request.args.includes('worktree') && request.args.includes('create')
+        ? JSON.stringify({ path: root })
+        : request.args.includes('terminal') && request.args.includes('create')
+          ? JSON.stringify({ handle: 'term-spawn' })
+          : '{}',
+    };
+  };
+  const plugin = createOrcaExecutorPlugin({
+    store,
+    cwd: root,
+    commandRunner: runner,
+    resolveTopicBinding: (_kind, streamKey) => streamKey === 'wave' ? { executor: 'orca', mode: 'wave', mailboxId: 'stream:wave', workspacePath: root, rotateAfterWaves: 1 } : undefined,
+  });
+  for (const [id, payload] of [['spawn', { mode: 'spawn', noParent: true }], ['wave', { mode: 'wave', streamKey: 'wave' }], ['fixed', { mode: 'fixed', streamKey: 'wave' }]] as const) {
+    const receipt = await plugin.execute([message(id, payload)], context, {});
+    assert.equal(receipt.executor, 'orca');
+    if (id === 'spawn') {
+      assert.ok(calls.some(call => call.args.includes('worktree')));
+      assert.ok(calls.some(call => call.args.includes('create')));
+      assert.equal(store.check({ mailboxId: 'task:spawn', peek: true }).items.length, 1);
+    } else if (id === 'wave') {
+      assert.equal(store.getWakeTarget('stream:wave')?.rotateAfterWaves, 1);
+    } else {
+      assert.equal(store.getWakeTarget('stream:wave')?.rotateAfterWaves, undefined);
+    }
+  }
+});
+
+test('new host executor factories use host invocation mode', async t => {
+  const cases = [
+    [createCodexCliExecutorPlugin, 'codex', ['exec', '--worktree']],
+    [createAntigravityCliExecutorPlugin, 'agy', ['run', '--dangerously-skip-permissions']],
+    [createClaudeAppExecutorPlugin, 'claude-app', ['send', '--session-mode', 'spawn']],
+    [createChatgptAppExecutorPlugin, 'dot', ['send', '--session-mode', 'spawn']],
+    [createAntigravityAppExecutorPlugin, 'antigravity-app', ['send', '--session-mode', 'spawn']],
+  ] as const;
+  for (const [factory, command, prefix] of cases) {
+    const calls: CommandRequest[] = [];
+    const commandRunner: CommandRunner = async request => { calls.push(request); return { stdout: '{}' }; };
+    await factory({ commandRunner }).execute([message()], context, {});
+    assert.equal(calls.at(-1)!.command, command);
+    assert.deepEqual(calls.at(-1)!.args.slice(0, prefix.length), prefix);
+  }
+  for (const mode of ['wave', 'fixed'] as const) {
+    await assert.rejects(createAntigravityCliExecutorPlugin({ commandRunner: async () => ({ stdout: '{}' }) }).execute([message(`agy-${mode}`, { mode })], context, {}), /Standalone Antigravity CLI only supports spawn mode/);
+  }
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  await createCodexCliExecutorPlugin({ store, resolveTopicBinding: () => ({ executor: 'codex-cli', mode: 'wave', mailboxId: 'default' }), commandRunner: async request => { calls.push(request); return { stdout: '{"threadId":"wave-thread"}' }; } })
+    .execute([message('wave-msg', { mode: 'wave' })], context, {});
+  assert.deepEqual(calls.at(-1)!.args.slice(0, 2), ['exec', '--worktree']);
+  assert.equal(store.getWakeTarget('default')?.conversationMode, 'fixed');
+  assert.equal(store.getWakeTarget('default')?.sessionId, 'wave-thread');
+  const claudeCalls: CommandRequest[] = [];
+  const claudeStore = new MailboxStore(join(root, 'claude-mailbox.json'));
+  await createClaudeAppExecutorPlugin({ store: claudeStore, resolveTopicBinding: () => ({ executor: 'claude-app', mode: 'wave', mailboxId: 'default' }), commandRunner: async request => { claudeCalls.push(request); return { stdout: '{}' }; } })
+    .execute([message('claude-wave', { mode: 'wave' })], context, {});
+  assert.deepEqual(claudeCalls.at(-1)!.args.slice(0, 3), ['send', '--session-mode', 'wave']);
+  assert.equal(claudeStore.getWakeTarget('default')?.conversationMode, 'wave');
+  const runtime = await new DealerNodeRuntime({ stateDir: directory(t), gateMode: 'approval_required' }).start();
+  assert.equal(runtime.config.gateMode, 'approval_required');
+  await runtime.stop();
+});
+
 for (const [host, profileName, defaultExecutor, executors] of [
-  ['orca', 'orca-dev', 'orca-spawn', ['orca-spawn', 'orca-wave', 'notify', 'inbox']],
+  ['orca', 'orca-dev', 'orca-spawn', ['orca', 'orca-spawn', 'orca-wave', 'notify', 'inbox']],
   ['codex', 'codex-dev', 'codex', ['codex', 'agent-pty', 'notify', 'inbox']],
   ['claude-code', 'claude-dev', 'claude-code', ['claude-code', 'agent-pty', 'notify', 'inbox']],
-  ['antigravity', 'antigravity-dev', 'antigravity', ['antigravity', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox']],
+  ['antigravity', 'antigravity-dev', 'antigravity', ['antigravity', 'orca', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox']],
 ] as const) {
   test(`${profileName} and ${host} patch validate`, () => {
     const profile = getBuiltInProfile(profileName);
     assert.equal(profile.defaultExecutor, defaultExecutor);
-    assert.equal(profile.gateMode, 'approval_required');
+    assert.equal(profile.gateMode, 'open');
     assert.deepEqual(profile.policies, ['dedup-cas']);
     assert.deepEqual(profile.executors, executors);
     const patch = JSON.parse(readFileSync(new URL(`../examples/user-patches/${host}.patch.json`, import.meta.url), 'utf8'));

@@ -16,6 +16,11 @@ import { dirname, join, resolve } from 'node:path';
 import { isValidMailboxId, validateSemanticHeader, verifyEnvelope } from '../core-types/index.ts';
 import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-types/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
+import { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES, normalizeConversationModeInput } from '../agent-host/index.ts';
+import type { AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
+export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../agent-host/index.ts';
+export type { AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
+export { normalizeConversationModeInput } from '../agent-host/index.ts';
 
 export const MAILBOX_SCHEMA = 'the-dealer-mailbox/v1';
 const LEGACY_INBOX_SCHEMA = 'the-dealer-inbox/v1';
@@ -62,7 +67,7 @@ export type WakeTargetMode = 'passive' | 'orca-run' | 'orca-terminal';
 
 export interface WakeTargetState {
   readonly hostAgent?: 'codex' | 'claude' | 'claude-code' | 'antigravity' | 'chatgpt-dot' | 'grok-bot';
-  readonly conversationMode?: 'spawn' | 'fixed';
+  readonly conversationMode?: ActiveConversationMode;
   readonly agentProfile?: string;
   readonly targetBot?: string;
   readonly sessionId?: string;
@@ -278,11 +283,37 @@ export interface MailboxTopicBinding {
   executor: string;
   mailboxId?: string;
   streamKey?: string;
+  mode?: AgentConversationMode;
+  conversationMode?: AgentConversationMode;
+  workspacePath?: string;
+  worktreeId?: string;
+  runId?: string;
+  terminalHandle?: string;
+  rotateAfterWaves?: number;
+}
+
+export function resolveEffectiveConversationMode(options: { executor?: string; binding?: Partial<MailboxTopicBinding>; payload?: Record<string, unknown>; sources?: ReadonlyArray<{ mode?: unknown; conversationMode?: unknown } | undefined>; fallbackMode?: unknown }): AgentConversationMode {
+  const layers = options.sources ?? [options.payload, options.binding, options.fallbackMode !== undefined ? { mode: options.fallbackMode } : undefined];
+  for (const layer of layers) {
+    const resolved = normalizeConversationModeInput(layer);
+    if (resolved !== undefined) return resolved;
+  }
+  const executor = options.executor ?? options.binding?.executor;
+  if (executor === 'inbox') return 'inbox-only';
+  if (executor === 'orca-wave') return 'wave';
+  if (executor === 'orca-spawn') return 'spawn';
+  if (executor === 'orca') return (options.binding?.rotateAfterWaves !== undefined || options.binding?.streamKey !== undefined || options.binding?.workspacePath !== undefined || options.binding?.runId !== undefined || options.binding?.terminalHandle !== undefined) ? 'wave' : 'spawn';
+  return 'spawn';
+}
+
+export function isStreamConversationBinding(binding: Partial<MailboxTopicBinding>): boolean {
+  const mode = resolveEffectiveConversationMode({ executor: binding.executor, binding });
+  return binding.executor === 'orca-wave' || (binding.executor === 'orca' && (mode === 'wave' || mode === 'fixed')) || mode === 'wave';
 }
 
 export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding): string {
   if (binding.mailboxId !== undefined) return normalizeMailboxId(binding.mailboxId);
-  return binding.executor === 'orca-wave'
+  return isStreamConversationBinding(binding)
     ? normalizeMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`) : 'default';
 }
 
@@ -331,10 +362,11 @@ export function resolveMailboxId(
     }
     return resolveBoundMailboxId(bindingKind, binding);
   }
-  if (executorName === 'orca-wave') {
+  const mode = resolveEffectiveConversationMode({ executor: executorName, binding, payload });
+  if (executorName === 'orca-wave' || (executorName === 'orca' && (mode === 'wave' || mode === 'fixed')) || mode === 'wave') {
     return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
   }
-  if (executorName === 'orca-spawn') {
+  if (executorName === 'orca-spawn' || (executorName === 'orca' && mode === 'spawn')) {
     return normalizeMailboxId(`task:${envelope.id}`, 'task mailbox');
   }
   return 'default';
@@ -439,8 +471,8 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   }
   const target = value as unknown as WakeTargetState;
   if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
-  if (target.hostAgent !== undefined && !['codex', 'claude', 'claude-code', 'antigravity', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
-  if (target.conversationMode !== undefined && !['spawn', 'fixed'].includes(target.conversationMode)) throw invalidStore();
+  if (target.hostAgent !== undefined && !['codex', 'codex-cli', 'claude', 'claude-code', 'claude-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
+  if (target.conversationMode !== undefined && !ACTIVE_CONVERSATION_MODES.includes(target.conversationMode)) throw invalidStore();
   if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
   if (!isValidMailboxId(target.mailboxId) || !WAKE_TARGET_MODES.includes(target.mode)) {
     throw invalidStore();

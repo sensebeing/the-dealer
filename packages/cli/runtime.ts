@@ -19,8 +19,15 @@ import { createEmitterPlugin } from '../emitter/index.ts';
 import { createDedupCasPolicyPlugin, isConfirmedHandoffReceipt, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../plugins-policy/index.ts';
 import {
   createOrcaSpawnExecutorPlugin,
+  createOrcaExecutorPlugin,
+  orcaAgent,
   createOrcaWaveExecutorPlugin,
   createCodexExecutorPlugin,
+  createCodexCliExecutorPlugin,
+  createClaudeAppExecutorPlugin,
+  createChatgptAppExecutorPlugin,
+  createAntigravityCliExecutorPlugin,
+  createAntigravityAppExecutorPlugin,
   createClaudeCodeExecutorPlugin,
   createAntigravityExecutorPlugin,
   createAgentPtyExecutorPlugin,
@@ -30,7 +37,7 @@ import {
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
-import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
+import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
@@ -110,6 +117,7 @@ export interface DealerRuntimeOptions {
   name?: string;
   skills?: string[];
   port?: number;
+  gateMode?: AdmissionMode;
   patch?: Partial<RuntimeConfig>;
   transport?: TransportPluginOptions;
   commandRunner?: CommandRunner;
@@ -171,6 +179,7 @@ export class DealerNodeRuntime {
   private externalChanges: Promise<unknown> = Promise.resolve();
   private server?: Server;
   private registerBuiltinExecutor?: (name: string) => void;
+  private registeredBuiltinNames = new Set<string>();
   private started = false;
   private ownsLock = false;
   private activeMutatingControlRequests = 0;
@@ -471,13 +480,14 @@ export class DealerNodeRuntime {
         ),
         ...this.options.patch,
       };
+      if (this.options.gateMode !== undefined) this.config.gateMode = this.options.gateMode;
       if (Array.isArray(this.config.executors) && !this.config.executors.includes('inbox')) {
         this.config.executors = [...this.config.executors, 'inbox'];
       }
       if (this.config.profile === 'personal-dev' && this.options.patch?.executors === undefined
         && Array.isArray(this.config.executors)
-        && this.config.executors.every(name => ['orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'].includes(name))) {
-        this.config.executors = [...new Set([...this.config.executors, 'agent-pty', 'codex', 'claude-code', 'antigravity'])];
+        && this.config.executors.every(name => ['orca-spawn', 'orca-wave', 'orca', 'agent-pty', 'notify', 'inbox'].includes(name))) {
+        this.config.executors = [...new Set([...this.config.executors, 'agent-pty', 'codex', 'claude-code', 'antigravity', 'orca', 'codex-cli', 'antigravity-cli', 'claude-app', 'chatgpt-app', 'antigravity-app'])];
       }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config);
@@ -622,8 +632,14 @@ export class DealerNodeRuntime {
         isDedupCasDuplicateReceipt,
         isDurableQueuedReceipt,
         createOrcaSpawnExecutorPlugin,
+  createOrcaExecutorPlugin,
         createOrcaWaveExecutorPlugin,
         createCodexExecutorPlugin,
+  createCodexCliExecutorPlugin,
+  createClaudeAppExecutorPlugin,
+  createChatgptAppExecutorPlugin,
+  createAntigravityCliExecutorPlugin,
+  createAntigravityAppExecutorPlugin,
         createClaudeCodeExecutorPlugin,
         createAntigravityExecutorPlugin,
         createAgentPtyExecutorPlugin,
@@ -922,11 +938,11 @@ export class DealerNodeRuntime {
   async applyAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { setDefault?: boolean; cwd?: string }) {
     const preset = this.previewAgentPreset(options);
     const host = options.host === 'claude' ? 'claude-code' : options.host;
-    const mode = options.conversationMode ?? 'fixed';
+    const mode = options.mode ?? options.conversationMode ?? 'fixed';
     const defaultExecutor = !options.setDefault ? this.config.defaultExecutor
       : mode === 'inbox-only' ? 'inbox'
       : host === 'orca' ? 'orca-spawn'
-      : ['codex', 'claude-code', 'antigravity'].includes(host) ? host : preset.binding.executor;
+      : ['codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(host) ? host : preset.binding.executor;
     this.config.executors = [...new Set([...this.config.executors, preset.binding.executor, defaultExecutor])];
     this.config.topicBindings = { ...this.config.topicBindings, [preset.topic]: preset.binding };
     for (const [name, config] of Object.entries(preset.executorConfig)) {
@@ -954,18 +970,20 @@ export class DealerNodeRuntime {
       const mailboxId = resolveBoundMailboxId(kind, binding);
       const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
-          ['orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'claude-code', 'antigravity'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
+          ['orca', 'orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
       if (notifyLark) mailboxes.push(mailboxId);
-      if (binding.executor !== 'orca-wave' || !(binding.workspacePath || binding.runId || binding.terminalHandle)) continue;
+      const effectiveMode = resolveEffectiveConversationMode({ executor: binding.executor, binding });
+      if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && effectiveMode !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
       const current = this.mailbox.getWakeTarget(mailboxId);
       const resolvedRotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
-        bindingRotateAfterWaves: rotateAfterWaves,
-        waveRotateAfterWaves: this.config.wave?.rotateAfterWaves,
-        managesWorkspace: Boolean(workspacePath),
-        runId,
-        pinnedTerminalHandle: terminalHandle,
-      });
+            mode: effectiveMode,
+            bindingRotateAfterWaves: rotateAfterWaves,
+            waveRotateAfterWaves: this.config.wave?.rotateAfterWaves,
+            managesWorkspace: Boolean(workspacePath),
+            runId,
+            pinnedTerminalHandle: terminalHandle,
+          });
       // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
       // handle, an Orca Run, or a workspace switch may replace or clear it. Passing every optional
       // field as an own property is what lets a reconfiguration erase a stale rotation default.
@@ -978,7 +996,7 @@ export class DealerNodeRuntime {
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
         workspacePath, worktreeId, runId, repoRoot: projectRoot,
-        agent: binding.agent as 'antigravity' | 'claude' | 'codex' | undefined, interactiveCommand,
+        agent: binding.agent ? orcaAgent(binding.agent) : undefined, interactiveCommand,
         autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
         rotateAfterWaves: resolvedRotateAfterWaves,
         terminalHandle: nextTerminalHandle,
@@ -1077,11 +1095,20 @@ export class DealerNodeRuntime {
             },
             commandRunner: this.options.commandRunner,
           }),
+          'orca': createOrcaExecutorPlugin({
+            ...this.config.executorConfig['orca'],
+            store: this.mailbox,
+            wakeup: this.wakeups,
+            resolveTopicBinding: this.executorTopicBinding,
+            projectRoots: linkedProjectRoots,
+            commandRunner: this.options.commandRunner,
+          }),
           'orca-wave': createOrcaWaveExecutorPlugin({
             ...this.config.executorConfig['orca-wave'],
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
+          'codex-cli': createCodexCliExecutorPlugin({ ...this.config.executorConfig['codex-cli'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'codex': createCodexExecutorPlugin({
             ...this.config.executorConfig['codex'],
             store: this.mailbox,
@@ -1089,6 +1116,8 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
+          'claude-app': createClaudeAppExecutorPlugin({ ...this.config.executorConfig['claude-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'chatgpt-app': createChatgptAppExecutorPlugin({ ...this.config.executorConfig['chatgpt-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'claude-code': createClaudeCodeExecutorPlugin({
             ...this.config.executorConfig['claude-code'],
             store: this.mailbox,
@@ -1096,6 +1125,8 @@ export class DealerNodeRuntime {
             resolveTopicBinding: this.executorTopicBinding,
             commandRunner: this.options.commandRunner,
           }),
+          'antigravity-cli': createAntigravityCliExecutorPlugin({ ...this.config.executorConfig['antigravity-cli'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
+          'antigravity-app': createAntigravityAppExecutorPlugin({ ...this.config.executorConfig['antigravity-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
           'antigravity': createAntigravityExecutorPlugin({
             ...this.config.executorConfig['antigravity'],
             store: this.mailbox,
@@ -1129,8 +1160,9 @@ export class DealerNodeRuntime {
         }
         const registered = new Set<string>();
         this.registerBuiltinExecutor = name => {
-          if (registered.has(name)) return;
+          if (registered.has(name) || this.registeredBuiltinNames.has(name)) return;
           const executor = executors[name];
+          if (!executor) throw new Error(`Unknown executor: ${name}`);
           const wrapped: ExecutorPlugin = {
             ...executor,
             execute: async (batch, context, config) => {
@@ -1154,7 +1186,7 @@ export class DealerNodeRuntime {
           };
           const registration = ctx.services.dispatcher.registerExecutor(
             wrapped,
-            name === 'orca-wave'
+            name === 'orca-wave' || name === 'orca'
               ? {
                   ...this.config.executorConfig[name],
                   store: this.mailbox,
@@ -1171,8 +1203,9 @@ export class DealerNodeRuntime {
           );
           ctx.effect(() => () => registration.dispose());
           registered.add(name);
+          this.registeredBuiltinNames.add(name);
         };
-        for (const name of this.config.executors) this.registerBuiltinExecutor(name);
+        for (const name of new Set(this.config.executors)) this.registerBuiltinExecutor(name);
         if (this.config.policies.includes('dedup-cas')) {
           let legacyLedger: DeliveryLedger | undefined;
           const registration = ctx.services.dispatcher.registerPolicy(
