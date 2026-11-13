@@ -1934,3 +1934,14 @@ test('pre-effect Orca refusals remain retryable', async t => {
   settleWakeDeliveryFailure(store, 'box', new Error('no_active_sender_terminal'));
   assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
 });
+
+test('rotating inbound delivery preserves terminal thread affinity across call order', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.upsertWakeTarget('stream:inbox', { mode: 'orca-terminal', rotateAfterWaves: 1, terminalHandle: 'term-1', coalesceMs: 0 });
+  const inbound = alert('thread-a', { semantic: { type: 'message', threadId: 'thread-a', replyMailbox: 'default' } });
+  store.enqueue([inbound], { mailboxId: 'stream:inbox' });
+  store.completeWakeDelivery('stream:inbox', 0, { terminalHandle: 'term-1' });
+  store.recordInboundEnvelope(inbound, 'stream:inbox');
+  assert.equal(store.resolveThreadLocalMailbox('thread-a'), 'terminal:term-1');
+  assert.equal(store.getWakeTarget('terminal:term-1')?.rotateAfterWaves, undefined);
+});
