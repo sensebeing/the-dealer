@@ -408,7 +408,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
       const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
       const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(batch[0]?.kind, typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined);
-      const interactive = payload.interactive === true || (binding?.mode ?? binding?.conversationMode) === 'spawn' || binding?.executor === 'orca' || config.interactive === true || options.interactive === true;
+      const interactive = payload.interactive === true || (payload.mode ?? payload.conversationMode ?? binding?.mode ?? binding?.conversationMode) === 'spawn' || binding?.executor === 'orca' || config.interactive === true || options.interactive === true;
       const store = options.store ?? config.store;
       const effectiveAgent = orcaAgent(payload.agent ?? binding?.agent ?? config.agent ?? options.agent);
       const wakeup = options.wakeup ?? config.wakeup;

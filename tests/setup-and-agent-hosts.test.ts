@@ -1224,7 +1224,13 @@ test('orca executor resolves spawn, wave and fixed modes per batch', async t => 
   const calls: CommandRequest[] = [];
   const runner: CommandRunner = async request => {
     calls.push(request);
-    return { stdout: request.args.includes('worktree') ? JSON.stringify({ path: root }) : '{}' };
+    return {
+      stdout: request.args.includes('worktree') && request.args.includes('create')
+        ? JSON.stringify({ path: root })
+        : request.args.includes('terminal') && request.args.includes('create')
+          ? JSON.stringify({ handle: 'term-spawn' })
+          : '{}',
+    };
   };
   const plugin = createOrcaExecutorPlugin({
     store,
@@ -1238,9 +1244,6 @@ test('orca executor resolves spawn, wave and fixed modes per batch', async t => 
     if (id === 'spawn') {
       assert.ok(calls.some(call => call.args.includes('worktree')));
       assert.ok(calls.some(call => call.args.includes('create')));
-      if (store.check({ mailboxId: 'task:spawn', peek: true }).items.length === 0) {
-        store.enqueue([message('spawn-retained')], { mailboxId: 'task:spawn' });
-      }
       assert.equal(store.check({ mailboxId: 'task:spawn', peek: true }).items.length, 1);
     } else if (id === 'wave') {
       assert.equal(store.getWakeTarget('stream:wave')?.rotateAfterWaves, 1);
