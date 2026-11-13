@@ -73,6 +73,14 @@ export function probeDealerSetup(options: {
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
+export function resolveHostExecutor(host: SupportedAgentHost): string {
+  if (host === 'orca' || host === 'antigravity') return 'orca';
+  if (host === 'claude') return 'claude-code';
+  if (host === 'chatgpt-dot') return 'chatgpt-app';
+  if (host === 'grok-bot') return 'agent-pty';
+  return host;
+}
+
 export function buildOnboardingPrompts(options: {
   networkId: string;
   inviteUri: string;
@@ -133,7 +141,7 @@ export function buildAgentBindingPreset(options: {
   if (host === 'grok-bot' && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
   const managed = host === 'orca' || host === 'antigravity';
   const topic = options.topic ?? 'collab.request.v4';
-  const executor = mode === 'inbox-only' ? 'inbox' : managed ? 'orca' : host;
+  const executor = mode === 'inbox-only' ? 'inbox' : resolveHostExecutor(host);
   const binding: TopicBindingConfig = {
     executor, mode,
     agent: host === 'antigravity' ? 'antigravity' : host === 'orca' ? options.agent ?? 'antigravity' : host,
@@ -147,15 +155,19 @@ export function buildAgentBindingPreset(options: {
     ...(managed && (mode === 'fixed' || mode === 'wave')
       ? {
           autoCreateWorkspace: true,
-          rotateAfterWaves: resolveOrcaWaveRotateAfterWaves({
-            bindingRotateAfterWaves: options.rotateAfterWaves,
-            managesWorkspace: true,
-          }),
+          ...(() => {
+            const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
+              mode: options.mode === 'fixed' ? 'fixed' : 'wave',
+              bindingRotateAfterWaves: options.rotateAfterWaves,
+              managesWorkspace: true,
+            });
+            return rotateAfterWaves === undefined ? {} : { rotateAfterWaves };
+          })(),
         }
       : {}),
   };
   validateTopicBindings({ [topic]: binding }, [executor]);
-  const executorConfig = executor === 'orca-spawn'
+  const executorConfig = (executor === 'orca' || executor === 'orca-spawn') && mode === 'spawn'
     ? { [executor]: { agent: binding.agent, interactive: true, ...(binding.workspacePath ? { cwd: binding.workspacePath } : {}) } }
     : {};
   return { topic, binding, executorConfig, summary: `${host}: ${mode} via ${executor}; configure receiver project roots and host CLI before enabling delivery.` };

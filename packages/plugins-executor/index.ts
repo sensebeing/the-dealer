@@ -753,7 +753,9 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           ...(cwd ? { workspacePath: cwd } : {}),
           ...(worktreeId ? { worktreeId } : {}),
           ...(terminalHandle ? { terminalHandle } : {}),
-          ...(rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
+          ...(effectiveMode === 'fixed'
+            ? { rotateAfterWaves: undefined }
+            : rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
           workspaceComment,
         };
       };

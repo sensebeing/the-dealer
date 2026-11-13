@@ -593,7 +593,7 @@ test('Phase 4: actual dealer node up launches dealerd and CLI talks over socket'
   assert.match(JSON.parse(setupInvite.output).teammatePrompt, /dealer network mount/);
   const setupBinding = await run(['setup', 'binding-preset', '--host', 'codex', '--mode', 'fixed', '--json']);
   assert.equal(setupBinding.code, 0, setupBinding.errors);
-  assert.equal(JSON.parse(setupBinding.output).binding.executor, 'agent-pty');
+  assert.equal(JSON.parse(setupBinding.output).binding.executor, 'codex');
   const projectRoot = join(root, 'daemon-project');
   mkdirSync(projectRoot);
   const scaffold = await run(['project', 'init', '--id', 'daemon-project', '--network', 'daemon-test', '--json'], projectRoot);
