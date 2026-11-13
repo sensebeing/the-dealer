@@ -111,23 +111,23 @@ flowchart LR
 
 | 宿主（`--host`） | 启动 profile（`--profile`） | 示例 patch | 命名执行器 |
 | --- | --- | --- | --- |
-| `orca` | `orca-dev` | [orca.patch.json](examples/user-patches/orca.patch.json) | `orca-spawn` / `orca-wave` |
-| `codex` | `codex-dev` | [codex.patch.json](examples/user-patches/codex.patch.json) | `codex` |
+| `orca` | `orca-dev` | [orca.patch.json](examples/user-patches/orca.patch.json) | `orca` (`orca-spawn` / `orca-wave`) |
+| `codex` | `codex-dev` | [codex.patch.json](examples/user-patches/codex.patch.json) | `codex-cli` / `codex` |
 | `claude-code` | `claude-dev` | [claude-code.patch.json](examples/user-patches/claude-code.patch.json) | `claude-code` |
-| `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity` |
+| `antigravity` | `antigravity-dev` | [antigravity.patch.json](examples/user-patches/antigravity.patch.json) | `antigravity-cli` / `antigravity-app` / `antigravity` |
 
 四个启动 profile 默认使用 `open` 门禁并启用 `dedup-cas`；需要审批时使用
 `--gate approval_required` 或 `dealer gate mode approval_required`。
 
 ### 支持的 Agent 应用与会话模式
 
-| 宿主 / 模式 | `spawn` | `wave` | `fixed` | `inbox-only` | 接收端参数 |
-| --- | --- | --- | --- |
-| `orca` | 新建子工作区 | 空闲门禁固定工作区 | 接收端项目/工作区路径与内层 `--agent` |
-| `codex` | 新建 CLI 工作区会话 | 复用已有线程队列 | 可选 `--agent-profile` 与固定 `--session-id` |
-| `claude-code` | 新建后台会话 | 恢复已有会话 | 可选 `--agent-profile` 与固定 `--session-id` |
-| `antigravity` | Orca 托管 `agy` 子工作区 | Orca 托管 `agy` 固定工作区 | Orca 工作区或独立 `antigravity` 执行器 |
-| `inbox-only`（任意宿主） | 不拉起外部进程 | 不拉起外部进程 | 写入持久化信箱，由人工或会话主动执行 `dealer inbox check` |
+| 宿主 / 模式 | `spawn` | `wave` | `fixed` | `inbox-only` |
+| --- | --- | --- | --- | --- |
+| `orca` | 新建子工作区 | 波次工作区 | 固定会话 | 持久化信箱 |
+| Desktop Apps: `claude-app` / `chatgpt-app` / `antigravity-app` | 新会话 | 波次队列 | 固定会话 | 持久化信箱 |
+| Terminal CLIs: `claude-code` / `codex-cli` | 新会话 | 波次队列 | 固定会话 | 持久化信箱 |
+| Terminal CLI: `antigravity-cli` | 新会话 | 不支持（使用 `orca` 或 `antigravity-app`） | 不支持（使用 `orca` 或 `antigravity-app`） | 持久化信箱 |
+| `inbox` | — | — | — | 手动收件箱 |
 
 同时提供 `chatgpt-dot` 与 `grok-bot`（需指定 `--target-bot`）桥接预设。
 
@@ -137,14 +137,14 @@ flowchart LR
 
 | 预设组合 | 参数 | 生成的执行器 |
 | --- | --- | --- |
-| `orca-fixed` | `--host orca --mode fixed` | `orca-wave` |
-| `orca-spawn` | `--host orca --mode spawn` | `orca-spawn` |
-| `codex-spawn` | `--host codex --mode spawn` | `agent-pty` |
-| `codex-fixed` | `--host codex --mode fixed` | `agent-pty` |
-| `claude-spawn` | `--host claude-code --mode spawn` | `agent-pty` |
-| `claude-fixed` | `--host claude-code --mode fixed` | `agent-pty` |
-| `antigravity-spawn` | `--host antigravity --mode spawn` | `orca-spawn` |
-| `antigravity-fixed` | `--host antigravity --mode fixed` | `orca-wave` |
+| `orca-fixed` | `--host orca --mode fixed` | `orca` (`mode: fixed`) |
+| `orca-spawn` | `--host orca --mode spawn` | `orca` (`mode: spawn`) |
+| `codex-spawn` | `--host codex --mode spawn` | `codex-cli` / `codex` (`mode: spawn`) |
+| `codex-fixed` | `--host codex --mode fixed` | `codex-cli` / `codex` (`mode: fixed`) |
+| `claude-spawn` | `--host claude-code --mode spawn` | `claude-code` (`mode: spawn`) |
+| `claude-fixed` | `--host claude-code --mode fixed` | `claude-code` (`mode: fixed`) |
+| `antigravity-spawn` | `--host antigravity --mode spawn`（或 `--host antigravity-cli --mode spawn`） | `orca`（`agent: antigravity`, `mode: spawn`）/ `antigravity-cli`（`mode: spawn`） |
+| `antigravity-fixed` | `--host antigravity --mode fixed`（或 `--host antigravity-app --mode fixed`） | `orca`（`agent: antigravity`, `mode: fixed`）/ `antigravity-app`（`mode: fixed`） |
 | `lark-mirror` | `apply-preset --notify-lark` | 开启该绑定的飞书镜像（在 `~/.dealer/config.json` 中配置 `larkNotify` 凭证与目标） |
 
 ```sh

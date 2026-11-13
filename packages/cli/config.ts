@@ -34,13 +34,13 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     gateMode: 'open',
     policies: ['dedup-cas'],
     executors: ['orca', 'orca-spawn', 'orca-wave', 'notify', 'inbox'],
-    defaultExecutor: 'orca-spawn',
+    defaultExecutor: 'orca',
   },
   'codex-dev': {
     name: 'codex-dev',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['codex', 'agent-pty', 'notify', 'inbox'],
+    executors: ['codex-cli', 'codex', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'codex',
   },
   'claude-dev': {
@@ -54,7 +54,7 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     name: 'antigravity-dev',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['antigravity', 'orca', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
+    executors: ['antigravity', 'antigravity-cli', 'antigravity-app', 'orca', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'antigravity',
   },
   'headless-relay': {

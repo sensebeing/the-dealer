@@ -484,10 +484,10 @@ export class DealerNodeRuntime {
       if (Array.isArray(this.config.executors) && !this.config.executors.includes('inbox')) {
         this.config.executors = [...this.config.executors, 'inbox'];
       }
-      if (this.config.profile === 'personal-dev' && this.options.patch?.executors === undefined
+      if (this.config.profile !== 'headless-relay' && this.options.patch?.executors === undefined
         && Array.isArray(this.config.executors)
-        && this.config.executors.every(name => ['orca-spawn', 'orca-wave', 'orca', 'agent-pty', 'notify', 'inbox'].includes(name))) {
-        this.config.executors = [...new Set([...this.config.executors, 'agent-pty', 'codex', 'claude-code', 'antigravity', 'orca', 'codex-cli', 'antigravity-cli', 'claude-app', 'chatgpt-app', 'antigravity-app'])];
+        && this.config.executors.every(name => profile.executors.includes(name))) {
+        this.config.executors = [...new Set([...this.config.executors, ...profile.executors])];
       }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config);
@@ -941,7 +941,7 @@ export class DealerNodeRuntime {
     const mode = options.mode ?? options.conversationMode ?? 'fixed';
     const defaultExecutor = !options.setDefault ? this.config.defaultExecutor
       : mode === 'inbox-only' ? 'inbox'
-      : host === 'orca' ? 'orca-spawn'
+      : host === 'orca' ? 'orca'
       : ['codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(host) ? host : preset.binding.executor;
     this.config.executors = [...new Set([...this.config.executors, preset.binding.executor, defaultExecutor])];
     this.config.topicBindings = { ...this.config.topicBindings, [preset.topic]: preset.binding };

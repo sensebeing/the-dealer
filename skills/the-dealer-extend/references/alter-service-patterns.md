@@ -5,7 +5,7 @@ project's current adapters and owner API before implementing them.
 
 | Pattern | Source input | Durable identity | Delivery |
 | --- | --- | --- | --- |
-| Feedback claim | owner claim page + CAS acquisition | entityId and claimVersion | orca-spawn task mailbox |
+| Feedback claim | owner claim page + CAS acquisition | entityId and claimVersion | orca (mode: spawn) / orca-spawn task mailbox |
 | Quality wave | report date, revision and digest | one cursor per report stream | fixed workspace or host session |
 | Alert wave | independent environment/table streams | one committed watermark per stream | coalesced fixed mailbox |
 | Collaboration request | collab.request.v4 + team registry | request/thread IDs and revisions | receiver-local inbox and selected mode |

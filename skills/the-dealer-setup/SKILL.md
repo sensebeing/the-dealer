@@ -179,14 +179,13 @@ mailbox readback and an actual host receipt before reporting onboarding complete
 
 | Environment | Built-in profile | First-class executor |
 | --- | --- | --- |
-| Orca | `orca-dev` | `orca-spawn`, `orca-wave` |
-| Codex | `codex-dev` | `codex` |
+| Orca | `orca-dev` | `orca` (legacy aliases: `orca-spawn`, `orca-wave`) |
+| Codex | `codex-dev` | `codex-cli` / `codex` |
 | Claude Code | `claude-dev` | `claude-code` |
-| Antigravity | `antigravity-dev` | `antigravity` (standalone `agy`) |
+| Antigravity | `antigravity-dev` | `antigravity-cli` / `antigravity-app` / `orca` (`antigravity` alias) |
 
 All four profiles use the `open` gate and `dedup-cas`; use `--gate approval_required`
-or `dealer gate mode approval_required` when approval is required. The named Codex, Claude Code, Claude app, ChatGPT app, Codex CLI, Antigravity CLI, and Antigravity app executors default to `spawn` and support `wave`, `fixed`, and `inbox-only`;
-`agent-pty` remains available for existing configurations and other bridges.
+or `dealer gate mode approval_required` when approval is required. `orca`, `claude-app`, `chatgpt-app`, `antigravity-app`, `claude-code`, and `codex-cli` support `spawn`, `wave`, `fixed`, and `inbox-only`; standalone `antigravity-cli` supports `spawn` and `inbox-only` (use `orca` or `antigravity-app` for `wave`/`fixed`).
 
 ```sh
 dealer node up --profile codex-dev --json
@@ -202,8 +201,7 @@ and `--session-id`; `--notify-lark` enables mailbox eligibility and node notific
 but does not configure Lark credentials.
 
 For compatibility, `apply-preset` applies the same bindings as `binding-preset`:
-Orca and Antigravity use managed `orca-spawn`/`orca-wave`; Codex and Claude Code
-use `agent-pty`. `--set-default` selects the named host executor for unbound
+`binding-preset` and `apply-preset` emit first-class executors (`orca`, `claude-app`, `chatgpt-app`, `antigravity-app`, `claude-code`, `codex-cli`, `antigravity-cli`, or `inbox` when `--mode inbox-only`) with second-level `mode` (`spawn`, `wave`, `fixed`, `inbox-only`), while preserving backward compatibility for legacy `orca-spawn`, `orca-wave`, `codex`, `antigravity`, and `agent-pty` bindings. `--set-default` selects the named host executor for unbound
 messages (or `inbox` for inbox-only). For direct named-executor topic bindings,
 use the ready-to-use [host patches](../../examples/user-patches/): `orca.patch.json`,
 `codex.patch.json`, `claude-code.patch.json`, and `antigravity.patch.json`.

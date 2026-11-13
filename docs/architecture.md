@@ -71,7 +71,7 @@ flowchart TB
         subgraph DispPipeline["Dispatcher Plugins"]
             direction TB
             Pol["Policy / Mailbox Plugins<br/>- dedup-cas (代次水位防重)<br/>- MailboxStore + WakeupRedriveService (持久化波次、Idle Gate、单行指针、会话轮转)"]
-            Exec["Executor Plugins<br/>- executor-orca-spawn (自动新建 Orca 工作区 + 起 Agent)<br/>- executor-orca-wave (投递常驻工作区 / Run)<br/>- executor-agent-pty (直接拉起 Claude/Codex/AGY/DSH)<br/>- executor-notify (桌面/飞书交互审批)"]
+            Exec["Executor Plugins<br/>- first-class: inbox; Desktop Apps claude-app/chatgpt-app/antigravity-app; Terminal CLIs claude-code/codex-cli/antigravity-cli; orca<br/>- mode: spawn / wave / fixed / inbox-only<br/>- legacy aliases: orca-spawn / orca-wave / agent-pty<br/>- executor-notify (桌面/飞书交互审批)"]
             Pol --> Exec
         end
 
@@ -387,7 +387,7 @@ export interface DispatchPolicyPlugin {
 }
 
 export interface ExecutorPlugin<C = unknown> {
-  name: string;                  // 如 "orca-spawn", "orca-wave", "agent-pty", "webhook-forward"
+  name: string;                  // first-class: inbox, desktop apps, terminal CLIs, orca; legacy aliases: orca-spawn, orca-wave, agent-pty
   /** 检查目标执行环境是否空闲可用（供 Wave Coalescer 的 Idle Gate 调用） */
   checkIdle?(config: C): Promise<{ idle: boolean; reason?: string }>;
   /** 真正执行派发（如创建 Orca 工作区、启动终端、发送 Prompt），返回可持久化的外部资源回执 */
@@ -403,16 +403,13 @@ export interface ExecutorPlugin<C = unknown> {
    - **`MailboxStore`**：唯一原子落盘的信箱账本，承载逻辑 `mailboxId`、单未决租约 `dlv_*`、`wakeTargets` 重驱状态、`inbound:` / `outbound:` 方向化线程路由与旧 `inbox.json` 一次性迁移；通过文件锁 + `fsync`/`rename` 落盘，并以事件唤醒而非轮询驱动消费者。
    - **`WakeupRedriveService`**：取代易失的 wave-coalescer。目标工作区忙碌或不可判定时只保留持久化 `pendingWake`，绝不注入文本；仅在权威 Orca 工作区/终端空闲门禁通过后投递严格单行指针，空闲探测或投递前准备失败按 1s → 2s → 5s → 10s 退避，安全待投递工作在守护进程重启后恢复。租约确认后达到 `completedWaves` 阈值时，在同一 Orca 工作区新建独立 Agent 会话 Tab 并把 `wakeTarget.terminalHandle` 切流到新 Tab，旧会话 Tab 完整保留且零写入（绝不发送 `/new` 原地重置）；固定工作区默认 `rotateAfterWaves = 1`，每波独占新会话 Tab，首波也不会劫持用户已手动打开的会话 Tab。首次在工作区解析出的 Orca 终端句柄随 `wakeTargets` 持久化，后续波次优先复用同一终端（含已标记 orphaned 但仍 connected 的 TUI），避免固定工作区在多终端之间漂移。
 3. **执行器插件 (`packages/plugins-executor/`)**：
-   - **投递结算与未知结果**：`MailboxStore.beginWakeDelivery` 在外部命令或终端注入前持久化 `deliveryInDoubt`，只有成功回执才由 `completeWakeDelivery` 清除此围栏。进程已启动后的错误、abort 或进程中断保留围栏与原因；命令边界确认进程从未启动的前置失败（`CommandNotStartedError`）以及投递前的准备失败（工作区/终端解析、权威空闲门禁、参数校验）不产生围栏，按 1s → 2s → 5s → 10s 指数退避重试。后续入队、强制 flush 与重启均不能自动重放未知结果，须先核实外部结果再显式修复目标；成功结算只覆盖预览序号水位内的消息，新入队消息保留 `enqueue` 决定的截止时间；会话帧即时唤醒，普通波次仍遵守 coalescing。初始执行器（`agent-pty` / 命名宿主 / `orca-spawn`）与后台重驱共用同一套 `deliverPassiveWakeTarget` / `deliverSpawnedOrcaTerminalWakeup` 投递原语，不各自复制指针构造与终端注入。
+   - **投递结算与未知结果**：`MailboxStore.beginWakeDelivery` 在外部命令或终端注入前持久化 `deliveryInDoubt`，只有成功回执才由 `completeWakeDelivery` 清除此围栏。进程已启动后的错误、abort 或进程中断保留围栏与原因；命令边界确认进程从未启动的前置失败（`CommandNotStartedError`）以及投递前的准备失败（工作区/终端解析、权威空闲门禁、参数校验）不产生围栏，按 1s → 2s → 5s → 10s 指数退避重试。后续入队、强制 flush 与重启均不能自动重放未知结果，须先核实外部结果再显式修复目标；成功结算只覆盖预览序号水位内的消息，新入队消息保留 `enqueue` 决定的截止时间；会话帧即时唤醒，普通波次仍遵守 coalescing。初始执行器（`orca` + mode、命名宿主或兼容别名 `agent-pty` / `orca-spawn`）与后台重驱共用同一套 `deliverPassiveWakeTarget` / `deliverSpawnedOrcaTerminalWakeup` 投递原语，不各自复制指针构造与终端注入。
    - **宿主会话身份**：`agent-host` 唯一负责身份映射和启动回执解析。显式 `sessionId` 原样保留；Claude 缺省名称由信箱 ID 可逆编码，Dot/Grok 使用原始信箱 ID。Codex spawn 仅在启动 JSON 的 `threadId`/`sessionId` 可用时启用 fixed 续接，不能用未传给创建过程的显式 ID 冒充新会话身份；无身份的 Codex 与独立 `agy run` 成功后清除自动宿主唤醒绑定，信箱仍可手动读取。已有 fixed 会话不从任务输出重新推断身份。
-   - **`plugin-executor-orca-spawn`（独立工作区派生器）**：
-     - 对应你的 `feedback_dispatcher`、低质会话派发与跨人协作 Request。
-     - 收到消息后：自动下载附件 Blob 到私有目录 → 调用 `orca worktree create` 创建独立工作区 → 预授权 `trustedWorkspaces` → 调用 `orca terminal create` 启动 `agy / claude / codex` → 持久化任务信箱并等待 `tui-idle` 确认后才注入单行任务前言。
-   - **`plugin-executor-orca-wave`（常驻工作区 / Run 投递器）**：
-     - 对应你的 6 条告警流、`ios-crash` 与 `prod-release`（`run_9ae56f59708c`）。
-     - 收到单条或聚合波次消息后：先持久化入队到 `stream:<streamKey>` 并登记唤醒目标；工作区忙碌时仍返回 `dispatched`，由 `WakeupRedriveService` 在空闲门禁通过后向绑定终端（或 `orca orchestration send --to run:<id>`）投递单行指针并更新卡片状态备注。
-   - **`plugin-executor-agent-pty`（零 Orca 依赖的通用 CLI Agent 执行器）**：
-     - 让全球任何没有安装 Orca 的开源用户也能开箱即用：通过本地 `git worktree` + 后台 PTY / `tmux` / headless 模式直接拉起 `claude`、`codex`、`deepseek-harness (dsh)` 或自定义 Shell 脚本处理任务，并将执行结果自动 `reply` 回发送节点。
+   - **`executor-orca`（Orca 工作区执行器）**：以 `mode: spawn | wave | fixed` 选择新建子工作区、波次投递或固定会话；负责协作 Request、告警流与常驻工作区投递。
+   - **Desktop App 执行器**：`executor-claude-app`、`executor-chatgpt-app`、`executor-antigravity-app`，以同一 `mode` taxonomy 连接桌面会话。
+   - **Terminal CLI 执行器**：`executor-claude-code`、`executor-codex-cli`、`executor-antigravity-cli`；独立 `antigravity-cli` 支持 `spawn` / `inbox-only`，其余模式使用 `orca` 或 `antigravity-app`。
+   - **`executor-inbox`（持久化人工收件箱）**：`mode: inbox-only` 时只写入 Durable Mailbox，不启动外部进程。
+   - **Backward-compatible aliases**：`orca-spawn`、`orca-wave` 与 `agent-pty` 继续解析为对应的一等执行器与会话模式，兼容既有配置。
 
 ---
 
@@ -426,7 +423,7 @@ export interface ExecutorPlugin<C = unknown> {
 | **2. 切换节点权限门禁** | `dealer gate mode approval_required --json`<br>`dealer gate list --json`<br>`dealer gate approve <approval_id> --trust-member oliver --json` | 自由切换 `open / approval_required / dnd / closed`，查看并批准待确认的跨节点消息 |
 | **3. 发现全网节点与能力** | `dealer peers list --skill ios-crash-triage --only-available --json` | Agent 发送前可自主查询当前在线的队友节点及其能力描述与空闲状态 |
 | **4. 发送消息（定向/多播/广播/AI路由）** | **显式定向**：`dealer send --to member:oliver --kind collab.request --subject "..." --body "..." --attach ./repro.log --json`<br>**AI 智能判断路由**：`dealer send --auto-route --hint "找负责运行时且空闲的节点排查此报错" --body "..." --json`<br>**全网/频道广播**：`dealer broadcast --topic team.sensebeing --subject "..." --body "..." --json` | 一条命令完成跨机器、跨团队成员的实时消息与大附件投递，支持 `--wait-receipt` 或异步流式回调 |
-| **5. 配置节点内收发派发器** | `dealer route add --match-kind "collab.request" --policy dedup-cas --executor orca-spawn --agent codex --json`<br>`dealer source add lark-alert --config ./alerts.yaml --json` | Agent 通过命令直接生成 `patch.yaml`，热挂载新的触发源或本地 Orca/Agent 派发规则 |
+| **5. 配置节点内收发派发器** | `dealer setup apply-preset --host orca --mode spawn --topic collab.request.v4 --agent codex --json`<br>`dealer route add --type local-agent --command codex --json`<br>`dealer source add lark-alert --config ./alerts.yaml --json` | Agent 通过命令直接生成 `patch.yaml`，热挂载新的触发源或本地 Orca/Agent 派发规则 |
 
 ---
 
@@ -474,9 +471,11 @@ the-dealer/                                 # 独立开源仓库根目录（建�
 │   ├── plugins-policy/                     # 官方内置入站调度策略插件包
 │   │   └── policy-dedup-cas/               # 幂等水位与版本 CAS 防重插件
 │   ├── plugins-executor/                   # 官方内置终端派发执行器插件包
-│   │   ├── executor-orca-spawn/            # 自动新建 Orca Worktree 并拉起 Agent 会话处理
-│   │   ├── executor-orca-wave/             # 向常驻 Orca 工作区终端或受控 Run 投递波次并更新卡片状态
-│   │   ├── executor-agent-pty/             # 通用无 Orca 环境：通过 git worktree + PTY/Subprocess 启动 Claude/Codex/AGY/DSH
+│   │   ├── executor-orca/                  # Orca mode: spawn / wave / fixed
+│   │   ├── executor-desktop-apps/          # claude-app / chatgpt-app / antigravity-app
+│   │   ├── executor-terminal-clis/         # claude-code / codex-cli / antigravity-cli
+│   │   ├── executor-inbox/                 # inbox-only 持久化人工收件箱
+│   │   ├── legacy-orca-aliases/            # orca-spawn / orca-wave / agent-pty 兼容别名
 │   │   └── executor-notify/                # macOS 原生通知 / 飞书通知与人工确认交互
 │   └── cli/                                # @the-dealer/cli：`dealer` 与 `dealerd` 命令行入口及内置 Profiles
 └── skills/
@@ -501,7 +500,7 @@ the-dealer/                                 # 独立开源仓库根目录（建�
 3. **Phase 3 — 发送路由与接收执行全插件生态 (`emitter` + `router` + `plugins-*`)**：
    - 实现三级智能路由链（显式 ID + Capability Tag + 本地 Agent/LLM Judge 插件）；
    - 实现 `policy-dedup-cas`、持久化 `MailboxStore` 与 `WakeupRedriveService`（波次恢复 + Idle Gate + 单行指针 + 会话轮转）；
-   - 实现 `executor-orca-spawn`、`executor-orca-wave` 与通用的 `executor-agent-pty`。
+   - 实现一等 `executor-orca`、桌面 App、Terminal CLI 与 `executor-inbox`，并保留 `orca-spawn`、`orca-wave`、`agent-pty` 兼容别名。
 4. **Phase 4 — CLI、`dealer` 配套 Skill 与 `alter-service` 真实场景迁移验证**：
    - 交付 `dealer` / `dealerd` CLI 与 `skills/the-dealer/SKILL.md`；
    - 在本机实跑双节点/多节点 P2P 自动发现、权限审批（`open` vs `approval_required`）、智能路由判断、大文件传输及自动唤醒 Orca 工作区端到端验收。
@@ -527,7 +526,7 @@ notification or file sinks, with no Lark webhook transport.
 
 `notifyGateApprovals` and `mirrorOutboundThreads` default to true. Default watched
 mailboxes omit compound topic/stream bindings and project topics with background
-`orca-wave`, `orca-spawn`, or `agent-pty` defaults; explicit `notifyLark` overrides
+first-class `orca`, desktop app, terminal CLI, or `inbox` defaults (with mode `spawn` / `wave` / `fixed` / `inbox-only`); legacy `orca-wave`, `orca-spawn`, and `agent-pty` remain compatible; explicit `notifyLark` overrides
 that choice. Inbox topics and top-level request bindings remain included. See
 [request threading](request-threading.md) for filters and configuration.
 

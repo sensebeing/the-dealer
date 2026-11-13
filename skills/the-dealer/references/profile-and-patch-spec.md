@@ -4,10 +4,10 @@
 | --- | --- | --- | --- | --- |
 | personal-dev | open | dedup-cas | orca, orca-spawn, orca-wave, codex-cli, codex, claude-code, antigravity-cli, antigravity, claude-app, chatgpt-app, antigravity-app, agent-pty, notify, inbox | orca-spawn |
 | dedicated-worker | open | dedup-cas | orca, orca-spawn, orca-wave, codex-cli, codex, claude-code, antigravity-cli, antigravity, claude-app, chatgpt-app, antigravity-app, agent-pty, inbox | orca-spawn |
-| orca-dev | open | dedup-cas | orca, orca-spawn, orca-wave, notify, inbox | orca-spawn |
-| codex-dev | open | dedup-cas | codex, agent-pty, notify, inbox | codex |
+| orca-dev | open | dedup-cas | orca, orca-spawn, orca-wave, notify, inbox | orca |
+| codex-dev | open | dedup-cas | codex-cli, codex, agent-pty, notify, inbox | codex |
 | claude-dev | open | dedup-cas | claude-code, agent-pty, notify, inbox | claude-code |
-| antigravity-dev | open | dedup-cas | antigravity, orca, orca-spawn, orca-wave, agent-pty, notify, inbox | antigravity |
+| antigravity-dev | open | dedup-cas | antigravity, antigravity-cli, antigravity-app, orca, orca-spawn, orca-wave, agent-pty, notify, inbox | antigravity |
 | headless-relay | open | none | notify, inbox | notify |
 
 The headless profile receives into a private notification inbox and can route
@@ -27,11 +27,11 @@ and arrays are not recursively merged. Use only trusted patch files.
 
 ```json
 {
-  "gateMode": "approval_required",
+  "gateMode": "open",
   "skills": ["ios-crash", "runtime"],
-  "defaultExecutor": "orca-wave",
+  "defaultExecutor": "orca",
   "executorConfig": {
-    "orca-wave": {
+    "orca": {
       "runId": "run_example",
       "terminalHandle": "term_example",
       "cwd": "/path/to/resident/workspace"
@@ -46,12 +46,11 @@ Allowed node fields: `profile`, `member`, `name`, `skills`, `port`, `gateMode`,
 `networks`, `defaultExecutor`, `policies`, `executors`, `executorConfig`,
 `routes`, `sources`, `wave`. Mount entries use `networkId`, `passphrase`,
 optional `bootstrapPeers`, `admissionMode`, `exposedSkills`, and local `role`.
-Avoid selecting `orca-wave` until its target and authoritative idle check are
+Avoid selecting `orca` until its target and authoritative idle check are
 configured. The default check inspects the workspace and descendants.
 
-A wake target applies only to envelopes selecting `orca-wave`; other executors
-dispatch immediately after dedup. Stream identity includes network,
-`payload.streamKey` (or message kind), and executor. `orca-wave` durably
+Orca workspace wake targets apply to envelopes selecting `orca` with `mode: wave` or `fixed` (and legacy `orca-wave`); spawn and host executors record passive or spawned-terminal wake targets. Stream identity includes network,
+`payload.streamKey` (or message kind), and executor. `orca` durably
 enqueues the batch into its mailbox and records a wake target, returning
 `dispatched` even when the workspace is busy. `wave.minAgeMs` is the coalescing
 delay before a pointer (a message's `payload.minAgeMs` overrides it), and
@@ -76,11 +75,11 @@ objects. Block lists, anchors, tags, multiline strings, and implicit YAML
 coercions are unsupported and rejected.
 
 ```yaml
-gateMode: approval_required
+gateMode: open
 skills: ["ios-crash", "runtime"]
-defaultExecutor: orca-wave
+defaultExecutor: orca
 executorConfig:
-  orca-wave:
+  orca:
     runId: run_example
     terminalHandle: term_example
     cwd: /path/to/workspace
@@ -105,7 +104,7 @@ is saved privately in stateDir. Webhooks accept the same full input via POST.
   "kind": "alert.feedback.v1",
   "subject": "Runtime feedback",
   "body": "Investigate this report",
-  "payload": {"executor": "orca-wave", "streamKey": "runtime", "revision": 1},
+  "payload": {"executor": "orca", "mode": "wave", "streamKey": "runtime", "revision": 1},
   "idempotencyKey": "feedback:123"
 }
 ```
