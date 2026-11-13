@@ -1526,6 +1526,7 @@ export class MailboxStore {
     patch: Partial<WakeTargetState> = {},
   ): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
+    let pinnedWakeMailbox: string | undefined;
     const completed = this.mutate(state => {
       const pendingWake = state.items.some(item =>
         item.mailboxId === id && item.status === 'queued' && item.sequence > deliveredSequence,
@@ -1540,6 +1541,7 @@ export class MailboxStore {
       if (current.mode === 'orca-terminal' && current.rotateAfterWaves !== undefined &&
           typeof next.terminalHandle === 'string' && next.terminalHandle.trim()) {
         const termMailbox = pinRotatingTargetInState(state, id, next.terminalHandle);
+        if (state.wakeTargets[termMailbox]?.pendingWake && !state.wakeTargets[termMailbox]?.deliveryInDoubt) pinnedWakeMailbox = termMailbox;
         const delivered = state.items.filter(item => item.mailboxId === id && item.sequence <= deliveredSequence);
         const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
         const updatedAt = new Date().toISOString();
@@ -1552,13 +1554,21 @@ export class MailboxStore {
       return structuredClone(next);
     });
     if (completed.pendingWake) this.events.emit('target', id);
+    if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return completed;
   }
 
   pinRotatingSessionMailbox(mailboxId: string, terminalHandle?: string): string {
     const id = normalizeMailboxId(mailboxId);
     if (typeof terminalHandle !== 'string' || !terminalHandle.trim()) return id;
-    return this.mutate(state => pinRotatingTargetInState(state, id, terminalHandle));
+    let notify = false;
+    const pinned = this.mutate(state => {
+      const mailbox = pinRotatingTargetInState(state, id, terminalHandle);
+      notify = Boolean(state.wakeTargets[mailbox]?.pendingWake && !state.wakeTargets[mailbox]?.deliveryInDoubt);
+      return mailbox;
+    });
+    if (notify) this.events.emit('target', pinned);
+    return pinned;
   }
 
   getWakeTarget(mailboxId: string): WakeTargetState | undefined {

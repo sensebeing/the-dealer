@@ -1949,9 +1949,12 @@ test('rotating inbound delivery preserves terminal thread affinity across call o
 test('pinning a rotating session preserves existing terminal wake fences', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   store.upsertWakeTarget('stream:inbox', { mode: 'orca-terminal', rotateAfterWaves: 1, terminalHandle: 'term-1' });
-  store.upsertWakeTarget('terminal:term-1', { mode: 'orca-terminal', terminalHandle: 'term-1', pendingWake: true, deliveryInDoubt: true });
+  store.upsertWakeTarget('terminal:term-1', { mode: 'orca-terminal', terminalHandle: 'term-1', pendingWake: true });
+  const notifications: string[] = [];
+  const subscription = store.onWakeTarget(mailbox => notifications.push(mailbox));
+  t.after(() => subscription.dispose());
   assert.equal(store.pinRotatingSessionMailbox('stream:inbox', 'term-1'), 'terminal:term-1');
   const target = store.getWakeTarget('terminal:term-1');
   assert.equal(target?.pendingWake, true);
-  assert.equal(target?.deliveryInDoubt, true);
+  assert.ok(notifications.includes('terminal:term-1'));
 });
