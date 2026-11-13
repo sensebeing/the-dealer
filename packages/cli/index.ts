@@ -130,6 +130,7 @@ function runtimeOptions(values: Record<string, any>, stateDir: string) {
     skills: values.skills?.split(',').filter(Boolean),
     port: values.port === undefined ? undefined : Number(values.port),
     patch: values.patch ? readPatch(values.patch) : undefined,
+    gateMode: values.gate ? admissionMode(String(values.gate)) : undefined,
     ...(values['advertised-host'] !== undefined
       ? { transport: { advertisedHost: String(values['advertised-host']) } }
       : {}),
@@ -1236,7 +1237,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     } else if (group === 'node') {
       if (action === 'up' || action === 'status') {
-        if (action === 'up' && (['profile', 'patch', 'member', 'name', 'skills', 'port', 'advertised-host'] as const).some(key => v[key] !== undefined)) {
+        if (action === 'up' && (['profile', 'patch', 'member', 'name', 'skills', 'port', 'advertised-host', 'gate'] as const).some(key => v[key] !== undefined)) {
           throw new Error('Node already running; stop it before changing startup configuration');
         }
         result = runtime.status();

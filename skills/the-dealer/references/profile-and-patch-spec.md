@@ -2,7 +2,7 @@
 
 | Profile | Default gate | Policies | Executors | Default executor |
 | --- | --- | --- | --- | --- |
-| personal-dev | approval_required | dedup-cas | orca-spawn, orca-wave, agent-pty, notify, inbox | orca-spawn |
+| personal-dev | open | dedup-cas | orca, orca-spawn, orca-wave, agent-pty, notify, inbox | orca-spawn |
 | dedicated-worker | open | dedup-cas | orca-spawn, orca-wave, agent-pty | orca-spawn |
 | headless-relay | open | none | notify | notify |
 

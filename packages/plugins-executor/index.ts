@@ -1,5 +1,5 @@
-import { buildAgentHostInvocation, resolveAgentSessionId } from '../agent-host/index.ts';
-import type { SupportedAgentHost } from '../agent-host/index.ts';
+import { buildAgentHostInvocation, resolveAgentSessionId, normalizeAgentHost } from '../agent-host/index.ts';
+import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
 import {
@@ -11,7 +11,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup } from '../mailbox/index.ts';
+import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
@@ -40,7 +40,8 @@ export interface AgentOptions {
   store?: MailboxStore;
   resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   agent?: SupportedAgentHost;
-  conversationMode?: 'spawn' | 'wave' | 'fixed';
+  mode?: AgentConversationMode;
+  conversationMode?: AgentConversationMode;
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
@@ -69,31 +70,35 @@ export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): Execut
 }
 
 export function createCodexExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('codex', options, 'codex');
+  return createNamedHostExecutorPlugin('codex', 'codex', options);
 }
 
 export function createClaudeCodeExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('claude-code', options, 'claude-code');
+  return createNamedHostExecutorPlugin('claude-code', 'claude-code', options);
 }
 
 export function createAntigravityExecutorPlugin(options: Omit<AgentOptions, 'agent'> & { agySettingsPath?: string } = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('antigravity', options, 'antigravity', options.agySettingsPath);
+  return createNamedHostExecutorPlugin('antigravity', 'antigravity', options);
 }
 
 export function createCodexCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('codex-cli', options, 'codex');
+  return createNamedHostExecutorPlugin('codex-cli', 'codex-cli', options);
 }
 export function createClaudeAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('claude-app', options, 'claude-app');
+  return createNamedHostExecutorPlugin('claude-app', 'claude-app', options);
 }
 export function createChatgptAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('chatgpt-app', options, 'chatgpt-app');
+  return createNamedHostExecutorPlugin('chatgpt-app', 'chatgpt-app', options);
 }
 export function createAntigravityCliExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('antigravity-cli', options, 'antigravity-cli');
+  return createNamedHostExecutorPlugin('antigravity-cli', 'antigravity-cli', options);
 }
 export function createAntigravityAppExecutorPlugin(options: Omit<AgentOptions, 'agent'> = {}): ExecutorPlugin {
-  return createAgentExecutorPlugin('antigravity-app', options, 'antigravity-app');
+  return createNamedHostExecutorPlugin('antigravity-app', 'antigravity-app', options);
+}
+
+function createNamedHostExecutorPlugin(name: string, host: SupportedAgentHost, options: AgentOptions): ExecutorPlugin {
+  return createAgentExecutorPlugin(name, options, host, (options as AgentOptions & { agySettingsPath?: string }).agySettingsPath);
 }
 
 function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: SupportedAgentHost, agySettingsPath?: string): ExecutorPlugin {
@@ -105,8 +110,9 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
       const payload = first?.payload ?? {};
       const binding = first ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined) : undefined;
       const agent = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
-      const mode = payload.mode ?? payload.conversationMode ?? binding?.mode ?? binding?.conversationMode ?? config.conversationMode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
-      const hostMode = mode !== undefined || ['antigravity', 'antigravity-cli', 'antigravity-app', 'claude-code', 'claude-app', 'chatgpt-app', 'chatgpt-dot', 'grok-bot', 'codex-cli'].includes(agent);
+      const rawMode = payload.mode ?? payload.conversationMode ?? binding?.mode ?? binding?.conversationMode ?? config.mode ?? config.conversationMode ?? options.mode ?? options.conversationMode ?? (host ? 'spawn' : undefined);
+      const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
+      const hostMode = rawMode !== undefined || Boolean(host) || (canonicalHost !== undefined && ['antigravity', 'antigravity-app', 'claude-code', 'claude-app', 'chatgpt-dot', 'grok-bot'].includes(canonicalHost));
       let request;
       let mailboxId: string | undefined;
       let effectiveSessionId: string | undefined;
@@ -120,8 +126,12 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           request = { command, args: options.args ?? agentArgs(command), cwd: options.cwd, input: renderWave(batch) };
         } else {
           if (!first) throw new Error('Empty agent batch');
-          if (mode !== undefined && mode !== 'spawn' && mode !== 'wave' && mode !== 'fixed') throw new Error('Invalid agent conversationMode');
-          const conversationMode = mode ?? 'spawn';
+          if (rawMode === 'inbox-only') {
+            if (store && binding?.mode === 'inbox-only') return createInboxExecutorPlugin({ store }).execute(batch, context, runtimeConfig);
+            throw new Error('Invalid agent conversationMode');
+          }
+          if (rawMode !== undefined && rawMode !== 'spawn' && rawMode !== 'wave' && rawMode !== 'fixed') throw new Error('Invalid agent conversationMode');
+          const conversationMode = (rawMode ?? 'spawn') as ActiveConversationMode;
           mailboxId = conversationMode === 'spawn' ? `task:${first.id}` : resolveMailboxId(first, 'inbox', binding);
           const terminalPrompt = optionalString(typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined);
           const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
@@ -130,9 +140,14 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           const targetBot = payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot;
           const sessionId = payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId;
           effectiveSessionId = resolveAgentSessionId(mailboxId, sessionId, agent ?? 'codex');
-          if (host === 'antigravity' && cwd && (agySettingsPath !== undefined || (options.commandRunner === undefined || options.commandRunner === runCommand))) {
+          if ((canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app') && cwd && (agySettingsPath !== undefined || (options.commandRunner === undefined || options.commandRunner === runCommand))) {
             trustAntigravityWorkspace(cwd, agySettingsPath);
           }
+          const invocation = buildAgentHostInvocation({
+            agent: agent ?? 'codex', conversationMode, mailboxId,
+            promptText: singleLine(terminalPrompt ?? renderWave(batch)),
+            cwd, command, agentProfile, targetBot, sessionId: effectiveSessionId,
+          });
           claim = (options.wakeup ?? config.wakeup)?.claim(mailboxId);
           if (store) {
             store.enqueue(batch, { mailboxId, wakeTarget: {
@@ -144,11 +159,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
               sessionId: effectiveSessionId,
             } });
           } else {
-            request = { ...buildAgentHostInvocation({
-              agent: agent ?? 'codex', conversationMode, mailboxId,
-              promptText: singleLine(terminalPrompt ?? renderWave(batch)),
-              cwd, command, agentProfile, targetBot, sessionId: effectiveSessionId,
-            }), cwd };
+            request = { ...invocation, cwd };
           }
         }
         let output;
@@ -709,9 +720,9 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           receiverTerminalHandle ??
           (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
         const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
-        const rotateAfterWaves = binding?.mode === 'fixed' && binding.rotateAfterWaves === undefined
-          ? undefined
-          : resolveOrcaWaveRotateAfterWaves({
+        const effectiveMode = resolveEffectiveConversationMode({ executor: binding?.executor ?? 'orca-wave', binding, payload, fallbackMode: (config as { mode?: unknown }).mode ?? (options as { mode?: unknown }).mode });
+        const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
+              mode: (payload.mode ?? binding?.mode ?? (config as { mode?: unknown }).mode) === 'fixed' ? 'fixed' : effectiveMode === 'fixed' ? 'fixed' : 'wave',
               bindingRotateAfterWaves: binding?.rotateAfterWaves,
               waveRotateAfterWaves: optionalPositiveInteger(waveConfig?.rotateAfterWaves),
               fallbackRotateAfterWaves: hasReceiverTarget
@@ -929,14 +940,12 @@ export function createOrcaExecutorPlugin(options: OrcaSpawnOptions & OrcaWaveOpt
         typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined,
       );
       const payload = batch[0]?.payload;
-      const effectiveMode = payload?.mode ?? payload?.conversationMode ?? binding?.mode ?? binding?.conversationMode ??
-        config.mode ?? config.conversationMode ?? (options as OrcaSpawnOptions & { mode?: string }).mode ?? options.conversationMode ??
-        (binding?.rotateAfterWaves !== undefined || binding?.streamKey !== undefined || binding?.workspacePath !== undefined || binding?.runId !== undefined || binding?.terminalHandle !== undefined
-          ? 'wave'
-          : 'spawn');
-      const receipt = effectiveMode === 'spawn'
-        ? await spawnPlugin.execute(batch, context, runtimeConfig)
-        : await wavePlugin.execute(batch, context, runtimeConfig);
+      const effectiveMode = resolveEffectiveConversationMode({ executor: 'orca', binding, payload, fallbackMode: config.mode ?? config.conversationMode ?? (options as OrcaSpawnOptions & { mode?: unknown }).mode ?? options.conversationMode });
+      const receipt = effectiveMode === 'inbox-only'
+        ? await createInboxExecutorPlugin({ store: options.store ?? (config.store as MailboxStore | undefined) }).execute(batch, context, runtimeConfig)
+        : effectiveMode === 'spawn'
+          ? await spawnPlugin.execute(batch, context, runtimeConfig)
+          : await wavePlugin.execute(batch, context, { ...runtimeConfig, mode: effectiveMode });
       return { ...receipt, executor: 'orca' };
     },
   };

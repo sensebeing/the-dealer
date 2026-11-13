@@ -25,6 +25,7 @@ import type {
   WakeTargetState,
 } from './store.ts';
 import { normalizeMailboxId } from './store.ts';
+import type { AgentConversationMode } from '../agent-host/index.ts';
 
 export interface WakeupRedriveOptions {
   store: MailboxStore;
@@ -76,6 +77,7 @@ export function maxPreviewSequence(preview: MailboxCheckResult): number {
 export const DEFAULT_ORCA_WORKSPACE_ROTATE_AFTER_WAVES = 1;
 
 export interface OrcaWaveRotateAfterWavesInput {
+  mode?: AgentConversationMode;
   /** Threshold configured on the resolved topic binding. */
   bindingRotateAfterWaves?: number;
   /** Threshold configured once for the whole wave executor/host. */
@@ -105,6 +107,7 @@ export function resolveOrcaWaveRotateAfterWaves(
   if (explicit !== undefined) {
     return explicit;
   }
+  if (input.mode === 'fixed') return undefined;
   return input.managesWorkspace && !input.runId && !input.pinnedTerminalHandle
     ? DEFAULT_ORCA_WORKSPACE_ROTATE_AFTER_WAVES
     : undefined;

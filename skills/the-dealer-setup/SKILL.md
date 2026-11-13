@@ -154,7 +154,7 @@ Keep incoming work in the durable inbox. Ask for the teammate’s member handle;
 replace the generated `teammate` placeholder before starting a new node. Ask for
 the Agent App (`orca`, `antigravity`, `claude-code`, `codex`, `chatgpt-dot`,
 `grok-bot`) and one mode:
-**fixed** (recommended for ongoing collaboration), **spawn** (independent tasks),
+**fixed** (recommended for ongoing collaboration), **wave** (per-wave session tab in a shared stream), **spawn** (independent tasks),
 or **inbox-only** (manual processing). Ask only for the selected host's required
 selectors: Orca inner agent/workspace; Codex profile/thread; Claude role/session;
 Dot agent; Grok targetBot. See [agent-app-matrix](references/agent-app-matrix.md).
@@ -184,8 +184,7 @@ mailbox readback and an actual host receipt before reporting onboarding complete
 | Antigravity | `antigravity-dev` | `antigravity` (standalone `agy`) |
 
 All four profiles use the `open` gate and `dedup-cas`; use `--gate approval_required`
-or `dealer gate mode approval_required` when approval is required. The named Codex,
-Claude Code and Antigravity executors default to `spawn` and support `fixed`;
+or `dealer gate mode approval_required` when approval is required. The named Codex, Claude Code, Claude app, ChatGPT app, Codex CLI, Antigravity CLI, and Antigravity app executors default to `spawn` and support `wave`, `fixed`, and `inbox-only`;
 `agent-pty` remains available for existing configurations and other bridges.
 
 ```sh

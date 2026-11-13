@@ -33,7 +33,7 @@
 如果已有可信的 ~/the-dealer 检出，则可运行 `npm --prefix ~/the-dealer link`。
 运行 `npx skills add sensebeing/the-dealer --global --agent '*'` 安装技能，
 保留已有配置。随后按已安装的 the-dealer-setup 技能引导我选择宿主预设
-（orca-dev、codex-dev、claude-dev 或 antigravity-dev）与会话模式（spawn、fixed
+（orca-dev、codex-dev、claude-dev 或 antigravity-dev）与会话模式（spawn、wave、fixed
 或 inbox-only），启动 dealerd 并完成本机自回环验证。
 ```
 
@@ -100,7 +100,7 @@ flowchart LR
 | 消息内联预览 | 唤醒指针直接附带最新消息的单行正文摘要、发送方与线程 ID，短消息无需二次拉取即可读取，同时以信箱租约作为权威状态。 |
 | 即时会话唤醒 | 新入队的 `question`、`reply`、`settle` 会话帧首次投递采用 `0ms` 合并窗口，同时遵守活跃租约、忙碌检测与重试退避约束。 |
 | Turn Autopilot 兼容 | 空闲检测将 Turn Autopilot 推荐预填识别为空闲，并在向目标根工作区注入唤醒指针前发送 `Ctrl+U`（`\x15`）清空预填文本；人工输入草稿仍保持忙碌保护。 |
-| 统一会话模式 | Orca、Codex、Claude Code 与 Antigravity（`agy`）统一支持 `spawn`、`fixed` 与 `inbox-only` 三种会话模式，并由持久化唤醒重驱驱动。 |
+| 统一会话模式 | Orca、Codex、Claude Code 与 Antigravity（`agy`）统一支持 `spawn`、`wave`、`fixed` 与 `inbox-only` 四种会话模式，并由持久化唤醒重驱驱动。 |
 | 人类协作镜像 | `lark-mirror` 将入站审批与信箱事件同步到飞书卡片或话题，`notify` 执行器发送系统原生通知。 |
 
 详见[架构设计](docs/architecture.md)、[线协议](docs/wire-protocol.md)与[宿主应用矩阵](skills/the-dealer-setup/references/agent-app-matrix.md)。
@@ -121,7 +121,7 @@ flowchart LR
 
 ### 支持的 Agent 应用与会话模式
 
-| 宿主 / 模式 | `spawn` | `fixed` | 接收端参数 |
+| 宿主 / 模式 | `spawn` | `wave` | `fixed` | `inbox-only` | 接收端参数 |
 | --- | --- | --- | --- |
 | `orca` | 新建子工作区 | 空闲门禁固定工作区 | 接收端项目/工作区路径与内层 `--agent` |
 | `codex` | 新建 CLI 工作区会话 | 复用已有线程队列 | 可选 `--agent-profile` 与固定 `--session-id` |

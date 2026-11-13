@@ -3,22 +3,22 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { redactProjectManifest, readProjectManifest, validateTopicBindings } from './config.ts';
 import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, TopicBindingConfig } from './config.ts';
-import { resolveOrcaWaveRotateAfterWaves } from '../mailbox/index.ts';
+import { CONVERSATION_MODES, resolveOrcaWaveRotateAfterWaves } from '../mailbox/index.ts';
 import { findExecutable } from '../orca-workspace/executable.ts';
 import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
 
 export const AGENT_HOST_CATALOG = [
-  { host: 'orca', command: 'orca', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agent', 'workspacePath'], description: 'Orca managed worktrees and idle-gated fixed conversations.' },
-  { host: 'antigravity', command: 'agy', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity in Orca managed worktrees; standalone agy is also available through agent-pty.' },
-  { host: 'claude-code', command: 'claude', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Claude Code background conversations and resumed sessions.' },
-  { host: 'codex', command: 'codex', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Codex worktree execution and fixed thread queues.' },
-  { host: 'chatgpt-dot', command: 'dot', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT Dot bridge with explicit session keys.' },
-  { host: 'grok-bot', command: 'grok-bot', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['targetBot', 'sessionId'], description: 'Grok bridge dispatch to a selected bot.' },
-  { host: 'claude-app', command: 'claude-app', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Claude app bridge.' },
-  { host: 'chatgpt-app', command: 'dot', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT app bridge.' },
-  { host: 'antigravity-app', command: 'agy', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity app bridge.' },
-  { host: 'codex-cli', command: 'codex', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['agentProfile', 'sessionId'], description: 'Codex CLI bridge.' },
-  { host: 'antigravity-cli', command: 'agy', modes: ['spawn', 'wave', 'fixed', 'inbox-only'], selectors: ['workspacePath'], description: 'Antigravity CLI bridge.' },
+  { host: 'orca', command: 'orca', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agent', 'workspacePath'], description: 'Orca managed worktrees and idle-gated conversations.' },
+  { host: 'antigravity', command: 'agy', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity in Orca managed worktrees.' },
+  { host: 'claude-code', command: 'claude', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Claude Code conversations.' },
+  { host: 'codex', command: 'codex', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Codex execution.' },
+  { host: 'chatgpt-dot', command: 'dot', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT Dot bridge.' },
+  { host: 'grok-bot', command: 'grok-bot', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['targetBot', 'sessionId'], description: 'Grok bridge.' },
+  { host: 'claude-app', command: 'claude-app', surface: 'app', app: 'Claude', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Claude app bridge.' },
+  { host: 'chatgpt-app', command: 'dot', surface: 'app', app: 'ChatGPT', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT app bridge.' },
+  { host: 'antigravity-app', command: 'agy', surface: 'app', app: 'Antigravity', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity app bridge.' },
+  { host: 'codex-cli', command: 'codex', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Codex CLI bridge.' },
+  { host: 'antigravity-cli', command: 'agy', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity CLI bridge.' },
 ] as const;
 
 function readOptionalJson(path: string): any {
@@ -36,14 +36,14 @@ export function probeDealerSetup(options: {
   const cwd = resolve(options.cwd ?? process.cwd());
   const stateDir = resolve(options.stateDir ?? env.DEALER_STATE_DIR ?? join(env.HOME ?? homedir(), '.dealer'));
   const lookup = options.pathLookup ?? ((command, environment) => findExecutable(command, environment, !options.env));
-  const commands = ['orca', 'agy', 'claude', 'codex', 'dot', 'grok-bot', 'lark-cli'];
+  const commands = [...new Set([...AGENT_HOST_CATALOG.map(entry => entry.command), 'lark-cli'])];
   const clis = Object.fromEntries(commands.map(command => [command, lookup(command, env) ?? null]));
   const config = readOptionalJson(join(stateDir, 'config.json'));
   const project = readOptionalJson(join(cwd, '.dealer/project.json'));
   const apps = Object.fromEntries(['Orca', 'Antigravity', 'Claude', 'Codex', 'ChatGPT', 'Grok'].map(name => [name,
     [join('/Applications', `${name}.app`), join(env.HOME ?? homedir(), 'Applications', `${name}.app`)].find(existsSync) ?? null,
   ]));
-  const recommendedHost = clis.orca ? 'orca' : AGENT_HOST_CATALOG.find(host => host.host !== 'antigravity' && clis[host.command])?.host ?? (clis.agy ? 'antigravity' : null);
+  const recommendedHost = clis.orca ? 'orca' : AGENT_HOST_CATALOG.find(host => host.surface === 'cli' && host.host !== 'antigravity' && host.host !== 'antigravity-cli' && clis[host.command])?.host ?? (clis.agy ? 'antigravity' : AGENT_HOST_CATALOG.find(host => host.surface === 'app' && host.app && apps[host.app] && clis[host.command])?.host ?? null);
   return {
     cwd, stateDir, clis, apps, recommendedHost, agentCatalog: AGENT_HOST_CATALOG,
     project: project ? redactProjectManifest(project) : project,
@@ -133,9 +133,9 @@ export function buildAgentBindingPreset(options: {
   if (host === 'grok-bot' && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
   const managed = host === 'orca' || host === 'antigravity';
   const topic = options.topic ?? 'collab.request.v4';
-  const executor = mode === 'inbox-only' ? 'inbox' : managed ? (mode === 'spawn' ? 'orca-spawn' : 'orca-wave') : 'agent-pty';
+  const executor = mode === 'inbox-only' ? 'inbox' : managed ? 'orca' : host;
   const binding: TopicBindingConfig = {
-    executor, conversationMode: mode,
+    executor, mode,
     agent: host === 'antigravity' ? 'antigravity' : host === 'orca' ? options.agent ?? 'antigravity' : host,
     ...(mode !== 'spawn' ? { mailboxId: `stream:${topic}` } : {}),
     ...(options.projectId ? { projectId: options.projectId } : {}),

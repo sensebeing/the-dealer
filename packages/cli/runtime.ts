@@ -37,7 +37,7 @@ import {
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
-import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
+import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
@@ -117,6 +117,7 @@ export interface DealerRuntimeOptions {
   name?: string;
   skills?: string[];
   port?: number;
+  gateMode?: AdmissionMode;
   patch?: Partial<RuntimeConfig>;
   transport?: TransportPluginOptions;
   commandRunner?: CommandRunner;
@@ -479,6 +480,7 @@ export class DealerNodeRuntime {
         ),
         ...this.options.patch,
       };
+      if (this.options.gateMode !== undefined) this.config.gateMode = this.options.gateMode;
       if (Array.isArray(this.config.executors) && !this.config.executors.includes('inbox')) {
         this.config.executors = [...this.config.executors, 'inbox'];
       }
@@ -970,12 +972,12 @@ export class DealerNodeRuntime {
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
           ['orca', 'orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
       if (notifyLark) mailboxes.push(mailboxId);
-      if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && (binding.mode ?? binding.conversationMode ?? 'wave') !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
+      const effectiveMode = resolveEffectiveConversationMode({ executor: binding.executor, binding });
+      if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && effectiveMode !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
       const current = this.mailbox.getWakeTarget(mailboxId);
-      const resolvedRotateAfterWaves = binding.mode === 'fixed' && rotateAfterWaves === undefined
-        ? undefined
-        : resolveOrcaWaveRotateAfterWaves({
+      const resolvedRotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
+            mode: effectiveMode,
             bindingRotateAfterWaves: rotateAfterWaves,
             waveRotateAfterWaves: this.config.wave?.rotateAfterWaves,
             managesWorkspace: Boolean(workspacePath),

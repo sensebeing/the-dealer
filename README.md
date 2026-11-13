@@ -34,7 +34,7 @@ a trusted ~/the-dealer checkout, use `npm --prefix ~/the-dealer link`.
 Install the skills with `npx skills add sensebeing/the-dealer --global --agent '*'`,
 preserving existing configuration. Follow the installed the-dealer-setup skill
 to choose a host profile (orca-dev, codex-dev, claude-dev, or antigravity-dev)
-and conversation mode (spawn, fixed, or inbox-only), start dealerd, and verify
+and conversation mode (spawn, wave, fixed, or inbox-only), start dealerd, and verify
 a local loopback message.
 ```
 
@@ -121,7 +121,7 @@ The microkernel manages plugin lifecycle and typed events. Outbound routing sele
 | Inline message preview | Wakeup pointers include a single-line preview of the latest message body, sender, and thread ID so agents can act on short messages immediately while mailbox leases remain the source of truth. |
 | Instant conversational wakeups | Newly queued `question`, `reply`, and `settle` frames bypass wave coalescing (`0ms` delay) on their first delivery attempt while still respecting active leases, busy checks, and retry backoff. |
 | Turn Autopilot compatibility | Idle checks recognize Turn Autopilot composer prefills as idle and send `Ctrl+U` (`\x15`) to clear a prefilled target-root composer before injecting the wakeup pointer. Human drafts remain busy. |
-| Unified session modes | Orca, Codex, Claude Code, and Antigravity (`agy`) all support `spawn`, `fixed`, and `inbox-only` modes, backed by durable wakeup redrive. |
+| Unified session modes | Orca, Codex, Claude Code, and Antigravity (`agy`) all support `spawn`, `wave`, `fixed`, and `inbox-only` modes, backed by durable wakeup redrive. |
 | Human copilot mirrors | `lark-mirror` mirrors inbound approvals and mailbox events to Lark cards or threads, and the `notify` executor posts native OS notifications. |
 
 See [architecture](docs/architecture.md), [wire protocol](docs/wire-protocol.md), and the [agent app matrix](skills/the-dealer-setup/references/agent-app-matrix.md).
@@ -143,7 +143,7 @@ is required.
 
 ### Supported agent apps and conversation modes
 
-| Host / mode | `spawn` | `fixed` | Receiver parameters |
+| Host / mode | `spawn` | `wave` | `fixed` | `inbox-only` | Receiver parameters |
 | --- | --- | --- | --- |
 | `orca` | New child worktree | Idle-gated workspace | Receiver project/workspace and inner `--agent` |
 | `codex` | New CLI worktree session | Existing thread queue | Optional `--agent-profile` and fixed `--session-id` |

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isValidMailboxId } from '../core-types/index.ts';
 import type { AdmissionMode, NetworkMountConfig } from '../core-types/index.ts';
+import { CONVERSATION_MODES, isStreamConversationBinding } from '../mailbox/index.ts';
 
 export interface BuiltInProfile {
   name: string;
@@ -31,7 +32,7 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     name: 'orca-dev',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['orca-spawn', 'orca-wave', 'notify', 'inbox'],
+    executors: ['orca', 'orca-spawn', 'orca-wave', 'notify', 'inbox'],
     defaultExecutor: 'orca-spawn',
   },
   'codex-dev': {
@@ -52,7 +53,7 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     name: 'antigravity-dev',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['antigravity', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
+    executors: ['antigravity', 'orca', 'orca-spawn', 'orca-wave', 'agent-pty', 'notify', 'inbox'],
     defaultExecutor: 'antigravity',
   },
   'headless-relay': {
@@ -97,7 +98,7 @@ export interface DealerProjectOnboardingPreset {
   requireLarkCli?: boolean;
   notifyLark?: boolean;
   defaultTopic?: string;
-  defaultConversationMode?: 'spawn' | 'fixed' | 'inbox-only';
+  defaultConversationMode?: typeof CONVERSATION_MODES[number];
   teamRegistryPath?: string;
 }
 
@@ -174,7 +175,7 @@ function validateManifest(manifest: DealerProjectManifest): void {
         ['requireLarkCli', 'notifyLark'].some(key => preset[key] !== undefined && typeof preset[key] !== 'boolean') ||
         ['networkId', 'defaultTopic', 'teamRegistryPath', 'passphrase'].some(key => preset[key] !== undefined && !nonempty(preset[key])) ||
         (preset.bootstrapPeers !== undefined && (!Array.isArray(preset.bootstrapPeers) || !preset.bootstrapPeers.every(nonempty))) ||
-        (preset.defaultConversationMode !== undefined && !['spawn', 'fixed', 'inbox-only'].includes(preset.defaultConversationMode))) {
+        (preset.defaultConversationMode !== undefined && !CONVERSATION_MODES.includes(preset.defaultConversationMode))) {
       throw new Error('Invalid project onboarding preset');
     }
   }
@@ -274,7 +275,7 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
         (binding.mode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.mode)) ||
         (binding.conversationMode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
         (binding.mode !== undefined && binding.conversationMode !== undefined && binding.mode !== binding.conversationMode) ||
-        ((binding.mode ?? binding.conversationMode) === 'inbox-only' && binding.executor !== 'inbox') ||
+        (binding.conversationMode === 'inbox-only' && binding.mode === undefined && binding.executor !== 'inbox') ||
         (['orca', 'orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'antigravity-cli', 'claude', 'claude-code', 'codex', 'codex-cli'].includes(binding.agent)) ||
         Object.keys(binding).some(key => !allowed.has(key)) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||
@@ -283,7 +284,7 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
         (binding.rotateAfterWaves !== undefined && (!Number.isSafeInteger(binding.rotateAfterWaves) || binding.rotateAfterWaves < 1)) ||
         (binding.mailboxId !== undefined && !isValidMailboxId(binding.mailboxId)) ||
         (binding.streamKey !== undefined && !isValidMailboxId(`stream:${binding.streamKey}`)) ||
-        (((binding.executor === 'orca-wave' || (binding.executor === 'orca' && (binding.mode ?? binding.conversationMode) !== undefined && (binding.mode ?? binding.conversationMode) !== 'spawn')) || (binding.mode ?? binding.conversationMode) === 'wave') && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
+        (isStreamConversationBinding(binding) && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
         (binding.projectId !== undefined && !validProjectId(binding.projectId))) {
       throw new Error(`Invalid topic binding: ${kind}`);
     }
