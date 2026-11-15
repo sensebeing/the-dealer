@@ -123,7 +123,9 @@ export class PeerDirectoryService implements NodeService {
       throw new Error('Invalid peer directory store');
     }
     for (const card of (parsed as { cards: unknown[] }).cards) {
-      this.acceptCard(card, undefined, false);
+      // Persisted cards carry durable identity, not live reachability: the peer may be
+      // offline, and its last endpoint is owned by transport discovery, not this store.
+      this.acceptCard(card, undefined, false, false);
     }
   }
 
@@ -158,10 +160,15 @@ export class PeerDirectoryService implements NodeService {
     }
   }
 
-  /** Accept the newest verified card for one network; returns true when the directory changed. */
+  /**
+   * Accept the newest verified card for one network; returns true when the directory
+   * changed. Only a card carried directly by its signing node may contribute an endpoint:
+   * persisted and gossiped third-party cards prove identity, never live reachability.
+   */
   private acceptCard(
     value: unknown,
     expectedNetworkId: string | undefined,
+    registerEndpoint: boolean,
     emit: boolean,
   ): boolean {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -195,13 +202,12 @@ export class PeerDirectoryService implements NodeService {
     if ((directory.get(card.nodeId)?.revision ?? 0) >= card.revision) {
       return false;
     }
-    if (card.endpointAddr) {
+    if (registerEndpoint && card.endpointAddr) {
       try {
         this.transport.registerPeerEndpoint?.(card.networkId, card.nodeId, card.endpointAddr);
       } catch {
-        // The card is verified identity; its endpoint is transport-owned reachability and
-        // may be registered later once the network is mounted. A stale endpoint must never
-        // discard durable member knowledge.
+        // Endpoint registration is transport-owned reachability; a failed registration
+        // never discards verified member identity.
       }
     }
     directory.set(card.nodeId, structuredClone(card));
@@ -224,13 +230,16 @@ export class PeerDirectoryService implements NodeService {
     }
     let changed = false;
     if (message.card) {
-      changed = this.acceptCard(message.card, event.networkId, true) || changed;
+      const directSender = event.senderNodeId === message.card.nodeId;
+      changed = this.acceptCard(message.card, event.networkId, directSender, true) || changed;
     }
     // Seed card gossip: a relay seed (or any member) shares the verified cards it knows,
-    // so a restarted peer learns its team before the members themselves reconnect.
+    // so a restarted peer learns its team before the members themselves reconnect. Those
+    // third-party entries never contribute endpoints: a gossiped NAT address is not proof
+    // that the member is reachable from here.
     if (Array.isArray(message.knownCards)) {
       for (const knownCard of message.knownCards.slice(0, MAX_GOSSIPED_PEER_CARDS)) {
-        changed = this.acceptCard(knownCard, event.networkId, true) || changed;
+        changed = this.acceptCard(knownCard, event.networkId, false, true) || changed;
       }
     }
     if (changed) {
@@ -295,18 +304,6 @@ export class PeerDirectoryService implements NodeService {
           this.self.set(networkId, this.build(networkId));
         }
         const selfCard = this.self.get(networkId)!;
-        // Persisted cards are loaded before the network mounts; re-register their last known
-        // endpoints now so a daemon restart can reach peers that never stopped.
-        for (const card of this.peers.get(networkId)?.values() ?? []) {
-          if (!card.endpointAddr) {
-            continue;
-          }
-          try {
-            this.transport.registerPeerEndpoint?.(networkId, card.nodeId, card.endpointAddr);
-          } catch {
-            // A stale endpoint is replaced by the next verified card or discovery beacon.
-          }
-        }
         // Card gossip carries the verified team directory: a relay seed or any member can
         // hand a restarted peer the cards it needs before that member reconnects itself.
         const knownCards = [...(this.peers.get(networkId)?.values() ?? [])]
