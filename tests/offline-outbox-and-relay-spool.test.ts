@@ -19,7 +19,7 @@ import { tmpdir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DealerNodeRuntime } from '../packages/cli/runtime.ts';
-import { runDealerCli } from '../packages/cli/index.ts';
+import { runDealerCli, summarizeNextStep } from '../packages/cli/index.ts';
 import { Kernel } from '../packages/kernel/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
@@ -431,6 +431,37 @@ test('outbox list and flush use the single CLI control surface', async t => {
   ]);
   assert.equal(listed.code, 0);
   assert.deepEqual(listed.value.map((item: { id: string }) => item.id), [envelope.id]);
+
+  // A scoped operator flush must honor --network; without it every queued obligation in
+  // the local store would be attempted regardless of the requested network.
+  const otherEnvelope: MessageEnvelope = {
+    ...envelope,
+    id: 'msg_outbox_cli_other',
+    traceId: 'trace_outbox_cli_other',
+    networkId: 'other-net',
+  };
+  runtime.outbox.enqueue({
+    envelope: otherEnvelope,
+    explicitTargets: ['member:other'],
+    pendingNodeIds: ['b'.repeat(64)],
+  });
+  const scopedFlush = await listCli(['outbox', 'flush', '--network', NETWORK, '--json']);
+  assert.equal(scopedFlush.code, 0);
+  assert.equal(scopedFlush.value.attempted, 1);
+  assert.equal(
+    scopedFlush.value.stillQueued,
+    1,
+    'the result count is scoped to the requested network',
+  );
+  assert.deepEqual(
+    scopedFlush.value.items.map((item: { id: string }) => item.id),
+    [envelope.id],
+  );
+  assert.equal(
+    runtime.outbox.get(otherEnvelope.id)?.status,
+    'queued',
+    'an out-of-network obligation is not attempted by a scoped flush',
+  );
   const stderr: string[] = [];
   const rejected = await runDealerCli(['outbox', 'list', '--status', 'bogus', '--json'], {
     runtime,
@@ -1103,6 +1134,24 @@ test('multicast redrive records terminal failures per target and keeps retrying 
   await service.stop();
 });
 
+test('operator requeue can recover a global local failure without signed evidence', async t => {
+  const dir = directory(t);
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  const item = outbox.enqueue({
+    envelope: envelopeFor(sender, NETWORK, target),
+    explicitTargets: [target],
+    pendingNodeIds: [target],
+  });
+  outbox.markFailed(item.id, 'Missing staged attachment evidence');
+  assert.equal(outbox.get(item.id)?.status, 'failed');
+  const requeued = outbox.requeue(item.id)!;
+  assert.equal(requeued.status, 'queued');
+  assert.deepEqual(requeued.pendingNodeIds, [], 'redrive re-routes the signed envelope');
+  assert.equal(requeued.lastError, undefined);
+});
+
 test('redrive preserves completed receipts and parks timed-out sends in doubt', async t => {
   let ayaOnline = false;
   let ayaTarget = '';
@@ -1396,6 +1445,50 @@ test('unresolved target classification is typed rather than message-text based',
   );
 });
 
+test('CLI next-step summary uses the shared durable outbox receipt predicate', () => {
+  const receipt = (durable: boolean): DeliveryReceipt => ({
+    messageId: 'msg_summary',
+    networkId: 'summary-net',
+    fromNodeId: 'ed25519:' + 'c'.repeat(64),
+    stage: 'queued',
+    executionReceipt: { executor: 'outbox', durable },
+    updatedAt: new Date().toISOString(),
+    signature: 'test-signature',
+  });
+  assert.equal(
+    summarizeNextStep('send', [receipt(false)]),
+    undefined,
+    'a non-durable outbox-stage receipt is not a completed durable handoff',
+  );
+  assert.match(
+    summarizeNextStep('send', [receipt(true)]) ?? '',
+    /durably queued in outbox/,
+  );
+});
+
+test('an unresolved selector queues durably while its network is unmounted', async t => {
+  const root = directory(t);
+  const runtime = runtimeFor(root, 'ben');
+  t.after(async () => {
+    await runtime.stop().catch(() => {});
+  });
+  await runtime.start();
+  await runtime.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await runtime.unmountNetwork(NETWORK);
+  const emitted = await runtime.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: ['member:not-yet-known'] },
+    kind: 'collab.request.v1',
+    subject: 'queued while unmounted',
+    body: 'identity resolution is directory-owned',
+    payload: {},
+  });
+  assert.equal(emitted.receipts[0]?.stage, 'queued');
+  const [item] = runtime.listOutbox({ status: 'queued' });
+  assert.deepEqual(item.pendingNodeIds, []);
+  assert.deepEqual(item.explicitTargets, ['member:not-yet-known']);
+});
+
 test('mailbox and outbox reclaim the shared lock owner after a dead incarnation', t => {
   const dir = directory(t);
   const deadOwner = {
@@ -1532,8 +1625,31 @@ function readRelaySpool(spoolFile: string): {
   return { schema, networkId, entries: [...entries.values()], blobs };
 }
 
-function tcpRequest(port: number, body: unknown, timeoutMs = 10_000): Promise<any> {
+/** True when the server sent any framed response; false when it closed without one. */
+function tcpReplyReceived(port: number, body: unknown, timeoutMs = 2_000): Promise<boolean> {
   return new Promise((resolve, reject) => {
+    const socket: Socket = createConnection({ host: '127.0.0.1', port });
+    let received = false;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('raw TCP probe timed out'));
+    }, timeoutMs);
+    const finish = (value: boolean) => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(value);
+    };
+    socket.on('connect', () => socket.write(framed(body)));
+    socket.on('data', () => {
+      received = true;
+      finish(true);
+    });
+    socket.on('close', () => finish(received));
+    socket.on('error', () => finish(received));
+  });
+}
+
+function tcpRequest(port: number, body: unknown, timeoutMs = 10_000): Promise<any> {  return new Promise((resolve, reject) => {
     const socket: Socket = createConnection({ host: '127.0.0.1', port });
     let buffer = Buffer.alloc(0);
     const timer = setTimeout(() => {
@@ -1562,9 +1678,66 @@ function tcpRequest(port: number, body: unknown, timeoutMs = 10_000): Promise<an
   });
 }
 
-/** A raw TCP relay endpoint that answers every request with one fixed frame body. */
-async function rawRelayServer(
+/**
+ * Open a persistent inbound tunnel to a seed as a peer that deterministically rejects every
+ * forwarded frame. Resolves once the seed acknowledges the tunnel.
+ */
+async function openRejectingTunnel(
   t: TestContext,
+  port: number,
+  keys: ReturnType<typeof deriveNetworkKeys>,
+  targetNodeId: string,
+): Promise<void> {
+  const socket = createConnection({ host: '127.0.0.1', port });
+  t.after(() => socket.destroy());
+  let buffer = Buffer.alloc(0);
+  let ack: (() => void) | undefined;
+  let acknowledged = false;
+  const ready = new Promise<void>((resolve, reject) => {
+    ack = resolve;
+    socket.once('error', reject);
+  });
+  socket.on('connect', () => {
+    socket.write(framed({
+      type: 'tunnel',
+      frame: sealNetworkFrame(
+        {
+          type: 'discovery',
+          endpointAddr: '127.0.0.1:9',
+          expires: Date.now() + 20_000,
+        },
+        keys,
+        targetNodeId,
+      ),
+    }));
+  });
+  socket.on('data', chunk => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 4) {
+      const size = buffer.readUInt32BE(0);
+      if (buffer.length < size + 4) {
+        return;
+      }
+      const message = JSON.parse(buffer.subarray(4, size + 4).toString('utf8'));
+      buffer = buffer.subarray(size + 4);
+      if (message?.type === 'tunnel_ack' && !acknowledged) {
+        acknowledged = true;
+        ack?.();
+      }
+      if (message?.type === 'relay_deliver' && typeof message.relayId === 'string') {
+        socket.write(framed({
+          type: 'relay_reply',
+          relayId: message.relayId,
+          error: 'target policy rejected',
+        }));
+      }
+    }
+  });
+  await ready;
+}
+
+/** A raw TCP relay endpoint that answers every request with one fixed frame body. */
+async function rawRelayServer(  t: TestContext,
   responseBody: string | Buffer,
 ): Promise<string> {
   const response = Buffer.isBuffer(responseBody)
@@ -1622,6 +1795,70 @@ test('malformed relay responses surface as local protocol failures, not offline 
   }
   assert.ok(isLocalDeliveryError(failure), 'a malformed seed response is a protocol failure');
   assert.match((failure as Error).message, /Malformed relay response/);
+});
+
+test('relay seed surfaces deterministic target rejection instead of spooling it', async t => {
+  const root = directory(t);
+  const targetEndpoint = await rawRelayServer(
+    t,
+    JSON.stringify({ error: 'target policy rejected' }),
+  );
+  const seed = runtimeFor(root, 'seed');
+  t.after(async () => {
+    await seed.stop().catch(() => {});
+  });
+  await seed.start();
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const endpoint = seed.transport.endpointAddr!;
+  const port = Number(endpoint.slice(endpoint.lastIndexOf(':') + 1));
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  seed.transport.registerPeerEndpoint(NETWORK, target, targetEndpoint);
+  const response = await tcpRequest(port, {
+    type: 'relay_send',
+    networkId: NETWORK,
+    spoolIfOffline: true,
+    target,
+    frame: sealNetworkFrame({ payload: 'poison' }, keys, sender.nodeId),
+    spoolKey: 'deterministic-rejection',
+  });
+  assert.equal(response.error, 'target policy rejected');
+  assert.notEqual(response.spooled, true, 'a deterministic rejection is never a spooled handoff');
+  const spoolFile = join(root, 'seed', 'relay-spool', `${keys.swarmTopicId}.json`);
+  assert.equal(
+    readRelaySpool(spoolFile).entries.length,
+    0,
+    'the seed must not retain a poison frame for offline replay',
+  );
+});
+
+test('relay seed reports a target tunnel rejection without spooling it', async t => {
+  const root = directory(t);
+  const seed = runtimeFor(root, 'seed');
+  t.after(async () => {
+    await seed.stop().catch(() => {});
+  });
+  await seed.start();
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const endpoint = seed.transport.endpointAddr!;
+  const port = Number(endpoint.slice(endpoint.lastIndexOf(':') + 1));
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const target = generateNodeKeyPair().nodeId;
+  await openRejectingTunnel(t, port, keys, target);
+  const sender = generateNodeKeyPair();
+  const response = await tcpRequest(port, {
+    type: 'relay_send',
+    networkId: NETWORK,
+    spoolIfOffline: true,
+    target,
+    frame: sealNetworkFrame({ payload: 'tunnel poison' }, keys, sender.nodeId),
+    spoolKey: 'tunnel-rejection',
+  });
+  assert.equal(response.error, 'target policy rejected');
+  assert.notEqual(response.spooled, true);
+  const spoolFile = join(root, 'seed', 'relay-spool', `${keys.swarmTopicId}.json`);
+  assert.equal(readRelaySpool(spoolFile).entries.length, 0);
 });
 
 test('relay network mismatch responses are local protocol failures', async t => {
@@ -1814,7 +2051,10 @@ test('relay spool validates targets, isolates senders and collects expired blobs
   const spoolFile = join(root, 'seed', 'relay-spool', `${swarmTopicId}.json`);
   let spool = readRelaySpool(spoolFile);
   assert.equal(spool.entries.length, 2);
-  assert.ok(spool.entries.every(entry => entry.blobs === undefined));
+  assert.ok(
+    spool.entries.every(entry => entry.blobHashes === undefined),
+    'entries without attachments persist no attachment metadata',
+  );
 
   const blobTarget = generateNodeKeyPair().nodeId;
   const blobBody = Buffer.from('cached attachment bytes');
@@ -1832,6 +2072,11 @@ test('relay spool validates targets, isolates senders and collects expired blobs
   assert.equal(
     spool.entries.find(entry => entry.id.endsWith(':blob'))?.blobHashes?.[hash],
     blobBody.length,
+  );
+  assert.equal(
+    await tcpReplyReceived(port, { type: 'blob', hash }),
+    false,
+    'a spooled attachment is never exposed through the process-global blob cache',
   );
 
   const client = runtimeFor(root, 'client');
@@ -1892,6 +2137,24 @@ test('relay spool validates targets, isolates senders and collects expired blobs
   assert.equal(existsSync(blobPath), false, 'expired spool blobs are garbage collected');
   const pruned = readRelaySpool(spoolFile);
   assert.equal(pruned.entries.length, 0);
+});
+
+test('relay spool mount reclaims orphaned blob files without a snapshot or journal', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const blobDir = join(root, 'seed', 'relay-spool', 'blobs', keys.swarmTopicId);
+  mkdirSync(blobDir, { recursive: true });
+  const orphan = Buffer.from('orphaned spool attachment');
+  const hash = blake3(orphan);
+  const blobPath = join(blobDir, hash);
+  writeFileSync(blobPath, orphan);
+  const seed = runtimeFor(root, 'seed');
+  t.after(async () => {
+    await seed.stop().catch(() => {});
+  });
+  await seed.start();
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  assert.equal(existsSync(blobPath), false, 'an unreferenced blob is collected on mount');
 });
 
 test('relay spool enforces per-target and global entry bounds when loading', async t => {

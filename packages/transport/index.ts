@@ -806,9 +806,6 @@ export class P2PTransportService implements TransportService {
     const journalFile = this.relaySpoolJournalFile(m)!;
     const hadSnapshot = existsSync(spoolFile);
     const hadJournal = existsSync(journalFile);
-    if (!hadSnapshot && !hadJournal) {
-      return;
-    }
     const now = Date.now();
     if (hadSnapshot) {
       let parsed: unknown;
@@ -829,7 +826,7 @@ export class P2PTransportService implements TransportService {
       }
       const entries: SpooledRelayEntry[] = [];
       for (const raw of (parsed as RelaySpoolFile).entries) {
-        const entry = this.parseStoredSpoolEntry(raw, m, now, true);
+        const entry = this.parseStoredSpoolEntry(raw, m, now);
         if (entry) {
           entries.push(entry);
         }
@@ -879,20 +876,22 @@ export class P2PTransportService implements TransportService {
       }
     }
     // Expired entries and orphaned blobs are dropped from the durable snapshot during mount.
-    this.pruneRelaySpool(m);
-    // A tampered or legacy snapshot must not bypass the same capacity bounds as live admission.
-    this.enforceRelaySpoolBudget(m);
-    this.persistRelaySpool(m);
+    let changed = this.pruneRelaySpool(m);
+    // A tampered snapshot must not bypass the same capacity bounds as live admission.
+    changed = this.enforceRelaySpoolBudget(m) || changed;
+    // A crash can leave blob files without any snapshot/journal reference. The directory
+    // scan above makes those orphans collectable; only write a snapshot when state changed.
+    if (hadSnapshot || hadJournal || changed) {
+      this.persistRelaySpool(m);
+    }
   }
 
   private parseStoredSpoolEntry(
     raw: unknown,
     m: Mount,
     now: number,
-    allowLegacyBlobs: boolean,
   ): SpooledRelayEntry | undefined {
     const entry = raw as Partial<SpooledRelayEntry> & {
-      blobs?: unknown;
       blobHashes?: unknown;
       frame?: SpooledRelayEntry['frame'];
     };
@@ -916,7 +915,6 @@ export class P2PTransportService implements TransportService {
     if (Date.parse(entry.expiresAt) <= now) {
       return undefined;
     }
-    const legacyBlobs = allowLegacyBlobs ? entry.blobs : undefined;
     const blobHashes: Record<string, number> = {};
     if (entry.blobHashes !== undefined) {
       if (
@@ -936,34 +934,6 @@ export class P2PTransportService implements TransportService {
           throw new Error('Invalid relay spool store');
         }
         blobHashes[hash] = size as number;
-      }
-    }
-    if (legacyBlobs !== undefined) {
-      // One-time migration from the base64-in-snapshot schema: verify and materialize the
-      // content-addressed files, then persist only hash + length metadata from now on.
-      if (
-        typeof legacyBlobs !== 'object' ||
-        legacyBlobs === null ||
-        Array.isArray(legacyBlobs) ||
-        Object.values(legacyBlobs).some(value => typeof value !== 'string')
-      ) {
-        throw new Error('Invalid relay spool store');
-      }
-      let total = 0;
-      for (const [hash, encoded] of Object.entries(legacyBlobs as Record<string, string>)) {
-        if (!/^[a-f0-9]{64}$/.test(hash)) {
-          throw new Error('Invalid relay spool store');
-        }
-        const bytes = Buffer.from(encoded, 'base64');
-        if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
-          throw new Error('Invalid relay spool store');
-        }
-        total += bytes.length;
-        if (total > MAX_RELAY_SPOOL_BLOB_BYTES) {
-          throw new Error('Invalid relay spool store');
-        }
-        this.writeSpoolBlob(m, hash, bytes);
-        blobHashes[hash] = bytes.length;
       }
     }
     return {
@@ -1007,7 +977,7 @@ export class P2PTransportService implements TransportService {
         blobs?: unknown;
       };
       if (record.op === 'upsert') {
-        const entry = this.parseStoredSpoolEntry(record.entry, m, now, false);
+        const entry = this.parseStoredSpoolEntry(record.entry, m, now);
         if (entry) {
           this.dropSpoolEntry(m, entry.targetNodeId, entry.id);
           this.insertSpoolEntry(m, entry);
@@ -1181,6 +1151,7 @@ export class P2PTransportService implements TransportService {
     for (const hash of m.spoolBlobCache.keys()) {
       if (!existsSync(join(directory, hash))) {
         m.spoolBlobCache.delete(hash);
+        this.spooledBlobs.delete(this.spoolBlobKey(m, hash));
         changed = true;
       }
     }
@@ -1390,7 +1361,8 @@ export class P2PTransportService implements TransportService {
   private writeSpoolBlob(m: Mount, hash: string, bytes: Buffer): string {
     const blobPath = join(this.spoolBlobDirectory(m), hash);
     writeFileAtomically(blobPath, bytes);
-    this.registerBlob(hash, blobPath);
+    // Never place a spooled attachment in the process-global sender cache: spool files are
+    // network-scoped and are served only through readSpooledBlob/relay_blob.
     this.spooledBlobs.add(this.spoolBlobKey(m, hash));
     return blobPath;
   }
@@ -2109,6 +2081,9 @@ export class P2PTransportService implements TransportService {
     try {
       socket.write(packet({ type: 'frame', frame }));
       const response = await new SocketReader(socket).json();
+      if (response?.error) {
+        throw new LocalDeliveryError(String(response.error));
+      }
       if (response?.frame?.senderNodeId !== target) {
         throw new LocalDeliveryError('Response binding mismatch');
       }
@@ -2649,7 +2624,12 @@ export class P2PTransportService implements TransportService {
         let replyFrame: SealedNetworkFrame;
         if (tunnel) {
           const reply = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, socket);
-          if (reply?.error) throw new Error(String(reply.error));
+          if (reply?.error) {
+            // A reachable target's signed decision is deterministic; never convert it to
+            // durable offline spooling or let target-controlled text drive classification.
+            socket.end(packet({ error: String(reply.error) }));
+            return;
+          }
           replyFrame = reply.frame;
         } else {
           // A spoolable request must fail over fast: an unreachable advertised endpoint
@@ -2670,6 +2650,18 @@ export class P2PTransportService implements TransportService {
       } catch (error) {
         liveError = asError(error);
       }
+      // Only connection-class failures prove the target is offline. Authentication/binding
+      // mismatches, malformed responses, and protocol errors remain visible to the sender;
+      // spooling them would fabricate a durable handoff and retry a poison frame for its TTL.
+      const targetOffline =
+        !(liveError instanceof LocalDeliveryError) &&
+        (liveError instanceof PeerUnreachableError ||
+          liveError instanceof DeliveryTimeoutError ||
+          isConnectionFailure(liveError));
+      if (!targetOffline) {
+        socket.end(packet({ error: liveError.message }));
+        return;
+      }
       if (!spoolIfOffline) {
         throw liveError;
       }
@@ -2678,7 +2670,6 @@ export class P2PTransportService implements TransportService {
       } catch (error) {
         socket.end(packet({ error: error instanceof Error ? error.message : String(error) }));
       }
-      return;
       return;
     }
     if (request.type === 'relay_blob') {

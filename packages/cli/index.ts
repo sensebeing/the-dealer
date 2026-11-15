@@ -13,6 +13,7 @@ import { MailboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
 import type { OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
+import { isDurableOutboxReceipt } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
 import { computeRuntimeFingerprint, readDaemonFingerprint, readAutoUpdateStatus, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
@@ -168,11 +169,7 @@ export function summarizeNextStep(
   receipts: readonly DeliveryReceipt[],
 ): string | undefined {
   void command;
-  const queuedOffline = receipts.some(
-    receipt =>
-      receipt.executionReceipt?.queuedOffline === true ||
-      receipt.executionReceipt?.executor === 'outbox',
-  );
+  const queuedOffline = receipts.some(isDurableOutboxReceipt);
   if (!queuedOffline) {
     return undefined;
   }
@@ -942,8 +939,8 @@ async function runSessionCommand(
       // A queued offline receipt is signed by the local outbox, not the target; report the
       // resolved target when known, otherwise null until redrive resolves the selector.
       targetNodeId:
-        firstReceipt?.executionReceipt?.queuedOffline === true
-          ? ((firstReceipt.executionReceipt.targetNodeId as string | undefined) ?? null)
+        isDurableOutboxReceipt(firstReceipt)
+          ? ((firstReceipt.executionReceipt?.targetNodeId as string | undefined) ?? null)
           : firstReceipt?.fromNodeId,
       targetMailbox: targetMailbox ?? 'default',
       replyMailbox,
@@ -1483,6 +1480,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       } else if (action === 'flush') {
         result = await runtime.flushOutbox({
           ...(typeof v.id === 'string' ? { id: String(v.id) } : {}),
+          ...(typeof v.network === 'string' ? { networkId: String(v.network) } : {}),
           ...(v.force === true ? { force: true } : {}),
         });
       } else if (action === 'requeue') {
@@ -1490,6 +1488,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           throw new Error('outbox requeue requires --id');
         }
         result = runtime.requeueOutbox(String(v.id));
+        if (!result) {
+          throw new Error(`Outbox item not found: ${String(v.id)}`);
+        }
       } else {
         throw new Error('Unknown outbox command; use list, flush or requeue');
       }
@@ -1533,7 +1534,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (
       owned &&
       (['send', 'broadcast', 'ask', 'reply', 'settle'].includes(group ?? '') ||
-        (group === 'outbox' && action === 'flush'))
+        (group === 'outbox' && (action === 'flush' || action === 'requeue')))
     ) {
       queuedForRedrive = true;
     }
@@ -1545,7 +1546,20 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   } finally {
     if (owned) {
       const stateDirForDaemon = resolve(options.stateDir ?? defaultStateDir());
-      const pending = queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0;
+      let pending = false;
+      try {
+        pending = Boolean(
+          queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0,
+        );
+      } catch (error) {
+        stderr(JSON.stringify({
+          warning: `Unable to inspect queued outbox obligations before shutdown: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        }));
+      }
+      // Teardown must still run when the outbox read fails; otherwise one corrupt read
+      // would leave the ephemeral runtime and its transport sockets alive.
       await owned.stop();
       if (pending) {
         // The command durability contract outlives this process: start the supervisor so

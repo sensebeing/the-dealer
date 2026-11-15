@@ -104,15 +104,12 @@ function validItem(value: unknown): value is OutboxItem {
     value.pendingNodeIds.every(nodeId => typeof nodeId === 'string') &&
     isRecord(value.deliveredReceipts) &&
     Object.values(value.deliveredReceipts).every(validReceipt) &&
-    (value.failedReceipts === undefined ||
-      (isRecord(value.failedReceipts) &&
-        Object.values(value.failedReceipts).every(validReceipt))) &&
-    (value.failedNodeIds === undefined ||
-      (Array.isArray(value.failedNodeIds) &&
-        value.failedNodeIds.every(nodeId => typeof nodeId === 'string'))) &&
-    (value.inDoubtNodeIds === undefined ||
-      (Array.isArray(value.inDoubtNodeIds) &&
-        value.inDoubtNodeIds.every(nodeId => typeof nodeId === 'string'))) &&
+    isRecord(value.failedReceipts) &&
+    Object.values(value.failedReceipts).every(validReceipt) &&
+    Array.isArray(value.failedNodeIds) &&
+    value.failedNodeIds.every(nodeId => typeof nodeId === 'string') &&
+    Array.isArray(value.inDoubtNodeIds) &&
+    value.inDoubtNodeIds.every(nodeId => typeof nodeId === 'string') &&
     Array.isArray(value.relaySpooledNodeIds) &&
     value.relaySpooledNodeIds.every(nodeId => typeof nodeId === 'string') &&
     isRecord(value.stagedFiles) &&
@@ -125,36 +122,16 @@ function validItem(value: unknown): value is OutboxItem {
     typeof value.createdAt === 'string' &&
     typeof value.updatedAt === 'string' &&
     typeof value.nextAttemptAt === 'string' &&
-    (value.lastError === undefined || typeof value.lastError === 'string') &&
-    (value.failedReceipt === undefined ||
-      (isRecord(value.failedReceipt) &&
-        typeof value.failedReceipt.nodeId === 'string' &&
-        validReceipt(value.failedReceipt.receipt)))
+    (value.lastError === undefined || typeof value.lastError === 'string')
   );
 }
 
-function normalizedItem(item: OutboxItem & {
-  failedReceipts?: Record<string, DeliveryReceipt>;
-  failedNodeIds?: string[];
-  inDoubtNodeIds?: string[];
-  failedReceipt?: { nodeId: string; receipt: DeliveryReceipt };
-}): OutboxItem {
-  const { failedReceipt, ...rest } = item;
-  const failedReceipts = {
-    ...(rest.failedReceipts ?? {}),
-    ...(failedReceipt ? { [failedReceipt.nodeId]: failedReceipt.receipt } : {}),
-  };
-  const failedNodeIds = [...new Set([
-    ...(rest.failedNodeIds ?? []),
-    ...Object.keys(failedReceipts),
-  ])];
+function normalizedItem(item: OutboxItem): OutboxItem {
   return {
-    ...rest,
-    failedReceipts,
-    failedNodeIds,
-    inDoubtNodeIds: [...new Set(rest.inDoubtNodeIds ?? [])],
-    pendingNodeIds: rest.pendingNodeIds.filter(
-      nodeId => !rest.deliveredReceipts[nodeId] && !failedNodeIds.includes(nodeId),
+    ...item,
+    inDoubtNodeIds: [...new Set(item.inDoubtNodeIds)],
+    pendingNodeIds: [...new Set(item.pendingNodeIds)].filter(
+      nodeId => !item.deliveredReceipts[nodeId] && !item.failedNodeIds.includes(nodeId),
     ),
   };
 }
@@ -444,6 +421,18 @@ export class OutboxStore {
           !item.deliveredReceipts[nodeId],
       );
       if (retryable.length === 0) {
+        // A global local failure (for example, missing staged evidence) has no per-target
+        // decision. An explicit operator retry may route the signed envelope again; it is
+        // not a signed terminal rejection and must remain operator-recoverable.
+        if (item.failedNodeIds.length === 0 && Object.keys(item.failedReceipts).length === 0) {
+          item.pendingNodeIds = [];
+          item.status = 'queued';
+          item.lastError = undefined;
+          item.updatedAt = now;
+          item.nextAttemptAt = now;
+          this.settleItem(item);
+          return clone(item);
+        }
         throw new Error('Outbox item has no locally failed targets to requeue');
       }
       const retry = new Set(retryable);
@@ -871,7 +860,12 @@ export class OutboxRedriveService {
     return {
       attempted,
       delivered,
-      stillQueued: this.outbox.list({ status: 'queued' }).length,
+      // Report the remainder through the same network scope as the candidates; a scoped
+      // operator flush must not claim obligations from other networks are still queued here.
+      stillQueued: this.outbox.list({
+        status: 'queued',
+        ...(options.networkId !== undefined ? { networkId: options.networkId } : {}),
+      }).length,
       items: processed,
     };
   }

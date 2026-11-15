@@ -7,7 +7,6 @@ import {
   createPublicKey,
   generateKeyPairSync,
   randomBytes,
-  randomUUID,
   sign,
   verify,
 } from 'node:crypto';

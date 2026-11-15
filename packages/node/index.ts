@@ -33,7 +33,6 @@ export interface NodePluginConfig {
 const PEER_DIRECTORY_SCHEMA = 'the-dealer-peer-directory/v1';
 const MAX_GOSSIPED_PEER_CARDS = 128;
 
-
 interface ObservableTransport extends TransportService {
   identityKeyPair?: ReturnType<typeof generateNodeKeyPair>;
   getNetworkConfig?(networkId: string): NetworkMountConfig | undefined;
@@ -57,6 +56,8 @@ export class PeerDirectoryService implements NodeService {
   private disposed = false;
   private exchanging = false;
   private readonly peersPath?: string;
+  /** Networks with a newly accepted direct peer; the next beacon carries known cards once. */
+  private readonly gossipRequested = new Set<string>();
 
   constructor(ctx: Context, config: NodePluginConfig) {
     this.ctx = ctx;
@@ -173,7 +174,8 @@ export class PeerDirectoryService implements NodeService {
     expectedNetworkId: string | undefined,
     registerEndpoint: boolean,
     emit: boolean,
-  ): boolean {    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  ): boolean {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       return false;
     }
     const card = value as NodeCard;
@@ -245,7 +247,13 @@ export class PeerDirectoryService implements NodeService {
     let changed = false;
     if (message.card) {
       const directSender = event.senderNodeId === message.card.nodeId;
-      changed = this.acceptCard(message.card, event.networkId, directSender, true) || changed;
+      const accepted = this.acceptCard(message.card, event.networkId, directSender, true);
+      if (accepted && directSender) {
+        // A peer that just announced itself needs the team directory. One event-driven
+        // gossip beacon teaches it without repeating 128 cards on every 250ms heartbeat.
+        this.gossipRequested.add(event.networkId);
+      }
+      changed = accepted || changed;
     }
     // Seed card gossip: a relay seed (or any member) shares the verified cards it knows,
     // so a restarted peer learns its team before the members themselves reconnect. Those
@@ -323,15 +331,23 @@ export class PeerDirectoryService implements NodeService {
           this.self.set(networkId, this.build(networkId));
         }
         const selfCard = this.self.get(networkId)!;
-        // Card gossip carries the verified team directory: a relay seed or any member can
-        // hand a restarted peer the cards it needs before that member reconnects itself.
-        const knownCards = [...(this.peers.get(networkId)?.values() ?? [])]
-          .filter(card => card.nodeId !== selfCard.nodeId)
-          .slice(0, MAX_GOSSIPED_PEER_CARDS);
+        // Card gossip is event-driven: startup/profile changes include the verified team
+        // directory, and a newly accepted direct peer receives it once on the next beacon.
+        // Steady-state 250ms presence heartbeats carry only the self card.
+        const includeKnownCards = refresh || this.gossipRequested.delete(networkId);
+        const knownCards = includeKnownCards
+          ? [...(this.peers.get(networkId)?.values() ?? [])]
+              .filter(card => card.nodeId !== selfCard.nodeId)
+              .slice(0, MAX_GOSSIPED_PEER_CARDS)
+          : [];
         await this.transport.broadcast(
           networkId,
           'peer.card',
-          Buffer.from(JSON.stringify({ type: 'peer.card', card: selfCard, knownCards })),
+          Buffer.from(JSON.stringify({
+            type: 'peer.card',
+            card: selfCard,
+            ...(includeKnownCards ? { knownCards } : {}),
+          })),
           // Presence is best-effort: one direct fast-fail plus a few relay seeds still gets a
           // useful share of the budget, while a blackholed peer can never stall the node.
           { timeoutMs: this.config.exchangeTimeoutMs ?? 4_000 },

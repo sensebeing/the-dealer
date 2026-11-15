@@ -374,7 +374,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           } catch (error) {
             // An unresolved explicit selector is a peering gap, not a routing bug: the
             // durable outbox retries it once the peer directory learns the member again.
-            if (isUnresolvedTargetError(error) && queueIfOffline && mounted) {
+            // Network mount state is irrelevant here; identity resolution is directory-owned.
+            if (isUnresolvedTargetError(error) && queueIfOffline) {
               const claimed = input.idempotencyKey
                 ? outbox.claimIdempotency({
                     envelope,
