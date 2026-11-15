@@ -1048,7 +1048,16 @@ export class P2PTransportService implements TransportService {
           if (!address) {
             break;
           }
-          replyFrame = await this.directFrame(m, peerNodeId, address, entry.frame, timeoutMs);
+          // Without an inbound tunnel this is only a speculative direct attempt before the
+          // target's own tunnel arrives; keep it inside the fast-fail window so the
+          // per-target drain lock cannot delay serveInboundTunnel's authoritative drain.
+          replyFrame = await this.directFrame(
+            m,
+            peerNodeId,
+            address,
+            entry.frame,
+            Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS),
+          );
         }
         const payload = unsealNetworkFrame<{ requestNonce?: string }>(replyFrame, m.keys);
         if (
@@ -1083,14 +1092,19 @@ export class P2PTransportService implements TransportService {
     }
   }
 
-  private learn(frame: SealedNetworkFrame, remoteHost?: string): Mount | undefined {
-    return this.learnWithMeta(frame, remoteHost).mount;
+  private learn(
+    frame: SealedNetworkFrame,
+    remoteHost?: string,
+    scheduleDrain = true,
+  ): Mount | undefined {
+    return this.learnWithMeta(frame, remoteHost, undefined, scheduleDrain).mount;
   }
 
   private learnWithMeta(
     frame: SealedNetworkFrame,
     remoteHost?: string,
     viaSeed?: string,
+    scheduleDrain = true,
   ): { mount?: Mount; reply: boolean } {
     const m = [...this.mounts.values()].find(m => m.keys.swarmTopicId === frame.swarmTopicId);
     if (!m) {
@@ -1132,7 +1146,11 @@ export class P2PTransportService implements TransportService {
         m.relays.delete(frame.senderNodeId);
       }
       // A fresh endpoint is the cheapest proof that a spooled target may be reachable again.
-      this.scheduleSpoolDrain(m, frame.senderNodeId);
+      // Discovery probes deliberately skip this: their peer opens a tunnel moments later,
+      // and a speculative direct drain would hold the per-target lock ahead of it.
+      if (scheduleDrain) {
+        this.scheduleSpoolDrain(m, frame.senderNodeId);
+      }
     }
     return { mount: m, reply: beacon.reply === true };
   }
@@ -1802,7 +1820,7 @@ export class P2PTransportService implements TransportService {
 
   /** Register a peer's persistent tunnel and resolve its relay replies until it closes. */
   private async serveInboundTunnel(socket: Socket, frame: SealedNetworkFrame): Promise<void> {
-    const mount = this.learn(frame, socket.remoteAddress);
+    const mount = this.learn(frame, socket.remoteAddress, false);
     if (!mount) {
       throw new Error('Invalid tunnel request');
     }
@@ -1925,7 +1943,9 @@ export class P2PTransportService implements TransportService {
   private async receive(socket: Socket): Promise<void> {
     const request = await new SocketReader(socket).json();
     if (request.type === 'discovery') {
-      const mount = this.learn(request.frame, socket.remoteAddress);
+      // Do not drain from this probe: the peer opens its persistent tunnel immediately
+      // afterwards, and serveInboundTunnel owns the first authoritative drain.
+      const mount = this.learn(request.frame, socket.remoteAddress, false);
       if (!mount) throw new Error('Invalid discovery request');
       for (const peerFrame of Array.isArray(request.peers) ? request.peers : []) {
         try {
@@ -2178,7 +2198,15 @@ export class P2PTransportService implements TransportService {
     try {
       let lastError: unknown;
       try {
-        await this.fetchBlobDirect(address, hash, size, temp, fallbacks.length > 0);
+        // Seed fallbacks prove the sender may be offline: fail over fast instead of burning
+        // the whole socket budget on its blackholed endpoint before asking the seed cache.
+        await this.fetchBlobDirect(
+          address,
+          hash,
+          size,
+          temp,
+          fallbacks.length > 0 || seedFallbacks.size > 0,
+        );
       } catch (error) {
         lastError = error;
         // The advertised endpoint is NAT-bound: try the peer's own tunnel to this node,
