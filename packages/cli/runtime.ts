@@ -37,7 +37,8 @@ import {
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../orca-workspace/index.ts';
 import type { CommandRunner } from '../orca-workspace/index.ts';
-import { MailboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
+import { MailboxStore, OutboxRedriveService, OutboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
+import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
@@ -172,6 +173,8 @@ export class DealerNodeRuntime {
   readonly options: DealerRuntimeOptions;
   config!: RuntimeConfig;
   mailbox!: MailboxStore;
+  outbox!: OutboxStore;
+  outboxRedrive!: OutboxRedriveService;
   wakeups!: WakeupRedriveService;
   larkNotifier?: LarkMailboxNotifier;
   private loadedProjects = new Map<string, { manifest: DealerProjectManifest; plugins: LoadedExternalPlugin[]; userPatch?: Partial<RuntimeConfig>; rootPath: string }>();
@@ -495,6 +498,10 @@ export class DealerNodeRuntime {
         legacyInboxPath:
           this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'),
       });
+      this.outbox = new OutboxStore(
+        join(this.stateDir, 'outbox.json'),
+        join(this.stateDir, 'outbox-blobs'),
+      );
       this.wakeups = new WakeupRedriveService({
         store: this.mailbox,
         commandRunner: this.options.commandRunner ?? runCommand,
@@ -516,6 +523,7 @@ export class DealerNodeRuntime {
         createTransportPlugin({
           ...this.options.transport,
           ...(advertisedHost ? { advertisedHost } : {}),
+          spoolDir: join(this.stateDir, 'relay-spool'),
           listenPort: this.config.port,
           localNodeId: keyPair.nodeId,
         }),
@@ -530,6 +538,7 @@ export class DealerNodeRuntime {
             summary: this.config.name,
             skills: this.config.skills.map(id => ({ id, description: id })),
           },
+          peersPath: join(this.stateDir, 'peers.json'),
         }),
       );
       await this.kernel.use(createRouterPlugin());
@@ -553,12 +562,24 @@ export class DealerNodeRuntime {
       );
       await this.kernel.use(
         createEmitterPlugin({
+          outbox: this.outbox,
           onSourceError: error => {
             this.lastError = String(error);
           },
         }),
       );
       await this.kernel.use(this.integrationPlugin());
+      this.outboxRedrive = new OutboxRedriveService({
+        outbox: this.outbox,
+        transport: this.transport,
+        router: this.kernel.ctx.services.router,
+        events: {
+          on: (event, listener) => this.kernel.ctx.on(event, listener),
+        },
+        onError: error => {
+          this.lastError = String(error);
+        },
+      });
       for (const network of this.config.networks) {
         await this.transport.mountNetwork(network);
         if (network.admissionMode) {
@@ -589,6 +610,9 @@ export class DealerNodeRuntime {
       }
       await this.activateLarkNotifier();
       this.refreshTopicBindings();
+      // Redrive starts only after networks are mounted: a queued obligation can address
+      // them immediately, and the timer is unref'd so it never holds the process open.
+      this.outboxRedrive.start();
       this.persist();
       this.started = true;
       return this;
@@ -1236,6 +1260,21 @@ export class DealerNodeRuntime {
     await this.wakeups.flushWakeups();
   }
 
+  listOutbox(filter: OutboxListFilter = {}): OutboxItem[] {
+    if (!this.outbox) {
+      throw new Error('Outbox is not available before the runtime starts');
+    }
+    return this.outbox.list(filter);
+  }
+
+  /** Operator/test flush of the durable outbox; redrive also runs on peer events and timers. */
+  flushOutbox(options: OutboxFlushOptions = {}): Promise<OutboxFlushResult> {
+    if (!this.outboxRedrive) {
+      return Promise.reject(new Error('Outbox redrive is not running'));
+    }
+    return this.outboxRedrive.flush(options);
+  }
+
   async mountNetwork(network: NetworkMountConfig & { role?: string }): Promise<void> {
     if (!network.networkId || !network.passphrase) {
       throw new Error('Network and passphrase required');
@@ -1383,6 +1422,7 @@ export class DealerNodeRuntime {
       networks: this.transport.listMountedNetworks(),
       gateMode: this.gate.getMode(),
       lastError: this.lastError,
+      outbox: { queuedCount: this.outbox ? this.outbox.list({ status: 'queued' }).length : 0 },
       runtimeFingerprint: readDaemonFingerprint(this.stateDir)?.fingerprint,
       autoUpdate: readAutoUpdateStatus(this.stateDir),
     };
@@ -1524,13 +1564,50 @@ export class DealerNodeRuntime {
     const server = createServer(async (request, response) => {
       if (
         request.method !== 'POST' ||
-        (request.url !== '/cli' && request.url !== '/cli-stream')
+        (request.url !== '/cli' &&
+          request.url !== '/cli-stream' &&
+          request.url !== '/v1/outbox/list' &&
+          request.url !== '/v1/outbox/flush')
       ) {
         response.writeHead(404).end();
         return;
       }
       if (this.draining) {
         response.writeHead(503).end(JSON.stringify({ error: 'Daemon is draining' }));
+        return;
+      }
+      if (request.method === 'POST' && (request.url === '/v1/outbox/list' || request.url === '/v1/outbox/flush')) {
+        this.activeMutatingControlRequests++;
+        try {
+          const raw = await readControlBody(request);
+          const body: unknown = raw.trim() ? JSON.parse(raw) : {};
+          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+            throw new Error('Expected a JSON object');
+          }
+          const input = body as Record<string, unknown>;
+          const result = request.url === '/v1/outbox/list'
+            ? this.listOutbox({
+                ...(typeof input.networkId === 'string' ? { networkId: input.networkId } : {}),
+                ...(typeof input.status === 'string'
+                  ? { status: input.status as OutboxListFilter['status'] }
+                  : {}),
+              })
+            : await this.flushOutbox({
+                ...(typeof input.id === 'string' ? { id: input.id } : {}),
+                ...(input.force === true ? { force: true } : {}),
+              });
+          if (!response.destroyed && !response.writableEnded) {
+            response
+              .writeHead(200, { 'content-type': 'application/json' })
+              .end(JSON.stringify(result));
+          }
+        } catch (error) {
+          if (!response.destroyed && !response.writableEnded) {
+            response.writeHead(400).end(JSON.stringify({ error: String(error) }));
+          }
+        } finally {
+          this.controlRequestSettled();
+        }
         return;
       }
       const expectedInstance = request.headers[EXPECTED_INSTANCE_HEADER];
@@ -1646,6 +1723,8 @@ export class DealerNodeRuntime {
   private async finishStop(): Promise<void> {
     const hadServer = this.server !== undefined;
     try {
+      // Stop redrive first: it must not start new sends while transport and kernel unwind.
+      await this.outboxRedrive?.stop();
       await this.wakeups?.stop();
     } finally {
       try {

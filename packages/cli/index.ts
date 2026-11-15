@@ -10,8 +10,9 @@ import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { MailboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
+import type { OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
-import type { SettlementOutcome } from '../core-types/index.ts';
+import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
 import { computeRuntimeFingerprint, readDaemonFingerprint, readAutoUpdateStatus, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
@@ -157,6 +158,26 @@ export interface ControlRpcOptions {
 }
 
 const DEFAULT_RPC_INACTIVITY_MS = 45_000;
+
+/**
+ * One caller-facing next-step phrase for command results. A queued-offline receipt is a
+ * complete durable handoff: the sender must not poll or hold its inbox lease open.
+ */
+export function summarizeNextStep(
+  command: string,
+  receipts: readonly DeliveryReceipt[],
+): string | undefined {
+  void command;
+  const queuedOffline = receipts.some(
+    receipt =>
+      receipt.executionReceipt?.queuedOffline === true ||
+      receipt.executionReceipt?.executor === 'outbox',
+  );
+  if (!queuedOffline) {
+    return undefined;
+  }
+  return 'Target peer is currently offline; message is durably queued in outbox (and spooled on relay seed if configured) and will auto-deliver when the peer reconnects. You may safely ack your current inbox lease now.';
+}
 
 /**
  * POST /cli-stream keeps normal commands fast while allowing long waits: the server emits an
@@ -875,7 +896,9 @@ async function runSessionCommand(
         targetMailbox,
         replyMailbox,
         receipts: emitted.receipts,
-        next: 'End your turn now; Dealer will wake this mailbox when the reply arrives.',
+        next:
+          summarizeNextStep('ask', emitted.receipts) ??
+          'End your turn now; Dealer will wake this mailbox when the reply arrives.',
       };
     }
     const networkId = required(v.network, '--network');
@@ -919,7 +942,9 @@ async function runSessionCommand(
       targetMailbox: targetMailbox ?? 'default',
       replyMailbox,
       receipts: emitted.receipts,
-      next: 'End your turn now; Dealer will wake this mailbox when the reply arrives.',
+      next:
+        summarizeNextStep('ask', emitted.receipts) ??
+        'End your turn now; Dealer will wake this mailbox when the reply arrives.',
     };
   }
 
@@ -953,6 +978,7 @@ async function runSessionCommand(
       },
       filePaths: v.attach as string[] | undefined,
     });
+    const queuedNextStep = summarizeNextStep('reply', emitted.receipts);
     return {
       replyId: emitted.messageId,
       threadId: route.threadId,
@@ -960,6 +986,7 @@ async function runSessionCommand(
       targetMailbox: route.targetMailbox,
       replyMailbox,
       receipts: emitted.receipts,
+      ...(queuedNextStep !== undefined ? { next: queuedNextStep } : {}),
     };
   }
 
@@ -989,6 +1016,7 @@ async function runSessionCommand(
     },
     filePaths: v.attach as string[] | undefined,
   });
+  const queuedNextStep = summarizeNextStep('settle', emitted.receipts);
   return {
     settlementId: emitted.messageId,
     threadId: route.threadId,
@@ -996,6 +1024,7 @@ async function runSessionCommand(
     targetNodeId: route.peerNodeId,
     targetMailbox: route.targetMailbox,
     receipts: emitted.receipts,
+    ...(queuedNextStep !== undefined ? { next: queuedNextStep } : {}),
   };
 }
 
@@ -1003,13 +1032,16 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
   let owned: DealerNodeRuntime | undefined;
+  // An ephemeral CLI runtime exits with this command; queued mail needs the daemon's
+  // background redrive to survive that exit.
+  let queuedForRedrive = false;
   try {
     const { values: v, positionals: p } = parse(argv);
     const [group, action] = p;
     if (v.help === true || group === 'help') {
       stdout(JSON.stringify({
         ok: true,
-        usage: 'dealer <send|reply|ask|settle|inbox|thread|worktree|node|project|setup|route|source> [options]',
+        usage: 'dealer <send|reply|ask|settle|inbox|thread|outbox|worktree|node|project|setup|route|source> [options]',
         commands: {
           send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--attach <path>] [--json]',
           reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
@@ -1017,6 +1049,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
           inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
           thread: 'dealer thread <show|list> [<threadId>] [--json]',
+          outbox: 'dealer outbox <list|flush> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
         },
       }, null, v.json ? undefined : 2));
       return 0;
@@ -1417,7 +1450,38 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         priority: rawUrgency === 'critical' ? 'urgent' : (rawUrgency as 'normal' | 'high' | undefined),
       });
       const published = result as any;
-      result = { ...published, ok: true, mode: group, published, threadId: published.envelope?.threadId ?? threadId ?? published.messageId, targetMailbox: targetMailbox ?? null, replyMailbox: published.envelope?.semantic?.replyMailbox ?? replyMailbox ?? null, next: `Wait for wakeup in this session, or inspect thread via: dealer thread show ${published.envelope?.threadId ?? threadId ?? published.messageId} --json` };
+      result = {
+        ...published,
+        ok: true,
+        mode: group,
+        published,
+        threadId: published.envelope?.threadId ?? threadId ?? published.messageId,
+        targetMailbox: targetMailbox ?? null,
+        replyMailbox: published.envelope?.semantic?.replyMailbox ?? replyMailbox ?? null,
+        next:
+          summarizeNextStep(group, published.receipts ?? []) ??
+          `Wait for wakeup in this session, or inspect thread via: dealer thread show ${published.envelope?.threadId ?? threadId ?? published.messageId} --json`,
+      };
+    } else if (group === 'outbox') {
+      if (action === 'list') {
+        const status = (typeof v.status === 'string' ? v.status : 'all') as
+          | OutboxItemStatus
+          | 'all';
+        if (!['queued', 'delivered', 'failed', 'all'].includes(status)) {
+          throw new Error('--status must be queued, delivered, failed or all');
+        }
+        result = runtime.listOutbox({
+          ...(typeof v.network === 'string' ? { networkId: String(v.network) } : {}),
+          status,
+        });
+      } else if (action === 'flush') {
+        result = await runtime.flushOutbox({
+          ...(typeof v.id === 'string' ? { id: String(v.id) } : {}),
+          ...(v.force === true ? { force: true } : {}),
+        });
+      } else {
+        throw new Error('Unknown outbox command; use list or flush');
+      }
     } else if ((group === 'route' || group === 'source') && action === 'add') {
       if (owned && group === 'source') {
         throw new Error('Start dealer node up before adding a live source');
@@ -1455,6 +1519,13 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     } else {
       throw new Error('Unknown command; see skills/the-dealer/SKILL.md');
     }
+    if (
+      owned &&
+      (['send', 'broadcast', 'ask', 'reply', 'settle'].includes(group ?? '') ||
+        (group === 'outbox' && action === 'flush'))
+    ) {
+      queuedForRedrive = true;
+    }
     stdout(JSON.stringify(result, null, v.json ? undefined : 2));
     return 0;
   } catch (error) {
@@ -1462,7 +1533,22 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     return 1;
   } finally {
     if (owned) {
+      const stateDirForDaemon = resolve(options.stateDir ?? defaultStateDir());
+      const pending = queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0;
       await owned.stop();
+      if (pending) {
+        // The command durability contract outlives this process: start the supervisor so
+        // outstanding obligations keep redriving after the CLI exits.
+        try {
+          await ensureDaemonRunning(stateDirForDaemon);
+        } catch (error) {
+          stderr(JSON.stringify({
+            warning: `Messages remain queued in the outbox but the background daemon could not start: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          }));
+        }
+      }
     }
   }
 }

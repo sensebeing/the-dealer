@@ -1,14 +1,28 @@
 import { createServer, createConnection, type Socket, type Server } from 'node:net';
 import { createSocket, type Socket as DatagramSocket } from 'node:dgram';
 import { createReadStream, createWriteStream } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { mkdir, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { tmpdir, networkInterfaces } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import {
+  OfflinePeerSpooledError,
+  PeerUnreachableError,
   deriveNetworkKeys,
   generateNodeKeyPair,
   sealNetworkFrame,
@@ -147,6 +161,11 @@ export function blake3(bytes: Uint8Array): string {
 }
 
 const MAX_FRAME = 8 * 1024 * 1024;
+/** Maximum raw attachment bytes spooled alongside one relay entry (base64 inflates on the wire). */
+const MAX_RELAY_SPOOL_BLOB_BYTES = 8 * 1024 * 1024;
+const RELAY_SPOOL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_RELAY_SPOOL_ENTRIES = 256;
+const RELAY_SPOOL_SCHEMA = 'the-dealer-relay-spool/v1';
 const GROUP = '239.255.42.99';
 // A relay candidate means the advertised endpoint may be NAT-bound; fail over fast
 // instead of waiting the full request timeout on every unicast.
@@ -305,6 +324,8 @@ class SocketReader {
 export interface TransportPluginOptions {
   localNodeId?: string;
   discoveryDir?: string;
+  /** Durable directory for the always-on relay store-and-forward spool and blob cache. */
+  spoolDir?: string;
   listenPort?: number;
   listenHost?: string;
   advertisedHost?: string;
@@ -331,6 +352,37 @@ interface Tunnel {
 /** How this node reaches a peer whose advertised endpoint is not routable from here. */
 type PeerFallback = { tunnel: Tunnel } | { mount: Mount; seed: string };
 
+/** Relay attempt policy: spooling and attachment bytes are only offered to relay seeds. */
+interface RelayRequestOptions {
+  spoolIfOffline?: boolean;
+  blobHashes?: readonly string[];
+}
+
+const PROTOCOL_FAILURE =
+  /Response binding mismatch|Unable to authenticate or decode|Unsupported frame protocol|Frame swarmTopicId|Invalid frame|Unknown swarm|Invalid endpoint/;
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+/** One sealed frame (and its small attachment cache) parked on an always-on relay seed. */
+export interface SpooledRelayEntry {
+  id: string;
+  targetNodeId: string;
+  networkId: string;
+  frame: SealedNetworkFrame;
+  /** hash -> base64 content, bounded by MAX_RELAY_SPOOL_BLOB_BYTES per entry. */
+  blobs?: Record<string, string>;
+  spooledAt: string;
+  expiresAt: string;
+}
+
+interface RelaySpoolFile {
+  schema: typeof RELAY_SPOOL_SCHEMA;
+  networkId: string;
+  entries: SpooledRelayEntry[];
+}
+
 interface Mount {
   config: NetworkMountConfig;
   keys: DerivedNetworkKeys;
@@ -343,6 +395,10 @@ interface Mount {
   inboundTunnels: Map<string, Tunnel>;
   /** Persistent tunnels this node keeps open towards its seeds, keyed by verified seed node. */
   outboundTunnels: Map<string, { socket: Socket; seed: string; acked: boolean }>;
+  /** Store-and-forward frames waiting for an offline target, keyed by target node, FIFO. */
+  relaySpool: Map<string, SpooledRelayEntry[]>;
+  /** Durable spool snapshot for this network, when spoolDir is configured. */
+  spoolFile?: string;
   file: string;
   lastSeedProbeAt: number;
 }
@@ -397,6 +453,12 @@ export class P2PTransportService implements TransportService {
   private closed = false;
   private sockets = new Set<Socket>();
   private blobs = new Map<string, { path: string; size: number }>();
+  /** Per-target drain locks: only one spool drain may run for a (network, target) pair. */
+  private spoolDrains = new Map<string, Promise<void>>();
+  /** Last drain attempt per target, so repeated beacons never hammer an offline endpoint. */
+  private spoolDrainAttempts = new Map<string, number>();
+  /** Relay-spooled attachment hashes, scoped by network swarm topic for strict isolation. */
+  private spooledBlobs = new Set<string>();
 
   constructor(options: TransportPluginOptions = {}, ctx?: Context) {
     this.options = options;
@@ -535,7 +597,7 @@ export class P2PTransportService implements TransportService {
     );
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const file = join(dir, `${createHash('sha256').update(this.localNodeId).digest('hex')}.json`);
-    const mount = {
+    const mount: Mount = {
       config: structuredClone(config),
       keys,
       peers: new Map<string, string>(),
@@ -543,9 +605,14 @@ export class P2PTransportService implements TransportService {
       relays: new Map<string, string>(),
       inboundTunnels: new Map<string, Tunnel>(),
       outboundTunnels: new Map<string, { socket: Socket; seed: string; acked: boolean }>(),
+      relaySpool: new Map<string, SpooledRelayEntry[]>(),
+      ...(this.options.spoolDir
+        ? { spoolFile: join(resolve(this.options.spoolDir), `${keys.swarmTopicId}.json`) }
+        : {}),
       file,
       lastSeedProbeAt: Number.NEGATIVE_INFINITY,
     };
+    this.loadRelaySpool(mount);
     this.mounts.set(config.networkId, mount);
     try {
       await this.announce(mount);
@@ -632,6 +699,377 @@ export class P2PTransportService implements TransportService {
     );
   }
 
+  /** Make a file addressable by its content hash, exactly like `shareFile` does. */
+  registerBlob(hash: string, filePath: string): void {
+    if (!/^[a-f0-9]{64}$/.test(hash)) {
+      throw new Error('Invalid blob hash');
+    }
+    const info = statSync(filePath);
+    if (!info.isFile()) {
+      throw new Error('Blob path is not a file');
+    }
+    this.blobs.set(hash, { path: filePath, size: info.size });
+  }
+
+  private spoolBlobDirectory(): string {
+    return this.options.spoolDir
+      ? join(resolve(this.options.spoolDir), 'blobs')
+      : join(tmpdir(), 'the-dealer-relay-blobs');
+  }
+
+  private loadRelaySpool(m: Mount): void {
+    const spoolFile = m.spoolFile;
+    if (!spoolFile || !existsSync(spoolFile)) {
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(spoolFile, 'utf8'));
+    } catch {
+      throw new Error('Invalid relay spool store');
+    }
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      (parsed as RelaySpoolFile).schema !== RELAY_SPOOL_SCHEMA ||
+      (parsed as RelaySpoolFile).networkId !== m.config.networkId ||
+      !Array.isArray((parsed as RelaySpoolFile).entries)
+    ) {
+      throw new Error('Invalid relay spool store');
+    }
+    const now = Date.now();
+    const entries = (parsed as RelaySpoolFile).entries.filter(entry => {
+      if (
+        typeof entry !== 'object' ||
+        entry === null ||
+        typeof entry.id !== 'string' ||
+        !entry.id ||
+        typeof entry.targetNodeId !== 'string' ||
+        !entry.targetNodeId ||
+        entry.networkId !== m.config.networkId ||
+        typeof entry.spooledAt !== 'string' ||
+        typeof entry.expiresAt !== 'string' ||
+        !Number.isFinite(Date.parse(entry.expiresAt)) ||
+        entry.frame?.protocol !== 'the-dealer-wire/v1' ||
+        entry.frame.swarmTopicId !== m.keys.swarmTopicId ||
+        typeof entry.frame.nonce !== 'string' ||
+        (entry.blobs !== undefined &&
+          (typeof entry.blobs !== 'object' ||
+            entry.blobs === null ||
+            Array.isArray(entry.blobs) ||
+            Object.values(entry.blobs).some(value => typeof value !== 'string')))
+      ) {
+        throw new Error('Invalid relay spool store');
+      }
+      return Date.parse(entry.expiresAt) > now;
+    });
+    entries.sort(
+      (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
+    );
+    for (const entry of entries) {
+      const queue = m.relaySpool.get(entry.targetNodeId) ?? [];
+      queue.push(entry);
+      m.relaySpool.set(entry.targetNodeId, queue);
+    }
+    // Expired entries are dropped from the durable snapshot during mount.
+    this.persistRelaySpool(m);
+  }
+
+  private persistRelaySpool(m: Mount): void {
+    const spoolFile = m.spoolFile;
+    if (!spoolFile) {
+      return;
+    }
+    const state: RelaySpoolFile = {
+      schema: RELAY_SPOOL_SCHEMA,
+      networkId: m.config.networkId,
+      entries: [...m.relaySpool.values()].flat(),
+    };
+    mkdirSync(dirname(spoolFile), { recursive: true, mode: 0o700 });
+    const temporary = `${spoolFile}.${randomUUID()}.tmp`;
+    try {
+      const fd = openSync(temporary, 'wx', 0o600);
+      try {
+        writeFileSync(fd, JSON.stringify(state));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, spoolFile);
+    } finally {
+      rmSync(temporary, { force: true });
+    }
+  }
+
+  /** Drop expired entries and enforce the per-target spool bound before appending. */
+  private pruneRelaySpool(m: Mount): boolean {
+    const now = Date.now();
+    let changed = false;
+    for (const [target, entries] of m.relaySpool) {
+      const live = entries.filter(entry => Date.parse(entry.expiresAt) > now);
+      if (live.length !== entries.length) {
+        changed = true;
+        if (live.length) {
+          m.relaySpool.set(target, live);
+        } else {
+          m.relaySpool.delete(target);
+        }
+      }
+    }
+    return changed;
+  }
+
+  /** Stable dedup key: the signed envelope id when the frame carries one, else the nonce. */
+  private relaySpoolEntryId(m: Mount, frame: SealedNetworkFrame): string {
+    const inner = unsealNetworkFrame<Record<string, unknown>>(frame, m.keys);
+    let candidate: unknown = inner;
+    if (
+      typeof inner === 'object' &&
+      inner !== null &&
+      typeof inner.dataBase64 === 'string'
+    ) {
+      try {
+        candidate = JSON.parse(Buffer.from(inner.dataBase64, 'base64').toString('utf8'));
+      } catch {
+        candidate = undefined;
+      }
+    }
+    const envelope = (candidate as { envelope?: { id?: unknown } } | undefined)?.envelope;
+    if (envelope && typeof envelope.id === 'string' && envelope.id.length > 0) {
+      return envelope.id;
+    }
+    return `nonce:${frame.nonce}`;
+  }
+
+  private spoolBlobKey(m: Mount, hash: string): string {
+    return `${m.keys.swarmTopicId}\n${hash}`;
+  }
+
+  private writeSpoolBlob(m: Mount, hash: string, bytes: Buffer): string {
+    const directory = this.spoolBlobDirectory();
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const blobPath = join(directory, hash);
+    const temporary = `${blobPath}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, bytes, { mode: 0o600 });
+      renameSync(temporary, blobPath);
+    } finally {
+      rmSync(temporary, { force: true });
+    }
+    this.registerBlob(hash, blobPath);
+    this.spooledBlobs.add(this.spoolBlobKey(m, hash));
+    return blobPath;
+  }
+
+  /**
+   * Serve a hash from this network's relay spool only. The in-memory set covers blobs written
+   * by this process; persisted entries are decoded lazily after a seed restart, so a durable
+   * spool remains useful without re-hashing every attachment during mount.
+   */
+  private async readSpooledBlob(m: Mount, hash: string): Promise<Buffer | undefined> {
+    if (this.spooledBlobs.has(this.spoolBlobKey(m, hash))) {
+      const blob = this.blobs.get(hash);
+      if (blob) {
+        try {
+          const bytes = await readFile(blob.path);
+          if (blake3(bytes) !== hash) {
+            throw new Error('Invalid cached blob');
+          }
+          return bytes;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error;
+          }
+          this.spooledBlobs.delete(this.spoolBlobKey(m, hash));
+        }
+      }
+    }
+    for (const entries of m.relaySpool.values()) {
+      for (const entry of entries) {
+        const encoded = entry.blobs?.[hash];
+        if (encoded === undefined) {
+          continue;
+        }
+        const bytes = Buffer.from(encoded, 'base64');
+        if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
+          throw new Error('Invalid cached blob');
+        }
+        this.writeSpoolBlob(m, hash, bytes);
+        return bytes;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Store a sealed frame for an offline target. Only a member holding the network key can
+   * reach this path: the caller already unsealed the frame, and every attachment is verified
+   * against its declared BLAKE3 hash before it becomes addressable.
+   */
+  private spoolRelayFrame(
+    m: Mount,
+    target: string,
+    frame: SealedNetworkFrame,
+    blobs: unknown,
+  ): { spooled: true; seedNodeId: string; spoolId: string } {
+    const verifiedBlobs: Record<string, string> = {};
+    if (blobs !== undefined) {
+      if (typeof blobs !== 'object' || blobs === null || Array.isArray(blobs)) {
+        throw new Error('Invalid relay spool blobs');
+      }
+      let total = 0;
+      for (const [hash, encoded] of Object.entries(blobs)) {
+        if (!/^[a-f0-9]{64}$/.test(hash) || typeof encoded !== 'string') {
+          throw new Error('Invalid relay spool blob');
+        }
+        const bytes = Buffer.from(encoded, 'base64');
+        if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
+          throw new Error('Invalid relay spool blob');
+        }
+        total += bytes.length;
+        if (total > MAX_RELAY_SPOOL_BLOB_BYTES) {
+          throw new Error('Relay spool blobs exceed limit');
+        }
+        this.writeSpoolBlob(m, hash, bytes);
+        verifiedBlobs[hash] = encoded;
+      }
+    }
+    this.pruneRelaySpool(m);
+    const id = this.relaySpoolEntryId(m, frame);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + RELAY_SPOOL_TTL_MS).toISOString();
+    const entries = m.relaySpool.get(target) ?? [];
+    const existing = entries.find(entry => entry.id === id);
+    if (existing) {
+      // A redrive re-seals the same envelope with a new nonce; keep FIFO position but
+      // refresh the frame, attachment cache and expiry.
+      existing.frame = frame;
+      existing.expiresAt = expiresAt;
+      if (Object.keys(verifiedBlobs).length) {
+        existing.blobs = { ...(existing.blobs ?? {}), ...verifiedBlobs };
+      }
+    } else {
+      entries.push({
+        id,
+        targetNodeId: target,
+        networkId: m.config.networkId,
+        frame,
+        ...(Object.keys(verifiedBlobs).length ? { blobs: verifiedBlobs } : {}),
+        spooledAt: now.toISOString(),
+        expiresAt,
+      });
+      while (entries.length > MAX_RELAY_SPOOL_ENTRIES) {
+        entries.shift();
+      }
+    }
+    entries.sort(
+      (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
+    );
+    m.relaySpool.set(target, entries);
+    this.persistRelaySpool(m);
+    return { spooled: true, seedNodeId: this.localNodeId, spoolId: id };
+  }
+
+  private spoolDrainKey(m: Mount, peerNodeId: string): string {
+    return `${m.keys.swarmTopicId}\n${peerNodeId}`;
+  }
+
+  private scheduleSpoolDrain(m: Mount, peerNodeId: string, immediate = false): void {
+    if (!m.relaySpool.get(peerNodeId)?.length) {
+      return;
+    }
+    const key = this.spoolDrainKey(m, peerNodeId);
+    const now = Date.now();
+    if (!immediate && now - (this.spoolDrainAttempts.get(key) ?? 0) < 2_000) {
+      return;
+    }
+    this.spoolDrainAttempts.set(key, now);
+    void this.drainRelaySpool(m, peerNodeId).catch(() => {});
+  }
+
+  /** FIFO drain of one target's spool; a per-target lock makes concurrent pulses harmless. */
+  private drainRelaySpool(m: Mount, peerNodeId: string): Promise<void> {
+    const key = this.spoolDrainKey(m, peerNodeId);
+    const prior = this.spoolDrains.get(key) ?? Promise.resolve();
+    const run = prior
+      .catch(() => {})
+      .then(() => this.drainRelaySpoolNow(m, peerNodeId));
+    this.spoolDrains.set(key, run);
+    return run.finally(() => {
+      if (this.spoolDrains.get(key) === run) {
+        this.spoolDrains.delete(key);
+      }
+    });
+  }
+
+  private async drainRelaySpoolNow(m: Mount, peerNodeId: string): Promise<void> {
+    const queued = m.relaySpool.get(peerNodeId);
+    if (!queued?.length || this.closed || !this.mounts.has(m.config.networkId)) {
+      return;
+    }
+    const timeoutMs = Math.min(this.options.socketTimeoutMs ?? 90_000, 30_000);
+    let removed = false;
+    for (const entry of [...queued]) {
+      if (Date.parse(entry.expiresAt) <= Date.now()) {
+        this.removeSpoolEntry(m, peerNodeId, entry.id);
+        removed = true;
+        continue;
+      }
+      try {
+        const tunnel = m.inboundTunnels.get(peerNodeId);
+        let replyFrame: SealedNetworkFrame;
+        if (tunnel) {
+          const reply = await this.requestOverTunnel(
+            tunnel,
+            { type: 'relay_deliver', frame: entry.frame },
+            undefined,
+            timeoutMs,
+          );
+          if (reply?.error) {
+            throw new Error(String(reply.error));
+          }
+          replyFrame = reply.frame;
+        } else {
+          const address = m.peers.get(peerNodeId);
+          if (!address) {
+            break;
+          }
+          replyFrame = await this.directFrame(m, peerNodeId, address, entry.frame, timeoutMs);
+        }
+        const payload = unsealNetworkFrame<{ requestNonce?: string }>(replyFrame, m.keys);
+        if (
+          replyFrame.senderNodeId !== peerNodeId ||
+          payload.requestNonce !== entry.frame.nonce
+        ) {
+          throw new Error('Response binding mismatch');
+        }
+        this.removeSpoolEntry(m, peerNodeId, entry.id);
+        removed = true;
+      } catch {
+        // The target is still offline (or the frame could not be confirmed); keep the
+        // entry and retry on the next tunnel/beacon pulse.
+        break;
+      }
+    }
+    if (removed) {
+      this.persistRelaySpool(m);
+    }
+  }
+
+  private removeSpoolEntry(m: Mount, targetNodeId: string, id: string): void {
+    const queue = m.relaySpool.get(targetNodeId);
+    if (!queue) {
+      return;
+    }
+    const next = queue.filter(entry => entry.id !== id);
+    if (next.length) {
+      m.relaySpool.set(targetNodeId, next);
+    } else {
+      m.relaySpool.delete(targetNodeId);
+    }
+  }
+
   private learn(frame: SealedNetworkFrame, remoteHost?: string): Mount | undefined {
     return this.learnWithMeta(frame, remoteHost).mount;
   }
@@ -680,6 +1118,8 @@ export class P2PTransportService implements TransportService {
         // A fresher beacon that reached us directly makes an obsolete relay seed mapping wrong.
         m.relays.delete(frame.senderNodeId);
       }
+      // A fresh endpoint is the cheapest proof that a spooled target may be reachable again.
+      this.scheduleSpoolDrain(m, frame.senderNodeId);
     }
     return { mount: m, reply: beacon.reply === true };
   }
@@ -884,6 +1324,7 @@ export class P2PTransportService implements TransportService {
     target: string,
     frame: SealedNetworkFrame,
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
+    options: RelayRequestOptions = {},
   ): Promise<Uint8Array> {
     // The caller's timeout is the whole exchange budget, not a per-attempt allowance: a
     // blackholed direct endpoint followed by hanging relay seeds must not multiply it.
@@ -893,7 +1334,7 @@ export class P2PTransportService implements TransportService {
     // Any fallback means the advertised endpoint may be NAT-bound; fail over fast
     // instead of waiting the full request timeout on the direct attempt.
     const fallbacks = this.peerFallbacks(target, [m]);
-    let lastError: Error = new Error(`Unknown peer: ${target}`);
+    let lastError: Error = new PeerUnreachableError(target, `Unknown peer: ${target}`);
     if (address) {
       try {
         return await this.directExchange(
@@ -904,14 +1345,20 @@ export class P2PTransportService implements TransportService {
           fallbacks.length ? Math.min(remaining(), RELAY_CONNECT_TIMEOUT_MS) : remaining(),
         );
       } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-        if (!fallbacks.length) {
+        lastError = asError(error);
+        // A signature/binding failure is never an offline symptom: retrying it through a
+        // relay or queueing it in an outbox would hide a real security decision.
+        if (PROTOCOL_FAILURE.test(lastError.message)) {
           throw lastError;
+        }
+        if (!fallbacks.length) {
+          throw this.unreachable(target, lastError);
         }
       }
     } else if (!fallbacks.length) {
-      throw lastError;
+      throw this.unreachable(target, lastError);
     }
+    let blobs: Promise<Record<string, string>> | undefined;
     for (const [index, fallback] of fallbacks.entries()) {
       if (Date.now() >= deadline) {
         break;
@@ -920,14 +1367,70 @@ export class P2PTransportService implements TransportService {
       // starve a live seed behind it, and the total still obeys the caller's deadline.
       const attemptTimeoutMs = Math.max(1, Math.floor(remaining() / (fallbacks.length - index)));
       try {
-        return 'tunnel' in fallback
-          ? await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, attemptTimeoutMs)
-          : await this.relayExchange(m, fallback.seed, target, frame, attemptTimeoutMs);
+        if ('tunnel' in fallback) {
+          return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, attemptTimeoutMs);
+        }
+        const relayBlobs = options.blobHashes?.length
+          ? await (blobs ??= this.readSpoolBlobs(options.blobHashes))
+          : undefined;
+        return await this.relayExchange(
+          m,
+          fallback.seed,
+          target,
+          frame,
+          attemptTimeoutMs,
+          {
+            ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
+            ...(relayBlobs && Object.keys(relayBlobs).length ? { blobs: relayBlobs } : {}),
+          },
+        );
       } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
+        // A confirmed spool is a successful handoff to durable relay storage: never try a
+        // second seed, which would duplicate entries and extend the caller's latency.
+        if (error instanceof OfflinePeerSpooledError) {
+          throw error;
+        }
+        lastError = asError(error);
       }
     }
-    throw lastError;
+    throw this.unreachable(target, lastError);
+  }
+
+  /** Keep transport reachability decisions in one place; protocol/security errors pass through. */
+  private unreachable(target: string, error: Error): Error {
+    if (
+      error instanceof OfflinePeerSpooledError ||
+      error instanceof PeerUnreachableError ||
+      PROTOCOL_FAILURE.test(error.message)
+    ) {
+      return error;
+    }
+    return new PeerUnreachableError(target, error.message, { cause: error });
+  }
+
+  /**
+   * Read the sender's attachment cache for one relay_send request. The whole JSON packet,
+   * including base64 expansion, must stay inside the transport frame limit.
+   */
+  private async readSpoolBlobs(hashes: readonly string[]): Promise<Record<string, string>> {
+    const blobs: Record<string, string> = {};
+    let total = 0;
+    for (const hash of new Set(hashes)) {
+      const blob = this.blobs.get(hash);
+      if (!blob || total + blob.size > RELAY_BLOB_LIMIT) {
+        continue;
+      }
+      const bytes = await readFile(blob.path);
+      if (blake3(bytes) !== hash) {
+        throw new Error('Attachment content changed before relay spooling');
+      }
+      if (total + bytes.length > RELAY_BLOB_LIMIT) {
+        continue;
+      }
+      blobs[hash] = bytes.toString('base64');
+      total += bytes.length;
+    }
+    return blobs;
   }
 
   /**
@@ -1005,21 +1508,37 @@ export class P2PTransportService implements TransportService {
     return Buffer.from(payload.dataBase64, 'base64');
   }
 
-  /** Blind forward: the seed never reads the payload, only authenticates the sealed frame. */
+  /** Forward a sealed frame and, when offered, durably spool it on an always-on seed. */
   private async relayExchange(
     m: Mount,
     seed: string,
     target: string,
     frame: SealedNetworkFrame,
     timeoutMs: number,
+    options: { spoolIfOffline?: boolean; blobs?: Record<string, string> } = {},
   ): Promise<Uint8Array> {
     const socket = this.track(createConnection(parseEndpoint(seed)));
     socket.setTimeout(timeoutMs);
     try {
-      socket.write(packet({ type: 'relay', target, frame }));
+      socket.write(packet({
+        type: 'relay_send',
+        networkId: m.config.networkId,
+        target,
+        frame,
+        ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
+        ...(options.blobs && Object.keys(options.blobs).length
+          ? { blobs: options.blobs }
+          : {}),
+      }));
       const response = await new SocketReader(socket).json();
       if (response?.error) {
         throw new Error(String(response.error));
+      }
+      if (response?.spooled === true) {
+        if (typeof response.seedNodeId !== 'string' || typeof response.spoolId !== 'string') {
+          throw new Error('Invalid relay spool response');
+        }
+        throw new OfflinePeerSpooledError(target, response.seedNodeId, response.spoolId);
       }
       const payload = unsealNetworkFrame<{
         requestNonce: string;
@@ -1069,7 +1588,13 @@ export class P2PTransportService implements TransportService {
     if (!m) {
       throw new Error(`Network not mounted: ${networkId}`);
     }
-    return this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs);
+    // Every unicast frame is eligible for durable storage on a relay seed; the seed only
+    // spools after live tunnel and direct delivery both fail. Attachment hashes come from
+    // the caller, so transport never parses envelope business semantics.
+    return this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs, {
+      spoolIfOffline: true,
+      blobHashes: opts?.spoolBlobHashes ?? [],
+    });
   }
 
   /** Same-machine mode: deliver a frame addressed to this node without opening a socket. */
@@ -1278,6 +1803,9 @@ export class P2PTransportService implements TransportService {
       previous.socket.destroy();
     }
     socket.write(packet({ type: 'tunnel_ack' }));
+    // The target just proved it is online; drain its durable store-and-forward queue
+    // before serving any further requests, so a returning peer receives mail immediately.
+    this.scheduleSpoolDrain(mount, peerNodeId, true);
     socket.once('close', () => {
       if (mount.inboundTunnels.get(peerNodeId) === tunnel) {
         mount.inboundTunnels.delete(peerNodeId);
@@ -1404,31 +1932,54 @@ export class P2PTransportService implements TransportService {
       await this.serveInboundTunnel(socket, request.frame);
       return;
     }
-    if (request.type === 'relay') {
+    if (request.type === 'relay' || request.type === 'relay_send') {
       const frame: SealedNetworkFrame = request.frame;
       const mount = [...this.mounts.values()].find(
         m => m.keys.swarmTopicId === frame?.swarmTopicId,
       );
       if (!mount) throw new Error('Unknown swarm');
+      if (
+        request.networkId !== undefined &&
+        request.networkId !== mount.config.networkId
+      ) {
+        throw new Error('Relay network mismatch');
+      }
+      // Membership proof: only a holder of the network key may relay or spool a frame.
       unsealNetworkFrame(frame, mount.keys);
       const target = typeof request.target === 'string' ? request.target : '';
       if (!target) throw new Error('Invalid relay target');
-      const tunnel = mount.inboundTunnels.get(target);
-      let replyFrame: SealedNetworkFrame;
-      if (tunnel) {
-        const reply = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, socket);
-        if (reply?.error) throw new Error(String(reply.error));
-        replyFrame = reply.frame;
-      } else {
-        replyFrame = await this.directFrame(
-          mount,
-          target,
-          this.endpointFor(mount, target),
-          frame,
-          this.options.socketTimeoutMs ?? 90_000,
-        );
+      const spoolIfOffline = request.spoolIfOffline === true;
+      let liveError: Error | undefined;
+      try {
+        const tunnel = mount.inboundTunnels.get(target);
+        let replyFrame: SealedNetworkFrame;
+        if (tunnel) {
+          const reply = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, socket);
+          if (reply?.error) throw new Error(String(reply.error));
+          replyFrame = reply.frame;
+        } else {
+          // A spoolable request must fail over fast: an unreachable advertised endpoint
+          // can never be allowed to burn the sender's whole frame budget before spooling.
+          const directTimeoutMs = spoolIfOffline
+            ? Math.min(this.options.socketTimeoutMs ?? 90_000, RELAY_CONNECT_TIMEOUT_MS)
+            : this.options.socketTimeoutMs ?? 90_000;
+          replyFrame = await this.directFrame(
+            mount,
+            target,
+            this.endpointFor(mount, target),
+            frame,
+            directTimeoutMs,
+          );
+        }
+        socket.end(packet({ ok: true, frame: replyFrame }));
+        return;
+      } catch (error) {
+        liveError = asError(error);
       }
-      socket.end(packet({ frame: replyFrame }));
+      if (!spoolIfOffline) {
+        throw liveError;
+      }
+      socket.end(packet(this.spoolRelayFrame(mount, target, frame, request.blobs)));
       return;
     }
     if (request.type === 'relay_blob') {
@@ -1439,6 +1990,14 @@ export class P2PTransportService implements TransportService {
       const target = typeof request.target === 'string' ? request.target : '';
       const hash = typeof request.hash === 'string' ? request.hash : '';
       if (!target || !/^[a-f0-9]{64}$/.test(hash)) throw new Error('Invalid relay blob request');
+      // The seed's own spool is authoritative: serve it before trying to reach the
+      // original sender, which may itself be offline. The lookup is network-scoped.
+      const cached = await this.readSpooledBlob(mount, hash);
+      if (cached) {
+        socket.write(packet({ size: cached.length }));
+        socket.end(cached);
+        return;
+      }
       const tunnel = mount.inboundTunnels.get(target);
       const bytes = tunnel
         ? await this.blobOverTunnel(tunnel, hash, socket)
@@ -1589,16 +2148,28 @@ export class P2PTransportService implements TransportService {
       throw new Error('Transport endpoint unavailable');
     }
     const fallbacks = nodeId === this.localNodeId ? [] : this.peerFallbacks(nodeId, this.mounts.values());
+    // Relay seeds keep a content-addressed cache of spooled attachments. When the original
+    // sender is now offline, ask each configured seed *inside that seed's own network* so
+    // the blob cache never becomes a cross-network read path. writeBlob still proves BLAKE3.
+    const seedFallbacks = new Map<string, { mount: Mount; seed: string }>();
+    if (nodeId !== this.localNodeId) {
+      for (const mount of this.mounts.values()) {
+        for (const seed of mount.config.bootstrapPeers ?? []) {
+          if (seed === this.endpointAddr || seed === address) {
+            continue;
+          }
+          seedFallbacks.set(`${mount.keys.swarmTopicId}\n${seed}`, { mount, seed });
+        }
+      }
+    }
     try {
+      let lastError: unknown;
       try {
         await this.fetchBlobDirect(address, hash, size, temp, fallbacks.length > 0);
       } catch (error) {
-        if (!fallbacks.length) {
-          throw error;
-        }
+        lastError = error;
         // The advertised endpoint is NAT-bound: try the peer's own tunnel to this node,
         // then every seed that can relay to it, until one transfer walks the hash.
-        let lastError: unknown = error;
         for (const fallback of fallbacks) {
           await rm(temp, { force: true });
           try {
@@ -1613,9 +2184,22 @@ export class P2PTransportService implements TransportService {
             lastError = next;
           }
         }
-        if (lastError !== undefined) {
-          throw lastError;
+        // The sender may be the one offline; its relay seed still holds the spooled blob.
+        for (const seedFallback of seedFallbacks.values()) {
+          if (lastError === undefined) {
+            break;
+          }
+          await rm(temp, { force: true });
+          try {
+            await this.fetchBlobRelay(seedFallback, nodeId, hash, size, temp);
+            lastError = undefined;
+          } catch (next) {
+            lastError = next;
+          }
         }
+      }
+      if (lastError !== undefined) {
+        throw lastError;
       }
       await rename(temp, destPath);
     } finally {

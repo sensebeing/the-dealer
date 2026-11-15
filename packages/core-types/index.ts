@@ -140,6 +140,65 @@ export interface SealedNetworkFrame {
   authTag: string;
 }
 
+/**
+ * Transport-level reachability failure: the peer endpoint is unknown, refused or timed
+ * out and no live tunnel or relay seed could carry the frame. Emitters use this marker to
+ * queue an envelope durably instead of treating every transport error as an offline peer.
+ */
+export class PeerUnreachableError extends Error {
+  readonly code = 'peer_unreachable';
+  readonly targetNodeId: string;
+
+  constructor(targetNodeId: string, message?: string, options?: { cause?: unknown }) {
+    super(message ?? `Peer unreachable: ${targetNodeId}`, options);
+    this.name = 'PeerUnreachableError';
+    this.targetNodeId = targetNodeId;
+  }
+}
+
+/**
+ * The frame was safely accepted by an always-on relay seed's store-and-forward spool while
+ * the target peer was offline. The sender still queues its own outbox entry until a live
+ * end-to-end receipt proves the target received it.
+ */
+export class OfflinePeerSpooledError extends Error {
+  readonly code = 'offline_peer_spooled';
+  readonly targetNodeId: string;
+  readonly seedNodeId: string;
+  readonly spoolId: string;
+
+  constructor(targetNodeId: string, seedNodeId: string, spoolId: string) {
+    super(`Peer ${targetNodeId} is offline; frame spooled on relay seed ${seedNodeId} as ${spoolId}`);
+    this.name = 'OfflinePeerSpooledError';
+    this.targetNodeId = targetNodeId;
+    this.seedNodeId = seedNodeId;
+    this.spoolId = spoolId;
+  }
+}
+
+export function isPeerUnreachableError(error: unknown): error is PeerUnreachableError {
+  return (
+    error instanceof PeerUnreachableError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'peer_unreachable')
+  );
+}
+
+export function isOfflinePeerSpooledError(error: unknown): error is OfflinePeerSpooledError {
+  return (
+    error instanceof OfflinePeerSpooledError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'offline_peer_spooled')
+  );
+}
+
+/** True only for failures that mean the target peer is currently offline or unreachable. */
+export function isPeerOfflineError(error: unknown): boolean {
+  return isPeerUnreachableError(error) || isOfflinePeerSpooledError(error);
+}
+
 export interface InboundFrameEvent {
   networkId: string;
   senderNodeId: string;
@@ -161,11 +220,17 @@ export interface TransportService {
   unmountNetwork(networkId: string): Promise<void>;
   listMountedNetworks(): readonly string[];
   registerPeerEndpoint?(networkId: string, peerNodeId: string, endpointAddr: string): void;
+  /** Make a locally available file addressable by its BLAKE3 hash for blob fetches. */
+  registerBlob?(hash: string, filePath: string): void;
   sendUnicast(
     networkId: string,
     targetNodeId: string,
     frame: Uint8Array,
-    opts?: { timeoutMs?: number },
+    opts?: {
+      timeoutMs?: number;
+      /** Content hashes the sender offers to an always-on relay seed for offline spooling. */
+      spoolBlobHashes?: readonly string[];
+    },
   ): Promise<Uint8Array>;
   sendMulticast(
     networkId: string,
@@ -217,6 +282,11 @@ export interface EmitMessageInput<T = Record<string, unknown>> {
   semantic?: SemanticHeaderInput;
   attachments?: readonly BlobAttachment[];
   filePaths?: readonly string[];
+  /**
+   * Defaults to true when the runtime configures a durable outbox: an unreachable target
+   * is queued locally (and spooled on a relay seed when available) instead of failing emit.
+   */
+  queueIfOffline?: boolean;
 }
 
 export interface EmitResult {
