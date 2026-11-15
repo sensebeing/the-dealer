@@ -44,6 +44,7 @@ import {
   signEnvelope,
   signNodeCard,
   signReceipt,
+  unsealNetworkFrame,
 } from '../packages/core-types/index.ts';
 import type {
   DeliveryReceipt,
@@ -53,6 +54,7 @@ import type {
   MessageEnvelope,
   NodeCard,
   NodeService,
+  SealedNetworkFrame,
   TransportService,
 } from '../packages/core-types/index.ts';
 
@@ -1445,6 +1447,11 @@ test('session --ack validates before sending and only burns the lease after comm
     assert.equal(rejecting.emitCalls.length, 1);
     rejecting.store.assertAckableLease(rejecting.leaseId);
     assert.equal(inboundStatus(rejecting.store, rejecting.inboundId), 'leased');
+    assert.equal(
+      JSON.parse(rejected.stdout.join('')).acked,
+      false,
+      'a terminal rejection must report that the lease was preserved',
+    );
 
     // A live handoff or a durable outbox obligation commits the send and only then acks.
     const queued = sessionHarness(t, async () => ({
@@ -1462,6 +1469,11 @@ test('session --ack validates before sending and only burns the lease after comm
       argsFor(group, queued.inboundId, queued.leaseId),
     );
     assert.equal(committed.code, 0, committed.stderr);
+    assert.equal(
+      JSON.parse(committed.stdout.join('')).acked,
+      true,
+      'a committed send must report that the lease was burned',
+    );
     assert.equal(queued.store.ack(queued.leaseId).alreadyAcknowledged, true);
     assert.equal(inboundStatus(queued.store, queued.inboundId), 'acked');
   }
@@ -2486,16 +2498,54 @@ function failDirectHop(transport: P2PTransportService, error: Error): void {
   };
 }
 
+/** Read the sender's live view of one peer's sealed discovery beacon expiry. */
+function beaconExpiry(
+  transport: P2PTransportService,
+  networkId: string,
+  nodeId: string,
+): number {
+  const mounts = (transport as unknown as {
+    mounts: Map<string, { beacons: Map<string, { expires: number }> }>;
+  }).mounts;
+  return mounts.get(networkId)?.beacons.get(nodeId)?.expires ?? 0;
+}
+
+/** Decode a sealed relay frame far enough to tell a user envelope from presence gossip. */
+function forwardedMessageEnvelope(
+  frame: SealedNetworkFrame,
+  keys: ReturnType<typeof deriveNetworkKeys>,
+): { id: string; networkId: string } | undefined {
+  try {
+    const forwarded = unsealNetworkFrame<{ dataBase64?: unknown }>(frame, keys);
+    if (typeof forwarded.dataBase64 !== 'string') {
+      return undefined;
+    }
+    const payload = JSON.parse(Buffer.from(forwarded.dataBase64, 'base64').toString('utf8'));
+    return payload?.type === 'message.envelope' &&
+      typeof payload.envelope?.id === 'string' &&
+      typeof payload.envelope?.networkId === 'string'
+      ? { id: payload.envelope.id, networkId: payload.envelope.networkId }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Emulates a pre-76e33d9 seed: it forwards the original `relay` verb with a sealed target
- * reply, but closes the connection for the newer `relay_send` verb it never learned.
+ * reply, but closes the connection for the newer `relay_send` verb it never learned. When
+ * the target's signing key is supplied, a forwarded message envelope is answered exactly
+ * as the live target would: a signed `dispatched` receipt bound to that envelope. Presence
+ * heartbeats also relay through the seed, so `envelopeRelayTypes` records only user sends.
  */
 async function legacyRelaySeed(
   t: TestContext,
   targetNodeId: string,
-): Promise<{ endpoint: string; relayTypes: string[] }> {
+  targetPrivateKeyPem?: string,
+): Promise<{ endpoint: string; relayTypes: string[]; envelopeRelayTypes: string[] }> {
   const keys = deriveNetworkKeys(NETWORK, 'secret');
   const relayTypes: string[] = [];
+  const envelopeRelayTypes: string[] = [];
   const server = createServer(socket => {
     socket.on('error', () => {});
     let buffer = Buffer.alloc(0);
@@ -2514,14 +2564,35 @@ async function legacyRelaySeed(
           return;
         }
         relayTypes.push(String(request.type));
+        const envelope = forwardedMessageEnvelope(request.frame, keys);
+        if (envelope !== undefined) {
+          envelopeRelayTypes.push(String(request.type));
+        }
         if (request.type !== 'relay') {
           socket.destroy();
           return;
         }
+        let dataBase64 = Buffer.from('legacy-relay-pong').toString('base64');
+        if (targetPrivateKeyPem !== undefined && envelope !== undefined) {
+          dataBase64 = Buffer.from(
+            JSON.stringify(
+              signReceipt(
+                {
+                  messageId: envelope.id,
+                  networkId: envelope.networkId,
+                  fromNodeId: targetNodeId,
+                  stage: 'dispatched',
+                  updatedAt: new Date().toISOString(),
+                },
+                targetPrivateKeyPem,
+              ),
+            ),
+          ).toString('base64');
+        }
         const reply = sealNetworkFrame(
           {
             requestNonce: request.frame.nonce,
-            dataBase64: Buffer.from('legacy-relay-pong').toString('base64'),
+            dataBase64,
           },
           keys,
           targetNodeId,
@@ -2545,7 +2616,11 @@ async function legacyRelaySeed(
   if (!address || typeof address === 'string') {
     throw new Error('Invalid legacy relay address');
   }
-  return { endpoint: `127.0.0.1:${address.port}`, relayTypes };
+  return {
+    endpoint: `127.0.0.1:${address.port}`,
+    relayTypes,
+    envelopeRelayTypes,
+  };
 }
 
 test('Darwin host-down, interface-down and AggregateError direct failures fall back to a live relay seed', async t => {
@@ -2717,7 +2792,7 @@ test('classified Darwin connect failures become a durable queued receipt instead
   }
 });
 
-test('spool-enabled send to a pre-upgrade seed queues locally with no in-doubt target', async t => {
+test('spool offer to a pre-upgrade seed retries the legacy verb while the target beacon is fresh', async t => {
   const root = directory(t);
   const ben = runtimeFor(root, 'ben', { discovery: 'mesh' });
   const diz = runtimeFor(root, 'diz', { discovery: 'mesh' });
@@ -2729,7 +2804,59 @@ test('spool-enabled send to a pre-upgrade seed queues locally with no in-doubt t
   });
   await diz.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
   const dizNodeId = diz.node.getSelfCard(NETWORK).nodeId;
-  const legacy = await legacyRelaySeed(t, dizNodeId);
+  const legacy = await legacyRelaySeed(t, dizNodeId, diz.node.privateKeyPem);
+  await ben.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacy.endpoint],
+  });
+  await until(
+    () => ben.node.resolveTarget('member:diz', NETWORK).length === 1,
+    'sender learns the target card',
+  );
+  await until(
+    () => beaconExpiry(ben.transport, NETWORK, dizNodeId) >= Date.now(),
+    'sender learns a fresh target beacon',
+  );
+  failDirectHop(
+    ben.transport,
+    Object.assign(new Error('connect EHOSTDOWN'), { code: 'EHOSTDOWN' }),
+  );
+
+  // The legacy seed drops the `relay_send` offer, but the fresh beacon proves the NAT-bound
+  // target is online. Retrying the original `relay` verb must deliver live, not queue.
+  const emitted = await ben.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v4',
+    subject: 'legacy seed live fallback',
+    body: 'a fresh beacon means the peer is reachable behind the old seed',
+    payload: {},
+  });
+  assert.equal(emitted.receipts.length, 1);
+  assert.equal(emitted.receipts[0]?.stage, 'dispatched');
+  assert.equal(emitted.receipts[0]?.fromNodeId, dizNodeId);
+  assert.deepEqual(legacy.envelopeRelayTypes, ['relay_send', 'relay']);
+  assert.equal(
+    ben.listOutbox({ status: 'queued' }).some(item => item.id === emitted.messageId),
+    false,
+    'a live fallback delivery must not leave a queued obligation',
+  );
+});
+
+test('spool-enabled send to a pre-upgrade seed queues locally once the target beacon expires', async t => {
+  const root = directory(t);
+  const ben = runtimeFor(root, 'ben', { discovery: 'mesh' });
+  const diz = runtimeFor(root, 'diz', { discovery: 'mesh' });
+  await ben.start();
+  await diz.start();
+  t.after(async () => {
+    await ben.stop().catch(() => {});
+    await diz.stop().catch(() => {});
+  });
+  await diz.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const dizNodeId = diz.node.getSelfCard(NETWORK).nodeId;
+  const legacy = await legacyRelaySeed(t, dizNodeId, diz.node.privateKeyPem);
   await ben.mountNetwork({
     networkId: NETWORK,
     passphrase: 'secret',
@@ -2742,6 +2869,13 @@ test('spool-enabled send to a pre-upgrade seed queues locally with no in-doubt t
   failDirectHop(
     ben.transport,
     Object.assign(new Error('connect EHOSTDOWN'), { code: 'EHOSTDOWN' }),
+  );
+  // The peer is only genuinely offline once its last beacon has expired; until then the
+  // sender must trust the beacon and retry the legacy verb instead of queueing.
+  await diz.stop();
+  await until(
+    () => beaconExpiry(ben.transport, NETWORK, dizNodeId) < Date.now(),
+    'the target beacon expires after the peer stops',
   );
 
   const emitted = await ben.emitter.emit({
@@ -2764,7 +2898,7 @@ test('spool-enabled send to a pre-upgrade seed queues locally with no in-doubt t
   assert.deepEqual(item.pendingNodeIds, [dizNodeId]);
   assert.deepEqual(item.inDoubtNodeIds, []);
   assert.deepEqual(item.relaySpooledNodeIds, []);
-  assert.deepEqual(legacy.relayTypes, ['relay_send']);
+  assert.deepEqual(legacy.envelopeRelayTypes, ['relay_send']);
 });
 
 test('malformed relay responses surface as local protocol failures, not offline queueing', async t => {

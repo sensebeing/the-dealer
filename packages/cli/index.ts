@@ -879,9 +879,12 @@ async function runSessionCommand(
       store.assertAckableLease(ackId, callerMailboxFlag);
     }
   };
-  const ackCommittedSend = (receipts: readonly DeliveryReceipt[]): void => {
+  // The returned `acked` is the caller's observable lease outcome: absent when no lease was
+  // passed, true only after the durable commit burned it, false when every receipt was a
+  // terminal failure and the lease was deliberately preserved for a retry.
+  const ackCommittedSend = (receipts: readonly DeliveryReceipt[]): boolean | undefined => {
     if (!ackId) {
-      return;
+      return undefined;
     }
     const committed =
       receipts.length === 0 ||
@@ -890,9 +893,11 @@ async function runSessionCommand(
           isConfirmedHandoffReceipt(receipt, { allowQueued: true }) ||
           !isTerminalDeliveryFailure(receipt),
       );
-    if (committed) {
-      store.ack(ackId, callerMailboxFlag);
+    if (!committed) {
+      return false;
     }
+    store.ack(ackId, callerMailboxFlag);
+    return true;
   };
 
   if (group === 'ask') {
@@ -933,7 +938,7 @@ async function runSessionCommand(
         },
         filePaths: v.attach as string[] | undefined,
       });
-      ackCommittedSend(emitted.receipts);
+      const acked = ackCommittedSend(emitted.receipts);
       return {
         questionId: emitted.messageId,
         threadId: route.threadId,
@@ -944,6 +949,7 @@ async function runSessionCommand(
         next:
           summarizeNextStep('ask', emitted.receipts) ??
           'End your turn now; Dealer will wake this mailbox when the reply arrives.',
+        ...(acked !== undefined ? { acked } : {}),
       };
     }
     const networkId = required(v.network, '--network');
@@ -978,7 +984,7 @@ async function runSessionCommand(
       },
       filePaths: v.attach as string[] | undefined,
     });
-    ackCommittedSend(emitted.receipts);
+    const acked = ackCommittedSend(emitted.receipts);
     const firstReceipt = emitted.receipts[0];
     return {
       questionId: emitted.messageId,
@@ -995,6 +1001,7 @@ async function runSessionCommand(
       next:
         summarizeNextStep('ask', emitted.receipts) ??
         'End your turn now; Dealer will wake this mailbox when the reply arrives.',
+      ...(acked !== undefined ? { acked } : {}),
     };
   }
 
@@ -1026,7 +1033,7 @@ async function runSessionCommand(
       },
       filePaths: v.attach as string[] | undefined,
     });
-    ackCommittedSend(emitted.receipts);
+    const acked = ackCommittedSend(emitted.receipts);
     const queuedNextStep = summarizeNextStep('reply', emitted.receipts);
     return {
       replyId: emitted.messageId,
@@ -1036,6 +1043,7 @@ async function runSessionCommand(
       replyMailbox,
       receipts: emitted.receipts,
       ...(queuedNextStep !== undefined ? { next: queuedNextStep } : {}),
+      ...(acked !== undefined ? { acked } : {}),
     };
   }
 
@@ -1065,7 +1073,7 @@ async function runSessionCommand(
     },
     filePaths: v.attach as string[] | undefined,
   });
-  ackCommittedSend(emitted.receipts);
+  const acked = ackCommittedSend(emitted.receipts);
   const queuedNextStep = summarizeNextStep('settle', emitted.receipts);
   return {
     settlementId: emitted.messageId,
@@ -1075,6 +1083,7 @@ async function runSessionCommand(
     targetMailbox: route.targetMailbox,
     receipts: emitted.receipts,
     ...(queuedNextStep !== undefined ? { next: queuedNextStep } : {}),
+    ...(acked !== undefined ? { acked } : {}),
   };
 }
 

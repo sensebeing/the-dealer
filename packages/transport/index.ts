@@ -2158,6 +2158,7 @@ export class P2PTransportService implements TransportService {
     timeoutMs: number,
     options: { spoolIfOffline?: boolean; spoolKey?: string; blobs?: Record<string, string> } = {},
   ): Promise<Uint8Array> {
+    const startedAt = Date.now();
     const socket = this.track(createConnection(parseEndpoint(seed)));
     socket.setTimeout(timeoutMs);
     try {
@@ -2174,7 +2175,28 @@ export class P2PTransportService implements TransportService {
           ? { blobs: options.blobs }
           : {}),
       }));
-      const response = await new SocketReader(socket).json();
+      let response: any;
+      try {
+        response = await new SocketReader(socket).json();
+      } catch (error) {
+        // A pre-upgrade seed answers a `relay_send` offer by dropping the connection. The
+        // beacon is the only evidence that decides whether that target is still live: with
+        // a fresh beacon the peer is demonstrably online behind NAT, so retrying the
+        // original `relay` verb delivers now instead of queueing a reachable peer; without
+        // one the fast failure is genuine and flows into the durable outbox.
+        if (
+          options.spoolIfOffline === true &&
+          (error as Error | undefined)?.message === 'Truncated stream'
+        ) {
+          const hasFreshBeacon = (m.beacons.get(target)?.expires ?? 0) >= Date.now();
+          const remainingMs = timeoutMs - (Date.now() - startedAt);
+          if (hasFreshBeacon && remainingMs > 0) {
+            socket.destroy();
+            return await this.relayExchange(m, seed, target, frame, remainingMs, {});
+          }
+        }
+        throw error;
+      }
       if (response?.error) {
         throw new LocalDeliveryError(String(response.error));
       }
