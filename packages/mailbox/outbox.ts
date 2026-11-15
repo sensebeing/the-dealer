@@ -735,8 +735,14 @@ export class OutboxRedriveService {
     let attempted = 0;
     let delivered = 0;
     const processed: OutboxItem[] = [];
-    const candidates: OutboxItem[] = [];
+    // One chronological pass: only an item that precedes `candidate` can have blocked its
+    // thread by the time `candidate` is visited, so a scoped `--id` or peer pulse is never
+    // blocked by a later event on the same thread, while a later event still may not
+    // overtake an earlier parked head.
     for (const candidate of allQueued) {
+      if (this.stopped) {
+        break;
+      }
       const threadKey = threadKeyOf(candidate);
       if (options.id !== undefined && candidate.id !== options.id) {
         // An earlier queued event on the same thread was excluded from this scoped flush:
@@ -758,19 +764,6 @@ export class OutboxRedriveService {
         blockedThreads.add(threadKey);
         continue;
       }
-      if (blockedThreads.has(threadKey)) {
-        processed.push(candidate);
-        continue;
-      }
-      candidates.push(candidate);
-    }
-    for (const candidate of candidates) {
-      if (this.stopped) {
-        break;
-      }
-      const threadKey = threadKeyOf(candidate);
-      // A previous iteration may have parked this thread's head (backoff, in-doubt, or a
-      // still-owed target); the later event stays queued without an attempt this pass.
       if (blockedThreads.has(threadKey)) {
         processed.push(candidate);
         continue;

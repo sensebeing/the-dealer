@@ -1321,6 +1321,121 @@ test('outbox redrive honours per-thread causal FIFO without blocking other threa
   }
 });
 
+test('scoped --id flush delivers its head even when a later event shares the thread', async t => {
+  const dir = directory(t);
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  const queued = (id: string) =>
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, 'scoped-net', target, id, 'thread-scoped'),
+      explicitTargets: [target],
+      pendingNodeIds: [target],
+    });
+  const head = queued('evt-0002');
+  const later = queued('evt-0003');
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    deliver: async (candidate, options) => {
+      deliveries.push(candidate.id);
+      const targets = options?.targetNodeIds ?? candidate.pendingNodeIds;
+      return {
+        deliveredReceipts: Object.fromEntries(
+          targets.map(nodeId => [
+            nodeId,
+            {
+              messageId: candidate.envelope.id,
+              networkId: candidate.networkId,
+              fromNodeId: nodeId,
+              stage: 'dispatched' as const,
+              updatedAt: new Date().toISOString(),
+              signature: 'test-signature',
+            },
+          ]),
+        ),
+        pendingNodeIds: [],
+        inDoubtNodeIds: [],
+      };
+    },
+  });
+  t.after(() => service.stop());
+
+  const result = await service.flush({ id: head.id });
+  assert.equal(result.attempted, 1, 'the scoped head itself must be attempted');
+  assert.deepEqual(deliveries, [head.id]);
+  assert.equal(outbox.get(head.id)?.status, 'delivered');
+  assert.equal(
+    outbox.get(later.id)?.status,
+    'queued',
+    'a later event on the same thread must not be delivered by a scoped --id flush',
+  );
+});
+
+test('peer pulse resolves the matching head without letting a later matching event overtake a skipped sibling', async t => {
+  const dir = directory(t);
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const peerP = generateNodeKeyPair().nodeId;
+  const peerQ = generateNodeKeyPair().nodeId;
+  const queued = (id: string, peer: string) =>
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, 'pulse-net', peer, id, 'thread-pulse'),
+      explicitTargets: [peer],
+      pendingNodeIds: [peer],
+    });
+  const head = queued('evt-0002', peerP);
+  const sibling = queued('evt-0003', peerQ);
+  const trailing = queued('evt-0004', peerP);
+  outbox.recordAttempt(head.id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+    inDoubtNodeIds: [peerP],
+  });
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    deliver: async (candidate, options) => {
+      deliveries.push(candidate.id);
+      const targets = options?.targetNodeIds ?? candidate.pendingNodeIds;
+      return {
+        deliveredReceipts: Object.fromEntries(
+          targets.map(nodeId => [
+            nodeId,
+            {
+              messageId: candidate.envelope.id,
+              networkId: candidate.networkId,
+              fromNodeId: nodeId,
+              stage: 'dispatched' as const,
+              updatedAt: new Date().toISOString(),
+              signature: 'test-signature',
+            },
+          ]),
+        ),
+        pendingNodeIds: [],
+        inDoubtNodeIds: [],
+      };
+    },
+  });
+  t.after(() => service.stop());
+
+  const result = await service.flush({
+    force: true,
+    forceMatchingTarget: true,
+    targetNodeId: peerP,
+  });
+  assert.equal(result.attempted, 1, 'only the matching in-doubt head is attempted');
+  assert.deepEqual(deliveries, [head.id]);
+  const resolved = outbox.get(head.id)!;
+  assert.equal(resolved.status, 'delivered', 'the peer pulse resolves the in-doubt head');
+  assert.deepEqual(resolved.inDoubtNodeIds, []);
+  assert.equal(outbox.get(sibling.id)?.status, 'queued');
+  assert.equal(
+    outbox.get(trailing.id)?.status,
+    'queued',
+    'a later peer-matching event may not overtake the skipped sibling on its thread',
+  );
+});
+
 interface SessionHarness {
   store: MailboxStore;
   leaseId: string;
