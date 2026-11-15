@@ -471,6 +471,72 @@ test('thread routes reverse-route replies and track settlement on both direction
   assert.throws(() => store.getThread(''), /Invalid thread reference/);
 });
 
+test('pruneOutboundThreadRecord removes only orphan outbound legs and recomputes the thread', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const question = envelope('msg_1', {
+    semantic: { type: 'question', threadId: 'msg_1', replyMailbox: 'worktree:main' },
+  });
+  store.recordInboundEnvelope(question, 'task:msg_1');
+  const reply = envelope('msg_2', {
+    semantic: { type: 'reply', threadId: 'msg_1', replyMailbox: 'worktree:main' },
+  });
+  store.recordOutboundEnvelope(reply, ['ed25519:' + 'b'.repeat(64)], 'worktree:main');
+  assert.equal(store.getThread('msg_1')!.state, 'replied');
+
+  const pruned = store.pruneOutboundThreadRecord('msg_2')!;
+  assert.equal(pruned.threadId, 'msg_1');
+  assert.equal(pruned.remainingCount, 1);
+  assert.equal(pruned.state, 'open');
+  assert.equal(pruned.settlement, undefined);
+  assert.equal(pruned.pruned.direction, 'outbound');
+  assert.equal(pruned.pruned.messageId, 'msg_2');
+  assert.equal(store.listThreadRecords('msg_1').length, 1);
+  assert.equal(store.getThread('msg_1')!.state, 'open');
+  assert.equal(store.getThread('msg_1')!.settlement, undefined);
+
+  // Pruning an absent outbound leg is a no-op, but an inbound leg is never prunable.
+  assert.equal(store.pruneOutboundThreadRecord('msg_2'), undefined);
+  assert.throws(
+    () => store.pruneOutboundThreadRecord('msg_1'),
+    /Cannot prune inbound thread record/,
+  );
+  assert.throws(() => store.pruneOutboundThreadRecord(''), /Invalid message id/);
+  assert.equal(
+    store.getThread('msg_1')!.direction,
+    'inbound',
+    'a refused inbound prune leaves the record intact',
+  );
+});
+
+test('pruneOutboundThreadRecord clears a stale settlement the removed leg introduced', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  store.recordInboundEnvelope(
+    envelope('root', { semantic: { type: 'question', threadId: 'root' } }),
+    'default',
+  );
+  store.recordOutboundEnvelope(
+    envelope('done', {
+      semantic: { type: 'settle', threadId: 'root', outcome: 'succeeded' },
+      payload: { summary: 'settled before the send failed' },
+    }),
+    ['ed25519:' + 'b'.repeat(64)],
+  );
+  assert.equal(store.getThread('root')!.state, 'settled');
+  assert.equal(store.getThread('root')!.settlement?.outcome, 'succeeded');
+
+  const pruned = store.pruneOutboundThreadRecord('done')!;
+  assert.equal(pruned.state, 'open');
+  assert.equal(pruned.settlement, undefined);
+  assert.equal(store.listThreadRecords('root').length, 1);
+  const [remaining] = store.listThreadRecords('root');
+  assert.equal(remaining.state, 'open');
+  assert.equal(remaining.settlement, undefined);
+  assert.equal(store.getThread('root')!.state, 'open');
+  assert.equal(store.getThread('root')!.settlement, undefined);
+});
+
 test('legacy inbox migrates once into the default mailbox without data loss', t => {
   const { root, path } = workspace(t);
   const legacyPath = join(root, 'inbox.json');

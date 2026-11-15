@@ -9,11 +9,15 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { MailboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
+import { MailboxStore, OutboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
 import type { OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
-import { isDurableOutboxReceipt } from '../core-types/index.ts';
+import {
+  isConfirmedHandoffReceipt,
+  isDurableOutboxReceipt,
+  isTerminalDeliveryFailure,
+} from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
 import { computeRuntimeFingerprint, readDaemonFingerprint, readAutoUpdateStatus, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
@@ -795,12 +799,33 @@ function runThreadCommand(
   action: string | undefined,
   target: string | undefined,
   v: Record<string, any>,
+  outbox?: OutboxStore,
 ) {
   if (action === 'list') {
     return store.listThreads({ kind: v.topic, state: v.state, limit: v.limit === undefined ? undefined : Number(v.limit) });
   }
+  if (action === 'prune') {
+    const id = required(target, 'message-id');
+    const existingOutbox = outbox?.get(id);
+    // A queued or delivered obligation still owns the message: pruning its reverse route
+    // would silently break redrive receipts and thread replay until an operator overrides.
+    if (
+      existingOutbox &&
+      (existingOutbox.status === 'queued' || existingOutbox.status === 'delivered') &&
+      v.force !== true
+    ) {
+      throw new Error(
+        `Refusing to prune outbound thread record ${id} while outbox status is ${existingOutbox.status}; pass --force to override`,
+      );
+    }
+    const pruned = store.pruneOutboundThreadRecord(id);
+    if (!pruned) {
+      throw new Error(`Outbound thread record not found: ${id}`);
+    }
+    return { ok: true, ...pruned };
+  }
   if (action !== 'show') {
-    throw new Error('Unknown thread command; use thread show <id>');
+    throw new Error('Unknown thread command; use thread show|list|prune');
   }
   const id = required(target, 'thread-id');
   const records = store.listThreadRecords(id);
@@ -845,6 +870,30 @@ async function runSessionCommand(
   const callerMailboxFlag =
     typeof v.mailbox === 'string' && v.mailbox ? String(v.mailbox) : undefined;
   const ackId = typeof v.ack === 'string' && v.ack ? String(v.ack) : undefined;
+  // The caller's inbound lease is burned only after the outbound send actually committed
+  // (a live handoff or a durable outbox obligation). A preflight rejects an unknown lease
+  // before any byte is sent, and a throwing or terminally rejected send leaves the lease
+  // intact so the caller can retry without losing the inbound batch.
+  const assertAckLease = (): void => {
+    if (ackId) {
+      store.assertAckableLease(ackId, callerMailboxFlag);
+    }
+  };
+  const ackCommittedSend = (receipts: readonly DeliveryReceipt[]): void => {
+    if (!ackId) {
+      return;
+    }
+    const committed =
+      receipts.length === 0 ||
+      receipts.some(
+        receipt =>
+          isConfirmedHandoffReceipt(receipt, { allowQueued: true }) ||
+          !isTerminalDeliveryFailure(receipt),
+      );
+    if (committed) {
+      store.ack(ackId, callerMailboxFlag);
+    }
+  };
 
   if (group === 'ask') {
     const replyTo = typeof v['reply-to'] === 'string' && v['reply-to']
@@ -858,9 +907,7 @@ async function runSessionCommand(
       );
       const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
       bindCallerWakeTarget(store, replyMailbox, caller);
-      if (ackId) {
-        store.ack(ackId, callerMailboxFlag);
-      }
+      assertAckLease();
       const body = required(v.body, '--body');
       const targetMailbox =
         typeof v['target-mailbox'] === 'string' && v['target-mailbox']
@@ -886,6 +933,7 @@ async function runSessionCommand(
         },
         filePaths: v.attach as string[] | undefined,
       });
+      ackCommittedSend(emitted.receipts);
       return {
         questionId: emitted.messageId,
         threadId: route.threadId,
@@ -904,9 +952,7 @@ async function runSessionCommand(
     if (Boolean(v.to) === Boolean(v['auto-route'])) {
       throw new Error('Choose exactly one of --to or --auto-route');
     }
-    if (ackId) {
-      store.ack(ackId, callerMailboxFlag);
-    }
+    assertAckLease();
     const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller?.terminalHandle);
     bindCallerWakeTarget(store, replyMailbox, caller);
     const targetMailbox =
@@ -932,6 +978,7 @@ async function runSessionCommand(
       },
       filePaths: v.attach as string[] | undefined,
     });
+    ackCommittedSend(emitted.receipts);
     const firstReceipt = emitted.receipts[0];
     return {
       questionId: emitted.messageId,
@@ -955,9 +1002,7 @@ async function runSessionCommand(
   const route = replyTargetOrThrow(store, messageId);
   const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
   bindCallerWakeTarget(store, replyMailbox, caller);
-  if (ackId) {
-    store.ack(ackId, callerMailboxFlag);
-  }
+  assertAckLease();
 
   if (group === 'reply') {
     const body = required(v.body, '--body');
@@ -981,6 +1026,7 @@ async function runSessionCommand(
       },
       filePaths: v.attach as string[] | undefined,
     });
+    ackCommittedSend(emitted.receipts);
     const queuedNextStep = summarizeNextStep('reply', emitted.receipts);
     return {
       replyId: emitted.messageId,
@@ -1019,6 +1065,7 @@ async function runSessionCommand(
     },
     filePaths: v.attach as string[] | undefined,
   });
+  ackCommittedSend(emitted.receipts);
   const queuedNextStep = summarizeNextStep('settle', emitted.receipts);
   return {
     settlementId: emitted.messageId,
@@ -1051,7 +1098,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           ask: 'dealer ask <messageId> --body <text> [--ack <leaseId>] [--json]',
           settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
           inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
-          thread: 'dealer thread <show|list> [<threadId>] [--json]',
+          thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
         },
       }, null, v.json ? undefined : 2));
@@ -1188,7 +1235,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     }
     if (group === 'thread') {
       const store = await mailboxStoreFor(options, stateDir);
-      stdout(JSON.stringify(runThreadCommand(store, action, target, v), null, v.json ? undefined : 2));
+      const outbox = options.runtime?.outbox ??
+        new OutboxStore(join(stateDir, 'outbox.json'), join(stateDir, 'outbox-blobs'));
+      stdout(JSON.stringify(runThreadCommand(store, action, target, v, outbox), null, v.json ? undefined : 2));
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'up') {

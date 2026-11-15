@@ -436,6 +436,10 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               }
             : {};
           const deliveredReceipts: Record<string, DeliveryReceipt> = {};
+          // Reached but not durably handed off (for example pending_approval). The target
+          // did receive the envelope, so the send is observable even though it stays out of
+          // the durable pending set when queueing is disabled.
+          const livePendingReceipts: Record<string, DeliveryReceipt> = {};
           const failedReceipts: Record<string, DeliveryReceipt> = {};
           const failedNodeIds: string[] = [];
           const observedReceipts: DeliveryReceipt[] = [];
@@ -471,6 +475,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               if (attempt.status === 'pending') {
                 if (attempt.receipt) {
                   observedReceipts.push(attempt.receipt);
+                  livePendingReceipts[target] = attempt.receipt;
                 }
                 if (!queueIfOffline) {
                   continue;
@@ -521,22 +526,35 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               receipts.push(queuedReceipt(envelope, self, targetNodeId, spooled, detail));
             }
           }
+          // `emitter/sent` is the single commitment signal for observers such as the thread
+          // ledger: only a broadcast that left the transport, a live handoff receipt, or a
+          // durable outbox obligation may create reverse-route state. Unqueued failures and
+          // terminal rejections leave no orphan outbound record behind.
+          const committedTargetNodeIds = route.targetNodeIds.filter(
+            target =>
+              deliveredReceipts[target] !== undefined ||
+              livePendingReceipts[target] !== undefined ||
+              (queueIfOffline && pendingNodeIds.includes(target)),
+          );
+          const emitSent = (): void => {
+            if (route.mode !== 'broadcast' && committedTargetNodeIds.length === 0) {
+              return;
+            }
+            ctx.emit('emitter/sent', {
+              envelope,
+              targetNodeIds:
+                route.mode === 'broadcast' ? route.targetNodeIds : committedTargetNodeIds,
+              receipts,
+            });
+          };
           if (fatalError !== undefined) {
             // Queued sibling receipts remain observable even though this deterministic
             // target failure is surfaced to the caller.
             (fatalError as Error & { receipts?: DeliveryReceipt[] }).receipts = receipts;
-            ctx.emit('emitter/sent', {
-              envelope,
-              targetNodeIds: route.targetNodeIds,
-              receipts,
-            });
+            emitSent();
             throw fatalError;
           }
-          ctx.emit('emitter/sent', {
-            envelope,
-            targetNodeIds: route.targetNodeIds,
-            receipts,
-          });
+          emitSent();
           return { messageId: envelope.id, traceId: envelope.traceId, receipts };
         },
         async redriveOutboxItem(
