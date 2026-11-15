@@ -153,7 +153,9 @@ export interface Services {
    - **连通模式**：同网段靠 UDP `239.255.42.99:45873` 组播与子网广播发现；装有 Tailscale 的机器把加密信标单播到 `tailscale status` 中每个在线节点的 UDP 45873 并走 `100.64.0.0/10` 直连；两者都不满足时，由一台常驻 `headless-relay` 节点充当种子。
    - **信标 Gossip**：`announce` 把本机已收集的**密封**发现帧（`beacons`，按 `senderNodeId` 只保留最新有效帧，过期超过 30s 清理）随 `discovery` 探测发给 `bootstrapPeers`，种子回送自己的帧与全部已知信标。节点据此学习对端 endpoint 以及 `relays`（哪个种子可以把帧送到该 peer）。
    - **常驻隧道**：每个挂载网络对每个种子保持一条 `tunnel` 长连接（`keepAlive(15s)`，无空闲超时），种子以 `peerNodeId -> 隧道` 登记。即使对端只宣告了不可直连的 NAT 地址，种子也能沿隧道把 `relay_deliver` 推回去，对端的 `relay_reply` 再沿原路返回。
-   - **盲转发**：`exchange` 先直连；存在中继候选时直连只等 1500ms，失败后改发 `relay` 请求。种子只校验该信封确实属于已挂载网络的 AEAD 密钥（不解析业务载荷），按目标隧道或直连转发。附件拉取同理：直连失败后发 `relay_blob`，由种子向目标按 BLAKE3 内容取回并回传，单次中继载荷上限 `MAX_FRAME - 4096`。
+   - **盲转发**：`exchange` 先直连；存在中继候选时直连只等 1500ms，失败后改发 `relay_send` 请求。种子只校验该信封确实属于已挂载网络的 AEAD 密钥（不解析业务载荷），按目标隧道或直连转发。附件拉取同理：直连失败后发 `relay_blob`，由种子向目标按 BLAKE3 内容取回并回传，单次中继载荷上限 `MAX_FRAME - 4096`。发送端是否附带附件不以“原始字节总和”估算，而是按实际序列化后的 `relay_send` 包（密封帧、JSON 键名、逐哈希 base64 膨胀与逗号）判断；一旦完整包会超过 `MAX_FRAME`，该次发送明确降级为 live-only（`complete:false`），绝不把部分附件塞进一个必然被 `packet()` 拒绝的帧。
+   - **离线暂存与自动排空**：`relay_send` 可携带 `spoolIfOffline`、调用方生成的稳定 `spoolKey` 与附件 BLAKE3 哈希。种子先对信封做 AEAD 成员校验（解封失败即拒绝），再逐个校验附件内容并按内容哈希写入**网络隔离**的附件目录；暂存条目只保存 `id`、密封帧与 `blobHashes` 元数据，不在 JSON 快照里重复 base64 正文。目标必须是 `ed25519:` NodeId 且不能是种子自身；条目以 `${senderNodeId}:${spoolKey}` 幂等，发送方不同者永远不能覆盖同一键，容量保护/淘汰始终按唯一的 `(targetNodeId, id)` 对判定，同一 `spoolKey` 跨目标不会互相豁免。总量同时计算**序列化后的密封帧字节**与附件字节，受每目标 256 条、每发送方 256 条、全局 1024 条与 32MiB、目标数 128 等边界约束，超限按最旧优先从违规的发送方/目标连同附件文件一起回收，加载快照时同样执行全部边界。运行时入队/排空只向 append-only journal 追加单条 `upsert`/`remove`/`drain` 记录，超过 32MiB 或启动/关闭时再合并为一次原子快照，避免每次入队同步重写整份 spool 阻塞种子。默认 TTL 7 天。目标重新建立隧道或刷新信标后，种子按序 `relay_deliver` 并在收到绑定 `requestNonce` 的回执后删除帧条目，但附件缓存保留到原 TTL，确保目标在回执之后才拉取附件、且原发送者已离线时仍可回答 `relay_blob`。`fetchBlobToPath` 在直连与目标中继都失败后还会回退到各挂载网络的 bootstrap 种子。
+   - **离线收件人仍是成员校验后的暂存**：暂存不绕过网络隔离，种子只接受已挂载网络、且能被该网络 AEAD 密钥解封的信封；附件按内容哈希校验，任何不一致都会拒绝暂存而不是把损坏内容交给接收端。
    - **地址宣告**：`--advertised-host <host>`（或 `DEALER_ADVERTISED_HOST`）覆盖自动探测的 LAN 地址，供反向代理、端口映射或多网卡主机使用。
 
 ```typescript
@@ -249,6 +251,9 @@ export interface NodeService {
 }
 ```
 
+- **已验证目录持久化**：配置 `peersPath` 后，每张通过 `verifyNodeCard` 的远端名片与本机每网络最后 revision 会原子写入 `peers.json`（临时文件 + `fsync` + `rename` + 父目录 `fsync`，`0600`），启动时重新逐张验签加载。这样即使队友离线，`member:` / `skill:` 选择器仍能解析出稳定目标，出站消息可进入持久化 outbox 等待重驱，而不是因为目录为空而路由失败。本机名片本身不落盘；下一张名片 revision 取 `max(持久化/已知 + 1, 当前毫秒时间)`，因此重启后的名片必然严格更新，不会被队友按旧 revision 丢弃。
+- **名片 Gossip**：`peer.card` 广播除自身名片外还携带 `knownCards`（最多 128 张已验证远端名片）。重启节点或只能经种子入网的新节点因此能在队友重新上线前拿到团队目录；接收端仍逐张验签、按 `revision` 单调更新并落盘，旧名片或伪造名片不会覆盖已有记录。临时卸载网络只清除本机名片，已验证远端目录保留。
+
 ---
 
 ### 模块 3：`emitter` — 节点内消息发送器与触发源扩展 (`@the-dealer/emitter`)
@@ -295,6 +300,12 @@ export interface EmitterService {
   - `plugin-source-cli-mcp`：供节点内正在运行的 Agent（AGY / Claude Code / Codex）通过 CLI 或 MCP 直接发消息。
   - `plugin-source-webhook`：本地安全 HTTP 端点（如承接 Source Hub `/feedback/wake` 或 GitLab/GitHub 事件）。
   - `plugin-source-poll-watermark`：通用水位轮询触发器基类，直接承载你的飞书多维表格告警源、Source Hub 反馈认领源、Runtime Monitor 低质会话源。
+- **离线出站（Durable Outbox）**：`sendUnicast` 只有遇到可重试的连接类失败（允许列表内的 `ECONNREFUSED/RESET/TIMEDOUT/EHOSTUNREACH/ENETUNREACH/DNS/截断流/超时`，或被种子 `spoolIfOffline` 接收后的 `OfflinePeerSpooledError`）才交给 outbox；签名不符、回执伪造、密码学校验失败、缺失/损坏附件、畸形中继响应、中继 `networkId` 不匹配与帧超限等确定性本地/协议错误仍然直接抛给调用方，绝不伪装成“已排队”。网络被卸载是瞬时运行态：该网络上的义务保持 `queued` 并在重新挂载后继续重驱，而不是逐目标标记 failures。首次发送与后续重驱共用 emitter 内同一个逐目标发送/分类通道：`dispatched` / `settled` / 持久 `queued` / dedup 重复回执才是 delivered；`rejected` / `failed` 是该目标的终态签名证据；`pending_approval`、内存态 `queued`、`received` 等非终态仍属于待重驱义务。某个目标失败不会中断或丢弃同批其他目标；若确定性错误与其他目标的离线义务同批出现，emitter 先把离线目标及其 queued 回执原子写入 outbox，再把该确定性错误抛给调用方。发送超时使用类型化的 `DeliveryTimeoutError` 且该目标记入 `inDoubtNodeIds`，只有直连 peer 脉冲或显式 `--force` 才会重发；普通定时器不会把可能已执行的帧当普通离线重试。
+  - 配置 `outbox` 时，`emitter` 是唯一的出站发送、路由与回执校验 owner：首次发送和后续重驱都经过同一个 `redriveOutboxItem` 通道；`mailbox/outbox` 只持久化义务、退避调度与解析后的目标，不构造线协议帧、不路由、不解析回执。它把已签名信封与附件副本原子写入 `outbox.json`，并返回一张本机签名的 `stage: "queued"` 回执，`executionReceipt` 标记 `executor: "outbox"`、`queuedOffline: true`，若种子已暂存另带 `relaySpooled: true`。
+  - 多播/部分目标离线时，已确认目标的真实回执照常返回，只为不可达目标追加 queued 回执；显式目标暂时无法解析（目录中尚无该成员）同样可以入队等目录恢复。
+  - 调用方显式传 `queueIfOffline: false` 时，既不入本地 outbox，也不请求种子暂存（`spoolIfOffline` 不发送），不会留下任何可重放的持久副本。queued 回执是持久义务的确认，不是外部执行确认。
+  - 同一 `(networkId, idempotencyKey)` 的并发/重复 emit 由 `OutboxStore.claimIdempotency` 在 outbox 文件锁内原子创建或加入**仍在 queued 的**唯一活动义务；并发 emit 不会都看到“不存在”而各自生成不同信封，只有 claim 成功者执行首次发送，其余调用方返回同一信封与持久 queued 回执。已经 delivered/failed 的历史义务不会被重新当作未决结果复用：再次使用同一业务键会发起新的发送尝试，由接收端 `dedup-cas` 按水位裁决是否重复。`executor: "outbox"` 的持久 queued 回执同时被 poll-source 水位视为已确认交接（与 settlement mode 无关）。
+  - 需要离队的每个 `attachments` 附件都必须通过 `attachmentPaths[blake3Hash]` 提供本地源路径；emitter 会在发送前用 `shareFile` 校验哈希/大小并把副本复制进 `outbox-blobs/`。缺失路径、路径内容与声明不符，或 `emitter/prepare` 钩子注入了无法暂存的附件时，queueing 直接被拒绝，绝不生成重启后无法服务附件的 queued 信封。重驱前还会确认每个信封附件都有暂存副本，缺失即终态本地失败并保留证据。
 
 ---
 
@@ -399,8 +410,10 @@ export interface ExecutorPlugin<C = unknown> {
 
 1. **调度策略插件 (`packages/plugins-policy/`)**：
    - **`plugin-policy-dedup-cas`**：基于 `idempotencyKey` 与单调代次水位（`claim_version / revision`）的本地持久化状态账本，确保同一事件精确派发一次，故障重启后沿用原回执对账，绝不重复建工作区。
-2. **持久化信箱与唤醒重驱 (`packages/mailbox/`)**：
+2. **持久化信箱、出站 outbox 与唤醒重驱 (`packages/mailbox/`)**：
    - **`MailboxStore`**：唯一原子落盘的信箱账本，承载逻辑 `mailboxId`、单未决租约 `dlv_*`、`wakeTargets` 重驱状态、`inbound:` / `outbound:` 方向化线程路由与旧 `inbox.json` 一次性迁移；通过文件锁 + `fsync`/`rename` 落盘，并以事件唤醒而非轮询驱动消费者。
+   - **`OutboxStore`**：发送端唯一的持久化出站义务账本（`outbox.json` + `outbox-blobs/`）。`claimIdempotency` 在目录锁内按 `(networkId, idempotencyKey)` 原子创建或加入义务，并发调用只能有一个 claim owner；同一条信封幂等入队，记录未确认的目标节点、已确认回执 `deliveredReceipts`、每目标终态失败 `failedReceipts` / `failedNodeIds`、可能已执行但回执超时的 `inDoubtNodeIds`、附件暂存路径、中继已暂存目标、尝试次数与下次退避时间；只有经 emitter 统一校验、属于确认交接阶段的真实回执才标记 `delivered`，签名拒绝/派发失败/本地完整性错误按目标记录并保留暂存证据，只有所有目标都已交付且无失败时才删除暂存文件。普通定时器或另一目标的 scoped 重驱都不能清除未被本次尝试覆盖的 `inDoubtNodeIds`；只有实际发送该目标、直连脉冲或显式 force 才会重新判定。`queued` / `delivered` / `failed` 是账本状态，不是进程猜测；仍有可交付目标时条目保持 `queued`。
+   - **`OutboxRedriveService`**：outbox 的唯一自动重驱调度 owner，但**不**构造线协议帧、不路由、不解析回执：它通过 `deliver` 回调把条目交给 emitter 的 `redriveOutboxItem`，只持久化返回的确认回执、逐目标失败结论与退避状态。`node/peer-updated` 仅对以 `direct: true` 标记的真实可达事件触发，按 `(networkId, nodeId)` 做 2s 节流后只强制该目标（或尚未解析的显式选择器），其他条目保持原退避；另以 2s unref 定时器兜底。总尝试 deadline 在 emitter 内部逐目标递减，outer race 不再丢弃已获得的回执；超时发生在可能已抵达目标的 in-flight 发送时，该目标记入 `inDoubtNodeIds`，普通定时器不自动重发，只有直连 peer 脉冲或显式 `--force` 才用稳定 envelope id 重新驱动并由接收端 dedup 收敛。网络卸载不产生终态结果：外部目标保持 `queued` 并保留既有 `inDoubtNodeIds`，重新挂载后继续。失败按 2s → 60s 指数退避，`stop()` 等待当前队列收敛；进程退出后义务仍在磁盘上，由下一次守护进程启动或 CLI `outbox flush` 继续。确定性本地/协议失败的条目只能由操作员显式 `dealer outbox requeue --id <message-id>` 恢复：无签名的失败目标与 `markFailed` 保留的未尝试目标重新进入 pending，尚未解析的选择器保持空 pending 交由 router 重新解析，仍在 in-doubt 的目标继续受 `--force` / 直连脉冲门禁；签名拒绝等终态证据不会被重开或自动重试，暂存证据只在全部目标交付后才删除。
    - **`WakeupRedriveService`**：取代易失的 wave-coalescer。目标工作区忙碌或不可判定时只保留持久化 `pendingWake`，绝不注入文本；仅在权威 Orca 工作区/终端空闲门禁通过后投递严格单行指针，空闲探测或投递前准备失败按 1s → 2s → 5s → 10s 退避，安全待投递工作在守护进程重启后恢复。租约确认后达到 `completedWaves` 阈值时，在同一 Orca 工作区新建独立 Agent 会话 Tab 并把 `wakeTarget.terminalHandle` 切流到新 Tab，旧会话 Tab 完整保留且零写入（绝不发送 `/new` 原地重置）；固定工作区默认 `rotateAfterWaves = 1`，每波独占新会话 Tab，首波也不会劫持用户已手动打开的会话 Tab。首次在工作区解析出的 Orca 终端句柄随 `wakeTargets` 持久化，后续波次优先复用同一终端（含已标记 orphaned 但仍 connected 的 TUI），避免固定工作区在多终端之间漂移。
 3. **执行器插件 (`packages/plugins-executor/`)**：
    - **投递结算与未知结果**：`MailboxStore.beginWakeDelivery` 在外部命令或终端注入前持久化 `deliveryInDoubt`，只有成功回执才由 `completeWakeDelivery` 清除此围栏。进程已启动后的错误、abort 或进程中断保留围栏与原因；命令边界确认进程从未启动的前置失败（`CommandNotStartedError`）以及投递前的准备失败（工作区/终端解析、权威空闲门禁、参数校验）不产生围栏，按 1s → 2s → 5s → 10s 指数退避重试。后续入队、强制 flush 与重启均不能自动重放未知结果，须先核实外部结果再显式修复目标；成功结算只覆盖预览序号水位内的消息，新入队消息保留 `enqueue` 决定的截止时间；会话帧即时唤醒，普通波次仍遵守 coalescing。初始执行器（`orca` + mode、命名宿主或兼容别名 `agent-pty` / `orca-spawn`）与后台重驱共用同一套 `deliverPassiveWakeTarget` / `deliverSpawnedOrcaTerminalWakeup` 投递原语，不各自复制指针构造与终端注入。
@@ -424,6 +437,7 @@ export interface ExecutorPlugin<C = unknown> {
 | **3. 发现全网节点与能力** | `dealer peers list --skill ios-crash-triage --only-available --json` | Agent 发送前可自主查询当前在线的队友节点及其能力描述与空闲状态 |
 | **4. 发送消息（定向/多播/广播/AI路由）** | **显式定向**：`dealer send --to member:oliver --kind collab.request --subject "..." --body "..." --attach ./repro.log --json`<br>**AI 智能判断路由**：`dealer send --auto-route --hint "找负责运行时且空闲的节点排查此报错" --body "..." --json`<br>**全网/频道广播**：`dealer broadcast --topic team.sensebeing --subject "..." --body "..." --json` | 一条命令完成跨机器、跨团队成员的实时消息与大附件投递，支持 `--wait-receipt` 或异步流式回调 |
 | **5. 配置节点内收发派发器** | `dealer setup apply-preset --host orca --mode spawn --topic collab.request.v4 --agent codex --json`<br>`dealer route add --type local-agent --command codex --json`<br>`dealer source add lark-alert --config ./alerts.yaml --json` | Agent 通过命令直接生成 `patch.yaml`，热挂载新的触发源或本地 Orca/Agent 派发规则 |
+| **6. 查看与重驱离线出站** | `dealer outbox list --status queued --json`<br>`dealer outbox flush --id <message-id> --json`<br>`dealer outbox flush --force --json`<br>`dealer outbox requeue --id <message-id> --json` | 查看持久化出站义务；对端恢复或目录恢复后立即重发。`queued` 回执表示消息已持久保存，可安全确认本地收件租约，无需轮询等待；`requeue` 仅用于操作员显式重试无签名的本地/协议失败目标 |
 
 ---
 
@@ -453,13 +467,15 @@ the-dealer/                                 # 独立开源仓库根目录（建�
 ├── packages/
 │   ├── kernel/                             # @the-dealer/kernel：Context、Service 注入、Typed Events、Reversible Effects、Profile/Patch Loader
 │   ├── core-types/                         # @the-dealer/core-types：NodeCard、MessageEnvelope、DeliveryReceipt 唯一 Schema 真源
+│   ├── process-lock/                       # owner 文件记录格式与进程实例存活判定
+│   ├── fs-atomic/                          # 原子写入/复制、append-only 持久日志与共享目录锁的唯一实现
 │   ├── transport/                          # @the-dealer/transport：TransportService 接口与 Iroh Engine 桥接插件
 │   ├── node/                               # @the-dealer/node：节点身份密钥管理、NodeCard 签名广播、PeerDirectory
 │   ├── emitter/                            # @the-dealer/emitter：消息组装、附件自动转 Blob、SourcePlugin 宿主
 │   ├── router/                             # @the-dealer/router：三级路由链（Explicit -> Tag Rule -> AI/Agent Judge）
 │   ├── gate/                               # @the-dealer/gate：open / approval_required / dnd / closed 状态机与 ACL 规则
 │   ├── dispatcher/                         # @the-dealer/dispatcher：入站账本、Policy 链与 Executor 宿主
-│   ├── mailbox/                            # @the-dealer/mailbox：持久化信箱账本、租约、方向化线程路由与 WakeupRedriveService
+│   ├── mailbox/                            # @the-dealer/mailbox：持久化信箱账本、租约、方向化线程路由、出站 outbox 重驱与 WakeupRedriveService
 │   ├── orca-workspace/                     # Orca 工作区/终端空闲检查、终端解析与单行投递的唯一 owner
 │   ├── plugins-source/                     # 官方内置发送触发源插件包
 │   │   ├── source-webhook/                 # 本地 HTTP Webhook 接收器

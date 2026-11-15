@@ -58,6 +58,18 @@
         "dependencies": []
       },
       {
+        "path": "packages/fs-atomic",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": [
+          "packages/process-lock"
+        ]
+      },
+      {
         "path": "packages/kernel",
         "languages": [
           "TypeScript"
@@ -88,7 +100,9 @@
         "boundary_docs": [
           "AGENTS.md"
         ],
-        "dependencies": []
+        "dependencies": [
+          "packages/fs-atomic"
+        ]
       },
       {
         "path": "packages/transport",
@@ -102,6 +116,7 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel",
+          "packages/fs-atomic",
           "native/dealer-iroh-engine"
         ]
       },
@@ -126,7 +141,8 @@
         ],
         "dependencies": [
           "packages/core-types",
-          "packages/kernel"
+          "packages/kernel",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -153,7 +169,8 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel",
-          "packages/plugins-policy"
+          "packages/plugins-policy",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -166,7 +183,8 @@
         ],
         "dependencies": [
           "packages/core-types",
-          "packages/kernel"
+          "packages/kernel",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -194,7 +212,7 @@
           "packages/core-types",
           "packages/agent-host",
           "packages/orca-workspace",
-          "packages/process-lock"
+          "packages/fs-atomic"
         ]
       },
       {
@@ -207,7 +225,8 @@
           "docs/plugin-guide.md"
         ],
         "dependencies": [
-          "packages/core-types"
+          "packages/core-types",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -239,7 +258,8 @@
           "packages/core-types",
           "packages/kernel",
           "packages/plugins-policy",
-          "packages/plugins-router"
+          "packages/plugins-router",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -272,7 +292,8 @@
           "packages/core-types",
           "packages/kernel",
           "packages/mailbox",
-          "packages/orca-workspace"
+          "packages/orca-workspace",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -299,7 +320,8 @@
           "packages/plugins-source",
           "packages/plugins-executor",
           "packages/plugins-lark-notifier",
-          "packages/process-lock"
+          "packages/process-lock",
+          "packages/fs-atomic"
         ]
       }
     ],
@@ -307,6 +329,7 @@
       {
         "from": "packages/core-types/",
         "imports": [
+          "../fs-atomic",
           "../kernel",
           "../transport",
           "../node",

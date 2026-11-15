@@ -1,4 +1,9 @@
-import { generateNodeKeyPair, signNodeCard, verifyNodeCard } from '../core-types/index.ts';
+import { existsSync, readFileSync } from 'node:fs';
+import {
+  verifyNodeCard,
+} from '../core-types/index.ts';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
+import { generateNodeKeyPair, signNodeCard } from '../core-types/index.ts';
 import type {
   AdmissionMode,
   Disposable,
@@ -21,7 +26,12 @@ export interface NodePluginConfig {
   exchangeIntervalMs?: number;
   /** Presence gossip budget per peer; ephemeral beacons never inherit the RPC socket timeout. */
   exchangeTimeoutMs?: number;
+  /** Durable verified peer cards so member selectors resolve before the peer reconnects. */
+  peersPath?: string;
 }
+
+const PEER_DIRECTORY_SCHEMA = 'the-dealer-peer-directory/v1';
+const MAX_GOSSIPED_PEER_CARDS = 128;
 
 interface ObservableTransport extends TransportService {
   identityKeyPair?: ReturnType<typeof generateNodeKeyPair>;
@@ -45,6 +55,9 @@ export class PeerDirectoryService implements NodeService {
   private pending: Promise<void> = Promise.resolve();
   private disposed = false;
   private exchanging = false;
+  private readonly peersPath?: string;
+  /** Networks with a newly accepted direct peer; the next beacon carries known cards once. */
+  private readonly gossipRequested = new Set<string>();
 
   constructor(ctx: Context, config: NodePluginConfig) {
     this.ctx = ctx;
@@ -55,6 +68,8 @@ export class PeerDirectoryService implements NodeService {
     if (this.keyPair.nodeId !== this.transport.localNodeId) {
       throw new Error('Node keyPair must match transport localNodeId');
     }
+    this.peersPath = config.peersPath;
+    this.loadPersistedPeers();
     const observe = this.transport.onNetworksChanged?.(() => this.publish());
     if (observe) {
       this.listeners.push(observe);
@@ -80,21 +95,108 @@ export class PeerDirectoryService implements NodeService {
     void this.publish().catch(() => {});
   }
 
-  private accept(event: InboundFrameEvent): void {
-    const message = event.payload as { type?: string; card?: NodeCard } | null;
-    if (message?.type !== 'peer.card' || !message.card) {
+  /** Load signed cards persisted by a previous incarnation; each card is verified again. */
+  private loadPersistedPeers(): void {
+    if (!this.peersPath || !existsSync(this.peersPath)) {
       return;
     }
-    const card = message.card;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(this.peersPath, 'utf8'));
+    } catch {
+      throw new Error('Invalid peer directory store');
+    }
     if (
-      !this.transport.listMountedNetworks().includes(event.networkId) ||
-      card.networkId !== event.networkId ||
-      card.nodeId === this.keyPair.nodeId
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      (parsed as { schema?: unknown }).schema !== PEER_DIRECTORY_SCHEMA ||
+      !Array.isArray((parsed as { cards?: unknown }).cards)
     ) {
+      throw new Error('Invalid peer directory store');
+    }
+    const selfRevisions = (parsed as { selfRevisions?: unknown }).selfRevisions;
+    if (selfRevisions !== undefined) {
+      if (
+        typeof selfRevisions !== 'object' ||
+        selfRevisions === null ||
+        Array.isArray(selfRevisions)
+      ) {
+        throw new Error('Invalid peer directory store');
+      }
+      for (const [networkId, revision] of Object.entries(selfRevisions)) {
+        if (
+          !networkId ||
+          !Number.isSafeInteger(revision) ||
+          revision < 0
+        ) {
+          throw new Error('Invalid peer directory store');
+        }
+        this.revisions.set(networkId, revision as number);
+      }
+    }
+    for (const card of (parsed as { cards: unknown[] }).cards) {
+      // Persisted cards carry durable identity, not live reachability: the peer may be
+      // offline, and its last endpoint is owned by transport discovery, not this store.
+      this.acceptCard(card, undefined, false, false);
+    }
+  }
+
+  /**
+   * Persist the verified peer directory atomically. The self card itself is rebuilt on every
+   * publish and excluded, but its last revision is durable so a restart can never go backwards.
+   */
+  private persistPeers(): void {
+    if (!this.peersPath) {
       return;
+    }
+    const cards = [...this.peers.values()]
+      .flatMap(directory => [...directory.values()])
+      .filter(card => card.nodeId !== this.keyPair.nodeId)
+      .sort((a, b) => a.networkId.localeCompare(b.networkId) || a.nodeId.localeCompare(b.nodeId));
+    writeFileAtomically(
+      this.peersPath,
+      JSON.stringify({
+        schema: PEER_DIRECTORY_SCHEMA,
+        selfRevisions: Object.fromEntries(this.revisions),
+        cards,
+      }),
+    );
+  }
+
+  /**
+   * Accept the newest verified card for one network; returns true when the directory
+   * changed. Only a card carried directly by its signing node may contribute an endpoint:
+   * persisted and gossiped third-party cards prove identity, never live reachability.
+   */
+  private acceptCard(
+    value: unknown,
+    expectedNetworkId: string | undefined,
+    registerEndpoint: boolean,
+    emit: boolean,
+  ): boolean {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const card = value as NodeCard;
+    if (
+      typeof card.nodeId !== 'string' ||
+      typeof card.networkId !== 'string' ||
+      (expectedNetworkId !== undefined && card.networkId !== expectedNetworkId)
+    ) {
+      return false;
     }
     if (!Number.isSafeInteger(card.revision) || card.revision < 1 || !verifyNodeCard(card)) {
-      return;
+      return false;
+    }
+    if (card.nodeId === this.keyPair.nodeId) {
+      // A verified card carrying our own identity is our previously published state. Advance
+      // the local revision past it so a restarted daemon's cards are accepted immediately.
+      if (card.revision <= (this.revisions.get(card.networkId) ?? 0)) {
+        return false;
+      }
+      this.revisions.set(card.networkId, card.revision);
+      return true;
     }
     if (
       !card.identity ||
@@ -103,25 +205,68 @@ export class PeerDirectoryService implements NodeService {
       !Array.isArray(card.capabilities?.skills) ||
       !card.runtimeState
     ) {
-      return;
+      return false;
     }
     if (!['open', 'approval_required', 'dnd', 'closed'].includes(card.admissionMode)) {
-      return;
+      return false;
     }
     const directory = this.peers.get(card.networkId) ?? new Map<string, NodeCard>();
     if ((directory.get(card.nodeId)?.revision ?? 0) >= card.revision) {
-      return;
+      return false;
     }
-    if (card.endpointAddr) {
+    if (registerEndpoint && card.endpointAddr) {
       try {
         this.transport.registerPeerEndpoint?.(card.networkId, card.nodeId, card.endpointAddr);
       } catch {
-        return;
+        // Endpoint registration is transport-owned reachability; a failed registration
+        // never discards verified member identity.
       }
     }
     directory.set(card.nodeId, structuredClone(card));
     this.peers.set(card.networkId, directory);
-    this.ctx.emit('node/peer-updated', structuredClone(card));
+    if (emit) {
+      // `direct` distinguishes live reachability from identity-only gossip so retry
+      // schedulers never treat a third-party card as proof the member reconnected.
+      this.ctx.emit('node/peer-updated', structuredClone(card), {
+        direct: registerEndpoint,
+      });
+    }
+    return true;
+  }
+
+  private accept(event: InboundFrameEvent): void {
+    const message = event.payload as
+      | { type?: string; card?: NodeCard; knownCards?: unknown }
+      | null;
+    if (message?.type !== 'peer.card') {
+      return;
+    }
+    if (!this.transport.listMountedNetworks().includes(event.networkId)) {
+      return;
+    }
+    let changed = false;
+    if (message.card) {
+      const directSender = event.senderNodeId === message.card.nodeId;
+      const accepted = this.acceptCard(message.card, event.networkId, directSender, true);
+      if (accepted && directSender) {
+        // A peer that just announced itself needs the team directory. One event-driven
+        // gossip beacon teaches it without repeating 128 cards on every 250ms heartbeat.
+        this.gossipRequested.add(event.networkId);
+      }
+      changed = accepted || changed;
+    }
+    // Seed card gossip: a relay seed (or any member) shares the verified cards it knows,
+    // so a restarted peer learns its team before the members themselves reconnect. Those
+    // third-party entries never contribute endpoints: a gossiped NAT address is not proof
+    // that the member is reachable from here.
+    if (Array.isArray(message.knownCards)) {
+      for (const knownCard of message.knownCards.slice(0, MAX_GOSSIPED_PEER_CARDS)) {
+        changed = this.acceptCard(knownCard, event.networkId, false, true) || changed;
+      }
+    }
+    if (changed) {
+      this.persistPeers();
+    }
   }
 
   private build(networkId: string): NodeCard {
@@ -129,8 +274,13 @@ export class PeerDirectoryService implements NodeService {
       this.transport.getNetworkConfig?.(networkId) ??
       this.config.networks?.find(n => n.networkId === networkId);
     const capabilities = this.config.capabilities ?? { summary: '', skills: [] };
-    const revision = (this.revisions.get(networkId) ?? 0) + 1;
+    // Persisted/gossiped last-seen revisions and wall-clock epochs both guard restart
+    // ordering: the next self card is always newer than anything peers already accepted.
+    const revision = Math.max((this.revisions.get(networkId) ?? 0) + 1, Date.now());
     this.revisions.set(networkId, revision);
+    // Self cards are rebuilt only on mount/profile changes, not on every presence beacon,
+    // so persisting the new revision here is both the durable truth and a bounded write.
+    this.persistPeers();
     return signNodeCard(
       {
         nodeId: this.keyPair.nodeId,
@@ -171,18 +321,33 @@ export class PeerDirectoryService implements NodeService {
       const networks = this.transport.listMountedNetworks();
       for (const id of this.self.keys()) {
         if (!networks.includes(id)) {
+          // Verified remote cards outlive a temporary unmount: a later remount and the
+          // offline outbox both still need member selectors, so only self state is dropped.
           this.self.delete(id);
-          this.peers.delete(id);
         }
       }
       for (const networkId of networks) {
         if (refresh || !this.self.has(networkId)) {
           this.self.set(networkId, this.build(networkId));
         }
+        const selfCard = this.self.get(networkId)!;
+        // Card gossip is event-driven: startup/profile changes include the verified team
+        // directory, and a newly accepted direct peer receives it once on the next beacon.
+        // Steady-state 250ms presence heartbeats carry only the self card.
+        const includeKnownCards = refresh || this.gossipRequested.delete(networkId);
+        const knownCards = includeKnownCards
+          ? [...(this.peers.get(networkId)?.values() ?? [])]
+              .filter(card => card.nodeId !== selfCard.nodeId)
+              .slice(0, MAX_GOSSIPED_PEER_CARDS)
+          : [];
         await this.transport.broadcast(
           networkId,
           'peer.card',
-          Buffer.from(JSON.stringify({ type: 'peer.card', card: this.self.get(networkId) })),
+          Buffer.from(JSON.stringify({
+            type: 'peer.card',
+            card: selfCard,
+            ...(includeKnownCards ? { knownCards } : {}),
+          })),
           // Presence is best-effort: one direct fast-fail plus a few relay seeds still gets a
           // useful share of the budget, while a blackholed peer can never stall the node.
           { timeoutMs: this.config.exchangeTimeoutMs ?? 4_000 },
@@ -290,6 +455,7 @@ export class PeerDirectoryService implements NodeService {
       await listener.dispose();
     }
     await this.pending.catch(() => {});
+    this.persistPeers();
     this.peers.clear();
     this.self.clear();
   }

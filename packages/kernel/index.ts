@@ -33,7 +33,10 @@ export interface Events {
   'transport/inbound': (
     event: InboundFrameEvent,
   ) => Uint8Array | void | Promise<Uint8Array | void>;
-  'node/peer-updated': (card: NodeCard) => void;
+  'node/peer-updated': (
+    card: NodeCard,
+    provenance?: { direct?: boolean },
+  ) => void;
   'emitter/prepare': (
     envelope: MessageEnvelope,
     next: (envelope: MessageEnvelope) => Promise<MessageEnvelope>,

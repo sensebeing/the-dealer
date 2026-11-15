@@ -268,7 +268,8 @@ async function startSeed(
             peers: gossip(probes),
           }));
         }
-        if (request?.type === 'relay' && typeof request.frame?.nonce === 'string' && request.target) {
+        if ((request?.type === 'relay' || request?.type === 'relay_send') &&
+            typeof request.frame?.nonce === 'string' && request.target) {
           socket.write(framedPacket({
             frame: sealNetworkFrame(
               { requestNonce: request.frame.nonce, dataBase64: Buffer.from(relayReply).toString('base64') },

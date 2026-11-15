@@ -1,3 +1,4 @@
+import { UnresolvedTargetError } from '../core-types/index.ts';
 import type { MessageEnvelope, NodeCard, RouteDecision, RouteJudgePlugin } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 
@@ -60,7 +61,7 @@ export function createRouterPlugin(): Plugin {
                 .resolveTarget(t, envelope.networkId)
                 .filter(c => c.networkId === envelope.networkId);
               if (!resolved.length) {
-                throw new Error(`Unresolved explicit target: ${t}`);
+                throw new UnresolvedTargetError(t);
               }
               return resolved;
             });

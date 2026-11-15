@@ -1,16 +1,6 @@
-import { randomUUID } from 'node:crypto';
-import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { signReceipt, verifyEnvelope, verifyReceipt } from '../core-types/index.ts';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type {
   DispatchPolicyPlugin,
   DispatchReceipt,
@@ -70,22 +60,7 @@ export class DeliveryLedger {
   set(key: string, value: DispatchReceipt): void {
     const next = { ...this.#entries, [key]: value };
     if (this.#path) {
-      mkdirSync(dirname(this.#path), { recursive: true });
-      const temp = `${this.#path}.${randomUUID()}.tmp`;
-      const fd = openSync(temp, 'wx', 0o600);
-      try {
-        writeFileSync(fd, JSON.stringify(next));
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(temp, this.#path);
-      const dir = openSync(dirname(this.#path), 'r');
-      try {
-        fsyncSync(dir);
-      } finally {
-        closeSync(dir);
-      }
+      writeFileAtomically(this.#path, JSON.stringify(next));
     }
     this.#entries = next;
   }

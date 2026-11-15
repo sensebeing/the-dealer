@@ -1,7 +1,6 @@
-import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { isConfirmedHandoffReceipt } from '../plugins-policy/index.ts';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
+import { isConfirmedHandoffReceipt } from '../core-types/index.ts';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import type {
@@ -101,27 +100,7 @@ export function createWebhookSourcePlugin(config: WebhookSourceConfig = {}): Web
 export function writeAtomicCursorFile(path: string, cursor: unknown): void {
   const json = JSON.stringify(cursor);
   if (json === undefined) throw new Error('Cursor must be JSON serializable');
-  const directory = dirname(path);
-  mkdirSync(directory, { recursive: true });
-  const temporary = join(directory, `.cursor-${randomUUID()}.tmp`);
-  try {
-    const fd = openSync(temporary, 'wx', 0o600);
-    try {
-      writeFileSync(fd, json + '\n');
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(temporary, path);
-    const directoryFd = openSync(directory, 'r');
-    try {
-      fsyncSync(directoryFd);
-    } finally {
-      closeSync(directoryFd);
-    }
-  } finally {
-    rmSync(temporary, { force: true });
-  }
+  writeFileAtomically(path, json + '\n');
 }
 
 export function readJsonCursorFile<T>(path: string, fallback: T): T {

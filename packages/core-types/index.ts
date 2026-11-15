@@ -131,6 +131,52 @@ export interface DeliveryReceipt {
   signature: string;
 }
 
+export const DEDUP_CAS_DUPLICATE_DETAIL = 'Duplicate or stale claim version';
+export const DEDUP_CAS_AMBIGUOUS_DETAIL = 'Previous delivery outcome unknown; newer revision required';
+
+type HandoffReceipt = {
+  stage?: string;
+  detail?: string;
+  executionReceipt?: Record<string, unknown>;
+};
+
+/** A durable queued handoff: the event is durably owned, not merely buffered in memory. */
+export function isDurableQueuedReceipt(receipt: HandoffReceipt | null | undefined): boolean {
+  return receipt?.stage === 'queued' && receipt.executionReceipt?.durable === true;
+}
+
+/** The sender's durable outbox owns the obligation; poll sources may advance immediately. */
+export function isDurableOutboxReceipt(receipt: HandoffReceipt | null | undefined): boolean {
+  return isDurableQueuedReceipt(receipt) && receipt?.executionReceipt?.executor === 'outbox';
+}
+
+export function isDedupCasDuplicateReceipt(
+  receipt: HandoffReceipt | null | undefined,
+  options?: { allowQueued?: boolean },
+): boolean {
+  if (receipt?.stage !== 'rejected' || receipt.detail !== DEDUP_CAS_DUPLICATE_DETAIL) return false;
+  if (receipt.executionReceipt?.durable !== true) return false;
+  const handoff = receipt.executionReceipt.handoff;
+  return handoff === 'settled' || (Boolean(options?.allowQueued) && handoff === 'queued');
+}
+
+/** A signed decision that must stop retries for this target and preserve its evidence. */
+export function isTerminalDeliveryFailure(
+  receipt: HandoffReceipt | null | undefined,
+): boolean {
+  return receipt?.stage === 'rejected' || receipt?.stage === 'failed';
+}
+
+export function isConfirmedHandoffReceipt(
+  receipt: HandoffReceipt | null | undefined,
+  options?: { allowQueued?: boolean },
+): boolean {
+  return receipt?.stage === 'dispatched' || receipt?.stage === 'settled' ||
+    (Boolean(options?.allowQueued) && isDurableQueuedReceipt(receipt)) ||
+    isDedupCasDuplicateReceipt(receipt, options) ||
+    isDurableOutboxReceipt(receipt);
+}
+
 export interface SealedNetworkFrame {
   protocol: 'the-dealer-wire/v1';
   swarmTopicId: string;
@@ -138,6 +184,165 @@ export interface SealedNetworkFrame {
   nonce: string;
   ciphertext: string;
   authTag: string;
+}
+
+/**
+ * Transport-level reachability failure: the peer endpoint is unknown, refused or timed
+ * out and no live tunnel or relay seed could carry the frame. Emitters use this marker to
+ * queue an envelope durably instead of treating every transport error as an offline peer.
+ */
+export class PeerUnreachableError extends Error {
+  readonly code = 'peer_unreachable';
+  readonly targetNodeId: string;
+
+  constructor(targetNodeId: string, message?: string, options?: { cause?: unknown }) {
+    super(message ?? `Peer unreachable: ${targetNodeId}`, options);
+    this.name = 'PeerUnreachableError';
+    this.targetNodeId = targetNodeId;
+  }
+}
+
+/**
+ * The frame was safely accepted by an always-on relay seed's store-and-forward spool while
+ * the target peer was offline. The sender still queues its own outbox entry until a live
+ * end-to-end receipt proves the target received it.
+ */
+export class OfflinePeerSpooledError extends Error {
+  readonly code = 'offline_peer_spooled';
+  readonly targetNodeId: string;
+  readonly seedNodeId: string;
+  readonly spoolId: string;
+
+  constructor(targetNodeId: string, seedNodeId: string, spoolId: string) {
+    super(`Peer ${targetNodeId} is offline; frame spooled on relay seed ${seedNodeId} as ${spoolId}`);
+    this.name = 'OfflinePeerSpooledError';
+    this.targetNodeId = targetNodeId;
+    this.seedNodeId = seedNodeId;
+    this.spoolId = spoolId;
+  }
+}
+
+export function isPeerUnreachableError(error: unknown): error is PeerUnreachableError {
+  return (
+    error instanceof PeerUnreachableError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'peer_unreachable')
+  );
+}
+
+export function isOfflinePeerSpooledError(error: unknown): error is OfflinePeerSpooledError {
+  return (
+    error instanceof OfflinePeerSpooledError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'offline_peer_spooled')
+  );
+}
+
+/** True only for failures that mean the target peer is currently offline or unreachable. */
+export function isPeerOfflineError(error: unknown): boolean {
+  return isPeerUnreachableError(error) || isOfflinePeerSpooledError(error);
+}
+
+/** Router-owned explicit selector failure; the emitter queues it instead of re-parsing text. */
+export class UnresolvedTargetError extends Error {
+  readonly code = 'unresolved_target';
+  readonly target: string;
+
+  constructor(target: string) {
+    super(`Unresolved explicit target: ${target}`);
+    this.name = 'UnresolvedTargetError';
+    this.target = target;
+  }
+}
+
+export function isUnresolvedTargetError(error: unknown): error is UnresolvedTargetError {
+  return (
+    error instanceof UnresolvedTargetError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'unresolved_target')
+  );
+}
+
+/**
+ * A deterministic local failure (missing/corrupt attachment, oversized frame or a rejected
+ * relay-spool protocol response). Retrying the same bytes can never succeed, so durable
+ * redrive must settle it as failed instead of consuming the peer-unreachable retry path.
+ */
+export class LocalDeliveryError extends Error {
+  readonly code = 'local_delivery_failure';
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'LocalDeliveryError';
+  }
+}
+
+export function isLocalDeliveryError(error: unknown): error is LocalDeliveryError {
+  return (
+    error instanceof LocalDeliveryError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'local_delivery_failure')
+  );
+}
+
+/**
+ * A send or response wait hit its deadline after the request may already have reached the
+ * target. Emitters must not auto-retry these as ordinary offline targets without a direct
+ * peer pulse or an explicit force, because the remote side may already have executed.
+ */
+export class DeliveryTimeoutError extends Error {
+  readonly code = 'delivery_timeout';
+
+  constructor(message = 'Delivery timed out', options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'DeliveryTimeoutError';
+  }
+}
+
+export function isDeliveryTimeoutError(error: unknown): error is DeliveryTimeoutError {
+  return (
+    error instanceof DeliveryTimeoutError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'delivery_timeout')
+  );
+}
+
+/** True for a timeout directly or anywhere in a wrapped peer-unreachable cause chain. */
+export function isDeliveryTimeoutFailure(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth += 1) {
+    if (isDeliveryTimeoutError(current)) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** The mount disappeared between an outbox write and a redrive attempt: retry after remount. */
+export class NetworkUnmountedError extends Error {
+  readonly code = 'network_unmounted';
+  readonly networkId: string;
+
+  constructor(networkId: string) {
+    super(`Network not mounted: ${networkId}`);
+    this.name = 'NetworkUnmountedError';
+    this.networkId = networkId;
+  }
+}
+
+export function isNetworkUnmountedError(error: unknown): error is NetworkUnmountedError {
+  return (
+    error instanceof NetworkUnmountedError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'network_unmounted')
+  );
 }
 
 export interface InboundFrameEvent {
@@ -161,11 +366,21 @@ export interface TransportService {
   unmountNetwork(networkId: string): Promise<void>;
   listMountedNetworks(): readonly string[];
   registerPeerEndpoint?(networkId: string, peerNodeId: string, endpointAddr: string): void;
+  /** Make a locally available file addressable by its BLAKE3 hash for blob fetches. */
+  registerBlob?(hash: string, filePath: string): void;
   sendUnicast(
     networkId: string,
     targetNodeId: string,
     frame: Uint8Array,
-    opts?: { timeoutMs?: number },
+    opts?: {
+      timeoutMs?: number;
+      /** Caller-owned policy: allow the relay seed to store this frame while the target is offline. */
+      spoolIfOffline?: boolean;
+      /** Opaque, stable identifier for deduplicating repeated redrives of the same obligation. */
+      spoolKey?: string;
+      /** Content hashes the sender offers to an always-on relay seed for offline spooling. */
+      spoolBlobHashes?: readonly string[];
+    },
   ): Promise<Uint8Array>;
   sendMulticast(
     networkId: string,
@@ -216,13 +431,140 @@ export interface EmitMessageInput<T = Record<string, unknown>> {
   idempotencyKey?: string;
   semantic?: SemanticHeaderInput;
   attachments?: readonly BlobAttachment[];
+  /** Local source paths for pre-shared attachments that a durable outbox must stage. */
+  attachmentPaths?: Readonly<Record<string, string>>;
   filePaths?: readonly string[];
+  /**
+   * Defaults to true when the runtime configures a durable outbox: an unreachable target
+   * is queued locally (and spooled on a relay seed when available) instead of failing emit.
+   */
+  queueIfOffline?: boolean;
 }
 
 export interface EmitResult {
   messageId: string;
   traceId: string;
   receipts: readonly DeliveryReceipt[];
+}
+
+export type OutboxItemStatus = 'queued' | 'delivered' | 'failed';
+
+/**
+ * One durable sender-side obligation. `pendingNodeIds` names the resolved targets still
+ * awaiting a live signed receipt; an empty list means the explicit selector has not been
+ * resolvable yet and must be retried through the emitter's router. A failed item keeps its
+ * unresolved targets so an explicit operator requeue can resume routing instead of settling
+ * early. Terminal decisions are retained per target, and `inDoubtNodeIds` marks timed-out
+ * sends that may already have executed: they are retried only after a direct peer pulse or
+ * an explicit operator flush.
+ */
+export interface OutboxItem {
+  id: string;
+  networkId: string;
+  envelope: MessageEnvelope;
+  explicitTargets: string[];
+  pendingNodeIds: string[];
+  deliveredReceipts: Record<string, DeliveryReceipt>;
+  /** Signed terminal decisions, kept as operator evidence and never reported as delivered. */
+  failedReceipts: Record<string, DeliveryReceipt>;
+  /**
+   * Every target with a terminal failure, with or without a signed receipt. `failedReceipts`
+   * is the signed-evidence subset; entries without one are unsigned local/protocol failures
+   * that an explicit operator requeue may restore.
+   */
+  failedNodeIds: string[];
+  inDoubtNodeIds: string[];
+  relaySpooledNodeIds: string[];
+  stagedFiles: Record<string, string>;
+  status: OutboxItemStatus;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  nextAttemptAt: string;
+  lastError?: string;
+}
+
+export interface OutboxEnqueueInput {
+  envelope: MessageEnvelope;
+  explicitTargets: string[];
+  pendingNodeIds: string[];
+  deliveredReceipts?: Record<string, DeliveryReceipt>;
+  failedReceipts?: Record<string, DeliveryReceipt>;
+  failedNodeIds?: string[];
+  inDoubtNodeIds?: string[];
+  relaySpooledNodeIds?: string[];
+  /** hash -> source path; copied into the durable outbox blob directory on first enqueue. */
+  filePaths?: Record<string, string>;
+  lastError?: string;
+}
+
+/** Atomic creation-or-join of the one durable obligation for an idempotency key. */
+export interface OutboxClaimInput {
+  envelope: MessageEnvelope;
+  explicitTargets: string[];
+  filePaths?: Record<string, string>;
+  /** How long a crash-before-first-send placeholder waits before redrive may send it. */
+  leaseMs?: number;
+}
+
+export interface OutboxClaimResult {
+  /** True only for the caller that created the obligation and may perform the first send. */
+  claimed: boolean;
+  item: OutboxItem;
+}
+
+export interface OutboxListFilter {
+  networkId?: string;
+  status?: OutboxItemStatus | 'all';
+}
+
+export interface OutboxFlushOptions {
+  id?: string;
+  networkId?: string;
+  /** Restrict a peer-triggered flush to the target that just became reachable. */
+  targetNodeId?: string;
+  /** Ignore the per-item retry schedule for an explicit operator flush or peer reconnect. */
+  force?: boolean;
+  /** Force only the target named by `targetNodeId`, leaving unrelated schedule state intact. */
+  forceMatchingTarget?: boolean;
+}
+
+export interface OutboxFlushResult {
+  attempted: number;
+  delivered: number;
+  stillQueued: number;
+  items: OutboxItem[];
+}
+
+export interface OutboxDeliveryFailure {
+  nodeId?: string;
+  receipt?: DeliveryReceipt;
+  error: string;
+}
+
+/** Emitter-owned outcome of one outbox redrive attempt; mailbox only persists the result. */
+export interface OutboxDeliveryOutcome {
+  /** Targets resolved by routing an initially unresolved explicit selector. */
+  resolvedTargetNodeIds?: readonly string[];
+  /** Live signed receipts, keyed by target node. */
+  deliveredReceipts?: Readonly<Record<string, DeliveryReceipt>>;
+  /** Targets still retryable after this attempt. */
+  pendingNodeIds?: readonly string[];
+  /** Targets whose send timed out after a possible external effect; retry only on pulse/force. */
+  inDoubtNodeIds?: readonly string[];
+  relaySpooledNodeIds?: readonly string[];
+  /** Per-target signed rejections/failures or local integrity errors; other targets continue. */
+  failures?: readonly OutboxDeliveryFailure[];
+  lastError?: string;
+}
+
+/** Persistence surface the emitter needs; the concrete OutboxStore implements it. */
+export interface OutboxStoreLike {
+  enqueue(input: OutboxEnqueueInput): OutboxItem;
+  /** Atomically reserve one obligation per (networkId, idempotencyKey) under the store lock. */
+  claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
+  /** Terminal local/routing failure with no signed target receipt. */
+  markFailed(id: string, lastError: string): OutboxItem | undefined;
 }
 
 export interface SourcePlugin {
@@ -234,6 +576,11 @@ export interface SourcePlugin {
 export interface EmitterService {
   emit<T>(input: EmitMessageInput<T>): Promise<EmitResult>;
   registerSource(source: SourcePlugin): Disposable;
+  /** Emitter-owned outbound preparation, routing, send and receipt validation for redrive. */
+  redriveOutboxItem?(
+    item: OutboxItem,
+    options?: { targetNodeIds?: readonly string[]; timeoutMs?: number },
+  ): Promise<OutboxDeliveryOutcome>;
 }
 
 export interface RouteDecision {

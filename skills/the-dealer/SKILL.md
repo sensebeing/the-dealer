@@ -74,9 +74,13 @@ Pick the connectivity mode before mounting:
   seed: `dealer project init --root . --bootstrap-peers relay-host:port --json`
   writes `onboarding.bootstrapPeers` for every linked member, or add
   `--seed relay-host:port` to `dealer network mount`. Nodes gossip sealed
-  discovery beacons through the seed and relay frames and attachments through it
-  whenever direct TCP to the advertised endpoint fails. Relay nodes never read
-  message payloads; frames stay sealed with the network key.
+  discovery beacons and verified peer cards through the seed, and relay frames
+  and attachments through it whenever direct TCP to the advertised endpoint
+  fails. When the target is offline, the seed durably spools the sealed frame
+  (deduplicated by envelope ID, 256 entries per target, 7-day TTL) and its
+  content-addressed attachments, then drains in FIFO order when that target
+  reconnects. Relay nodes never read message payloads; frames stay sealed with
+  the network key and only members that can unseal them are accepted.
 
 Use `dealer node up --advertised-host <host> --json` (or set
 `DEALER_ADVERTISED_HOST` for `dealerd`) when a machine must advertise a specific
@@ -133,13 +137,46 @@ Configure a judge before relying on freeform auto-routing.
 
 Attachments travel as BLAKE3 content-addressed blob tickets. The receiving
 runtime fetches and verifies them into its private `attachments/` directory
-before executing, exposing paths in `payload.localAttachments`. The sender
-must remain available until fetching finishes.
+before executing, exposing paths in `payload.localAttachments`. A relay seed
+that spooled the message also retains its verified attachment copies, so the
+original sender may go offline; without a spooling seed, the sender must remain
+available until fetching finishes.
 
 A `pending_approval` receipt means delivered to the gate, `queued` means
 waiting, and `dispatched` means handed to an executor—not agent completion.
 Broadcast has no per-peer delivery acknowledgements. Do not claim execution
 from a successful broadcast command alone.
+
+## Offline delivery and the outbox
+
+Addressed unicast or multicast sends (`send`, `reply`, `ask`, `settle`) do not fail the
+whole operation when the target peer is unreachable and a durable outbox is configured:
+the structured result reports a queued outcome owned by the local outbox. That outcome is
+a confirmed durable obligation, not evidence of execution. Acknowledge your current inbox
+lease and end the turn; do not poll, sleep, or re-send the same message.
+
+Broadcast is best-effort and is never queued per peer: it has no per-peer
+acknowledgements, so a successful broadcast command does not prove any member received it.
+
+```sh
+dealer outbox list --json
+dealer outbox list --network sensebeing --status queued --json
+dealer outbox flush --json
+dealer outbox flush --id <message-id> --json
+dealer outbox flush --force --json
+dealer outbox requeue --id <message-id> --json
+```
+
+Redrive is automatic and settles an obligation only through the target's signed
+receipt; unsigned, forged, mismatched or rejected receipts fail the item instead of
+keeping it queued. The verified peer directory persists across restarts, and a relay
+seed's spool (when configured) holds the frame and verified attachments until the
+target reconnects. The authoritative state machine, receipt semantics and durable
+storage layout live in [`docs/architecture.md`](../../docs/architecture.md).
+
+Forgeries, signature failures, receipt mismatches and other protocol errors are
+never converted into queued receipts. They fail the command (or mark a redrive item
+`failed`) and must be investigated rather than retried blindly.
 
 ## Inbound gate
 
@@ -162,9 +199,10 @@ do not use a mode change as a way to revoke previously trusted senders.
 
 Gate pending items/trust are in-memory. CAS policy watermarks
 (`dedup-watermarks.json`), identity, mounts, configuration, source cursors,
-the dispatch ledger, `mailbox.json`, wake targets, and thread routes persist
-on disk. A persisted `dispatching` or `failed` entry must be reconciled with
-the external executor before retrying.
+the dispatch ledger, `mailbox.json`, wake targets, thread routes, the verified
+peer directory (`peers.json`), the outbox (`outbox.json` + `outbox-blobs/`) and
+relay-spool entries persist on disk. A persisted `dispatching` or `failed` entry
+must be reconciled with the external executor before retrying.
 
 ## Sources, routes, profiles and plugins
 

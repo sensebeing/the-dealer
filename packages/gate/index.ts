@@ -1,8 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { isConfirmedHandoffReceipt } from '../plugins-policy/index.ts';
-import { verifyEnvelope } from '../core-types/index.ts';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
+import { isConfirmedHandoffReceipt, verifyEnvelope } from '../core-types/index.ts';
 import type {
   AdmissionMode,
   GateRulePlugin,
@@ -76,22 +75,7 @@ function loadDnd(path: string | undefined, limit: number): Map<string, DndEntry>
 }
 
 function persistDnd(path: string, queued: ReadonlyMap<string, DndEntry>): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${randomUUID()}.tmp`;
-  const fd = openSync(temp, 'wx', 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify({ queued: Object.fromEntries(queued) }));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temp, path);
-  const dir = openSync(dirname(path), 'r');
-  try {
-    fsyncSync(dir);
-  } finally {
-    closeSync(dir);
-  }
+  writeFileAtomically(path, JSON.stringify({ queued: Object.fromEntries(queued) }));
 }
 
 export function createGatePlugin(config: GateConfig = {}): Plugin {

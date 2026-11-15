@@ -1,58 +1,27 @@
-import { randomUUID } from 'node:crypto';
-import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import type {
   DispatchPolicyPlugin,
   DispatchReceipt,
   MessageEnvelope,
 } from '../core-types/index.ts';
-
-export const DEDUP_CAS_DUPLICATE_DETAIL = 'Duplicate or stale claim version';
-
-export const DEDUP_CAS_AMBIGUOUS_DETAIL = 'Previous delivery outcome unknown; newer revision required';
+import {
+  DEDUP_CAS_AMBIGUOUS_DETAIL,
+  DEDUP_CAS_DUPLICATE_DETAIL,
+  isDurableQueuedReceipt,
+} from '../core-types/index.ts';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
+export {
+  DEDUP_CAS_AMBIGUOUS_DETAIL,
+  DEDUP_CAS_DUPLICATE_DETAIL,
+  isDedupCasDuplicateReceipt,
+  isDurableQueuedReceipt,
+  isConfirmedHandoffReceipt,
+} from '../core-types/index.ts';
 
 export type DedupWatermarkStatus = 'unknown' | 'queued' | 'settled';
 export interface DedupWatermarkEntry {
   revision: number;
   status: DedupWatermarkStatus;
-}
-
-type HandoffReceipt = {
-  stage?: string;
-  detail?: string;
-  executionReceipt?: Record<string, unknown>;
-};
-
-export function isDurableQueuedReceipt(receipt: HandoffReceipt | null | undefined): boolean {
-  return receipt?.stage === 'queued' && receipt.executionReceipt?.durable === true;
-}
-
-export function isDedupCasDuplicateReceipt(
-  receipt: HandoffReceipt | null | undefined,
-  options?: { allowQueued?: boolean },
-): boolean {
-  if (receipt?.stage !== 'rejected' || receipt.detail !== DEDUP_CAS_DUPLICATE_DETAIL) return false;
-  if (receipt.executionReceipt?.durable !== true) return false;
-  const handoff = receipt.executionReceipt.handoff;
-  return handoff === 'settled' || (Boolean(options?.allowQueued) && handoff === 'queued');
-}
-
-export function isConfirmedHandoffReceipt(
-  receipt: HandoffReceipt | null | undefined,
-  options?: { allowQueued?: boolean },
-): boolean {
-  return receipt?.stage === 'dispatched' || receipt?.stage === 'settled' ||
-    (Boolean(options?.allowQueued) && isDurableQueuedReceipt(receipt)) ||
-    isDedupCasDuplicateReceipt(receipt, options);
 }
 
 export interface DedupCasOptions {
@@ -87,22 +56,7 @@ function loadWatermarks(path: string, options: DedupCasOptions): Record<string, 
 }
 
 function persistWatermarks(path: string, watermarks: ReadonlyMap<string, DedupWatermarkEntry>): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${randomUUID()}.tmp`;
-  const fd = openSync(temp, 'wx', 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify(Object.fromEntries(watermarks)));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temp, path);
-  const dir = openSync(dirname(path), 'r');
-  try {
-    fsyncSync(dir);
-  } finally {
-    closeSync(dir);
-  }
+  writeFileAtomically(path, JSON.stringify(Object.fromEntries(watermarks)));
 }
 
 export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): DispatchPolicyPlugin {

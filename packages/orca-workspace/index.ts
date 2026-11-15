@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync, openSync, closeSync, fsyncSync, rmSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
 import { basename, dirname, join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -607,20 +607,7 @@ export function trustAntigravityWorkspace(workspacePath: string, settingsPath?: 
     }
   }
   settings.trustedWorkspaces = trusted;
-  mkdirSync(dirname(file), { recursive: true });
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  const fd = openSync(temporary, 'wx', 0o600);
-  try {
-    writeFileSync(fd, `${JSON.stringify(settings, null, 2)}\n`);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  try {
-    renameSync(temporary, file);
-  } finally {
-    rmSync(temporary, { force: true });
-  }
+  writeFileAtomically(file, `${JSON.stringify(settings, null, 2)}\n`);
 }
 
 export async function ensureOrcaWorkspace(
