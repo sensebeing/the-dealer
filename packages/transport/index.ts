@@ -374,6 +374,8 @@ export interface SpooledRelayEntry {
   targetNodeId: string;
   networkId: string;
   frame: SealedNetworkFrame;
+  /** Serialized sealed-frame bytes, counted against the global spool byte budget. */
+  frameBytes: number;
   /** hash -> raw byte length for attachments already verified into the network blob cache. */
   blobHashes?: Record<string, number>;
   spooledAt: string;
@@ -830,6 +832,10 @@ export class P2PTransportService implements TransportService {
         targetNodeId: raw.targetNodeId,
         networkId: m.config.networkId,
         frame: raw.frame,
+        frameBytes:
+          Number.isSafeInteger(raw.frameBytes) && raw.frameBytes > 0
+            ? raw.frameBytes
+            : Buffer.byteLength(JSON.stringify(raw.frame)),
         ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
         spooledAt: raw.spooledAt,
         expiresAt: raw.expiresAt,
@@ -978,8 +984,10 @@ export class P2PTransportService implements TransportService {
 
   private relaySpoolBytes(m: Mount): number {
     const sizes = new Map<string, number>();
+    let frameBytes = 0;
     for (const entries of m.relaySpool.values()) {
       for (const entry of entries) {
+        frameBytes += entry.frameBytes;
         for (const [hash, size] of Object.entries(entry.blobHashes ?? {})) {
           sizes.set(hash, size);
         }
@@ -990,7 +998,7 @@ export class P2PTransportService implements TransportService {
         sizes.set(hash, meta.size);
       }
     }
-    let total = 0;
+    let total = frameBytes;
     for (const size of sizes.values()) {
       total += size;
     }
@@ -1211,6 +1219,7 @@ export class P2PTransportService implements TransportService {
     const id = this.relaySpoolEntryId(frame, spoolKey);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + RELAY_SPOOL_TTL_MS).toISOString();
+    const frameBytes = Buffer.byteLength(JSON.stringify(frame));
     const entries = m.relaySpool.get(target) ?? [];
     const existing = entries.find(entry => entry.id === id);
     if (existing && existing.frame.senderNodeId !== frame.senderNodeId) {
@@ -1229,6 +1238,7 @@ export class P2PTransportService implements TransportService {
       // A redrive re-seals the same obligation with a new nonce; keep FIFO position but
       // refresh the frame, attachment metadata and expiry.
       existing.frame = frame;
+      existing.frameBytes = frameBytes;
       existing.expiresAt = expiresAt;
       existing.blobHashes = blobHashes;
     } else {
@@ -1237,6 +1247,7 @@ export class P2PTransportService implements TransportService {
         targetNodeId: target,
         networkId: m.config.networkId,
         frame,
+        frameBytes,
         ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
         spooledAt: now.toISOString(),
         expiresAt,
