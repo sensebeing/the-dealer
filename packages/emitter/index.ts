@@ -3,6 +3,7 @@ import {
   isConfirmedHandoffReceipt,
   isOfflinePeerSpooledError,
   isPeerOfflineError,
+  isTerminalDeliveryFailure,
   isUnresolvedTargetError,
   LocalDeliveryError,
   resolveSemanticHeader,
@@ -229,6 +230,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               }
             : {};
           const deliveredReceipts: Record<string, DeliveryReceipt> = {};
+          const failedReceipts: Record<string, DeliveryReceipt> = {};
+          const observedReceipts: DeliveryReceipt[] = [];
           const pendingNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
           let offlineDetail: string | undefined;
@@ -237,11 +240,24 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           } else {
             for (const target of route.targetNodeIds) {
               try {
-                deliveredReceipts[target] = parseReceipt(
+                const receipt = parseReceipt(
                   await transport.sendUnicast(envelope.networkId, target, frame, spoolOptions),
                   envelope,
                   target,
                 );
+                observedReceipts.push(receipt);
+                if (isConfirmedHandoffReceipt(receipt, { allowQueued: true })) {
+                  deliveredReceipts[target] = receipt;
+                } else if (isTerminalDeliveryFailure(receipt)) {
+                  // A signed rejection/failure is evidence, never delivery. If another
+                  // target needs the durable outbox, preserve this per-target decision.
+                  failedReceipts[target] = receipt;
+                } else if (queueIfOffline) {
+                  // Nonterminal ingress (memory-only queue or approval wait) does not prove
+                  // a durable handoff; the local outbox keeps the obligation.
+                  pendingNodeIds.push(target);
+                  offlineDetail = `Target ${target} returned ${receipt.stage}`;
+                }
               } catch (error) {
                 // Receipt forgery, signature failures and every other local bug must
                 // surface; only a proven offline peer becomes a durable obligation.
@@ -256,13 +272,14 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               }
             }
           }
-          const receipts: DeliveryReceipt[] = Object.values(deliveredReceipts);
+          const receipts: DeliveryReceipt[] = [...observedReceipts];
           if (pendingNodeIds.length > 0) {
             outbox.enqueue({
               envelope,
               explicitTargets: [...(input.routing.targets ?? [])],
               pendingNodeIds,
               deliveredReceipts,
+              failedReceipts,
               relaySpooledNodeIds,
               filePaths: stagedPaths,
               ...(offlineDetail !== undefined ? { lastError: offlineDetail } : {}),
@@ -294,19 +311,26 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               transport.registerBlob?.(hash, filePath);
             } catch (error) {
               return {
-                failed: {
+                failures: [{
                   error: `Missing staged attachment ${hash}: ${
                     error instanceof Error ? error.message : String(error)
                   }`,
-                },
+                }],
               };
             }
           }
           let targets = options.targetNodeIds !== undefined
             ? [...options.targetNodeIds]
-            : item.pendingNodeIds.filter(nodeId => !item.deliveredReceipts[nodeId]);
+            : item.pendingNodeIds.filter(
+                nodeId =>
+                  !item.deliveredReceipts[nodeId] &&
+                  !item.failedNodeIds.includes(nodeId),
+              );
           const untouched = item.pendingNodeIds.filter(
-            nodeId => !targets.includes(nodeId) && !item.deliveredReceipts[nodeId],
+            nodeId =>
+              !targets.includes(nodeId) &&
+              !item.deliveredReceipts[nodeId] &&
+              !item.failedNodeIds.includes(nodeId),
           );
           let resolvedTargetNodeIds: readonly string[] | undefined;
           if (targets.length === 0 && options.targetNodeIds === undefined) {
@@ -318,14 +342,18 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 return { lastError: error.message, pendingNodeIds: [] };
               }
               return {
-                failed: { error: error instanceof Error ? error.message : String(error) },
+                failures: [{
+                  error: error instanceof Error ? error.message : String(error),
+                }],
               };
             }
             if (route.mode === 'broadcast' || route.targetNodeIds.length === 0) {
-              return { failed: { error: 'Outbox item has no addressable target' } };
+              return { failures: [{ error: 'Outbox item has no addressable target' }] };
             }
             resolvedTargetNodeIds = route.targetNodeIds.filter(
-              nodeId => !item.deliveredReceipts[nodeId],
+              nodeId =>
+                !item.deliveredReceipts[nodeId] &&
+                !item.failedNodeIds.includes(nodeId),
             );
             targets = [...resolvedTargetNodeIds];
           }
@@ -340,14 +368,24 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           ];
           const deliveredReceipts: Record<string, DeliveryReceipt> = {};
           const pendingNodeIds: string[] = [];
+          const inDoubtNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
-          let failed: OutboxDeliveryFailure | undefined;
+          const failures: OutboxDeliveryFailure[] = [];
           let lastError: string | undefined;
+          // The total attempt deadline lives here, not in an outer race: every receipt
+          // already obtained is returned even when a later target consumes the budget.
+          const deadline = Date.now() + (options.timeoutMs ?? 10_000);
           for (const target of targets) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) {
+              // Never attempted, so the bytes certainly cannot have executed there.
+              pendingNodeIds.push(target);
+              continue;
+            }
             try {
               const receipt = parseReceipt(
                 await transport.sendUnicast(item.networkId, target, frame, {
-                  ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+                  timeoutMs: remaining,
                   spoolIfOffline: true,
                   spoolKey: item.envelope.id,
                   spoolBlobHashes,
@@ -355,27 +393,24 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 item.envelope,
                 target,
               );
-              if (
-                isConfirmedHandoffReceipt(receipt, { allowQueued: true }) ||
-                receipt.stage === 'pending_approval'
-              ) {
+              if (isConfirmedHandoffReceipt(receipt, { allowQueued: true })) {
                 deliveredReceipts[target] = receipt;
                 continue;
               }
-              if (receipt.stage === 'rejected' || receipt.stage === 'failed') {
-                // A signed rejection/failure is terminal: retrying identical bytes would
-                // just reproduce the target's decision while hiding it from the operator.
-                failed = {
+              if (isTerminalDeliveryFailure(receipt)) {
+                // A signed rejection/failure is terminal for this target only; other
+                // multicast targets must still be attempted and persisted independently.
+                failures.push({
                   nodeId: target,
                   receipt,
                   error: `Target ${target} returned ${receipt.stage}${
                     receipt.detail ? `: ${receipt.detail}` : ''
                   }`,
-                };
-                break;
+                });
+                continue;
               }
-              // Reached the target but not durably handed off (memory-only queue/approval
-              // ingress): keep the obligation and retry under the ordinary backoff.
+              // Reached the target but not durably handed off (memory-only queue or
+              // approval wait): keep the obligation and retry under the ordinary backoff.
               pendingNodeIds.push(target);
               lastError = `Target ${target} returned ${receipt.stage}`;
             } catch (error) {
@@ -383,25 +418,29 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 pendingNodeIds.push(target);
                 if (isOfflinePeerSpooledError(error)) {
                   relaySpooledNodeIds.push(target);
+                } else if (Date.now() >= deadline) {
+                  // The send may have reached the target before its reply timed out. Park
+                  // it until a direct peer pulse or explicit flush supplies the resolution.
+                  inDoubtNodeIds.push(target);
                 }
                 lastError = error instanceof Error ? error.message : String(error);
                 continue;
               }
-              failed = {
+              failures.push({
                 nodeId: target,
                 error: `Local or protocol failure: ${
                   error instanceof Error ? error.message : String(error)
                 }`,
-              };
-              break;
+              });
             }
           }
           return {
             ...(resolvedTargetNodeIds !== undefined ? { resolvedTargetNodeIds } : {}),
             deliveredReceipts,
             pendingNodeIds: [...new Set([...untouched, ...pendingNodeIds])],
+            inDoubtNodeIds,
             relaySpooledNodeIds,
-            ...(failed !== undefined ? { failed } : {}),
+            ...(failures.length > 0 ? { failures } : {}),
             ...(lastError !== undefined ? { lastError } : {}),
           };
         },
@@ -445,7 +484,10 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
 
       /** Reuse an already durable obligation without emitting a second outbox entry. */
       const replayQueued = (existing: OutboxItem): EmitResult => {
-        const receipts: DeliveryReceipt[] = Object.values(existing.deliveredReceipts);
+        const receipts: DeliveryReceipt[] = [
+          ...Object.values(existing.deliveredReceipts),
+          ...Object.values(existing.failedReceipts),
+        ];
         const pending = existing.pendingNodeIds.length > 0
           ? existing.pendingNodeIds
           : [undefined];

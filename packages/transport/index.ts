@@ -23,8 +23,8 @@ import {
   generateNodeKeyPair,
   sealNetworkFrame,
   unsealNetworkFrame,
-  writeFileAtomically,
 } from '../core-types/index.ts';
+import { appendFileDurably, readDurableJournal, writeFileAtomically } from '../fs-atomic/index.ts';
 import type {
   BlobAttachment,
   DerivedNetworkKeys,
@@ -165,6 +165,8 @@ const MAX_RELAY_SPOOL_ENTRIES = 256;
 const MAX_RELAY_SPOOL_TARGETS = 128;
 const MAX_RELAY_SPOOL_TOTAL_ENTRIES = 1_024;
 const MAX_RELAY_SPOOL_TOTAL_BYTES = 32 * 1024 * 1024;
+/** A journal larger than the live spool bound is folded into one snapshot; normal writes append. */
+const MAX_RELAY_SPOOL_JOURNAL_BYTES = 32 * 1024 * 1024;
 const MAX_RELAY_SPOOL_SENDER_ENTRIES = 256;
 const MAX_RELAY_SPOOL_KEY_LENGTH = 128;
 const RELAY_SPOOL_SCHEMA = 'the-dealer-relay-spool/v1';
@@ -684,6 +686,9 @@ export class P2PTransportService implements TransportService {
     m.beacons.clear();
     m.relays.clear();
     await this.tick;
+    // Fold the append-only delta into one snapshot at shutdown so the next start reads a
+    // compact base; live admission/drain never performs this full rewrite.
+    this.persistRelaySpool(m);
     await rm(m.file, { force: true });
     await this.notifyMount();
   }
@@ -735,142 +740,75 @@ export class P2PTransportService implements TransportService {
 
   private loadRelaySpool(m: Mount): void {
     const spoolFile = m.spoolFile;
-    if (!spoolFile || !existsSync(spoolFile)) {
+    if (!spoolFile) {
       return;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(readFileSync(spoolFile, 'utf8'));
-    } catch {
-      throw new Error('Invalid relay spool store');
-    }
-    if (
-      typeof parsed !== 'object' ||
-      parsed === null ||
-      Array.isArray(parsed) ||
-      (parsed as RelaySpoolFile).schema !== RELAY_SPOOL_SCHEMA ||
-      (parsed as RelaySpoolFile).networkId !== m.config.networkId ||
-      !Array.isArray((parsed as RelaySpoolFile).entries)
-    ) {
-      throw new Error('Invalid relay spool store');
+    const journalFile = this.relaySpoolJournalFile(m)!;
+    const hadSnapshot = existsSync(spoolFile);
+    const hadJournal = existsSync(journalFile);
+    if (!hadSnapshot && !hadJournal) {
+      return;
     }
     const now = Date.now();
-    const entries: SpooledRelayEntry[] = [];
-    for (const raw of (parsed as RelaySpoolFile).entries) {
+    if (hadSnapshot) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(readFileSync(spoolFile, 'utf8'));
+      } catch {
+        throw new Error('Invalid relay spool store');
+      }
       if (
-        typeof raw !== 'object' ||
-        raw === null ||
-        typeof raw.id !== 'string' ||
-        !raw.id ||
-        typeof raw.targetNodeId !== 'string' ||
-        !raw.targetNodeId ||
-        raw.networkId !== m.config.networkId ||
-        typeof raw.spooledAt !== 'string' ||
-        typeof raw.expiresAt !== 'string' ||
-        !Number.isFinite(Date.parse(raw.expiresAt)) ||
-        raw.frame?.protocol !== 'the-dealer-wire/v1' ||
-        raw.frame.swarmTopicId !== m.keys.swarmTopicId ||
-        typeof raw.frame.nonce !== 'string'
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        (parsed as RelaySpoolFile).schema !== RELAY_SPOOL_SCHEMA ||
+        (parsed as RelaySpoolFile).networkId !== m.config.networkId ||
+        !Array.isArray((parsed as RelaySpoolFile).entries)
       ) {
         throw new Error('Invalid relay spool store');
       }
-      if (Date.parse(raw.expiresAt) <= now) {
-        continue;
+      const entries: SpooledRelayEntry[] = [];
+      for (const raw of (parsed as RelaySpoolFile).entries) {
+        const entry = this.parseStoredSpoolEntry(raw, m, now, true);
+        if (entry) {
+          entries.push(entry);
+        }
       }
-      const legacyBlobs = (raw as { blobs?: unknown }).blobs;
-      const blobHashes: Record<string, number> = {};
-      if (raw.blobHashes !== undefined) {
-        if (
-          typeof raw.blobHashes !== 'object' ||
-          raw.blobHashes === null ||
-          Array.isArray(raw.blobHashes)
-        ) {
+      entries.sort(
+        (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
+      );
+      for (const entry of entries) {
+        this.insertSpoolEntry(m, entry);
+      }
+      const savedBlobs = (parsed as RelaySpoolFile).blobs;
+      if (savedBlobs !== undefined) {
+        if (typeof savedBlobs !== 'object' || savedBlobs === null || Array.isArray(savedBlobs)) {
           throw new Error('Invalid relay spool store');
         }
-        for (const [hash, size] of Object.entries(raw.blobHashes)) {
+        for (const [hash, meta] of Object.entries(savedBlobs)) {
           if (
             !/^[a-f0-9]{64}$/.test(hash) ||
-            !Number.isSafeInteger(size) ||
-            size < 0 ||
-            size > MAX_RELAY_SPOOL_BLOB_BYTES
+            typeof meta !== 'object' ||
+            meta === null ||
+            !Number.isSafeInteger(meta.size) ||
+            meta.size < 0 ||
+            meta.size > MAX_RELAY_SPOOL_BLOB_BYTES ||
+            typeof meta.expiresAt !== 'string' ||
+            !Number.isFinite(Date.parse(meta.expiresAt))
           ) {
             throw new Error('Invalid relay spool store');
           }
-          blobHashes[hash] = size;
-        }
-      }
-      if (legacyBlobs !== undefined) {
-        // One-time migration from the base64-in-snapshot schema: verify and materialize the
-        // content-addressed files, then persist only hash + length metadata from now on.
-        if (
-          typeof legacyBlobs !== 'object' ||
-          legacyBlobs === null ||
-          Array.isArray(legacyBlobs) ||
-          Object.values(legacyBlobs).some(value => typeof value !== 'string')
-        ) {
-          throw new Error('Invalid relay spool store');
-        }
-        let total = 0;
-        for (const [hash, encoded] of Object.entries(legacyBlobs as Record<string, string>)) {
-          if (!/^[a-f0-9]{64}$/.test(hash)) {
-            throw new Error('Invalid relay spool store');
+          if (Date.parse(meta.expiresAt) <= now) {
+            continue;
           }
-          const bytes = Buffer.from(encoded, 'base64');
-          if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
-            throw new Error('Invalid relay spool store');
-          }
-          total += bytes.length;
-          if (total > MAX_RELAY_SPOOL_BLOB_BYTES) {
-            throw new Error('Invalid relay spool store');
-          }
-          this.writeSpoolBlob(m, hash, bytes);
-          blobHashes[hash] = bytes.length;
+          m.spoolBlobCache.set(hash, { size: meta.size, expiresAt: meta.expiresAt });
         }
-      }
-      entries.push({
-        id: raw.id,
-        targetNodeId: raw.targetNodeId,
-        networkId: m.config.networkId,
-        frame: raw.frame,
-        frameBytes:
-          Number.isSafeInteger(raw.frameBytes) && raw.frameBytes > 0
-            ? raw.frameBytes
-            : Buffer.byteLength(JSON.stringify(raw.frame)),
-        ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
-        spooledAt: raw.spooledAt,
-        expiresAt: raw.expiresAt,
-      });
-    }
-    entries.sort(
-      (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
-    );
-    for (const entry of entries) {
-      const queue = m.relaySpool.get(entry.targetNodeId) ?? [];
-      queue.push(entry);
-      m.relaySpool.set(entry.targetNodeId, queue);
-    }
-    const savedBlobs = (parsed as RelaySpoolFile).blobs;
-    if (savedBlobs !== undefined) {
-      if (typeof savedBlobs !== 'object' || savedBlobs === null || Array.isArray(savedBlobs)) {
-        throw new Error('Invalid relay spool store');
-      }
-      for (const [hash, meta] of Object.entries(savedBlobs)) {
-        if (
-          !/^[a-f0-9]{64}$/.test(hash) ||
-          typeof meta !== 'object' ||
-          meta === null ||
-          !Number.isSafeInteger(meta.size) ||
-          meta.size < 0 ||
-          meta.size > MAX_RELAY_SPOOL_BLOB_BYTES ||
-          typeof meta.expiresAt !== 'string' ||
-          !Number.isFinite(Date.parse(meta.expiresAt)) ||
-          Date.parse(meta.expiresAt) <= now
-        ) {
-          throw new Error('Invalid relay spool store');
-        }
-        m.spoolBlobCache.set(hash, { size: meta.size, expiresAt: meta.expiresAt });
       }
     }
+    // Apply the append-only delta written since the last snapshot, then compact once at
+    // startup. Live admission/drain only append one record, so the seed never rewrites the
+    // whole spool on the request path.
+    this.loadRelaySpoolJournal(m, now);
     // Files from a previous process are addressable and must participate in orphan GC.
     const directory = this.spoolBlobDirectory(m);
     if (existsSync(directory)) {
@@ -887,6 +825,214 @@ export class P2PTransportService implements TransportService {
     this.persistRelaySpool(m);
   }
 
+  private parseStoredSpoolEntry(
+    raw: unknown,
+    m: Mount,
+    now: number,
+    allowLegacyBlobs: boolean,
+  ): SpooledRelayEntry | undefined {
+    const entry = raw as Partial<SpooledRelayEntry> & {
+      blobs?: unknown;
+      blobHashes?: unknown;
+      frame?: SpooledRelayEntry['frame'];
+    };
+    if (
+      typeof entry !== 'object' ||
+      entry === null ||
+      typeof entry.id !== 'string' ||
+      !entry.id ||
+      typeof entry.targetNodeId !== 'string' ||
+      !entry.targetNodeId ||
+      entry.networkId !== m.config.networkId ||
+      typeof entry.spooledAt !== 'string' ||
+      typeof entry.expiresAt !== 'string' ||
+      !Number.isFinite(Date.parse(entry.expiresAt)) ||
+      entry.frame?.protocol !== 'the-dealer-wire/v1' ||
+      entry.frame.swarmTopicId !== m.keys.swarmTopicId ||
+      typeof entry.frame.nonce !== 'string'
+    ) {
+      throw new Error('Invalid relay spool store');
+    }
+    if (Date.parse(entry.expiresAt) <= now) {
+      return undefined;
+    }
+    const legacyBlobs = allowLegacyBlobs ? entry.blobs : undefined;
+    const blobHashes: Record<string, number> = {};
+    if (entry.blobHashes !== undefined) {
+      if (
+        typeof entry.blobHashes !== 'object' ||
+        entry.blobHashes === null ||
+        Array.isArray(entry.blobHashes)
+      ) {
+        throw new Error('Invalid relay spool store');
+      }
+      for (const [hash, size] of Object.entries(entry.blobHashes)) {
+        if (
+          !/^[a-f0-9]{64}$/.test(hash) ||
+          !Number.isSafeInteger(size) ||
+          (size as number) < 0 ||
+          (size as number) > MAX_RELAY_SPOOL_BLOB_BYTES
+        ) {
+          throw new Error('Invalid relay spool store');
+        }
+        blobHashes[hash] = size as number;
+      }
+    }
+    if (legacyBlobs !== undefined) {
+      // One-time migration from the base64-in-snapshot schema: verify and materialize the
+      // content-addressed files, then persist only hash + length metadata from now on.
+      if (
+        typeof legacyBlobs !== 'object' ||
+        legacyBlobs === null ||
+        Array.isArray(legacyBlobs) ||
+        Object.values(legacyBlobs).some(value => typeof value !== 'string')
+      ) {
+        throw new Error('Invalid relay spool store');
+      }
+      let total = 0;
+      for (const [hash, encoded] of Object.entries(legacyBlobs as Record<string, string>)) {
+        if (!/^[a-f0-9]{64}$/.test(hash)) {
+          throw new Error('Invalid relay spool store');
+        }
+        const bytes = Buffer.from(encoded, 'base64');
+        if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
+          throw new Error('Invalid relay spool store');
+        }
+        total += bytes.length;
+        if (total > MAX_RELAY_SPOOL_BLOB_BYTES) {
+          throw new Error('Invalid relay spool store');
+        }
+        this.writeSpoolBlob(m, hash, bytes);
+        blobHashes[hash] = bytes.length;
+      }
+    }
+    return {
+      id: entry.id,
+      targetNodeId: entry.targetNodeId,
+      networkId: m.config.networkId,
+      frame: entry.frame,
+      frameBytes:
+        Number.isSafeInteger(entry.frameBytes) && (entry.frameBytes as number) > 0
+          ? entry.frameBytes as number
+          : Buffer.byteLength(JSON.stringify(entry.frame)),
+      ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
+      spooledAt: entry.spooledAt,
+      expiresAt: entry.expiresAt,
+    };
+  }
+
+  private insertSpoolEntry(m: Mount, entry: SpooledRelayEntry): void {
+    const queue = m.relaySpool.get(entry.targetNodeId) ?? [];
+    queue.push(entry);
+    m.relaySpool.set(entry.targetNodeId, queue);
+    queue.sort(
+      (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
+    );
+  }
+
+  private loadRelaySpoolJournal(m: Mount, now: number): void {
+    const journalFile = this.relaySpoolJournalFile(m);
+    if (!journalFile) {
+      return;
+    }
+    for (const raw of readDurableJournal(journalFile)) {
+      if (typeof raw !== 'object' || raw === null || typeof (raw as { op?: unknown }).op !== 'string') {
+        throw new Error('Invalid relay spool store');
+      }
+      const record = raw as {
+        op: string;
+        entry?: unknown;
+        targetNodeId?: unknown;
+        id?: unknown;
+        blobs?: unknown;
+      };
+      if (record.op === 'upsert') {
+        const entry = this.parseStoredSpoolEntry(record.entry, m, now, false);
+        if (entry) {
+          this.dropSpoolEntry(m, entry.targetNodeId, entry.id);
+          this.insertSpoolEntry(m, entry);
+        }
+      } else if (record.op === 'remove') {
+        if (typeof record.targetNodeId !== 'string' || typeof record.id !== 'string') {
+          throw new Error('Invalid relay spool store');
+        }
+        this.dropSpoolEntry(m, record.targetNodeId, record.id);
+      } else if (record.op === 'drain') {
+        if (typeof record.targetNodeId !== 'string' || typeof record.id !== 'string') {
+          throw new Error('Invalid relay spool store');
+        }
+        this.dropSpoolEntry(m, record.targetNodeId, record.id);
+        this.mergeRelaySpoolCache(m, record.blobs, now);
+      } else if (record.op === 'cache') {
+        this.mergeRelaySpoolCache(m, record.blobs, now);
+      } else if (record.op === 'uncache') {
+        if (!Array.isArray(record.blobs) || record.blobs.some(hash => typeof hash !== 'string')) {
+          throw new Error('Invalid relay spool store');
+        }
+        for (const hash of record.blobs) {
+          m.spoolBlobCache.delete(hash);
+        }
+      } else {
+        throw new Error('Invalid relay spool store');
+      }
+    }
+  }
+
+  private mergeRelaySpoolCache(m: Mount, raw: unknown, now: number): void {
+    if (raw === undefined) {
+      return;
+    }
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error('Invalid relay spool store');
+    }
+    for (const [hash, meta] of Object.entries(raw)) {
+      if (
+        !/^[a-f0-9]{64}$/.test(hash) ||
+        typeof meta !== 'object' ||
+        meta === null ||
+        !Number.isSafeInteger((meta as SpooledRelayBlob).size) ||
+        (meta as SpooledRelayBlob).size < 0 ||
+        (meta as SpooledRelayBlob).size > MAX_RELAY_SPOOL_BLOB_BYTES ||
+        typeof (meta as SpooledRelayBlob).expiresAt !== 'string' ||
+        !Number.isFinite(Date.parse((meta as SpooledRelayBlob).expiresAt))
+      ) {
+        throw new Error('Invalid relay spool store');
+      }
+      if (Date.parse((meta as SpooledRelayBlob).expiresAt) <= now) {
+        continue;
+      }
+      m.spoolBlobCache.set(hash, {
+        size: (meta as SpooledRelayBlob).size,
+        expiresAt: (meta as SpooledRelayBlob).expiresAt,
+      });
+    }
+  }
+
+  private relaySpoolJournalFile(m: Mount): string | undefined {
+    return m.spoolFile ? `${m.spoolFile}.journal` : undefined;
+  }
+
+  private appendRelaySpoolRecord(m: Mount, record: Record<string, unknown>): void {
+    const journalFile = this.relaySpoolJournalFile(m);
+    if (!journalFile) {
+      return;
+    }
+    appendFileDurably(journalFile, `${JSON.stringify(record)}\n`);
+  }
+
+  private relaySpoolJournalOverBudget(m: Mount): boolean {
+    const journalFile = this.relaySpoolJournalFile(m);
+    if (!journalFile) {
+      return false;
+    }
+    try {
+      return statSync(journalFile).size > MAX_RELAY_SPOOL_JOURNAL_BYTES;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Compact the base snapshot and truncate the journal; called at load and shutdown only. */
   private persistRelaySpool(m: Mount): void {
     const spoolFile = m.spoolFile;
     if (!spoolFile) {
@@ -901,16 +1047,28 @@ export class P2PTransportService implements TransportService {
         : {}),
     };
     writeFileAtomically(spoolFile, JSON.stringify(state));
+    rmSync(`${spoolFile}.journal`, { force: true });
   }
 
   /** Drop expired entries/cache, then enforce every global and per-target spool bound. */
-  private pruneRelaySpool(m: Mount): boolean {
+  private pruneRelaySpool(m: Mount, journal = false): boolean {
     const now = Date.now();
     let changed = false;
     for (const [target, entries] of m.relaySpool) {
       const live = entries.filter(entry => Date.parse(entry.expiresAt) > now);
       if (live.length !== entries.length) {
         changed = true;
+        if (journal) {
+          for (const entry of entries) {
+            if (Date.parse(entry.expiresAt) <= now) {
+              this.appendRelaySpoolRecord(m, {
+                op: 'remove',
+                targetNodeId: target,
+                id: entry.id,
+              });
+            }
+          }
+        }
         if (live.length) {
           m.relaySpool.set(target, live);
         } else {
@@ -918,11 +1076,16 @@ export class P2PTransportService implements TransportService {
         }
       }
     }
+    const uncached: string[] = [];
     for (const [hash, meta] of m.spoolBlobCache) {
       if (Date.parse(meta.expiresAt) <= now) {
         m.spoolBlobCache.delete(hash);
+        uncached.push(hash);
         changed = true;
       }
+    }
+    if (journal && uncached.length) {
+      this.appendRelaySpoolRecord(m, { op: 'uncache', blobs: uncached });
     }
     return this.collectSpoolBlobFiles(m) || changed;
   }
@@ -1015,12 +1178,12 @@ export class P2PTransportService implements TransportService {
 
   private oldestSpoolEntry(
     m: Mount,
-    predicate: (entry: SpooledRelayEntry) => boolean,
+    predicate: (target: string, entry: SpooledRelayEntry) => boolean,
   ): { target: string; entry: SpooledRelayEntry } | undefined {
     let oldest: { target: string; entry: SpooledRelayEntry } | undefined;
     for (const [target, entries] of m.relaySpool) {
       for (const entry of entries) {
-        if (!predicate(entry)) {
+        if (!predicate(target, entry)) {
           continue;
         }
         if (
@@ -1048,31 +1211,38 @@ export class P2PTransportService implements TransportService {
     }
   }
 
-  private spoolEntryById(m: Mount, id: string): SpooledRelayEntry | undefined {
-    for (const entries of m.relaySpool.values()) {
-      const entry = entries.find(candidate => candidate.id === id);
-      if (entry) {
-        return entry;
-      }
-    }
-    return undefined;
-  }
-
   /**
    * Bound total entries/bytes and each target/sender share by evicting the oldest first.
-   * The entry being admitted is protected; a single entry always fits within the global
-   * byte budget, so the admission itself can never be starved by older entries.
+   * Protection is the unique (target, id) admission pair, never an id shared across targets.
+   * The entry being admitted fits within the global byte budget on its own, so admission
+   * can never be starved by older entries.
    */
-  private enforceRelaySpoolBudget(m: Mount, protectedId?: string): boolean {
-    const protectedEntry =
-      protectedId === undefined ? undefined : this.spoolEntryById(m, protectedId);
+  private enforceRelaySpoolBudget(
+    m: Mount,
+    protectedEntry?: { targetNodeId: string; id: string },
+    journal = false,
+  ): boolean {
     let changed = false;
+    const isProtected = (target: string, entry: SpooledRelayEntry): boolean =>
+      protectedEntry !== undefined &&
+      protectedEntry.targetNodeId === target &&
+      protectedEntry.id === entry.id;
     const evict = (target: string, entry: SpooledRelayEntry) => {
       this.dropSpoolEntry(m, target, entry.id);
+      if (journal) {
+        this.appendRelaySpoolRecord(m, {
+          op: 'remove',
+          targetNodeId: target,
+          id: entry.id,
+        });
+      }
       changed = true;
     };
     while (m.relaySpool.size > MAX_RELAY_SPOOL_TARGETS) {
-      const oldest = this.oldestSpoolEntry(m, entry => entry.id !== protectedId);
+      const oldest = this.oldestSpoolEntry(
+        m,
+        (target, entry) => !isProtected(target, entry),
+      );
       if (!oldest) break;
       evict(oldest.target, oldest.entry);
     }
@@ -1083,7 +1253,7 @@ export class P2PTransportService implements TransportService {
       if (targetOver) {
         const [target, entries] = targetOver;
         const oldest = entries
-          .filter(entry => entry.id !== protectedId)
+          .filter(entry => !isProtected(target, entry))
           .sort(
             (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) ||
               a.id.localeCompare(b.id),
@@ -1092,17 +1262,27 @@ export class P2PTransportService implements TransportService {
         evict(target, oldest);
         continue;
       }
-      const senderOver =
-        protectedEntry !== undefined &&
-        this.entryCount(
-          m,
-          entry => entry.frame.senderNodeId === protectedEntry.frame.senderNodeId,
-        ) > MAX_RELAY_SPOOL_SENDER_ENTRIES;
+      const counts = new Map<string, number>();
+      for (const entries of m.relaySpool.values()) {
+        for (const entry of entries) {
+          const sender = entry.frame.senderNodeId;
+          counts.set(sender, (counts.get(sender) ?? 0) + 1);
+        }
+      }
+      // A self-asserted sender id still gets its own bounded share on load and admission.
+      const senderOver = [...counts].find(
+        ([, count]) => count > MAX_RELAY_SPOOL_SENDER_ENTRIES,
+      )?.[0];
       const totalOver = this.entryCount(m, () => true) > MAX_RELAY_SPOOL_TOTAL_ENTRIES;
-      if (!senderOver && !totalOver) {
+      if (senderOver === undefined && !totalOver) {
         break;
       }
-      const oldest = this.oldestSpoolEntry(m, entry => entry.id !== protectedId);
+      const oldest = this.oldestSpoolEntry(
+        m,
+        (target, entry) =>
+          !isProtected(target, entry) &&
+          (senderOver === undefined || entry.frame.senderNodeId === senderOver),
+      );
       if (!oldest) break;
       evict(oldest.target, oldest.entry);
     }
@@ -1115,10 +1295,16 @@ export class P2PTransportService implements TransportService {
         m.spoolBlobCache.delete(hash);
         this.spooledBlobs.delete(this.spoolBlobKey(m, hash));
         rmSync(join(this.spoolBlobDirectory(m), hash), { force: true });
+        if (journal) {
+          this.appendRelaySpoolRecord(m, { op: 'uncache', blobs: [hash] });
+        }
         changed = true;
         continue;
       }
-      const oldest = this.oldestSpoolEntry(m, entry => entry.id !== protectedId);
+      const oldest = this.oldestSpoolEntry(
+        m,
+        (target, entry) => !isProtected(target, entry),
+      );
       if (!oldest) break;
       evict(oldest.target, oldest.entry);
     }
@@ -1215,7 +1401,7 @@ export class P2PTransportService implements TransportService {
         prepared.push({ hash, bytes });
       }
     }
-    this.pruneRelaySpool(m);
+    this.pruneRelaySpool(m, true);
     const id = this.relaySpoolEntryId(frame, spoolKey);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + RELAY_SPOOL_TTL_MS).toISOString();
@@ -1234,6 +1420,20 @@ export class P2PTransportService implements TransportService {
     for (const { hash, bytes } of prepared) {
       this.writeSpoolBlob(m, hash, bytes);
     }
+    const entry: SpooledRelayEntry = {
+      id,
+      targetNodeId: target,
+      networkId: m.config.networkId,
+      frame,
+      frameBytes,
+      ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
+      spooledAt: existing?.spooledAt ?? now.toISOString(),
+      expiresAt,
+    };
+    // Append the one-entry delta before publishing in memory: a crash either replays this
+    // upsert or leaves the previous snapshot/delta untouched. The seed never rewrites the
+    // full spool snapshot on the admission path.
+    this.appendRelaySpoolRecord(m, { op: 'upsert', entry });
     if (existing) {
       // A redrive re-seals the same obligation with a new nonce; keep FIFO position but
       // refresh the frame, attachment metadata and expiry.
@@ -1242,23 +1442,16 @@ export class P2PTransportService implements TransportService {
       existing.expiresAt = expiresAt;
       existing.blobHashes = blobHashes;
     } else {
-      entries.push({
-        id,
-        targetNodeId: target,
-        networkId: m.config.networkId,
-        frame,
-        frameBytes,
-        ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
-        spooledAt: now.toISOString(),
-        expiresAt,
-      });
+      entries.push(entry);
     }
     entries.sort(
       (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
     );
     m.relaySpool.set(target, entries);
-    this.enforceRelaySpoolBudget(m, id);
-    this.persistRelaySpool(m);
+    this.enforceRelaySpoolBudget(m, { targetNodeId: target, id }, true);
+    if (this.relaySpoolJournalOverBudget(m)) {
+      this.persistRelaySpool(m);
+    }
     return { spooled: true, seedNodeId: this.localNodeId, spoolId: id };
   }
 
@@ -1303,6 +1496,11 @@ export class P2PTransportService implements TransportService {
     let removed = false;
     for (const entry of [...queued]) {
       if (Date.parse(entry.expiresAt) <= Date.now()) {
+        this.appendRelaySpoolRecord(m, {
+          op: 'remove',
+          targetNodeId: peerNodeId,
+          id: entry.id,
+        });
         this.dropSpoolEntry(m, peerNodeId, entry.id);
         removed = true;
         continue;
@@ -1347,6 +1545,21 @@ export class P2PTransportService implements TransportService {
         // The frame handoff is confirmed, but the target may fetch attachments afterwards;
         // retain their bytes until this entry's original TTL instead of deleting them now.
         this.retainSpoolBlobs(m, entry);
+        const retained = Object.fromEntries(
+          Object.entries(entry.blobHashes ?? {}).map(([hash, size]) => [
+            hash,
+            {
+              size,
+              expiresAt: m.spoolBlobCache.get(hash)?.expiresAt ?? entry.expiresAt,
+            },
+          ]),
+        );
+        this.appendRelaySpoolRecord(m, {
+          op: 'drain',
+          targetNodeId: peerNodeId,
+          id: entry.id,
+          ...(Object.keys(retained).length ? { blobs: retained } : {}),
+        });
         this.dropSpoolEntry(m, peerNodeId, entry.id);
         removed = true;
       } catch {
@@ -1357,7 +1570,9 @@ export class P2PTransportService implements TransportService {
     }
     if (removed) {
       this.collectSpoolBlobFiles(m);
-      this.persistRelaySpool(m);
+      if (this.relaySpoolJournalOverBudget(m)) {
+        this.persistRelaySpool(m);
+      }
     }
   }
 
@@ -2698,6 +2913,9 @@ export class P2PTransportService implements TransportService {
     }
     await this.tick;
     await serverClose;
+    for (const m of this.mounts.values()) {
+      this.persistRelaySpool(m);
+    }
     await Promise.all([...this.mounts.values()].map(m => rm(m.file, { force: true })));
     this.mounts.clear();
     this.handlers.clear();

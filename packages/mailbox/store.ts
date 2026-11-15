@@ -2,22 +2,17 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import {
   isValidMailboxId,
   validateSemanticHeader,
   verifyEnvelope,
-  writeFileAtomically,
 } from '../core-types/index.ts';
 import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-types/index.ts';
-import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
+import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES, normalizeConversationModeInput } from '../agent-host/index.ts';
 import type { AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../agent-host/index.ts';
@@ -30,9 +25,6 @@ const MAX_ACKED_LEASE_HISTORY = 256;
 const MAX_WAKEUP_HINT_LENGTH = 120;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 3_600_000;
-const LOCK_RETRY_MS = 20;
-const LOCK_TIMEOUT_MS = 2_000;
-const STALE_LOCK_MS = 30_000;
 const LEASE_ID_PATTERN = /^dlv_[0-9a-f]{12}$/;
 
 export type MailboxItemStatus = 'queued' | 'leased' | 'acked';
@@ -989,57 +981,7 @@ export class MailboxStore {
   }
 
   private withFileLock<T>(operation: () => T): T {
-    mkdirSync(dirname(this.lockDir), { recursive: true, mode: 0o700 });
-    const ownerPath = join(this.lockDir, 'owner.json');
-    const deadline = Date.now() + LOCK_TIMEOUT_MS;
-    const sleeper = new Int32Array(new SharedArrayBuffer(4));
-    let acquired = false;
-    while (!acquired) {
-      try {
-        mkdirSync(this.lockDir);
-        acquired = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-          throw error;
-        }
-        this.clearStaleLock(ownerPath);
-        if (Date.now() >= deadline) {
-          throw new Error(`Mailbox store is locked: ${this.lockDir}`);
-        }
-        Atomics.wait(sleeper, 0, 0, LOCK_RETRY_MS);
-      }
-    }
-    try {
-      holdOwnedDirectory(this.lockDir);
-      writeFileSync(
-        ownerPath,
-        JSON.stringify(processOwnerRecord()),
-        { mode: 0o600 },
-      );
-      return operation();
-    } finally {
-      rmSync(this.lockDir, { recursive: true, force: true });
-      releaseOwnedDirectory(this.lockDir);
-    }
-  }
-
-  private clearStaleLock(ownerPath: string): void {
-    const owner = readProcessOwner(ownerPath);
-    if (owner !== undefined) {
-      // A same-PID owner is reclaimed only when its record proves the writer was a
-      // previous incarnation of this container; a live or unprovable owner keeps it.
-      if (isDeadProcessOwner(owner, this.lockDir)) {
-        rmSync(this.lockDir, { recursive: true, force: true });
-      }
-      return;
-    }
-    try {
-      if (Date.now() - statSync(this.lockDir).mtimeMs > STALE_LOCK_MS) {
-        rmSync(this.lockDir, { recursive: true, force: true });
-      }
-    } catch {
-      // The lock disappeared while we inspected it.
-    }
+    return withOwnedLock(this.lockDir, 'Mailbox store', operation);
   }
 
   private read(): MailboxFileState {

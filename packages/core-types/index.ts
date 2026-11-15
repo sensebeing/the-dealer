@@ -1,16 +1,4 @@
 import {
-  chmodSync,
-  closeSync,
-  copyFileSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname } from 'node:path';
-import {
   createCipheriv,
   createDecipheriv,
   createHash,
@@ -171,6 +159,13 @@ export function isDedupCasDuplicateReceipt(
   if (receipt.executionReceipt?.durable !== true) return false;
   const handoff = receipt.executionReceipt.handoff;
   return handoff === 'settled' || (Boolean(options?.allowQueued) && handoff === 'queued');
+}
+
+/** A signed decision that must stop retries for this target and preserve its evidence. */
+export function isTerminalDeliveryFailure(
+  receipt: HandoffReceipt | null | undefined,
+): boolean {
+  return receipt?.stage === 'rejected' || receipt?.stage === 'failed';
 }
 
 export function isConfirmedHandoffReceipt(
@@ -400,7 +395,9 @@ export type OutboxItemStatus = 'queued' | 'delivered' | 'failed';
 /**
  * One durable sender-side obligation. `pendingNodeIds` names the resolved targets still
  * awaiting a live signed receipt; an empty list means the explicit selector has not been
- * resolvable yet and must be retried through the emitter's router.
+ * resolvable yet and must be retried through the emitter's router. Terminal decisions are
+ * retained per target, and `inDoubtNodeIds` marks timed-out sends that may already have
+ * executed: they are retried only after a direct peer pulse or an explicit operator flush.
  */
 export interface OutboxItem {
   id: string;
@@ -409,6 +406,11 @@ export interface OutboxItem {
   explicitTargets: string[];
   pendingNodeIds: string[];
   deliveredReceipts: Record<string, DeliveryReceipt>;
+  /** Signed terminal decisions, kept as operator evidence and never reported as delivered. */
+  failedReceipts: Record<string, DeliveryReceipt>;
+  /** Targets whose terminal failure has no signed receipt (local integrity/protocol error). */
+  failedNodeIds: string[];
+  inDoubtNodeIds: string[];
   relaySpooledNodeIds: string[];
   stagedFiles: Record<string, string>;
   status: OutboxItemStatus;
@@ -417,7 +419,6 @@ export interface OutboxItem {
   updatedAt: string;
   nextAttemptAt: string;
   lastError?: string;
-  failedReceipt?: { nodeId: string; receipt: DeliveryReceipt };
 }
 
 export interface OutboxEnqueueInput {
@@ -425,6 +426,9 @@ export interface OutboxEnqueueInput {
   explicitTargets: string[];
   pendingNodeIds: string[];
   deliveredReceipts?: Record<string, DeliveryReceipt>;
+  failedReceipts?: Record<string, DeliveryReceipt>;
+  failedNodeIds?: string[];
+  inDoubtNodeIds?: string[];
   relaySpooledNodeIds?: string[];
   /** hash -> source path; copied into the durable outbox blob directory on first enqueue. */
   filePaths?: Record<string, string>;
@@ -466,11 +470,13 @@ export interface OutboxDeliveryOutcome {
   resolvedTargetNodeIds?: readonly string[];
   /** Live signed receipts, keyed by target node. */
   deliveredReceipts?: Readonly<Record<string, DeliveryReceipt>>;
-  /** Targets still offline or otherwise retryable after this attempt. */
+  /** Targets still retryable after this attempt. */
   pendingNodeIds?: readonly string[];
+  /** Targets whose send timed out after a possible external effect; retry only on pulse/force. */
+  inDoubtNodeIds?: readonly string[];
   relaySpooledNodeIds?: readonly string[];
-  /** A signed rejection/failure or local integrity error that must stop retries. */
-  failed?: OutboxDeliveryFailure;
+  /** Per-target signed rejections/failures or local integrity errors; other targets continue. */
+  failures?: readonly OutboxDeliveryFailure[];
   lastError?: string;
 }
 
@@ -931,69 +937,5 @@ export function unsealNetworkFrame<T = unknown>(
       'Unable to authenticate or decode network frame (wrong key or tampered frame)',
       { cause },
     );
-  }
-}
-
-/**
- * Persist the rename itself. Some platforms/filesystems reject fsync on a read-only
- * directory descriptor; those are benign, while any other I/O failure must still surface.
- */
-export function syncDirectory(directory: string): void {
-  let fd: number | undefined;
-  try {
-    fd = openSync(directory, 'r');
-    fsyncSync(fd);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== 'EINVAL' && code !== 'EBADF' && code !== 'EPERM' && code !== 'ENOTSUP') {
-      throw error;
-    }
-  } finally {
-    if (fd !== undefined) {
-      closeSync(fd);
-    }
-  }
-}
-
-/** Sole atomic JSON/data write owner: temp file, file fsync, rename, parent fsync. */
-export function writeFileAtomically(
-  filePath: string,
-  data: string | Uint8Array,
-  mode = 0o600,
-): void {
-  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
-  const temporary = `${filePath}.${randomUUID()}.tmp`;
-  try {
-    const fd = openSync(temporary, 'wx', mode);
-    try {
-      writeFileSync(fd, data);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(temporary, filePath);
-    syncDirectory(dirname(filePath));
-  } finally {
-    rmSync(temporary, { force: true });
-  }
-}
-
-/** Copy a file into a durable destination with the same fsync/rename contract. */
-export function copyFileAtomically(sourcePath: string, destPath: string, mode = 0o600): void {
-  mkdirSync(dirname(destPath), { recursive: true, mode: 0o700 });
-  const temporary = `${destPath}.${randomUUID()}.tmp`;
-  try {
-    copyFileSync(sourcePath, temporary);
-    chmodSync(temporary, mode);
-    const fd = openSync(temporary, 'r');
-    try {
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(temporary, destPath);
-    syncDirectory(dirname(destPath));
-  } finally {
-    rmSync(temporary, { force: true });
   }
 }

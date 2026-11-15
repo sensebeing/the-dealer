@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import {
   verifyNodeCard,
-  writeFileAtomically,
 } from '../core-types/index.ts';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
 import { generateNodeKeyPair, signNodeCard } from '../core-types/index.ts';
 import type {
   AdmissionMode,

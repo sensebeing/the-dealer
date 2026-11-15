@@ -8,8 +8,8 @@ import {
   DEDUP_CAS_AMBIGUOUS_DETAIL,
   DEDUP_CAS_DUPLICATE_DETAIL,
   isDurableQueuedReceipt,
-  writeFileAtomically,
 } from '../core-types/index.ts';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
 export {
   DEDUP_CAS_AMBIGUOUS_DETAIL,
   DEDUP_CAS_DUPLICATE_DETAIL,

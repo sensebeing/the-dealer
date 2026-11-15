@@ -14,7 +14,7 @@ import {
 } from 'node:fs';
 import { request } from 'node:http';
 import { createConnection, type Socket } from 'node:net';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DealerNodeRuntime } from '../packages/cli/runtime.ts';
@@ -23,6 +23,7 @@ import { Kernel } from '../packages/kernel/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
 import { OutboxRedriveService, OutboxStore } from '../packages/mailbox/outbox.ts';
+import { MailboxStore } from '../packages/mailbox/store.ts';
 import { createPollWatermarkSourcePlugin } from '../packages/plugins-source/index.ts';
 import { blake3 } from '../packages/transport/index.ts';
 import type { TransportPluginOptions } from '../packages/transport/index.ts';
@@ -482,17 +483,35 @@ function envelopeFor(
 
 async function emitterHarness(
   t: TestContext,
-  options: { stage?: DeliveryStage; sendError?: Error } = {},
+  options: {
+    stage?: DeliveryStage;
+    sendError?: Error;
+    extraMembers?: readonly string[];
+    plan?: (
+      targetNodeId: string,
+      callIndex: number,
+    ) => { stage?: DeliveryStage; detail?: string; error?: Error; delayMs?: number } | undefined;
+  } = {},
 ) {
   const dir = directory(t);
   const networkId = 'harness-net';
   const sender = generateNodeKeyPair();
   const receiver = generateNodeKeyPair();
   const targetCard = cardFor(receiver, networkId, 'diz');
+  const extraTargets = (options.extraMembers ?? []).map(member => {
+    const keyPair = generateNodeKeyPair();
+    return { member, keyPair, card: cardFor(keyPair, networkId, member) };
+  });
+  const targetCards = [targetCard, ...extraTargets.map(target => target.card)];
+  const receiptKeys = new Map<string, string>([
+    [targetCard.nodeId, receiver.privateKeyPem],
+    ...extraTargets.map(target => [target.card.nodeId, target.keyPair.privateKeyPem] as const),
+  ]);
   const selfCard = cardFor(sender, networkId, 'ben');
   const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
   const sendCalls: Array<{
     targetNodeId: string;
+    callIndex: number;
     opts?: {
       timeoutMs?: number;
       spoolIfOffline?: boolean;
@@ -527,20 +546,38 @@ async function emitterHarness(
       const envelope = (JSON.parse(Buffer.from(frame).toString('utf8')) as {
         envelope: MessageEnvelope;
       }).envelope;
-      sendCalls.push({ targetNodeId, ...(opts ? { opts } : {}), envelope });
+      const callIndex = sendCalls.filter(call => call.targetNodeId === targetNodeId).length;
+      sendCalls.push({ targetNodeId, callIndex, ...(opts ? { opts } : {}), envelope });
+      const plan = options.plan?.(targetNodeId, callIndex) ?? {};
       if (options.sendError) {
         throw options.sendError;
+      }
+      if (plan.delayMs !== undefined) {
+        await new Promise<void>((resolveDelay, rejectDelay) => {
+          const timer = setTimeout(resolveDelay, plan.delayMs);
+          const timeout = setTimeout(() => {
+            clearTimeout(timer);
+            rejectDelay(new PeerUnreachableError(targetNodeId, 'Transport timeout'));
+          }, Math.max(1, opts?.timeoutMs ?? 90_000));
+        });
+      }
+      if (plan.error) {
+        throw plan.error;
       }
       const receipt = signReceipt(
         {
           messageId: envelope.id,
           networkId: targetNetworkId,
           fromNodeId: targetNodeId,
-          stage: options.stage ?? 'dispatched',
-          ...(options.stage === 'rejected' ? { detail: 'gate closed' } : {}),
+          stage: plan.stage ?? options.stage ?? 'dispatched',
+          ...(plan.detail !== undefined
+            ? { detail: plan.detail }
+            : options.stage === 'rejected'
+              ? { detail: 'gate closed' }
+              : {}),
           updatedAt: new Date().toISOString(),
         },
-        receiver.privateKeyPem,
+        receiptKeys.get(targetNodeId) ?? receiver.privateKeyPem,
       );
       return Buffer.from(JSON.stringify(receipt));
     },
@@ -565,9 +602,15 @@ async function emitterHarness(
   const node = {
     getSelfCard: () => selfCard,
     async updateSelfProfile() {},
-    listPeers: () => [targetCard],
-    resolveTarget: (selector: string) =>
-      selector === targetCard.nodeId || selector === 'member:diz' ? [targetCard] : [],
+    listPeers: () => targetCards,
+    resolveTarget: (selector: string) => {
+      const card = targetCards.find(
+        candidate =>
+          selector === candidate.nodeId ||
+          selector === `member:${candidate.identity.member}`,
+      );
+      return card ? [card] : [];
+    },
   } as unknown as NodeService;
   const kernel = new Kernel();
   kernel.ctx.provide('transport', transport);
@@ -583,6 +626,10 @@ async function emitterHarness(
     sender,
     receiver,
     targetCard,
+    targetCards,
+    targetByMember: new Map(
+      targetCards.map(card => [card.identity.member, card] as const),
+    ),
     outbox,
     emitter: kernel.ctx.services.emitter,
     sendCalls,
@@ -612,7 +659,7 @@ test('redrive settles signed rejection or dispatcher failure as terminal failed'
     const result = await service.flush({ id: item.id });
     const failed = harness.outbox.get(item.id)!;
     assert.equal(failed.status, 'failed');
-    assert.equal(failed.failedReceipt?.receipt.stage, stage);
+    assert.equal(failed.failedReceipts[harness.targetCard.nodeId]?.stage, stage);
     assert.match(failed.lastError ?? '', new RegExp(stage));
     assert.ok(existsSync(failed.stagedFiles[hash]), 'staged evidence is preserved');
     assert.equal(result.stillQueued, 0);
@@ -639,6 +686,182 @@ test('redrive settles signed rejection or dispatcher failure as terminal failed'
   assert.equal(harness.outbox.get(item.id)?.status, 'failed');
   assert.match(harness.outbox.get(item.id)?.lastError ?? '', /Missing staged attachment/);
   await service.stop();
+});
+
+test('initial emit keeps a gate rejection out of delivered receipts', async t => {
+  let dizOnline = false;
+  let rejectTarget = '';
+  const harness = await emitterHarness(t, {
+    extraMembers: ['aya'],
+    plan: target => {
+      if (target === rejectTarget) {
+        return { stage: 'rejected', detail: 'gate closed' };
+      }
+      return dizOnline ? {} : { error: new PeerUnreachableError(target) };
+    },
+  });
+  const diz = harness.targetByMember.get('diz')!.nodeId;
+  const aya = harness.targetByMember.get('aya')!.nodeId;
+  rejectTarget = aya;
+  const emitted = await harness.emitter.emit({
+    networkId: harness.networkId,
+    routing: { mode: 'multicast', targets: ['member:diz', 'member:aya'] },
+    kind: 'task',
+    subject: 'mixed multicast',
+    body: 'one offline target and one rejecting target',
+    payload: {},
+  });
+  assert.ok(emitted.receipts.some(receipt => receipt.stage === 'rejected'));
+  assert.ok(
+    emitted.receipts.some(
+      receipt => receipt.stage === 'queued' && receipt.executionReceipt?.targetNodeId === diz,
+    ),
+  );
+  const queued = harness.outbox.list({ status: 'queued' })[0];
+  assert.deepEqual(queued.pendingNodeIds, [diz]);
+  assert.deepEqual(queued.deliveredReceipts, {});
+  assert.equal(queued.failedReceipts[aya]?.stage, 'rejected');
+
+  dizOnline = true;
+  const service = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+  });
+  await service.flush({ id: queued.id, force: true });
+  const settled = harness.outbox.get(queued.id)!;
+  assert.equal(settled.status, 'failed', 'a failed target is never reported as delivered');
+  assert.equal(settled.deliveredReceipts[diz]?.stage, 'dispatched');
+  assert.equal(settled.failedReceipts[aya]?.stage, 'rejected');
+  assert.deepEqual(settled.pendingNodeIds, []);
+  assert.equal(
+    harness.sendCalls.filter(call => call.targetNodeId === aya).length,
+    1,
+    'the rejected target is not retried',
+  );
+  await service.stop();
+});
+
+test('multicast redrive records terminal failures per target and keeps retrying peers', async t => {
+  let boOnline = false;
+  let ayaTarget = '';
+  let boTarget = '';
+  const harness = await emitterHarness(t, {
+    extraMembers: ['aya', 'bo'],
+    plan: target => {
+      if (target === ayaTarget) {
+        return { stage: 'rejected', detail: 'gate closed' };
+      }
+      if (target === boTarget && !boOnline) {
+        return { error: new PeerUnreachableError(target) };
+      }
+      return {};
+    },
+  });
+  const diz = harness.targetByMember.get('diz')!.nodeId;
+  ayaTarget = harness.targetByMember.get('aya')!.nodeId;
+  boTarget = harness.targetByMember.get('bo')!.nodeId;
+  const envelope = envelopeFor(harness.sender, harness.networkId, diz);
+  const sourcePath = join(harness.dir, 'multicast-evidence.txt');
+  writeFileSync(sourcePath, 'multicast evidence');
+  const hash = blake3(Buffer.from('multicast evidence'));
+  const item = harness.outbox.enqueue({
+    envelope,
+    explicitTargets: [diz, ayaTarget, boTarget],
+    pendingNodeIds: [diz, ayaTarget, boTarget],
+    filePaths: { [hash]: sourcePath },
+  });
+  const service = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+  });
+  await service.flush({ id: item.id, force: true });
+  let current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'queued', 'the offline target keeps the obligation live');
+  assert.deepEqual(current.pendingNodeIds, [boTarget]);
+  assert.equal(current.deliveredReceipts[diz]?.stage, 'dispatched');
+  assert.equal(current.failedReceipts[ayaTarget]?.stage, 'rejected');
+  assert.ok(existsSync(current.stagedFiles[hash]), 'staged evidence survives a partial failure');
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === ayaTarget).length, 1);
+
+  boOnline = true;
+  await service.flush({ id: item.id, force: true });
+  current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'failed', 'a terminal target decision is never hidden by delivery');
+  assert.deepEqual(current.pendingNodeIds, []);
+  assert.equal(current.deliveredReceipts[boTarget]?.stage, 'dispatched');
+  assert.ok(existsSync(current.stagedFiles[hash]), 'staged evidence is retained for the failure');
+  assert.equal(
+    harness.sendCalls.filter(call => call.targetNodeId === ayaTarget).length,
+    1,
+    'later flushes never resend a terminal target',
+  );
+  await service.stop();
+});
+
+test('redrive preserves completed receipts and parks timed-out sends in doubt', async t => {
+  let ayaOnline = false;
+  let ayaTarget = '';
+  const harness = await emitterHarness(t, {
+    extraMembers: ['aya'],
+    plan: target => {
+      if (target === ayaTarget) {
+        return ayaOnline ? {} : { delayMs: 200 };
+      }
+      return {};
+    },
+  });
+  const diz = harness.targetByMember.get('diz')!.nodeId;
+  ayaTarget = harness.targetByMember.get('aya')!.nodeId;
+  const item = harness.outbox.enqueue({
+    envelope: envelopeFor(harness.sender, harness.networkId, diz),
+    explicitTargets: [diz, ayaTarget],
+    pendingNodeIds: [diz, ayaTarget],
+  });
+  const pulse = new EventEmitter();
+  const service = new OutboxRedriveService({
+    outbox: harness.outbox,
+    intervalMs: 60_000,
+    attemptTimeoutMs: 25,
+    events: {
+      on: (event, listener) => {
+        pulse.on(event, listener);
+        return { dispose: () => pulse.off(event, listener) };
+      },
+    },
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+  });
+  service.start();
+  t.after(() => service.stop());
+  await service.flush({ id: item.id });
+  let current = harness.outbox.get(item.id)!;
+  assert.equal(current.deliveredReceipts[diz]?.stage, 'dispatched', 'the completed receipt is durable');
+  assert.deepEqual(current.pendingNodeIds, [ayaTarget]);
+  assert.deepEqual(current.inDoubtNodeIds, [ayaTarget], 'the timed-out send is in doubt');
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === diz).length, 1);
+
+  await new Promise(resolveTimeout => setTimeout(resolveTimeout, 80));
+  await service.flush({ id: item.id });
+  assert.equal(
+    harness.sendCalls.filter(call => call.targetNodeId === ayaTarget).length,
+    1,
+    'the ordinary timer never resends an in-doubt target',
+  );
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === diz).length, 1);
+
+  ayaOnline = true;
+  pulse.emit(
+    'node/peer-updated',
+    harness.targetByMember.get('aya'),
+    { direct: true },
+  );
+  await until(
+    () => harness.outbox.get(item.id)?.status === 'delivered',
+    'a direct peer pulse resolves and delivers the in-doubt target',
+  );
+  current = harness.outbox.get(item.id)!;
+  assert.equal(current.deliveredReceipts[ayaTarget]?.stage, 'dispatched');
+  assert.deepEqual(current.inDoubtNodeIds, []);
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === diz).length, 1);
 });
 
 test('queueIfOffline opt-out leaves no durable copy and idempotent re-emits converge', async t => {
@@ -868,6 +1091,35 @@ test('unresolved target classification is typed rather than message-text based',
   );
 });
 
+test('mailbox and outbox reclaim the shared lock owner after a dead incarnation', t => {
+  const dir = directory(t);
+  const deadOwner = {
+    pid: 2_147_483_646,
+    instanceId: 'dead-incarnation',
+    host: hostname(),
+  };
+  const mailboxPath = join(dir, 'mailbox.json');
+  mkdirSync(`${mailboxPath}.lock`, { recursive: true });
+  writeFileSync(join(`${mailboxPath}.lock`, 'owner.json'), JSON.stringify(deadOwner));
+  const mailbox = new MailboxStore(mailboxPath);
+  assert.equal(mailbox.upsertWakeTarget('default').mailboxId, 'default');
+  assert.equal(existsSync(`${mailboxPath}.lock`), false, 'the dead mailbox lock is reclaimed');
+
+  const outboxPath = join(dir, 'outbox.json');
+  mkdirSync(`${outboxPath}.lock`, { recursive: true });
+  writeFileSync(join(`${outboxPath}.lock`, 'owner.json'), JSON.stringify(deadOwner));
+  const outbox = new OutboxStore(outboxPath, join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  const item = outbox.enqueue({
+    envelope: envelopeFor(sender, 'lock-net', target),
+    explicitTargets: [target],
+    pendingNodeIds: [target],
+  });
+  assert.equal(item.status, 'queued');
+  assert.equal(existsSync(`${outboxPath}.lock`), false, 'the dead outbox lock is reclaimed');
+});
+
 test('outbox enqueue is durable even when the writer is killed immediately after returning', t => {
   const dir = directory(t);
   const outboxPath = join(dir, 'outbox.json');
@@ -919,6 +1171,56 @@ function framed(value: unknown): Buffer {
   const size = Buffer.alloc(4);
   size.writeUInt32BE(body.length);
   return Buffer.concat([size, body]);
+}
+
+/** Effective durable spool state: compacted base snapshot plus the append-only journal. */
+function readRelaySpool(spoolFile: string): {
+  schema: string;
+  networkId: string;
+  entries: Array<Record<string, any>>;
+  blobs: Record<string, { size: number; expiresAt: string }>;
+} {
+  const entries = new Map<string, Record<string, any>>();
+  const blobs: Record<string, { size: number; expiresAt: string }> = {};
+  let schema = 'the-dealer-relay-spool/v1';
+  let networkId = '';
+  const keyFor = (entry: Record<string, any>) => `${entry.targetNodeId}\n${entry.id}`;
+  if (existsSync(spoolFile)) {
+    const base = JSON.parse(readFileSync(spoolFile, 'utf8')) as {
+      schema?: string;
+      networkId?: string;
+      entries?: Array<Record<string, any>>;
+      blobs?: Record<string, { size: number; expiresAt: string }>;
+    };
+    schema = base.schema ?? schema;
+    networkId = base.networkId ?? networkId;
+    for (const entry of base.entries ?? []) {
+      entries.set(keyFor(entry), entry);
+    }
+    Object.assign(blobs, base.blobs ?? {});
+  }
+  const journalFile = `${spoolFile}.journal`;
+  if (existsSync(journalFile)) {
+    for (const line of readFileSync(journalFile, 'utf8').split('\n')) {
+      if (!line) continue;
+      const record = JSON.parse(line) as Record<string, any>;
+      if (record.op === 'upsert') {
+        entries.set(keyFor(record.entry), record.entry);
+      } else if (record.op === 'remove' || record.op === 'drain') {
+        entries.delete(`${record.targetNodeId}\n${record.id}`);
+        if (record.op === 'drain' && record.blobs) {
+          Object.assign(blobs, record.blobs);
+        }
+      } else if (record.op === 'cache') {
+        Object.assign(blobs, record.blobs ?? {});
+      } else if (record.op === 'uncache') {
+        for (const hash of record.blobs as string[]) {
+          delete blobs[hash];
+        }
+      }
+    }
+  }
+  return { schema, networkId, entries: [...entries.values()], blobs };
 }
 
 function tcpRequest(port: number, body: unknown, timeoutMs = 10_000): Promise<any> {
@@ -1019,9 +1321,7 @@ test('relay spool validates targets, isolates senders and collects expired blobs
   assert.match(String(response.error), /Invalid relay spool key/);
 
   const spoolFile = join(root, 'seed', 'relay-spool', `${swarmTopicId}.json`);
-  let spool = JSON.parse(readFileSync(spoolFile, 'utf8')) as {
-    entries: Array<{ id: string; blobs?: unknown; blobHashes?: Record<string, number> }>;
-  };
+  let spool = readRelaySpool(spoolFile);
   assert.equal(spool.entries.length, 2);
   assert.ok(spool.entries.every(entry => entry.blobs === undefined));
 
@@ -1037,7 +1337,7 @@ test('relay spool validates targets, isolates senders and collects expired blobs
   assert.equal(response.spooled, true);
   const blobPath = join(root, 'seed', 'relay-spool', 'blobs', swarmTopicId, hash);
   assert.ok(existsSync(blobPath));
-  spool = JSON.parse(readFileSync(spoolFile, 'utf8'));
+  spool = readRelaySpool(spoolFile);
   assert.equal(
     spool.entries.find(entry => entry.id.endsWith(':blob'))?.blobHashes?.[hash],
     blobBody.length,
@@ -1070,9 +1370,7 @@ test('relay spool validates targets, isolates senders and collects expired blobs
   truncateSync(oversizedPath, 7 * 1024 * 1024);
   const oversizedHash = 'e'.repeat(64);
   client.transport.registerBlob(oversizedHash, oversizedPath);
-  const entriesBefore = (
-    JSON.parse(readFileSync(spoolFile, 'utf8')) as { entries: unknown[] }
-  ).entries.length;
+  const entriesBefore = readRelaySpool(spoolFile).entries.length;
   await assert.rejects(
     client.transport.sendUnicast(
       NETWORK,
@@ -1089,13 +1387,11 @@ test('relay spool validates targets, isolates senders and collects expired blobs
       // mint a spooled handoff or leave a partial relay entry behind.
       error.code === 'peer_unreachable' && error.code !== 'offline_peer_spooled',
   );
-  const entriesAfter = (
-    JSON.parse(readFileSync(spoolFile, 'utf8')) as { entries: unknown[] }
-  ).entries.length;
+  const entriesAfter = readRelaySpool(spoolFile).entries.length;
   assert.equal(entriesAfter, entriesBefore, 'an incomplete attachment offer is never spooled');
 
   await seed.stop();
-  spool = JSON.parse(readFileSync(spoolFile, 'utf8'));
+  spool = readRelaySpool(spoolFile);
   for (const entry of spool.entries) {
     (entry as { expiresAt: string }).expiresAt = new Date(Date.now() - 1_000).toISOString();
   }
@@ -1103,7 +1399,7 @@ test('relay spool validates targets, isolates senders and collects expired blobs
   seed = await createSeed(port);
   await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
   assert.equal(existsSync(blobPath), false, 'expired spool blobs are garbage collected');
-  const pruned = JSON.parse(readFileSync(spoolFile, 'utf8')) as { entries: unknown[] };
+  const pruned = readRelaySpool(spoolFile);
   assert.equal(pruned.entries.length, 0);
 });
 
@@ -1118,13 +1414,15 @@ test('relay spool enforces per-target and global entry bounds when loading', asy
   const now = Date.now();
   const entries: Array<Record<string, unknown>> = [];
   let sequence = 0;
+  const senderFor = (value: number) => `ed25519:${value.toString(16).padStart(64, '0')}`;
   const add = (targetNodeId: string, count: number, offset: number) => {
     for (let index = 0; index < count; index += 1) {
+      const sender = senderFor(sequence);
       entries.push({
-        id: `${sender.nodeId}:key-${sequence}`,
+        id: `${sender}:key-${sequence}`,
         targetNodeId,
         networkId: NETWORK,
-        frame: sealNetworkFrame({ sequence }, keys, sender.nodeId),
+        frame: sealNetworkFrame({ sequence }, keys, sender),
         spooledAt: new Date(now - 1_000_000 + offset + index).toISOString(),
         expiresAt: new Date(now + 86_400_000).toISOString(),
       });
@@ -1149,13 +1447,156 @@ test('relay spool enforces per-target and global entry bounds when loading', asy
   });
   await seed.start();
   await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
-  const saved = JSON.parse(readFileSync(spoolFile, 'utf8')) as {
-    entries: Array<{ targetNodeId: string }>;
-  };
+  const saved = readRelaySpool(spoolFile);
   assert.equal(saved.entries.length, 1024, 'global entry budget is enforced');
   assert.equal(
     saved.entries.filter(entry => entry.targetNodeId === hotTarget).length,
     256,
     'per-target entry budget is enforced',
   );
+});
+
+test('relay spool load enforces the per-sender bound for one sender', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const spoolDir = join(root, 'seed', 'relay-spool');
+  mkdirSync(spoolDir, { recursive: true });
+  const sender = generateNodeKeyPair();
+  const targetNodeId = generateNodeKeyPair().nodeId;
+  const now = Date.now();
+  const entries = Array.from({ length: 1_100 }, (_, index) => ({
+    id: `${sender.nodeId}:load-${index}`,
+    targetNodeId,
+    networkId: NETWORK,
+    frame: sealNetworkFrame({ index }, keys, sender.nodeId),
+    spooledAt: new Date(now - 1_000_000 + index).toISOString(),
+    expiresAt: new Date(now + 86_400_000).toISOString(),
+  }));
+  const spoolFile = join(spoolDir, `${keys.swarmTopicId}.json`);
+  writeFileSync(
+    spoolFile,
+    JSON.stringify({ schema: 'the-dealer-relay-spool/v1', networkId: NETWORK, entries }),
+  );
+  const seed = runtimeFor(root, 'seed');
+  t.after(async () => {
+    await seed.stop().catch(() => {});
+  });
+  await seed.start();
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const saved = readRelaySpool(spoolFile);
+  assert.equal(saved.entries.length, 256, 'the per-sender load bound is enforced');
+  assert.ok(saved.entries.every(entry => entry.frame.senderNodeId === sender.nodeId));
+});
+
+test('relay spool protects only the unique target/id admission pair', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const spoolDir = join(root, 'seed', 'relay-spool');
+  mkdirSync(spoolDir, { recursive: true });
+  const sender = generateNodeKeyPair();
+  const now = Date.now();
+  const sharedKey = 'shared-spool-key';
+  // 128 distinct targets all share one sender/id. An id-only protection rule would shield
+  // every one of them from every eviction loop and let one admission breach the target cap.
+  const entries = Array.from({ length: 128 }, (_, index) => ({
+    id: `${sender.nodeId}:${sharedKey}`,
+    targetNodeId: `ed25519:${(index + 1).toString(16).padStart(64, '0')}`,
+    networkId: NETWORK,
+    frame: sealNetworkFrame({ index }, keys, sender.nodeId),
+    spooledAt: new Date(now - 1_000_000 + index).toISOString(),
+    expiresAt: new Date(now + 86_400_000).toISOString(),
+  }));
+  const spoolFile = join(spoolDir, `${keys.swarmTopicId}.json`);
+  writeFileSync(
+    spoolFile,
+    JSON.stringify({ schema: 'the-dealer-relay-spool/v1', networkId: NETWORK, entries }),
+  );
+  const seed = runtimeFor(root, 'seed');
+  t.after(async () => {
+    await seed.stop().catch(() => {});
+  });
+  await seed.start();
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const endpoint = seed.transport.endpointAddr!;
+  const port = Number(endpoint.slice(endpoint.lastIndexOf(':') + 1));
+  const newTarget = generateNodeKeyPair().nodeId;
+  const response = await tcpRequest(port, {
+    type: 'relay_send',
+    networkId: NETWORK,
+    spoolIfOffline: true,
+    target: newTarget,
+    frame: sealNetworkFrame({ payload: 'new' }, keys, sender.nodeId),
+    spoolKey: sharedKey,
+  });
+  assert.equal(response.spooled, true);
+  const saved = readRelaySpool(spoolFile);
+  assert.equal(saved.entries.length, 128, 'the target cap evicts a same-id old entry');
+  assert.ok(
+    saved.entries.some(entry => entry.targetNodeId === newTarget),
+    'the newly admitted target/id pair is preserved',
+  );
+});
+
+test('relay spool journal restores entries before the first snapshot compaction', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const spoolDir = join(root, 'seed', 'relay-spool');
+  mkdirSync(spoolDir, { recursive: true });
+  const sender = generateNodeKeyPair();
+  const entry = {
+    id: `${sender.nodeId}:journal-only`,
+    targetNodeId: generateNodeKeyPair().nodeId,
+    networkId: NETWORK,
+    frame: sealNetworkFrame({ payload: 'journal-only' }, keys, sender.nodeId),
+    frameBytes: 0,
+    spooledAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+  };
+  entry.frameBytes = Buffer.byteLength(JSON.stringify(entry.frame));
+  const spoolFile = join(spoolDir, `${keys.swarmTopicId}.json`);
+  writeFileSync(`${spoolFile}.journal`, `${JSON.stringify({ op: 'upsert', entry })}\n`);
+  const seed = runtimeFor(root, 'seed');
+  t.after(async () => {
+    await seed.stop().catch(() => {});
+  });
+  await seed.start();
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const saved = readRelaySpool(spoolFile);
+  assert.equal(saved.entries.length, 1, 'the journal is replayed when no snapshot exists');
+  assert.equal(saved.entries[0].id, entry.id);
+  assert.ok(existsSync(spoolFile), 'mount compacts the journal into a base snapshot');
+});
+
+test('relay spool counts sealed frame bytes against the global budget', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const seed = runtimeFor(root, 'seed');
+  t.after(async () => {
+    await seed.stop().catch(() => {});
+  });
+  await seed.start();
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const endpoint = seed.transport.endpointAddr!;
+  const port = Number(endpoint.slice(endpoint.lastIndexOf(':') + 1));
+  const sender = generateNodeKeyPair();
+  const payload = 'x'.repeat(3 * 1024 * 1024);
+  for (let index = 0; index < 9; index += 1) {
+    const response = await tcpRequest(port, {
+      type: 'relay_send',
+      networkId: NETWORK,
+      spoolIfOffline: true,
+      target: generateNodeKeyPair().nodeId,
+      frame: sealNetworkFrame({ index, payload }, keys, sender.nodeId),
+      spoolKey: `large-${index}`,
+    }, 30_000);
+    assert.equal(response.spooled, true);
+  }
+  const spoolFile = join(root, 'seed', 'relay-spool', `${keys.swarmTopicId}.json`);
+  const saved = readRelaySpool(spoolFile);
+  const frameBytes = saved.entries.reduce(
+    (total, entry) => total + Number(entry.frameBytes ?? 0),
+    0,
+  );
+  assert.ok(saved.entries.length < 9, 'large sealed frames are evicted by the byte budget');
+  assert.ok(frameBytes <= 32 * 1024 * 1024, 'the global budget includes sealed frame bytes');
 });
