@@ -717,27 +717,56 @@ export class OutboxRedriveService {
 
   private async flushNow(options: OutboxFlushOptions): Promise<OutboxFlushResult> {
     const now = Date.now();
-    let candidates = this.outbox
-      .list({ status: 'queued', ...(options.networkId ? { networkId: options.networkId } : {}) })
-      .filter(item => options.id === undefined || item.id === options.id);
-    if (options.forceMatchingTarget) {
-      const targetNodeId = options.targetNodeId;
-      if (!targetNodeId) {
-        throw new Error('forceMatchingTarget requires targetNodeId');
-      }
-      // Only this target's item (or an unresolved explicit selector, which may now match
-      // the newly reachable peer) participates. Unrelated backoff stays untouched.
-      candidates = candidates.filter(
-        item =>
-          item.pendingNodeIds.includes(targetNodeId) || item.pendingNodeIds.length === 0,
-      );
+    if (options.forceMatchingTarget && !options.targetNodeId) {
+      throw new Error('forceMatchingTarget requires targetNodeId');
     }
+    const scopedTargetNodeId = options.targetNodeId;
+    // Causal order is per thread: `list` is oldest-first by createdAt then id, so an earlier
+    // undelivered event on a thread (backoff, in-doubt gate, or excluded by --id) must block
+    // every later event on that same thread from overtaking it, without blocking other
+    // threads. `--id ... --force` is the explicit operator override for one obligation.
+    const allQueued = this.outbox.list({
+      status: 'queued',
+      ...(options.networkId ? { networkId: options.networkId } : {}),
+    });
+    const threadKeyOf = (item: OutboxItem): string =>
+      `${item.networkId}\n${item.envelope.semantic?.threadId ?? item.id}`;
+    const blockedThreads = new Set<string>();
     let attempted = 0;
     let delivered = 0;
     const processed: OutboxItem[] = [];
-    for (const candidate of candidates) {
+    // One chronological pass: only an item that precedes `candidate` can have blocked its
+    // thread by the time `candidate` is visited, so a scoped `--id` or peer pulse is never
+    // blocked by a later event on the same thread, while a later event still may not
+    // overtake an earlier parked head.
+    for (const candidate of allQueued) {
       if (this.stopped) {
         break;
+      }
+      const threadKey = threadKeyOf(candidate);
+      if (options.id !== undefined && candidate.id !== options.id) {
+        // An earlier queued event on the same thread was excluded from this scoped flush:
+        // without an explicit force, the requested item may not overtake it.
+        if (!options.force) {
+          blockedThreads.add(threadKey);
+        }
+        continue;
+      }
+      if (
+        options.forceMatchingTarget &&
+        !(
+          candidate.pendingNodeIds.includes(scopedTargetNodeId!) ||
+          candidate.pendingNodeIds.length === 0
+        )
+      ) {
+        // A peer pulse advances only obligations for that peer; an earlier event on the
+        // thread that still waits for another target keeps the thread's head in place.
+        blockedThreads.add(threadKey);
+        continue;
+      }
+      if (blockedThreads.has(threadKey)) {
+        processed.push(candidate);
+        continue;
       }
       // A forced peer flush bypasses only the matching item's schedule; ordinary timer
       // flushes still honour each item's exponential backoff.
@@ -747,6 +776,7 @@ export class OutboxRedriveService {
         candidate.pendingNodeIds.includes(options.targetNodeId!);
       const force = options.force && matchesTarget;
       if (!force && Date.parse(candidate.nextAttemptAt) > now) {
+        blockedThreads.add(threadKey);
         processed.push(candidate);
         continue;
       }
@@ -767,6 +797,7 @@ export class OutboxRedriveService {
               nodeId => !candidate.inDoubtNodeIds.includes(nodeId),
             );
       if (eligibleTargets.length > 0 && requestTargets.length === 0) {
+        blockedThreads.add(threadKey);
         processed.push(candidate);
         continue;
       }
@@ -789,6 +820,7 @@ export class OutboxRedriveService {
           ).toISOString(),
         }) ?? latest;
         processed.push(failed);
+        blockedThreads.add(threadKey);
         continue;
       }
       let item = this.outbox.get(candidate.id) ?? candidate;
@@ -821,9 +853,13 @@ export class OutboxRedriveService {
         }
       }
       if (item.status !== 'queued') {
+        // Delivered or terminally failed: the thread's head is settled, so later queued
+        // events on the same thread may deliver in this very pass.
         processed.push(item);
         continue;
       }
+      // Still owes a live target: later events on this thread must not overtake it.
+      blockedThreads.add(threadKey);
       const settledNodeIds = new Set([
         ...Object.keys(item.deliveredReceipts),
         ...item.failedNodeIds,

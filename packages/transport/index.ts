@@ -391,6 +391,12 @@ const CONNECTION_FAILURE_CODES = new Set([
   'ETIMEDOUT',
   'EHOSTUNREACH',
   'ENETUNREACH',
+  // Darwin/BSD report a same-subnet peer that fails ARP as EHOSTDOWN and a local
+  // interface transition as ENETDOWN; other POSIX stacks use ENONET/ESHUTDOWN.
+  'EHOSTDOWN',
+  'ENETDOWN',
+  'ENONET',
+  'ESHUTDOWN',
   'EAI_AGAIN',
   'ENOTFOUND',
   'EPIPE',
@@ -408,20 +414,40 @@ const CONNECTION_FAILURE_MESSAGES = new Set([
   'Relay target unreachable',
 ]);
 
-function isConnectionFailure(error: unknown): boolean {
+/**
+ * One classification for every reachability symptom, including the AggregateError that
+ * Node's Happy Eyeballs can raise when each per-address connect attempt failed. A mixed
+ * aggregate is deterministic unless every member is itself connection-class.
+ */
+function isConnectionFailure(error: unknown, depth = 0): boolean {
   let current: unknown = error;
-  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth += 1) {
-    if (typeof current === 'object') {
-      const code = (current as { code?: unknown }).code;
-      if (typeof code === 'string' && CONNECTION_FAILURE_CODES.has(code)) {
-        return true;
-      }
-      const message = (current as { message?: unknown }).message;
-      if (typeof message === 'string' && CONNECTION_FAILURE_MESSAGES.has(message)) {
-        return true;
-      }
+  for (let hop = depth; hop < 5 && current !== undefined && current !== null; hop += 1) {
+    if (typeof current !== 'object') {
+      return false;
     }
-    current = (current as { cause?: unknown }).cause;
+    const candidate = current as {
+      code?: unknown;
+      message?: unknown;
+      errors?: unknown;
+      cause?: unknown;
+    };
+    if (typeof candidate.code === 'string' && CONNECTION_FAILURE_CODES.has(candidate.code)) {
+      return true;
+    }
+    if (
+      typeof candidate.message === 'string' &&
+      CONNECTION_FAILURE_MESSAGES.has(candidate.message)
+    ) {
+      return true;
+    }
+    if (
+      Array.isArray(candidate.errors) &&
+      candidate.errors.length > 0 &&
+      candidate.errors.every(entry => isConnectionFailure(entry, hop + 1))
+    ) {
+      return true;
+    }
+    current = candidate.cause;
   }
   return false;
 }
@@ -550,9 +576,16 @@ export class P2PTransportService implements TransportService {
     }
     this.sockets.add(socket);
     socket.once('close', () => this.sockets.delete(socket));
-    socket.setTimeout(this.options.socketTimeoutMs ?? 90_000, () =>
-      socket.destroy(new DeliveryTimeoutError('Transport timeout')),
-    );
+    socket.setTimeout(this.options.socketTimeoutMs ?? 90_000, () => {
+      // A TCP handshake that never completed proves zero application bytes left this
+      // kernel: the peer is simply unreachable, so this must not be reported as a
+      // possibly-executed in-doubt send. Once connected, a silent reply is ambiguous.
+      socket.destroy(
+        socket.connecting
+          ? Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' })
+          : new DeliveryTimeoutError('Transport timeout'),
+      );
+    });
     socket.on('error', () => {});
     return socket;
   }
@@ -1922,7 +1955,7 @@ export class P2PTransportService implements TransportService {
           ? await (blobs ??= this.readSpoolBlobs(
               options.blobHashes,
               Buffer.byteLength(JSON.stringify({
-                type: 'relay_send',
+                type: options.spoolIfOffline ? 'relay_send' : 'relay',
                 networkId: m.config.networkId,
                 target,
                 frame,
@@ -1990,9 +2023,9 @@ export class P2PTransportService implements TransportService {
   }
 
   /**
-   * Read the sender's attachment cache for one relay_send request. Every offered hash must
+   * Read the sender's attachment cache for one relay request. Every offered hash must
    * resolve and re-hash to its declared content. Completeness is judged against the exact
-   * serialized relay_send packet, including the sealed frame, JSON keys, and base64
+   * serialized relay packet, including the sealed frame, JSON keys, and base64
    * expansion, so a packet that would fail `packet()` is offered live-only instead.
    */
   private async readSpoolBlobs(
@@ -2125,11 +2158,14 @@ export class P2PTransportService implements TransportService {
     timeoutMs: number,
     options: { spoolIfOffline?: boolean; spoolKey?: string; blobs?: Record<string, string> } = {},
   ): Promise<Uint8Array> {
+    const startedAt = Date.now();
     const socket = this.track(createConnection(parseEndpoint(seed)));
     socket.setTimeout(timeoutMs);
     try {
       socket.write(packet({
-        type: 'relay_send',
+        // Live non-spooling sends use the original `relay` verb so pre-upgrade seeds keep
+        // forwarding them; only a spool offer needs the newer `relay_send` verb.
+        type: options.spoolIfOffline ? 'relay_send' : 'relay',
         networkId: m.config.networkId,
         target,
         frame,
@@ -2139,7 +2175,28 @@ export class P2PTransportService implements TransportService {
           ? { blobs: options.blobs }
           : {}),
       }));
-      const response = await new SocketReader(socket).json();
+      let response: any;
+      try {
+        response = await new SocketReader(socket).json();
+      } catch (error) {
+        // A pre-upgrade seed answers a `relay_send` offer by dropping the connection. The
+        // beacon is the only evidence that decides whether that target is still live: with
+        // a fresh beacon the peer is demonstrably online behind NAT, so retrying the
+        // original `relay` verb delivers now instead of queueing a reachable peer; without
+        // one the fast failure is genuine and flows into the durable outbox.
+        if (
+          options.spoolIfOffline === true &&
+          (error as Error | undefined)?.message === 'Truncated stream'
+        ) {
+          const hasFreshBeacon = (m.beacons.get(target)?.expires ?? 0) >= Date.now();
+          const remainingMs = timeoutMs - (Date.now() - startedAt);
+          if (hasFreshBeacon && remainingMs > 0) {
+            socket.destroy();
+            return await this.relayExchange(m, seed, target, frame, remainingMs, {});
+          }
+        }
+        throw error;
+      }
       if (response?.error) {
         throw new LocalDeliveryError(String(response.error));
       }

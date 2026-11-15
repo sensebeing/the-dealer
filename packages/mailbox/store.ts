@@ -130,6 +130,15 @@ export interface ThreadSummaryRecord {
   latestEnvelope?: MessageEnvelope;
 }
 
+/** Result of removing one orphan outbound thread record and recomputing the thread. */
+export interface PruneOutboundThreadResult {
+  pruned: ThreadRouteRecord;
+  threadId: string;
+  remainingCount: number;
+  state: ThreadRouteRecord['state'];
+  settlement?: ThreadRouteRecord['settlement'];
+}
+
 export interface ResolvedReplyTarget {
   threadId: string;
   messageId: string;
@@ -1231,6 +1240,31 @@ export class MailboxStore {
     };
   }
 
+  /**
+   * Read-only preflight for a caller-supplied `--ack` lease. It mirrors `ack()`'s lookup
+   * but never mutates the mailbox, so a command that later fails (or sends nothing) cannot
+   * burn the lease that proves the caller still owns the inbound batch.
+   */
+  assertAckableLease(leaseId: string, mailboxId?: string): void {
+    const requestedMailbox =
+      mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
+    const state = this.read();
+    const candidates = requestedMailbox ? [requestedMailbox] : Object.keys(state.mailboxes);
+    for (const candidate of candidates) {
+      const record = state.mailboxes[candidate];
+      if (!record) {
+        continue;
+      }
+      if (
+        record.outstanding?.leaseId === leaseId ||
+        record.ackedLeaseIds.includes(leaseId)
+      ) {
+        return;
+      }
+    }
+    throw new Error(`Unknown or mismatched delivery lease: ${leaseId}`);
+  }
+
   ack(leaseId: string, mailboxId?: string): MailboxAckResult {
     const requestedMailbox =
       mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
@@ -1672,6 +1706,60 @@ export class MailboxStore {
       },
       settlement,
     );
+  }
+
+  /**
+   * Operator reconciliation for an orphan outbound thread record left by a send that never
+   * committed. Only the outbound leg may be pruned; the remaining records of the thread are
+   * recomputed from their own envelopes so a stale settlement cannot outlive its message.
+   */
+  pruneOutboundThreadRecord(messageId: string): PruneOutboundThreadResult | undefined {
+    if (!isNonEmptyString(messageId)) {
+      throw new Error('Invalid message id');
+    }
+    return this.mutate(state => {
+      const key = `outbound:${messageId}`;
+      const removed = state.threads[key];
+      if (removed === undefined) {
+        if (state.threads[`inbound:${messageId}`] !== undefined) {
+          throw new Error(`Cannot prune inbound thread record: ${messageId}`);
+        }
+        return undefined;
+      }
+      delete state.threads[key];
+      const remaining = threadRecordsFor(state, removed.threadId);
+      let nextState: ThreadRouteRecord['state'] = 'open';
+      let nextSettlement: ThreadRouteRecord['settlement'] | undefined;
+      for (const record of remaining) {
+        const ownState = record.envelope ? stateForSemantic(record.envelope) : record.state;
+        const ownSettlement = record.envelope
+          ? settlementOf(record.envelope, record.createdAt)
+          : record.settlement;
+        nextState = mergeThreadState(nextState, ownState);
+        if (ownSettlement !== undefined) {
+          nextSettlement = ownSettlement;
+        }
+      }
+      const now = new Date().toISOString();
+      for (const record of remaining) {
+        // Drop any stale settlement first: the recomputed value is the only one that may
+        // remain, and a thread with no settle envelope must not keep an old one.
+        const { settlement: _discardedSettlement, ...rest } = record;
+        state.threads[threadKey(record)] = {
+          ...rest,
+          state: nextState,
+          updatedAt: now,
+          ...(nextSettlement !== undefined ? { settlement: nextSettlement } : {}),
+        };
+      }
+      return {
+        pruned: structuredClone(removed),
+        threadId: removed.threadId,
+        remainingCount: remaining.length,
+        state: nextState,
+        ...(nextSettlement !== undefined ? { settlement: nextSettlement } : {}),
+      };
+    });
   }
 
   listItemsAfterSequence(afterSequence: number): MailboxItem[] {

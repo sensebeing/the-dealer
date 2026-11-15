@@ -26,7 +26,7 @@ import { createRouterPlugin } from '../packages/router/index.ts';
 import { OutboxRedriveService, OutboxStore } from '../packages/mailbox/outbox.ts';
 import { MailboxStore } from '../packages/mailbox/store.ts';
 import { createPollWatermarkSourcePlugin } from '../packages/plugins-source/index.ts';
-import { blake3 } from '../packages/transport/index.ts';
+import { P2PTransportService, blake3 } from '../packages/transport/index.ts';
 import type { TransportPluginOptions } from '../packages/transport/index.ts';
 import type { RuntimeConfig } from '../packages/cli/config.ts';
 import {
@@ -36,20 +36,25 @@ import {
   deriveNetworkKeys,
   generateNodeKeyPair,
   isConfirmedHandoffReceipt,
+  isDeliveryTimeoutFailure,
   isLocalDeliveryError,
+  isPeerUnreachableError,
   isUnresolvedTargetError,
   sealNetworkFrame,
   signEnvelope,
   signNodeCard,
   signReceipt,
+  unsealNetworkFrame,
 } from '../packages/core-types/index.ts';
 import type {
   DeliveryReceipt,
   DeliveryStage,
+  EmitMessageInput,
   EmitterService,
   MessageEnvelope,
   NodeCard,
   NodeService,
+  SealedNetworkFrame,
   TransportService,
 } from '../packages/core-types/index.ts';
 
@@ -471,6 +476,137 @@ test('outbox list and flush use the single CLI control surface', async t => {
   assert.match(stderr.join('\n'), /--status must be queued, delivered, failed or all/);
 });
 
+test('dealer thread prune removes orphan outbound records and guards live outbox obligations', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  const store = new MailboxStore(join(stateDir, 'mailbox.json'));
+  const peer = generateNodeKeyPair();
+  const sender = generateNodeKeyPair();
+  const message = (
+    id: string,
+    semantic: MessageEnvelope['semantic'],
+    from: ReturnType<typeof generateNodeKeyPair>,
+    member: string,
+  ): MessageEnvelope =>
+    signEnvelope(
+      {
+        id,
+        traceId: id,
+        networkId: NETWORK,
+        from: { nodeId: from.nodeId, member, nodeName: 'node' },
+        routing: { mode: 'unicast', targets: [] },
+        kind: 'collab.request.v1',
+        priority: 'normal',
+        subject: id,
+        body: id,
+        payload: {},
+        attachments: [],
+        createdAt: new Date().toISOString(),
+        ...(semantic ? { semantic } : {}),
+      },
+      from.privateKeyPem,
+    );
+
+  const inbound = message(
+    'msg_inbound_prune',
+    { type: 'question', threadId: 'msg_inbound_prune' },
+    peer,
+    'diz',
+  );
+  store.recordInboundEnvelope(inbound, 'default');
+  const orphan = message(
+    'msg_orphan_reply',
+    { type: 'reply', threadId: 'msg_inbound_prune' },
+    sender,
+    'ben',
+  );
+  store.recordOutboundEnvelope(orphan, [peer.nodeId], 'default');
+  assert.equal(store.getThread('msg_inbound_prune')!.state, 'replied');
+
+  const run = async (args: string[]) => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli([...args, '--json'], {
+      stateDir,
+      stdout: line => stdout.push(line),
+      stderr: line => stderr.push(line),
+    });
+    return {
+      code,
+      value: stdout.length ? JSON.parse(stdout.join('\n')) : undefined,
+      stderr: stderr.join('\n'),
+    };
+  };
+
+  const pruned = await run(['thread', 'prune', orphan.id]);
+  assert.equal(pruned.code, 0, pruned.stderr);
+  assert.equal(pruned.value.ok, true);
+  assert.equal(pruned.value.threadId, 'msg_inbound_prune');
+  assert.equal(pruned.value.remainingCount, 1);
+  assert.equal(pruned.value.state, 'open');
+  assert.equal(pruned.value.pruned.messageId, orphan.id);
+  assert.equal(store.getThread('msg_inbound_prune')!.state, 'open');
+  assert.equal(store.getThread('msg_inbound_prune')!.settlement, undefined);
+
+  const inboundRefusal = await run(['thread', 'prune', inbound.id]);
+  assert.equal(inboundRefusal.code, 1);
+  assert.match(inboundRefusal.stderr, /Cannot prune inbound thread record/);
+
+  const unknown = await run(['thread', 'prune', 'msg_missing_prune']);
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.stderr, /Outbound thread record not found/);
+
+  // A queued obligation still owns the message: pruning is refused without --force.
+  const outbox = new OutboxStore(join(stateDir, 'outbox.json'), join(stateDir, 'outbox-blobs'));
+  const guarded = message(
+    'msg_guarded_reply',
+    { type: 'reply', threadId: 'msg_inbound_prune' },
+    sender,
+    'ben',
+  );
+  store.recordOutboundEnvelope(guarded, [peer.nodeId], 'default');
+  outbox.enqueue({
+    envelope: guarded,
+    explicitTargets: [peer.nodeId],
+    pendingNodeIds: [peer.nodeId],
+  });
+  const guardedRefusal = await run(['thread', 'prune', guarded.id]);
+  assert.equal(guardedRefusal.code, 1);
+  assert.match(guardedRefusal.stderr, /Refusing to prune outbound thread record/);
+  assert.equal(store.getThread(guarded.id)?.direction, 'outbound');
+
+  const forced = await run(['thread', 'prune', guarded.id, '--force']);
+  assert.equal(forced.code, 0, forced.stderr);
+  assert.equal(
+    store.listThreadRecords('msg_inbound_prune').some(record => record.messageId === guarded.id),
+    false,
+  );
+
+  // A delivered obligation is guarded exactly like a queued one.
+  const delivered = message(
+    'msg_delivered_reply',
+    { type: 'reply', threadId: 'msg_inbound_prune' },
+    sender,
+    'ben',
+  );
+  store.recordOutboundEnvelope(delivered, [peer.nodeId], 'default');
+  outbox.enqueue({
+    envelope: delivered,
+    explicitTargets: [peer.nodeId],
+    pendingNodeIds: [peer.nodeId],
+  });
+  outbox.markNodeDelivered(delivered.id, peer.nodeId, receiptFor({
+    messageId: delivered.id,
+    networkId: NETWORK,
+    fromNodeId: peer.nodeId,
+  }));
+  assert.equal(outbox.get(delivered.id)?.status, 'delivered');
+  const deliveredRefusal = await run(['thread', 'prune', delivered.id]);
+  assert.equal(deliveredRefusal.code, 1);
+  assert.match(deliveredRefusal.stderr, /while outbox status is delivered/);
+});
+
 function cardFor(
   keyPair: ReturnType<typeof generateNodeKeyPair>,
   networkId: string,
@@ -545,6 +681,15 @@ async function emitterHarness(
   ]);
   const selfCard = cardFor(sender, networkId, 'ben');
   const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  // Mirrors the runtime subscription: `emitter/sent` is the only writer of the outbound
+  // thread ledger, so any event emitted by a send that never committed is observable as a
+  // polluted record here.
+  const mailbox = new MailboxStore(join(dir, 'mailbox.json'));
+  const sentEvents: Array<{
+    envelope: MessageEnvelope;
+    targetNodeIds: readonly string[];
+    receipts: readonly DeliveryReceipt[];
+  }> = [];
   const sendCalls: Array<{
     targetNodeId: string;
     callIndex: number;
@@ -664,6 +809,14 @@ async function emitterHarness(
         : {}),
     }),
   );
+  kernel.ctx.on('emitter/sent', event => {
+    sentEvents.push(event);
+    mailbox.recordOutboundEnvelope(
+      event.envelope,
+      event.targetNodeIds,
+      event.envelope.semantic?.replyMailbox ?? 'default',
+    );
+  });
   t.after(() => kernel.stop());
   return {
     dir,
@@ -676,6 +829,8 @@ async function emitterHarness(
       targetCards.map(card => [card.identity.member, card] as const),
     ),
     outbox,
+    mailbox,
+    sentEvents,
     emitter: kernel.ctx.services.emitter,
     sendCalls,
     setMounted(value: boolean) {
@@ -870,6 +1025,123 @@ test('initial emit enqueues offline siblings before surfacing a deterministic pr
   await service.stop();
 });
 
+test('uncommitted sends never emit emitter/sent or pollute the outbound thread ledger', async t => {
+  // A signed terminal rejection is evidence, not a handoff: nothing entered the outbox, so
+  // observers must not create a reverse route for it.
+  const rejecting = await emitterHarness(t, { stage: 'rejected' });
+  const rejected = await rejecting.emitter.emit({
+    networkId: rejecting.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'task',
+    subject: 'terminal rejection',
+    body: 'the target refuses this message',
+    payload: {},
+  });
+  assert.equal(rejected.receipts[0]?.stage, 'rejected');
+  assert.deepEqual(rejecting.sentEvents, []);
+  assert.deepEqual(rejecting.outbox.list({ status: 'all' }), []);
+  assert.deepEqual(rejecting.mailbox.listThreads(), []);
+
+  // A deterministic local/protocol failure never reaches the outbox either.
+  const failing = await emitterHarness(t, {
+    plan: () => {
+      throw new LocalDeliveryError('Invalid or mismatched delivery receipt');
+    },
+  });
+  let failure: unknown;
+  try {
+    await failing.emitter.emit({
+      networkId: failing.networkId,
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'task',
+      subject: 'local failure',
+      body: 'receipt verification failed',
+      payload: {},
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(isLocalDeliveryError(failure));
+  assert.deepEqual(failing.sentEvents, []);
+  assert.deepEqual(failing.outbox.list({ status: 'all' }), []);
+  assert.deepEqual(failing.mailbox.listThreads(), []);
+
+  // An explicit opt-out from offline queueing must not invent a durable obligation either.
+  const optOut = await emitterHarness(t, {
+    plan: target => ({ error: new PeerUnreachableError(target) }),
+  });
+  await assert.rejects(
+    optOut.emitter.emit({
+      networkId: optOut.networkId,
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'task',
+      subject: 'offline without queueing',
+      body: 'queueIfOffline:false leaves no trace',
+      payload: {},
+      queueIfOffline: false,
+    }),
+    error => isPeerUnreachableError(error),
+  );
+  assert.deepEqual(optOut.sentEvents, []);
+  assert.deepEqual(optOut.outbox.list({ status: 'all' }), []);
+  assert.deepEqual(optOut.mailbox.listThreads(), []);
+});
+
+test('partial multicast emits emitter/sent only for the targets that actually committed', async t => {
+  let ayaTarget = '';
+  let dizOnline = false;
+  const harness = await emitterHarness(t, {
+    extraMembers: ['aya'],
+    plan: target => {
+      if (target === ayaTarget) {
+        throw new LocalDeliveryError('Invalid or mismatched delivery receipt');
+      }
+      return dizOnline ? {} : { error: new PeerUnreachableError(target) };
+    },
+  });
+  const diz = harness.targetByMember.get('diz')!.nodeId;
+  ayaTarget = harness.targetByMember.get('aya')!.nodeId;
+  let failure: unknown;
+  try {
+    await harness.emitter.emit({
+      networkId: harness.networkId,
+      routing: { mode: 'multicast', targets: ['member:diz', 'member:aya'] },
+      kind: 'task',
+      subject: 'partial handoff',
+      body: 'one durable sibling and one deterministic failure',
+      payload: {},
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(isLocalDeliveryError(failure));
+  assert.equal(harness.sentEvents.length, 1);
+  assert.deepEqual(harness.sentEvents[0].targetNodeIds, [diz]);
+  const records = harness.mailbox.listThreadRecords(harness.sentEvents[0].envelope.id);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].direction, 'outbound');
+  assert.deepEqual(records[0].peerNodeIds, [diz]);
+  assert.equal(harness.outbox.list({ status: 'queued' }).length, 1);
+
+  // A genuine live handoff still records its target exactly once.
+  dizOnline = true;
+  const delivered = await harness.emitter.emit({
+    networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'task',
+    subject: 'live handoff',
+    body: 'dispatched receipt',
+    payload: {},
+  });
+  assert.equal(delivered.receipts[0]?.stage, 'dispatched');
+  assert.equal(harness.sentEvents.length, 2);
+  assert.deepEqual(harness.sentEvents[1].targetNodeIds, [diz]);
+  assert.equal(
+    harness.mailbox.listThreadRecords(delivered.messageId)[0].peerNodeIds[0],
+    diz,
+  );
+});
+
 test('initial emit parks a timed-out target in doubt instead of ordinary offline', async t => {
   const harness = await emitterHarness(t, {
     attemptTimeoutMs: 25,
@@ -945,6 +1217,381 @@ test('scoped redrive preserves in-doubt flags for untouched targets', async t =>
     'a scoped attempt may not clear an untouched target doubt flag',
   );
   await service.stop();
+});
+
+function threadedEnvelope(
+  sender: ReturnType<typeof generateNodeKeyPair>,
+  networkId: string,
+  target: string,
+  id: string,
+  threadId: string,
+): MessageEnvelope {
+  return signEnvelope(
+    {
+      id,
+      traceId: id,
+      networkId,
+      from: { nodeId: sender.nodeId, member: 'ben', nodeName: 'ben' },
+      routing: { mode: 'unicast', targets: [target] },
+      kind: 'collab.request.v1',
+      priority: 'normal',
+      subject: id,
+      body: id,
+      payload: {},
+      attachments: [],
+      semantic: { type: 'reply', threadId },
+      createdAt: new Date().toISOString(),
+    },
+    sender.privateKeyPem,
+  );
+}
+
+test('outbox redrive honours per-thread causal FIFO without blocking other threads', async t => {
+  const dir = directory(t);
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  const queued = (id: string, threadId: string) =>
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, 'fifo-net', target, id, threadId),
+      explicitTargets: [target],
+      pendingNodeIds: [target],
+    });
+  // Fixed ids keep the oldest-first order deterministic when all enqueues share a millisecond.
+  const evt2 = queued('evt-0002', 'thread-a');
+  const evt3 = queued('evt-0003', 'thread-a');
+  const evt4 = queued('evt-0004', 'thread-a');
+  const other = queued('evt-0100', 'thread-b');
+  // The earlier causal event is parked behind backoff and in-doubt; the later events on the
+  // same thread are already due.
+  outbox.recordAttempt(evt2.id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+    inDoubtNodeIds: [target],
+  });
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    deliver: async (candidate, options) => {
+      deliveries.push(candidate.id);
+      const targets = options?.targetNodeIds ?? candidate.pendingNodeIds;
+      return {
+        deliveredReceipts: Object.fromEntries(
+          targets.map(nodeId => [
+            nodeId,
+            {
+              messageId: candidate.envelope.id,
+              networkId: candidate.networkId,
+              fromNodeId: nodeId,
+              stage: 'dispatched' as const,
+              updatedAt: new Date().toISOString(),
+              signature: 'test-signature',
+            },
+          ]),
+        ),
+        pendingNodeIds: [],
+        inDoubtNodeIds: [],
+      };
+    },
+  });
+  t.after(() => service.stop());
+
+  const first = await service.flush();
+  assert.deepEqual(
+    deliveries,
+    [other.id],
+    'a later event on a blocked thread may never overtake its undelivered head',
+  );
+  assert.deepEqual(first.items.map(item => item.id), [evt2.id, evt3.id, evt4.id, other.id]);
+  assert.equal(outbox.get(other.id)?.status, 'delivered');
+  assert.equal(outbox.get(evt2.id)?.status, 'queued');
+  assert.deepEqual(outbox.get(evt3.id)?.pendingNodeIds, [target]);
+  assert.deepEqual(outbox.get(evt4.id)?.pendingNodeIds, [target]);
+
+  // A scoped --id without --force still may not jump the thread's undelivered head.
+  const scoped = await service.flush({ id: evt3.id });
+  assert.equal(scoped.attempted, 0);
+  assert.deepEqual(deliveries, [other.id]);
+
+  // Once the head is eligible (peer pulse or explicit operator force), one pass drains the
+  // whole thread in exact causal order.
+  await service.flush({ force: true });
+  assert.deepEqual(deliveries, [other.id, evt2.id, evt3.id, evt4.id]);
+  for (const id of [evt2.id, evt3.id, evt4.id]) {
+    assert.equal(outbox.get(id)?.status, 'delivered');
+  }
+});
+
+test('scoped --id flush delivers its head even when a later event shares the thread', async t => {
+  const dir = directory(t);
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  const queued = (id: string) =>
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, 'scoped-net', target, id, 'thread-scoped'),
+      explicitTargets: [target],
+      pendingNodeIds: [target],
+    });
+  const head = queued('evt-0002');
+  const later = queued('evt-0003');
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    deliver: async (candidate, options) => {
+      deliveries.push(candidate.id);
+      const targets = options?.targetNodeIds ?? candidate.pendingNodeIds;
+      return {
+        deliveredReceipts: Object.fromEntries(
+          targets.map(nodeId => [
+            nodeId,
+            {
+              messageId: candidate.envelope.id,
+              networkId: candidate.networkId,
+              fromNodeId: nodeId,
+              stage: 'dispatched' as const,
+              updatedAt: new Date().toISOString(),
+              signature: 'test-signature',
+            },
+          ]),
+        ),
+        pendingNodeIds: [],
+        inDoubtNodeIds: [],
+      };
+    },
+  });
+  t.after(() => service.stop());
+
+  const result = await service.flush({ id: head.id });
+  assert.equal(result.attempted, 1, 'the scoped head itself must be attempted');
+  assert.deepEqual(deliveries, [head.id]);
+  assert.equal(outbox.get(head.id)?.status, 'delivered');
+  assert.equal(
+    outbox.get(later.id)?.status,
+    'queued',
+    'a later event on the same thread must not be delivered by a scoped --id flush',
+  );
+});
+
+test('peer pulse resolves the matching head without letting a later matching event overtake a skipped sibling', async t => {
+  const dir = directory(t);
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const peerP = generateNodeKeyPair().nodeId;
+  const peerQ = generateNodeKeyPair().nodeId;
+  const queued = (id: string, peer: string) =>
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, 'pulse-net', peer, id, 'thread-pulse'),
+      explicitTargets: [peer],
+      pendingNodeIds: [peer],
+    });
+  const head = queued('evt-0002', peerP);
+  const sibling = queued('evt-0003', peerQ);
+  const trailing = queued('evt-0004', peerP);
+  outbox.recordAttempt(head.id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+    inDoubtNodeIds: [peerP],
+  });
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    deliver: async (candidate, options) => {
+      deliveries.push(candidate.id);
+      const targets = options?.targetNodeIds ?? candidate.pendingNodeIds;
+      return {
+        deliveredReceipts: Object.fromEntries(
+          targets.map(nodeId => [
+            nodeId,
+            {
+              messageId: candidate.envelope.id,
+              networkId: candidate.networkId,
+              fromNodeId: nodeId,
+              stage: 'dispatched' as const,
+              updatedAt: new Date().toISOString(),
+              signature: 'test-signature',
+            },
+          ]),
+        ),
+        pendingNodeIds: [],
+        inDoubtNodeIds: [],
+      };
+    },
+  });
+  t.after(() => service.stop());
+
+  const result = await service.flush({
+    force: true,
+    forceMatchingTarget: true,
+    targetNodeId: peerP,
+  });
+  assert.equal(result.attempted, 1, 'only the matching in-doubt head is attempted');
+  assert.deepEqual(deliveries, [head.id]);
+  const resolved = outbox.get(head.id)!;
+  assert.equal(resolved.status, 'delivered', 'the peer pulse resolves the in-doubt head');
+  assert.deepEqual(resolved.inDoubtNodeIds, []);
+  assert.equal(outbox.get(sibling.id)?.status, 'queued');
+  assert.equal(
+    outbox.get(trailing.id)?.status,
+    'queued',
+    'a later peer-matching event may not overtake the skipped sibling on its thread',
+  );
+});
+
+interface SessionHarness {
+  store: MailboxStore;
+  leaseId: string;
+  inboundId: string;
+  emitCalls: EmitMessageInput[];
+  runtime: DealerNodeRuntime;
+}
+
+/** A minimal session command surface: only the mailbox lease and emitter are exercised. */
+function sessionHarness(
+  t: TestContext,
+  emit: (
+    input: EmitMessageInput,
+  ) => Promise<{ messageId: string; traceId: string; receipts: DeliveryReceipt[] }>,
+): SessionHarness {
+  const dir = directory(t);
+  const store = new MailboxStore(join(dir, 'mailbox.json'));
+  const peer = generateNodeKeyPair();
+  const inbound = signEnvelope(
+    {
+      id: 'msg_inbound_session',
+      traceId: 'msg_inbound_session',
+      networkId: 'team',
+      from: { nodeId: peer.nodeId, member: 'diz', nodeName: 'diz' },
+      routing: { mode: 'unicast', targets: [] },
+      kind: 'collab.request.v1',
+      priority: 'normal',
+      subject: 'inbound question',
+      body: 'answer me',
+      payload: {},
+      attachments: [],
+      semantic: { type: 'question', threadId: 'msg_inbound_session' },
+      createdAt: new Date().toISOString(),
+    },
+    peer.privateKeyPem,
+  );
+  store.enqueue([inbound]);
+  store.recordInboundEnvelope(inbound, 'default');
+  const leaseId = store.check({ mailboxId: 'default' }).deliveryId!;
+  const emitCalls: EmitMessageInput[] = [];
+  const runtime = {
+    mailbox: store,
+    emitter: {
+      emit: async (input: EmitMessageInput) => {
+        emitCalls.push(input);
+        return emit(input);
+      },
+    },
+    start: async () => {},
+  } as unknown as DealerNodeRuntime;
+  return { store, leaseId, inboundId: inbound.id, emitCalls, runtime };
+}
+
+function receiptFor(overrides: Partial<DeliveryReceipt>): DeliveryReceipt {
+  return {
+    messageId: 'msg_outbound_session',
+    networkId: 'team',
+    fromNodeId: 'ed25519:' + 'c'.repeat(64),
+    stage: 'dispatched',
+    updatedAt: new Date().toISOString(),
+    signature: 'test-signature',
+    ...overrides,
+  };
+}
+
+test('session --ack validates before sending and only burns the lease after commit', async t => {
+  const argsFor = (group: 'ask' | 'reply' | 'settle', messageId: string, leaseId: string) =>
+    group === 'ask'
+      ? ['ask', '--reply-to', messageId, '--body', 'follow-up', '--ack', leaseId, '--json']
+      : group === 'reply'
+        ? ['reply', messageId, '--body', 'answer', '--ack', leaseId, '--json']
+        : ['settle', messageId, '--outcome', 'succeeded', '--summary', 'done', '--ack', leaseId, '--json'];
+  const run = async (runtime: DealerNodeRuntime, args: string[]) => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(args, {
+      runtime,
+      stdout: line => stdout.push(line),
+      stderr: line => stderr.push(line),
+    });
+    return { code, stdout, stderr: stderr.join('\n') };
+  };
+  const inboundStatus = (store: MailboxStore, id: string) =>
+    store.list({ includeAcked: true }).items.find(item => item.id === id)?.status;
+
+  for (const group of ['ask', 'reply', 'settle'] as const) {
+    // An unknown lease is rejected before the emitter is ever called.
+    const invalid = sessionHarness(t, async () => {
+      throw new Error('emit must not run for an unknown --ack lease');
+    });
+    const rejectedAck = await run(
+      invalid.runtime,
+      argsFor(group, invalid.inboundId, 'dlv_deadbeef0000'),
+    );
+    assert.equal(rejectedAck.code, 1);
+    assert.match(rejectedAck.stderr, /Unknown or mismatched delivery lease/);
+    assert.deepEqual(invalid.emitCalls, []);
+    invalid.store.assertAckableLease(invalid.leaseId);
+
+    // A throwing emit leaves the caller's inbound lease untouched.
+    const throwing = sessionHarness(t, async () => {
+      throw new LocalDeliveryError('send failed');
+    });
+    const thrown = await run(
+      throwing.runtime,
+      argsFor(group, throwing.inboundId, throwing.leaseId),
+    );
+    assert.equal(thrown.code, 1);
+    assert.match(thrown.stderr, /send failed/);
+    throwing.store.assertAckableLease(throwing.leaseId);
+    assert.equal(inboundStatus(throwing.store, throwing.inboundId), 'leased');
+
+    // A terminally rejected send is not a committed handoff: the lease stays leased.
+    const rejecting = sessionHarness(t, async () => ({
+      messageId: 'msg_outbound_session',
+      traceId: 'trace_outbound_session',
+      receipts: [receiptFor({ stage: 'rejected', detail: 'gate closed' })],
+    }));
+    const rejected = await run(
+      rejecting.runtime,
+      argsFor(group, rejecting.inboundId, rejecting.leaseId),
+    );
+    assert.equal(rejected.code, 0, rejected.stderr);
+    assert.equal(rejecting.emitCalls.length, 1);
+    rejecting.store.assertAckableLease(rejecting.leaseId);
+    assert.equal(inboundStatus(rejecting.store, rejecting.inboundId), 'leased');
+    assert.equal(
+      JSON.parse(rejected.stdout.join('')).acked,
+      false,
+      'a terminal rejection must report that the lease was preserved',
+    );
+
+    // A live handoff or a durable outbox obligation commits the send and only then acks.
+    const queued = sessionHarness(t, async () => ({
+      messageId: 'msg_outbound_session',
+      traceId: 'trace_outbound_session',
+      receipts: [
+        receiptFor({
+          stage: 'queued',
+          executionReceipt: { durable: true, executor: 'outbox' },
+        }),
+      ],
+    }));
+    const committed = await run(
+      queued.runtime,
+      argsFor(group, queued.inboundId, queued.leaseId),
+    );
+    assert.equal(committed.code, 0, committed.stderr);
+    assert.equal(
+      JSON.parse(committed.stdout.join('')).acked,
+      true,
+      'a committed send must report that the lease was burned',
+    );
+    assert.equal(queued.store.ack(queued.leaseId).alreadyAcknowledged, true);
+    assert.equal(inboundStatus(queued.store, queued.inboundId), 'acked');
+  }
 });
 
 test('unmounted network keeps outbox obligations queued through remount', async t => {
@@ -1952,6 +2599,422 @@ async function rawRelayServer(  t: TestContext,
   }
   return `127.0.0.1:${address.port}`;
 }
+
+/**
+ * Replace only the sender's direct TCP hop with a deterministic error. A real ARP failure
+ * (EHOSTDOWN) cannot be provoked on every test host, but every downstream decision is
+ * identical to the OS raising the same classified connect error.
+ */
+function failDirectHop(transport: P2PTransportService, error: Error): void {
+  (transport as unknown as {
+    directFrame: (...args: unknown[]) => Promise<never>;
+  }).directFrame = async () => {
+    throw error;
+  };
+}
+
+/** Read the sender's live view of one peer's sealed discovery beacon expiry. */
+function beaconExpiry(
+  transport: P2PTransportService,
+  networkId: string,
+  nodeId: string,
+): number {
+  const mounts = (transport as unknown as {
+    mounts: Map<string, { beacons: Map<string, { expires: number }> }>;
+  }).mounts;
+  return mounts.get(networkId)?.beacons.get(nodeId)?.expires ?? 0;
+}
+
+/** Decode a sealed relay frame far enough to tell a user envelope from presence gossip. */
+function forwardedMessageEnvelope(
+  frame: SealedNetworkFrame,
+  keys: ReturnType<typeof deriveNetworkKeys>,
+): { id: string; networkId: string } | undefined {
+  try {
+    const forwarded = unsealNetworkFrame<{ dataBase64?: unknown }>(frame, keys);
+    if (typeof forwarded.dataBase64 !== 'string') {
+      return undefined;
+    }
+    const payload = JSON.parse(Buffer.from(forwarded.dataBase64, 'base64').toString('utf8'));
+    return payload?.type === 'message.envelope' &&
+      typeof payload.envelope?.id === 'string' &&
+      typeof payload.envelope?.networkId === 'string'
+      ? { id: payload.envelope.id, networkId: payload.envelope.networkId }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Emulates a pre-76e33d9 seed: it forwards the original `relay` verb with a sealed target
+ * reply, but closes the connection for the newer `relay_send` verb it never learned. When
+ * the target's signing key is supplied, a forwarded message envelope is answered exactly
+ * as the live target would: a signed `dispatched` receipt bound to that envelope. Presence
+ * heartbeats also relay through the seed, so `envelopeRelayTypes` records only user sends.
+ */
+async function legacyRelaySeed(
+  t: TestContext,
+  targetNodeId: string,
+  targetPrivateKeyPem?: string,
+): Promise<{ endpoint: string; relayTypes: string[]; envelopeRelayTypes: string[] }> {
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const relayTypes: string[] = [];
+  const envelopeRelayTypes: string[] = [];
+  const server = createServer(socket => {
+    socket.on('error', () => {});
+    let buffer = Buffer.alloc(0);
+    socket.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 4) {
+        const size = buffer.readUInt32BE(0);
+        if (buffer.length < size + 4) {
+          return;
+        }
+        const request = JSON.parse(buffer.subarray(4, size + 4).toString('utf8'));
+        buffer = buffer.subarray(size + 4);
+        if (request.type !== 'relay' && request.type !== 'relay_send') {
+          // An un-upgraded seed has no discovery/spool handler on this fake endpoint.
+          socket.destroy();
+          return;
+        }
+        relayTypes.push(String(request.type));
+        const envelope = forwardedMessageEnvelope(request.frame, keys);
+        if (envelope !== undefined) {
+          envelopeRelayTypes.push(String(request.type));
+        }
+        if (request.type !== 'relay') {
+          socket.destroy();
+          return;
+        }
+        let dataBase64 = Buffer.from('legacy-relay-pong').toString('base64');
+        if (targetPrivateKeyPem !== undefined && envelope !== undefined) {
+          dataBase64 = Buffer.from(
+            JSON.stringify(
+              signReceipt(
+                {
+                  messageId: envelope.id,
+                  networkId: envelope.networkId,
+                  fromNodeId: targetNodeId,
+                  stage: 'dispatched',
+                  updatedAt: new Date().toISOString(),
+                },
+                targetPrivateKeyPem,
+              ),
+            ),
+          ).toString('base64');
+        }
+        const reply = sealNetworkFrame(
+          {
+            requestNonce: request.frame.nonce,
+            dataBase64,
+          },
+          keys,
+          targetNodeId,
+        );
+        socket.end(framed({ ok: true, frame: reply }));
+        return;
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  t.after(
+    () =>
+      new Promise<void>(resolve => {
+        server.close(() => resolve());
+      }),
+  );
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Invalid legacy relay address');
+  }
+  return {
+    endpoint: `127.0.0.1:${address.port}`,
+    relayTypes,
+    envelopeRelayTypes,
+  };
+}
+
+test('Darwin host-down, interface-down and AggregateError direct failures fall back to a live relay seed', async t => {
+  const dir = directory(t);
+  const network = { networkId: NETWORK, passphrase: 'secret' };
+  const seed = new P2PTransportService({
+    discoveryDir: join(dir, 'seed'),
+    multicast: false,
+    socketTimeoutMs: 5_000,
+  });
+  t.after(() => seed.dispose());
+  await seed.mountNetwork(network);
+  const target = new P2PTransportService({
+    discoveryDir: join(dir, 'target'),
+    multicast: false,
+    socketTimeoutMs: 5_000,
+  });
+  t.after(() => target.dispose());
+  await target.mountNetwork(network);
+  target.onInboundFrame(() => Buffer.from('relayed-pong'));
+  // The live seed knows the target endpoint; the sender learns the target card but its own
+  // direct hop is the only thing replaced below.
+  seed.registerPeerEndpoint(NETWORK, target.localNodeId, target.endpointAddr!);
+  const sender = new P2PTransportService({
+    discoveryDir: join(dir, 'sender'),
+    multicast: false,
+    socketTimeoutMs: 5_000,
+  });
+  t.after(() => sender.dispose());
+  await sender.mountNetwork({ ...network, bootstrapPeers: [seed.endpointAddr!] });
+  sender.registerPeerEndpoint(NETWORK, target.localNodeId, '127.0.0.1:9');
+
+  const hostDown = Object.assign(new Error('connect EHOSTDOWN 10.165.37.53:51086'), {
+    code: 'EHOSTDOWN',
+  });
+  const interfaceDown = Object.assign(new Error('connect ENETDOWN'), { code: 'ENETDOWN' });
+  const aggregate = new AggregateError(
+    [
+      Object.assign(new Error('connect EHOSTDOWN'), { code: 'EHOSTDOWN' }),
+      Object.assign(new Error('connect ENETUNREACH'), { code: 'ENETUNREACH' }),
+    ],
+    'connect ENETUNREACH',
+  );
+  for (const failure of [hostDown, interfaceDown, aggregate]) {
+    failDirectHop(sender, failure);
+    const reply = await sender.sendUnicast(
+      NETWORK,
+      target.localNodeId,
+      Buffer.from('reachability probe'),
+    );
+    assert.equal(
+      Buffer.from(reply).toString(),
+      'relayed-pong',
+      `${failure.message} must be classified offline instead of failing the exchange`,
+    );
+  }
+
+  // An aggregate that mixes a deterministic error with an offline one is not a peer outage:
+  // relaying or queueing it would hide a real protocol/local failure.
+  const mixed = new AggregateError(
+    [
+      Object.assign(new Error('connect EHOSTDOWN'), { code: 'EHOSTDOWN' }),
+      new LocalDeliveryError('Invalid or mismatched delivery receipt'),
+    ],
+    'mixed connect failure',
+  );
+  failDirectHop(sender, mixed);
+  await assert.rejects(
+    sender.sendUnicast(NETWORK, target.localNodeId, Buffer.from('poisoned probe')),
+    error => error === mixed,
+  );
+});
+
+test('mixed-version seeds keep live sends on the legacy relay verb and fail spool offers fast', async t => {
+  const dir = directory(t);
+  const target = generateNodeKeyPair().nodeId;
+  const legacy = await legacyRelaySeed(t, target);
+  const transport = new P2PTransportService({
+    discoveryDir: dir,
+    multicast: false,
+    socketTimeoutMs: 5_000,
+  });
+  t.after(() => transport.dispose());
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacy.endpoint],
+  });
+
+  // A live non-spooling send must stay byte-compatible with seeds that only know `relay`.
+  const live = await transport.sendUnicast(
+    NETWORK,
+    target,
+    Buffer.from('live frame'),
+    { timeoutMs: 5_000 },
+  );
+  assert.equal(Buffer.from(live).toString(), 'legacy-relay-pong');
+  assert.deepEqual(legacy.relayTypes, ['relay']);
+
+  let failure: unknown;
+  try {
+    await transport.sendUnicast(NETWORK, target, Buffer.from('spool offer'), {
+      timeoutMs: 5_000,
+      spoolIfOffline: true,
+      spoolKey: 'legacy-seed-spool',
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(
+    isPeerUnreachableError(failure),
+    'a legacy seed closing on relay_send is an offline peer, not an in-doubt send',
+  );
+  assert.equal(
+    isDeliveryTimeoutFailure(failure),
+    false,
+    'the closed socket must not park the target in inDoubtNodeIds',
+  );
+  assert.deepEqual(legacy.relayTypes, ['relay', 'relay_send']);
+});
+
+test('classified Darwin connect failures become a durable queued receipt instead of a failed emit', async t => {
+  const root = directory(t);
+  const ben = runtimeFor(root, 'ben', { discovery: 'mesh' });
+  const diz = runtimeFor(root, 'diz', { discovery: 'mesh' });
+  await ben.start();
+  await diz.start();
+  t.after(async () => {
+    await ben.stop().catch(() => {});
+    await diz.stop().catch(() => {});
+  });
+  await ben.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await diz.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await until(
+    () => ben.node.resolveTarget('member:diz', NETWORK).length === 1,
+    'sender learns the target card',
+  );
+  const dizNodeId = diz.node.getSelfCard(NETWORK).nodeId;
+
+  const failures = [
+    Object.assign(new Error('connect EHOSTDOWN 10.165.37.53:51086'), { code: 'EHOSTDOWN' }),
+    Object.assign(new Error('connect ENETDOWN'), { code: 'ENETDOWN' }),
+    new AggregateError(
+      [
+        Object.assign(new Error('connect EHOSTDOWN'), { code: 'EHOSTDOWN' }),
+        Object.assign(new Error('connect ENETUNREACH'), { code: 'ENETUNREACH' }),
+      ],
+      'connect ENETUNREACH',
+    ),
+  ];
+  for (const failure of failures) {
+    failDirectHop(ben.transport, failure);
+    const emitted = await ben.emitter.emit({
+      networkId: NETWORK,
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'collab.request.v4',
+      subject: `offline ${failure.message}`,
+      body: 'the peer is unreachable, not actively refusing the protocol',
+      payload: {},
+    });
+    assert.equal(emitted.receipts.length, 1);
+    assert.equal(emitted.receipts[0].stage, 'queued', failure.message);
+    const item = ben
+      .listOutbox({ status: 'queued' })
+      .find(candidate => candidate.id === emitted.messageId);
+    assert.ok(item, `${failure.message} must be durably owned by the outbox`);
+    assert.deepEqual(item.pendingNodeIds, [dizNodeId]);
+    assert.deepEqual(item.inDoubtNodeIds, []);
+  }
+});
+
+test('spool offer to a pre-upgrade seed retries the legacy verb while the target beacon is fresh', async t => {
+  const root = directory(t);
+  const ben = runtimeFor(root, 'ben', { discovery: 'mesh' });
+  const diz = runtimeFor(root, 'diz', { discovery: 'mesh' });
+  await ben.start();
+  await diz.start();
+  t.after(async () => {
+    await ben.stop().catch(() => {});
+    await diz.stop().catch(() => {});
+  });
+  await diz.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const dizNodeId = diz.node.getSelfCard(NETWORK).nodeId;
+  const legacy = await legacyRelaySeed(t, dizNodeId, diz.node.privateKeyPem);
+  await ben.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacy.endpoint],
+  });
+  await until(
+    () => ben.node.resolveTarget('member:diz', NETWORK).length === 1,
+    'sender learns the target card',
+  );
+  await until(
+    () => beaconExpiry(ben.transport, NETWORK, dizNodeId) >= Date.now(),
+    'sender learns a fresh target beacon',
+  );
+  failDirectHop(
+    ben.transport,
+    Object.assign(new Error('connect EHOSTDOWN'), { code: 'EHOSTDOWN' }),
+  );
+
+  // The legacy seed drops the `relay_send` offer, but the fresh beacon proves the NAT-bound
+  // target is online. Retrying the original `relay` verb must deliver live, not queue.
+  const emitted = await ben.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v4',
+    subject: 'legacy seed live fallback',
+    body: 'a fresh beacon means the peer is reachable behind the old seed',
+    payload: {},
+  });
+  assert.equal(emitted.receipts.length, 1);
+  assert.equal(emitted.receipts[0]?.stage, 'dispatched');
+  assert.equal(emitted.receipts[0]?.fromNodeId, dizNodeId);
+  assert.deepEqual(legacy.envelopeRelayTypes, ['relay_send', 'relay']);
+  assert.equal(
+    ben.listOutbox({ status: 'queued' }).some(item => item.id === emitted.messageId),
+    false,
+    'a live fallback delivery must not leave a queued obligation',
+  );
+});
+
+test('spool-enabled send to a pre-upgrade seed queues locally once the target beacon expires', async t => {
+  const root = directory(t);
+  const ben = runtimeFor(root, 'ben', { discovery: 'mesh' });
+  const diz = runtimeFor(root, 'diz', { discovery: 'mesh' });
+  await ben.start();
+  await diz.start();
+  t.after(async () => {
+    await ben.stop().catch(() => {});
+    await diz.stop().catch(() => {});
+  });
+  await diz.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const dizNodeId = diz.node.getSelfCard(NETWORK).nodeId;
+  const legacy = await legacyRelaySeed(t, dizNodeId, diz.node.privateKeyPem);
+  await ben.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacy.endpoint],
+  });
+  await until(
+    () => ben.node.resolveTarget('member:diz', NETWORK).length === 1,
+    'sender learns the target card',
+  );
+  failDirectHop(
+    ben.transport,
+    Object.assign(new Error('connect EHOSTDOWN'), { code: 'EHOSTDOWN' }),
+  );
+  // The peer is only genuinely offline once its last beacon has expired; until then the
+  // sender must trust the beacon and retry the legacy verb instead of queueing.
+  await diz.stop();
+  await until(
+    () => beaconExpiry(ben.transport, NETWORK, dizNodeId) < Date.now(),
+    'the target beacon expires after the peer stops',
+  );
+
+  const emitted = await ben.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v4',
+    subject: 'legacy seed spool',
+    body: 'the seed predates relay_send; keep the obligation local',
+    payload: {},
+  });
+  assert.equal(emitted.receipts[0]?.stage, 'queued');
+  assert.equal(
+    emitted.receipts[0]?.executionReceipt?.relaySpooled,
+    false,
+    'a legacy seed never confirmed a spool handoff',
+  );
+  const item = ben
+    .listOutbox({ status: 'queued' })
+    .find(candidate => candidate.id === emitted.messageId)!;
+  assert.deepEqual(item.pendingNodeIds, [dizNodeId]);
+  assert.deepEqual(item.inDoubtNodeIds, []);
+  assert.deepEqual(item.relaySpooledNodeIds, []);
+  assert.deepEqual(legacy.envelopeRelayTypes, ['relay_send']);
+});
 
 test('malformed relay responses surface as local protocol failures, not offline queueing', async t => {
   const root = directory(t);

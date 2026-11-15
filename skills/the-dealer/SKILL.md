@@ -325,14 +325,22 @@ dealer ask --reply-to <inbound-envelope-id> --body 'Follow-up question' --json
 dealer reply <inbound-envelope-id> --body 'The dispatcher owns retries' --json
 dealer settle <inbound-envelope-id> --outcome succeeded --summary 'Verified' --json
 dealer thread show <envelope-or-thread-id> --json
+dealer thread prune <message-id> --json
 ```
 
 `ask --reply-to`, `reply`, and `settle` resolve the thread's reverse route
 (peer node, network, topic, target mailbox, reply mailbox) and can acknowledge
-the local lease by passing `--ack <dlv_id>`. `dealer settle` requires
+the local lease by passing `--ack <dlv_id>`; the lease is only acknowledged
+after the send actually commits (a live handoff or a durable outbox queue), so
+a failed send leaves it intact for a retry. `dealer settle` requires
 `--outcome` (`succeeded`, `failed`, or `cancelled`) and a `--summary` (or body
 fallback). `thread show` returns the merged thread state and both directional
 records; it works through the daemon or directly against the saved mailbox.
+If a send failed without queueing and left an unconfirmed orphan outbound
+thread record, `dealer thread prune <message-id>` removes only that `outbound:`
+leg and recomputes the thread state; it refuses `inbound:` ids and refuses a
+message the outbox still holds as `queued` or `delivered` unless you pass
+`--force`.
 Inside Orca, `ORCA_WORKTREE_ID`/`ORCA_TERMINAL_HANDLE` bind the caller's
 worktree or terminal automatically. Omit `--mailbox` for two-way ask/reply/
 settle conversations; each side wakes the other's Orca terminal. `dealer ask`
