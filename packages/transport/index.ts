@@ -16,7 +16,9 @@ import { once } from 'node:events';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import {
+  DeliveryTimeoutError,
   LocalDeliveryError,
+  NetworkUnmountedError,
   OfflinePeerSpooledError,
   PeerUnreachableError,
   deriveNetworkKeys,
@@ -274,13 +276,24 @@ function ipv4Broadcast(address: string, netmask: string): string | undefined {
 function packet(value: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(value));
   if (body.length > MAX_FRAME) {
-    throw new Error('Frame exceeds limit');
+    throw new LocalDeliveryError('Frame exceeds limit');
   }
   const size = Buffer.alloc(4);
   size.writeUInt32BE(body.length);
   return Buffer.concat([size, body]);
 }
 
+/** A stream ending before its declared frame length is a connection failure, not a protocol decision. */
+class TruncatedStreamError extends Error {
+  readonly code = 'truncated_stream';
+
+  constructor() {
+    super('Truncated stream');
+    this.name = 'TruncatedStreamError';
+  }
+}
+
+/** One oversized or unparsable frame body is a deterministic protocol failure. */
 class SocketReader {
   private iterator: AsyncIterator<Buffer>;
   private buffered = Buffer.alloc(0);
@@ -293,7 +306,7 @@ class SocketReader {
     while (this.buffered.length < size) {
       const next = await this.iterator.next();
       if (next.done) {
-        throw new Error('Truncated stream');
+        throw new TruncatedStreamError();
       }
       this.buffered = Buffer.concat([this.buffered, next.value]);
     }
@@ -305,9 +318,14 @@ class SocketReader {
   async json(): Promise<any> {
     const size = (await this.exact(4)).readUInt32BE();
     if (size > MAX_FRAME) {
-      throw new Error('Frame exceeds limit');
+      throw new LocalDeliveryError('Frame exceeds limit');
     }
-    return JSON.parse((await this.exact(size)).toString());
+    const body = await this.exact(size);
+    try {
+      return JSON.parse(body.toString());
+    } catch {
+      throw new LocalDeliveryError('Malformed relay response');
+    }
   }
 
   async *remaining(): AsyncGenerator<Buffer> {
@@ -363,8 +381,50 @@ interface RelayRequestOptions {
   blobHashes?: readonly string[];
 }
 
-const PROTOCOL_FAILURE =
-  /Response binding mismatch|Unable to authenticate or decode|Unsupported frame protocol|Frame swarmTopicId|Invalid frame|Unknown swarm|Invalid endpoint|Frame exceeds limit|Invalid relay spool|Relay spool capacity exceeded|Invalid relay target/;
+/**
+ * Connection-class failures are the only errors a relay fallback may reinterpret as an
+ * offline peer. Protocol, framing, signature, and local I/O errors stay deterministic.
+ */
+const CONNECTION_FAILURE_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'ECONNABORTED',
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'truncated_stream',
+  'delivery_timeout',
+]);
+
+const CONNECTION_FAILURE_MESSAGES = new Set([
+  'Truncated stream',
+  'Transport timeout',
+  'Relay tunnel timeout',
+  'Relay tunnel closed',
+  'Relay target unreachable',
+]);
+
+function isConnectionFailure(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth += 1) {
+    if (typeof current === 'object') {
+      const code = (current as { code?: unknown }).code;
+      if (typeof code === 'string' && CONNECTION_FAILURE_CODES.has(code)) {
+        return true;
+      }
+      const message = (current as { message?: unknown }).message;
+      if (typeof message === 'string' && CONNECTION_FAILURE_MESSAGES.has(message)) {
+        return true;
+      }
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
 
 function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
@@ -491,7 +551,7 @@ export class P2PTransportService implements TransportService {
     this.sockets.add(socket);
     socket.once('close', () => this.sockets.delete(socket));
     socket.setTimeout(this.options.socketTimeoutMs ?? 90_000, () =>
-      socket.destroy(new Error('Transport timeout')),
+      socket.destroy(new DeliveryTimeoutError('Transport timeout')),
     );
     socket.on('error', () => {});
     return socket;
@@ -590,7 +650,7 @@ export class P2PTransportService implements TransportService {
   private get(networkId: string): Mount {
     const m = this.mounts.get(networkId);
     if (!m) {
-      throw new Error(`Network not mounted: ${networkId}`);
+      throw new NetworkUnmountedError(networkId);
     }
     return m;
   }
@@ -1862,8 +1922,9 @@ export class P2PTransportService implements TransportService {
       } catch (error) {
         lastError = asError(error);
         // A signature/binding failure is never an offline symptom: retrying it through a
-        // relay or queueing it in an outbox would hide a real security decision.
-        if (lastError instanceof LocalDeliveryError || PROTOCOL_FAILURE.test(lastError.message)) {
+        // relay or queueing it in an outbox would hide a real security decision. Unknown
+        // errors are equally deterministic until proven connection-class.
+        if (lastError instanceof LocalDeliveryError || !isConnectionFailure(lastError)) {
           throw lastError;
         }
         if (!fallbacks.length) {
@@ -1886,7 +1947,18 @@ export class P2PTransportService implements TransportService {
           return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, attemptTimeoutMs);
         }
         const attachmentPacket = options.blobHashes?.length
-          ? await (blobs ??= this.readSpoolBlobs(options.blobHashes))
+          ? await (blobs ??= this.readSpoolBlobs(
+              options.blobHashes,
+              Buffer.byteLength(JSON.stringify({
+                type: 'relay_send',
+                networkId: m.config.networkId,
+                target,
+                frame,
+                ...(options.spoolIfOffline === true ? { spoolIfOffline: true } : {}),
+                ...(options.spoolKey !== undefined ? { spoolKey: options.spoolKey } : {}),
+                blobs: {},
+              })),
+            ))
           : { blobs: {}, complete: true };
         return await this.relayExchange(
           m,
@@ -1917,6 +1989,11 @@ export class P2PTransportService implements TransportService {
         if (error instanceof LocalDeliveryError) {
           throw error;
         }
+        // Only a connection-class failure may advance to the next seed; a malformed or
+        // mismatched response is deterministic and must surface as such.
+        if (!isConnectionFailure(error)) {
+          throw error;
+        }
         lastError = asError(error);
       }
     }
@@ -1928,30 +2005,41 @@ export class P2PTransportService implements TransportService {
     if (
       error instanceof OfflinePeerSpooledError ||
       error instanceof PeerUnreachableError ||
-      error instanceof LocalDeliveryError ||
-      PROTOCOL_FAILURE.test(error.message)
+      error instanceof LocalDeliveryError
     ) {
       return error;
     }
-    return new PeerUnreachableError(target, error.message, { cause: error });
+    // Never reinterpret an arbitrary failure as offline: only connection-class errors may
+    // become PeerUnreachableError, because only those can justify a durable queued receipt.
+    if (isConnectionFailure(error)) {
+      return new PeerUnreachableError(target, error.message, { cause: error });
+    }
+    return error;
   }
 
   /**
    * Read the sender's attachment cache for one relay_send request. Every offered hash must
-   * resolve and re-hash to its declared content; an oversized set is reported as incomplete
-   * so the caller can stay live-only instead of minting a partial spooled handoff.
+   * resolve and re-hash to its declared content. Completeness is judged against the exact
+   * serialized relay_send packet, including the sealed frame, JSON keys, and base64
+   * expansion, so a packet that would fail `packet()` is offered live-only instead.
    */
   private async readSpoolBlobs(
     hashes: readonly string[],
+    emptyPacketBytes: number,
   ): Promise<{ blobs: Record<string, string>; complete: boolean }> {
     const blobs: Record<string, string> = {};
-    let total = 0;
+    // Replacing the empty `{}` with entries removes two bytes and adds one comma between
+    // entries. Each entry contributes `"<hash>":"<base64>"`, i.e. hash.length + 5 + base64.
+    let entryBytes = -2;
+    let entries = 0;
     for (const hash of new Set(hashes)) {
       const blob = this.blobs.get(hash);
       if (!blob) {
         throw new LocalDeliveryError(`Missing attachment blob for relay spooling: ${hash}`);
       }
-      if (blob.size > RELAY_BLOB_LIMIT || total + blob.size > RELAY_BLOB_LIMIT) {
+      const entryBytesWithOverhead =
+        (entries > 0 ? 1 : 0) + hash.length + 5 + 4 * Math.ceil(blob.size / 3);
+      if (emptyPacketBytes + entryBytes + entryBytesWithOverhead > MAX_FRAME) {
         return { blobs: {}, complete: false };
       }
       const bytes = await readFile(blob.path);
@@ -1960,11 +2048,15 @@ export class P2PTransportService implements TransportService {
           `Attachment content changed before relay spooling: ${hash}`,
         );
       }
-      if (total + bytes.length > RELAY_BLOB_LIMIT) {
+      const base64 = bytes.toString('base64');
+      const exactEntryBytes =
+        (entries > 0 ? 1 : 0) + hash.length + 5 + base64.length;
+      if (emptyPacketBytes + entryBytes + exactEntryBytes > MAX_FRAME) {
         return { blobs: {}, complete: false };
       }
-      blobs[hash] = bytes.toString('base64');
-      total += bytes.length;
+      blobs[hash] = base64;
+      entryBytes += exactEntryBytes;
+      entries += 1;
     }
     return { blobs, complete: true };
   }
@@ -2018,7 +2110,7 @@ export class P2PTransportService implements TransportService {
       socket.write(packet({ type: 'frame', frame }));
       const response = await new SocketReader(socket).json();
       if (response?.frame?.senderNodeId !== target) {
-        throw new Error('Response binding mismatch');
+        throw new LocalDeliveryError('Response binding mismatch');
       }
       return response.frame;
     } finally {
@@ -2034,12 +2126,17 @@ export class P2PTransportService implements TransportService {
     timeoutMs: number,
   ): Promise<Uint8Array> {
     const responseFrame = await this.directFrame(m, target, address, frame, timeoutMs);
-    const payload = unsealNetworkFrame<{
-      requestNonce: string;
-      dataBase64: string;
-    }>(responseFrame, m.keys);
+    let payload: { requestNonce: string; dataBase64: string };
+    try {
+      payload = unsealNetworkFrame<{ requestNonce: string; dataBase64: string }>(
+        responseFrame,
+        m.keys,
+      );
+    } catch {
+      throw new LocalDeliveryError('Unable to authenticate or decode direct response');
+    }
     if (payload.requestNonce !== frame.nonce) {
-      throw new Error('Response binding mismatch');
+      throw new LocalDeliveryError('Response binding mismatch');
     }
     return Buffer.from(payload.dataBase64, 'base64');
   }
@@ -2077,12 +2174,20 @@ export class P2PTransportService implements TransportService {
         }
         throw new OfflinePeerSpooledError(target, response.seedNodeId, response.spoolId);
       }
-      const payload = unsealNetworkFrame<{
-        requestNonce: string;
-        dataBase64: string;
-      }>(response.frame, m.keys);
+      if (!response?.frame) {
+        throw new LocalDeliveryError('Invalid relay response');
+      }
+      let payload: { requestNonce: string; dataBase64: string };
+      try {
+        payload = unsealNetworkFrame<{ requestNonce: string; dataBase64: string }>(
+          response.frame,
+          m.keys,
+        );
+      } catch {
+        throw new LocalDeliveryError('Unable to authenticate or decode relay response');
+      }
       if (response.frame.senderNodeId !== target || payload.requestNonce !== frame.nonce) {
-        throw new Error('Response binding mismatch');
+        throw new LocalDeliveryError('Response binding mismatch');
       }
       return Buffer.from(payload.dataBase64, 'base64');
     } finally {
@@ -2100,14 +2205,27 @@ export class P2PTransportService implements TransportService {
   ): Promise<Uint8Array> {
     const response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs);
     if (response?.error) {
-      throw new Error(String(response.error));
+      const detail = String(response.error);
+      const error = new Error(detail);
+      if (isConnectionFailure(error)) {
+        throw new PeerUnreachableError(target, detail, { cause: error });
+      }
+      throw new LocalDeliveryError(detail);
     }
-    const payload = unsealNetworkFrame<{
-      requestNonce: string;
-      dataBase64: string;
-    }>(response.frame, m.keys);
+    if (!response?.frame) {
+      throw new LocalDeliveryError('Invalid relay response');
+    }
+    let payload: { requestNonce: string; dataBase64: string };
+    try {
+      payload = unsealNetworkFrame<{ requestNonce: string; dataBase64: string }>(
+        response.frame,
+        m.keys,
+      );
+    } catch {
+      throw new LocalDeliveryError('Unable to authenticate or decode relay response');
+    }
     if (response.frame.senderNodeId !== target || payload.requestNonce !== frame.nonce) {
-      throw new Error('Response binding mismatch');
+      throw new LocalDeliveryError('Response binding mismatch');
     }
     return Buffer.from(payload.dataBase64, 'base64');
   }
@@ -2128,7 +2246,7 @@ export class P2PTransportService implements TransportService {
       return this.deliverLocal(networkId, bytes, m);
     }
     if (!m) {
-      throw new Error(`Network not mounted: ${networkId}`);
+      throw new NetworkUnmountedError(networkId);
     }
     // Spooling is caller-owned policy: an explicit opt-out must leave no durable relay
     // copy. Attachment hashes still come from the caller, so transport stays envelope-blind.
@@ -2158,7 +2276,7 @@ export class P2PTransportService implements TransportService {
       (payload as { protocol?: string }).protocol === 'the-dealer-wire/v1'
     ) {
       if (!mount) {
-        throw new Error(`Network not mounted: ${networkId}`);
+        throw new NetworkUnmountedError(networkId);
       }
       const frame = payload as SealedNetworkFrame;
       if (frame.swarmTopicId !== mount.keys.swarmTopicId) {
@@ -2397,7 +2515,7 @@ export class P2PTransportService implements TransportService {
       // The persistent tunnel socket itself never times out: a locally issued request
       // needs its own deadline, while a forwarded one is bounded by its requester.
       if (!requestSocket) {
-        timer = setTimeout(() => finish(new Error('Relay tunnel timeout')), timeoutMs);
+        timer = setTimeout(() => finish(new DeliveryTimeoutError('Relay tunnel timeout')), timeoutMs);
       }
       try {
         tunnel.socket.write(packet({ ...body, relayId }));
@@ -2478,20 +2596,35 @@ export class P2PTransportService implements TransportService {
     }
     if (request.type === 'relay' || request.type === 'relay_send') {
       const frame: SealedNetworkFrame = request.frame;
+      const reject = (error: string) => {
+        socket.end(packet({ error }));
+      };
       const mount = [...this.mounts.values()].find(
         m => m.keys.swarmTopicId === frame?.swarmTopicId,
       );
-      if (!mount) throw new Error('Unknown swarm');
+      if (!mount) {
+        reject('Unknown swarm');
+        return;
+      }
       if (
         request.networkId !== undefined &&
         request.networkId !== mount.config.networkId
       ) {
-        throw new Error('Relay network mismatch');
+        reject('Relay network mismatch');
+        return;
       }
       // Membership proof: only a holder of the network key may relay or spool a frame.
-      unsealNetworkFrame(frame, mount.keys);
+      try {
+        unsealNetworkFrame(frame, mount.keys);
+      } catch {
+        reject('Unable to authenticate or decode relay request');
+        return;
+      }
       const target = typeof request.target === 'string' ? request.target : '';
-      if (!target) throw new Error('Invalid relay target');
+      if (!target) {
+        reject('Invalid relay target');
+        return;
+      }
       if (
         request.spoolKey !== undefined &&
         (typeof request.spoolKey !== 'string' ||

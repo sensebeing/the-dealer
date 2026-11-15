@@ -1286,6 +1286,14 @@ export class DealerNodeRuntime {
     return this.outbox.list(filter);
   }
 
+  /** Explicit operator retry for terminal local (not signed) outbox failures. */
+  requeueOutbox(id: string): OutboxItem | undefined {
+    if (!this.outbox) {
+      throw new Error('Outbox is not available before the runtime starts');
+    }
+    return this.outbox.requeue(id);
+  }
+
   /** Operator/test flush of the durable outbox; redrive also runs on peer events and timers. */
   flushOutbox(options: OutboxFlushOptions = {}): Promise<OutboxFlushResult> {
     if (!this.outboxRedrive) {

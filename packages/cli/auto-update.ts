@@ -1,9 +1,10 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../core-types/index.ts';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
 import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
 
 export type FingerprintRecord = {
@@ -174,10 +175,7 @@ export function computeRuntimeFingerprint(stateDir: string, checkoutDir?: string
 }
 
 function atomicJson(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 });
-  renameSync(temporary, path);
+  writeFileAtomically(path, JSON.stringify(value));
 }
 
 export function writeDaemonFingerprint(stateDir: string, value: FingerprintRecord): void {

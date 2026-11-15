@@ -164,6 +164,7 @@ dealer outbox list --network sensebeing --status queued --json
 dealer outbox flush --json
 dealer outbox flush --id <message-id> --json
 dealer outbox flush --force --json
+dealer outbox requeue --id <message-id> --json
 ```
 
 Redrive is automatic and settles an obligation only through the target's signed

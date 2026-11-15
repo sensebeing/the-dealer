@@ -1,6 +1,7 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type { Disposable, MessageEnvelope, PendingApprovalItem } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 import type { MailboxItem, MailboxStore } from '../mailbox/store.ts';
@@ -272,20 +273,7 @@ export class LarkMailboxNotifier {
   private persist(state: NotifyState): void {
     state.deliveredItems = prune(state.deliveredItems, item => item.deliveredAt);
     state.threadRoots = prune(state.threadRoots, item => item.updatedAt);
-    mkdirSync(dirname(this.statePath), { recursive: true, mode: 0o700 });
-    const temporary = `${this.statePath}.${randomUUID()}.tmp`;
-    const fd = openSync(temporary, 'wx', 0o600);
-    try {
-      writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    try {
-      renameSync(temporary, this.statePath);
-    } finally {
-      rmSync(temporary, { force: true });
-    }
+    writeFileAtomically(this.statePath, `${JSON.stringify(state, null, 2)}\n`);
   }
 }
 

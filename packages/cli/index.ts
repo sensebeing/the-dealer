@@ -1055,7 +1055,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
           inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
           thread: 'dealer thread <show|list> [<threadId>] [--json]',
-          outbox: 'dealer outbox <list|flush> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
+          outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
         },
       }, null, v.json ? undefined : 2));
       return 0;
@@ -1485,8 +1485,13 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           ...(typeof v.id === 'string' ? { id: String(v.id) } : {}),
           ...(v.force === true ? { force: true } : {}),
         });
+      } else if (action === 'requeue') {
+        if (typeof v.id !== 'string') {
+          throw new Error('outbox requeue requires --id');
+        }
+        result = runtime.requeueOutbox(String(v.id));
       } else {
-        throw new Error('Unknown outbox command; use list or flush');
+        throw new Error('Unknown outbox command; use list, flush or requeue');
       }
     } else if ((group === 'route' || group === 'source') && action === 'add') {
       if (owned && group === 'source') {

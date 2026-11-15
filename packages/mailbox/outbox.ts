@@ -10,6 +10,8 @@ import type {
   Disposable,
   MessageEnvelope,
   NodeCard,
+  OutboxClaimInput,
+  OutboxClaimResult,
   OutboxDeliveryOutcome,
   OutboxEnqueueInput,
   OutboxFlushOptions,
@@ -23,6 +25,8 @@ export type {
   OutboxDeliveryFailure,
   OutboxDeliveryOutcome,
   OutboxEnqueueInput,
+  OutboxClaimInput,
+  OutboxClaimResult,
   OutboxFlushOptions,
   OutboxFlushResult,
   OutboxItem,
@@ -35,6 +39,7 @@ const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
 const MIN_ATTEMPT_DELAY_MS = 2_000;
 const MAX_ATTEMPT_DELAY_MS = 60_000;
 const DEFAULT_REDRIVE_TIMEOUT_MS = 10_000;
+const DEFAULT_CLAIM_LEASE_MS = 60_000;
 
 export interface OutboxAttemptUpdate {
   pendingNodeIds?: string[];
@@ -380,6 +385,91 @@ export class OutboxStore {
         candidate.envelope.idempotencyKey === idempotencyKey,
     );
     return item ? clone(item) : undefined;
+  }
+
+  /**
+   * Atomically create or join the single durable obligation for an idempotency key. The
+   * check and the reservation happen under the same store lock, so concurrent emitters
+   * cannot both observe "absent" and mint different envelopes/obligations. A claimed item
+   * starts with no confirmed delivery and a lease: if the process dies before the first
+   * send/merge, ordinary redrive later sends the same signed envelope at least once.
+   */
+  claimIdempotency(input: OutboxClaimInput): OutboxClaimResult {
+    if (!validEnvelope(input?.envelope)) {
+      throw new Error('Invalid outbox envelope');
+    }
+    const key = input.envelope.idempotencyKey;
+    if (!key) {
+      throw new Error('Outbox claim requires an idempotency key');
+    }
+    const id = input.envelope.id;
+    const now = new Date().toISOString();
+    return this.mutate(state => {
+      const existing = state.items.find(
+        item =>
+          item.status === 'queued' &&
+          item.networkId === input.envelope.networkId &&
+          item.envelope.idempotencyKey === key,
+      );
+      if (existing) {
+        return { claimed: false, item: clone(existing) };
+      }
+      const leaseMs = Number.isFinite(input.leaseMs) && (input.leaseMs ?? 0) > 0
+        ? input.leaseMs!
+        : DEFAULT_CLAIM_LEASE_MS;
+      const item: OutboxItem = {
+        id,
+        networkId: input.envelope.networkId,
+        envelope: structuredClone(input.envelope),
+        explicitTargets: [...new Set(input.explicitTargets ?? [])],
+        pendingNodeIds: [],
+        deliveredReceipts: {},
+        failedReceipts: {},
+        failedNodeIds: [],
+        inDoubtNodeIds: [],
+        relaySpooledNodeIds: [],
+        stagedFiles: this.stageFiles(id, input.filePaths, {}),
+        status: 'queued',
+        attempts: 0,
+        createdAt: now,
+        updatedAt: now,
+        nextAttemptAt: new Date(Date.now() + leaseMs).toISOString(),
+      };
+      this.settleItem(item);
+      state.items.push(item);
+      return { claimed: true, item: clone(item) };
+    });
+  }
+
+  /**
+   * Explicit operator retry for deterministic local failures. Only unsigned local-failure
+   * targets move back to pending; signed terminal rejections stay terminal evidence.
+   */
+  requeue(id: string): OutboxItem | undefined {
+    const now = new Date().toISOString();
+    return this.mutate(state => {
+      const item = state.items.find(candidate => candidate.id === id);
+      if (!item) {
+        return undefined;
+      }
+      if (item.status !== 'failed') {
+        throw new Error('Only a failed outbox item can be requeued');
+      }
+      const retryable = item.failedNodeIds.filter(
+        nodeId => !item.deliveredReceipts[nodeId],
+      );
+      if (retryable.length === 0) {
+        throw new Error('Outbox item has no locally failed targets to requeue');
+      }
+      const retry = new Set(retryable);
+      item.failedNodeIds = item.failedNodeIds.filter(nodeId => !retry.has(nodeId));
+      item.pendingNodeIds = [...new Set([...item.pendingNodeIds, ...retryable])];
+      item.lastError = undefined;
+      item.updatedAt = now;
+      item.nextAttemptAt = now;
+      this.settleItem(item);
+      return clone(item);
+    });
   }
 
   list(filter: OutboxListFilter = {}): OutboxItem[] {
@@ -747,18 +837,37 @@ export class OutboxRedriveService {
         ...Object.keys(item.deliveredReceipts),
         ...item.failedNodeIds,
       ]);
+      // A scoped attempt can never settle a target it did not request, regardless of what
+      // the delivery outcome reports. Preserve those pending targets independently.
+      const requestedNodeIds = new Set(requestTargets);
+      const untouchedPendingNodeIds = requestTargets.length > 0
+        ? item.pendingNodeIds.filter(
+            nodeId =>
+              !requestedNodeIds.has(nodeId) &&
+              !settledNodeIds.has(nodeId) &&
+              !item.failedNodeIds.includes(nodeId),
+          )
+        : [];
       const pendingNodeIds = [
-        ...new Set(
-          (outcome.pendingNodeIds ?? resolved ?? item.pendingNodeIds).filter(
-            nodeId => !settledNodeIds.has(nodeId),
-          ),
-        ),
+        ...new Set([
+          ...(outcome.pendingNodeIds ?? resolved ?? item.pendingNodeIds),
+          ...untouchedPendingNodeIds,
+        ].filter(nodeId => !settledNodeIds.has(nodeId))),
       ];
-      const inDoubtNodeIds = (
-        outcome.inDoubtNodeIds !== undefined
-          ? outcome.inDoubtNodeIds
-          : item.inDoubtNodeIds
-      ).filter(nodeId => pendingNodeIds.includes(nodeId));
+      const attemptedThisPass = new Set(
+        requestTargets.length > 0 ? requestTargets : pendingNodeIds,
+      );
+      // A scoped flush attempts only its requested targets. In-doubt flags on untouched
+      // pending targets remain authoritative; only an explicit attempt may clear them.
+      const inDoubtNodeIds = [
+        ...new Set([
+          ...(outcome.inDoubtNodeIds ?? []),
+          ...item.inDoubtNodeIds.filter(
+            nodeId =>
+              pendingNodeIds.includes(nodeId) && !attemptedThisPass.has(nodeId),
+          ),
+        ]),
+      ].filter(nodeId => pendingNodeIds.includes(nodeId));
       item = this.outbox.recordAttempt(item.id, {
         pendingNodeIds,
         inDoubtNodeIds,

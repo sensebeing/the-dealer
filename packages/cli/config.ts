@@ -1,6 +1,6 @@
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { writeFileAtomically } from '../fs-atomic/index.ts';
 import { isValidMailboxId } from '../core-types/index.ts';
 import type { AdmissionMode, NetworkMountConfig } from '../core-types/index.ts';
 import { CONVERSATION_MODES, isStreamConversationBinding } from '../mailbox/index.ts';
@@ -363,9 +363,7 @@ export function admissionMode(value: string): AdmissionMode {
 }
 
 export function saveJson(path: string, data: unknown): void {
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
-  renameSync(temporary, path);
+  writeFileAtomically(path, `${JSON.stringify(data, null, 2)}\n`);
 }
 
 /**

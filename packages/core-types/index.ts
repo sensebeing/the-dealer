@@ -290,6 +290,62 @@ export function isLocalDeliveryError(error: unknown): error is LocalDeliveryErro
   );
 }
 
+/**
+ * A send or response wait hit its deadline after the request may already have reached the
+ * target. Emitters must not auto-retry these as ordinary offline targets without a direct
+ * peer pulse or an explicit force, because the remote side may already have executed.
+ */
+export class DeliveryTimeoutError extends Error {
+  readonly code = 'delivery_timeout';
+
+  constructor(message = 'Delivery timed out', options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'DeliveryTimeoutError';
+  }
+}
+
+export function isDeliveryTimeoutError(error: unknown): error is DeliveryTimeoutError {
+  return (
+    error instanceof DeliveryTimeoutError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'delivery_timeout')
+  );
+}
+
+/** True for a timeout directly or anywhere in a wrapped peer-unreachable cause chain. */
+export function isDeliveryTimeoutFailure(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth += 1) {
+    if (isDeliveryTimeoutError(current)) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** The mount disappeared between an outbox write and a redrive attempt: retry after remount. */
+export class NetworkUnmountedError extends Error {
+  readonly code = 'network_unmounted';
+  readonly networkId: string;
+
+  constructor(networkId: string) {
+    super(`Network not mounted: ${networkId}`);
+    this.name = 'NetworkUnmountedError';
+    this.networkId = networkId;
+  }
+}
+
+export function isNetworkUnmountedError(error: unknown): error is NetworkUnmountedError {
+  return (
+    error instanceof NetworkUnmountedError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'network_unmounted')
+  );
+}
+
 export interface InboundFrameEvent {
   networkId: string;
   senderNodeId: string;
@@ -376,6 +432,8 @@ export interface EmitMessageInput<T = Record<string, unknown>> {
   idempotencyKey?: string;
   semantic?: SemanticHeaderInput;
   attachments?: readonly BlobAttachment[];
+  /** Local source paths for pre-shared attachments that a durable outbox must stage. */
+  attachmentPaths?: Readonly<Record<string, string>>;
   filePaths?: readonly string[];
   /**
    * Defaults to true when the runtime configures a durable outbox: an unreachable target
@@ -435,6 +493,21 @@ export interface OutboxEnqueueInput {
   lastError?: string;
 }
 
+/** Atomic creation-or-join of the one durable obligation for an idempotency key. */
+export interface OutboxClaimInput {
+  envelope: MessageEnvelope;
+  explicitTargets: string[];
+  filePaths?: Record<string, string>;
+  /** How long a crash-before-first-send placeholder waits before redrive may send it. */
+  leaseMs?: number;
+}
+
+export interface OutboxClaimResult {
+  /** True only for the caller that created the obligation and may perform the first send. */
+  claimed: boolean;
+  item: OutboxItem;
+}
+
 export interface OutboxListFilter {
   networkId?: string;
   status?: OutboxItemStatus | 'all';
@@ -483,7 +556,10 @@ export interface OutboxDeliveryOutcome {
 /** Persistence surface the emitter needs; the concrete OutboxStore implements it. */
 export interface OutboxStoreLike {
   enqueue(input: OutboxEnqueueInput): OutboxItem;
-  findQueuedByIdempotency?(networkId: string, idempotencyKey: string): OutboxItem | undefined;
+  /** Atomically reserve one obligation per (networkId, idempotencyKey) under the store lock. */
+  claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
+  /** Terminal local/routing failure with no signed target receipt. */
+  markFailed(id: string, lastError: string): OutboxItem | undefined;
 }
 
 export interface SourcePlugin {

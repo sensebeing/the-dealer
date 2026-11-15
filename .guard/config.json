@@ -100,7 +100,9 @@
         "boundary_docs": [
           "AGENTS.md"
         ],
-        "dependencies": []
+        "dependencies": [
+          "packages/fs-atomic"
+        ]
       },
       {
         "path": "packages/transport",
@@ -167,7 +169,8 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel",
-          "packages/plugins-policy"
+          "packages/plugins-policy",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -180,7 +183,8 @@
         ],
         "dependencies": [
           "packages/core-types",
-          "packages/kernel"
+          "packages/kernel",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -254,7 +258,8 @@
           "packages/core-types",
           "packages/kernel",
           "packages/plugins-policy",
-          "packages/plugins-router"
+          "packages/plugins-router",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -287,7 +292,8 @@
           "packages/core-types",
           "packages/kernel",
           "packages/mailbox",
-          "packages/orca-workspace"
+          "packages/orca-workspace",
+          "packages/fs-atomic"
         ]
       },
       {
@@ -314,7 +320,8 @@
           "packages/plugins-source",
           "packages/plugins-executor",
           "packages/plugins-lark-notifier",
-          "packages/process-lock"
+          "packages/process-lock",
+          "packages/fs-atomic"
         ]
       }
     ],
