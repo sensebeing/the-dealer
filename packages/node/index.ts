@@ -1,17 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname } from 'node:path';
-import { generateNodeKeyPair, signNodeCard, verifyNodeCard } from '../core-types/index.ts';
+  verifyNodeCard,
+  writeFileAtomically,
+} from '../core-types/index.ts';
+import { generateNodeKeyPair, signNodeCard } from '../core-types/index.ts';
 import type {
   AdmissionMode,
   Disposable,
@@ -122,6 +114,26 @@ export class PeerDirectoryService implements NodeService {
     ) {
       throw new Error('Invalid peer directory store');
     }
+    const selfRevisions = (parsed as { selfRevisions?: unknown }).selfRevisions;
+    if (selfRevisions !== undefined) {
+      if (
+        typeof selfRevisions !== 'object' ||
+        selfRevisions === null ||
+        Array.isArray(selfRevisions)
+      ) {
+        throw new Error('Invalid peer directory store');
+      }
+      for (const [networkId, revision] of Object.entries(selfRevisions)) {
+        if (
+          !networkId ||
+          !Number.isSafeInteger(revision) ||
+          revision < 0
+        ) {
+          throw new Error('Invalid peer directory store');
+        }
+        this.revisions.set(networkId, revision as number);
+      }
+    }
     for (const card of (parsed as { cards: unknown[] }).cards) {
       // Persisted cards carry durable identity, not live reachability: the peer may be
       // offline, and its last endpoint is owned by transport discovery, not this store.
@@ -130,8 +142,8 @@ export class PeerDirectoryService implements NodeService {
   }
 
   /**
-   * Persist the verified peer directory atomically. The self card is rebuilt on every
-   * publish and is deliberately excluded: only remote members are durable facts here.
+   * Persist the verified peer directory atomically. The self card itself is rebuilt on every
+   * publish and excluded, but its last revision is durable so a restart can never go backwards.
    */
   private persistPeers(): void {
     if (!this.peersPath) {
@@ -141,23 +153,14 @@ export class PeerDirectoryService implements NodeService {
       .flatMap(directory => [...directory.values()])
       .filter(card => card.nodeId !== this.keyPair.nodeId)
       .sort((a, b) => a.networkId.localeCompare(b.networkId) || a.nodeId.localeCompare(b.nodeId));
-    mkdirSync(dirname(this.peersPath), { recursive: true, mode: 0o700 });
-    const temporary = `${this.peersPath}.${randomUUID()}.tmp`;
-    try {
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(
-          fd,
-          JSON.stringify({ schema: PEER_DIRECTORY_SCHEMA, cards }),
-        );
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(temporary, this.peersPath);
-    } finally {
-      rmSync(temporary, { force: true });
-    }
+    writeFileAtomically(
+      this.peersPath,
+      JSON.stringify({
+        schema: PEER_DIRECTORY_SCHEMA,
+        selfRevisions: Object.fromEntries(this.revisions),
+        cards,
+      }),
+    );
   }
 
   /**
@@ -170,21 +173,28 @@ export class PeerDirectoryService implements NodeService {
     expectedNetworkId: string | undefined,
     registerEndpoint: boolean,
     emit: boolean,
-  ): boolean {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  ): boolean {    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       return false;
     }
     const card = value as NodeCard;
     if (
       typeof card.nodeId !== 'string' ||
       typeof card.networkId !== 'string' ||
-      (expectedNetworkId !== undefined && card.networkId !== expectedNetworkId) ||
-      card.nodeId === this.keyPair.nodeId
+      (expectedNetworkId !== undefined && card.networkId !== expectedNetworkId)
     ) {
       return false;
     }
     if (!Number.isSafeInteger(card.revision) || card.revision < 1 || !verifyNodeCard(card)) {
       return false;
+    }
+    if (card.nodeId === this.keyPair.nodeId) {
+      // A verified card carrying our own identity is our previously published state. Advance
+      // the local revision past it so a restarted daemon's cards are accepted immediately.
+      if (card.revision <= (this.revisions.get(card.networkId) ?? 0)) {
+        return false;
+      }
+      this.revisions.set(card.networkId, card.revision);
+      return true;
     }
     if (
       !card.identity ||
@@ -213,7 +223,11 @@ export class PeerDirectoryService implements NodeService {
     directory.set(card.nodeId, structuredClone(card));
     this.peers.set(card.networkId, directory);
     if (emit) {
-      this.ctx.emit('node/peer-updated', structuredClone(card));
+      // `direct` distinguishes live reachability from identity-only gossip so retry
+      // schedulers never treat a third-party card as proof the member reconnected.
+      this.ctx.emit('node/peer-updated', structuredClone(card), {
+        direct: registerEndpoint,
+      });
     }
     return true;
   }
@@ -252,8 +266,13 @@ export class PeerDirectoryService implements NodeService {
       this.transport.getNetworkConfig?.(networkId) ??
       this.config.networks?.find(n => n.networkId === networkId);
     const capabilities = this.config.capabilities ?? { summary: '', skills: [] };
-    const revision = (this.revisions.get(networkId) ?? 0) + 1;
+    // Persisted/gossiped last-seen revisions and wall-clock epochs both guard restart
+    // ordering: the next self card is always newer than anything peers already accepted.
+    const revision = Math.max((this.revisions.get(networkId) ?? 0) + 1, Date.now());
     this.revisions.set(networkId, revision);
+    // Self cards are rebuilt only on mount/profile changes, not on every presence beacon,
+    // so persisting the new revision here is both the durable truth and a bounded write.
+    this.persistPeers();
     return signNodeCard(
       {
         nodeId: this.keyPair.nodeId,
@@ -420,6 +439,7 @@ export class PeerDirectoryService implements NodeService {
       await listener.dispose();
     }
     await this.pending.catch(() => {});
+    this.persistPeers();
     this.peers.clear();
     this.self.clear();
   }

@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import {
+  isConfirmedHandoffReceipt,
   isOfflinePeerSpooledError,
   isPeerOfflineError,
+  isUnresolvedTargetError,
+  LocalDeliveryError,
   resolveSemanticHeader,
   signEnvelope,
   signReceipt,
@@ -11,20 +14,24 @@ import {
 import type {
   DeliveryReceipt,
   EmitMessageInput,
+  EmitResult,
   EmitterService,
   MessageEnvelope,
   NodeCard,
+  OutboxDeliveryFailure,
+  OutboxDeliveryOutcome,
+  OutboxItem,
+  OutboxStoreLike,
   RouteDecision,
   SourcePlugin,
 } from '../core-types/index.ts';
-import type { OutboxStore } from '../mailbox/outbox.ts';
 import type { Plugin } from '../kernel/index.ts';
 
 export interface EmitterConfig {
   privateKeyPem?: string;
   onSourceError?: (error: unknown) => void;
   /** Durable offline fallback; when absent, unreachable targets fail emit as before. */
-  outbox?: OutboxStore;
+  outbox?: OutboxStoreLike;
 }
 
 /** Unsigned envelope built by the emitter; semantic thread ids are resolved before signing. */
@@ -79,10 +86,47 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           privateKeyPem,
         );
 
+      /** Verify one signed reply before it may settle or fail a durable obligation. */
+      const parseReceipt = (
+        bytes: Uint8Array,
+        envelope: MessageEnvelope,
+        target: string,
+      ): DeliveryReceipt => {
+        let receipt: DeliveryReceipt;
+        try {
+          receipt = JSON.parse(Buffer.from(bytes).toString('utf8'));
+        } catch {
+          throw new LocalDeliveryError('Invalid delivery receipt payload');
+        }
+        if (
+          !verifyReceipt(receipt) ||
+          receipt.messageId !== envelope.id ||
+          receipt.networkId !== envelope.networkId ||
+          receipt.fromNodeId !== target
+        ) {
+          throw new LocalDeliveryError('Invalid or mismatched delivery receipt');
+        }
+        return receipt;
+      };
+
+      /** Previously unresolved explicit selectors converge their reply route once resolved. */
       const service: EmitterService = {
         async emit<T>(input: EmitMessageInput<T>) {
           const { transport, node, router } = ctx.services;
           const self = node.getSelfCard(input.networkId);
+          const mounted = transport.listMountedNetworks().includes(input.networkId);
+          const queueIfOffline = outbox !== undefined && input.queueIfOffline !== false;
+
+          // A re-emitted idempotent item converges on the existing durable obligation
+          // instead of creating a second outbox entry and relay spool copy.
+          const existing =
+            queueIfOffline && input.idempotencyKey
+              ? outbox.findQueuedByIdempotency?.(input.networkId, input.idempotencyKey)
+              : undefined;
+          if (existing) {
+            return replayQueued(existing);
+          }
+
           const sharedFiles = await Promise.all(
             (input.filePaths ?? []).map(async filePath => ({
               filePath,
@@ -149,15 +193,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           } catch (error) {
             // An unresolved explicit selector is a peering gap, not a routing bug: the
             // durable outbox retries it once the peer directory learns the member again.
-            const unresolved =
-              error instanceof Error &&
-              error.message.startsWith('Unresolved explicit target:');
-            if (
-              unresolved &&
-              outbox !== undefined &&
-              input.queueIfOffline !== false &&
-              transport.listMountedNetworks().includes(envelope.networkId)
-            ) {
+            if (isUnresolvedTargetError(error) && queueIfOffline && mounted) {
               const detail = error.message;
               outbox.enqueue({
                 envelope,
@@ -177,44 +213,39 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             throw error;
           }
           const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));
-          const spoolBlobHashes = [...new Set(envelope.attachments.map(attachment => attachment.blake3Hash))];
+          const spoolBlobHashes = [
+            ...new Set([
+              ...Object.keys(stagedPaths),
+              ...envelope.attachments.map(attachment => attachment.blake3Hash),
+            ]),
+          ];
+          // Spooling is caller-owned policy: an explicit queueIfOffline:false send must not
+          // leave any durable relay copy, otherwise the caller could retry a queued message.
+          const spoolOptions = queueIfOffline
+            ? {
+                spoolIfOffline: true,
+                spoolKey: envelope.id,
+                spoolBlobHashes,
+              }
+            : {};
           const deliveredReceipts: Record<string, DeliveryReceipt> = {};
           const pendingNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
           let offlineDetail: string | undefined;
-          const parse = (bytes: Uint8Array, target: string): DeliveryReceipt => {
-            const receipt: DeliveryReceipt = JSON.parse(
-              Buffer.from(bytes).toString('utf8'),
-            );
-            if (
-              !verifyReceipt(receipt) ||
-              receipt.messageId !== envelope.id ||
-              receipt.networkId !== envelope.networkId ||
-              receipt.fromNodeId !== target
-            ) {
-              throw new Error('Invalid or mismatched delivery receipt');
-            }
-            return receipt;
-          };
           if (route.mode === 'broadcast') {
             await transport.broadcast(envelope.networkId, envelope.routing.topic ?? 'messages', frame);
           } else {
             for (const target of route.targetNodeIds) {
               try {
-                deliveredReceipts[target] = parse(
-                  await transport.sendUnicast(envelope.networkId, target, frame, {
-                    spoolBlobHashes,
-                  }),
+                deliveredReceipts[target] = parseReceipt(
+                  await transport.sendUnicast(envelope.networkId, target, frame, spoolOptions),
+                  envelope,
                   target,
                 );
               } catch (error) {
                 // Receipt forgery, signature failures and every other local bug must
                 // surface; only a proven offline peer becomes a durable obligation.
-                if (
-                  !isPeerOfflineError(error) ||
-                  outbox === undefined ||
-                  input.queueIfOffline === false
-                ) {
+                if (!isPeerOfflineError(error) || !queueIfOffline) {
                   throw error;
                 }
                 pendingNodeIds.push(target);
@@ -251,6 +282,129 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           });
           return { messageId: envelope.id, traceId: envelope.traceId, receipts };
         },
+        async redriveOutboxItem(
+          item: OutboxItem,
+          options: { targetNodeIds?: readonly string[]; timeoutMs?: number } = {},
+        ): Promise<OutboxDeliveryOutcome> {
+          const { transport, node, router } = ctx.services;
+          // Staged evidence must still exist before any byte is re-sent; a missing copy is
+          // a deterministic local failure, not a reason to retry the same broken payload.
+          for (const [hash, filePath] of Object.entries(item.stagedFiles)) {
+            try {
+              transport.registerBlob?.(hash, filePath);
+            } catch (error) {
+              return {
+                failed: {
+                  error: `Missing staged attachment ${hash}: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                },
+              };
+            }
+          }
+          let targets = options.targetNodeIds !== undefined
+            ? [...options.targetNodeIds]
+            : item.pendingNodeIds.filter(nodeId => !item.deliveredReceipts[nodeId]);
+          const untouched = item.pendingNodeIds.filter(
+            nodeId => !targets.includes(nodeId) && !item.deliveredReceipts[nodeId],
+          );
+          let resolvedTargetNodeIds: readonly string[] | undefined;
+          if (targets.length === 0 && options.targetNodeIds === undefined) {
+            let route: RouteDecision;
+            try {
+              route = await router.route(item.envelope);
+            } catch (error) {
+              if (isUnresolvedTargetError(error)) {
+                return { lastError: error.message, pendingNodeIds: [] };
+              }
+              return {
+                failed: { error: error instanceof Error ? error.message : String(error) },
+              };
+            }
+            if (route.mode === 'broadcast' || route.targetNodeIds.length === 0) {
+              return { failed: { error: 'Outbox item has no addressable target' } };
+            }
+            resolvedTargetNodeIds = route.targetNodeIds.filter(
+              nodeId => !item.deliveredReceipts[nodeId],
+            );
+            targets = [...resolvedTargetNodeIds];
+          }
+          const frame = Buffer.from(
+            JSON.stringify({ type: 'message.envelope', envelope: item.envelope }),
+          );
+          const spoolBlobHashes = [
+            ...new Set([
+              ...Object.keys(item.stagedFiles),
+              ...item.envelope.attachments.map(attachment => attachment.blake3Hash),
+            ]),
+          ];
+          const deliveredReceipts: Record<string, DeliveryReceipt> = {};
+          const pendingNodeIds: string[] = [];
+          const relaySpooledNodeIds: string[] = [];
+          let failed: OutboxDeliveryFailure | undefined;
+          let lastError: string | undefined;
+          for (const target of targets) {
+            try {
+              const receipt = parseReceipt(
+                await transport.sendUnicast(item.networkId, target, frame, {
+                  ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+                  spoolIfOffline: true,
+                  spoolKey: item.envelope.id,
+                  spoolBlobHashes,
+                }),
+                item.envelope,
+                target,
+              );
+              if (
+                isConfirmedHandoffReceipt(receipt, { allowQueued: true }) ||
+                receipt.stage === 'pending_approval'
+              ) {
+                deliveredReceipts[target] = receipt;
+                continue;
+              }
+              if (receipt.stage === 'rejected' || receipt.stage === 'failed') {
+                // A signed rejection/failure is terminal: retrying identical bytes would
+                // just reproduce the target's decision while hiding it from the operator.
+                failed = {
+                  nodeId: target,
+                  receipt,
+                  error: `Target ${target} returned ${receipt.stage}${
+                    receipt.detail ? `: ${receipt.detail}` : ''
+                  }`,
+                };
+                break;
+              }
+              // Reached the target but not durably handed off (memory-only queue/approval
+              // ingress): keep the obligation and retry under the ordinary backoff.
+              pendingNodeIds.push(target);
+              lastError = `Target ${target} returned ${receipt.stage}`;
+            } catch (error) {
+              if (isPeerOfflineError(error)) {
+                pendingNodeIds.push(target);
+                if (isOfflinePeerSpooledError(error)) {
+                  relaySpooledNodeIds.push(target);
+                }
+                lastError = error instanceof Error ? error.message : String(error);
+                continue;
+              }
+              failed = {
+                nodeId: target,
+                error: `Local or protocol failure: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              };
+              break;
+            }
+          }
+          return {
+            ...(resolvedTargetNodeIds !== undefined ? { resolvedTargetNodeIds } : {}),
+            deliveredReceipts,
+            pendingNodeIds: [...new Set([...untouched, ...pendingNodeIds])],
+            relaySpooledNodeIds,
+            ...(failed !== undefined ? { failed } : {}),
+            ...(lastError !== undefined ? { lastError } : {}),
+          };
+        },
         registerSource(source) {
           if (sources.has(source)) {
             throw new Error('Source already registered');
@@ -280,6 +434,39 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           return { dispose };
         },
       };
+
+      const selfCardFor = (item: OutboxItem): NodeCard => {
+        const self = ctx.services.node.getSelfCard(item.networkId);
+        if (self.nodeId !== item.envelope.from.nodeId) {
+          throw new Error('Outbox sender identity changed');
+        }
+        return self;
+      };
+
+      /** Reuse an already durable obligation without emitting a second outbox entry. */
+      const replayQueued = (existing: OutboxItem): EmitResult => {
+        const receipts: DeliveryReceipt[] = Object.values(existing.deliveredReceipts);
+        const pending = existing.pendingNodeIds.length > 0
+          ? existing.pendingNodeIds
+          : [undefined];
+        for (const targetNodeId of pending) {
+          const spooled =
+            targetNodeId !== undefined && existing.relaySpooledNodeIds.includes(targetNodeId);
+          const detail =
+            targetNodeId === undefined
+              ? `Reused durable outbox obligation ${existing.id}`
+              : spooled
+                ? `Reused durable outbox obligation ${existing.id}; spooled on relay seed for offline peer ${targetNodeId}`
+                : `Reused durable outbox obligation ${existing.id} for offline peer ${targetNodeId}`;
+          receipts.push(queuedReceipt(existing.envelope, selfCardFor(existing), targetNodeId, spooled, detail));
+        }
+        return {
+          messageId: existing.envelope.id,
+          traceId: existing.envelope.traceId,
+          receipts,
+        };
+      };
+
       ctx.provide('emitter', service);
     },
   };

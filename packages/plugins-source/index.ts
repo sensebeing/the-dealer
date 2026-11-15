@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { isConfirmedHandoffReceipt } from '../plugins-policy/index.ts';
+import { isConfirmedHandoffReceipt } from '../core-types/index.ts';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
 import type {

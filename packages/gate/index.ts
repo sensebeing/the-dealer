@@ -1,8 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { isConfirmedHandoffReceipt } from '../plugins-policy/index.ts';
-import { verifyEnvelope } from '../core-types/index.ts';
+import { isConfirmedHandoffReceipt, verifyEnvelope } from '../core-types/index.ts';
 import type {
   AdmissionMode,
   GateRulePlugin,

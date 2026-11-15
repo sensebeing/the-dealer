@@ -1,4 +1,16 @@
 import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname } from 'node:path';
+import {
   createCipheriv,
   createDecipheriv,
   createHash,
@@ -7,6 +19,7 @@ import {
   createPublicKey,
   generateKeyPairSync,
   randomBytes,
+  randomUUID,
   sign,
   verify,
 } from 'node:crypto';
@@ -131,6 +144,45 @@ export interface DeliveryReceipt {
   signature: string;
 }
 
+export const DEDUP_CAS_DUPLICATE_DETAIL = 'Duplicate or stale claim version';
+export const DEDUP_CAS_AMBIGUOUS_DETAIL = 'Previous delivery outcome unknown; newer revision required';
+
+type HandoffReceipt = {
+  stage?: string;
+  detail?: string;
+  executionReceipt?: Record<string, unknown>;
+};
+
+/** A durable queued handoff: the event is durably owned, not merely buffered in memory. */
+export function isDurableQueuedReceipt(receipt: HandoffReceipt | null | undefined): boolean {
+  return receipt?.stage === 'queued' && receipt.executionReceipt?.durable === true;
+}
+
+/** The sender's durable outbox owns the obligation; poll sources may advance immediately. */
+export function isDurableOutboxReceipt(receipt: HandoffReceipt | null | undefined): boolean {
+  return isDurableQueuedReceipt(receipt) && receipt?.executionReceipt?.executor === 'outbox';
+}
+
+export function isDedupCasDuplicateReceipt(
+  receipt: HandoffReceipt | null | undefined,
+  options?: { allowQueued?: boolean },
+): boolean {
+  if (receipt?.stage !== 'rejected' || receipt.detail !== DEDUP_CAS_DUPLICATE_DETAIL) return false;
+  if (receipt.executionReceipt?.durable !== true) return false;
+  const handoff = receipt.executionReceipt.handoff;
+  return handoff === 'settled' || (Boolean(options?.allowQueued) && handoff === 'queued');
+}
+
+export function isConfirmedHandoffReceipt(
+  receipt: HandoffReceipt | null | undefined,
+  options?: { allowQueued?: boolean },
+): boolean {
+  return receipt?.stage === 'dispatched' || receipt?.stage === 'settled' ||
+    (Boolean(options?.allowQueued) && isDurableQueuedReceipt(receipt)) ||
+    isDedupCasDuplicateReceipt(receipt, options) ||
+    isDurableOutboxReceipt(receipt);
+}
+
 export interface SealedNetworkFrame {
   protocol: 'the-dealer-wire/v1';
   swarmTopicId: string;
@@ -199,6 +251,50 @@ export function isPeerOfflineError(error: unknown): boolean {
   return isPeerUnreachableError(error) || isOfflinePeerSpooledError(error);
 }
 
+/** Router-owned explicit selector failure; the emitter queues it instead of re-parsing text. */
+export class UnresolvedTargetError extends Error {
+  readonly code = 'unresolved_target';
+  readonly target: string;
+
+  constructor(target: string) {
+    super(`Unresolved explicit target: ${target}`);
+    this.name = 'UnresolvedTargetError';
+    this.target = target;
+  }
+}
+
+export function isUnresolvedTargetError(error: unknown): error is UnresolvedTargetError {
+  return (
+    error instanceof UnresolvedTargetError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'unresolved_target')
+  );
+}
+
+/**
+ * A deterministic local failure (missing/corrupt attachment, oversized frame or a rejected
+ * relay-spool protocol response). Retrying the same bytes can never succeed, so durable
+ * redrive must settle it as failed instead of consuming the peer-unreachable retry path.
+ */
+export class LocalDeliveryError extends Error {
+  readonly code = 'local_delivery_failure';
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'LocalDeliveryError';
+  }
+}
+
+export function isLocalDeliveryError(error: unknown): error is LocalDeliveryError {
+  return (
+    error instanceof LocalDeliveryError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'local_delivery_failure')
+  );
+}
+
 export interface InboundFrameEvent {
   networkId: string;
   senderNodeId: string;
@@ -228,6 +324,10 @@ export interface TransportService {
     frame: Uint8Array,
     opts?: {
       timeoutMs?: number;
+      /** Caller-owned policy: allow the relay seed to store this frame while the target is offline. */
+      spoolIfOffline?: boolean;
+      /** Opaque, stable identifier for deduplicating repeated redrives of the same obligation. */
+      spoolKey?: string;
       /** Content hashes the sender offers to an always-on relay seed for offline spooling. */
       spoolBlobHashes?: readonly string[];
     },
@@ -295,6 +395,91 @@ export interface EmitResult {
   receipts: readonly DeliveryReceipt[];
 }
 
+export type OutboxItemStatus = 'queued' | 'delivered' | 'failed';
+
+/**
+ * One durable sender-side obligation. `pendingNodeIds` names the resolved targets still
+ * awaiting a live signed receipt; an empty list means the explicit selector has not been
+ * resolvable yet and must be retried through the emitter's router.
+ */
+export interface OutboxItem {
+  id: string;
+  networkId: string;
+  envelope: MessageEnvelope;
+  explicitTargets: string[];
+  pendingNodeIds: string[];
+  deliveredReceipts: Record<string, DeliveryReceipt>;
+  relaySpooledNodeIds: string[];
+  stagedFiles: Record<string, string>;
+  status: OutboxItemStatus;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  nextAttemptAt: string;
+  lastError?: string;
+  failedReceipt?: { nodeId: string; receipt: DeliveryReceipt };
+}
+
+export interface OutboxEnqueueInput {
+  envelope: MessageEnvelope;
+  explicitTargets: string[];
+  pendingNodeIds: string[];
+  deliveredReceipts?: Record<string, DeliveryReceipt>;
+  relaySpooledNodeIds?: string[];
+  /** hash -> source path; copied into the durable outbox blob directory on first enqueue. */
+  filePaths?: Record<string, string>;
+  lastError?: string;
+}
+
+export interface OutboxListFilter {
+  networkId?: string;
+  status?: OutboxItemStatus | 'all';
+}
+
+export interface OutboxFlushOptions {
+  id?: string;
+  networkId?: string;
+  /** Restrict a peer-triggered flush to the target that just became reachable. */
+  targetNodeId?: string;
+  /** Ignore the per-item retry schedule for an explicit operator flush or peer reconnect. */
+  force?: boolean;
+  /** Force only the target named by `targetNodeId`, leaving unrelated schedule state intact. */
+  forceMatchingTarget?: boolean;
+}
+
+export interface OutboxFlushResult {
+  attempted: number;
+  delivered: number;
+  stillQueued: number;
+  items: OutboxItem[];
+}
+
+export interface OutboxDeliveryFailure {
+  nodeId?: string;
+  receipt?: DeliveryReceipt;
+  error: string;
+}
+
+/** Emitter-owned outcome of one outbox redrive attempt; mailbox only persists the result. */
+export interface OutboxDeliveryOutcome {
+  /** Targets resolved by routing an initially unresolved explicit selector. */
+  resolvedTargetNodeIds?: readonly string[];
+  /** Live signed receipts, keyed by target node. */
+  deliveredReceipts?: Readonly<Record<string, DeliveryReceipt>>;
+  /** Targets still offline or otherwise retryable after this attempt. */
+  pendingNodeIds?: readonly string[];
+  relaySpooledNodeIds?: readonly string[];
+  /** A signed rejection/failure or local integrity error that must stop retries. */
+  failed?: OutboxDeliveryFailure;
+  lastError?: string;
+}
+
+/** Persistence surface the emitter needs; the concrete OutboxStore implements it. */
+export interface OutboxStoreLike {
+  enqueue(input: OutboxEnqueueInput): OutboxItem;
+  findQueuedByIdempotency?(networkId: string, idempotencyKey: string): OutboxItem | undefined;
+}
+
 export interface SourcePlugin {
   name: string;
   start(emitter: EmitterService): void | Promise<void>;
@@ -304,6 +489,11 @@ export interface SourcePlugin {
 export interface EmitterService {
   emit<T>(input: EmitMessageInput<T>): Promise<EmitResult>;
   registerSource(source: SourcePlugin): Disposable;
+  /** Emitter-owned outbound preparation, routing, send and receipt validation for redrive. */
+  redriveOutboxItem?(
+    item: OutboxItem,
+    options?: { targetNodeIds?: readonly string[]; timeoutMs?: number },
+  ): Promise<OutboxDeliveryOutcome>;
 }
 
 export interface RouteDecision {
@@ -741,5 +931,69 @@ export function unsealNetworkFrame<T = unknown>(
       'Unable to authenticate or decode network frame (wrong key or tampered frame)',
       { cause },
     );
+  }
+}
+
+/**
+ * Persist the rename itself. Some platforms/filesystems reject fsync on a read-only
+ * directory descriptor; those are benign, while any other I/O failure must still surface.
+ */
+export function syncDirectory(directory: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(directory, 'r');
+    fsyncSync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EINVAL' && code !== 'EBADF' && code !== 'EPERM' && code !== 'ENOTSUP') {
+      throw error;
+    }
+  } finally {
+    if (fd !== undefined) {
+      closeSync(fd);
+    }
+  }
+}
+
+/** Sole atomic JSON/data write owner: temp file, file fsync, rename, parent fsync. */
+export function writeFileAtomically(
+  filePath: string,
+  data: string | Uint8Array,
+  mode = 0o600,
+): void {
+  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+  const temporary = `${filePath}.${randomUUID()}.tmp`;
+  try {
+    const fd = openSync(temporary, 'wx', mode);
+    try {
+      writeFileSync(fd, data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, filePath);
+    syncDirectory(dirname(filePath));
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+/** Copy a file into a durable destination with the same fsync/rename contract. */
+export function copyFileAtomically(sourcePath: string, destPath: string, mode = 0o600): void {
+  mkdirSync(dirname(destPath), { recursive: true, mode: 0o700 });
+  const temporary = `${destPath}.${randomUUID()}.tmp`;
+  try {
+    copyFileSync(sourcePath, temporary);
+    chmodSync(temporary, mode);
+    const fd = openSync(temporary, 'r');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, destPath);
+    syncDirectory(dirname(destPath));
+  } finally {
+    rmSync(temporary, { force: true });
   }
 }

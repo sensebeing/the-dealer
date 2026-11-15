@@ -1,31 +1,18 @@
-import { randomUUID } from 'node:crypto';
-import {
-  chmodSync,
-  closeSync,
-  copyFileSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import {
-  isOfflinePeerSpooledError,
-  isPeerOfflineError,
-  verifyReceipt,
-} from '../core-types/index.ts';
+import { copyFileAtomically, writeFileAtomically } from '../core-types/index.ts';
 import type {
   DeliveryReceipt,
   Disposable,
   MessageEnvelope,
   NodeCard,
-  RouterService,
-  TransportService,
+  OutboxDeliveryOutcome,
+  OutboxEnqueueInput,
+  OutboxFlushOptions,
+  OutboxFlushResult,
+  OutboxItem,
+  OutboxItemStatus,
+  OutboxListFilter,
 } from '../core-types/index.ts';
 import {
   holdOwnedDirectory,
@@ -35,6 +22,17 @@ import {
   releaseOwnedDirectory,
 } from '../process-lock/index.ts';
 
+export type {
+  OutboxDeliveryFailure,
+  OutboxDeliveryOutcome,
+  OutboxEnqueueInput,
+  OutboxFlushOptions,
+  OutboxFlushResult,
+  OutboxItem,
+  OutboxItemStatus,
+  OutboxListFilter,
+} from '../core-types/index.ts';
+
 export const OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
 const LOCK_RETRY_MS = 20;
 const LOCK_TIMEOUT_MS = 2_000;
@@ -42,46 +40,7 @@ const STALE_LOCK_MS = 30_000;
 const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
 const MIN_ATTEMPT_DELAY_MS = 2_000;
 const MAX_ATTEMPT_DELAY_MS = 60_000;
-
-export type OutboxItemStatus = 'queued' | 'delivered' | 'failed';
-
-/**
- * One durable sender-side obligation. `pendingNodeIds` names the resolved targets still
- * awaiting a live signed receipt; an empty list means the explicit selector has not been
- * resolvable yet and must be retried through the router.
- */
-export interface OutboxItem {
-  id: string;
-  networkId: string;
-  envelope: MessageEnvelope;
-  explicitTargets: string[];
-  pendingNodeIds: string[];
-  deliveredReceipts: Record<string, DeliveryReceipt>;
-  relaySpooledNodeIds: string[];
-  stagedFiles: Record<string, string>;
-  status: OutboxItemStatus;
-  attempts: number;
-  createdAt: string;
-  updatedAt: string;
-  nextAttemptAt: string;
-  lastError?: string;
-}
-
-export interface OutboxEnqueueInput {
-  envelope: MessageEnvelope;
-  explicitTargets: string[];
-  pendingNodeIds: string[];
-  deliveredReceipts?: Record<string, DeliveryReceipt>;
-  relaySpooledNodeIds?: string[];
-  /** hash -> source path; copied into the durable outbox blob directory on first enqueue. */
-  filePaths?: Record<string, string>;
-  lastError?: string;
-}
-
-export interface OutboxListFilter {
-  networkId?: string;
-  status?: OutboxItemStatus | 'all';
-}
+const DEFAULT_REDRIVE_TIMEOUT_MS = 10_000;
 
 export interface OutboxAttemptUpdate {
   pendingNodeIds?: string[];
@@ -157,7 +116,11 @@ function validItem(value: unknown): value is OutboxItem {
     typeof value.createdAt === 'string' &&
     typeof value.updatedAt === 'string' &&
     typeof value.nextAttemptAt === 'string' &&
-    (value.lastError === undefined || typeof value.lastError === 'string')
+    (value.lastError === undefined || typeof value.lastError === 'string') &&
+    (value.failedReceipt === undefined ||
+      (isRecord(value.failedReceipt) &&
+        typeof value.failedReceipt.nodeId === 'string' &&
+        validReceipt(value.failedReceipt.receipt)))
   );
 }
 
@@ -253,20 +216,7 @@ export class OutboxStore {
   }
 
   private save(state: OutboxFileState): void {
-    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const temporary = `${this.path}.${randomUUID()}.tmp`;
-    try {
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(fd, JSON.stringify(state));
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(temporary, this.path);
-    } finally {
-      rmSync(temporary, { force: true });
-    }
+    writeFileAtomically(this.path, JSON.stringify(state));
   }
 
   private mutate<T>(operation: (state: OutboxFileState) => T): T {
@@ -297,8 +247,7 @@ export class OutboxStore {
       const directory = join(this.blobDir, encodeURIComponent(id));
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       const destination = join(directory, hash);
-      copyFileSync(source, destination);
-      chmodSync(destination, 0o600);
+      copyFileAtomically(source, destination);
       staged[hash] = destination;
     }
     return staged;
@@ -359,6 +308,9 @@ export class OutboxStore {
           : existing?.lastError !== undefined
             ? { lastError: existing.lastError }
             : {}),
+        ...(existing?.failedReceipt !== undefined
+          ? { failedReceipt: existing.failedReceipt }
+          : {}),
       };
       if (index >= 0) {
         state.items[index] = item;
@@ -371,6 +323,23 @@ export class OutboxStore {
 
   get(id: string): OutboxItem | undefined {
     const item = this.read().items.find(candidate => candidate.id === id);
+    return item ? clone(item) : undefined;
+  }
+
+  /** Reuse the one queued obligation for an idempotency key instead of duplicating it. */
+  findQueuedByIdempotency(
+    networkId: string,
+    idempotencyKey: string,
+  ): OutboxItem | undefined {
+    if (!idempotencyKey) {
+      return undefined;
+    }
+    const item = this.read().items.find(
+      candidate =>
+        candidate.status === 'queued' &&
+        candidate.networkId === networkId &&
+        candidate.envelope.idempotencyKey === idempotencyKey,
+    );
     return item ? clone(item) : undefined;
   }
 
@@ -425,6 +394,33 @@ export class OutboxStore {
     });
   }
 
+  /** A signed rejection/failure or local integrity error: stop retries, preserve evidence. */
+  markFailed(
+    id: string,
+    lastError: string,
+    failedReceipt?: { nodeId: string; receipt: DeliveryReceipt },
+  ): OutboxItem | undefined {
+    const now = new Date().toISOString();
+    return this.mutate(state => {
+      const item = state.items.find(candidate => candidate.id === id);
+      if (!item) {
+        return undefined;
+      }
+      item.status = 'failed';
+      item.lastError = lastError;
+      item.updatedAt = now;
+      item.nextAttemptAt = now;
+      if (failedReceipt) {
+        item.failedReceipt = {
+          nodeId: failedReceipt.nodeId,
+          receipt: structuredClone(failedReceipt.receipt),
+        };
+      }
+      // Staged files are deliberately retained as evidence for operator inspection.
+      return clone(item);
+    });
+  }
+
   recordAttempt(id: string, update: OutboxAttemptUpdate): OutboxItem | undefined {
     if (typeof update?.nextAttemptAt !== 'string' || !Number.isFinite(Date.parse(update.nextAttemptAt))) {
       throw new Error('Invalid outbox attempt schedule');
@@ -467,27 +463,20 @@ export class OutboxStore {
   }
 }
 
-export interface OutboxFlushOptions {
-  id?: string;
-  /** Ignore the per-item retry schedule, for an explicit operator flush or peer reconnect. */
-  force?: boolean;
-}
-
-export interface OutboxFlushResult {
-  attempted: number;
-  delivered: number;
-  stillQueued: number;
-  items: OutboxItem[];
-}
-
 export interface OutboxRedriveEvents {
-  on(event: 'node/peer-updated', listener: (card: NodeCard) => void): Disposable;
+  on(
+    event: 'node/peer-updated',
+    listener: (card: NodeCard, provenance?: { direct?: boolean }) => void,
+  ): Disposable;
 }
 
 export interface OutboxRedriveOptions {
   outbox: OutboxStore;
-  transport: Pick<TransportService, 'sendUnicast' | 'registerBlob'>;
-  router: Pick<RouterService, 'route'>;
+  /** Emitter-owned delivery: routing, envelope framing, transport send and receipt checks. */
+  deliver: (
+    item: OutboxItem,
+    options?: { targetNodeIds?: readonly string[]; timeoutMs?: number },
+  ) => Promise<OutboxDeliveryOutcome>;
   events?: OutboxRedriveEvents;
   onError?: (error: unknown) => void;
   /** Called once a previously unresolved explicit selector has produced real targets. */
@@ -496,43 +485,34 @@ export interface OutboxRedriveOptions {
     targetNodeIds: readonly string[],
   ) => void;
   intervalMs?: number;
-}
-
-function parseTargetReceipt(
-  bytes: Uint8Array,
-  envelope: MessageEnvelope,
-  targetNodeId: string,
-): DeliveryReceipt {
-  let receipt: DeliveryReceipt;
-  try {
-    receipt = JSON.parse(Buffer.from(bytes).toString('utf8'));
-  } catch {
-    throw new Error('Invalid or mismatched delivery receipt');
-  }
-  if (
-    !verifyReceipt(receipt) ||
-    receipt.messageId !== envelope.id ||
-    receipt.networkId !== envelope.networkId ||
-    receipt.fromNodeId !== targetNodeId
-  ) {
-    throw new Error('Invalid or mismatched delivery receipt');
-  }
-  return receipt;
+  attemptTimeoutMs?: number;
 }
 
 function attemptDelayMs(attempts: number): number {
   return Math.min(MAX_ATTEMPT_DELAY_MS, MIN_ATTEMPT_DELAY_MS * 2 ** Math.min(attempts, 5));
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  });
+}
+
 /**
- * Sole redrive owner for the durable outbox. Peer announcements and a low-frequency,
- * unref'd timer trigger delivery; every send is an ordinary authenticated unicast, so a
- * relay seed may spool it again when the target is still offline.
+ * Sole durable-obligation owner for the outbox. The emitter owns routing, framing and
+ * receipt verification through `deliver`; this service only persists obligations,
+ * schedules backoff and scopes peer-triggered retries to the peer that reconnected.
  */
 export class OutboxRedriveService {
   private readonly outbox: OutboxStore;
-  private readonly transport: Pick<TransportService, 'sendUnicast' | 'registerBlob'>;
-  private readonly router: Pick<RouterService, 'route'>;
+  private readonly deliver: OutboxRedriveOptions['deliver'];
   private readonly events?: OutboxRedriveEvents;
   private readonly onError: (error: unknown) => void;
   private readonly onTargetsResolved?: (
@@ -540,6 +520,7 @@ export class OutboxRedriveService {
     targetNodeIds: readonly string[],
   ) => void;
   private readonly intervalMs: number;
+  private readonly attemptTimeoutMs: number;
   private timer?: ReturnType<typeof setInterval>;
   private subscription?: Disposable;
   private queue: Promise<unknown> = Promise.resolve();
@@ -548,12 +529,12 @@ export class OutboxRedriveService {
 
   constructor(options: OutboxRedriveOptions) {
     this.outbox = options.outbox;
-    this.transport = options.transport;
-    this.router = options.router;
+    this.deliver = options.deliver;
     this.events = options.events;
     this.onError = options.onError ?? (() => {});
     this.onTargetsResolved = options.onTargetsResolved;
     this.intervalMs = options.intervalMs ?? DEFAULT_REDRIVE_INTERVAL_MS;
+    this.attemptTimeoutMs = options.attemptTimeoutMs ?? DEFAULT_REDRIVE_TIMEOUT_MS;
   }
 
   start(): void {
@@ -561,7 +542,9 @@ export class OutboxRedriveService {
       return;
     }
     this.stopped = false;
-    this.subscription = this.events?.on('node/peer-updated', card => this.onPeerUpdated(card));
+    this.subscription = this.events?.on('node/peer-updated', (card, provenance) =>
+      this.onPeerUpdated(card, provenance),
+    );
     this.timer = setInterval(() => this.tick(), this.intervalMs);
     this.timer.unref();
   }
@@ -573,29 +556,25 @@ export class OutboxRedriveService {
     void this.flush().catch(error => this.onError(error));
   }
 
-  private onPeerUpdated(card: NodeCard): void {
-    if (this.stopped) {
+  private onPeerUpdated(card: NodeCard, provenance?: { direct?: boolean }): void {
+    // Presence gossip proves identity, not reachability: a gossiped third-party card must
+    // never advance the retry clock for a target that has not actually reconnected.
+    if (this.stopped || provenance?.direct === false) {
       return;
     }
-    const queued = this.outbox.list({ status: 'queued' });
-    if (
-      !queued.some(
-        item =>
-          item.networkId === card.networkId &&
-          (item.pendingNodeIds.length === 0 || item.pendingNodeIds.includes(card.nodeId)),
-      )
-    ) {
-      return;
-    }
-    // Presence cards refresh several times a second. Retry at most once per peer per
-    // reconnect pulse; the per-item backoff still governs ordinary timer attempts.
+    // Throttle before touching the outbox: presence cards refresh several times a second.
     const key = `${card.networkId}\n${card.nodeId}`;
     const now = Date.now();
     if (now - (this.lastPeerPulse.get(key) ?? 0) < 2_000) {
       return;
     }
     this.lastPeerPulse.set(key, now);
-    void this.flush({ force: true }).catch(error => this.onError(error));
+    void this.flush({
+      networkId: card.networkId,
+      targetNodeId: card.nodeId,
+      force: true,
+      forceMatchingTarget: true,
+    }).catch(error => this.onError(error));
   }
 
   flush(options: OutboxFlushOptions = {}): Promise<OutboxFlushResult> {
@@ -606,9 +585,21 @@ export class OutboxRedriveService {
 
   private async flushNow(options: OutboxFlushOptions): Promise<OutboxFlushResult> {
     const now = Date.now();
-    const candidates = this.outbox.list({ status: 'queued' }).filter(
-      item => options.id === undefined || item.id === options.id,
-    );
+    let candidates = this.outbox
+      .list({ status: 'queued', ...(options.networkId ? { networkId: options.networkId } : {}) })
+      .filter(item => options.id === undefined || item.id === options.id);
+    if (options.forceMatchingTarget) {
+      const targetNodeId = options.targetNodeId;
+      if (!targetNodeId) {
+        throw new Error('forceMatchingTarget requires targetNodeId');
+      }
+      // Only this target's item (or an unresolved explicit selector, which may now match
+      // the newly reachable peer) participates. Unrelated backoff stays untouched.
+      candidates = candidates.filter(
+        item =>
+          item.pendingNodeIds.includes(targetNodeId) || item.pendingNodeIds.length === 0,
+      );
+    }
     let attempted = 0;
     let delivered = 0;
     const processed: OutboxItem[] = [];
@@ -616,102 +607,95 @@ export class OutboxRedriveService {
       if (this.stopped) {
         break;
       }
-      if (!options.force && Date.parse(candidate.nextAttemptAt) > now) {
+      // A forced peer flush bypasses only the matching item's schedule; ordinary timer
+      // flushes still honour each item's exponential backoff.
+      const matchesTarget =
+        !options.forceMatchingTarget ||
+        candidate.pendingNodeIds.length === 0 ||
+        candidate.pendingNodeIds.includes(options.targetNodeId!);
+      const force = options.force && matchesTarget;
+      if (!force && Date.parse(candidate.nextAttemptAt) > now) {
         processed.push(candidate);
         continue;
       }
       attempted += 1;
-      let item = candidate;
-      let lastError: string | undefined;
-      for (const [hash, path] of Object.entries(item.stagedFiles)) {
-        try {
-          this.transport.registerBlob?.(hash, path);
-        } catch (error) {
-          lastError = String(error);
-        }
-      }
-      let targets = item.pendingNodeIds.filter(nodeId => !item.deliveredReceipts[nodeId]);
-      if (targets.length === 0 && item.pendingNodeIds.length === 0) {
-        // The selector was not resolvable when the envelope was emitted; retry routing now
-        // that the peer directory may hold the target again.
-        try {
-          const decision = await this.router.route(item.envelope);
-          if (decision.mode === 'broadcast' || decision.targetNodeIds.length === 0) {
-            throw new Error('Outbox item has no addressable target');
-          }
-          targets = decision.targetNodeIds.filter(
-            nodeId => !item.deliveredReceipts[nodeId],
-          );
-          // The initial emit recorded an empty outbound route; the peer directory now
-          // knows the target, so converge that durable reply route before sending.
-          try {
-            this.onTargetsResolved?.(item.envelope, decision.targetNodeIds);
-          } catch (error) {
-            this.onError(error);
-          }
-          item =
-            this.outbox.recordAttempt(item.id, {
-              pendingNodeIds: targets,
-              nextAttemptAt: item.nextAttemptAt,
-            }) ?? item;
-        } catch (error) {
-          lastError = String(error);
-          item =
-            this.outbox.recordAttempt(item.id, {
-              lastError,
-              nextAttemptAt: new Date(Date.now() + attemptDelayMs(item.attempts + 1)).toISOString(),
-            }) ?? item;
-          processed.push(item);
-          continue;
-        }
-      }
-      const relaySpooledNodeIds: string[] = [];
-      for (const targetNodeId of targets) {
-        try {
-          const frame = Buffer.from(
-            JSON.stringify({ type: 'message.envelope', envelope: item.envelope }),
-          );
-          const bytes = await this.transport.sendUnicast(item.networkId, targetNodeId, frame, {
-            spoolBlobHashes: [
-              ...new Set([
-                ...Object.keys(item.stagedFiles),
-                ...item.envelope.attachments.map(attachment => attachment.blake3Hash),
-              ]),
-            ],
-          });
-          const receipt = parseTargetReceipt(bytes, item.envelope, targetNodeId);
-          // Any valid signed receipt is the live target confirmation the outbox awaited;
-          // dedup-cas duplicate rejections are explicit confirmations, not failures.
-          item =
-            this.outbox.markNodeDelivered(item.id, targetNodeId, receipt) ?? item;
-          delivered += 1;
-        } catch (error) {
-          if (isPeerOfflineError(error)) {
-            if (isOfflinePeerSpooledError(error)) {
-              relaySpooledNodeIds.push(targetNodeId);
-            }
-          } else {
-            lastError = String(error);
-          }
-        }
-      }
-      const latest = this.outbox.get(item.id) ?? item;
-      if (latest.status === 'queued') {
-        const pendingNodeIds = targets.filter(
-          targetNodeId => !latest.deliveredReceipts[targetNodeId],
+      const requestTargets = options.forceMatchingTarget && options.targetNodeId
+        ? candidate.pendingNodeIds.filter(
+            nodeId =>
+              nodeId === options.targetNodeId && !candidate.deliveredReceipts[nodeId],
+          )
+        : candidate.pendingNodeIds.filter(nodeId => !candidate.deliveredReceipts[nodeId]);
+      let outcome: OutboxDeliveryOutcome;
+      try {
+        outcome = await withTimeout(
+          this.deliver(candidate, {
+            // An empty list means "route the unresolved selector", not "deliver nowhere".
+            ...(requestTargets.length > 0 ? { targetNodeIds: requestTargets } : {}),
+            timeoutMs: this.attemptTimeoutMs,
+          }),
+          this.attemptTimeoutMs,
+          'Outbox redrive attempt timed out',
         );
-        item =
-          this.outbox.recordAttempt(latest.id, {
-            pendingNodeIds,
-            ...(relaySpooledNodeIds.length ? { relaySpooledNodeIds } : {}),
-            ...(lastError !== undefined ? { lastError } : {}),
-            nextAttemptAt: new Date(
-              Date.now() + attemptDelayMs(latest.attempts + 1),
-            ).toISOString(),
-          }) ?? latest;
-      } else {
-        item = latest;
+      } catch (error) {
+        const latest = this.outbox.get(candidate.id) ?? candidate;
+        const failed = this.outbox.recordAttempt(latest.id, {
+          lastError: String(error),
+          nextAttemptAt: new Date(
+            Date.now() + attemptDelayMs(latest.attempts + 1),
+          ).toISOString(),
+        }) ?? latest;
+        processed.push(failed);
+        continue;
       }
+      let item = this.outbox.get(candidate.id) ?? candidate;
+      for (const [nodeId, receipt] of Object.entries(outcome.deliveredReceipts ?? {})) {
+        item = this.outbox.markNodeDelivered(item.id, nodeId, receipt) ?? item;
+        delivered += 1;
+      }
+      if (outcome.failed) {
+        const error = outcome.failed.error || outcome.lastError || 'Outbox redrive failed';
+        item = this.outbox.markFailed(
+          item.id,
+          error,
+          outcome.failed.receipt && outcome.failed.nodeId
+            ? { nodeId: outcome.failed.nodeId, receipt: outcome.failed.receipt }
+            : undefined,
+        ) ?? item;
+        processed.push(item);
+        continue;
+      }
+      const resolved = outcome.resolvedTargetNodeIds;
+      if (resolved?.length && candidate.pendingNodeIds.length === 0) {
+        // The initial emit recorded an empty outbound route; the peer directory now knows
+        // the target, so converge that durable reply route before sending.
+        try {
+          this.onTargetsResolved?.(candidate.envelope, resolved);
+        } catch (error) {
+          this.onError(error);
+        }
+      }
+      if (item.status !== 'queued') {
+        processed.push(item);
+        continue;
+      }
+      const deliveredNodeIds = new Set(Object.keys(item.deliveredReceipts));
+      const pendingNodeIds = [
+        ...new Set(
+          (outcome.pendingNodeIds ?? resolved ?? item.pendingNodeIds).filter(
+            nodeId => !deliveredNodeIds.has(nodeId),
+          ),
+        ),
+      ];
+      item = this.outbox.recordAttempt(item.id, {
+        pendingNodeIds,
+        ...(outcome.relaySpooledNodeIds?.length
+          ? { relaySpooledNodeIds: [...outcome.relaySpooledNodeIds] }
+          : {}),
+        ...(outcome.lastError !== undefined ? { lastError: outcome.lastError } : {}),
+        nextAttemptAt: new Date(
+          Date.now() + attemptDelayMs(item.attempts + 1),
+        ).toISOString(),
+      }) ?? item;
       processed.push(item);
     }
     return {

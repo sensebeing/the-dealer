@@ -149,13 +149,14 @@ from a successful broadcast command alone.
 
 ## Offline delivery and the outbox
 
-When a target peer is unreachable, `send`, `reply`, `ask`, `broadcast` and
-`settle` do not fail the whole operation if the message can be durably queued.
-The signed receipt has `stage: "queued"` and `executionReceipt.queuedOffline:
-true` (plus `executor: "outbox"`); the envelope and any attachments are stored
-in `outbox.json` / `outbox-blobs/`. A queued receipt is a confirmed durable
-obligation, not evidence of execution: acknowledge your current inbox lease and
-end the turn. Do not poll, sleep, or re-send the same message.
+Addressed unicast or multicast sends (`send`, `reply`, `ask`, `settle`) do not fail the
+whole operation when the target peer is unreachable and a durable outbox is configured:
+the structured result reports a queued outcome owned by the local outbox. That outcome is
+a confirmed durable obligation, not evidence of execution. Acknowledge your current inbox
+lease and end the turn; do not poll, sleep, or re-send the same message.
+
+Broadcast is best-effort and is never queued per peer: it has no per-peer
+acknowledgements, so a successful broadcast command does not prove any member received it.
 
 ```sh
 dealer outbox list --json
@@ -165,20 +166,16 @@ dealer outbox flush --id <message-id> --json
 dealer outbox flush --force --json
 ```
 
-Redrive is automatic: the daemon retries when the peer's verified card arrives
-and on a 2s timer, with 2s → 60s backoff, and marks an item `delivered` only
-after the target's signed receipt confirms the message ID, network and sender.
-Attachments are re-registered from the staged copies on each attempt. `flush`
-forces an immediate attempt (`--force` ignores the backoff window). If the CLI
-queued a message while no daemon was running, it starts the daemon so redrive
-survives process exit. The verified peer directory (`peers.json`) persists
-across restarts, so `member:` and `skill:` selectors still resolve while the
-peer is offline; the relay seed's spool (when configured) holds the frame until
-the target reconnects.
+Redrive is automatic and settles an obligation only through the target's signed
+receipt; unsigned, forged, mismatched or rejected receipts fail the item instead of
+keeping it queued. The verified peer directory persists across restarts, and a relay
+seed's spool (when configured) holds the frame and verified attachments until the
+target reconnects. The authoritative state machine, receipt semantics and durable
+storage layout live in [`docs/architecture.md`](../../docs/architecture.md).
 
 Forgeries, signature failures, receipt mismatches and other protocol errors are
-never converted into queued receipts. They fail the command and must be
-investigated rather than retried blindly.
+never converted into queued receipts. They fail the command (or mark a redrive item
+`failed`) and must be investigated rather than retried blindly.
 
 ## Inbound gate
 

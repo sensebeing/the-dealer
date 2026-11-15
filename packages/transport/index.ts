@@ -2,16 +2,11 @@ import { createServer, createConnection, type Socket, type Server } from 'node:n
 import { createSocket, type Socket as DatagramSocket } from 'node:dgram';
 import { createReadStream, createWriteStream } from 'node:fs';
 import {
-  closeSync,
   existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
+  readdirSync,
   readFileSync,
-  renameSync,
   rmSync,
   statSync,
-  writeFileSync,
 } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { tmpdir, networkInterfaces } from 'node:os';
@@ -21,12 +16,14 @@ import { once } from 'node:events';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import {
+  LocalDeliveryError,
   OfflinePeerSpooledError,
   PeerUnreachableError,
   deriveNetworkKeys,
   generateNodeKeyPair,
   sealNetworkFrame,
   unsealNetworkFrame,
+  writeFileAtomically,
 } from '../core-types/index.ts';
 import type {
   BlobAttachment,
@@ -165,6 +162,11 @@ const MAX_FRAME = 8 * 1024 * 1024;
 const MAX_RELAY_SPOOL_BLOB_BYTES = 8 * 1024 * 1024;
 const RELAY_SPOOL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_RELAY_SPOOL_ENTRIES = 256;
+const MAX_RELAY_SPOOL_TARGETS = 128;
+const MAX_RELAY_SPOOL_TOTAL_ENTRIES = 1_024;
+const MAX_RELAY_SPOOL_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_RELAY_SPOOL_SENDER_ENTRIES = 256;
+const MAX_RELAY_SPOOL_KEY_LENGTH = 128;
 const RELAY_SPOOL_SCHEMA = 'the-dealer-relay-spool/v1';
 const GROUP = '239.255.42.99';
 // A relay candidate means the advertised endpoint may be NAT-bound; fail over fast
@@ -355,25 +357,31 @@ type PeerFallback = { tunnel: Tunnel } | { mount: Mount; seed: string };
 /** Relay attempt policy: spooling and attachment bytes are only offered to relay seeds. */
 interface RelayRequestOptions {
   spoolIfOffline?: boolean;
+  spoolKey?: string;
   blobHashes?: readonly string[];
 }
 
 const PROTOCOL_FAILURE =
-  /Response binding mismatch|Unable to authenticate or decode|Unsupported frame protocol|Frame swarmTopicId|Invalid frame|Unknown swarm|Invalid endpoint/;
+  /Response binding mismatch|Unable to authenticate or decode|Unsupported frame protocol|Frame swarmTopicId|Invalid frame|Unknown swarm|Invalid endpoint|Frame exceeds limit|Invalid relay spool|Relay spool capacity exceeded|Invalid relay target/;
 
 function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
 
-/** One sealed frame (and its small attachment cache) parked on an always-on relay seed. */
+/** One sealed frame (and its verified attachment cache) parked on an always-on relay seed. */
 export interface SpooledRelayEntry {
   id: string;
   targetNodeId: string;
   networkId: string;
   frame: SealedNetworkFrame;
-  /** hash -> base64 content, bounded by MAX_RELAY_SPOOL_BLOB_BYTES per entry. */
-  blobs?: Record<string, string>;
+  /** hash -> raw byte length for attachments already verified into the network blob cache. */
+  blobHashes?: Record<string, number>;
   spooledAt: string;
+  expiresAt: string;
+}
+
+interface SpooledRelayBlob {
+  size: number;
   expiresAt: string;
 }
 
@@ -381,6 +389,8 @@ interface RelaySpoolFile {
   schema: typeof RELAY_SPOOL_SCHEMA;
   networkId: string;
   entries: SpooledRelayEntry[];
+  /** Post-drain attachment cache; kept until the originating entry's TTL so late fetches work. */
+  blobs?: Record<string, SpooledRelayBlob>;
 }
 
 interface Mount {
@@ -397,6 +407,8 @@ interface Mount {
   outboundTunnels: Map<string, { socket: Socket; seed: string; acked: boolean }>;
   /** Store-and-forward frames waiting for an offline target, keyed by target node, FIFO. */
   relaySpool: Map<string, SpooledRelayEntry[]>;
+  /** Attachment bytes retained for late blob fetches after their frame entry drained. */
+  spoolBlobCache: Map<string, SpooledRelayBlob>;
   /** Durable spool snapshot for this network, when spoolDir is configured. */
   spoolFile?: string;
   file: string;
@@ -606,6 +618,7 @@ export class P2PTransportService implements TransportService {
       inboundTunnels: new Map<string, Tunnel>(),
       outboundTunnels: new Map<string, { socket: Socket; seed: string; acked: boolean }>(),
       relaySpool: new Map<string, SpooledRelayEntry[]>(),
+      spoolBlobCache: new Map<string, SpooledRelayBlob>(),
       ...(this.options.spoolDir
         ? { spoolFile: join(resolve(this.options.spoolDir), `${keys.swarmTopicId}.json`) }
         : {}),
@@ -711,10 +724,11 @@ export class P2PTransportService implements TransportService {
     this.blobs.set(hash, { path: filePath, size: info.size });
   }
 
-  private spoolBlobDirectory(): string {
+  /** Content-addressed blob cache is network-scoped: a spooled hash never leaks across mounts. */
+  private spoolBlobDirectory(m: Mount): string {
     return this.options.spoolDir
-      ? join(resolve(this.options.spoolDir), 'blobs')
-      : join(tmpdir(), 'the-dealer-relay-blobs');
+      ? join(resolve(this.options.spoolDir), 'blobs', m.keys.swarmTopicId)
+      : join(tmpdir(), 'the-dealer-relay-blobs', m.keys.swarmTopicId);
   }
 
   private loadRelaySpool(m: Mount): void {
@@ -739,53 +753,131 @@ export class P2PTransportService implements TransportService {
       throw new Error('Invalid relay spool store');
     }
     const now = Date.now();
-    const entries = (parsed as RelaySpoolFile).entries.filter(entry => {
+    const entries: SpooledRelayEntry[] = [];
+    for (const raw of (parsed as RelaySpoolFile).entries) {
       if (
-        typeof entry !== 'object' ||
-        entry === null ||
-        typeof entry.id !== 'string' ||
-        !entry.id ||
-        typeof entry.targetNodeId !== 'string' ||
-        !entry.targetNodeId ||
-        entry.networkId !== m.config.networkId ||
-        typeof entry.spooledAt !== 'string' ||
-        typeof entry.expiresAt !== 'string' ||
-        !Number.isFinite(Date.parse(entry.expiresAt)) ||
-        entry.frame?.protocol !== 'the-dealer-wire/v1' ||
-        entry.frame.swarmTopicId !== m.keys.swarmTopicId ||
-        typeof entry.frame.nonce !== 'string' ||
-        (entry.blobs !== undefined &&
-          (typeof entry.blobs !== 'object' ||
-            entry.blobs === null ||
-            Array.isArray(entry.blobs) ||
-            Object.values(entry.blobs).some(value => typeof value !== 'string')))
+        typeof raw !== 'object' ||
+        raw === null ||
+        typeof raw.id !== 'string' ||
+        !raw.id ||
+        typeof raw.targetNodeId !== 'string' ||
+        !raw.targetNodeId ||
+        raw.networkId !== m.config.networkId ||
+        typeof raw.spooledAt !== 'string' ||
+        typeof raw.expiresAt !== 'string' ||
+        !Number.isFinite(Date.parse(raw.expiresAt)) ||
+        raw.frame?.protocol !== 'the-dealer-wire/v1' ||
+        raw.frame.swarmTopicId !== m.keys.swarmTopicId ||
+        typeof raw.frame.nonce !== 'string'
       ) {
         throw new Error('Invalid relay spool store');
       }
-      return Date.parse(entry.expiresAt) > now;
-    });
+      if (Date.parse(raw.expiresAt) <= now) {
+        continue;
+      }
+      const legacyBlobs = (raw as { blobs?: unknown }).blobs;
+      const blobHashes: Record<string, number> = {};
+      if (raw.blobHashes !== undefined) {
+        if (
+          typeof raw.blobHashes !== 'object' ||
+          raw.blobHashes === null ||
+          Array.isArray(raw.blobHashes)
+        ) {
+          throw new Error('Invalid relay spool store');
+        }
+        for (const [hash, size] of Object.entries(raw.blobHashes)) {
+          if (
+            !/^[a-f0-9]{64}$/.test(hash) ||
+            !Number.isSafeInteger(size) ||
+            size < 0 ||
+            size > MAX_RELAY_SPOOL_BLOB_BYTES
+          ) {
+            throw new Error('Invalid relay spool store');
+          }
+          blobHashes[hash] = size;
+        }
+      }
+      if (legacyBlobs !== undefined) {
+        // One-time migration from the base64-in-snapshot schema: verify and materialize the
+        // content-addressed files, then persist only hash + length metadata from now on.
+        if (
+          typeof legacyBlobs !== 'object' ||
+          legacyBlobs === null ||
+          Array.isArray(legacyBlobs) ||
+          Object.values(legacyBlobs).some(value => typeof value !== 'string')
+        ) {
+          throw new Error('Invalid relay spool store');
+        }
+        let total = 0;
+        for (const [hash, encoded] of Object.entries(legacyBlobs as Record<string, string>)) {
+          if (!/^[a-f0-9]{64}$/.test(hash)) {
+            throw new Error('Invalid relay spool store');
+          }
+          const bytes = Buffer.from(encoded, 'base64');
+          if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
+            throw new Error('Invalid relay spool store');
+          }
+          total += bytes.length;
+          if (total > MAX_RELAY_SPOOL_BLOB_BYTES) {
+            throw new Error('Invalid relay spool store');
+          }
+          this.writeSpoolBlob(m, hash, bytes);
+          blobHashes[hash] = bytes.length;
+        }
+      }
+      entries.push({
+        id: raw.id,
+        targetNodeId: raw.targetNodeId,
+        networkId: m.config.networkId,
+        frame: raw.frame,
+        ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
+        spooledAt: raw.spooledAt,
+        expiresAt: raw.expiresAt,
+      });
+    }
     entries.sort(
       (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
     );
     for (const entry of entries) {
-      // A seed restart must keep spooled attachments addressable even after the frame entry
-      // is drained and removed before the target's executor fetches the blob. Rehydrate the
-      // durable cache (and the network-scoped membership) while the entry still exists.
-      for (const [hash, encoded] of Object.entries(entry.blobs ?? {})) {
-        if (!/^[a-f0-9]{64}$/.test(hash)) {
-          throw new Error('Invalid relay spool store');
-        }
-        const bytes = Buffer.from(encoded, 'base64');
-        if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
-          throw new Error('Invalid relay spool store');
-        }
-        this.writeSpoolBlob(m, hash, bytes);
-      }
       const queue = m.relaySpool.get(entry.targetNodeId) ?? [];
       queue.push(entry);
       m.relaySpool.set(entry.targetNodeId, queue);
     }
-    // Expired entries are dropped from the durable snapshot during mount.
+    const savedBlobs = (parsed as RelaySpoolFile).blobs;
+    if (savedBlobs !== undefined) {
+      if (typeof savedBlobs !== 'object' || savedBlobs === null || Array.isArray(savedBlobs)) {
+        throw new Error('Invalid relay spool store');
+      }
+      for (const [hash, meta] of Object.entries(savedBlobs)) {
+        if (
+          !/^[a-f0-9]{64}$/.test(hash) ||
+          typeof meta !== 'object' ||
+          meta === null ||
+          !Number.isSafeInteger(meta.size) ||
+          meta.size < 0 ||
+          meta.size > MAX_RELAY_SPOOL_BLOB_BYTES ||
+          typeof meta.expiresAt !== 'string' ||
+          !Number.isFinite(Date.parse(meta.expiresAt)) ||
+          Date.parse(meta.expiresAt) <= now
+        ) {
+          throw new Error('Invalid relay spool store');
+        }
+        m.spoolBlobCache.set(hash, { size: meta.size, expiresAt: meta.expiresAt });
+      }
+    }
+    // Files from a previous process are addressable and must participate in orphan GC.
+    const directory = this.spoolBlobDirectory(m);
+    if (existsSync(directory)) {
+      for (const name of readdirSync(directory)) {
+        if (/^[a-f0-9]{64}$/.test(name)) {
+          this.spooledBlobs.add(this.spoolBlobKey(m, name));
+        }
+      }
+    }
+    // Expired entries and orphaned blobs are dropped from the durable snapshot during mount.
+    this.pruneRelaySpool(m);
+    // A tampered or legacy snapshot must not bypass the same capacity bounds as live admission.
+    this.enforceRelaySpoolBudget(m);
     this.persistRelaySpool(m);
   }
 
@@ -798,24 +890,14 @@ export class P2PTransportService implements TransportService {
       schema: RELAY_SPOOL_SCHEMA,
       networkId: m.config.networkId,
       entries: [...m.relaySpool.values()].flat(),
+      ...(m.spoolBlobCache.size
+        ? { blobs: Object.fromEntries(m.spoolBlobCache) }
+        : {}),
     };
-    mkdirSync(dirname(spoolFile), { recursive: true, mode: 0o700 });
-    const temporary = `${spoolFile}.${randomUUID()}.tmp`;
-    try {
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(fd, JSON.stringify(state));
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(temporary, spoolFile);
-    } finally {
-      rmSync(temporary, { force: true });
-    }
+    writeFileAtomically(spoolFile, JSON.stringify(state));
   }
 
-  /** Drop expired entries and enforce the per-target spool bound before appending. */
+  /** Drop expired entries/cache, then enforce every global and per-target spool bound. */
   private pruneRelaySpool(m: Mount): boolean {
     const now = Date.now();
     let changed = false;
@@ -830,29 +912,221 @@ export class P2PTransportService implements TransportService {
         }
       }
     }
+    for (const [hash, meta] of m.spoolBlobCache) {
+      if (Date.parse(meta.expiresAt) <= now) {
+        m.spoolBlobCache.delete(hash);
+        changed = true;
+      }
+    }
+    return this.collectSpoolBlobFiles(m) || changed;
+  }
+
+  /** Delete every cached blob file no live entry or unexpired post-drain cache refers to. */
+  private collectSpoolBlobFiles(m: Mount): boolean {
+    const referenced = new Set<string>();
+    for (const entries of m.relaySpool.values()) {
+      for (const entry of entries) {
+        for (const hash of Object.keys(entry.blobHashes ?? {})) {
+          referenced.add(hash);
+        }
+      }
+    }
+    for (const hash of m.spoolBlobCache.keys()) {
+      referenced.add(hash);
+    }
+    let changed = false;
+    const directory = this.spoolBlobDirectory(m);
+    const prefix = `${m.keys.swarmTopicId}\n`;
+    for (const key of [...this.spooledBlobs]) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const hash = key.slice(prefix.length);
+      if (referenced.has(hash)) {
+        continue;
+      }
+      rmSync(join(directory, hash), { force: true });
+      this.spooledBlobs.delete(key);
+      changed = true;
+    }
+    for (const hash of m.spoolBlobCache.keys()) {
+      if (!existsSync(join(directory, hash))) {
+        m.spoolBlobCache.delete(hash);
+        changed = true;
+      }
+    }
     return changed;
   }
 
-  /** Stable dedup key: the signed envelope id when the frame carries one, else the nonce. */
-  private relaySpoolEntryId(m: Mount, frame: SealedNetworkFrame): string {
-    const inner = unsealNetworkFrame<Record<string, unknown>>(frame, m.keys);
-    let candidate: unknown = inner;
-    if (
-      typeof inner === 'object' &&
-      inner !== null &&
-      typeof inner.dataBase64 === 'string'
-    ) {
-      try {
-        candidate = JSON.parse(Buffer.from(inner.dataBase64, 'base64').toString('utf8'));
-      } catch {
-        candidate = undefined;
+  /**
+   * Keep a drained entry's attachment bytes until its original TTL: the target commonly
+   * fetches blobs after its gate/dispatcher receipt, when the original sender may be gone.
+   */
+  private retainSpoolBlobs(m: Mount, entry: SpooledRelayEntry): void {
+    for (const [hash, size] of Object.entries(entry.blobHashes ?? {})) {
+      const existing = m.spoolBlobCache.get(hash);
+      if (!existing || Date.parse(existing.expiresAt) < Date.parse(entry.expiresAt)) {
+        m.spoolBlobCache.set(hash, { size, expiresAt: entry.expiresAt });
       }
     }
-    const envelope = (candidate as { envelope?: { id?: unknown } } | undefined)?.envelope;
-    if (envelope && typeof envelope.id === 'string' && envelope.id.length > 0) {
-      return envelope.id;
+  }
+
+  /** Stable, sender-scoped spool identity from caller-owned opaque data; never parses frames. */
+  private relaySpoolEntryId(frame: SealedNetworkFrame, spoolKey?: string): string {
+    return `${frame.senderNodeId}:${spoolKey ?? `nonce:${frame.nonce}`}`;
+  }
+
+  private relaySpoolBytes(m: Mount): number {
+    const sizes = new Map<string, number>();
+    for (const entries of m.relaySpool.values()) {
+      for (const entry of entries) {
+        for (const [hash, size] of Object.entries(entry.blobHashes ?? {})) {
+          sizes.set(hash, size);
+        }
+      }
     }
-    return `nonce:${frame.nonce}`;
+    for (const [hash, meta] of m.spoolBlobCache) {
+      if (!sizes.has(hash)) {
+        sizes.set(hash, meta.size);
+      }
+    }
+    let total = 0;
+    for (const size of sizes.values()) {
+      total += size;
+    }
+    return total;
+  }
+
+  private entryCount(m: Mount, predicate: (entry: SpooledRelayEntry) => boolean): number {
+    let count = 0;
+    for (const entries of m.relaySpool.values()) {
+      count += entries.filter(predicate).length;
+    }
+    return count;
+  }
+
+  private oldestSpoolEntry(
+    m: Mount,
+    predicate: (entry: SpooledRelayEntry) => boolean,
+  ): { target: string; entry: SpooledRelayEntry } | undefined {
+    let oldest: { target: string; entry: SpooledRelayEntry } | undefined;
+    for (const [target, entries] of m.relaySpool) {
+      for (const entry of entries) {
+        if (!predicate(entry)) {
+          continue;
+        }
+        if (
+          !oldest ||
+          Date.parse(entry.spooledAt) < Date.parse(oldest.entry.spooledAt) ||
+          (entry.spooledAt === oldest.entry.spooledAt && entry.id < oldest.entry.id)
+        ) {
+          oldest = { target, entry };
+        }
+      }
+    }
+    return oldest;
+  }
+
+  private dropSpoolEntry(m: Mount, target: string, id: string): void {
+    const entries = m.relaySpool.get(target);
+    if (!entries) {
+      return;
+    }
+    const next = entries.filter(entry => entry.id !== id);
+    if (next.length) {
+      m.relaySpool.set(target, next);
+    } else {
+      m.relaySpool.delete(target);
+    }
+  }
+
+  private spoolEntryById(m: Mount, id: string): SpooledRelayEntry | undefined {
+    for (const entries of m.relaySpool.values()) {
+      const entry = entries.find(candidate => candidate.id === id);
+      if (entry) {
+        return entry;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Bound total entries/bytes and each target/sender share by evicting the oldest first.
+   * The entry being admitted is protected; a single entry always fits within the global
+   * byte budget, so the admission itself can never be starved by older entries.
+   */
+  private enforceRelaySpoolBudget(m: Mount, protectedId?: string): boolean {
+    const protectedEntry =
+      protectedId === undefined ? undefined : this.spoolEntryById(m, protectedId);
+    let changed = false;
+    const evict = (target: string, entry: SpooledRelayEntry) => {
+      this.dropSpoolEntry(m, target, entry.id);
+      changed = true;
+    };
+    while (m.relaySpool.size > MAX_RELAY_SPOOL_TARGETS) {
+      const oldest = this.oldestSpoolEntry(m, entry => entry.id !== protectedId);
+      if (!oldest) break;
+      evict(oldest.target, oldest.entry);
+    }
+    for (;;) {
+      const targetOver = [...m.relaySpool].find(
+        ([, entries]) => entries.length > MAX_RELAY_SPOOL_ENTRIES,
+      );
+      if (targetOver) {
+        const [target, entries] = targetOver;
+        const oldest = entries
+          .filter(entry => entry.id !== protectedId)
+          .sort(
+            (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) ||
+              a.id.localeCompare(b.id),
+          )[0];
+        if (!oldest) break;
+        evict(target, oldest);
+        continue;
+      }
+      const senderOver =
+        protectedEntry !== undefined &&
+        this.entryCount(
+          m,
+          entry => entry.frame.senderNodeId === protectedEntry.frame.senderNodeId,
+        ) > MAX_RELAY_SPOOL_SENDER_ENTRIES;
+      const totalOver = this.entryCount(m, () => true) > MAX_RELAY_SPOOL_TOTAL_ENTRIES;
+      if (!senderOver && !totalOver) {
+        break;
+      }
+      const oldest = this.oldestSpoolEntry(m, entry => entry.id !== protectedId);
+      if (!oldest) break;
+      evict(oldest.target, oldest.entry);
+    }
+    while (this.relaySpoolBytes(m) > MAX_RELAY_SPOOL_TOTAL_BYTES) {
+      const cacheEviction = [...m.spoolBlobCache]
+        .filter(([hash]) => !this.spoolHashReferencedByEntries(m, hash))
+        .sort((a, b) => Date.parse(a[1].expiresAt) - Date.parse(b[1].expiresAt))[0];
+      if (cacheEviction) {
+        const [hash] = cacheEviction;
+        m.spoolBlobCache.delete(hash);
+        this.spooledBlobs.delete(this.spoolBlobKey(m, hash));
+        rmSync(join(this.spoolBlobDirectory(m), hash), { force: true });
+        changed = true;
+        continue;
+      }
+      const oldest = this.oldestSpoolEntry(m, entry => entry.id !== protectedId);
+      if (!oldest) break;
+      evict(oldest.target, oldest.entry);
+    }
+    // Evicted entries' blobs are unreachable now unless another live entry still names them.
+    return this.collectSpoolBlobFiles(m) || changed;
+  }
+
+  private spoolHashReferencedByEntries(m: Mount, hash: string): boolean {
+    for (const entries of m.relaySpool.values()) {
+      for (const entry of entries) {
+        if (entry.blobHashes?.[hash] !== undefined) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private spoolBlobKey(m: Mount, hash: string): string {
@@ -860,126 +1134,119 @@ export class P2PTransportService implements TransportService {
   }
 
   private writeSpoolBlob(m: Mount, hash: string, bytes: Buffer): string {
-    const directory = this.spoolBlobDirectory();
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const blobPath = join(directory, hash);
-    const temporary = `${blobPath}.${randomUUID()}.tmp`;
-    try {
-      writeFileSync(temporary, bytes, { mode: 0o600 });
-      renameSync(temporary, blobPath);
-    } finally {
-      rmSync(temporary, { force: true });
-    }
+    const blobPath = join(this.spoolBlobDirectory(m), hash);
+    writeFileAtomically(blobPath, bytes);
     this.registerBlob(hash, blobPath);
     this.spooledBlobs.add(this.spoolBlobKey(m, hash));
     return blobPath;
   }
 
   /**
-   * Serve a hash from this network's relay spool only. The in-memory set covers blobs written
-   * by this process; persisted entries are decoded lazily after a seed restart, so a durable
-   * spool remains useful without re-hashing every attachment during mount.
+   * Serve a hash from this network's content-addressed spool cache only. The file is the
+   * durable truth after restart; a missing file simply falls back to the original sender.
    */
   private async readSpooledBlob(m: Mount, hash: string): Promise<Buffer | undefined> {
-    if (this.spooledBlobs.has(this.spoolBlobKey(m, hash))) {
-      const blob = this.blobs.get(hash);
-      if (blob) {
-        try {
-          const bytes = await readFile(blob.path);
-          if (blake3(bytes) !== hash) {
-            throw new Error('Invalid cached blob');
-          }
-          return bytes;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            throw error;
-          }
-          this.spooledBlobs.delete(this.spoolBlobKey(m, hash));
-        }
-      }
+    const blobPath = join(this.spoolBlobDirectory(m), hash);
+    if (!existsSync(blobPath)) {
+      this.spooledBlobs.delete(this.spoolBlobKey(m, hash));
+      m.spoolBlobCache.delete(hash);
+      return undefined;
     }
-    for (const entries of m.relaySpool.values()) {
-      for (const entry of entries) {
-        const encoded = entry.blobs?.[hash];
-        if (encoded === undefined) {
-          continue;
-        }
-        const bytes = Buffer.from(encoded, 'base64');
-        if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
-          throw new Error('Invalid cached blob');
-        }
-        this.writeSpoolBlob(m, hash, bytes);
-        return bytes;
-      }
+    const bytes = await readFile(blobPath);
+    if (blake3(bytes) !== hash) {
+      throw new LocalDeliveryError('Invalid cached blob');
     }
-    return undefined;
+    return bytes;
   }
 
   /**
-   * Store a sealed frame for an offline target. Only a member holding the network key can
-   * reach this path: the caller already unsealed the frame, and every attachment is verified
-   * against its declared BLAKE3 hash before it becomes addressable.
+   * Store a sealed frame for an offline target. Transport stays blind: the sender supplies
+   * an opaque, stable spool key, every attachment is verified against its BLAKE3 hash, and
+   * the target must be a node id rather than an arbitrary member-chosen string.
    */
   private spoolRelayFrame(
     m: Mount,
     target: string,
     frame: SealedNetworkFrame,
     blobs: unknown,
+    spoolKey?: string,
   ): { spooled: true; seedNodeId: string; spoolId: string } {
-    const verifiedBlobs: Record<string, string> = {};
+    if (
+      !/^ed25519:[0-9a-f]{64}$/.test(target) ||
+      target === this.localNodeId
+    ) {
+      throw new LocalDeliveryError('Invalid relay spool target');
+    }
+    if (
+      spoolKey !== undefined &&
+      (typeof spoolKey !== 'string' ||
+        spoolKey.length === 0 ||
+        spoolKey.length > MAX_RELAY_SPOOL_KEY_LENGTH ||
+        /[\u0000-\u001f\u007f]/.test(spoolKey))
+    ) {
+      throw new LocalDeliveryError('Invalid relay spool key');
+    }
+    const prepared: Array<{ hash: string; bytes: Buffer }> = [];
     if (blobs !== undefined) {
       if (typeof blobs !== 'object' || blobs === null || Array.isArray(blobs)) {
-        throw new Error('Invalid relay spool blobs');
+        throw new LocalDeliveryError('Invalid relay spool blobs');
       }
       let total = 0;
       for (const [hash, encoded] of Object.entries(blobs)) {
         if (!/^[a-f0-9]{64}$/.test(hash) || typeof encoded !== 'string') {
-          throw new Error('Invalid relay spool blob');
+          throw new LocalDeliveryError('Invalid relay spool blob');
         }
         const bytes = Buffer.from(encoded, 'base64');
         if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
-          throw new Error('Invalid relay spool blob');
+          throw new LocalDeliveryError('Invalid relay spool blob');
         }
         total += bytes.length;
         if (total > MAX_RELAY_SPOOL_BLOB_BYTES) {
-          throw new Error('Relay spool blobs exceed limit');
+          throw new LocalDeliveryError('Relay spool blobs exceed limit');
         }
-        this.writeSpoolBlob(m, hash, bytes);
-        verifiedBlobs[hash] = encoded;
+        prepared.push({ hash, bytes });
       }
     }
     this.pruneRelaySpool(m);
-    const id = this.relaySpoolEntryId(m, frame);
+    const id = this.relaySpoolEntryId(frame, spoolKey);
     const now = new Date();
     const expiresAt = new Date(now.getTime() + RELAY_SPOOL_TTL_MS).toISOString();
     const entries = m.relaySpool.get(target) ?? [];
     const existing = entries.find(entry => entry.id === id);
+    if (existing && existing.frame.senderNodeId !== frame.senderNodeId) {
+      throw new LocalDeliveryError('Relay spool identity conflict');
+    }
+    const blobHashes: Record<string, number> = { ...(existing?.blobHashes ?? {}) };
+    for (const { hash, bytes } of prepared) {
+      blobHashes[hash] = bytes.length;
+    }
+    // Materialize verified bytes before publishing the entry, so a failed write can never
+    // leave the in-memory obligation pointing at a hash that was never stored.
+    for (const { hash, bytes } of prepared) {
+      this.writeSpoolBlob(m, hash, bytes);
+    }
     if (existing) {
-      // A redrive re-seals the same envelope with a new nonce; keep FIFO position but
-      // refresh the frame, attachment cache and expiry.
+      // A redrive re-seals the same obligation with a new nonce; keep FIFO position but
+      // refresh the frame, attachment metadata and expiry.
       existing.frame = frame;
       existing.expiresAt = expiresAt;
-      if (Object.keys(verifiedBlobs).length) {
-        existing.blobs = { ...(existing.blobs ?? {}), ...verifiedBlobs };
-      }
+      existing.blobHashes = blobHashes;
     } else {
       entries.push({
         id,
         targetNodeId: target,
         networkId: m.config.networkId,
         frame,
-        ...(Object.keys(verifiedBlobs).length ? { blobs: verifiedBlobs } : {}),
+        ...(Object.keys(blobHashes).length ? { blobHashes } : {}),
         spooledAt: now.toISOString(),
         expiresAt,
       });
-      while (entries.length > MAX_RELAY_SPOOL_ENTRIES) {
-        entries.shift();
-      }
     }
     entries.sort(
       (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
     );
     m.relaySpool.set(target, entries);
+    this.enforceRelaySpoolBudget(m, id);
     this.persistRelaySpool(m);
     return { spooled: true, seedNodeId: this.localNodeId, spoolId: id };
   }
@@ -1025,7 +1292,7 @@ export class P2PTransportService implements TransportService {
     let removed = false;
     for (const entry of [...queued]) {
       if (Date.parse(entry.expiresAt) <= Date.now()) {
-        this.removeSpoolEntry(m, peerNodeId, entry.id);
+        this.dropSpoolEntry(m, peerNodeId, entry.id);
         removed = true;
         continue;
       }
@@ -1066,7 +1333,10 @@ export class P2PTransportService implements TransportService {
         ) {
           throw new Error('Response binding mismatch');
         }
-        this.removeSpoolEntry(m, peerNodeId, entry.id);
+        // The frame handoff is confirmed, but the target may fetch attachments afterwards;
+        // retain their bytes until this entry's original TTL instead of deleting them now.
+        this.retainSpoolBlobs(m, entry);
+        this.dropSpoolEntry(m, peerNodeId, entry.id);
         removed = true;
       } catch {
         // The target is still offline (or the frame could not be confirmed); keep the
@@ -1075,20 +1345,8 @@ export class P2PTransportService implements TransportService {
       }
     }
     if (removed) {
+      this.collectSpoolBlobFiles(m);
       this.persistRelaySpool(m);
-    }
-  }
-
-  private removeSpoolEntry(m: Mount, targetNodeId: string, id: string): void {
-    const queue = m.relaySpool.get(targetNodeId);
-    if (!queue) {
-      return;
-    }
-    const next = queue.filter(entry => entry.id !== id);
-    if (next.length) {
-      m.relaySpool.set(targetNodeId, next);
-    } else {
-      m.relaySpool.delete(targetNodeId);
     }
   }
 
@@ -1379,7 +1637,7 @@ export class P2PTransportService implements TransportService {
         lastError = asError(error);
         // A signature/binding failure is never an offline symptom: retrying it through a
         // relay or queueing it in an outbox would hide a real security decision.
-        if (PROTOCOL_FAILURE.test(lastError.message)) {
+        if (lastError instanceof LocalDeliveryError || PROTOCOL_FAILURE.test(lastError.message)) {
           throw lastError;
         }
         if (!fallbacks.length) {
@@ -1389,7 +1647,7 @@ export class P2PTransportService implements TransportService {
     } else if (!fallbacks.length) {
       throw this.unreachable(target, lastError);
     }
-    let blobs: Promise<Record<string, string>> | undefined;
+    let blobs: Promise<{ blobs: Record<string, string>; complete: boolean }> | undefined;
     for (const [index, fallback] of fallbacks.entries()) {
       if (Date.now() >= deadline) {
         break;
@@ -1401,9 +1659,9 @@ export class P2PTransportService implements TransportService {
         if ('tunnel' in fallback) {
           return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, attemptTimeoutMs);
         }
-        const relayBlobs = options.blobHashes?.length
+        const attachmentPacket = options.blobHashes?.length
           ? await (blobs ??= this.readSpoolBlobs(options.blobHashes))
-          : undefined;
+          : { blobs: {}, complete: true };
         return await this.relayExchange(
           m,
           fallback.seed,
@@ -1411,14 +1669,26 @@ export class P2PTransportService implements TransportService {
           frame,
           attemptTimeoutMs,
           {
-            ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
-            ...(relayBlobs && Object.keys(relayBlobs).length ? { blobs: relayBlobs } : {}),
+            // An incomplete offer (an attachment exceeds one frame) stays live-only: the
+            // target could never fetch an omitted blob from this spool entry.
+            ...(options.spoolIfOffline === true && attachmentPacket.complete
+              ? { spoolIfOffline: true }
+              : {}),
+            ...(options.spoolKey !== undefined ? { spoolKey: options.spoolKey } : {}),
+            ...(Object.keys(attachmentPacket.blobs).length
+              ? { blobs: attachmentPacket.blobs }
+              : {}),
           },
         );
       } catch (error) {
         // A confirmed spool is a successful handoff to durable relay storage: never try a
         // second seed, which would duplicate entries and extend the caller's latency.
         if (error instanceof OfflinePeerSpooledError) {
+          throw error;
+        }
+        // Local attachment/framing failures are deterministic and must never be masked as
+        // peer unreachability (which would enqueue the same broken bytes forever).
+        if (error instanceof LocalDeliveryError) {
           throw error;
         }
         lastError = asError(error);
@@ -1432,6 +1702,7 @@ export class P2PTransportService implements TransportService {
     if (
       error instanceof OfflinePeerSpooledError ||
       error instanceof PeerUnreachableError ||
+      error instanceof LocalDeliveryError ||
       PROTOCOL_FAILURE.test(error.message)
     ) {
       return error;
@@ -1440,28 +1711,36 @@ export class P2PTransportService implements TransportService {
   }
 
   /**
-   * Read the sender's attachment cache for one relay_send request. The whole JSON packet,
-   * including base64 expansion, must stay inside the transport frame limit.
+   * Read the sender's attachment cache for one relay_send request. Every offered hash must
+   * resolve and re-hash to its declared content; an oversized set is reported as incomplete
+   * so the caller can stay live-only instead of minting a partial spooled handoff.
    */
-  private async readSpoolBlobs(hashes: readonly string[]): Promise<Record<string, string>> {
+  private async readSpoolBlobs(
+    hashes: readonly string[],
+  ): Promise<{ blobs: Record<string, string>; complete: boolean }> {
     const blobs: Record<string, string> = {};
     let total = 0;
     for (const hash of new Set(hashes)) {
       const blob = this.blobs.get(hash);
-      if (!blob || total + blob.size > RELAY_BLOB_LIMIT) {
-        continue;
+      if (!blob) {
+        throw new LocalDeliveryError(`Missing attachment blob for relay spooling: ${hash}`);
+      }
+      if (blob.size > RELAY_BLOB_LIMIT || total + blob.size > RELAY_BLOB_LIMIT) {
+        return { blobs: {}, complete: false };
       }
       const bytes = await readFile(blob.path);
       if (blake3(bytes) !== hash) {
-        throw new Error('Attachment content changed before relay spooling');
+        throw new LocalDeliveryError(
+          `Attachment content changed before relay spooling: ${hash}`,
+        );
       }
       if (total + bytes.length > RELAY_BLOB_LIMIT) {
-        continue;
+        return { blobs: {}, complete: false };
       }
       blobs[hash] = bytes.toString('base64');
       total += bytes.length;
     }
-    return blobs;
+    return { blobs, complete: true };
   }
 
   /**
@@ -1546,7 +1825,7 @@ export class P2PTransportService implements TransportService {
     target: string,
     frame: SealedNetworkFrame,
     timeoutMs: number,
-    options: { spoolIfOffline?: boolean; blobs?: Record<string, string> } = {},
+    options: { spoolIfOffline?: boolean; spoolKey?: string; blobs?: Record<string, string> } = {},
   ): Promise<Uint8Array> {
     const socket = this.track(createConnection(parseEndpoint(seed)));
     socket.setTimeout(timeoutMs);
@@ -1557,17 +1836,18 @@ export class P2PTransportService implements TransportService {
         target,
         frame,
         ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
+        ...(options.spoolKey !== undefined ? { spoolKey: options.spoolKey } : {}),
         ...(options.blobs && Object.keys(options.blobs).length
           ? { blobs: options.blobs }
           : {}),
       }));
       const response = await new SocketReader(socket).json();
       if (response?.error) {
-        throw new Error(String(response.error));
+        throw new LocalDeliveryError(String(response.error));
       }
       if (response?.spooled === true) {
         if (typeof response.seedNodeId !== 'string' || typeof response.spoolId !== 'string') {
-          throw new Error('Invalid relay spool response');
+          throw new LocalDeliveryError('Invalid relay spool response');
         }
         throw new OfflinePeerSpooledError(target, response.seedNodeId, response.spoolId);
       }
@@ -1610,7 +1890,12 @@ export class P2PTransportService implements TransportService {
     networkId: string,
     target: string,
     bytes: Uint8Array,
-    opts?: { timeoutMs?: number },
+    opts?: {
+      timeoutMs?: number;
+      spoolIfOffline?: boolean;
+      spoolKey?: string;
+      spoolBlobHashes?: readonly string[];
+    },
   ): Promise<Uint8Array> {
     const m = this.mounts.get(networkId);
     if (target === this.localNodeId) {
@@ -1619,11 +1904,11 @@ export class P2PTransportService implements TransportService {
     if (!m) {
       throw new Error(`Network not mounted: ${networkId}`);
     }
-    // Every unicast frame is eligible for durable storage on a relay seed; the seed only
-    // spools after live tunnel and direct delivery both fail. Attachment hashes come from
-    // the caller, so transport never parses envelope business semantics.
+    // Spooling is caller-owned policy: an explicit opt-out must leave no durable relay
+    // copy. Attachment hashes still come from the caller, so transport stays envelope-blind.
     return this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs, {
-      spoolIfOffline: true,
+      ...(opts?.spoolIfOffline === true ? { spoolIfOffline: true } : {}),
+      ...(opts?.spoolKey !== undefined ? { spoolKey: opts.spoolKey } : {}),
       blobHashes: opts?.spoolBlobHashes ?? [],
     });
   }
@@ -1981,7 +2266,24 @@ export class P2PTransportService implements TransportService {
       unsealNetworkFrame(frame, mount.keys);
       const target = typeof request.target === 'string' ? request.target : '';
       if (!target) throw new Error('Invalid relay target');
+      if (
+        request.spoolKey !== undefined &&
+        (typeof request.spoolKey !== 'string' ||
+          request.spoolKey.length === 0 ||
+          request.spoolKey.length > MAX_RELAY_SPOOL_KEY_LENGTH ||
+          /[\u0000-\u001f\u007f]/.test(request.spoolKey))
+      ) {
+        socket.end(packet({ error: 'Invalid relay spool key' }));
+        return;
+      }
       const spoolIfOffline = request.spoolIfOffline === true;
+      if (
+        spoolIfOffline &&
+        (!/^ed25519:[0-9a-f]{64}$/.test(target) || target === this.localNodeId)
+      ) {
+        socket.end(packet({ error: 'Invalid relay spool target' }));
+        return;
+      }
       let liveError: Error | undefined;
       try {
         const tunnel = mount.inboundTunnels.get(target);
@@ -2012,7 +2314,12 @@ export class P2PTransportService implements TransportService {
       if (!spoolIfOffline) {
         throw liveError;
       }
-      socket.end(packet(this.spoolRelayFrame(mount, target, frame, request.blobs)));
+      try {
+        socket.end(packet(this.spoolRelayFrame(mount, target, frame, request.blobs, request.spoolKey)));
+      } catch (error) {
+        socket.end(packet({ error: error instanceof Error ? error.message : String(error) }));
+      }
+      return;
       return;
     }
     if (request.type === 'relay_blob') {

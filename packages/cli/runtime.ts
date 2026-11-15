@@ -16,7 +16,12 @@ import { createGatePlugin } from '../gate/index.ts';
 import type { NetworkGateService } from '../gate/index.ts';
 import { createDispatcherPlugin, DeliveryLedger } from '../dispatcher/index.ts';
 import { createEmitterPlugin } from '../emitter/index.ts';
-import { createDedupCasPolicyPlugin, isConfirmedHandoffReceipt, isDedupCasDuplicateReceipt, isDurableQueuedReceipt } from '../plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin } from '../plugins-policy/index.ts';
+import {
+  isConfirmedHandoffReceipt,
+  isDedupCasDuplicateReceipt,
+  isDurableQueuedReceipt,
+} from '../core-types/index.ts';
 import {
   createOrcaSpawnExecutorPlugin,
   createOrcaExecutorPlugin,
@@ -571,8 +576,15 @@ export class DealerNodeRuntime {
       await this.kernel.use(this.integrationPlugin());
       this.outboxRedrive = new OutboxRedriveService({
         outbox: this.outbox,
-        transport: this.transport,
-        router: this.kernel.ctx.services.router,
+        // Emitter owns routing, framing, transport send and receipt verification; the
+        // mailbox only persists the resulting obligation state.
+        deliver: (item, options) => {
+          const redrive = this.emitter.redriveOutboxItem;
+          if (!redrive) {
+            throw new Error('Emitter does not support outbox redrive');
+          }
+          return redrive.call(this.emitter, item, options);
+        },
         events: {
           on: (event, listener) => this.kernel.ctx.on(event, listener),
         },
@@ -1571,50 +1583,13 @@ export class DealerNodeRuntime {
     const server = createServer(async (request, response) => {
       if (
         request.method !== 'POST' ||
-        (request.url !== '/cli' &&
-          request.url !== '/cli-stream' &&
-          request.url !== '/v1/outbox/list' &&
-          request.url !== '/v1/outbox/flush')
+        (request.url !== '/cli' && request.url !== '/cli-stream')
       ) {
         response.writeHead(404).end();
         return;
       }
       if (this.draining) {
         response.writeHead(503).end(JSON.stringify({ error: 'Daemon is draining' }));
-        return;
-      }
-      if (request.method === 'POST' && (request.url === '/v1/outbox/list' || request.url === '/v1/outbox/flush')) {
-        this.activeMutatingControlRequests++;
-        try {
-          const raw = await readControlBody(request);
-          const body: unknown = raw.trim() ? JSON.parse(raw) : {};
-          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-            throw new Error('Expected a JSON object');
-          }
-          const input = body as Record<string, unknown>;
-          const result = request.url === '/v1/outbox/list'
-            ? this.listOutbox({
-                ...(typeof input.networkId === 'string' ? { networkId: input.networkId } : {}),
-                ...(typeof input.status === 'string'
-                  ? { status: input.status as OutboxListFilter['status'] }
-                  : {}),
-              })
-            : await this.flushOutbox({
-                ...(typeof input.id === 'string' ? { id: input.id } : {}),
-                ...(input.force === true ? { force: true } : {}),
-              });
-          if (!response.destroyed && !response.writableEnded) {
-            response
-              .writeHead(200, { 'content-type': 'application/json' })
-              .end(JSON.stringify(result));
-          }
-        } catch (error) {
-          if (!response.destroyed && !response.writableEnded) {
-            response.writeHead(400).end(JSON.stringify({ error: String(error) }));
-          }
-        } finally {
-          this.controlRequestSettled();
-        }
         return;
       }
       const expectedInstance = request.headers[EXPECTED_INSTANCE_HEADER];
