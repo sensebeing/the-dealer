@@ -415,33 +415,39 @@ export class OutboxStore {
       if (item.status !== 'failed') {
         throw new Error('Only a failed outbox item can be requeued');
       }
+      // Signed receipts are terminal evidence and never reopen. Unsigned failed targets and
+      // unresolved pending targets are the operator's recoverable obligation.
       const retryable = item.failedNodeIds.filter(
         nodeId =>
           !item.failedReceipts[nodeId] &&
           !item.deliveredReceipts[nodeId],
       );
-      if (retryable.length === 0) {
-        // A global local failure (for example, missing staged evidence) has no per-target
-        // decision. An explicit operator retry may route the signed envelope again; it is
-        // not a signed terminal rejection and must remain operator-recoverable.
-        if (item.failedNodeIds.length === 0 && Object.keys(item.failedReceipts).length === 0) {
-          item.pendingNodeIds = [];
-          item.status = 'queued';
-          item.lastError = undefined;
-          item.updatedAt = now;
-          item.nextAttemptAt = now;
-          this.settleItem(item);
-          return clone(item);
-        }
+      const pending = item.pendingNodeIds.filter(
+        nodeId =>
+          !item.deliveredReceipts[nodeId] &&
+          !item.failedNodeIds.includes(nodeId),
+      );
+      // An item-level failure with no target-level evidence can mean an unresolved selector
+      // that must re-enter routing. A fully delivered item has nothing to recover.
+      const reroutable =
+        item.failedNodeIds.length === 0 &&
+        Object.keys(item.deliveredReceipts).length === 0;
+      if (retryable.length === 0 && pending.length === 0 && !reroutable) {
         throw new Error('Outbox item has no locally failed targets to requeue');
       }
       const retry = new Set(retryable);
       item.failedNodeIds = item.failedNodeIds.filter(nodeId => !retry.has(nodeId));
-      item.pendingNodeIds = [...new Set([...item.pendingNodeIds, ...retryable])];
+      item.pendingNodeIds = [...new Set([...pending, ...retryable])];
+      // In-doubt targets stay gated behind an explicit force or direct peer pulse.
+      item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(
+        nodeId => item.pendingNodeIds.includes(nodeId),
+      );
+      item.status = 'queued';
       item.lastError = undefined;
       item.updatedAt = now;
       item.nextAttemptAt = now;
-      this.settleItem(item);
+      // Deliberately no settleItem: an unresolved item with no pending targets must stay
+      // queued for routing, and a partial delivery must never settle as delivered here.
       return clone(item);
     });
   }
@@ -535,7 +541,11 @@ export class OutboxStore {
     });
   }
 
-  /** A local failure that prevents every remaining target from being attempted. */
+  /**
+   * An item-level failure with no per-target signed decision. Unresolved targets and their
+   * in-doubt flags are retained as the operator's recovery obligation: an explicit requeue
+   * resumes routing without ever resurrecting a target that already has terminal evidence.
+   */
   markFailed(id: string, lastError: string): OutboxItem | undefined {
     const now = new Date().toISOString();
     return this.mutate(state => {
@@ -545,8 +555,15 @@ export class OutboxStore {
       }
       item.status = 'failed';
       item.lastError = lastError;
-      item.pendingNodeIds = [];
-      item.inDoubtNodeIds = [];
+      // Keep only targets that are still deliverable; terminal decisions already settled.
+      item.pendingNodeIds = [...new Set(item.pendingNodeIds)].filter(
+        nodeId =>
+          !item.deliveredReceipts[nodeId] &&
+          !item.failedNodeIds.includes(nodeId),
+      );
+      item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(
+        nodeId => item.pendingNodeIds.includes(nodeId),
+      );
       item.updatedAt = now;
       item.nextAttemptAt = now;
       // Staged files are deliberately retained as evidence for operator inspection.

@@ -1134,7 +1134,7 @@ test('multicast redrive records terminal failures per target and keeps retrying 
   await service.stop();
 });
 
-test('operator requeue can recover a global local failure without signed evidence', async t => {
+test('operator requeue restores a global local failure to routing', async t => {
   const dir = directory(t);
   const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
   const sender = generateNodeKeyPair();
@@ -1145,11 +1145,196 @@ test('operator requeue can recover a global local failure without signed evidenc
     pendingNodeIds: [target],
   });
   outbox.markFailed(item.id, 'Missing staged attachment evidence');
-  assert.equal(outbox.get(item.id)?.status, 'failed');
+  const failed = outbox.get(item.id)!;
+  assert.equal(failed.status, 'failed');
+  assert.deepEqual(
+    failed.pendingNodeIds,
+    [target],
+    'an item-level failure retains the targets it never attempted',
+  );
   const requeued = outbox.requeue(item.id)!;
   assert.equal(requeued.status, 'queued');
-  assert.deepEqual(requeued.pendingNodeIds, [], 'redrive re-routes the signed envelope');
+  assert.deepEqual(requeued.pendingNodeIds, [target], 'requeue restores the pending target');
   assert.equal(requeued.lastError, undefined);
+});
+
+test('requeue preserves in-doubt fences through a global local failure', async t => {
+  const dir = directory(t);
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  const item = outbox.enqueue({
+    envelope: envelopeFor(sender, NETWORK, target),
+    explicitTargets: [target],
+    pendingNodeIds: [target],
+    inDoubtNodeIds: [target],
+  });
+  outbox.markFailed(item.id, 'Missing staged attachment evidence');
+  const requeued = outbox.requeue(item.id)!;
+  assert.equal(requeued.status, 'queued');
+  assert.deepEqual(requeued.pendingNodeIds, [target]);
+  assert.deepEqual(
+    requeued.inDoubtNodeIds,
+    [target],
+    'requeue never clears a target whose execution outcome is unknown',
+  );
+
+  const service = new OutboxRedriveService({
+    outbox,
+    deliver: async () => {
+      throw new Error('an in-doubt target must not be delivered without an explicit force');
+    },
+  });
+  const parked = await service.flush({ id: item.id });
+  assert.equal(parked.attempted, 0);
+  assert.equal(outbox.get(item.id)?.status, 'queued');
+  await service.stop();
+});
+
+test('requeue after a global local failure resumes a partially delivered obligation', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['bo'] });
+  const diz = harness.targetCard.nodeId;
+  const bo = harness.targetByMember.get('bo')!.nodeId;
+  const envelope = envelopeFor(harness.sender, harness.networkId, diz);
+  const body = Buffer.from('partial delivery evidence');
+  const hash = blake3(body);
+  const sourcePath = join(harness.dir, 'partial-evidence.txt');
+  writeFileSync(sourcePath, body);
+  const item = harness.outbox.enqueue({
+    envelope,
+    explicitTargets: [diz, bo],
+    pendingNodeIds: [diz, bo],
+    filePaths: { [hash]: sourcePath },
+  });
+  const service = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+  });
+
+  // Deliver only diz; bo stays an untouched pending target.
+  await service.flush({
+    id: item.id,
+    force: true,
+    forceMatchingTarget: true,
+    targetNodeId: diz,
+  });
+  let current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'queued');
+  assert.deepEqual(current.pendingNodeIds, [bo]);
+  assert.equal(current.deliveredReceipts[diz]?.stage, 'dispatched');
+
+  // Missing staged evidence aborts the attempt with no per-target decision at all.
+  rmSync(current.stagedFiles[hash]);
+  await service.flush({ id: item.id, force: true });
+  current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'failed');
+  assert.deepEqual(
+    current.pendingNodeIds,
+    [bo],
+    'the never-attempted target remains an obligation after the item-level failure',
+  );
+  assert.ok(current.stagedFiles[hash], 'the staged path is retained for recovery');
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === bo).length, 0);
+
+  writeFileSync(current.stagedFiles[hash], body);
+  const requeued = harness.outbox.requeue(item.id)!;
+  assert.equal(requeued.status, 'queued');
+  assert.deepEqual(requeued.pendingNodeIds, [bo]);
+  assert.ok(existsSync(requeued.stagedFiles[hash]), 'requeue must not delete staged evidence');
+
+  await service.flush({ id: item.id, force: true });
+  current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'delivered');
+  assert.deepEqual(current.pendingNodeIds, []);
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === bo).length, 1);
+  assert.equal(
+    harness.sendCalls.filter(call => call.targetNodeId === diz).length,
+    1,
+    'a requeue never resends a target with a confirmed receipt',
+  );
+  assert.equal(Object.keys(current.stagedFiles).length, 0);
+  await service.stop();
+});
+
+test('requeue recovers mixed unsigned failures while keeping signed rejections terminal', async t => {
+  let ayaTarget = '';
+  let boTarget = '';
+  let cyTarget = '';
+  let cyOnline = false;
+  const harness = await emitterHarness(t, {
+    extraMembers: ['aya', 'bo', 'cy'],
+    plan: (target, callIndex) => {
+      if (target === ayaTarget) {
+        return { stage: 'rejected', detail: 'gate closed' };
+      }
+      if (target === boTarget && callIndex === 0) {
+        return { error: new LocalDeliveryError('local integrity failure') };
+      }
+      if (target === cyTarget && !cyOnline) {
+        return { error: new PeerUnreachableError(target) };
+      }
+      return {};
+    },
+  });
+  const diz = harness.targetCard.nodeId;
+  ayaTarget = harness.targetByMember.get('aya')!.nodeId;
+  boTarget = harness.targetByMember.get('bo')!.nodeId;
+  cyTarget = harness.targetByMember.get('cy')!.nodeId;
+  const envelope = envelopeFor(harness.sender, harness.networkId, diz);
+  const body = Buffer.from('mixed failure evidence');
+  const hash = blake3(body);
+  const sourcePath = join(harness.dir, 'mixed-evidence.txt');
+  writeFileSync(sourcePath, body);
+  const item = harness.outbox.enqueue({
+    envelope,
+    explicitTargets: [diz, ayaTarget, boTarget, cyTarget],
+    pendingNodeIds: [diz, ayaTarget, boTarget, cyTarget],
+    filePaths: { [hash]: sourcePath },
+  });
+  const service = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+  });
+
+  await service.flush({ id: item.id, force: true });
+  let current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'queued');
+  assert.deepEqual(current.pendingNodeIds, [cyTarget]);
+  assert.equal(current.failedReceipts[ayaTarget]?.stage, 'rejected');
+  assert.deepEqual(current.failedNodeIds.slice().sort(), [ayaTarget, boTarget].sort());
+
+  // The missing evidence is an item-level failure; cy must stay a recoverable obligation.
+  rmSync(current.stagedFiles[hash]);
+  await service.flush({ id: item.id, force: true });
+  current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'failed');
+  assert.deepEqual(current.pendingNodeIds, [cyTarget]);
+
+  writeFileSync(current.stagedFiles[hash], body);
+  cyOnline = true;
+  const requeued = harness.outbox.requeue(item.id)!;
+  assert.equal(requeued.status, 'queued');
+  assert.deepEqual(requeued.failedNodeIds, [ayaTarget], 'only the signed rejection stays terminal');
+  assert.deepEqual(
+    requeued.pendingNodeIds.slice().sort(),
+    [boTarget, cyTarget].sort(),
+    'the unsigned failure and the retained target resume routing',
+  );
+
+  await service.flush({ id: item.id, force: true });
+  current = harness.outbox.get(item.id)!;
+  assert.equal(current.status, 'failed', 'the signed rejection remains terminal evidence');
+  assert.deepEqual(current.pendingNodeIds, []);
+  assert.equal(current.deliveredReceipts[boTarget]?.stage, 'dispatched');
+  assert.equal(current.deliveredReceipts[cyTarget]?.stage, 'dispatched');
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === ayaTarget).length, 1);
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === boTarget).length, 2);
+  assert.equal(harness.sendCalls.filter(call => call.targetNodeId === cyTarget).length, 2);
+  assert.ok(
+    existsSync(current.stagedFiles[hash]),
+    'staged evidence survives while a terminal rejection remains',
+  );
+  await service.stop();
 });
 
 test('redrive preserves completed receipts and parks timed-out sends in doubt', async t => {

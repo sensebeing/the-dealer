@@ -452,9 +452,11 @@ export type OutboxItemStatus = 'queued' | 'delivered' | 'failed';
 /**
  * One durable sender-side obligation. `pendingNodeIds` names the resolved targets still
  * awaiting a live signed receipt; an empty list means the explicit selector has not been
- * resolvable yet and must be retried through the emitter's router. Terminal decisions are
- * retained per target, and `inDoubtNodeIds` marks timed-out sends that may already have
- * executed: they are retried only after a direct peer pulse or an explicit operator flush.
+ * resolvable yet and must be retried through the emitter's router. A failed item keeps its
+ * unresolved targets so an explicit operator requeue can resume routing instead of settling
+ * early. Terminal decisions are retained per target, and `inDoubtNodeIds` marks timed-out
+ * sends that may already have executed: they are retried only after a direct peer pulse or
+ * an explicit operator flush.
  */
 export interface OutboxItem {
   id: string;
@@ -465,7 +467,11 @@ export interface OutboxItem {
   deliveredReceipts: Record<string, DeliveryReceipt>;
   /** Signed terminal decisions, kept as operator evidence and never reported as delivered. */
   failedReceipts: Record<string, DeliveryReceipt>;
-  /** Targets whose terminal failure has no signed receipt (local integrity/protocol error). */
+  /**
+   * Every target with a terminal failure, with or without a signed receipt. `failedReceipts`
+   * is the signed-evidence subset; entries without one are unsigned local/protocol failures
+   * that an explicit operator requeue may restore.
+   */
   failedNodeIds: string[];
   inDoubtNodeIds: string[];
   relaySpooledNodeIds: string[];
