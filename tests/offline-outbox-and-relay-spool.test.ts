@@ -1095,6 +1095,11 @@ test('multicast redrive records terminal failures per target and keeps retrying 
     1,
     'later flushes never resend a terminal target',
   );
+  assert.throws(
+    () => harness.outbox.requeue(item.id),
+    /no locally failed targets/,
+    'a signed terminal rejection is never operator-requeued as a local failure',
+  );
   await service.stop();
 });
 

@@ -370,23 +370,6 @@ export class OutboxStore {
     return item ? clone(item) : undefined;
   }
 
-  /** Reuse the one queued obligation for an idempotency key instead of duplicating it. */
-  findQueuedByIdempotency(
-    networkId: string,
-    idempotencyKey: string,
-  ): OutboxItem | undefined {
-    if (!idempotencyKey) {
-      return undefined;
-    }
-    const item = this.read().items.find(
-      candidate =>
-        candidate.status === 'queued' &&
-        candidate.networkId === networkId &&
-        candidate.envelope.idempotencyKey === idempotencyKey,
-    );
-    return item ? clone(item) : undefined;
-  }
-
   /**
    * Atomically create or join the single durable obligation for an idempotency key. The
    * check and the reservation happen under the same store lock, so concurrent emitters
@@ -456,7 +439,9 @@ export class OutboxStore {
         throw new Error('Only a failed outbox item can be requeued');
       }
       const retryable = item.failedNodeIds.filter(
-        nodeId => !item.deliveredReceipts[nodeId],
+        nodeId =>
+          !item.failedReceipts[nodeId] &&
+          !item.deliveredReceipts[nodeId],
       );
       if (retryable.length === 0) {
         throw new Error('Outbox item has no locally failed targets to requeue');
