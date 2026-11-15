@@ -579,6 +579,13 @@ export class DealerNodeRuntime {
         onError: error => {
           this.lastError = String(error);
         },
+        onTargetsResolved: (envelope, targetNodeIds) => {
+          this.mailbox.recordOutboundEnvelope(
+            envelope,
+            targetNodeIds,
+            envelope.semantic?.replyMailbox ?? 'default',
+          );
+        },
       });
       for (const network of this.config.networks) {
         await this.transport.mountNetwork(network);

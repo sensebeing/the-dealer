@@ -490,6 +490,11 @@ export interface OutboxRedriveOptions {
   router: Pick<RouterService, 'route'>;
   events?: OutboxRedriveEvents;
   onError?: (error: unknown) => void;
+  /** Called once a previously unresolved explicit selector has produced real targets. */
+  onTargetsResolved?: (
+    envelope: MessageEnvelope,
+    targetNodeIds: readonly string[],
+  ) => void;
   intervalMs?: number;
 }
 
@@ -530,6 +535,10 @@ export class OutboxRedriveService {
   private readonly router: Pick<RouterService, 'route'>;
   private readonly events?: OutboxRedriveEvents;
   private readonly onError: (error: unknown) => void;
+  private readonly onTargetsResolved?: (
+    envelope: MessageEnvelope,
+    targetNodeIds: readonly string[],
+  ) => void;
   private readonly intervalMs: number;
   private timer?: ReturnType<typeof setInterval>;
   private subscription?: Disposable;
@@ -543,6 +552,7 @@ export class OutboxRedriveService {
     this.router = options.router;
     this.events = options.events;
     this.onError = options.onError ?? (() => {});
+    this.onTargetsResolved = options.onTargetsResolved;
     this.intervalMs = options.intervalMs ?? DEFAULT_REDRIVE_INTERVAL_MS;
   }
 
@@ -632,6 +642,13 @@ export class OutboxRedriveService {
           targets = decision.targetNodeIds.filter(
             nodeId => !item.deliveredReceipts[nodeId],
           );
+          // The initial emit recorded an empty outbound route; the peer directory now
+          // knows the target, so converge that durable reply route before sending.
+          try {
+            this.onTargetsResolved?.(item.envelope, decision.targetNodeIds);
+          } catch (error) {
+            this.onError(error);
+          }
           item =
             this.outbox.recordAttempt(item.id, {
               pendingNodeIds: targets,

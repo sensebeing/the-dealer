@@ -6,6 +6,7 @@ import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DealerNodeRuntime } from '../packages/cli/runtime.ts';
+import { runDealerCli } from '../packages/cli/index.ts';
 import { blake3 } from '../packages/transport/index.ts';
 import type { TransportPluginOptions } from '../packages/transport/index.ts';
 import type { RuntimeConfig } from '../packages/cli/config.ts';
@@ -58,6 +59,7 @@ interface NodeOptions {
   transport?: Partial<TransportPluginOptions>;
   patch?: Partial<RuntimeConfig>;
   discovery?: string;
+  port?: number;
 }
 
 function runtimeFor(root: string, member: string, options: NodeOptions = {}): DealerNodeRuntime {
@@ -66,6 +68,7 @@ function runtimeFor(root: string, member: string, options: NodeOptions = {}): De
     member,
     name: member,
     profile: 'headless-relay',
+    ...(options.port !== undefined ? { port: options.port } : {}),
     patch: {
       defaultExecutor: 'inbox',
       ...options.patch,
@@ -147,6 +150,62 @@ test('known peer persistence survives restart and queued mail auto-redrives when
   );
   // Redrive is end-to-end confirmed, not merely optimistic.
   assert.equal(ben.listOutbox({ status: 'queued' }).length, 0);
+
+  // An explicit selector with no directory entry yet is still a durable obligation. Its
+  // first emit has no target, so the recorded outbound route must converge once redrive
+  // resolves the member after that peer joins. The ask result must not claim the local
+  // outbox signer as the target.
+  const askOut: string[] = [];
+  const askCode = await runDealerCli(
+    [
+      'ask',
+      '--network',
+      NETWORK,
+      '--to',
+      'member:future',
+      '--subject',
+      'Future member',
+      '--body',
+      'queued before the member exists',
+      '--json',
+    ],
+    { runtime: ben, stdout: line => askOut.push(line) },
+  );
+  assert.equal(askCode, 0);
+  const asked = JSON.parse(askOut.join('\n')) as {
+    questionId: string;
+    targetNodeId: string | null;
+  };
+  assert.equal(asked.targetNodeId, null);
+  const unknownItem = ben
+    .listOutbox({ status: 'queued' })
+    .find(item => item.id === asked.questionId);
+  assert.ok(unknownItem);
+  assert.deepEqual(unknownItem.pendingNodeIds, []);
+  assert.equal(ben.mailbox.resolveReplyTarget(asked.questionId)?.peerNodeId, '');
+
+  const future = await create('future');
+  await future.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const futureNodeId = future.node.getSelfCard(NETWORK).nodeId;
+  await until(
+    () =>
+      ben
+        .listOutbox({ status: 'delivered' })
+        .some(item => item.id === asked.questionId),
+    'redrive resolves and delivers the initially unknown member',
+  );
+  assert.equal(
+    ben.mailbox.resolveReplyTarget(asked.questionId)?.peerNodeId,
+    futureNodeId,
+    'the outbound thread route converges to the resolved target',
+  );
+  await until(
+    () =>
+      future.mailbox
+        .list({ mailboxId: 'default' })
+        .items.some(item => item.id === asked.questionId),
+    'the resolved target receives the queued question',
+  );
 });
 
 test('staggered offline peers converge through a relay seed spool, attachment cache and dedup-cas', async t => {
@@ -171,6 +230,8 @@ test('staggered offline peers converge through a relay seed spool, attachment ca
   const seed = await create('seed');
   await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
   const seedEndpoint = seed.transport.endpointAddr!;
+  const seedPort = Number(seedEndpoint.slice(seedEndpoint.lastIndexOf(':') + 1));
+  assert.ok(Number.isSafeInteger(seedPort) && seedPort > 0);
 
   const ben = await create('ben', { transport: isolatedTransport });
   let diz = await create('diz', {
@@ -225,8 +286,14 @@ test('staggered offline peers converge through a relay seed spool, attachment ca
   assert.ok(existsSync(queued[0].stagedFiles[staged[0]]));
 
   // The sender disappears before the target ever wakes up: only the seed's durable spool
-  // and blob cache remain.
+  // and blob cache remain. Restart the seed on the same endpoint first: the reloaded spool
+  // must rehydrate attachment blobs even though the frame entry is drained and removed
+  // before the target's executor asks for the blob.
   await ben.stop();
+  await seed.stop();
+  const restartedSeed = await create('seed', { port: seedPort });
+  await restartedSeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  assert.equal(restartedSeed.transport.endpointAddr, seedEndpoint);
 
   diz = await create('diz', {
     transport: isolatedTransport,

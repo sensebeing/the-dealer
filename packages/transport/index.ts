@@ -768,6 +768,19 @@ export class P2PTransportService implements TransportService {
       (a, b) => Date.parse(a.spooledAt) - Date.parse(b.spooledAt) || a.id.localeCompare(b.id),
     );
     for (const entry of entries) {
+      // A seed restart must keep spooled attachments addressable even after the frame entry
+      // is drained and removed before the target's executor fetches the blob. Rehydrate the
+      // durable cache (and the network-scoped membership) while the entry still exists.
+      for (const [hash, encoded] of Object.entries(entry.blobs ?? {})) {
+        if (!/^[a-f0-9]{64}$/.test(hash)) {
+          throw new Error('Invalid relay spool store');
+        }
+        const bytes = Buffer.from(encoded, 'base64');
+        if (bytes.toString('base64') !== encoded || blake3(bytes) !== hash) {
+          throw new Error('Invalid relay spool store');
+        }
+        this.writeSpoolBlob(m, hash, bytes);
+      }
       const queue = m.relaySpool.get(entry.targetNodeId) ?? [];
       queue.push(entry);
       m.relaySpool.set(entry.targetNodeId, queue);

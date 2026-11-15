@@ -935,10 +935,16 @@ async function runSessionCommand(
       },
       filePaths: v.attach as string[] | undefined,
     });
+    const firstReceipt = emitted.receipts[0];
     return {
       questionId: emitted.messageId,
       threadId: emitted.messageId,
-      targetNodeId: emitted.receipts[0]?.fromNodeId,
+      // A queued offline receipt is signed by the local outbox, not the target; report the
+      // resolved target when known, otherwise null until redrive resolves the selector.
+      targetNodeId:
+        firstReceipt?.executionReceipt?.queuedOffline === true
+          ? ((firstReceipt.executionReceipt.targetNodeId as string | undefined) ?? null)
+          : firstReceipt?.fromNodeId,
       targetMailbox: targetMailbox ?? 'default',
       replyMailbox,
       receipts: emitted.receipts,
