@@ -171,8 +171,12 @@ Redrive is automatic and settles an obligation only through the target's signed
 receipt; unsigned, forged, mismatched or rejected receipts fail the item instead of
 keeping it queued. The verified peer directory persists across restarts, and a relay
 seed's spool (when configured) holds the frame and verified attachments until the
-target reconnects. The authoritative state machine, receipt semantics and durable
-storage layout live in [`docs/architecture.md`](../../docs/architecture.md).
+target reconnects. A peer that slept and woke without restarting keeps the same signed
+card, so transport's own live evidence (a fresh sealed beacon or the peer's tunnel)
+triggers the redrive; a target that stayed online but timed out is reconciled on its
+normal backoff and answered idempotently by the receiver's delivery ledger. The
+authoritative state machine, receipt semantics and durable storage layout live in
+[`docs/architecture.md`](../../docs/architecture.md).
 
 Forgeries, signature failures, receipt mismatches and other protocol errors are
 never converted into queued receipts. They fail the command (or mark a redrive item

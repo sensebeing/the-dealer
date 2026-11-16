@@ -353,6 +353,20 @@ export interface InboundFrameEvent {
   payload: unknown;
 }
 
+/** Which authenticated evidence proved a peer reachable: its own beacon, gossip, or a tunnel. */
+export type PeerReachabilityVia = 'direct' | 'relay' | 'tunnel';
+
+/**
+ * A live reachability transition owned by transport, not by identity: it fires when a peer
+ * becomes reachable again (fresh sealed beacon, gossiped beacon, or its inbound tunnel) even
+ * though the peer's signed `NodeCard.revision` never changed across a sleep/wake cycle.
+ */
+export interface PeerReachableEvent {
+  networkId: string;
+  nodeId: string;
+  via: PeerReachabilityVia;
+}
+
 export interface MountedNetworkHandle extends Disposable {
   readonly networkId: string;
   readonly swarmTopicId: string;
@@ -368,6 +382,12 @@ export interface TransportService {
   registerPeerEndpoint?(networkId: string, peerNodeId: string, endpointAddr: string): void;
   /** Make a locally available file addressable by its BLAKE3 hash for blob fetches. */
   registerBlob?(hash: string, filePath: string): void;
+  /**
+   * True when transport holds an unexpired authenticated discovery beacon or a live inbound
+   * tunnel for `peerNodeId`. Reachability is transport's alone: a verified `NodeCard` proves
+   * identity, never liveness, so durable obligations must consult this before resending.
+   */
+  isPeerReachable?(networkId: string, peerNodeId: string): boolean;
   sendUnicast(
     networkId: string,
     targetNodeId: string,

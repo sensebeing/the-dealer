@@ -19,6 +19,7 @@ import type {
   OutboxItem,
   OutboxItemStatus,
   OutboxListFilter,
+  PeerReachableEvent,
 } from '../core-types/index.ts';
 
 export type {
@@ -608,10 +609,20 @@ export class OutboxStore {
   }
 }
 
+/**
+ * The two live-obligation pulses this service consumes. `node/peer-updated` is signed
+ * identity (whose `revision` survives sleep/wake unchanged); `transport/peer-reachable` is
+ * transport-owned liveness evidence from a fresh beacon, relay gossip, or a peer tunnel.
+ */
+export type OutboxRedriveEventMap = {
+  'node/peer-updated': [card: NodeCard, provenance?: { direct?: boolean }];
+  'transport/peer-reachable': [event: PeerReachableEvent];
+};
+
 export interface OutboxRedriveEvents {
-  on(
-    event: 'node/peer-updated',
-    listener: (card: NodeCard, provenance?: { direct?: boolean }) => void,
+  on<K extends keyof OutboxRedriveEventMap>(
+    event: K,
+    listener: (...args: OutboxRedriveEventMap[K]) => void,
   ): Disposable;
 }
 
@@ -623,6 +634,8 @@ export interface OutboxRedriveOptions {
     options?: { targetNodeIds?: readonly string[]; timeoutMs?: number },
   ) => Promise<OutboxDeliveryOutcome>;
   events?: OutboxRedriveEvents;
+  /** Transport-owned level check: may an in-doubt target be reconciled on its normal schedule? */
+  isPeerReachable?: (networkId: string, nodeId: string) => boolean;
   onError?: (error: unknown) => void;
   /** Called once a previously unresolved explicit selector has produced real targets. */
   onTargetsResolved?: (
@@ -646,6 +659,7 @@ export class OutboxRedriveService {
   private readonly outbox: OutboxStore;
   private readonly deliver: OutboxRedriveOptions['deliver'];
   private readonly events?: OutboxRedriveEvents;
+  private readonly isPeerReachable?: (networkId: string, nodeId: string) => boolean;
   private readonly onError: (error: unknown) => void;
   private readonly onTargetsResolved?: (
     envelope: MessageEnvelope,
@@ -654,7 +668,7 @@ export class OutboxRedriveService {
   private readonly intervalMs: number;
   private readonly attemptTimeoutMs: number;
   private timer?: ReturnType<typeof setInterval>;
-  private subscription?: Disposable;
+  private subscriptions: Disposable[] = [];
   private queue: Promise<unknown> = Promise.resolve();
   private stopped = false;
   private lastPeerPulse = new Map<string, number>();
@@ -663,6 +677,7 @@ export class OutboxRedriveService {
     this.outbox = options.outbox;
     this.deliver = options.deliver;
     this.events = options.events;
+    this.isPeerReachable = options.isPeerReachable;
     this.onError = options.onError ?? (() => {});
     this.onTargetsResolved = options.onTargetsResolved;
     this.intervalMs = options.intervalMs ?? DEFAULT_REDRIVE_INTERVAL_MS;
@@ -674,9 +689,14 @@ export class OutboxRedriveService {
       return;
     }
     this.stopped = false;
-    this.subscription = this.events?.on('node/peer-updated', (card, provenance) =>
-      this.onPeerUpdated(card, provenance),
-    );
+    if (this.events) {
+      this.subscriptions.push(
+        this.events.on('node/peer-updated', (card, provenance) =>
+          this.onPeerUpdated(card, provenance),
+        ),
+        this.events.on('transport/peer-reachable', event => this.onPeerReachable(event)),
+      );
+    }
     this.timer = setInterval(() => this.tick(), this.intervalMs);
     this.timer.unref();
   }
@@ -691,19 +711,32 @@ export class OutboxRedriveService {
   private onPeerUpdated(card: NodeCard, provenance?: { direct?: boolean }): void {
     // Presence gossip proves identity, not reachability: a gossiped third-party card must
     // never advance the retry clock for a target that has not actually reconnected.
-    if (this.stopped || provenance?.direct === false) {
+    if (provenance?.direct === false) {
       return;
     }
-    // Throttle before touching the outbox: presence cards refresh several times a second.
-    const key = `${card.networkId}\n${card.nodeId}`;
+    this.pulsePeer(card.networkId, card.nodeId, false);
+  }
+
+  private onPeerReachable(event: PeerReachableEvent): void {
+    // A peer opening its tunnel immediately after our discovery probe must not wait out
+    // the beacon pulse throttle; direct and gossiped beacons share the same throttle.
+    this.pulsePeer(event.networkId, event.nodeId, event.via === 'tunnel');
+  }
+
+  /** One peer-scoped force flush; identity pulses are throttled because cards refresh often. */
+  private pulsePeer(networkId: string, nodeId: string, bypassThrottle: boolean): void {
+    if (this.stopped) {
+      return;
+    }
+    const key = `${networkId}\n${nodeId}`;
     const now = Date.now();
-    if (now - (this.lastPeerPulse.get(key) ?? 0) < 2_000) {
+    if (!bypassThrottle && now - (this.lastPeerPulse.get(key) ?? 0) < 2_000) {
       return;
     }
     this.lastPeerPulse.set(key, now);
     void this.flush({
-      networkId: card.networkId,
-      targetNodeId: card.nodeId,
+      networkId,
+      targetNodeId: nodeId,
       force: true,
       forceMatchingTarget: true,
     }).catch(error => this.onError(error));
@@ -791,10 +824,13 @@ export class OutboxRedriveService {
           // An explicit operator flush resolves in-doubt sends through the same stable
           // envelope id; the target's dedup policy decides a duplicate safely.
           ? eligibleTargets
-          // Timed-out sends may already have executed. Only a direct peer pulse or an
-          // operator force may retry them; the ordinary timer keeps them parked.
+          // A timed-out send may already have executed. It stays parked until transport
+          // proves the peer live again (a fresh beacon or its own tunnel): the same signed
+          // envelope id is then reconciled by the receiver's DeliveryLedger/dedup-cas.
           : eligibleTargets.filter(
-              nodeId => !candidate.inDoubtNodeIds.includes(nodeId),
+              nodeId =>
+                !candidate.inDoubtNodeIds.includes(nodeId) ||
+                this.isPeerReachable?.(candidate.networkId, nodeId) === true,
             );
       if (eligibleTargets.length > 0 && requestTargets.length === 0) {
         blockedThreads.add(threadKey);
@@ -929,8 +965,10 @@ export class OutboxRedriveService {
       clearInterval(this.timer);
       this.timer = undefined;
     }
-    this.subscription?.dispose();
-    this.subscription = undefined;
+    for (const subscription of this.subscriptions) {
+      subscription.dispose();
+    }
+    this.subscriptions = [];
     await this.queue.catch(() => {});
   }
 }

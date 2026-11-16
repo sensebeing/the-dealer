@@ -13,6 +13,7 @@ import type {
   DispatchReceipt,
   DeliveryReceipt,
   InboundFrameEvent,
+  PeerReachableEvent,
 } from '../core-types/index.ts';
 
 export type { Disposable } from '../core-types/index.ts';
@@ -37,6 +38,7 @@ export interface Events {
     card: NodeCard,
     provenance?: { direct?: boolean },
   ) => void;
+  'transport/peer-reachable': (event: PeerReachableEvent) => void;
   'emitter/prepare': (
     envelope: MessageEnvelope,
     next: (envelope: MessageEnvelope) => Promise<MessageEnvelope>,

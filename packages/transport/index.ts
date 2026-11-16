@@ -23,6 +23,7 @@ import {
   PeerUnreachableError,
   deriveNetworkKeys,
   generateNodeKeyPair,
+  isDeliveryTimeoutFailure,
   sealNetworkFrame,
   unsealNetworkFrame,
 } from '../core-types/index.ts';
@@ -475,6 +476,14 @@ interface SpooledRelayBlob {
   expiresAt: string;
 }
 
+/** A persisted spool entry that addresses this node on either end is never a real relay duty. */
+function isSelfSpooledEntry(raw: unknown, localNodeId: string): boolean {
+  const entry = raw as { targetNodeId?: unknown; frame?: { senderNodeId?: unknown } } | null;
+  return (
+    entry?.targetNodeId === localNodeId || entry?.frame?.senderNodeId === localNodeId
+  );
+}
+
 interface RelaySpoolFile {
   schema: typeof RELAY_SPOOL_SCHEMA;
   networkId: string;
@@ -508,6 +517,11 @@ interface Mount {
 type Handler = (
   event: InboundFrameEvent & { rawBytes?: Uint8Array },
 ) => Promise<Uint8Array | void> | Uint8Array | void;
+
+/** Normalize a host for identity comparison across IPv4-mapped and scoped forms. */
+function normalizedHost(host: string): string {
+  return host.replace(/^::ffff:/i, '').split('%')[0].toLowerCase();
+}
 
 function isPrivateLanIpv4Host(host: string): boolean {
   const parts = host.split('.');
@@ -561,6 +575,12 @@ export class P2PTransportService implements TransportService {
   private spoolDrainAttempts = new Map<string, number>();
   /** Relay-spooled attachment hashes, scoped by network swarm topic for strict isolation. */
   private spooledBlobs = new Set<string>();
+  /** The bound listener port: a seed address on this port is this node, not a remote peer. */
+  private listenPort?: number;
+  /** The configured bind host; wildcard binds mean any local interface is this node. */
+  private boundHost?: string;
+  /** Every endpoint proven to be this node (advertised, aliased, or hairpinned back). */
+  private selfEndpoints = new Set<string>();
 
   constructor(options: TransportPluginOptions = {}, ctx?: Context) {
     this.options = options;
@@ -569,7 +589,7 @@ export class P2PTransportService implements TransportService {
     this.localNodeId = options.localNodeId ?? this.identityKeyPair!.nodeId;
   }
 
-  private track(socket: Socket): Socket {
+  private track(socket: Socket, onConnectedTimeout?: () => Error): Socket {
     if (this.closed) {
       socket.destroy();
       return socket;
@@ -579,15 +599,82 @@ export class P2PTransportService implements TransportService {
     socket.setTimeout(this.options.socketTimeoutMs ?? 90_000, () => {
       // A TCP handshake that never completed proves zero application bytes left this
       // kernel: the peer is simply unreachable, so this must not be reported as a
-      // possibly-executed in-doubt send. Once connected, a silent reply is ambiguous.
+      // possibly-executed in-doubt send. Once connected, a silent reply is ambiguous and
+      // the caller's evidence decides whether the target or only a relay seed failed.
       socket.destroy(
         socket.connecting
           ? Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' })
-          : new DeliveryTimeoutError('Transport timeout'),
+          : (onConnectedTimeout?.() ?? new DeliveryTimeoutError('Transport timeout')),
       );
     });
     socket.on('error', () => {});
     return socket;
+  }
+
+  /**
+   * A seed address that resolves back to this node's own listener is never a relay: dialing
+   * it would make this node relay or spool its own frames. Any local interface address on
+   * the bound port counts when the listener is bound to a wildcard address.
+   */
+  private isSelfEndpoint(candidate: string): boolean {
+    if (candidate === this.endpointAddr || this.selfEndpoints.has(candidate)) {
+      return true;
+    }
+    if (this.listenPort === undefined) {
+      return false;
+    }
+    let parsed: { host: string; port: number };
+    try {
+      parsed = parseEndpoint(candidate);
+    } catch {
+      return false;
+    }
+    if (parsed.port !== this.listenPort) {
+      return false;
+    }
+    const host = normalizedHost(parsed.host);
+    const boundHost = this.boundHost ?? '0.0.0.0';
+    if (boundHost === '0.0.0.0' || boundHost === '::') {
+      if (['127.0.0.1', '::1', 'localhost', '0.0.0.0', '::'].includes(host)) {
+        return true;
+      }
+      for (const addresses of Object.values(networkInterfaces())) {
+        for (const address of addresses ?? []) {
+          if (normalizedHost(address.address) === host) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    return host === normalizedHost(boundHost);
+  }
+
+  /**
+   * Remember an endpoint that proved to be this node, and erase every tunnel/relay artifact
+   * that pointed at it. An alias (Tailscale address, DNS name, hairpinned forwarder) can
+   * only be proven at runtime by a frame that carries this node's own authenticated sender.
+   */
+  private recordSelfEndpoint(endpoint: string): void {
+    this.selfEndpoints.add(endpoint);
+    for (const m of this.mounts.values()) {
+      for (const [seedNodeId, entry] of m.outboundTunnels) {
+        if (seedNodeId === this.localNodeId || entry.seed === endpoint) {
+          entry.socket.destroy();
+          m.outboundTunnels.delete(seedNodeId);
+        }
+      }
+      const selfInbound = m.inboundTunnels.get(this.localNodeId);
+      if (selfInbound) {
+        selfInbound.socket.destroy();
+        m.inboundTunnels.delete(this.localNodeId);
+      }
+      for (const [peerId, relaySeed] of m.relays) {
+        if (peerId === this.localNodeId || relaySeed === endpoint) {
+          m.relays.delete(peerId);
+        }
+      }
+    }
   }
 
   private async start(port?: number): Promise<void> {
@@ -613,7 +700,10 @@ export class P2PTransportService implements TransportService {
         throw new Error('Invalid listener address');
       }
       const host = defaultAdvertisedHost(this.options);
+      this.listenPort = address.port;
+      this.boundHost = this.options.listenHost ?? '0.0.0.0';
       this.endpointAddr = `${host.includes(':') ? `[${host}]` : host}:${address.port}`;
+      this.selfEndpoints.add(this.endpointAddr);
       if (this.options.multicast !== false) {
         const udp = createSocket({ type: 'udp4', reuseAddr: true });
         this.udp = udp;
@@ -824,6 +914,28 @@ export class P2PTransportService implements TransportService {
     this.blobs.set(hash, { path: filePath, size: info.size });
   }
 
+  /**
+   * Authoritative live reachability: an unexpired authenticated sealed beacon, or a peer's
+   * own live inbound tunnel. Signed identity cards never participate, because a peer that
+   * slept and woke without restarting keeps the same `NodeCard.revision`.
+   */
+  isPeerReachable(networkId: string, peerNodeId: string): boolean {
+    if (this.closed) {
+      return false;
+    }
+    if (peerNodeId === this.localNodeId) {
+      return true;
+    }
+    const m = this.mounts.get(networkId);
+    if (!m) {
+      return false;
+    }
+    return (
+      (m.beacons.get(peerNodeId)?.expires ?? 0) >= Date.now() ||
+      m.inboundTunnels.has(peerNodeId)
+    );
+  }
+
   /** Content-addressed blob cache is network-scoped: a spooled hash never leaks across mounts. */
   private spoolBlobDirectory(m: Mount): string {
     return this.options.spoolDir
@@ -840,6 +952,7 @@ export class P2PTransportService implements TransportService {
     const hadSnapshot = existsSync(spoolFile);
     const hadJournal = existsSync(journalFile);
     const now = Date.now();
+    let droppedSelf = false;
     if (hadSnapshot) {
       let parsed: unknown;
       try {
@@ -862,6 +975,9 @@ export class P2PTransportService implements TransportService {
         const entry = this.parseStoredSpoolEntry(raw, m, now);
         if (entry) {
           entries.push(entry);
+        } else if (isSelfSpooledEntry(raw, this.localNodeId)) {
+          // A pre-fix build could spool its own frame on a self alias: purge it on mount.
+          droppedSelf = true;
         }
       }
       entries.sort(
@@ -898,7 +1014,7 @@ export class P2PTransportService implements TransportService {
     // Apply the append-only delta written since the last snapshot, then compact once at
     // startup. Live admission/drain only append one record, so the seed never rewrites the
     // whole spool on the request path.
-    this.loadRelaySpoolJournal(m, now);
+    const droppedFromJournal = this.loadRelaySpoolJournal(m, now);
     // Files from a previous process are addressable and must participate in orphan GC.
     const directory = this.spoolBlobDirectory(m);
     if (existsSync(directory)) {
@@ -909,7 +1025,7 @@ export class P2PTransportService implements TransportService {
       }
     }
     // Expired entries and orphaned blobs are dropped from the durable snapshot during mount.
-    let changed = this.pruneRelaySpool(m);
+    let changed = this.pruneRelaySpool(m) || droppedSelf || droppedFromJournal;
     // A tampered snapshot must not bypass the same capacity bounds as live admission.
     changed = this.enforceRelaySpoolBudget(m) || changed;
     // A crash can leave blob files without any snapshot/journal reference. The directory
@@ -946,6 +1062,9 @@ export class P2PTransportService implements TransportService {
       throw new Error('Invalid relay spool store');
     }
     if (Date.parse(entry.expiresAt) <= now) {
+      return undefined;
+    }
+    if (entry.frame.senderNodeId === this.localNodeId || entry.targetNodeId === this.localNodeId) {
       return undefined;
     }
     const blobHashes: Record<string, number> = {};
@@ -993,11 +1112,12 @@ export class P2PTransportService implements TransportService {
     );
   }
 
-  private loadRelaySpoolJournal(m: Mount, now: number): void {
+  private loadRelaySpoolJournal(m: Mount, now: number): boolean {
     const journalFile = this.relaySpoolJournalFile(m);
     if (!journalFile) {
-      return;
+      return false;
     }
+    let droppedSelf = false;
     for (const raw of readDurableJournal(journalFile)) {
       if (typeof raw !== 'object' || raw === null || typeof (raw as { op?: unknown }).op !== 'string') {
         throw new Error('Invalid relay spool store');
@@ -1014,6 +1134,8 @@ export class P2PTransportService implements TransportService {
         if (entry) {
           this.dropSpoolEntry(m, entry.targetNodeId, entry.id);
           this.insertSpoolEntry(m, entry);
+        } else if (isSelfSpooledEntry(record.entry, this.localNodeId)) {
+          droppedSelf = true;
         }
       } else if (record.op === 'remove') {
         if (typeof record.targetNodeId !== 'string' || typeof record.id !== 'string') {
@@ -1039,6 +1161,7 @@ export class P2PTransportService implements TransportService {
         throw new Error('Invalid relay spool store');
       }
     }
+    return droppedSelf;
   }
 
   private mergeRelaySpoolCache(m: Mount, raw: unknown, now: number): void {
@@ -1436,6 +1559,10 @@ export class P2PTransportService implements TransportService {
     ) {
       throw new LocalDeliveryError('Invalid relay spool target');
     }
+    if (frame.senderNodeId === this.localNodeId) {
+      // Spooling this node's own frame on itself would fabricate a durable relay handoff.
+      throw new LocalDeliveryError('Invalid relay spool sender');
+    }
     if (
       spoolKey !== undefined &&
       (typeof spoolKey !== 'string' ||
@@ -1672,34 +1799,58 @@ export class P2PTransportService implements TransportService {
     ) {
       return { reply: false };
     }
+    if (frame.senderNodeId === this.localNodeId) {
+      // A beacon carrying this node's own authenticated identity is this node seen through
+      // an alias (Tailscale address, DNS name, hairpinned forwarder). It must never become
+      // a peer endpoint, beacon, relay mapping, spool drain, or reachability transition.
+      return { mount: m, reply: beacon.reply === true };
+    }
+    const effectiveViaSeed =
+      viaSeed !== undefined && !this.isSelfEndpoint(viaSeed) ? viaSeed : undefined;
     const current = m.beacons.get(frame.senderNodeId);
     if (current && beacon.expires <= current.expires) {
       // Beacons travel by gossip, so a delayed frame from the same or an older
       // generation must never rewrite this peer's endpoint or relay mapping.
       return { mount: m, reply: beacon.reply === true };
     }
+    const now = Date.now();
+    const hadFreshBeacon = (current?.expires ?? 0) >= now;
+    const hadTunnel = m.inboundTunnels.has(frame.senderNodeId);
+    const priorEndpoint = m.peers.get(frame.senderNodeId);
+    const priorRelay = m.relays.get(frame.senderNodeId);
     this.registerPeerEndpoint(
       m.config.networkId,
       frame.senderNodeId,
       this.reachableEndpoint(beacon.endpointAddr, remoteHost),
     );
-    if (frame.senderNodeId !== this.localNodeId) {
-      // Sealed discovery frames are the only beacon form a seed can gossip without
-      // being able to forge endpoints; keep the freshest one per sender.
-      m.beacons.set(frame.senderNodeId, { frame, expires: beacon.expires });
-      if (viaSeed !== undefined) {
-        // Remember who can relay to this peer when its advertised endpoint is unreachable.
-        m.relays.set(frame.senderNodeId, viaSeed);
-      } else if (remoteHost && remoteHost !== '127.0.0.1' && remoteHost !== '0.0.0.0') {
-        // A fresher beacon that reached us directly makes an obsolete relay seed mapping wrong.
-        m.relays.delete(frame.senderNodeId);
-      }
-      // A fresh endpoint is the cheapest proof that a spooled target may be reachable again.
-      // Discovery probes deliberately skip this: their peer opens a tunnel moments later,
-      // and a speculative direct drain would hold the per-target lock ahead of it.
-      if (scheduleDrain) {
-        this.scheduleSpoolDrain(m, frame.senderNodeId);
-      }
+    // Sealed discovery frames are the only beacon form a seed can gossip without
+    // being able to forge endpoints; keep the freshest one per sender.
+    m.beacons.set(frame.senderNodeId, { frame, expires: beacon.expires });
+    if (effectiveViaSeed !== undefined) {
+      // Remember who can relay to this peer when its advertised endpoint is unreachable.
+      m.relays.set(frame.senderNodeId, effectiveViaSeed);
+    } else if (remoteHost && remoteHost !== '127.0.0.1' && remoteHost !== '0.0.0.0') {
+      // A fresher beacon that reached us directly makes an obsolete relay seed mapping wrong.
+      m.relays.delete(frame.senderNodeId);
+    }
+    // A fresh endpoint is the cheapest proof that a spooled target may be reachable again.
+    // Discovery probes deliberately skip this: their peer opens a tunnel moments later,
+    // and a speculative direct drain would hold the per-target lock ahead of it.
+    if (scheduleDrain) {
+      this.scheduleSpoolDrain(m, frame.senderNodeId);
+    }
+    // Pulse only genuine changes: a peer that was dark becomes reachable, or its proven
+    // route changed. Steady-state beacon refreshes stay silent.
+    if (
+      (!hadFreshBeacon && !hadTunnel) ||
+      priorEndpoint !== m.peers.get(frame.senderNodeId) ||
+      priorRelay !== m.relays.get(frame.senderNodeId)
+    ) {
+      this.ctx?.emit('transport/peer-reachable', {
+        networkId: m.config.networkId,
+        nodeId: frame.senderNodeId,
+        via: effectiveViaSeed !== undefined ? 'relay' : 'direct',
+      });
     }
     return { mount: m, reply: beacon.reply === true };
   }
@@ -1796,7 +1947,7 @@ export class P2PTransportService implements TransportService {
         }
       }
     }
-    await Promise.allSettled([...new Set(m.config.bootstrapPeers ?? [])].filter(seed => seed !== this.endpointAddr).map(async seed => {
+    await Promise.allSettled([...new Set(m.config.bootstrapPeers ?? [])].filter(seed => !this.isSelfEndpoint(seed)).map(async seed => {
       // The persistent tunnel lets the seed push relayed requests back; the probe
       // below exchanges sealed beacons so isolated peers can discover each other.
       const prior = [...m.outboundTunnels.entries()].find(([, entry]) => entry.seed === seed && entry.acked);
@@ -1812,18 +1963,26 @@ export class P2PTransportService implements TransportService {
         if (response.frame?.swarmTopicId !== m.keys.swarmTopicId) {
           throw new Error('Invalid discovery response');
         }
+        if (response.frame?.senderNodeId === this.localNodeId) {
+          // This "seed" answered with our own authenticated identity: an alias or a
+          // hairpinned forwarder back to this listener, never a relay.
+          this.recordSelfEndpoint(seed);
+          return;
+        }
         const seedHost = parseEndpoint(seed).host;
         if (!this.learnWithMeta(response.frame, seedHost).mount) {
           throw new Error('Invalid discovery response');
         }
         const seedNodeId = response.frame.senderNodeId;
-        if (seedNodeId === this.localNodeId) return;
         this.ensureOutboundTunnel(m, seedNodeId, seed, response.tunneled === true, prior?.[1]);
         const activeTunnel = m.outboundTunnels.get(seedNodeId);
         if (!activeTunnel || activeTunnel.seed === seed) {
           m.relays.set(seedNodeId, seed);
         }
         for (const peerFrame of Array.isArray(response.peers) ? response.peers : []) {
+          if (peerFrame?.senderNodeId === this.localNodeId) {
+            continue;
+          }
           try {
             // Gossiped beacons were not reached directly, so keep the advertised
             // endpoint and remember the seed that can relay to their sender.
@@ -1915,6 +2074,9 @@ export class P2PTransportService implements TransportService {
     // instead of waiting the full request timeout on the direct attempt.
     const fallbacks = this.peerFallbacks(target, [m]);
     let lastError: Error = new PeerUnreachableError(target, `Unknown peer: ${target}`);
+    // A post-connect direct timeout is genuine in-doubt evidence and must survive later
+    // fallback failures; a relay-only or pre-connect failure never becomes in-doubt.
+    let targetDeliveryTimeout: Error | undefined;
     if (address) {
       try {
         return await this.directExchange(
@@ -1926,6 +2088,9 @@ export class P2PTransportService implements TransportService {
         );
       } catch (error) {
         lastError = asError(error);
+        if (isDeliveryTimeoutFailure(lastError)) {
+          targetDeliveryTimeout ??= lastError;
+        }
         // A signature/binding failure is never an offline symptom: retrying it through a
         // relay or queueing it in an outbox would hide a real security decision. Unknown
         // errors are equally deterministic until proven connection-class.
@@ -1995,14 +2160,23 @@ export class P2PTransportService implements TransportService {
           throw error;
         }
         // Only a connection-class failure may advance to the next seed; a malformed or
-        // mismatched response is deterministic and must surface as such.
-        if (!isConnectionFailure(error)) {
+        // mismatched response is deterministic and must surface as such. A self endpoint
+        // proven at runtime is exactly such a hop failure: keep trying real seeds.
+        if (!(error instanceof PeerUnreachableError) && !isConnectionFailure(error)) {
           throw error;
         }
         lastError = asError(error);
+        if (isDeliveryTimeoutFailure(lastError)) {
+          targetDeliveryTimeout ??= lastError;
+        }
       }
     }
-    throw this.unreachable(target, lastError);
+    throw this.unreachable(
+      target,
+      targetDeliveryTimeout !== undefined && !isDeliveryTimeoutFailure(lastError)
+        ? targetDeliveryTimeout
+        : lastError,
+    );
   }
 
   /** Keep transport reachability decisions in one place; protocol/security errors pass through. */
@@ -2090,7 +2264,10 @@ export class P2PTransportService implements TransportService {
   /** Seeds that may forward to this target: its introducing seed first, then configured seeds. */
   private relayCandidates(m: Mount, target: string): string[] {
     const seeds = [m.relays.get(target), ...(m.config.bootstrapPeers ?? [])]
-      .filter((seed): seed is string => typeof seed === 'string' && seed.length > 0 && seed !== this.endpointAddr);
+      .filter(
+        (seed): seed is string =>
+          typeof seed === 'string' && seed.length > 0 && !this.isSelfEndpoint(seed),
+      );
     return [...new Set(seeds)];
   }
 
@@ -2159,7 +2336,16 @@ export class P2PTransportService implements TransportService {
     options: { spoolIfOffline?: boolean; spoolKey?: string; blobs?: Record<string, string> } = {},
   ): Promise<Uint8Array> {
     const startedAt = Date.now();
-    const socket = this.track(createConnection(parseEndpoint(seed)));
+    const socket = this.track(
+      createConnection(parseEndpoint(seed)),
+      () =>
+        // A connected-but-silent relay seed only proves a target execution timeout when
+        // the target itself has a fresh beacon. Otherwise this is a relay/offline
+        // reachability failure and must never park the target in inDoubtNodeIds.
+        (m.beacons.get(target)?.expires ?? 0) >= Date.now()
+          ? new DeliveryTimeoutError('Transport timeout')
+          : Object.assign(new Error('Relay transport timeout'), { code: 'ETIMEDOUT' }),
+    );
     socket.setTimeout(timeoutMs);
     try {
       socket.write(packet({
@@ -2200,6 +2386,16 @@ export class P2PTransportService implements TransportService {
       if (response?.error) {
         throw new LocalDeliveryError(String(response.error));
       }
+      if (
+        response?.selfRelay === true ||
+        (response?.spooled === true && response.seedNodeId === this.localNodeId)
+      ) {
+        // The "seed" handed our own sealed frame back to us: an alias or hairpinned
+        // forwarder. Remember it, then advance to the next real fallback seed instead of
+        // fabricating an offline-spooled handoff.
+        this.recordSelfEndpoint(seed);
+        throw new PeerUnreachableError(target, 'Skipped self relay endpoint');
+      }
       if (response?.spooled === true) {
         if (typeof response.seedNodeId !== 'string' || typeof response.spoolId !== 'string') {
           throw new LocalDeliveryError('Invalid relay spool response');
@@ -2235,7 +2431,23 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs: number,
   ): Promise<Uint8Array> {
-    const response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs);
+    let response: any;
+    try {
+      response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs);
+    } catch (error) {
+      if (
+        error instanceof DeliveryTimeoutError &&
+        (m.beacons.get(target)?.expires ?? 0) < Date.now()
+      ) {
+        // The peer slept without closing its tunnel; the socket is a zombie that would
+        // keep absorbing requests. Evict it and report an offline reachability failure.
+        tunnel.socket.destroy();
+        throw Object.assign(new Error('Relay tunnel timed out after peer beacon expired'), {
+          code: 'ETIMEDOUT',
+        });
+      }
+      throw error;
+    }
     if (response?.error) {
       const detail = String(response.error);
       const error = new Error(detail);
@@ -2481,6 +2693,12 @@ export class P2PTransportService implements TransportService {
 
   /** Register a peer's persistent tunnel and resolve its relay replies until it closes. */
   private async serveInboundTunnel(socket: Socket, frame: SealedNetworkFrame): Promise<void> {
+    if (frame?.senderNodeId === this.localNodeId) {
+      // Our own sealed frame arrived through an alias or hairpin: registering it would
+      // create a self tunnel that relays this node's frames back to itself.
+      socket.destroy();
+      return;
+    }
     const mount = this.learn(frame, socket.remoteAddress, false);
     if (!mount) {
       throw new Error('Invalid tunnel request');
@@ -2495,6 +2713,15 @@ export class P2PTransportService implements TransportService {
       previous.socket.destroy();
     }
     socket.write(packet({ type: 'tunnel_ack' }));
+    if (previous?.socket !== socket) {
+      // A peer's own authenticated tunnel is live reachability evidence that survives a
+      // sleep/wake cycle without any `NodeCard.revision` change.
+      this.ctx?.emit('transport/peer-reachable', {
+        networkId: mount.config.networkId,
+        nodeId: peerNodeId,
+        via: 'tunnel',
+      });
+    }
     // The target just proved it is online; drain its durable store-and-forward queue
     // before serving any further requests, so a returning peer receives mail immediately.
     this.scheduleSpoolDrain(mount, peerNodeId, true);
@@ -2544,11 +2771,10 @@ export class P2PTransportService implements TransportService {
       });
       requestSocket?.once('close', abort);
       tunnel.socket.once('close', abort);
-      // The persistent tunnel socket itself never times out: a locally issued request
-      // needs its own deadline, while a forwarded one is bounded by its requester.
-      if (!requestSocket) {
-        timer = setTimeout(() => finish(new DeliveryTimeoutError('Relay tunnel timeout')), timeoutMs);
-      }
+      // Every request has its own deadline. A seed forwarding down a half-open zombie
+      // tunnel must time out and evict it instead of stalling until the outer requester
+      // socket expires (or forever, when that requester never notices).
+      timer = setTimeout(() => finish(new DeliveryTimeoutError('Relay tunnel timeout')), timeoutMs);
       try {
         tunnel.socket.write(packet({ ...body, relayId }));
       } catch (error) {
@@ -2652,6 +2878,13 @@ export class P2PTransportService implements TransportService {
         reject('Unable to authenticate or decode relay request');
         return;
       }
+      if (frame.senderNodeId === this.localNodeId) {
+        // This node's own sealed frame reached its own listener through an alias or a
+        // hairpinned forwarder. Answering with this node's identity lets the sender
+        // recognize the endpoint as self and fall through to a real seed.
+        socket.end(packet({ selfRelay: true, seedNodeId: this.localNodeId }));
+        return;
+      }
       const target = typeof request.target === 'string' ? request.target : '';
       if (!target) {
         reject('Invalid relay target');
@@ -2680,7 +2913,28 @@ export class P2PTransportService implements TransportService {
         const tunnel = mount.inboundTunnels.get(target);
         let replyFrame: SealedNetworkFrame;
         if (tunnel) {
-          const reply = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, socket);
+          // A peer that closed its lid leaves a half-open tunnel: nothing will ever answer
+          // down it. When no fresh beacon proves the target alive, bound the wait to the
+          // relay failover window and evict the dead tunnel so the frame is spooled now.
+          const targetHasFreshBeacon = (mount.beacons.get(target)?.expires ?? 0) >= Date.now();
+          const tunnelTimeoutMs =
+            spoolIfOffline && !targetHasFreshBeacon
+              ? Math.min(this.options.socketTimeoutMs ?? 90_000, RELAY_CONNECT_TIMEOUT_MS)
+              : this.options.socketTimeoutMs ?? 90_000;
+          let reply: any;
+          try {
+            reply = await this.requestOverTunnel(
+              tunnel,
+              { type: 'relay_deliver', frame },
+              socket,
+              tunnelTimeoutMs,
+            );
+          } catch (error) {
+            if (error instanceof DeliveryTimeoutError && !targetHasFreshBeacon) {
+              tunnel.socket.destroy();
+            }
+            throw error;
+          }
           if (reply?.error) {
             // A reachable target's signed decision is deterministic; never convert it to
             // durable offline spooling or let target-controlled text drive classification.
@@ -2902,7 +3156,7 @@ export class P2PTransportService implements TransportService {
     if (nodeId !== this.localNodeId) {
       for (const mount of this.mounts.values()) {
         for (const seed of mount.config.bootstrapPeers ?? []) {
-          if (seed === this.endpointAddr || seed === address) {
+          if (this.isSelfEndpoint(seed) || seed === address) {
             continue;
           }
           seedFallbacks.set(`${mount.keys.swarmTopicId}\n${seed}`, { mount, seed });
@@ -3101,6 +3355,9 @@ export class P2PTransportService implements TransportService {
     this.mounts.clear();
     this.handlers.clear();
     this.mountHandlers.clear();
+    this.selfEndpoints.clear();
+    this.listenPort = undefined;
+    this.boundHost = undefined;
   }
 }
 
