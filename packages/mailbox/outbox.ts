@@ -714,24 +714,46 @@ export class OutboxRedriveService {
     if (provenance?.direct === false) {
       return;
     }
-    this.pulsePeer(card.networkId, card.nodeId, false);
+    // Identity resolution is the only event that can turn an unresolved selector into a
+    // real target, so identity pulses also retry obligations with no pending node ids.
+    this.pulsePeer(card.networkId, card.nodeId, {
+      bypassThrottle: false,
+      includeUnresolved: true,
+    });
   }
 
   private onPeerReachable(event: PeerReachableEvent): void {
     // A peer opening its tunnel immediately after our discovery probe must not wait out
     // the beacon pulse throttle; direct and gossiped beacons share the same throttle.
-    this.pulsePeer(event.networkId, event.nodeId, event.via === 'tunnel');
+    // Beacon pulses carry no identity and cannot resolve a selector: they only touch
+    // obligations already pending for this exact node.
+    this.pulsePeer(event.networkId, event.nodeId, {
+      bypassThrottle: event.via === 'tunnel',
+      includeUnresolved: false,
+    });
   }
 
   /** One peer-scoped force flush; identity pulses are throttled because cards refresh often. */
-  private pulsePeer(networkId: string, nodeId: string, bypassThrottle: boolean): void {
+  private pulsePeer(
+    networkId: string,
+    nodeId: string,
+    options: { bypassThrottle: boolean; includeUnresolved: boolean },
+  ): void {
     if (this.stopped) {
       return;
     }
     const key = `${networkId}\n${nodeId}`;
     const now = Date.now();
-    if (!bypassThrottle && now - (this.lastPeerPulse.get(key) ?? 0) < 2_000) {
+    if (!options.bypassThrottle && now - (this.lastPeerPulse.get(key) ?? 0) < 2_000) {
       return;
+    }
+    if (!options.includeUnresolved) {
+      const hasMatchingQueued = this.outbox
+        .list({ networkId, status: 'queued' })
+        .some(item => item.pendingNodeIds.includes(nodeId));
+      if (!hasMatchingQueued) {
+        return;
+      }
     }
     this.lastPeerPulse.set(key, now);
     void this.flush({
@@ -739,6 +761,7 @@ export class OutboxRedriveService {
       targetNodeId: nodeId,
       force: true,
       forceMatchingTarget: true,
+      ...(options.includeUnresolved ? { includeUnresolved: true } : {}),
     }).catch(error => this.onError(error));
   }
 
@@ -789,7 +812,7 @@ export class OutboxRedriveService {
         options.forceMatchingTarget &&
         !(
           candidate.pendingNodeIds.includes(scopedTargetNodeId!) ||
-          candidate.pendingNodeIds.length === 0
+          (options.includeUnresolved === true && candidate.pendingNodeIds.length === 0)
         )
       ) {
         // A peer pulse advances only obligations for that peer; an earlier event on the
@@ -805,8 +828,8 @@ export class OutboxRedriveService {
       // flushes still honour each item's exponential backoff.
       const matchesTarget =
         !options.forceMatchingTarget ||
-        candidate.pendingNodeIds.length === 0 ||
-        candidate.pendingNodeIds.includes(options.targetNodeId!);
+        candidate.pendingNodeIds.includes(options.targetNodeId!) ||
+        (options.includeUnresolved === true && candidate.pendingNodeIds.length === 0);
       const force = options.force && matchesTarget;
       if (!force && Date.parse(candidate.nextAttemptAt) > now) {
         blockedThreads.add(threadKey);

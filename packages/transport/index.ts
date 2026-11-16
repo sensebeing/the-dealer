@@ -587,6 +587,8 @@ export class P2PTransportService implements TransportService {
    * frame naming this node, and an arbitrary TCP server could echo unauthenticated JSON.
    */
   private readonly selfLoopSecret = randomBytes(32);
+  /** Nonces this process is actively awaiting replies for; only those may mint a proof. */
+  private readonly inFlightSelfNonces = new Set<string>();
 
   constructor(options: TransportPluginOptions = {}, ctx?: Context) {
     this.options = options;
@@ -656,17 +658,23 @@ export class P2PTransportService implements TransportService {
     return host === normalizedHost(boundHost);
   }
 
-  /** HMAC over the request nonce, bound to this process rather than to the network key. */
-  private selfLoopProof(nonce: string): string {
-    return createHmac('sha256', this.selfLoopSecret).update(nonce).digest('base64url');
+  /** HMAC over the purpose and request nonce, bound to this process alone. */
+  private selfLoopProof(purpose: 'discovery' | 'relay', nonce: string): string {
+    return createHmac('sha256', this.selfLoopSecret)
+      .update(`${purpose}:${nonce}`)
+      .digest('base64url');
   }
 
   /** Constant-time check that a self reply was produced by this same process. */
-  private verifySelfLoopProof(nonce: string, proof: unknown): boolean {
+  private verifySelfLoopProof(
+    purpose: 'discovery' | 'relay',
+    nonce: string,
+    proof: unknown,
+  ): boolean {
     if (typeof proof !== 'string') {
       return false;
     }
-    const expected = Buffer.from(this.selfLoopProof(nonce));
+    const expected = Buffer.from(this.selfLoopProof(purpose, nonce));
     const actual = Buffer.from(proof);
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   }
@@ -1975,6 +1983,7 @@ export class P2PTransportService implements TransportService {
       const socket = this.track(createConnection(parseEndpoint(seed)));
       socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
       try {
+        this.inFlightSelfNonces.add(frame.nonce);
         socket.write(packet({
           type: 'discovery',
           frame,
@@ -1988,7 +1997,7 @@ export class P2PTransportService implements TransportService {
           // This "seed" answered with our own authenticated identity. Only a reply that
           // carries this process's self-loop proof is genuine: without it, an arbitrary
           // server could blacklist a real seed by echoing our node id.
-          if (!this.verifySelfLoopProof(frame.nonce, response.selfProof)) {
+          if (!this.verifySelfLoopProof('discovery', frame.nonce, response.selfProof)) {
             throw new Error('Invalid discovery response');
           }
           this.recordSelfEndpoint(seed);
@@ -2000,10 +2009,6 @@ export class P2PTransportService implements TransportService {
         }
         const seedNodeId = response.frame.senderNodeId;
         this.ensureOutboundTunnel(m, seedNodeId, seed, response.tunneled === true, prior?.[1]);
-        const activeTunnel = m.outboundTunnels.get(seedNodeId);
-        if (!activeTunnel || activeTunnel.seed === seed) {
-          m.relays.set(seedNodeId, seed);
-        }
         for (const peerFrame of Array.isArray(response.peers) ? response.peers : []) {
           if (peerFrame?.senderNodeId === this.localNodeId) {
             continue;
@@ -2022,6 +2027,7 @@ export class P2PTransportService implements TransportService {
           m.outboundTunnels.delete(prior[0]);
         }
       } finally {
+        this.inFlightSelfNonces.delete(frame.nonce);
         socket.destroy();
       }
     }));
@@ -2297,7 +2303,10 @@ export class P2PTransportService implements TransportService {
     const seeds = [m.relays.get(target), ...(m.config.bootstrapPeers ?? [])]
       .filter(
         (seed): seed is string =>
-          typeof seed === 'string' && seed.length > 0 && !this.isSelfEndpoint(seed),
+          typeof seed === 'string' &&
+          seed.length > 0 &&
+          !this.isSelfEndpoint(seed) &&
+          seed !== m.peers.get(target),
       );
     return [...new Set(seeds)];
   }
@@ -2379,6 +2388,7 @@ export class P2PTransportService implements TransportService {
     );
     socket.setTimeout(timeoutMs);
     try {
+      this.inFlightSelfNonces.add(frame.nonce);
       socket.write(packet({
         // Live non-spooling sends use the original `relay` verb so pre-upgrade seeds keep
         // forwarding them; only a spool offer needs the newer `relay_send` verb.
@@ -2421,7 +2431,7 @@ export class P2PTransportService implements TransportService {
         // The "seed" handed our own sealed frame back to us: an alias or hairpinned
         // forwarder. Only a proof bound to this process may blacklist it as self; an
         // unauthenticated response is a protocol failure, never silent offline queueing.
-        if (!this.verifySelfLoopProof(frame.nonce, response.selfProof)) {
+        if (!this.verifySelfLoopProof('relay', frame.nonce, response.selfProof)) {
           throw new LocalDeliveryError('Unauthenticated self-relay response');
         }
         this.recordSelfEndpoint(seed);
@@ -2453,6 +2463,7 @@ export class P2PTransportService implements TransportService {
       }
       return Buffer.from(payload.dataBase64, 'base64');
     } finally {
+      this.inFlightSelfNonces.delete(frame.nonce);
       socket.destroy();
     }
   }
@@ -2869,8 +2880,20 @@ export class P2PTransportService implements TransportService {
       const mount = this.learn(request.frame, socket.remoteAddress, false);
       if (!mount) throw new Error('Invalid discovery request');
       for (const peerFrame of Array.isArray(request.peers) ? request.peers : []) {
+        if (peerFrame?.senderNodeId === this.localNodeId) {
+          continue;
+        }
         try {
-          this.learnWithMeta(peerFrame, undefined);
+          // A third-party beacon gossiped inside this inbound probe was not reached
+          // directly: attribute it to the requester's endpoint so it stays `via: relay`.
+          this.learnWithMeta(
+            peerFrame,
+            undefined,
+            peerFrame?.senderNodeId === request.frame.senderNodeId
+              ? undefined
+              : mount.peers.get(request.frame.senderNodeId),
+            false,
+          );
         } catch {
           // One unreadable gossiped frame must not fail the reply.
         }
@@ -2880,8 +2903,9 @@ export class P2PTransportService implements TransportService {
         peers: [...mount.beacons.values()].map(entry => entry.frame),
         tunneled: mount.inboundTunnels.has(request.frame.senderNodeId),
         ...(request.frame?.senderNodeId === this.localNodeId &&
-        typeof request.frame.nonce === 'string'
-          ? { selfProof: this.selfLoopProof(request.frame.nonce) }
+        typeof request.frame.nonce === 'string' &&
+        this.inFlightSelfNonces.has(request.frame.nonce)
+          ? { selfProof: this.selfLoopProof('discovery', request.frame.nonce) }
           : {}),
       }));
       return;
@@ -2918,9 +2942,16 @@ export class P2PTransportService implements TransportService {
       }
       if (frame.senderNodeId === this.localNodeId) {
         // This node's own sealed frame reached its own listener through an alias or a
-        // hairpinned forwarder. Answering with a proof bound to this process lets the
-        // sender recognize the endpoint as self and fall through to a real seed.
-        socket.end(packet({ selfRelay: true, selfProof: this.selfLoopProof(frame.nonce) }));
+        // hairpinned forwarder. Only mint a proof while this process is actually awaiting
+        // that nonce; an external key holder forging our id must be rejected outright.
+        if (!this.inFlightSelfNonces.has(frame.nonce)) {
+          reject('Invalid relay sender');
+          return;
+        }
+        socket.end(packet({
+          selfRelay: true,
+          selfProof: this.selfLoopProof('relay', frame.nonce),
+        }));
         return;
       }
       const target = typeof request.target === 'string' ? request.target : '';
@@ -3394,6 +3425,7 @@ export class P2PTransportService implements TransportService {
     this.handlers.clear();
     this.mountHandlers.clear();
     this.selfEndpoints.clear();
+    this.inFlightSelfNonces.clear();
     this.listenPort = undefined;
     this.boundHost = undefined;
   }

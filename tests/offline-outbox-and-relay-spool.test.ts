@@ -848,6 +848,7 @@ async function emitterHarness(
     mailbox,
     sentEvents,
     emitter: kernel.ctx.services.emitter,
+    kernel,
     sendCalls,
     setMounted(value: boolean) {
       mounted = value;
@@ -4216,6 +4217,156 @@ test('a relay seed gossips a waking peer beacon so a cross-subnet obligation red
   );
   assert.deepEqual(deliveries, ids);
   assert.equal(transport.isPeerReachable(NETWORK, target), true);
+});
+
+test('steady-state seed probes never fabricate reachability or force-flush parked obligations', async t => {
+  const lanAddress = Object.values(networkInterfaces())
+    .flatMap(addresses => addresses ?? [])
+    .find(address => address.family === 'IPv4' && !address.internal)?.address;
+  if (!lanAddress) {
+    t.skip('no non-loopback IPv4 interface is available to exercise a direct seed probe');
+    return;
+  }
+  const root = directory(t);
+  const seedKernel = new Kernel();
+  t.after(() => seedKernel.stop());
+  const seed = new P2PTransportService(
+    {
+      discoveryDir: join(root, 'seed'),
+      multicast: false,
+      advertisedHost: lanAddress,
+    },
+    seedKernel.ctx,
+  );
+  t.after(() => seed.dispose());
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    { discoveryDir: join(root, 'client'), multicast: false, discoveryIntervalMs: 50 },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [seed.endpointAddr!],
+  });
+
+  const sender = generateNodeKeyPair();
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+  // An unresolved selector can only be moved by identity-directory resolution, and the
+  // parked in-doubt item can only be moved by an explicit force: a steady-state seed
+  // refresh must do neither.
+  const unresolved = outbox.enqueue({
+    envelope: envelopeFor(sender, NETWORK, 'member:unseen'),
+    explicitTargets: ['member:unseen'],
+    pendingNodeIds: [],
+  });
+  const parked = outbox.enqueue({
+    envelope: threadedEnvelope(sender, NETWORK, seed.localNodeId, 'EVT-PARKED', 'thread-parked'),
+    explicitTargets: [seed.localNodeId],
+    pendingNodeIds: [seed.localNodeId],
+  });
+  outbox.recordAttempt(parked.id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+    inDoubtNodeIds: [seed.localNodeId],
+  });
+  const attemptsBefore = {
+    unresolved: outbox.get(unresolved.id)!.attempts,
+    parked: outbox.get(parked.id)!.attempts,
+  };
+  const outboxBefore = readFileSync(join(root, 'outbox.json'), 'utf8');
+
+  const reachability: PeerReachableEvent[] = [];
+  kernel.ctx.on('transport/peer-reachable', event => reachability.push(event));
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    intervalMs: 60_000,
+    events: {
+      on: (event, listener) => kernel.ctx.on(event, listener),
+    },
+    deliver: async candidate => {
+      deliveries.push(candidate.envelope.id);
+      return {
+        pendingNodeIds: candidate.pendingNodeIds,
+        inDoubtNodeIds: candidate.inDoubtNodeIds,
+      };
+    },
+  });
+  service.start();
+  t.after(() => service.stop());
+
+  // At least two full seed-probe cycles (rate-limited to 2s) with nothing changing.
+  await new Promise(resolveProbe => setTimeout(resolveProbe, 4_600));
+  assert.deepEqual(reachability, [], 'a steady-state seed refresh is not a reachability transition');
+  assert.equal(
+    mountOf(transport, NETWORK).relays.has(seed.localNodeId),
+    false,
+    'a seed is never mapped as its own relay',
+  );
+  assert.deepEqual(deliveries, [], 'no parked obligation is force-flushed by a probe');
+  assert.equal(outbox.get(unresolved.id)!.attempts, attemptsBefore.unresolved);
+  assert.equal(outbox.get(parked.id)!.attempts, attemptsBefore.parked);
+  assert.equal(
+    readFileSync(join(root, 'outbox.json'), 'utf8'),
+    outboxBefore,
+    'steady-state probes never rewrite outbox.json',
+  );
+});
+
+test('a reachability pulse never reroutes unresolved selectors while an identity pulse does', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['unseen'] });
+  const unseen = harness.targetByMember.get('unseen')!;
+  const item = harness.outbox.enqueue({
+    envelope: envelopeFor(harness.sender, harness.networkId, 'member:unseen'),
+    explicitTargets: ['member:unseen'],
+    pendingNodeIds: [],
+  });
+  const parked = harness.outbox.recordAttempt(item.id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+  })!;
+  assert.ok(harness.emitter.redriveOutboxItem, 'emitter owns redrive delivery');
+  const service = new OutboxRedriveService({
+    outbox: harness.outbox,
+    intervalMs: 60_000,
+    events: {
+      on: (event, listener) => harness.kernel.ctx.on(event, listener),
+    },
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+  });
+  service.start();
+  t.after(() => service.stop());
+
+  // Transport liveness for an unrelated peer cannot resolve `member:unseen`.
+  harness.kernel.ctx.emit('transport/peer-reachable', {
+    networkId: harness.networkId,
+    nodeId: generateNodeKeyPair().nodeId,
+    via: 'direct',
+  });
+  await new Promise(resolvePulse => setTimeout(resolvePulse, 100));
+  assert.equal(harness.outbox.get(item.id)!.attempts, parked.attempts);
+  assert.equal(harness.outbox.get(item.id)!.status, 'queued');
+  assert.deepEqual(harness.sendCalls, [], 'the unresolved selector is not force-routed');
+
+  // The identity directory learning the member is what resolves and delivers it.
+  harness.kernel.ctx.emit('node/peer-updated', unseen, { direct: true });
+  await until(
+    () => harness.outbox.get(item.id)!.status === 'delivered',
+    'the identity pulse resolves the unresolved selector',
+    5_000,
+  );
+  assert.deepEqual(
+    harness.sendCalls.map(call => call.targetNodeId),
+    [unseen.nodeId],
+    'identity resolution routes the unresolved selector to the learned member',
+  );
+  assert.deepEqual(
+    Object.keys(harness.outbox.get(item.id)!.deliveredReceipts),
+    [unseen.nodeId],
+  );
 });
 
 test('bootstrapPeers with self aliases and a hairpin forwarder never self-tunnel or self-spool', async t => {

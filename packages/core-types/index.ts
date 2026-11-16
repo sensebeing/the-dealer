@@ -548,6 +548,12 @@ export interface OutboxFlushOptions {
   force?: boolean;
   /** Force only the target named by `targetNodeId`, leaving unrelated schedule state intact. */
   forceMatchingTarget?: boolean;
+  /**
+   * When combined with `forceMatchingTarget`, also retry obligations whose explicit selector
+   * has not resolved to any target yet; used by identity directory updates, never by
+   * transport beacon pulses.
+   */
+  includeUnresolved?: boolean;
 }
 
 export interface OutboxFlushResult {
