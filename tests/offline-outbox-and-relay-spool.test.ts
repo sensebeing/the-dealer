@@ -15,7 +15,7 @@ import {
 } from 'node:fs';
 import { request } from 'node:http';
 import { createConnection, createServer, type Socket } from 'node:net';
-import { tmpdir, hostname } from 'node:os';
+import { tmpdir, hostname, networkInterfaces } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DealerNodeRuntime } from '../packages/cli/runtime.ts';
@@ -54,6 +54,8 @@ import type {
   MessageEnvelope,
   NodeCard,
   NodeService,
+  OutboxItem,
+  PeerReachableEvent,
   SealedNetworkFrame,
   TransportService,
 } from '../packages/core-types/index.ts';
@@ -659,6 +661,17 @@ async function emitterHarness(
     sendError?: Error;
     attemptTimeoutMs?: number;
     extraMembers?: readonly string[];
+    /** Replace only the wire hop: an emitter-level test over a real transport instance. */
+    send?: (
+      targetNodeId: string,
+      frame: Uint8Array,
+      opts?: {
+        timeoutMs?: number;
+        spoolIfOffline?: boolean;
+        spoolKey?: string;
+        spoolBlobHashes?: readonly string[];
+      },
+    ) => Promise<Uint8Array>;
     plan?: (
       targetNodeId: string,
       callIndex: number,
@@ -730,6 +743,9 @@ async function emitterHarness(
       }).envelope;
       const callIndex = sendCalls.filter(call => call.targetNodeId === targetNodeId).length;
       sendCalls.push({ targetNodeId, callIndex, ...(opts ? { opts } : {}), envelope });
+      if (options.send) {
+        return options.send(targetNodeId, frame, opts);
+      }
       const plan = options.plan?.(targetNodeId, callIndex) ?? {};
       if (options.sendError) {
         throw options.sendError;
@@ -832,6 +848,7 @@ async function emitterHarness(
     mailbox,
     sentEvents,
     emitter: kernel.ctx.services.emitter,
+    kernel,
     sendCalls,
     setMounted(value: boolean) {
       mounted = value;
@@ -3045,6 +3062,53 @@ test('malformed relay responses surface as local protocol failures, not offline 
   assert.match((failure as Error).message, /Malformed relay response/);
 });
 
+test('unauthenticated self-relay responses fail locally without blacklisting or queueing', async t => {
+  const root = directory(t);
+  const endpoint = await rawRelayServer(t, JSON.stringify({ selfRelay: true }));
+  const client = runtimeFor(root, 'client');
+  t.after(async () => {
+    await client.stop().catch(() => {});
+  });
+  await client.start();
+  await client.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [endpoint],
+  });
+  const harness = await emitterHarness(t, {
+    send: (targetNodeId, frame, opts) =>
+      client.transport.sendUnicast(NETWORK, targetNodeId, frame, opts),
+  });
+  let failure: unknown;
+  try {
+    await harness.emitter.emit({
+      networkId: harness.networkId,
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'collab.request.v1',
+      subject: 'spoofed self relay',
+      body: 'must never become self-blacklist or offline state',
+      payload: {},
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(
+    isLocalDeliveryError(failure),
+    'an unauthenticated selfRelay response is a deterministic protocol failure',
+  );
+  assert.match((failure as Error).message, /Unauthenticated self-relay response/);
+  assert.equal(
+    (client.transport as unknown as { selfEndpoints: Set<string> }).selfEndpoints.has(endpoint),
+    false,
+    'a spoofed self relay never blacklists the seed',
+  );
+  assert.equal(
+    harness.outbox.list({ status: 'queued' }).length,
+    0,
+    'a deterministic protocol failure is not an offline obligation',
+  );
+});
+
 test('relay seed surfaces deterministic target rejection instead of spooling it', async t => {
   const root = directory(t);
   const targetEndpoint = await rawRelayServer(
@@ -3618,4 +3682,974 @@ test('relay spool counts sealed frame bytes against the global budget', async t 
   );
   assert.ok(saved.entries.length < 9, 'large sealed frames are evicted by the byte budget');
   assert.ok(frameBytes <= 32 * 1024 * 1024, 'the global budget includes sealed frame bytes');
+});
+
+// ---------------------------------------------------------------------------
+// Reachability attribution, sleep/wake redrive and self-seed exclusion.
+// ---------------------------------------------------------------------------
+
+function portOf(endpoint: string): number {
+  return Number(endpoint.slice(endpoint.lastIndexOf(':') + 1));
+}
+
+/** One authenticated sealed discovery beacon, the only liveness evidence transport trusts. */
+function sealedDiscovery(
+  keys: ReturnType<typeof deriveNetworkKeys>,
+  senderNodeId: string,
+  endpointAddr: string,
+  ttlMs = 10_000,
+): SealedNetworkFrame {
+  return sealNetworkFrame(
+    { type: 'discovery', endpointAddr, expires: Date.now() + ttlMs },
+    keys,
+    senderNodeId,
+  );
+}
+
+/** Deliver one sealed beacon to a listener exactly as a waking peer's announce would. */
+async function sendDiscoveryBeacon(
+  port: number,
+  frame: SealedNetworkFrame,
+  peers: readonly SealedNetworkFrame[] = [],
+): Promise<any> {
+  return tcpRequest(port, { type: 'discovery', frame, peers: [...peers] });
+}
+
+/**
+ * Open the peer's real persistent tunnel and answer every forwarded frame with a sealed
+ * reply bound to its nonce. `received` records the decoded application payloads in order.
+ */
+async function openAcceptingTunnel(
+  t: TestContext,
+  port: number,
+  keys: ReturnType<typeof deriveNetworkKeys>,
+  targetNodeId: string,
+  received: string[],
+): Promise<void> {
+  const socket = createConnection({ host: '127.0.0.1', port });
+  t.after(() => socket.destroy());
+  let buffer = Buffer.alloc(0);
+  let acknowledge: (() => void) | undefined;
+  let acknowledged = false;
+  const ready = new Promise<void>((resolve, reject) => {
+    acknowledge = resolve;
+    socket.once('error', reject);
+  });
+  socket.on('connect', () => {
+    socket.write(framed({
+      type: 'tunnel',
+      frame: sealNetworkFrame(
+        { type: 'discovery', endpointAddr: '127.0.0.1:9', expires: Date.now() + 20_000 },
+        keys,
+        targetNodeId,
+      ),
+    }));
+  });
+  socket.on('data', chunk => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 4) {
+      const size = buffer.readUInt32BE(0);
+      if (buffer.length < size + 4) {
+        return;
+      }
+      const message = JSON.parse(buffer.subarray(4, size + 4).toString('utf8'));
+      buffer = buffer.subarray(size + 4);
+      if (message?.type === 'tunnel_ack' && !acknowledged) {
+        acknowledged = true;
+        acknowledge?.();
+        continue;
+      }
+      if (message?.type === 'relay_deliver' && typeof message.relayId === 'string' && message.frame) {
+        const inner = unsealNetworkFrame<{ dataBase64?: string }>(message.frame, keys);
+        received.push(Buffer.from(inner.dataBase64 ?? '', 'base64').toString('utf8'));
+        socket.write(framed({
+          type: 'relay_reply',
+          relayId: message.relayId,
+          frame: sealNetworkFrame(
+            {
+              requestNonce: message.frame.nonce,
+              dataBase64: Buffer.from('delivered').toString('base64'),
+            },
+            keys,
+            targetNodeId,
+          ),
+        }));
+      }
+    }
+  });
+  await ready;
+}
+
+/** A TCP forwarder back to this node's own listener: a hairpinned alias of self. */
+async function hairpinForwarder(
+  t: TestContext,
+  targetPort: number,
+  delayMs = 0,
+): Promise<string> {
+  const server = createServer(client => {
+    // Hold the request until the delay elapses so a race test can guarantee a real seed
+    // completes its probe first; `pipe` resumes the paused socket with buffered bytes.
+    client.pause();
+    client.on('error', () => {});
+    const forward = () => {
+      const upstream = createConnection({ host: '127.0.0.1', port: targetPort });
+      client.pipe(upstream);
+      upstream.pipe(client);
+      client.on('error', () => upstream.destroy());
+      upstream.on('error', () => client.destroy());
+    };
+    if (delayMs > 0) {
+      setTimeout(forward, delayMs);
+    } else {
+      forward();
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  t.after(
+    () =>
+      new Promise<void>(resolve => {
+        server.close(() => resolve());
+      }),
+  );
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Invalid hairpin address');
+  }
+  return `127.0.0.1:${address.port}`;
+}
+
+function mountOf(
+  transport: P2PTransportService,
+  networkId: string,
+): {
+  outboundTunnels: Map<string, { seed: string }>;
+  inboundTunnels: Map<string, unknown>;
+  relays: Map<string, string>;
+  peers: Map<string, string>;
+} {
+  const mounts = (transport as unknown as {
+    mounts: Map<string, {
+      outboundTunnels: Map<string, { seed: string }>;
+      inboundTunnels: Map<string, unknown>;
+      relays: Map<string, string>;
+      peers: Map<string, string>;
+    }>;
+  }).mounts;
+  const mount = mounts.get(networkId);
+  if (!mount) {
+    throw new Error(`Network not mounted: ${networkId}`);
+  }
+  return mount;
+}
+
+test('a sleeping peer behind a zombie relay tunnel is spooled as offline and its causal thread drains on wake', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const seed = new P2PTransportService({
+    discoveryDir: join(root, 'seed-discovery'),
+    spoolDir: join(root, 'seed-spool'),
+    multicast: false,
+    socketTimeoutMs: 5_000,
+  });
+  t.after(() => seed.dispose());
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const seedPort = portOf(seed.endpointAddr!);
+  const spoolFile = join(root, 'seed-spool', `${keys.swarmTopicId}.json`);
+
+  const sender = new P2PTransportService({
+    discoveryDir: join(root, 'sender-discovery'),
+    multicast: false,
+    socketTimeoutMs: 5_000,
+  });
+  t.after(() => sender.dispose());
+  await sender.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [seed.endpointAddr!],
+  });
+  const harness = await emitterHarness(t, {
+    send: (targetNodeId, frame, opts) =>
+      sender.sendUnicast(NETWORK, targetNodeId, frame, opts),
+  });
+  const target = harness.targetCard.nodeId;
+
+  // The peer closed its lid after opening a tunnel: the TCP socket stays half-open with an
+  // already expired discovery beacon, so no relay_deliver will ever be answered.
+  const zombie = createConnection({ host: '127.0.0.1', port: seedPort });
+  t.after(() => zombie.destroy());
+  await new Promise<void>((resolve, reject) => {
+    zombie.once('error', reject);
+    let buffer = Buffer.alloc(0);
+    zombie.on('connect', () => {
+      zombie.write(framed({
+        type: 'tunnel',
+        frame: sealNetworkFrame(
+          { type: 'discovery', endpointAddr: '127.0.0.1:9', expires: Date.now() + 150 },
+          keys,
+          target,
+        ),
+      }));
+    });
+    zombie.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 4) {
+        const size = buffer.readUInt32BE(0);
+        if (buffer.length < size + 4) {
+          return;
+        }
+        const message = JSON.parse(buffer.subarray(4, size + 4).toString('utf8'));
+        buffer = buffer.subarray(size + 4);
+        if (message?.type === 'tunnel_ack') {
+          resolve();
+          return;
+        }
+      }
+    });
+  });
+  await new Promise(resolveStorage => setTimeout(resolveStorage, 250));
+  // The tunnel socket is still half-open, but its beacon expired: a stale socket alone is
+  // never live reachability evidence.
+  assert.equal(seed.isPeerReachable(NETWORK, target), false);
+
+  const threadId = 'thread-a1';
+  const emittedIds: string[] = [];
+  const startedAt = Date.now();
+  for (const label of ['EVT-0002', 'EVT-0003', 'EVT-0004']) {
+    const emitted = await harness.emitter.emit({
+      networkId: harness.networkId,
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'collab.request.v1',
+      subject: label,
+      body: label,
+      payload: {},
+      semantic: { type: 'reply', threadId },
+    });
+    assert.equal(emitted.receipts[0]?.stage, 'queued');
+    emittedIds.push(emitted.messageId);
+  }
+  // The relay seed's dead tunnel was evicted instead of hanging the sender, and an offline
+  // target behind it is durable spooling evidence, never a possibly-executed in-doubt send.
+  assert.ok(
+    Date.now() - startedAt < 5_000,
+    'the zombie tunnel is bounded by the relay failover window',
+  );
+  const queued = harness.outbox.list({ status: 'queued' });
+  assert.equal(queued.length, 3);
+  for (const item of queued) {
+    assert.deepEqual(item.pendingNodeIds, [harness.targetCard.nodeId]);
+    assert.deepEqual(item.inDoubtNodeIds, []);
+    assert.deepEqual(item.relaySpooledNodeIds, [harness.targetCard.nodeId]);
+    assert.equal(item.deliveredReceipts[harness.targetCard.nodeId], undefined);
+  }
+  const spooled = readRelaySpool(spoolFile);
+  assert.deepEqual(
+    spooled.entries.map(entry => entry.id),
+    emittedIds.map(id => `${sender.localNodeId}:${id}`),
+    'the causal thread is spooled in order',
+  );
+
+  // The peer wakes and reconnects its own tunnel: the seed drains the whole thread in FIFO
+  // order, which is only possible because the dead zombie tunnel was evicted above.
+  const delivered: string[] = [];
+  await openAcceptingTunnel(t, seedPort, keys, target, delivered);
+  await until(
+    () => readRelaySpool(spoolFile).entries.length === 0,
+    'the reconnected peer drains the whole spooled thread',
+    10_000,
+  );
+  assert.deepEqual(
+    delivered.map(body => (JSON.parse(body) as { envelope?: { id?: string } }).envelope?.id),
+    emittedIds,
+  );
+});
+
+test('an in-doubt send reconciles on its normal schedule once transport proves the peer live without executing twice', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    { discoveryDir: join(root, 'mesh'), multicast: false },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  await transport.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const port = portOf(transport.endpointAddr!);
+  const targetKeyPair = generateNodeKeyPair();
+  const target = targetKeyPair.nodeId;
+  const sender = generateNodeKeyPair();
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+  const item = outbox.enqueue({
+    envelope: threadedEnvelope(sender, NETWORK, target, 'EVT-A2', 'thread-a2'),
+    explicitTargets: [target],
+    pendingNodeIds: [target],
+  });
+
+  // The receiver's DeliveryLedger/dedup-cas: executing the same signed envelope id twice
+  // is impossible, so a redrive answers from the ledger instead of running the handler.
+  const executions: string[] = [];
+  const ledger = new Map<string, DeliveryReceipt>();
+  let dropReply = true;
+  const deliver = async (candidate: OutboxItem) => {
+    let receipt = ledger.get(candidate.envelope.id);
+    if (!receipt) {
+      executions.push(candidate.envelope.id);
+      receipt = signReceipt(
+        {
+          messageId: candidate.envelope.id,
+          networkId: candidate.networkId,
+          fromNodeId: target,
+          stage: 'dispatched',
+          updatedAt: new Date().toISOString(),
+        },
+        targetKeyPair.privateKeyPem,
+      );
+      ledger.set(candidate.envelope.id, receipt);
+    }
+    if (dropReply) {
+      // The target ran, but its reply packet was lost: the sender cannot know that.
+      dropReply = false;
+      return { pendingNodeIds: [target], inDoubtNodeIds: [target], lastError: 'Transport timeout' };
+    }
+    return { deliveredReceipts: { [target]: receipt }, pendingNodeIds: [], inDoubtNodeIds: [] };
+  };
+  const service = new OutboxRedriveService({
+    outbox,
+    deliver,
+    isPeerReachable: (networkId, nodeId) => transport.isPeerReachable(networkId, nodeId),
+  });
+
+  await service.flush();
+  let current = outbox.get(item.id)!;
+  assert.deepEqual(current.inDoubtNodeIds, [target], 'a lost reply after execution is in doubt');
+  assert.deepEqual(executions, [item.id]);
+
+  // Due on the ordinary schedule, but transport holds no live evidence for the target.
+  outbox.recordAttempt(item.id, { nextAttemptAt: new Date().toISOString() });
+  await service.flush();
+  assert.deepEqual(executions, [item.id], 'without live evidence the in-doubt target stays parked');
+  assert.deepEqual(outbox.get(item.id)!.inDoubtNodeIds, [target]);
+
+  // The peer never restarted (`NodeCard.revision` unchanged): one sealed beacon is the
+  // only proof of liveness, and the parked obligation reconciles on its normal backoff.
+  await sendDiscoveryBeacon(port, sealedDiscovery(keys, target, '127.0.0.1:9'));
+  assert.equal(transport.isPeerReachable(NETWORK, target), true);
+  outbox.recordAttempt(item.id, { nextAttemptAt: new Date().toISOString() });
+  await service.flush();
+  current = outbox.get(item.id)!;
+  assert.equal(current.status, 'delivered');
+  assert.deepEqual(current.inDoubtNodeIds, []);
+  assert.deepEqual(executions, [item.id], 'the receiver ledger answers the duplicate');
+  assert.equal(ledger.size, 1);
+  await service.stop();
+});
+
+test('a sleep/wake beacon pulse with an unchanged identity drains a parked causal thread within 2s', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    { discoveryDir: join(root, 'mesh'), multicast: false },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  await transport.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const port = portOf(transport.endpointAddr!);
+  const targetKeyPair = generateNodeKeyPair();
+  const target = targetKeyPair.nodeId;
+  const sender = generateNodeKeyPair();
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+  const threadId = 'thread-b1';
+  const ids = ['EVT-0002', 'EVT-0003', 'EVT-0004'];
+  const items = ids.map(id =>
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, NETWORK, target, id, threadId),
+      explicitTargets: [target],
+      pendingNodeIds: [target],
+    }),
+  );
+  // The head is parked in doubt with 60s of backoff: only real reachability may move it,
+  // and no forced operator flush is involved anywhere in this test.
+  outbox.recordAttempt(items[0].id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+    inDoubtNodeIds: [target],
+  });
+
+  const reachability: PeerReachableEvent[] = [];
+  const identityPulses: string[] = [];
+  kernel.ctx.on('transport/peer-reachable', event => reachability.push(event));
+  kernel.ctx.on('node/peer-updated', card => identityPulses.push(card.nodeId));
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    intervalMs: 60_000,
+    events: {
+      on: (event, listener) => kernel.ctx.on(event, listener),
+    },
+    deliver: async (candidate, options) => {
+      const targets = options?.targetNodeIds ?? candidate.pendingNodeIds;
+      deliveries.push(candidate.envelope.id);
+      return {
+        deliveredReceipts: Object.fromEntries(
+          targets.map(nodeId => [
+            nodeId,
+            {
+              messageId: candidate.envelope.id,
+              networkId: candidate.networkId,
+              fromNodeId: nodeId,
+              stage: 'dispatched',
+              updatedAt: new Date().toISOString(),
+              signature: 'test-signature',
+            },
+          ]),
+        ),
+        pendingNodeIds: [],
+        inDoubtNodeIds: [],
+      };
+    },
+  });
+  service.start();
+  t.after(() => service.stop());
+
+  const startedAt = Date.now();
+  await sendDiscoveryBeacon(port, sealedDiscovery(keys, target, '127.0.0.1:9'));
+  await until(
+    () => outbox.list({ status: 'delivered' }).length === 3,
+    'the reachability pulse drains the whole causal thread',
+    5_000,
+  );
+  assert.ok(Date.now() - startedAt < 2_000, 'the wake pulse redrives without waiting out backoff');
+  assert.deepEqual(deliveries, ids, 'the causal thread is drained in order');
+  assert.deepEqual(reachability, [{ networkId: NETWORK, nodeId: target, via: 'direct' }]);
+  assert.deepEqual(identityPulses, [], 'identity cards never advance a retry clock');
+  assert.equal(transport.isPeerReachable(NETWORK, target), true);
+
+  // A steady-state refresh of the same beacon is not a new reachability transition.
+  await sendDiscoveryBeacon(port, sealedDiscovery(keys, target, '127.0.0.1:9', 9_000));
+  assert.equal(reachability.length, 1, 'only live transitions pulse; refreshes stay silent');
+});
+
+test('a relay seed gossips a waking peer beacon so a cross-subnet obligation redrives without an identity change', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const seedKernel = new Kernel();
+  t.after(() => seedKernel.stop());
+  const seed = new P2PTransportService(
+    { discoveryDir: join(root, 'seed'), multicast: false },
+    seedKernel.ctx,
+  );
+  t.after(() => seed.dispose());
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    { discoveryDir: join(root, 'ben'), multicast: false },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [seed.endpointAddr!],
+  });
+  await until(
+    () => transport.isPeerReachable(NETWORK, seed.localNodeId),
+    'the sender learns the relay seed beacon',
+    5_000,
+  );
+
+  const targetKeyPair = generateNodeKeyPair();
+  const target = targetKeyPair.nodeId;
+  const sender = generateNodeKeyPair();
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+  const threadId = 'thread-b2';
+  const ids = ['EVT-0002', 'EVT-0003'];
+  const items = ids.map(id =>
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, NETWORK, target, id, threadId),
+      explicitTargets: [target],
+      pendingNodeIds: [target],
+    }),
+  );
+  outbox.recordAttempt(items[0].id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+
+  const reachability: PeerReachableEvent[] = [];
+  kernel.ctx.on('transport/peer-reachable', event => reachability.push(event));
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    intervalMs: 60_000,
+    events: {
+      on: (event, listener) => kernel.ctx.on(event, listener),
+    },
+    deliver: async (candidate, options) => {
+      const targets = options?.targetNodeIds ?? candidate.pendingNodeIds;
+      deliveries.push(candidate.envelope.id);
+      return {
+        deliveredReceipts: Object.fromEntries(
+          targets.map(nodeId => [
+            nodeId,
+            {
+              messageId: candidate.envelope.id,
+              networkId: candidate.networkId,
+              fromNodeId: nodeId,
+              stage: 'dispatched',
+              updatedAt: new Date().toISOString(),
+              signature: 'test-signature',
+            },
+          ]),
+        ),
+        pendingNodeIds: [],
+        inDoubtNodeIds: [],
+      };
+    },
+  });
+  service.start();
+  t.after(() => service.stop());
+
+  // The peer is on an isolated subnet: only the seed can ever see its beacon.
+  await sendDiscoveryBeacon(portOf(seed.endpointAddr!), sealedDiscovery(keys, target, '192.0.2.44:9'));
+  await until(
+    () => reachability.some(event => event.nodeId === target),
+    'the seed gossips the waking peer beacon',
+    8_000,
+  );
+  assert.deepEqual(
+    reachability.filter(event => event.nodeId === target),
+    [{ networkId: NETWORK, nodeId: target, via: 'relay' }],
+  );
+  await until(
+    () => outbox.list({ status: 'delivered' }).length === 2,
+    'the gossiped relay pulse redrives the cross-subnet thread',
+    5_000,
+  );
+  assert.deepEqual(deliveries, ids);
+  assert.equal(transport.isPeerReachable(NETWORK, target), true);
+});
+
+test('steady-state seed probes never fabricate reachability or force-flush parked obligations', async t => {
+  const lanAddress = Object.values(networkInterfaces())
+    .flatMap(addresses => addresses ?? [])
+    .find(address => address.family === 'IPv4' && !address.internal)?.address;
+  if (!lanAddress) {
+    t.skip('no non-loopback IPv4 interface is available to exercise a direct seed probe');
+    return;
+  }
+  const root = directory(t);
+  const seedKernel = new Kernel();
+  t.after(() => seedKernel.stop());
+  const seed = new P2PTransportService(
+    {
+      discoveryDir: join(root, 'seed'),
+      multicast: false,
+      advertisedHost: lanAddress,
+    },
+    seedKernel.ctx,
+  );
+  t.after(() => seed.dispose());
+  await seed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    { discoveryDir: join(root, 'client'), multicast: false, discoveryIntervalMs: 50 },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [seed.endpointAddr!],
+  });
+  await until(
+    () => transport.isPeerReachable(NETWORK, seed.localNodeId),
+    'client learns the non-loopback seed beacon',
+    5_000,
+  );
+
+  const sender = generateNodeKeyPair();
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+  // An unresolved selector can only be moved by identity-directory resolution, and the
+  // parked in-doubt item can only be moved by an explicit force: a steady-state seed
+  // refresh must do neither.
+  const unresolved = outbox.enqueue({
+    envelope: envelopeFor(sender, NETWORK, 'member:unseen'),
+    explicitTargets: ['member:unseen'],
+    pendingNodeIds: [],
+  });
+  const parked = outbox.enqueue({
+    envelope: threadedEnvelope(sender, NETWORK, seed.localNodeId, 'EVT-PARKED', 'thread-parked'),
+    explicitTargets: [seed.localNodeId],
+    pendingNodeIds: [seed.localNodeId],
+  });
+  outbox.recordAttempt(parked.id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+    inDoubtNodeIds: [seed.localNodeId],
+  });
+  const attemptsBefore = {
+    unresolved: outbox.get(unresolved.id)!.attempts,
+    parked: outbox.get(parked.id)!.attempts,
+  };
+  const outboxBefore = readFileSync(join(root, 'outbox.json'), 'utf8');
+
+  const reachability: PeerReachableEvent[] = [];
+  kernel.ctx.on('transport/peer-reachable', event => reachability.push(event));
+  const deliveries: string[] = [];
+  const service = new OutboxRedriveService({
+    outbox,
+    intervalMs: 60_000,
+    events: {
+      on: (event, listener) => kernel.ctx.on(event, listener),
+    },
+    deliver: async candidate => {
+      deliveries.push(candidate.envelope.id);
+      return {
+        pendingNodeIds: candidate.pendingNodeIds,
+        inDoubtNodeIds: candidate.inDoubtNodeIds,
+      };
+    },
+  });
+  service.start();
+  t.after(() => service.stop());
+
+  // At least two full seed-probe cycles (rate-limited to 2s) with nothing changing.
+  await new Promise(resolveProbe => setTimeout(resolveProbe, 4_600));
+  assert.equal(
+    transport.isPeerReachable(NETWORK, seed.localNodeId),
+    true,
+    'every probe cycle actually reached the non-loopback seed',
+  );
+  assert.deepEqual(reachability, [], 'a steady-state seed refresh is not a reachability transition');
+  assert.equal(
+    mountOf(transport, NETWORK).relays.has(seed.localNodeId),
+    false,
+    'a seed is never mapped as its own relay',
+  );
+  assert.deepEqual(deliveries, [], 'no parked obligation is force-flushed by a probe');
+  assert.equal(outbox.get(unresolved.id)!.attempts, attemptsBefore.unresolved);
+  assert.equal(outbox.get(parked.id)!.attempts, attemptsBefore.parked);
+  assert.equal(
+    readFileSync(join(root, 'outbox.json'), 'utf8'),
+    outboxBefore,
+    'steady-state probes never rewrite outbox.json',
+  );
+});
+
+test('a reachability pulse never reroutes unresolved selectors while an identity pulse does', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['unseen'] });
+  const unseen = harness.targetByMember.get('unseen')!;
+  const item = harness.outbox.enqueue({
+    envelope: envelopeFor(harness.sender, harness.networkId, 'member:unseen'),
+    explicitTargets: ['member:unseen'],
+    pendingNodeIds: [],
+  });
+  const parked = harness.outbox.recordAttempt(item.id, {
+    nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+  })!;
+  assert.ok(harness.emitter.redriveOutboxItem, 'emitter owns redrive delivery');
+  const service = new OutboxRedriveService({
+    outbox: harness.outbox,
+    intervalMs: 60_000,
+    events: {
+      on: (event, listener) => harness.kernel.ctx.on(event, listener),
+    },
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+  });
+  service.start();
+  t.after(() => service.stop());
+
+  // Transport liveness for an unrelated peer cannot resolve `member:unseen`.
+  harness.kernel.ctx.emit('transport/peer-reachable', {
+    networkId: harness.networkId,
+    nodeId: generateNodeKeyPair().nodeId,
+    via: 'direct',
+  });
+  await new Promise(resolvePulse => setTimeout(resolvePulse, 100));
+  assert.equal(harness.outbox.get(item.id)!.attempts, parked.attempts);
+  assert.equal(harness.outbox.get(item.id)!.status, 'queued');
+  assert.deepEqual(harness.sendCalls, [], 'the unresolved selector is not force-routed');
+
+  // The identity directory learning the member is what resolves and delivers it.
+  harness.kernel.ctx.emit('node/peer-updated', unseen, { direct: true });
+  await until(
+    () => harness.outbox.get(item.id)!.status === 'delivered',
+    'the identity pulse resolves the unresolved selector',
+    5_000,
+  );
+  assert.deepEqual(
+    harness.sendCalls.map(call => call.targetNodeId),
+    [unseen.nodeId],
+    'identity resolution routes the unresolved selector to the learned member',
+  );
+  assert.deepEqual(
+    Object.keys(harness.outbox.get(item.id)!.deliveredReceipts),
+    [unseen.nodeId],
+  );
+});
+
+test('bootstrapPeers with self aliases and a hairpin forwarder never self-tunnel or self-spool', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    {
+      discoveryDir: join(root, 'mesh'),
+      spoolDir: join(root, 'spool'),
+      multicast: false,
+    },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  // Start the listener on a throwaway network first so the self aliases are known.
+  await transport.mountNetwork({ networkId: 'warmup-net', passphrase: 'secret' });
+  const port = portOf(transport.endpointAddr!);
+  const lanAddress = Object.values(networkInterfaces())
+    .flatMap(addresses => addresses ?? [])
+    .find(address => address.family === 'IPv4' && !address.internal)?.address;
+  const hairpin = await hairpinForwarder(t, port);
+  const bootstrapPeers = [
+    transport.endpointAddr!,
+    `127.0.0.1:${port}`,
+    ...(lanAddress ? [`${lanAddress}:${port}`] : []),
+    hairpin,
+  ];
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers,
+  });
+  // Two full seed-probe rounds: every self alias must stay filtered on every round.
+  await new Promise(resolveProbe => setTimeout(resolveProbe, 2_600));
+
+  const mount = mountOf(transport, NETWORK);
+  assert.equal(mount.outboundTunnels.size, 0, 'no outbound tunnel is opened to self');
+  assert.equal(mount.inboundTunnels.size, 0, 'no inbound tunnel is registered from self');
+  assert.equal(mount.relays.has(transport.localNodeId), false, 'self is never a relay seed');
+  assert.equal(mount.peers.has(transport.localNodeId), false, 'self is never a peer endpoint');
+  const selfEndpoints = (transport as unknown as { selfEndpoints: Set<string> }).selfEndpoints;
+  assert.equal(selfEndpoints.has(transport.endpointAddr!), true);
+  assert.equal(selfEndpoints.has(hairpin), true, 'the hairpinned forwarder is proven to be self');
+
+  // The target is offline and every configured "seed" is self: queue locally, never claim
+  // a durable spool handoff on this node itself.
+  const harness = await emitterHarness(t, {
+    send: (targetNodeId, frame, opts) => transport.sendUnicast(NETWORK, targetNodeId, frame, opts),
+  });
+  const selfOnly = await harness.emitter.emit({
+    networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v1',
+    subject: 'self-only seed list',
+    body: 'must stay a local obligation',
+    payload: {},
+  });
+  assert.equal(selfOnly.receipts[0]?.stage, 'queued');
+  assert.equal(selfOnly.receipts[0]?.executionReceipt?.relaySpooled, false);
+  const selfOnlyItem = harness.outbox.get(selfOnly.messageId)!;
+  assert.deepEqual(selfOnlyItem.inDoubtNodeIds, []);
+  assert.deepEqual(selfOnlyItem.relaySpooledNodeIds, []);
+  const spoolFile = join(root, 'spool', `${keys.swarmTopicId}.json`);
+  assert.equal(
+    existsSync(spoolFile) ? readRelaySpool(spoolFile).entries.length : 0,
+    0,
+    'no self relay-spool entry is ever written',
+  );
+
+  // A real seed configured behind the self aliases must still be reached: the static
+  // filter skips self, and the runtime hairpin proof removes the forwarder mid-probe.
+  const realSeed = new P2PTransportService({
+    discoveryDir: join(root, 'seed-discovery'),
+    spoolDir: join(root, 'seed-spool'),
+    multicast: false,
+    socketTimeoutMs: 5_000,
+  });
+  t.after(() => realSeed.dispose());
+  await realSeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await transport.unmountNetwork(NETWORK);
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [...bootstrapPeers, realSeed.endpointAddr!],
+  });
+  const throughRealSeed = await harness.emitter.emit({
+    networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v1',
+    subject: 'real seed behind self',
+    body: 'must spool on the real seed',
+    payload: {},
+  });
+  assert.equal(throughRealSeed.receipts[0]?.stage, 'queued');
+  assert.equal(throughRealSeed.receipts[0]?.executionReceipt?.relaySpooled, true);
+  const throughItem = harness.outbox.get(throughRealSeed.messageId)!;
+  assert.deepEqual(throughItem.relaySpooledNodeIds, [harness.targetCard.nodeId]);
+  assert.deepEqual(throughItem.inDoubtNodeIds, []);
+  assert.deepEqual(
+    readRelaySpool(join(root, 'seed-spool', `${keys.swarmTopicId}.json`)).entries.map(
+      entry => entry.id,
+    ),
+    [`${transport.localNodeId}:${throughRealSeed.messageId}`],
+    'the frame is spooled on the real seed only',
+  );
+  assert.equal(
+    existsSync(spoolFile) ? readRelaySpool(spoolFile).entries.length : 0,
+    0,
+    'the hairpinned self endpoint never stores its own frame',
+  );
+
+  // An alias that only appears after mount (a stale relay mapping) cannot be filtered
+  // statically. The wire response proves it is self, and the send still falls through to
+  // the real seed instead of reporting a self-spooled handoff.
+  const lateHairpin = await hairpinForwarder(t, port);
+  mountOf(transport, NETWORK).relays.set(harness.targetCard.nodeId, lateHairpin);
+  const throughLateAlias = await harness.emitter.emit({
+    networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v1',
+    subject: 'late hairpin alias',
+    body: 'must be rejected by the wire protocol',
+    payload: {},
+  });
+  assert.equal(throughLateAlias.receipts[0]?.stage, 'queued');
+  assert.equal(throughLateAlias.receipts[0]?.executionReceipt?.relaySpooled, true);
+  assert.ok(
+    (transport as unknown as { selfEndpoints: Set<string> }).selfEndpoints.has(lateHairpin),
+    'the wire response proves the alias is this node',
+  );
+  assert.ok(
+    readRelaySpool(join(root, 'seed-spool', `${keys.swarmTopicId}.json`)).entries.some(
+      entry => entry.id === `${transport.localNodeId}:${throughLateAlias.messageId}`,
+    ),
+    'the send advances past the self alias and spools on the real seed',
+  );
+  assert.equal(
+    existsSync(spoolFile) ? readRelaySpool(spoolFile).entries.length : 0,
+    0,
+    'the late self alias never stores its own frame',
+  );
+});
+
+test('a hairpinned self probe still proves itself when a real seed wins the probe round', async t => {
+  const root = directory(t);
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    { discoveryDir: join(root, 'client'), multicast: false },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  // Warm up on a throwaway network so the forwarder can point back at this listener.
+  await transport.mountNetwork({ networkId: 'warmup-net', passphrase: 'secret' });
+  const hairpin = await hairpinForwarder(t, portOf(transport.endpointAddr!), 250);
+  const realSeed = new P2PTransportService({
+    discoveryDir: join(root, 'seed'),
+    multicast: false,
+  });
+  t.after(() => realSeed.dispose());
+  await realSeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+
+  const reachability: PeerReachableEvent[] = [];
+  kernel.ctx.on('transport/peer-reachable', event => reachability.push(event));
+  // The real seed answers within milliseconds while the hairpin holds its request for
+  // 250ms: a per-seed nonce deletion would let the fast probe invalidate the slow one.
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [realSeed.endpointAddr!, hairpin],
+  });
+  assert.equal(
+    (transport as unknown as { selfEndpoints: Set<string> }).selfEndpoints.has(hairpin),
+    true,
+    'the hairpinned forwarder is still proven to be this node',
+  );
+  assert.equal(transport.isPeerReachable(NETWORK, realSeed.localNodeId), true);
+  assert.equal(
+    mountOf(transport, NETWORK).relays.has(transport.localNodeId),
+    false,
+    'self is never mapped as a relay seed',
+  );
+  assert.equal(
+    reachability.filter(event => event.nodeId === transport.localNodeId).length,
+    0,
+    'the self probe never becomes a peer reachability pulse',
+  );
+});
+
+test('a mounted transport purges pre-existing self-spooled snapshot and journal entries', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const selfId = generateNodeKeyPair().nodeId;
+  const remoteSender = generateNodeKeyPair().nodeId;
+  const remoteTarget = generateNodeKeyPair().nodeId;
+  const spoolDir = join(root, 'spool');
+  mkdirSync(spoolDir, { recursive: true });
+  const spoolFile = join(spoolDir, `${keys.swarmTopicId}.json`);
+  const now = Date.now();
+  const expiry = new Date(now + 86_400_000).toISOString();
+  const selfAsSender = {
+    id: `${selfId}:self-spool`,
+    targetNodeId: remoteTarget,
+    networkId: NETWORK,
+    frame: sealNetworkFrame({ payload: 'self-spooled' }, keys, selfId),
+    spooledAt: new Date(now - 2_000).toISOString(),
+    expiresAt: expiry,
+  };
+  const selfAsTarget = {
+    id: `${remoteSender}:incoming-self`,
+    targetNodeId: selfId,
+    networkId: NETWORK,
+    frame: sealNetworkFrame({ payload: 'incoming-self' }, keys, remoteSender),
+    spooledAt: new Date(now - 1_000).toISOString(),
+    expiresAt: expiry,
+  };
+  const legitimate = {
+    id: `${remoteSender}:legitimate`,
+    targetNodeId: remoteTarget,
+    networkId: NETWORK,
+    frame: sealNetworkFrame({ payload: 'legitimate' }, keys, remoteSender),
+    spooledAt: new Date(now - 500).toISOString(),
+    expiresAt: expiry,
+  };
+  writeFileSync(
+    spoolFile,
+    JSON.stringify({
+      schema: 'the-dealer-relay-spool/v1',
+      networkId: NETWORK,
+      entries: [selfAsSender, selfAsTarget],
+    }),
+  );
+  writeFileSync(
+    `${spoolFile}.journal`,
+    `${JSON.stringify({ op: 'upsert', entry: selfAsSender })}\n` +
+      `${JSON.stringify({ op: 'upsert', entry: legitimate })}\n`,
+  );
+
+  const transport = new P2PTransportService({
+    localNodeId: selfId,
+    discoveryDir: join(root, 'mesh'),
+    spoolDir,
+    multicast: false,
+  });
+  t.after(() => transport.dispose());
+  await transport.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+
+  const saved = readRelaySpool(spoolFile);
+  assert.deepEqual(
+    saved.entries.map(entry => entry.id),
+    [legitimate.id],
+    'only the entry with two real remote endpoints survives',
+  );
+  assert.equal(
+    existsSync(`${spoolFile}.journal`),
+    false,
+    'the dropped self entries are compacted into one clean snapshot',
+  );
 });

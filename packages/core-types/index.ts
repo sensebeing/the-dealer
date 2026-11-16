@@ -353,6 +353,20 @@ export interface InboundFrameEvent {
   payload: unknown;
 }
 
+/** Which authenticated evidence proved a peer reachable: its own beacon, gossip, or a tunnel. */
+export type PeerReachabilityVia = 'direct' | 'relay' | 'tunnel';
+
+/**
+ * A live reachability transition owned by transport, not by identity: it fires when a peer
+ * becomes reachable again (fresh sealed beacon, gossiped beacon, or its inbound tunnel) even
+ * though the peer's signed `NodeCard.revision` never changed across a sleep/wake cycle.
+ */
+export interface PeerReachableEvent {
+  networkId: string;
+  nodeId: string;
+  via: PeerReachabilityVia;
+}
+
 export interface MountedNetworkHandle extends Disposable {
   readonly networkId: string;
   readonly swarmTopicId: string;
@@ -368,6 +382,13 @@ export interface TransportService {
   registerPeerEndpoint?(networkId: string, peerNodeId: string, endpointAddr: string): void;
   /** Make a locally available file addressable by its BLAKE3 hash for blob fetches. */
   registerBlob?(hash: string, filePath: string): void;
+  /**
+   * True when transport holds an unexpired authenticated discovery beacon for
+   * `peerNodeId`. Reachability is transport's alone: a verified `NodeCard` proves identity,
+   * never liveness, and neither does a lingering half-open tunnel whose beacon has expired,
+   * so durable obligations must consult this before resending.
+   */
+  isPeerReachable?(networkId: string, peerNodeId: string): boolean;
   sendUnicast(
     networkId: string,
     targetNodeId: string,
@@ -527,6 +548,12 @@ export interface OutboxFlushOptions {
   force?: boolean;
   /** Force only the target named by `targetNodeId`, leaving unrelated schedule state intact. */
   forceMatchingTarget?: boolean;
+  /**
+   * When combined with `forceMatchingTarget`, also retry obligations whose explicit selector
+   * has not resolved to any target yet; used by identity directory updates, never by
+   * transport beacon pulses.
+   */
+  includeUnresolved?: boolean;
 }
 
 export interface OutboxFlushResult {

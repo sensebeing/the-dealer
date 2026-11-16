@@ -588,6 +588,9 @@ export class DealerNodeRuntime {
         events: {
           on: (event, listener) => this.kernel.ctx.on(event, listener),
         },
+        // Transport owns live reachability: a parked in-doubt target is only reconciled on
+        // its normal schedule once a fresh beacon or its own tunnel proves it online.
+        isPeerReachable: (networkId, nodeId) => this.transport.isPeerReachable(networkId, nodeId),
         onError: error => {
           this.lastError = String(error);
         },
