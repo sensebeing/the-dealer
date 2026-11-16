@@ -376,12 +376,14 @@ export async function probeOrcaTerminalIdle(
     : { idle: false, reason: `Terminal idle probe failed: ${result.reason ?? 'Terminal is busy'}` };
 }
 
-/** Shared interactive Antigravity launcher for fixed and task workspaces. */
+/**
+ * Shared interactive Antigravity launcher for fixed and task workspaces.
+ * Antigravity accounts are owned by Orca's native account pool and `agy-switch`; the launcher
+ * never probes for or delegates to the retired Magpie wrapper (which still exists on hosts for
+ * Claude Code and Codex routing).
+ */
 export function defaultAntigravityLaunchCommand(): string {
-  const magpie = join(homedir(), '.local/bin/magpie');
-  return existsSync(magpie)
-    ? `'${magpie.replace(/'/g, "'\\''")}' agy run --dangerously-skip-permissions`
-    : 'agy --dangerously-skip-permissions';
+  return 'agy --dangerously-skip-permissions';
 }
 
 export type SupportedOrcaAgent = 'antigravity' | 'claude' | 'codex';

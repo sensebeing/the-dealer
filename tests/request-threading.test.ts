@@ -198,6 +198,14 @@ test('mock Orca runner never mutates default Antigravity settings during workspa
   if (before) assert.deepEqual(readFileSync(settings), before);
 });
 
+test('default Antigravity launcher invokes native agy and never the retired Magpie wrapper', () => {
+  // Antigravity accounts are owned by Orca's native account pool and `agy-switch`; the retired
+  // Magpie wrapper remains installed for Claude Code and Codex routing but must never wrap `agy`.
+  // Failure means Dealer re-coupled Antigravity launches to an external wrapper binary instead of
+  // launching native `agy` directly.
+  assert.equal(defaultAntigravityLaunchCommand(), 'agy --dangerously-skip-permissions');
+});
+
 test('spawned terminals wait for idle before a prefixed pointer is injected', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
