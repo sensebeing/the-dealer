@@ -919,8 +919,9 @@ test('Orca idle inspection includes child workspaces and rejects truncated inven
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
 });
 
-test('Orca idle inspection trusts real TUI previews and skips terminal wait', async () => {
+test('Orca idle inspection trusts real TUI previews and probes only exact mode placeholders', async () => {
   let lastLine = '  ⏵⏵ bypass permissions on';
+  let waitOk = false;
   let waits = 0;
   const runner: CommandRunner = async request => {
     if (request.args[0] === 'worktree') {
@@ -963,7 +964,7 @@ test('Orca idle inspection trusts real TUI previews and skips terminal wait', as
     }
     if (request.args[1] === 'wait') {
       waits++;
-      return { stdout: '{"ok":false,"error":{"code":"timeout"}}' };
+      return { stdout: JSON.stringify({ ok: waitOk, ...(waitOk ? {} : { error: { code: 'timeout' } }) }) };
     }
     return { stdout: '{"ok":true}' };
   };
@@ -971,8 +972,19 @@ test('Orca idle inspection trusts real TUI previews and skips terminal wait', as
   assert.equal(waits, 0);
   lastLine = '> unsent draft';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
+  assert.equal(waits, 0, 'an unsent draft is never resolved by a readiness probe');
   lastLine = '>';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
+  assert.equal(waits, 0);
+  // Only the exact Antigravity mode placeholder on an empty composer may consult the readiness
+  // probe; a changed hint stays busy without one.
+  lastLine = '> Auto mode: edits & safe commands auto-approved';
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
+  assert.equal(waits, 0);
+  lastLine = '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)';
+  waitOk = true;
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
+  assert.equal(waits, 1);
 });
 
 test('local command executor actually runs a process and captures JSON without shell interpolation', async () => {
