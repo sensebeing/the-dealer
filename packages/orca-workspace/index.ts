@@ -138,6 +138,27 @@ export function isAutopilotComposerPrefill(preview: string): boolean {
   });
 }
 
+/**
+ * Antigravity (agy >= 1.5.9) draws these exact execution-mode hints inside an empty `> `
+ * composer. Orca's plain-text preview strips the dim styling, so only this vocabulary can mark a
+ * `> ` line as a placeholder: everything else remains indistinguishable from an unsent human
+ * draft. A changed hint or an unknown agent fails closed, keeping the composer busy.
+ */
+const ANTIGRAVITY_MODE_PLACEHOLDERS: ReadonlySet<string> = new Set([
+  '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
+  '> Plan mode: research & plan only (shift+tab to cycle)',
+  '> Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
+  '> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
+]);
+
+/** True only for an exact Antigravity mode hint on an Antigravity-owned composer line. */
+export function isAntigravityModePlaceholder(
+  previewLine: string,
+  agentIdentity?: unknown,
+): boolean {
+  return agentIdentity === 'antigravity' && ANTIGRAVITY_MODE_PLACEHOLDERS.has(singleLine(previewLine));
+}
+
 export interface OrcaWorkspaceIdleOptions {
   /**
    * The terminal this wakeup will write into. `null` means delivery creates an independent session
@@ -174,9 +195,9 @@ function reusableTerminalCandidates(
  * agents, and every terminal the wakeup could write into must be connected, writable and free of
  * an unsent composer draft. When a fresh session tab will receive the pointer, retained tabs in
  * the root workspace neither block the wakeup nor mark the composer prefilled. Synthetic
- * inventories and `> ` composer lines are confirmed with Orca's authoritative
- * `terminal wait --for tui-idle`: a plain-text preview cannot tell an empty composer's TUI mode
- * placeholder from an unsent human draft.
+ * inventories are confirmed with `terminal wait`. A `> ` composer line is treated as an empty
+ * Antigravity composer only when it matches the exact mode-placeholder vocabulary and Orca's
+ * readiness probe also reports idle; every other `> ` line stays busy as an unsent human draft.
  */
 export async function checkOrcaWorkspaceIdle(
   runner: CommandRunner,
@@ -295,9 +316,13 @@ export async function checkOrcaWorkspaceIdle(
         }
         if (lastLine?.trimStart().startsWith('> ')) {
           // A plain-text preview strips ANSI styling, so an empty Antigravity composer showing a
-          // dim execution-mode placeholder looks exactly like an unsent human draft; the PTY/ANSI
-          // probe is the single owner that can tell them apart.
-          if (!(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle) {
+          // dim execution-mode placeholder looks exactly like an unsent human draft. Only the
+          // exact Antigravity placeholder may relax the draft guard, and Orca's readiness probe
+          // must also confirm the TUI is idle; a changed hint or any other `> ` line stays busy.
+          if (
+            !isAntigravityModePlaceholder(lastLine, terminal.agentIdentity) ||
+            !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle
+          ) {
             return false;
           }
         }
