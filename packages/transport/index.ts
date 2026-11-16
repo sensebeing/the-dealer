@@ -1976,61 +1976,67 @@ export class P2PTransportService implements TransportService {
         }
       }
     }
-    await Promise.allSettled([...new Set(m.config.bootstrapPeers ?? [])].filter(seed => !this.isSelfEndpoint(seed)).map(async seed => {
-      // The persistent tunnel lets the seed push relayed requests back; the probe
-      // below exchanges sealed beacons so isolated peers can discover each other.
-      const prior = [...m.outboundTunnels.entries()].find(([, entry]) => entry.seed === seed && entry.acked);
-      const socket = this.track(createConnection(parseEndpoint(seed)));
-      socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
-      try {
-        this.inFlightSelfNonces.add(frame.nonce);
-        socket.write(packet({
-          type: 'discovery',
-          frame,
-          peers: [...m.beacons.values()].map(entry => entry.frame),
-        }));
-        const response = await new SocketReader(socket).json();
-        if (response.frame?.swarmTopicId !== m.keys.swarmTopicId) {
-          throw new Error('Invalid discovery response');
-        }
-        if (response.frame?.senderNodeId === this.localNodeId) {
-          // This "seed" answered with our own authenticated identity. Only a reply that
-          // carries this process's self-loop proof is genuine: without it, an arbitrary
-          // server could blacklist a real seed by echoing our node id.
-          if (!this.verifySelfLoopProof('discovery', frame.nonce, response.selfProof)) {
+    // The nonce is shared by every seed probed in this round, so it must stay in flight
+    // until the whole round settles: a fast seed's completion must never invalidate a
+    // slower hairpinned probe that is still proving itself to be this node.
+    this.inFlightSelfNonces.add(frame.nonce);
+    try {
+      await Promise.allSettled([...new Set(m.config.bootstrapPeers ?? [])].filter(seed => !this.isSelfEndpoint(seed)).map(async seed => {
+        // The persistent tunnel lets the seed push relayed requests back; the probe
+        // below exchanges sealed beacons so isolated peers can discover each other.
+        const prior = [...m.outboundTunnels.entries()].find(([, entry]) => entry.seed === seed && entry.acked);
+        const socket = this.track(createConnection(parseEndpoint(seed)));
+        socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
+        try {
+          socket.write(packet({
+            type: 'discovery',
+            frame,
+            peers: [...m.beacons.values()].map(entry => entry.frame),
+          }));
+          const response = await new SocketReader(socket).json();
+          if (response.frame?.swarmTopicId !== m.keys.swarmTopicId) {
             throw new Error('Invalid discovery response');
           }
-          this.recordSelfEndpoint(seed);
-          return;
-        }
-        const seedHost = parseEndpoint(seed).host;
-        if (!this.learnWithMeta(response.frame, seedHost).mount) {
-          throw new Error('Invalid discovery response');
-        }
-        const seedNodeId = response.frame.senderNodeId;
-        this.ensureOutboundTunnel(m, seedNodeId, seed, response.tunneled === true, prior?.[1]);
-        for (const peerFrame of Array.isArray(response.peers) ? response.peers : []) {
-          if (peerFrame?.senderNodeId === this.localNodeId) {
-            continue;
+          if (response.frame?.senderNodeId === this.localNodeId) {
+            // This "seed" answered with our own authenticated identity. Only a reply that
+            // carries this process's self-loop proof is genuine: without it, an arbitrary
+            // server could blacklist a real seed by echoing our node id.
+            if (!this.verifySelfLoopProof('discovery', frame.nonce, response.selfProof)) {
+              throw new Error('Invalid discovery response');
+            }
+            this.recordSelfEndpoint(seed);
+            return;
           }
-          try {
-            // Gossiped beacons were not reached directly, so keep the advertised
-            // endpoint and remember the seed that can relay to their sender.
-            this.learnWithMeta(peerFrame, undefined, seed);
-          } catch {
-            // One unreadable gossiped frame must not fail the whole probe.
+          const seedHost = parseEndpoint(seed).host;
+          if (!this.learnWithMeta(response.frame, seedHost).mount) {
+            throw new Error('Invalid discovery response');
           }
+          const seedNodeId = response.frame.senderNodeId;
+          this.ensureOutboundTunnel(m, seedNodeId, seed, response.tunneled === true, prior?.[1]);
+          for (const peerFrame of Array.isArray(response.peers) ? response.peers : []) {
+            if (peerFrame?.senderNodeId === this.localNodeId) {
+              continue;
+            }
+            try {
+              // Gossiped beacons were not reached directly, so keep the advertised
+              // endpoint and remember the seed that can relay to their sender.
+              this.learnWithMeta(peerFrame, undefined, seed);
+            } catch {
+              // One unreadable gossiped frame must not fail the whole probe.
+            }
+          }
+        } catch {
+          if (prior && m.outboundTunnels.get(prior[0]) === prior[1]) {
+            prior[1].socket.destroy();
+            m.outboundTunnels.delete(prior[0]);
+          }
+        } finally {
+          socket.destroy();
         }
-      } catch {
-        if (prior && m.outboundTunnels.get(prior[0]) === prior[1]) {
-          prior[1].socket.destroy();
-          m.outboundTunnels.delete(prior[0]);
-        }
-      } finally {
-        this.inFlightSelfNonces.delete(frame.nonce);
-        socket.destroy();
-      }
-    }));
+      }));
+    } finally {
+      this.inFlightSelfNonces.delete(frame.nonce);
+    }
   }
 
   private async discover(announce = true): Promise<void> {

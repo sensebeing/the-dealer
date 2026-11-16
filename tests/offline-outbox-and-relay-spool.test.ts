@@ -3781,13 +3781,28 @@ async function openAcceptingTunnel(
 }
 
 /** A TCP forwarder back to this node's own listener: a hairpinned alias of self. */
-async function hairpinForwarder(t: TestContext, targetPort: number): Promise<string> {
+async function hairpinForwarder(
+  t: TestContext,
+  targetPort: number,
+  delayMs = 0,
+): Promise<string> {
   const server = createServer(client => {
-    const upstream = createConnection({ host: '127.0.0.1', port: targetPort });
-    client.pipe(upstream);
-    upstream.pipe(client);
-    client.on('error', () => upstream.destroy());
-    upstream.on('error', () => client.destroy());
+    // Hold the request until the delay elapses so a race test can guarantee a real seed
+    // completes its probe first; `pipe` resumes the paused socket with buffered bytes.
+    client.pause();
+    client.on('error', () => {});
+    const forward = () => {
+      const upstream = createConnection({ host: '127.0.0.1', port: targetPort });
+      client.pipe(upstream);
+      upstream.pipe(client);
+      client.on('error', () => upstream.destroy());
+      upstream.on('error', () => client.destroy());
+    };
+    if (delayMs > 0) {
+      setTimeout(forward, delayMs);
+    } else {
+      forward();
+    }
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -4253,6 +4268,11 @@ test('steady-state seed probes never fabricate reachability or force-flush parke
     passphrase: 'secret',
     bootstrapPeers: [seed.endpointAddr!],
   });
+  await until(
+    () => transport.isPeerReachable(NETWORK, seed.localNodeId),
+    'client learns the non-loopback seed beacon',
+    5_000,
+  );
 
   const sender = generateNodeKeyPair();
   const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
@@ -4301,6 +4321,11 @@ test('steady-state seed probes never fabricate reachability or force-flush parke
 
   // At least two full seed-probe cycles (rate-limited to 2s) with nothing changing.
   await new Promise(resolveProbe => setTimeout(resolveProbe, 4_600));
+  assert.equal(
+    transport.isPeerReachable(NETWORK, seed.localNodeId),
+    true,
+    'every probe cycle actually reached the non-loopback seed',
+  );
   assert.deepEqual(reachability, [], 'a steady-state seed refresh is not a reachability transition');
   assert.equal(
     mountOf(transport, NETWORK).relays.has(seed.localNodeId),
@@ -4509,6 +4534,52 @@ test('bootstrapPeers with self aliases and a hairpin forwarder never self-tunnel
     existsSync(spoolFile) ? readRelaySpool(spoolFile).entries.length : 0,
     0,
     'the late self alias never stores its own frame',
+  );
+});
+
+test('a hairpinned self probe still proves itself when a real seed wins the probe round', async t => {
+  const root = directory(t);
+  const kernel = new Kernel();
+  t.after(() => kernel.stop());
+  const transport = new P2PTransportService(
+    { discoveryDir: join(root, 'client'), multicast: false },
+    kernel.ctx,
+  );
+  t.after(() => transport.dispose());
+  // Warm up on a throwaway network so the forwarder can point back at this listener.
+  await transport.mountNetwork({ networkId: 'warmup-net', passphrase: 'secret' });
+  const hairpin = await hairpinForwarder(t, portOf(transport.endpointAddr!), 250);
+  const realSeed = new P2PTransportService({
+    discoveryDir: join(root, 'seed'),
+    multicast: false,
+  });
+  t.after(() => realSeed.dispose());
+  await realSeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+
+  const reachability: PeerReachableEvent[] = [];
+  kernel.ctx.on('transport/peer-reachable', event => reachability.push(event));
+  // The real seed answers within milliseconds while the hairpin holds its request for
+  // 250ms: a per-seed nonce deletion would let the fast probe invalidate the slow one.
+  await transport.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [realSeed.endpointAddr!, hairpin],
+  });
+  assert.equal(
+    (transport as unknown as { selfEndpoints: Set<string> }).selfEndpoints.has(hairpin),
+    true,
+    'the hairpinned forwarder is still proven to be this node',
+  );
+  assert.equal(transport.isPeerReachable(NETWORK, realSeed.localNodeId), true);
+  assert.equal(
+    mountOf(transport, NETWORK).relays.has(transport.localNodeId),
+    false,
+    'self is never mapped as a relay seed',
+  );
+  assert.equal(
+    reachability.filter(event => event.nodeId === transport.localNodeId).length,
+    0,
+    'the self probe never becomes a peer reachability pulse',
   );
 });
 
