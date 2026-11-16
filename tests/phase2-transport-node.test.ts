@@ -15,7 +15,7 @@ import { createTransportPlugin, P2PTransportService, blake3 } from '../packages/
 import { createNodePlugin, PeerDirectoryService } from '../packages/node/index.ts';
 
 async function until(check: () => boolean) {
-  for (let i = 0; i < 400; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)); }
+  for (let i = 0; i < 150; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)); }
   assert.ok(check(), 'condition did not converge');
 }
 async function mesh(t: test.TestContext, count = 3) {

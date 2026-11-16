@@ -11,7 +11,7 @@ import {
 import { mkdir, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { tmpdir, networkInterfaces } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -581,6 +581,12 @@ export class P2PTransportService implements TransportService {
   private boundHost?: string;
   /** Every endpoint proven to be this node (advertised, aliased, or hairpinned back). */
   private selfEndpoints = new Set<string>();
+  /**
+   * Per-process secret that proves a "you are talking to yourself" reply really came from
+   * this process. Network membership alone is not enough: another key holder could seal a
+   * frame naming this node, and an arbitrary TCP server could echo unauthenticated JSON.
+   */
+  private readonly selfLoopSecret = randomBytes(32);
 
   constructor(options: TransportPluginOptions = {}, ctx?: Context) {
     this.options = options;
@@ -650,10 +656,25 @@ export class P2PTransportService implements TransportService {
     return host === normalizedHost(boundHost);
   }
 
+  /** HMAC over the request nonce, bound to this process rather than to the network key. */
+  private selfLoopProof(nonce: string): string {
+    return createHmac('sha256', this.selfLoopSecret).update(nonce).digest('base64url');
+  }
+
+  /** Constant-time check that a self reply was produced by this same process. */
+  private verifySelfLoopProof(nonce: string, proof: unknown): boolean {
+    if (typeof proof !== 'string') {
+      return false;
+    }
+    const expected = Buffer.from(this.selfLoopProof(nonce));
+    const actual = Buffer.from(proof);
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  }
+
   /**
    * Remember an endpoint that proved to be this node, and erase every tunnel/relay artifact
    * that pointed at it. An alias (Tailscale address, DNS name, hairpinned forwarder) can
-   * only be proven at runtime by a frame that carries this node's own authenticated sender.
+   * only be proven at runtime by a self-loop proof bound to this process.
    */
   private recordSelfEndpoint(endpoint: string): void {
     this.selfEndpoints.add(endpoint);
@@ -915,9 +936,11 @@ export class P2PTransportService implements TransportService {
   }
 
   /**
-   * Authoritative live reachability: an unexpired authenticated sealed beacon, or a peer's
-   * own live inbound tunnel. Signed identity cards never participate, because a peer that
-   * slept and woke without restarting keeps the same `NodeCard.revision`.
+   * Authoritative live reachability: an unexpired authenticated sealed beacon, nothing
+   * else. A signed identity card never participates because a peer that slept and woke
+   * without restarting keeps the same `NodeCard.revision`; a lingering half-open tunnel
+   * never participates either, because its beacon expiring means liveness is unproven
+   * even though the dead socket has not been reaped by the OS yet.
    */
   isPeerReachable(networkId: string, peerNodeId: string): boolean {
     if (this.closed) {
@@ -930,10 +953,7 @@ export class P2PTransportService implements TransportService {
     if (!m) {
       return false;
     }
-    return (
-      (m.beacons.get(peerNodeId)?.expires ?? 0) >= Date.now() ||
-      m.inboundTunnels.has(peerNodeId)
-    );
+    return (m.beacons.get(peerNodeId)?.expires ?? 0) >= Date.now();
   }
 
   /** Content-addressed blob cache is network-scoped: a spooled hash never leaks across mounts. */
@@ -1815,7 +1835,6 @@ export class P2PTransportService implements TransportService {
     }
     const now = Date.now();
     const hadFreshBeacon = (current?.expires ?? 0) >= now;
-    const hadTunnel = m.inboundTunnels.has(frame.senderNodeId);
     const priorEndpoint = m.peers.get(frame.senderNodeId);
     const priorRelay = m.relays.get(frame.senderNodeId);
     this.registerPeerEndpoint(
@@ -1840,9 +1859,11 @@ export class P2PTransportService implements TransportService {
       this.scheduleSpoolDrain(m, frame.senderNodeId);
     }
     // Pulse only genuine changes: a peer that was dark becomes reachable, or its proven
-    // route changed. Steady-state beacon refreshes stay silent.
+    // route changed. Steady-state beacon refreshes stay silent. A lingering half-open
+    // tunnel never suppresses this: an expired beacon means the peer was dark, so the
+    // fresh beacon that follows sleep/wake must always redrive.
     if (
-      (!hadFreshBeacon && !hadTunnel) ||
+      !hadFreshBeacon ||
       priorEndpoint !== m.peers.get(frame.senderNodeId) ||
       priorRelay !== m.relays.get(frame.senderNodeId)
     ) {
@@ -1964,8 +1985,12 @@ export class P2PTransportService implements TransportService {
           throw new Error('Invalid discovery response');
         }
         if (response.frame?.senderNodeId === this.localNodeId) {
-          // This "seed" answered with our own authenticated identity: an alias or a
-          // hairpinned forwarder back to this listener, never a relay.
+          // This "seed" answered with our own authenticated identity. Only a reply that
+          // carries this process's self-loop proof is genuine: without it, an arbitrary
+          // server could blacklist a real seed by echoing our node id.
+          if (!this.verifySelfLoopProof(frame.nonce, response.selfProof)) {
+            throw new Error('Invalid discovery response');
+          }
           this.recordSelfEndpoint(seed);
           return;
         }
@@ -2114,7 +2139,13 @@ export class P2PTransportService implements TransportService {
       const attemptTimeoutMs = Math.max(1, Math.floor(remaining() / (fallbacks.length - index)));
       try {
         if ('tunnel' in fallback) {
-          return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, attemptTimeoutMs);
+          // A tunnel whose peer beacon expired may be a dead half-open socket: bound the
+          // attempt to the relay failover window so it cannot starve real seeds behind it.
+          const tunnelTimeoutMs =
+            (m.beacons.get(target)?.expires ?? 0) >= Date.now()
+              ? attemptTimeoutMs
+              : Math.min(attemptTimeoutMs, RELAY_CONNECT_TIMEOUT_MS);
+          return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, tunnelTimeoutMs);
         }
         const attachmentPacket = options.blobHashes?.length
           ? await (blobs ??= this.readSpoolBlobs(
@@ -2386,17 +2417,20 @@ export class P2PTransportService implements TransportService {
       if (response?.error) {
         throw new LocalDeliveryError(String(response.error));
       }
-      if (
-        response?.selfRelay === true ||
-        (response?.spooled === true && response.seedNodeId === this.localNodeId)
-      ) {
+      if (response?.selfRelay === true) {
         // The "seed" handed our own sealed frame back to us: an alias or hairpinned
-        // forwarder. Remember it, then advance to the next real fallback seed instead of
-        // fabricating an offline-spooled handoff.
+        // forwarder. Only a proof bound to this process may blacklist it as self; an
+        // unauthenticated response is a protocol failure, never silent offline queueing.
+        if (!this.verifySelfLoopProof(frame.nonce, response.selfProof)) {
+          throw new LocalDeliveryError('Unauthenticated self-relay response');
+        }
         this.recordSelfEndpoint(seed);
         throw new PeerUnreachableError(target, 'Skipped self relay endpoint');
       }
       if (response?.spooled === true) {
+        if (response.seedNodeId === this.localNodeId) {
+          throw new LocalDeliveryError('Invalid relay spool response');
+        }
         if (typeof response.seedNodeId !== 'string' || typeof response.spoolId !== 'string') {
           throw new LocalDeliveryError('Invalid relay spool response');
         }
@@ -2845,6 +2879,10 @@ export class P2PTransportService implements TransportService {
         frame: this.discoveryFrame(mount),
         peers: [...mount.beacons.values()].map(entry => entry.frame),
         tunneled: mount.inboundTunnels.has(request.frame.senderNodeId),
+        ...(request.frame?.senderNodeId === this.localNodeId &&
+        typeof request.frame.nonce === 'string'
+          ? { selfProof: this.selfLoopProof(request.frame.nonce) }
+          : {}),
       }));
       return;
     }
@@ -2880,9 +2918,9 @@ export class P2PTransportService implements TransportService {
       }
       if (frame.senderNodeId === this.localNodeId) {
         // This node's own sealed frame reached its own listener through an alias or a
-        // hairpinned forwarder. Answering with this node's identity lets the sender
-        // recognize the endpoint as self and fall through to a real seed.
-        socket.end(packet({ selfRelay: true, seedNodeId: this.localNodeId }));
+        // hairpinned forwarder. Answering with a proof bound to this process lets the
+        // sender recognize the endpoint as self and fall through to a real seed.
+        socket.end(packet({ selfRelay: true, selfProof: this.selfLoopProof(frame.nonce) }));
         return;
       }
       const target = typeof request.target === 'string' ? request.target : '';

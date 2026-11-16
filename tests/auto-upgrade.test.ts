@@ -217,7 +217,7 @@ test('idle-gated daemon watcher restarts dealerd when a linked project .dealer m
   const after = await until(() => {
     const record = readDaemonFingerprint(stateDir);
     return record && record.pid !== before.pid && record.fingerprint !== before.fingerprint ? record : undefined;
-  }, 'idle-gated daemon restart after the manifest edit', 30_000);
+  }, 'idle-gated daemon restart after the manifest edit');
   assert.equal(after.fingerprint, computeRuntimeFingerprint(stateDir));
   const status2 = await dealer(['node', 'status'], stateDir);
   assert.equal(status2.runtimeFingerprint, after.fingerprint);
@@ -295,7 +295,7 @@ test('passive fs.watch reload and gracefulStop drain in-flight dispatches before
   const after = await until(() => {
     const record = readDaemonFingerprint(passive.stateDir);
     return record && record.pid !== before.pid && record.fingerprint !== before.fingerprint ? record : undefined;
-  }, 'passive fs.watch daemon reload', 30_000);
+  }, 'passive fs.watch daemon reload');
   assert.notEqual(after.pid, before.pid);
   assert.equal(after.fingerprint, computeRuntimeFingerprint(passive.stateDir));
 });

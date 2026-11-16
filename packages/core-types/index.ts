@@ -383,9 +383,10 @@ export interface TransportService {
   /** Make a locally available file addressable by its BLAKE3 hash for blob fetches. */
   registerBlob?(hash: string, filePath: string): void;
   /**
-   * True when transport holds an unexpired authenticated discovery beacon or a live inbound
-   * tunnel for `peerNodeId`. Reachability is transport's alone: a verified `NodeCard` proves
-   * identity, never liveness, so durable obligations must consult this before resending.
+   * True when transport holds an unexpired authenticated discovery beacon for
+   * `peerNodeId`. Reachability is transport's alone: a verified `NodeCard` proves identity,
+   * never liveness, and neither does a lingering half-open tunnel whose beacon has expired,
+   * so durable obligations must consult this before resending.
    */
   isPeerReachable?(networkId: string, peerNodeId: string): boolean;
   sendUnicast(

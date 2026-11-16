@@ -3061,6 +3061,53 @@ test('malformed relay responses surface as local protocol failures, not offline 
   assert.match((failure as Error).message, /Malformed relay response/);
 });
 
+test('unauthenticated self-relay responses fail locally without blacklisting or queueing', async t => {
+  const root = directory(t);
+  const endpoint = await rawRelayServer(t, JSON.stringify({ selfRelay: true }));
+  const client = runtimeFor(root, 'client');
+  t.after(async () => {
+    await client.stop().catch(() => {});
+  });
+  await client.start();
+  await client.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [endpoint],
+  });
+  const harness = await emitterHarness(t, {
+    send: (targetNodeId, frame, opts) =>
+      client.transport.sendUnicast(NETWORK, targetNodeId, frame, opts),
+  });
+  let failure: unknown;
+  try {
+    await harness.emitter.emit({
+      networkId: harness.networkId,
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'collab.request.v1',
+      subject: 'spoofed self relay',
+      body: 'must never become self-blacklist or offline state',
+      payload: {},
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(
+    isLocalDeliveryError(failure),
+    'an unauthenticated selfRelay response is a deterministic protocol failure',
+  );
+  assert.match((failure as Error).message, /Unauthenticated self-relay response/);
+  assert.equal(
+    (client.transport as unknown as { selfEndpoints: Set<string> }).selfEndpoints.has(endpoint),
+    false,
+    'a spoofed self relay never blacklists the seed',
+  );
+  assert.equal(
+    harness.outbox.list({ status: 'queued' }).length,
+    0,
+    'a deterministic protocol failure is not an offline obligation',
+  );
+});
+
 test('relay seed surfaces deterministic target rejection instead of spooling it', async t => {
   const root = directory(t);
   const targetEndpoint = await rawRelayServer(
@@ -3847,6 +3894,9 @@ test('a sleeping peer behind a zombie relay tunnel is spooled as offline and its
     });
   });
   await new Promise(resolveStorage => setTimeout(resolveStorage, 250));
+  // The tunnel socket is still half-open, but its beacon expired: a stale socket alone is
+  // never live reachability evidence.
+  assert.equal(seed.isPeerReachable(NETWORK, target), false);
 
   const threadId = 'thread-a1';
   const emittedIds: string[] = [];
@@ -3878,13 +3928,6 @@ test('a sleeping peer behind a zombie relay tunnel is spooled as offline and its
     assert.deepEqual(item.relaySpooledNodeIds, [harness.targetCard.nodeId]);
     assert.equal(item.deliveredReceipts[harness.targetCard.nodeId], undefined);
   }
-  // Socket teardown is asynchronous: the eviction must settle before the seed stops
-  // treating the dead zombie tunnel as live reachability.
-  await until(
-    () => !seed.isPeerReachable(NETWORK, target),
-    'the expired zombie tunnel no longer counts as live reachability',
-    5_000,
-  );
   const spooled = readRelaySpool(spoolFile);
   assert.deepEqual(
     spooled.entries.map(entry => entry.id),
