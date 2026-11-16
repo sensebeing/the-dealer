@@ -1166,6 +1166,13 @@ test('Autopilot composer recognition preserves human drafts and clears only befo
     if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [
       { handle: 'term', connected: true, writable: true, preview },
     ] } }) };
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
+      // Real `tui-idle` fails while a human draft sits in the composer; only an empty composer
+      // holding a TUI placeholder is idle.
+      return { stdout: preview.split(/\r?\n/).some(line => line.trimStart().startsWith('> '))
+        ? '{"ok":false,"error":{"code":"timeout"}}'
+        : '{"ok":true}' };
+    }
     return { stdout: '{"ok":true}' };
   };
   assert.deepEqual(await checkOrcaWorkspaceIdle(runner, 'orca', root), { idle: true, composerPrefilled: true, reason: undefined });
@@ -1225,6 +1232,15 @@ test('workspace idle inspection scopes composer checks to the terminal the wakeu
     if (request.args[0] === 'terminal' && request.args[1] === 'list') {
       return { stdout: JSON.stringify({ ok: true, result: { terminals } }) };
     }
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
+      // Real `tui-idle` fails while a human draft sits in the composer; only an empty composer
+      // holding a TUI placeholder is idle.
+      const probe = terminals.find(terminal =>
+        terminal.handle === String(request.args[request.args.indexOf('--terminal') + 1]));
+      return { stdout: probe?.preview.split(/\r?\n/).some(line => line.trimStart().startsWith('> '))
+        ? '{"ok":false,"error":{"code":"timeout"}}'
+        : '{"ok":true}' };
+    }
     return { stdout: '{"ok":true}' };
   };
   // Legacy callers inspect every reachable composer in the root workspace.
@@ -1262,6 +1278,100 @@ test('workspace idle inspection scopes composer checks to the terminal the wakeu
     await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: 'target' }),
     { idle: true, reason: undefined },
   );
+});
+
+test('a TUI mode placeholder on an empty composer never wedges a bound wave delivery', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'agy-placeholder');
+  const placeholder = '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)';
+  const calls: CommandRequest[] = [];
+  const waits: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: JSON.stringify({ ok: true, result: { truncated: false, worktrees: [
+        { path: workspacePath, worktreeId: 'agy', childWorktreeIds: [], unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: [
+        { handle: 'term-agy', connected: true, writable: true, agentIdentity: 'antigravity', preview: `history\n${placeholder}` },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
+      waits.push(request);
+      return { stdout: '{"ok":true}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+  t.after(() => service.stop());
+  store.enqueue([alert('placeholder')], {
+    mailboxId: 'stream:placeholder',
+    wakeTarget: {
+      mode: 'orca-terminal',
+      terminalHandle: 'term-agy',
+      workspacePath,
+      coalesceMs: 0,
+      rotateAfterWaves: 10,
+      completedWaves: 1,
+    },
+  });
+
+  const delivered = await service.flushMailbox('stream:placeholder');
+  assert.equal(delivered.woke, true, delivered.reason);
+  // The plain-text preview cannot disambiguate the placeholder, so Orca's PTY/ANSI probe decides.
+  assert.deepEqual(waits.map(call => call.args), [[
+    'terminal', 'wait', '--terminal', 'term-agy', '--for', 'tui-idle', '--timeout-ms', '1', '--json',
+  ]]);
+  const sends = sendsTo(calls, 'term-agy');
+  assert.equal(sends.length, 1);
+  assert.match(textOf(sends[0]), /^You have 1 Dealer message\(s\) in stream:placeholder/);
+  assert.equal(terminalSends(calls).some(call => textOf(call) === '\x15'), false, 'an empty composer is never cleared');
+  assert.equal(store.getWakeTarget('stream:placeholder')!.completedWaves, 1);
+});
+
+test('an unsent human draft fails the tui-idle probe and receives no pointer', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'agy-draft');
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: JSON.stringify({ ok: true, result: { truncated: false, worktrees: [
+        { path: workspacePath, worktreeId: 'agy', childWorktreeIds: [], unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: [
+        { handle: 'term-agy', connected: true, writable: true, agentIdentity: 'antigravity', preview: 'history\n> unsent draft' },
+      ] } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
+      return { stdout: '{"ok":false,"error":{"code":"timeout"}}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  assert.deepEqual(
+    await checkOrcaWorkspaceIdle(runner, 'orca', workspacePath),
+    { idle: false, reason: 'Workspace or descendant is busy or unverifiable' },
+  );
+  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+  t.after(() => service.stop());
+  store.enqueue([alert('draft')], {
+    mailboxId: 'stream:draft',
+    wakeTarget: {
+      mode: 'orca-terminal', terminalHandle: 'term-agy', workspacePath, coalesceMs: 0,
+    },
+  });
+
+  const deferred = await service.flushMailbox('stream:draft');
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(terminalSends(calls).length, 0, 'nothing is injected while the draft is present');
+  assert.equal(store.getWakeTarget('stream:draft')!.pendingWake, true);
 });
 
 test('fresh-tab and bound-tab plans ignore disconnected or non-writable retained tabs', async t => {

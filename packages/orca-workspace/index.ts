@@ -174,7 +174,9 @@ function reusableTerminalCandidates(
  * agents, and every terminal the wakeup could write into must be connected, writable and free of
  * an unsent composer draft. When a fresh session tab will receive the pointer, retained tabs in
  * the root workspace neither block the wakeup nor mark the composer prefilled. Synthetic
- * inventories are confirmed with `terminal wait`.
+ * inventories and `> ` composer lines are confirmed with Orca's authoritative
+ * `terminal wait --for tui-idle`: a plain-text preview cannot tell an empty composer's TUI mode
+ * placeholder from an unsent human draft.
  */
 export async function checkOrcaWorkspaceIdle(
   runner: CommandRunner,
@@ -274,27 +276,7 @@ export async function checkOrcaWorkspaceIdle(
         typeof terminal.preview === 'string' || typeof terminal.agentIdentity === 'string';
       if (!realOrcaTerminal) {
         // Synthetic or older inventory without TUI metadata: ask Orca directly.
-        try {
-          const waited = await checkedCommand(runner, {
-            command,
-            args: [
-              'terminal',
-              'wait',
-              '--terminal',
-              terminal.handle,
-              '--for',
-              'tui-idle',
-              '--timeout-ms',
-              '1',
-              '--json',
-            ],
-            cwd,
-            signal,
-          });
-          if (JSON.parse(waited.stdout).ok !== true) {
-            return false;
-          }
-        } catch {
+        if (!(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle) {
           return false;
         }
         continue;
@@ -311,7 +293,14 @@ export async function checkOrcaWorkspaceIdle(
           }
           continue;
         }
-        if (lastLine?.trimStart().startsWith('> ')) return false;
+        if (lastLine?.trimStart().startsWith('> ')) {
+          // A plain-text preview strips ANSI styling, so an empty Antigravity composer showing a
+          // dim execution-mode placeholder looks exactly like an unsent human draft; the PTY/ANSI
+          // probe is the single owner that can tell them apart.
+          if (!(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle) {
+            return false;
+          }
+        }
       }
     }
     for (const id of row.childWorktreeIds ?? []) {
