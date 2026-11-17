@@ -2451,6 +2451,14 @@ for (const [agent, envKey, resumeCommand] of [
     await invoke(['inbox', 'check'], { ...env, ORCA_TERMINAL_HANDLE: 'term-shell', ORCA_PANE_KEY: '', [envKey]: '' });
     assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, undefined);
     assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.paneKey, undefined);
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.agent, undefined);
+    await runtime.mountNetwork({ networkId: 'capture', passphrase: 'capture-test-secret' });
+    await invoke(['broadcast', '--network', 'capture', '--topic', 'test.capture', '--body', 'hello']);
+    const broadcastTarget = runtime.mailbox.getWakeTarget(mailboxId)!;
+    assert.equal(broadcastTarget.terminalHandle, 'term-origin');
+    assert.equal(broadcastTarget.agent, agent);
+    assert.equal(broadcastTarget.sessionId, 'original-session');
+    assert.equal(broadcastTarget.paneKey, 'tab:leaf');
   });
 }
 
@@ -2575,3 +2583,30 @@ for (const siblingAgent of ['antigravity', undefined]) {
     assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
   });
 }
+
+test('caller identity transitions clear omitted fields only when identity changes', async t => {
+  const root = directory(t);
+  const runtime = await makeNode(t, root, 'identity');
+  const workspacePath = join(root, 'identity');
+  const mailboxId = 'worktree:identity';
+  const cases = [
+    { name: 'new session without pane', env: { CODEX_THREAD_ID: 'new-session' }, expected: { agent: 'codex', sessionId: 'new-session', paneKey: undefined } },
+    { name: 'new pane without session', env: { ORCA_PANE_KEY: 'new:pane' }, expected: { agent: undefined, sessionId: undefined, paneKey: 'new:pane' } },
+    { name: 'restored pane subshell', env: { ORCA_TERMINAL_HANDLE: 'term-restored', ORCA_PANE_KEY: 'old:pane' }, expected: { agent: 'codex', sessionId: 'old-session', paneKey: 'old:pane' } },
+    { name: 'same session new handle', env: { ORCA_TERMINAL_HANDLE: 'term-restored', CODEX_THREAD_ID: 'old-session' }, expected: { agent: 'codex', sessionId: 'old-session', paneKey: 'old:pane' } },
+    { name: 'bare shell new handle', env: { ORCA_TERMINAL_HANDLE: 'term-shell' }, expected: { agent: undefined, sessionId: undefined, paneKey: undefined } },
+  ];
+  for (const { name, env, expected } of cases) {
+    runtime.mailbox.upsertWakeTarget(mailboxId, {
+      mode: 'orca-terminal', workspacePath, terminalHandle: 'term-original',
+      agent: 'codex', sessionId: 'old-session', paneKey: 'old:pane',
+    });
+    const code = await runDealerCli(['inbox', 'check', '--json'], {
+      runtime, env: { ORCA_WORKTREE_ID: `repo::${workspacePath}`, ORCA_TERMINAL_HANDLE: 'term-original', ...env },
+      stdout: () => {}, stderr: line => assert.fail(line),
+    });
+    assert.equal(code, 0, name);
+    const actual = runtime.mailbox.getWakeTarget(mailboxId)!;
+    assert.deepEqual({ agent: actual.agent, sessionId: actual.sessionId, paneKey: actual.paneKey }, expected, name);
+  }
+});

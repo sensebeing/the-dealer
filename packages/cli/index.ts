@@ -790,17 +790,22 @@ function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: Ca
   if (!caller) return;
   const existing = store.getWakeTarget(mailboxId);
   if (existing?.mode === 'orca-run' || (existing?.mode === 'passive' && existing.hostAgent !== undefined)) return;
+  const switchedIdentity =
+    (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
+    (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
+    (caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
+      (!caller.paneKey || !existing.paneKey || caller.paneKey !== existing.paneKey) &&
+      (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId));
   store.upsertWakeTarget(mailboxId, {
     mode: 'orca-terminal',
     ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
     ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
     ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
-    ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
-    ...(caller.agent ? { agent: caller.agent } : {}),
-    ...(caller.sessionId ? { sessionId: caller.sessionId } :
-      caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
-        (!caller.paneKey || caller.paneKey !== existing.paneKey)
-        ? { sessionId: undefined, paneKey: caller.paneKey } : {}),
+    ...(switchedIdentity ? { paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent } : {
+      ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
+      ...(caller.sessionId ? { sessionId: caller.sessionId } : {}),
+      ...(caller.agent ? { agent: caller.agent } : {}),
+    }),
   });
 }
 
@@ -1131,7 +1136,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
-    if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '')) {
+    if (['ask', 'reply', 'settle', 'send', 'broadcast', 'inbox'].includes(group ?? '')) {
       if (v['pane-key'] === undefined) v['pane-key'] = (callerEnv.ORCA_PANE_KEY ?? callerEnv.ORCA_AGENT_PANE)?.trim() || undefined;
       const conversation = [
         ['antigravity', callerEnv.ANTIGRAVITY_CONVERSATION_ID?.trim()],
@@ -1187,7 +1192,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     }
     // Preserve caller-relative paths when the daemon has a different cwd.
-    if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '') || group === 'project' || group === 'plugin' || (group === 'network' && action === 'mount') || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
+    if (['ask', 'reply', 'settle', 'send', 'broadcast', 'inbox'].includes(group ?? '') || group === 'project' || group === 'plugin' || (group === 'network' && action === 'mount') || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
       argv = [...p];
       for (const [key, value] of Object.entries(v)) {
         if (value === true) {
