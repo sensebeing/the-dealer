@@ -1,5 +1,5 @@
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
-import { runCommand, CommandNotStartedError } from '../packages/orca-workspace/index.ts';
+import { runCommand, CommandNotStartedError } from '../packages/subprocess/index.ts';
 import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/agent-host/index.ts';
 import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
 import test from 'node:test';
@@ -479,7 +479,7 @@ test('executable discovery prefers executable PATH entries and falls back to exe
   const pathCommand = join(pathBin, 'lark-cli');
   const localCommand = join(localBin, 'lark-cli');
   for (const file of [pathCommand, localCommand]) { writeFileSync(file, '#!/bin/sh\nexit 0\n'); chmodSync(file, 0o755); }
-  const module = new URL('../packages/orca-workspace/executable.ts', import.meta.url).href;
+  const module = new URL('../packages/subprocess/index.ts', import.meta.url).href;
   const setup = new URL('../packages/cli/setup.ts', import.meta.url).href;
   const inspect = async () => {
     const result = await promisify(execFile)(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e',

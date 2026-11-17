@@ -48,6 +48,16 @@
         "dependencies": []
       },
       {
+        "path": "packages/subprocess",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md"
+        ],
+        "dependencies": []
+      },
+      {
         "path": "packages/process-lock",
         "languages": [
           "TypeScript"
@@ -101,7 +111,8 @@
           "AGENTS.md"
         ],
         "dependencies": [
-          "packages/fs-atomic"
+          "packages/fs-atomic",
+          "packages/subprocess"
         ]
       },
       {
@@ -169,7 +180,6 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel",
-          "packages/plugins-policy",
           "packages/fs-atomic"
         ]
       },
@@ -212,7 +222,8 @@
           "packages/core-types",
           "packages/agent-host",
           "packages/orca-workspace",
-          "packages/fs-atomic"
+          "packages/fs-atomic",
+          "packages/subprocess"
         ]
       },
       {
@@ -242,7 +253,7 @@
           "packages/core-types",
           "packages/kernel",
           "packages/router",
-          "packages/orca-workspace"
+          "packages/subprocess"
         ]
       },
       {
@@ -259,7 +270,8 @@
           "packages/kernel",
           "packages/plugins-policy",
           "packages/plugins-router",
-          "packages/fs-atomic"
+          "packages/fs-atomic",
+          "packages/subprocess"
         ]
       },
       {
@@ -276,7 +288,8 @@
           "packages/agent-host",
           "packages/mailbox",
           "packages/orca-workspace",
-          "packages/cli"
+          "packages/cli",
+          "packages/subprocess"
         ]
       },
       {
@@ -292,8 +305,8 @@
           "packages/core-types",
           "packages/kernel",
           "packages/mailbox",
-          "packages/orca-workspace",
-          "packages/fs-atomic"
+          "packages/fs-atomic",
+          "packages/subprocess"
         ]
       },
       {
@@ -314,14 +327,14 @@
           "packages/dispatcher",
           "packages/emitter",
           "packages/mailbox",
-          "packages/orca-workspace",
           "packages/plugins-policy",
           "packages/plugins-router",
           "packages/plugins-source",
           "packages/plugins-executor",
           "packages/plugins-lark-notifier",
           "packages/process-lock",
-          "packages/fs-atomic"
+          "packages/fs-atomic",
+          "packages/subprocess"
         ]
       }
     ],
@@ -345,7 +358,8 @@
           "../plugins-source",
           "../plugins-executor",
           "../plugins-lark-notifier",
-          "../cli"
+          "../cli",
+          "../subprocess"
         ],
         "rule_id": "guard.service-boundaries",
         "message": "core-types is the leaf contract layer and must not import runtime packages."
@@ -367,7 +381,8 @@
           "../plugins-source",
           "../plugins-executor",
           "../plugins-lark-notifier",
-          "../cli"
+          "../cli",
+          "../subprocess"
         ],
         "rule_id": "guard.service-boundaries",
         "message": "kernel owns lifecycle and dependency injection only; it must not import P2P, routing, gate, mailbox, or executor modules."
@@ -406,6 +421,46 @@
         ],
         "rule_id": "guard.service-boundaries",
         "message": "gate owns inbound admission only and must not invoke executors directly."
+      },
+      {
+        "from": "packages/subprocess/",
+        "imports": [
+          ".."
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "subprocess is a foundation leaf for OS commands and PATH lookup; it must not import sibling packages."
+      },
+      {
+        "from": "packages/plugins-router/",
+        "imports": [
+          "../orca-workspace"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "plugins-router must use subprocess for generic OS commands, not depend on Orca workspace operations."
+      },
+      {
+        "from": "packages/plugins-source/",
+        "imports": [
+          "../orca-workspace"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "plugins-source must use subprocess for generic OS commands, not depend on Orca workspace operations."
+      },
+      {
+        "from": "packages/plugins-lark-notifier/",
+        "imports": [
+          "../orca-workspace"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "plugins-lark-notifier must use subprocess for generic OS commands, not depend on Orca workspace operations."
+      },
+      {
+        "from": "packages/cli/",
+        "imports": [
+          "../orca-workspace"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "cli must use subprocess for generic OS commands, not depend on Orca workspace operations."
       }
     ]
   }

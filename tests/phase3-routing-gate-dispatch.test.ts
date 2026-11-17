@@ -19,8 +19,9 @@ import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packa
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
 import { createInboxExecutorPlugin, createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
-import { CommandNotStartedError, checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
-import type { CommandRequest, CommandRunner } from '../packages/orca-workspace/index.ts';
+import { checkOrcaWorkspaceIdle } from '../packages/orca-workspace/index.ts';
+import { CommandNotStartedError, checkedCommand, runCommand } from '../packages/subprocess/index.ts';
+import type { CommandRequest, CommandRunner } from '../packages/subprocess/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
 
 const sender = generateNodeKeyPair(), receiver = generateNodeKeyPair();

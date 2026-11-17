@@ -9,8 +9,8 @@ import type {
   EmitterService,
   SourcePlugin,
 } from '../core-types/index.ts';
-import { checkedCommand, runCommand } from '../orca-workspace/index.ts';
-import type { CommandRunner } from '../orca-workspace/index.ts';
+import { checkedCommand, runCommand } from '../subprocess/index.ts';
+import type { CommandRunner } from '../subprocess/index.ts';
 
 export interface WebhookSourceConfig {
   port?: number;

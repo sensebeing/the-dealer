@@ -3,8 +3,8 @@ export { parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouter
 export type { TeamRegistry } from './team-registry.ts';
 import type { MessageEnvelope, NodeCard, RouteDecision, RouteJudgePlugin } from '../core-types/index.ts';
 import { validateDecision } from '../router/index.ts';
-import { checkedCommand, runCommand } from '../orca-workspace/index.ts';
-import type { CommandRunner } from '../orca-workspace/index.ts';
+import { checkedCommand, runCommand } from '../subprocess/index.ts';
+import type { CommandRunner } from '../subprocess/index.ts';
 
 function promptFor(envelope: MessageEnvelope, candidates: readonly NodeCard[]): string {
   return (

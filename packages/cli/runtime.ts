@@ -40,8 +40,8 @@ import {
   createInboxExecutorPlugin,
 } from '../plugins-executor/index.ts';
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
-import { runCommand } from '../orca-workspace/index.ts';
-import type { CommandRunner } from '../orca-workspace/index.ts';
+import { runCommand } from '../subprocess/index.ts';
+import type { CommandRunner } from '../subprocess/index.ts';
 import { MailboxStore, OutboxRedriveService, OutboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
