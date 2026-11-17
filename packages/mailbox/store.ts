@@ -989,6 +989,9 @@ export class MailboxStore {
           continue;
         }
         const cloned = structuredClone(envelope);
+        if (isRecord(cloned.payload) && Array.isArray(cloned.payload.localAttachments) && cloned.payload.localAttachments.length === 0) {
+          delete cloned.payload.localAttachments;
+        }
         const payload = isRecord(cloned.payload) ? cloned.payload : {};
         const hint = sanitizeWakeupHint(
           options.wakeupHint ?? payload.wakeupHint ?? cloned.subject,

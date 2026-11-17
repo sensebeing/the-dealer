@@ -321,7 +321,7 @@ test('receiver resolves compound stream bindings without sender preparation and 
     assert.equal(runtime.mailbox.getWakeTarget(`stream:${streamKey}`)?.driverConfig?.workspacePath, workspace);
     const items = runtime.mailbox.listItemsAfterSequence(-1).filter(item => item.mailboxId === `stream:${streamKey}`);
     assert.equal(items.length, 1);
-    assert.deepEqual(items[0].envelope, { ...message, payload: { ...message.payload, localAttachments: [] } });
+    assert.deepEqual(items[0].envelope, message);
     assert.equal(runtime.mailbox.listThreadRecords(message.id)[0].localMailbox, `stream:${streamKey}`);
   }
   const question = envelope('question', { payload: { streamKey: 'tools-alert' }, semantic: { type: 'question', threadId: 'tools-alert', targetMailbox: 'default' } });

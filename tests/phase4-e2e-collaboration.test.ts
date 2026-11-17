@@ -963,7 +963,7 @@ test('Phase 4: both DND crash windows park the signed obligation across restart 
     await restarted.gate.evaluate(newer);
     await restarted.gate.setMode('open');
     assert.equal(restarted.gate.listDndQueue().length, 0);
-    assert.deepEqual(restarted.mailbox.list().items[0].envelope, { ...newer, payload: { ...newer.payload, localAttachments: [] } });
+    assert.deepEqual(restarted.mailbox.list().items[0].envelope, newer);
     await restarted.stop();
   }
 });
@@ -1092,7 +1092,7 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.deepEqual(restarted.gate.listDndQueue(), []);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
   assert.equal(restarted.mailbox.list().totalCount, 1);
-  assert.deepEqual(restarted.mailbox.list().items[0].envelope, { ...queued.envelope, payload: { ...queued.envelope.payload, localAttachments: [] } });
+  assert.deepEqual(restarted.mailbox.list().items[0].envelope, queued.envelope);
 });
 
 test('external project executors and policies share configuration, attachments and lifecycle with builtins', async t => {
@@ -1168,6 +1168,15 @@ test('external project executors and policies share configuration, attachments a
   assert.deepEqual(sanitized.localAttachments, []);
   assert.deepEqual(sanitized.attachments, []);
   assert.equal(JSON.stringify(sanitized).includes(forgedSecretPath), false);
+  const inboxForged = await alice.emitter.emit(input('custom-bob', {
+    executor: 'inbox', localAttachments: [forgedSecretPath],
+  }));
+  assert.equal(inboxForged.receipts[0].stage, 'dispatched');
+  const persisted = bob.mailbox.listItemsAfterSequence(-1).find(item => item.id === inboxForged.messageId)!;
+  assert.ok(persisted);
+  assert.equal(persisted.envelope.payload.localAttachments, undefined);
+  const savedMailbox = JSON.parse(readFileSync(join(bob.stateDir, 'mailbox.json'), 'utf8'));
+  assert.equal(savedMailbox.items.find(item => item.id === inboxForged.messageId).envelope.payload.localAttachments, undefined);
   const dispatcher = bob.kernel.getService('dispatcher');
   assert.equal(dispatcher.hasExecutor('custom-exec'), true);
   assert.equal(dispatcher.hasPolicy('custom-policy'), true);
