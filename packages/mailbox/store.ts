@@ -65,6 +65,7 @@ export interface WakeTargetState {
   readonly agentProfile?: string;
   readonly targetBot?: string;
   readonly sessionId?: string;
+  readonly paneKey?: string;
 
   readonly mailboxId: string;
   readonly mode: WakeTargetMode;
@@ -414,6 +415,7 @@ function mergeWakeTarget(
   const agentProfile = optional('agentProfile');
   const targetBot = optional('targetBot');
   const sessionId = optional('sessionId');
+  const paneKey = optional('paneKey');
   const agent = optional('agent');
   const interactiveCommand = optional('interactiveCommand');
   const orcaCommand = optional('orcaCommand');
@@ -448,6 +450,7 @@ function mergeWakeTarget(
     ...(agentProfile !== undefined ? { agentProfile } : {}),
     ...(targetBot !== undefined ? { targetBot } : {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(paneKey !== undefined ? { paneKey } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(interactiveCommand !== undefined ? { interactiveCommand } : {}),
     ...(orcaCommand !== undefined ? { orcaCommand } : {}),
@@ -505,6 +508,7 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     'agentProfile',
     'targetBot',
     'sessionId',
+    'paneKey',
     'interactiveCommand',
     'orcaCommand',
     'runId',

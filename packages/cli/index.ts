@@ -81,6 +81,9 @@ const stringFlags = [
   'reply-mailbox',
   'target-mailbox',
   'terminal-handle',
+  'caller-agent',
+  'caller-session-id',
+  'pane-key',
   'worktree-id',
   'subject',
   'bootstrap-peers',
@@ -661,7 +664,7 @@ async function runInboxCommand(
   const command = action ?? 'list';
   const caller = resolveCallerOrcaBinding(v);
   const mailboxId = (v.mailbox as string | undefined) ?? caller?.mailboxId;
-  if (caller && (mailboxId ?? 'default') === caller.mailboxId) bindCallerWakeTarget(store, caller.mailboxId, caller);
+  if (command !== 'list' && v.peek !== true && caller && (mailboxId ?? 'default') === caller.mailboxId) bindCallerWakeTarget(store, caller.mailboxId, caller);
   const checkOnlyFlags =
     v.ack !== undefined || v.peek === true || v.wait === true || v['timeout-ms'] !== undefined;
   if (command === 'check') {
@@ -753,6 +756,9 @@ function replyTargetOrThrow(
 }
 
 interface CallerOrcaBinding {
+  paneKey?: string;
+  agent?: 'antigravity' | 'claude' | 'codex';
+  sessionId?: string;
   mailboxId: string;
   terminalHandle?: string;
   worktreeId?: string;
@@ -771,7 +777,13 @@ function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | u
   if (!terminalHandle && !worktreeId && !workspacePath) return undefined;
   const mailboxId = workspacePath ? `worktree:${basename(workspacePath)}`
     : worktreeId ? `worktree:${basename(worktreeId)}` : `terminal:${terminalHandle}`;
-  return { mailboxId, ...(terminalHandle ? { terminalHandle } : {}), ...(worktreeId ? { worktreeId } : {}), ...(workspacePath ? { workspacePath } : {}) };
+  const agent = v['caller-agent'];
+  if (agent !== undefined && !['antigravity', 'claude', 'codex'].includes(agent)) throw new Error('Invalid caller agent');
+  return {
+    mailboxId, terminalHandle, worktreeId, workspacePath, agent,
+    paneKey: v['pane-key']?.trim() || undefined,
+    sessionId: v['caller-session-id']?.trim() || undefined,
+  };
 }
 
 function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): void {
@@ -783,6 +795,11 @@ function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: Ca
     ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
     ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
     ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
+    ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
+    ...(caller.agent ? { agent: caller.agent } : {}),
+    ...(caller.sessionId ? { sessionId: caller.sessionId } :
+      caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle
+        ? { sessionId: undefined, paneKey: caller.paneKey } : {}),
   });
 }
 
@@ -1114,6 +1131,16 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
     if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '')) {
+      if (v['pane-key'] === undefined) v['pane-key'] = (callerEnv.ORCA_PANE_KEY ?? callerEnv.ORCA_AGENT_PANE)?.trim() || undefined;
+      const conversation = [
+        ['antigravity', callerEnv.ANTIGRAVITY_CONVERSATION_ID?.trim()],
+        ['claude', (callerEnv.CLAUDE_CODE_SESSION_ID ?? callerEnv.CLAUDE_SESSION_ID)?.trim()],
+        ['codex', (callerEnv.CODEX_THREAD_ID ?? callerEnv.CODEX_SESSION_ID)?.trim()],
+      ].find(([, sessionId]) => sessionId);
+      if (conversation) {
+        if (v['caller-agent'] === undefined) v['caller-agent'] = conversation[0];
+        if (v['caller-session-id'] === undefined) v['caller-session-id'] = conversation[1];
+      }
       if (v['terminal-handle'] === undefined && callerEnv.ORCA_TERMINAL_HANDLE?.trim()) v['terminal-handle'] = callerEnv.ORCA_TERMINAL_HANDLE.trim();
       if (v['worktree-id'] === undefined && (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)?.trim()) v['worktree-id'] = (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)!.trim();
     }

@@ -348,7 +348,14 @@ leg and recomputes the thread state; it refuses `inbound:` ids and refuses a
 message the outbox still holds as `queued` or `delivered` unless you pass
 `--force`.
 Inside Orca, `ORCA_WORKTREE_ID`/`ORCA_TERMINAL_HANDLE` bind the caller's
-worktree or terminal automatically. Omit `--mailbox` for two-way ask/reply/
+worktree or terminal automatically. Mutating caller operations also capture
+`ANTIGRAVITY_CONVERSATION_ID`, `CLAUDE_CODE_SESSION_ID`/`CLAUDE_SESSION_ID`, or
+`CODEX_THREAD_ID`/`CODEX_SESSION_ID`, plus `ORCA_PANE_KEY`/`ORCA_AGENT_PANE`.
+When that workspace sleeps, incoming thread mail reuses the restored pane or
+resumes the recorded conversation in a background tab with auto-permissions,
+without taking over a sibling tab. Session rotation starts a fresh conversation
+and clears the previous session/pane identity. `inbox list` and `inbox check
+--peek` do not change these bindings. Omit `--mailbox` for two-way ask/reply/
 settle conversations; each side wakes the other's Orca terminal. `dealer ask`
 defaults to `collab.question.v1` when `--topic` is omitted, and
 `--target-mailbox worktree:<name>` addresses a named Orca worktree.

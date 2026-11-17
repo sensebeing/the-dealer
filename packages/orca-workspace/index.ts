@@ -46,6 +46,14 @@ export interface OrcaTerminalRow {
   lastOutputAt?: unknown;
   tabId?: string;
   leafId?: string;
+  recordedPaneKey?: unknown;
+}
+
+function matchesPane(terminal: OrcaTerminalRow, paneKey?: string): boolean {
+  return Boolean(paneKey) && terminal.connected === true && terminal.writable !== false &&
+    (terminal.recordedPaneKey === paneKey ||
+      (typeof terminal.tabId === 'string' && typeof terminal.leafId === 'string' &&
+        `${terminal.tabId}:${terminal.leafId}` === paneKey));
 }
 
 /** Recognize an Autopilot recommendation copied into the terminal composer. */
@@ -87,6 +95,7 @@ export interface OrcaWorkspaceIdleOptions {
    * to that terminal (or, when it was closed, to the terminals a rebind could reuse).
    */
   targetTerminalHandle?: string | null;
+  targetPaneKey?: string;
   /** Preferred target agent when the bound terminal is gone and a rebind picks a replacement. */
   agent?: SupportedOrcaAgent;
 }
@@ -176,9 +185,11 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
-    const targetTerm = row.path === cwd && typeof options?.targetTerminalHandle === 'string'
-      ? handles.find(t => String(t.handle) === options.targetTerminalHandle) : undefined;
-    const targetPaneKey = targetTerm?.tabId && targetTerm?.leafId ? `${targetTerm.tabId}:${targetTerm.leafId}` : undefined;
+    const targetTerm = row.path === cwd
+      ? handles.find(t => t.connected && t.writable !== false && String(t.handle) === options?.targetTerminalHandle)
+        ?? handles.find(t => matchesPane(t, options?.targetPaneKey)) : undefined;
+    const targetPaneKey = targetTerm?.tabId && targetTerm?.leafId ? `${targetTerm.tabId}:${targetTerm.leafId}`
+      : targetTerm && typeof targetTerm.recordedPaneKey === 'string' ? targetTerm.recordedPaneKey : undefined;
     if (targetPaneKey === undefined) {
       if (row.unverifiableTerminalCount !== 0 || !row.agents || row.agents.some(agent => agent.state !== 'done')) return false;
     } else {
@@ -193,7 +204,8 @@ export async function checkOrcaWorkspaceIdle(
     // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
     // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
     // rebind could reuse when it was closed).
-    const rootTarget = row.path === cwd ? options?.targetTerminalHandle : undefined;
+    const rootTarget = row.path === cwd
+      ? (targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle) : undefined;
     const targetPresent = typeof rootTarget === 'string' &&
       observableHandles.some(t => String(t.handle) === rootTarget);
     const reuseHandles = typeof rootTarget === 'string' && !targetPresent
@@ -329,6 +341,22 @@ export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravi
   return defaultAntigravityLaunchCommand();
 }
 
+export function buildOrcaAgentLaunchCommand(options?: {
+  agent?: SupportedOrcaAgent; interactiveCommand?: string; sessionId?: string;
+}): string {
+  const sessionId = options?.sessionId;
+  if (sessionId !== undefined && /[\0\r\n]/.test(sessionId)) throw new Error('Invalid Orca conversation ID');
+  const agent = options?.agent ?? 'antigravity';
+  const defaultCmd = defaultAgentLaunchCommand(agent);
+  const customCmd = options?.interactiveCommand?.trim();
+  if (sessionId?.trim() && (!customCmd || customCmd === defaultCmd)) {
+    const quoted = "'" + sessionId.trim().replaceAll("'", "'\\''") + "'";
+    if (agent === 'codex') return `${defaultCmd} resume ${quoted}`;
+    return `${defaultCmd} ${agent === 'claude' ? '--resume' : '--conversation'} ${quoted}`;
+  }
+  return customCmd || defaultCmd;
+}
+
 /**
  * Create an independent agent terminal tab in an Orca workspace. Session rotation and first-wave
  * delivery both use this so a retained conversation tab is never reset or written into.
@@ -340,9 +368,9 @@ export async function spawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options: { agent?: SupportedOrcaAgent; interactiveCommand?: string } = {},
+  options: { agent?: SupportedOrcaAgent; interactiveCommand?: string; sessionId?: string } = {},
 ): Promise<{ handle: string; raw: unknown }> {
-  const launchCommand = options.interactiveCommand?.trim() || defaultAgentLaunchCommand(options.agent);
+  const launchCommand = buildOrcaAgentLaunchCommand(options);
   let spawned;
   try {
     spawned = await runner({
@@ -390,8 +418,9 @@ export async function isOrcaWorkspaceTerminalLive(
   runner: CommandRunner,
   command: string,
   cwd: string,
-  terminalHandle: string,
+  terminalHandle?: string,
   signal?: AbortSignal,
+  preferredPaneKey?: string,
 ): Promise<boolean> {
   const listed = await checkedCommand(runner, {
     command,
@@ -404,7 +433,8 @@ export async function isOrcaWorkspaceTerminalLive(
     throw new Error('Incomplete Orca terminal inventory');
   }
   const terminal = (inventory.result.terminals as OrcaTerminalRow[]).find(
-    row => row && String(row.handle) === terminalHandle,
+    row => row && row.connected === true && row.writable !== false &&
+      ((Boolean(terminalHandle) && String(row.handle) === terminalHandle) || matchesPane(row, preferredPaneKey)),
   );
   return terminal !== undefined && terminal.connected === true && terminal.writable !== false;
 }
@@ -415,7 +445,7 @@ export async function planOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
   const targetAgent = options?.agent ?? 'antigravity';
   const listed = await checkedCommand(runner, {
@@ -438,6 +468,9 @@ export async function planOrcaWorkspaceTerminal(
     );
     if (bound) return { handle: String(bound.handle), kind: 'existing' };
   }
+  const pane = terminals.find(t => t && matchesPane(t, options?.preferredPaneKey));
+  if (pane) return { kind: 'existing', handle: String(pane.handle) };
+  if (options?.sessionId?.trim()) return { kind: 'create' };
   const nonOrphanConnected = terminals.filter(
     t => t && t.orphaned !== true && t.connected && t.writable !== false,
   );
@@ -466,13 +499,13 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string },
 ): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
   const plan = await planOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
   if (plan.kind === 'existing') return { handle: plan.handle, spawned: false };
   if (plan.kind === 'shell') {
     await sendOrcaTerminalText(runner, command, plan.handle,
-      options?.interactiveCommand?.trim() || defaultAgentLaunchCommand(options?.agent), { cwd, signal });
+      buildOrcaAgentLaunchCommand(options), { cwd, signal });
     return { handle: plan.handle, spawned: true, shellBootstrapped: true };
   }
   const spawned = await spawnOrcaWorkspaceTerminal(runner, command, cwd, signal, options);

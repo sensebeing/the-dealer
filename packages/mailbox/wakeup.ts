@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import {
   OrcaTerminalLaunchRejectedError,
-  defaultAgentLaunchCommand,
+  buildOrcaAgentLaunchCommand,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
   isOrcaWorkspaceTerminalLive,
@@ -233,25 +233,29 @@ export async function launchFencedOrcaWorkspaceTerminal(
     workspacePath: string;
     agent?: WakeTargetState['agent'];
     interactiveCommand?: string;
+    sessionId?: string;
     signal?: AbortSignal;
     now?: number;
     resetCompletedWaves?: boolean;
     shellTerminalHandle?: string;
   },
 ) {
+  const resumeSessionId = options.resetCompletedWaves ? undefined : options.sessionId?.trim() || undefined;
+  const launchCommand = buildOrcaAgentLaunchCommand({ ...options, sessionId: resumeSessionId });
   store.beginWakeDelivery(mailboxId);
   try {
     let launched: { handle: string; raw: unknown };
     if (options.shellTerminalHandle) {
       await sendOrcaTerminalText(runner, options.command, options.shellTerminalHandle,
-        options.interactiveCommand?.trim() || defaultAgentLaunchCommand(options.agent),
+        launchCommand,
         { cwd: options.workspacePath, signal: options.signal });
       launched = { handle: options.shellTerminalHandle, raw: undefined };
     } else {
-      launched = await spawnOrcaWorkspaceTerminal(runner, options.command, options.workspacePath, options.signal, options);
+      launched = await spawnOrcaWorkspaceTerminal(runner, options.command, options.workspacePath, options.signal, { ...options, sessionId: resumeSessionId });
     }
     const target = store.upsertWakeTarget(mailboxId, {
-      ...(options.resetCompletedWaves ? { completedWaves: 0 } : {}),
+      ...(options.resetCompletedWaves ? { completedWaves: 0, sessionId: undefined } : {}),
+      paneKey: undefined,
       terminalHandle: launched.handle,
       deliveryInDoubt: undefined,
       pendingWake: true,
@@ -696,27 +700,17 @@ export class WakeupRedriveService {
     if (this.runner === runCommand && !this.idleCheck && !existsSync(workspacePath)) {
       return false;
     }
-    if (mailboxId.startsWith('task:')) {
-      if (!target.terminalHandle) return true;
+    if (needsSessionRotation(target, preview)) return true;
+    if (mailboxId.startsWith('task:') || target.sessionId?.trim()) {
+      if (!target.terminalHandle && !target.paneKey) return true;
       return !this.idleCheck && !(await isOrcaWorkspaceTerminalLive(
-        this.runner, command, workspacePath, target.terminalHandle,
+        this.runner, command, workspacePath, target.terminalHandle, undefined, target.paneKey,
       ));
     }
     if (target.rotateAfterWaves === undefined) return false;
-    // Rotation always creates an empty tab, so the retained tab (draft or not) cannot gate it.
-    if (needsSessionRotation(target, preview)) {
-      return true;
-    }
-    // The first wave on an unbound workspace opens its own tab instead of hijacking a human's.
-    if (!target.terminalHandle) {
-      return true;
-    }
-    // A tab closed mid-wave or mid-window is replaced instead of falling back to another tab.
+    if (!target.terminalHandle && !target.paneKey) return true;
     return !(await isOrcaWorkspaceTerminalLive(
-      this.runner,
-      command,
-      workspacePath,
-      target.terminalHandle,
+      this.runner, command, workspacePath, target.terminalHandle, undefined, target.paneKey,
     ));
   }
 
@@ -744,6 +738,7 @@ export class WakeupRedriveService {
       // tab is the only composer that can receive the pointer.
       return withPlan(await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
         targetTerminalHandle: spawnFreshSession ? null : target.terminalHandle,
+        targetPaneKey: spawnFreshSession ? undefined : target.paneKey,
         agent: target.agent,
       }));
     }
@@ -819,8 +814,8 @@ export class WakeupRedriveService {
     let rotated = false;
     const dedicatedTaskTab = mailboxId.startsWith('task:') && target.mode === 'orca-terminal' && Boolean(target.workspacePath);
     const replaceTaskTab = dedicatedTaskTab && !(needsRotation || spawnFreshSession) &&
-      (!terminalHandle || (!this.idleCheck && !(await isOrcaWorkspaceTerminalLive(
-        this.runner, command, target.workspacePath!, terminalHandle,
+      ((!terminalHandle && !target.paneKey) || (!this.idleCheck && !(await isOrcaWorkspaceTerminalLive(
+        this.runner, command, target.workspacePath!, terminalHandle, undefined, target.paneKey,
       ))));
 
     if (needsRotation || spawnFreshSession || replaceTaskTab) {
@@ -833,7 +828,7 @@ export class WakeupRedriveService {
       const workspacePath = target.workspacePath;
       const spawned = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
         command, workspacePath, agent: target.agent, interactiveCommand: target.interactiveCommand,
-        now: this.now(), resetCompletedWaves: needsRotation,
+        now: this.now(), resetCompletedWaves: needsRotation, sessionId: target.sessionId,
       });
       terminalHandle = spawned.handle;
       target = spawned.target;
@@ -850,13 +845,14 @@ export class WakeupRedriveService {
         );
         return needsRotation ? { ...deferred, rotated: true } : deferred;
       }
-    } else if (!dedicatedTaskTab && (!terminalHandle || !this.idleCheck) && target.workspacePath && target.mode === 'orca-terminal') {
+    } else if ((!terminalHandle || !this.idleCheck) && target.workspacePath && target.mode === 'orca-terminal') {
       // Real Orca mode re-resolves before every send so a terminal closed since the last delivery
       // is rebound (or respawned) before the external boundary is crossed; `preferredHandle` keeps
       // a live binding without spawning a second terminal. Tests that inject an authoritative idle
       // check only resolve when no handle exists yet.
       const plan = await planOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, {
         agent: target.agent, preferredHandle: target.terminalHandle,
+        preferredPaneKey: target.paneKey, sessionId: target.sessionId,
       });
       if (plan.kind === 'existing') {
         terminalHandle = plan.handle;
@@ -864,7 +860,7 @@ export class WakeupRedriveService {
       } else {
         const launched = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
           command, workspacePath: target.workspacePath, agent: target.agent,
-          interactiveCommand: target.interactiveCommand, now: this.now(),
+          interactiveCommand: target.interactiveCommand, now: this.now(), sessionId: target.sessionId,
           ...(plan.kind === 'shell' ? { shellTerminalHandle: plan.handle } : {}),
         });
         terminalHandle = launched.handle;

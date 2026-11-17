@@ -2,7 +2,7 @@ import { Kernel } from '../packages/kernel/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import type { NodeService } from '../packages/core-types/index.ts';
-import { spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
+import { buildOrcaAgentLaunchCommand, spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
 import { CommandNotStartedError, runCommand } from '../packages/subprocess/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -73,6 +73,10 @@ function sendsTo(calls: readonly CommandRequest[], handle: string): CommandReque
 }
 
 interface FakeTerminalRow {
+  orphaned?: boolean;
+  recordedPaneKey?: string;
+  tabId?: string;
+  leafId?: string;
   handle: string;
   connected: boolean;
   writable: boolean;
@@ -87,6 +91,7 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
     terminals: [...initial],
     waitOk: true,
     created: 0,
+    agents: initial.length ? [{ state: 'done' } as { state: string; paneKey?: string }] : [],
   };
   const runner: CommandRunner = async request => {
     state.calls.push(request);
@@ -101,7 +106,7 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
               worktreeId: 'fake-worktree',
               childWorktreeIds: [],
               unverifiableTerminalCount: 0,
-              agents: [{ state: 'done' }],
+              agents: state.agents,
             }],
           },
         }),
@@ -113,7 +118,8 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
     if (request.args[0] === 'terminal' && request.args[1] === 'create') {
       state.created += 1;
       const handle = `term-new-${state.created}`;
-      state.terminals.push({ handle, connected: true, writable: true, agentIdentity: 'antigravity', preview: '' });
+      state.terminals.push({ handle, connected: true, writable: true, agentIdentity: 'antigravity', preview: '', tabId: handle, leafId: 'root' });
+      state.agents.push({ state: 'done', paneKey: `${handle}:root` });
       return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle } } }) };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
@@ -324,6 +330,7 @@ test('rotation persists the new session tab before tui-idle and the next tick re
       mode: 'orca-terminal',
       workspacePath,
       terminalHandle: 'term-rotate',
+      sessionId: 'retired-session', paneKey: 'retired:pane',
       coalesceMs: 0,
       rotateAfterWaves: 1,
       completedWaves: 1,
@@ -338,6 +345,10 @@ test('rotation persists the new session tab before tui-idle and the next tick re
   assert.equal(state.created, 1);
   assert.equal(store.getWakeTarget('stream:rotate')!.terminalHandle, 'term-new-1');
   assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
+  assert.equal(store.getWakeTarget('stream:rotate')!.sessionId, undefined);
+  assert.equal(store.getWakeTarget('stream:rotate')!.paneKey, undefined);
+  const create = state.calls.find(call => call.args[1] === 'create')!;
+  assert.equal(create.args[create.args.indexOf('--command') + 1], 'agy --dangerously-skip-permissions');
   assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, true);
   assert.equal(terminalSends(state.calls).length, 0, 'no pointer is written before the TUI is idle');
 
@@ -1002,57 +1013,64 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   await alice.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
   await bob.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
   await until(() => alice.node.listPeers().length === 1 && bob.node.listPeers().length === 1, 'peer discovery');
-  const aliceEnv = { ORCA_TERMINAL_HANDLE: 'term-alice', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` };
-  const bobEnv = { ORCA_TERMINAL_HANDLE: 'term-bob', ORCA_WORKTREE_ID: `repo::${bobWtPath}` };
+  for (const runtime of [alice, bob]) {
+    await runtime.serveControl(async (argv, context) => {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const code = await runDealerCli(argv, { runtime, signal: context.signal, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+      return { code, stdout, stderr };
+    });
+  }
+  const aliceEnv = { ANTIGRAVITY_CONVERSATION_ID: 'alice-session', ORCA_PANE_KEY: 'alice:pane', ORCA_TERMINAL_HANDLE: 'term-alice', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` };
+  const bobEnv = { CLAUDE_CODE_SESSION_ID: 'bob-session', ORCA_PANE_KEY: 'bob:pane', ORCA_TERMINAL_HANDLE: 'term-bob', ORCA_WORKTREE_ID: `repo::${bobWtPath}` };
   const askOut: string[] = [];
-  await runDealerCli(['ask', '--network', 'team', '--to', 'member:bob', '--target-mailbox', 'worktree:bob-wt', '--body', 'Please review'], { runtime: alice, env: aliceEnv, stdout: line => askOut.push(line) });
+  await runDealerCli(['ask', '--network', 'team', '--to', 'member:bob', '--target-mailbox', 'worktree:bob-wt', '--body', 'Please review'], { stateDir: alice.stateDir, env: aliceEnv, stdout: line => askOut.push(line) });
   const asked = JSON.parse(askOut.join('\n'));
   assert.equal(asked.replyMailbox, 'worktree:alice-wt');
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.mode, 'orca-terminal');
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-alice');
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.workspacePath, aliceWtPath);
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.sessionId, 'alice-session');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.paneKey, 'alice:pane');
   await until(() => bob.mailbox.list({ mailboxId: 'worktree:bob-wt' }).totalCount > 0, 'Bob inbound mailbox');
   await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-bob')), 'Bob terminal wake');
   const checkOut: string[] = [];
-  await runDealerCli(['inbox', 'check'], { runtime: bob, env: bobEnv, stdout: line => checkOut.push(line) });
+  await runDealerCli(['inbox', 'check'], { stateDir: bob.stateDir, env: bobEnv, stdout: line => checkOut.push(line) });
   const checked = JSON.parse(checkOut.join('\n'));
   assert.equal(checked.mailboxId, 'worktree:bob-wt');
   assert.equal(checked.items.length, 1);
   const replyOut: string[] = [];
-  await runDealerCli(['reply', asked.questionId, '--body', 'Approved', '--ack', checked.deliveryId], { runtime: bob, env: bobEnv, stdout: line => replyOut.push(line) });
+  await runDealerCli(['reply', asked.questionId, '--body', 'Approved', '--ack', checked.deliveryId], { stateDir: bob.stateDir, env: bobEnv, stdout: line => replyOut.push(line) });
   const replied = JSON.parse(replyOut.join('\n'));
   assert.equal(replied.replyMailbox, 'worktree:bob-wt');
   assert.equal(replied.targetMailbox, 'worktree:alice-wt');
   assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.mode, 'orca-terminal');
   assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.terminalHandle, 'term-bob');
   assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.workspacePath, bobWtPath);
+  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.sessionId, 'bob-session');
+  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.agent, 'claude');
+  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.paneKey, 'bob:pane');
   await until(() => alice.mailbox.list({ mailboxId: 'worktree:alice-wt' }).totalCount > 0, 'Alice reply mailbox');
   await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-alice')), 'Alice terminal wake');
   const aliceCheckOut: string[] = [];
-  await runDealerCli(['inbox', 'check'], { runtime: alice, env: aliceEnv, stdout: line => aliceCheckOut.push(line) });
+  await runDealerCli(['inbox', 'check'], { stateDir: alice.stateDir, env: aliceEnv, stdout: line => aliceCheckOut.push(line) });
   const aliceCheck = JSON.parse(aliceCheckOut.join('\n'));
   assert.equal(aliceCheck.mailboxId, 'worktree:alice-wt');
   assert.equal(aliceCheck.items.length, 1);
   const followUpOut: string[] = [];
-  await runDealerCli(['ask', '--reply-to', replied.replyId, '--body', 'Follow-up', '--ack', aliceCheck.deliveryId], { runtime: alice, env: aliceEnv, stdout: line => followUpOut.push(line) });
+  await runDealerCli(['ask', '--reply-to', replied.replyId, '--body', 'Follow-up', '--ack', aliceCheck.deliveryId], { stateDir: alice.stateDir, env: aliceEnv, stdout: line => followUpOut.push(line) });
   await until(() => bob.mailbox.list({ mailboxId: 'worktree:bob-wt' }).totalCount > 0, 'Bob follow-up mailbox');
   await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-bob')), 'Bob terminal wake');
   const bobCheckOut: string[] = [];
-  await runDealerCli(['inbox', 'check'], { runtime: bob, env: bobEnv, stdout: line => bobCheckOut.push(line) });
+  await runDealerCli(['inbox', 'check'], { stateDir: bob.stateDir, env: bobEnv, stdout: line => bobCheckOut.push(line) });
   const bobCheck = JSON.parse(bobCheckOut.join('\n'));
   assert.equal(bobCheck.mailboxId, 'worktree:bob-wt');
   assert.equal(bobCheck.items.length, 1);
   const settleOut: string[] = [];
-  await runDealerCli(['settle', asked.questionId, '--outcome', 'succeeded', '--summary', 'Done', '--ack', bobCheck.deliveryId], { runtime: bob, env: bobEnv, stdout: line => settleOut.push(line) });
+  await runDealerCli(['settle', asked.questionId, '--outcome', 'succeeded', '--summary', 'Done', '--ack', bobCheck.deliveryId], { stateDir: bob.stateDir, env: bobEnv, stdout: line => settleOut.push(line) });
   await until(() => calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-alice')).length >= 2, 'Alice terminal settle wake');
 
   alice.mailbox.enqueue([alert('rpc-mail')], { mailboxId: 'worktree:alice-wt' });
-  await alice.serveControl(async (argv, context) => {
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    const code = await runDealerCli(argv, { runtime: alice, signal: context.signal, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
-    return { code, stdout, stderr };
-  });
   await runDealerCli(['inbox', 'check', '--json'], { stateDir: alice.stateDir, env: { ORCA_TERMINAL_HANDLE: 'term-rpc', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` }, stdout: () => {} });
   assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-rpc');
 
@@ -2380,4 +2398,110 @@ test('redrive fences both dedicated tab creation and non-task shell bootstrap on
       assert.equal(state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === (task ? 'create' : 'send')).length, 1);
     }
   }
+});
+
+for (const [agent, envKey, resumeCommand] of [
+  ['antigravity', 'ANTIGRAVITY_CONVERSATION_ID', "agy --dangerously-skip-permissions --conversation 'original-session'"],
+  ['claude', 'CLAUDE_CODE_SESSION_ID', "claude --dangerously-skip-permissions --resume 'original-session'"],
+  ['codex', 'CODEX_THREAD_ID', "codex --dangerously-bypass-approvals-and-sandbox resume 'original-session'"],
+] as const) {
+  test(`RPC caller capture and sleeping conversation resume: ${agent}`, async t => {
+    const root = directory(t);
+    const workspacePath = join(root, 'sleeping');
+    const { runner, state } = fakeOrcaWorkspace(workspacePath);
+    const runtime = await makeNode(t, root, 'self', { commandRunner: runner });
+    await runtime.serveControl(async (argv, context) => {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const code = await runDealerCli(argv, { runtime, signal: context.signal, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+      return { code, stdout, stderr };
+    });
+    const env = { ORCA_TERMINAL_HANDLE: 'term-origin', ORCA_WORKTREE_ID: `repo::${workspacePath}`, ORCA_PANE_KEY: 'tab:leaf', [envKey]: 'original-session' };
+    const invoke = async (args: string[], callerEnv = env) => {
+      const out: string[] = [];
+      const code = await runDealerCli([...args, '--json'], { stateDir: runtime.stateDir, env: callerEnv, stdout: line => out.push(line), stderr: line => assert.fail(line) });
+      assert.equal(code, 0);
+      return JSON.parse(out.join('\n'));
+    };
+    const sent = await invoke(['send', '--network', 'local', '--to', 'member:self', '--topic', 'test.resume', '--body', 'hello']);
+    const mailboxId = 'worktree:sleeping';
+    const bound = runtime.mailbox.getWakeTarget(mailboxId)!;
+    assert.equal(bound.agent, agent);
+    assert.equal(bound.sessionId, 'original-session');
+    assert.equal(bound.paneKey, 'tab:leaf');
+    for (const args of [['inbox', 'list'], ['inbox', 'check', '--peek']]) {
+      await invoke(args, { ...env, ORCA_TERMINAL_HANDLE: 'term-foreign', [envKey]: 'foreign-session' });
+      assert.deepEqual(runtime.mailbox.getWakeTarget(mailboxId), bound);
+    }
+    await invoke(['reply', sent.messageId, '--body', 'reply'], {} as typeof env);
+    await until(() => state.calls.some(call => call.args[1] === 'send' && call.args.includes('term-new-1')), 'resumed conversation pointer');
+    const create = state.calls.find(call => call.args[1] === 'create')!;
+    assert.equal(create.args[create.args.indexOf('--command') + 1], resumeCommand);
+    assert.ok(!create.args.includes('--focus'));
+    assert.ok(state.calls.findIndex(call => call.args[1] === 'wait') < state.calls.findIndex(call => call.args[1] === 'send'));
+    const resumed = runtime.mailbox.getWakeTarget(mailboxId)!;
+    assert.equal(resumed.terminalHandle, 'term-new-1');
+    assert.equal(resumed.sessionId, 'original-session');
+    assert.equal(resumed.paneKey, undefined);
+    await invoke(['inbox', 'check'], { ...env, ORCA_TERMINAL_HANDLE: 'term-new-1', [envKey]: '' });
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, 'original-session');
+    await invoke(['inbox', 'check'], { ...env, ORCA_TERMINAL_HANDLE: 'term-shell', ORCA_PANE_KEY: '', [envKey]: '' });
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, undefined);
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.paneKey, undefined);
+  });
+}
+
+for (const mailboxId of ['worktree:bound', 'task:bound']) {
+  for (const restored of [undefined, 'recorded', 'coordinates'] as const) {
+    test(`conversation isolation with busy sibling (${mailboxId}): ${restored ?? 'resume'}`, async t => {
+      const root = directory(t);
+      const workspacePath = join(root, 'bound');
+      const store = new MailboxStore(join(root, 'mailbox.json'));
+      const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+        { handle: 'term-sibling', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> human draft' },
+      ]);
+      if (restored) state.terminals.push({ handle: 'term-restored', connected: true, writable: true, agentIdentity: 'antigravity', preview: '', orphaned: true,
+        ...(restored === 'recorded' ? { recordedPaneKey: 'tab:leaf' } : { tabId: 'tab', leafId: 'leaf' }),
+      });
+      state.agents = [{ state: 'working', paneKey: 'sibling:pane' }, ...(restored ? [{ state: 'done', paneKey: 'tab:leaf' }] : [])];
+      const service = new WakeupRedriveService({ store, commandRunner: runner });
+      t.after(() => service.stop());
+      store.enqueue([alert('conversation-mail')], { mailboxId, wakeTarget: {
+        mode: 'orca-terminal', workspacePath, terminalHandle: 'term-origin', sessionId: 'original', paneKey: 'tab:leaf', coalesceMs: 0,
+      } });
+      const result = await service.flushMailbox(mailboxId, { force: true });
+      assert.equal(result.woke, true);
+      assert.equal(state.created, restored ? 0 : 1);
+      assert.equal(sendsTo(state.calls, 'term-sibling').length, 0);
+      assert.equal(sendsTo(state.calls, restored ? 'term-restored' : 'term-new-1').length, 1);
+    });
+  }
+
+}
+
+test('Orca resume commands quote conversation IDs and reject control characters before launch', async () => {
+  assert.equal(buildOrcaAgentLaunchCommand({ agent: 'claude', sessionId: "a'b;$(touch nope)" }),
+    "claude --dangerously-skip-permissions --resume 'a'\\''b;$(touch nope)'");
+  assert.equal(buildOrcaAgentLaunchCommand({ sessionId: 'session', interactiveCommand: 'custom-agent --flag' }), 'custom-agent --flag');
+  assert.equal(buildOrcaAgentLaunchCommand({ sessionId: 'session', interactiveCommand: 'agy --dangerously-skip-permissions' }), "agy --dangerously-skip-permissions --conversation 'session'");
+  let calls = 0;
+  for (const sessionId of ['bad\nvalue', 'bad\rvalue', 'bad\0value']) {
+    await assert.rejects(spawnOrcaWorkspaceTerminal(async () => { calls++; return { stdout: '' }; }, 'orca', '/workspace', undefined, { sessionId }), /Invalid Orca conversation ID/);
+  }
+  assert.equal(calls, 0);
+});
+
+test('rotating mailbox pins the active conversation identity durably', t => {
+  const file = join(directory(t), 'mailbox.json');
+  const store = new MailboxStore(file);
+  store.upsertWakeTarget('stream:wave', {
+    mode: 'orca-terminal', workspacePath: '/workspace', terminalHandle: 'term-original',
+    agent: 'codex', sessionId: 'original-session', paneKey: 'tab:leaf', rotateAfterWaves: 1,
+  });
+  assert.equal(store.pinRotatingSessionMailbox('stream:wave', 'term-original'), 'terminal:term-original');
+  const pinned = new MailboxStore(file).getWakeTarget('terminal:term-original')!;
+  assert.equal(pinned.agent, 'codex');
+  assert.equal(pinned.sessionId, 'original-session');
+  assert.equal(pinned.paneKey, 'tab:leaf');
+  assert.equal(pinned.rotateAfterWaves, undefined);
 });
