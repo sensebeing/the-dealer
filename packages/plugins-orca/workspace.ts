@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { defaultAgentLaunchCommand, trustAntigravityWorkspace } from '../plugins-agent-host/hosts.ts';
-import { isAutopilotComposerPrefill, isAntigravityModePlaceholder } from './tui-quirks.ts';
+import { isOrcaComposerEmpty } from './tui-quirks.ts';
 import { beforeExternalEffect } from '../plugins-executor/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomInt } from 'node:crypto';
@@ -39,11 +39,11 @@ export async function findOrcaWorktreeByName(
 
 export interface OrcaIdleResult {
   idle: boolean;
-  composerPrefilled?: boolean;
   reason?: string;
 }
 
 export interface OrcaTerminalRow {
+  worktreePath?: string;
   handle: string;
   connected: boolean;
   writable?: boolean;
@@ -133,7 +133,6 @@ export async function checkOrcaWorkspaceIdle(
     return { idle: false, reason: 'Workspace not found' };
   }
   if (options?.targetTerminalHandle === null) return { idle: true, reason: undefined };
-  let composerPrefilled = false;
   const visited = new Set<string>();
   const idleTree = async (row: Workspace): Promise<boolean> => {
     if (visited.has(row.worktreeId)) {
@@ -207,40 +206,17 @@ export async function checkOrcaWorkspaceIdle(
       if (!terminal.connected || !terminal.writable) {
         return false;
       }
-      const realOrcaTerminal =
-        typeof terminal.preview === 'string' || typeof terminal.agentIdentity === 'string';
-      if (!realOrcaTerminal) {
-        // Synthetic or older inventory without TUI metadata: ask Orca directly.
-        if (!(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle) {
-          return false;
-        }
-        continue;
-      }
-      if (typeof terminal.preview === 'string') {
-        // Autopilot recommendations may prefill the composer below an idle agent.
-        const lastLine = terminal.preview
-          .split(/\r?\n/)
-          .filter((line) => line.trim())
-          .at(-1);
-        if (isAutopilotComposerPrefill(terminal.preview)) {
-          if (row.path === cwd) {
-            composerPrefilled = true;
-          }
-          continue;
-        }
-        if (lastLine?.trimStart().startsWith('> ')) {
-          // A plain-text preview strips ANSI styling, so an empty Antigravity composer showing a
-          // dim execution-mode placeholder looks exactly like an unsent human draft. Only the
-          // exact Antigravity placeholder may relax the draft guard, and Orca's readiness probe
-          // must also confirm the TUI is idle; a changed hint or any other `> ` line stays busy.
-          if (
-            !isAntigravityModePlaceholder(lastLine, terminal.agentIdentity) ||
-            !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle
-          ) {
-            return false;
-          }
-        }
-      }
+      if (
+        typeof terminal.preview === 'string' &&
+        !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
+      )
+        return false;
+      // A recognized agent (or inventory without preview metadata) needs authoritative TUI readiness.
+      // A bare shell has no agent TUI yet; its workspace proof permits only the bootstrap path.
+      if (
+        (terminal.agentIdentity || typeof terminal.preview !== 'string') &&
+        !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle
+      ) return false;
     }
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
@@ -264,7 +240,6 @@ export async function checkOrcaWorkspaceIdle(
   const idle = await idleTree(root);
   return {
     idle,
-    ...(idle && composerPrefilled ? { composerPrefilled: true } : {}),
     reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable',
   };
 }
@@ -300,11 +275,36 @@ export async function waitOrcaTerminalIdle(
     }
     return { idle: true };
   } catch (error) {
-    return { idle: false, reason: `Terminal idle wait failed: ${String(error)}` };
+    return {
+      idle: false,
+      reason: `Terminal idle wait failed: ${String(error)}`,
+    };
   }
 }
 
-/** Probe one terminal without injecting anything; used when no workspace path is known. */
+/** Read the actual terminal surface; older injected inventories may omit the terminal record. */
+export async function readOrcaTerminal(
+  runner: CommandRunner,
+  command: string,
+  terminalHandle: string,
+  cwd?: string,
+  signal?: AbortSignal,
+): Promise<OrcaTerminalRow | undefined> {
+  const shown = await checkedCommand(runner, {
+    command,
+    args: ['terminal', 'show', '--terminal', terminalHandle, '--json'],
+    cwd,
+    signal,
+  });
+  const parsed = JSON.parse(shown.stdout);
+  if (parsed?.ok === false) throw new Error('Orca terminal show failed');
+  const terminal = parsed?.result?.terminal;
+  if (terminal && typeof terminal === 'object' && !Array.isArray(terminal)) return terminal;
+  if (runner === runCommand) throw new Error('Orca terminal show returned no terminal');
+  return undefined;
+}
+
+/** Every terminal-only target receives the same composer protection as workspace targets. */
 export async function probeOrcaTerminalIdle(
   runner: CommandRunner,
   command: string,
@@ -312,10 +312,31 @@ export async function probeOrcaTerminalIdle(
   cwd?: string,
   signal?: AbortSignal,
 ): Promise<OrcaIdleResult> {
-  const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal);
-  return result.idle
-    ? result
-    : { idle: false, reason: `Terminal idle probe failed: ${result.reason ?? 'Terminal is busy'}` };
+  try {
+    const terminal = await readOrcaTerminal(runner, command, terminalHandle, cwd, signal);
+    if (terminal && (terminal.connected !== true || terminal.writable === false))
+      return {
+        idle: false,
+        reason: 'Terminal is disconnected or not writable',
+      };
+    if (
+      typeof terminal?.preview === 'string' &&
+      !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
+    )
+      return { idle: false, reason: 'Terminal composer has unsent draft' };
+    const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal);
+    return result.idle
+      ? result
+      : {
+          idle: false,
+          reason: `Terminal idle probe failed: ${result.reason ?? 'Terminal is busy'}`,
+        };
+  } catch (error) {
+    return {
+      idle: false,
+      reason: `Terminal idle probe failed: ${String(error)}`,
+    };
+  }
 }
 
 export type SupportedOrcaAgent = 'antigravity' | 'claude' | 'codex';
@@ -501,17 +522,8 @@ export async function sendOrcaTerminalText(
   command: string,
   terminalHandle: string,
   text: string,
-  options: { cwd?: string; signal?: AbortSignal; waitSubmit?: number; clearComposer?: boolean } = {},
+  options: { cwd?: string; signal?: AbortSignal; waitSubmit?: number } = {},
 ): Promise<void> {
-  if (options.clearComposer === true) {
-    const cleared = await checkedCommand(runner, {
-      command,
-      args: ['terminal', 'send', '--terminal', terminalHandle, '--text', '\x15', '--json'],
-      cwd: options.cwd,
-      signal: options.signal,
-    });
-    if (JSON.parse(cleared.stdout).ok === false) throw new Error('Orca composer clear failed');
-  }
   const args = [
     'terminal',
     'send',

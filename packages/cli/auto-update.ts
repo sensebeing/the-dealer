@@ -399,6 +399,7 @@ export function selfUpdate(options: SelfUpdateOptions): any {
   let headSha: string | undefined;
   let error: string | undefined;
   let syncedSkills: string[] = [];
+  let stashedLocalChanges = false;
   try {
     const root = options.checkoutDir ?? (existsSync(join(dealerRootFor(), '.git')) ? dealerRootFor() : join(options.homeDir ?? process.env.HOME ?? '', 'the-dealer'));
     if (existsSync(join(root, '.git'))) {
@@ -406,25 +407,70 @@ export function selfUpdate(options: SelfUpdateOptions): any {
       const dirty = git(['status', '--porcelain']);
       const branch = git(['branch', '--show-current']);
       headSha = git(['rev-parse', 'HEAD']);
-      if (dirty) {
-        sourceStatus = 'skipped_dirty_checkout';
-      } else if (branch !== 'main') {
+      if (branch !== 'main') {
         sourceStatus = 'skipped_non_main_branch';
+      } else if (/^(UU|AA|DD|AU|UA|DU|UD) /m.test(dirty) || ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))))) {
+        status = 'failed';
+        sourceStatus = 'conflicted_checkout';
+        error = 'Checkout has unresolved merge or rebase state';
       } else {
-        git(['pull', '--ff-only']);
-        const nextSha = git(['rev-parse', 'HEAD']);
-        sourceStatus = nextSha === headSha ? 'up_to_date' : 'updated';
-        status = sourceStatus === 'updated' ? 'updated' : 'complete';
-        headSha = nextSha;
+        const beforeSha = headSha;
+        const stashRef = () => {
+          try { return git(['rev-parse', '--verify', '--quiet', 'refs/stash']); }
+          catch { return ''; }
+        };
+        let savedStash: string | undefined;
+        const restore = () => {
+          if (!savedStash || stashRef() !== savedStash) throw new Error('Temporary update stash is no longer the newest stash');
+          try { git(['stash', 'pop', '--index']); }
+          catch {
+            git(['reset', '--hard', beforeSha]);
+            git(['clean', '-fd']);
+            git(['stash', 'pop']);
+          }
+        };
+        if (dirty) {
+          const stashBefore = stashRef();
+          git(['stash', 'push', '--include-untracked', '-m', 'dealer-self-update']);
+          savedStash = stashRef();
+          if (!savedStash || savedStash === stashBefore) throw new Error('Failed to preserve local changes in update stash');
+          stashedLocalChanges = true;
+        }
+        try { git(['pull', '--ff-only']); }
+        catch (pullError) {
+          if (savedStash) restore();
+          throw pullError;
+        }
+        const pulledSha = git(['rev-parse', 'HEAD']);
+        let restored = true;
+        if (savedStash) {
+          try { git(['stash', 'pop']); }
+          catch {
+            git(['reset', '--hard', beforeSha]);
+            git(['clean', '-fd']);
+            restore();
+            restored = false;
+            status = 'failed';
+            sourceStatus = 'stash_conflict_rolled_back';
+            headSha = beforeSha;
+            error = 'Local changes conflicted with upstream update; rolled back cleanly to previous HEAD';
+          }
+        }
+        if (restored) {
+          sourceStatus = pulledSha === beforeSha ? 'up_to_date' : 'updated';
+          status = sourceStatus === 'updated' ? 'updated' : 'complete';
+          headSha = pulledSha;
+        }
       }
       syncedSkills = syncSkills(root, options);
     }
   } catch (caught) {
+    status = 'failed';
     sourceStatus = 'error';
     error = String(caught);
   }
-  const { error: _previousError, ...restPrevious } = previous;
-  const report = { ...restPrevious, lastCheckedAt: checkedAt, ...(status === 'updated' ? { lastUpdatedAt: new Date().toISOString() } : {}), status, sourceStatus, ...(headSha ? { headSha } : {}), syncedSkills, restartedDaemon: false, ...(error ? { error } : {}) };
+  const { error: _previousError, stashedLocalChanges: _previousStash, ...restPrevious } = previous;
+  const report = { ...restPrevious, lastCheckedAt: checkedAt, ...(status === 'updated' ? { lastUpdatedAt: new Date().toISOString() } : {}), status, sourceStatus, ...(stashedLocalChanges ? { stashedLocalChanges: true } : {}), ...(headSha ? { headSha } : {}), syncedSkills, restartedDaemon: false, ...(error ? { error } : {}) };
   atomicJson(join(options.stateDir, 'auto-update.json'), report);
   writeFileSync(join(options.stateDir, 'auto-update.log'), `${JSON.stringify(report)}\n`, { flag: 'a', mode: 0o600 });
   rmSync(lock, { recursive: true, force: true });

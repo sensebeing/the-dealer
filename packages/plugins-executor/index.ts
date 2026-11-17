@@ -49,7 +49,7 @@ export interface RawAgentOptions {
 }
 
 /** Generic command/pipe execution. Host-specific launch conventions belong to host plugins. */
-export function createAgentPtyExecutorPlugin(options: RawAgentOptions = {}): ExecutorPlugin {
+export function createRawCommandExecutorPlugin(options: RawAgentOptions = {}): ExecutorPlugin {
   return {
     name: 'agent-pty',
     async execute(batch, context) {

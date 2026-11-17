@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import {
   OrcaTerminalLaunchRejectedError,
+  readOrcaTerminal,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
   isOrcaWorkspaceTerminalLive,
@@ -216,7 +217,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
     if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
     const command = target.orcaCommand ?? 'orca';
     const preview = store.check({ mailboxId, peek: true });
-    const idle = await waitOrcaTerminalIdle(
+    const ready = await waitOrcaTerminalIdle(
       runner,
       command,
       target.terminalHandle,
@@ -224,6 +225,14 @@ export async function deliverSpawnedOrcaTerminalWakeup(
       5000,
       options.signal,
     );
+    const idle = !ready.idle
+      ? ready
+      : target.workspacePath
+        ? await checkOrcaWorkspaceIdle(runner, command, target.workspacePath, options.signal, {
+            targetTerminalHandle: target.terminalHandle,
+            agent: target.agent,
+          })
+        : await probeOrcaTerminalIdle(runner, command, target.terminalHandle, undefined, options.signal);
     if (!idle.idle) {
       store.upsertWakeTarget(mailboxId, {
         pendingWake: true,
@@ -331,13 +340,7 @@ class OrcaWakeDelivery {
       }
       return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
     }
-    return await this.deliver(
-      mailboxId,
-      target,
-      preview,
-      idle.composerPrefilled === true,
-      idle.spawnFreshSession === true,
-    );
+    return await this.deliver(mailboxId, target, preview, idle.spawnFreshSession === true);
   }
 
   /**
@@ -414,7 +417,10 @@ class OrcaWakeDelivery {
         await probeOrcaTerminalIdle(this.runner, command, target.terminalHandle, target.workspacePath),
       );
     }
-    return withPlan({ idle: false, reason: 'Authoritative terminal idle check required' });
+    return withPlan({
+      idle: false,
+      reason: 'Authoritative terminal idle check required',
+    });
   }
 
   private defer(
@@ -454,14 +460,13 @@ class OrcaWakeDelivery {
         agent: target.agent,
       });
     }
-    return { idle: true };
+    return probeOrcaTerminalIdle(this.runner, command, terminalHandle);
   }
 
   private async deliver(
     mailboxId: string,
     target: OrcaWakeTarget,
     preview: MailboxCheckResult,
-    composerPrefilled: boolean,
     freshSession: boolean,
   ): Promise<WakeupDriverOutcome> {
     const command = target.orcaCommand ?? this.command;
@@ -496,7 +501,6 @@ class OrcaWakeDelivery {
       });
       terminalHandle = spawned.handle;
       target = spawned.target;
-      composerPrefilled = false;
       rotated = needsRotation;
       const idle = await this.waitFreshTabIdle(target, terminalHandle, command);
       if (!idle.idle) {
@@ -542,7 +546,7 @@ class OrcaWakeDelivery {
         }
         const idle = this.idleCheck
           ? await this.idleCheck()
-          : await waitOrcaTerminalIdle(this.runner, command, terminalHandle, target.workspacePath, 5000);
+          : await this.waitFreshTabIdle(target, terminalHandle, command);
         if (!idle.idle)
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
       }
@@ -585,7 +589,6 @@ class OrcaWakeDelivery {
     } else {
       await sendOrcaTerminalText(this.runner, command, terminalHandle!, pointer, {
         cwd: target.workspacePath,
-        ...(composerPrefilled ? { clearComposer: true } : {}),
       });
     }
 
@@ -630,9 +633,25 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
     deliver: (context) => new OrcaWakeDelivery(context, options).run(context),
     async resolveSessionTarget(mailboxId) {
       if (mailboxId.startsWith('terminal:') && mailboxId.length > 9) {
+        let workspacePath: string | undefined;
+        try {
+          const terminal = await readOrcaTerminal(
+            options.commandRunner ?? runCommand,
+            options.orcaCommand ?? 'orca',
+            mailboxId.slice(9),
+          );
+          if (typeof terminal?.worktreePath === 'string' && terminal.worktreePath.trim())
+            workspacePath = terminal.worktreePath;
+        } catch {
+          // Optional address enrichment only: the delivery-time terminal probe still fails closed.
+        }
         return {
           driver: 'orca-terminal',
-          driverConfig: { terminalHandle: mailboxId.slice(9), orcaCommand: options.orcaCommand ?? 'orca' },
+          driverConfig: {
+            terminalHandle: mailboxId.slice(9),
+            orcaCommand: options.orcaCommand ?? 'orca',
+            ...(workspacePath ? { workspacePath } : {}),
+          },
         };
       }
       if (mailboxId.startsWith('worktree:') && mailboxId.length > 9) {
@@ -644,7 +663,10 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
         if (found)
           return {
             driver: 'orca-terminal',
-            driverConfig: { ...found, orcaCommand: options.orcaCommand ?? 'orca' },
+            driverConfig: {
+              ...found,
+              orcaCommand: options.orcaCommand ?? 'orca',
+            },
           };
       }
       return undefined;
@@ -653,7 +675,10 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
 }
 
 export function createOrcaRunWakeupDriver(options: OrcaWakeupDriverOptions = {}): WakeupDriver {
-  return { name: 'orca-run', deliver: (context) => new OrcaWakeDelivery(context, options).run(context) };
+  return {
+    name: 'orca-run',
+    deliver: (context) => new OrcaWakeDelivery(context, options).run(context),
+  };
 }
 
 export function createOrcaWakeupDrivers(options: OrcaWakeupDriverOptions = {}): readonly WakeupDriver[] {

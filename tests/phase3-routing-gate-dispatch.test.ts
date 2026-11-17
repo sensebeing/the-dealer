@@ -21,7 +21,7 @@ import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packa
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
 import { createInboxExecutorPlugin, createNotifyExecutorPlugin } from '../packages/plugins-executor/index.ts';
-import { createHostAwareAgentPtyExecutorPlugin as createAgentPtyExecutorPlugin } from '../packages/plugins-agent-host/index.ts';
+import { createAgentPtyExecutorPlugin } from '../packages/plugins-agent-host/index.ts';
 import { createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-orca/index.ts';
 import { checkOrcaWorkspaceIdle } from '../packages/plugins-orca/index.ts';
 import { CommandNotStartedError, checkedCommand, runCommand } from '../packages/subprocess/index.ts';
@@ -466,6 +466,8 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
     if (request.args[0] === 'terminal' && request.args[1] === 'wait' && waitFails) {
       throw new Error('wait timed out');
     }
+    if (request.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path: dir, worktreeId: 'root', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] }] } }) };
+    if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'term-agy', connected: true, writable: true, agentIdentity: 'antigravity', preview: '>' }] } }) };
     return { stdout: '{"ok":true}' };
   };
   const store = new MailboxStore(join(dir, 'mailbox.json'));
@@ -490,19 +492,22 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
     'terminal create',
     'worktree set',
     'terminal wait',
+    'worktree ps',
+    'terminal list',
+    'terminal wait',
     'terminal send',
   ]);
   assert.equal(flagValue(requests[1].args, '--command'), 'agy run --dangerously-skip-permissions');
   assert.equal(flagValue(requests[2].args, '--comment'), 'dealer: antigravity');
   assert.equal(flagValue(requests[3].args, '--timeout-ms'), '5000');
-  assert.equal(flagValue(requests[4].args, '--terminal'), 'term-agy');
+  assert.equal(flagValue(requests[7].args, '--terminal'), 'term-agy');
   assert.equal(
-    flagValue(requests[4].args, '--text'),
+    flagValue(requests[7].args, '--text'),
     buildTaskPreamble(`task:${first.id}`, first.id, undefined, first.body || first.subject),
   );
-  assert.ok(flagValue(requests[4].args, '--text').startsWith('Details — Dealer Task dispatched to mailbox '));
-  assert.ok(requests[4].args.includes('--enter'));
-  assert.equal(flagValue(requests[4].args, '--wait-submit'), '5');
+  assert.ok(flagValue(requests[7].args, '--text').startsWith('Details — Dealer Task dispatched to mailbox '));
+  assert.ok(requests[7].args.includes('--enter'));
+  assert.equal(flagValue(requests[7].args, '--wait-submit'), '5');
   const trusted = JSON.parse(await readFile(settingsPath, 'utf8')).trustedWorkspaces;
   assert.ok(trusted.includes(dir));
 
@@ -547,6 +552,8 @@ test('orca-spawn payload.interactive selects the mailbox TUI path', async t => {
         stdout: JSON.stringify({ ok: true, result: { terminal: { handle: 'term-interactive' } } }),
       };
     }
+    if (request.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path: dir, worktreeId: 'root', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] }] } }) };
+    if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'term-interactive', connected: true, writable: true, agentIdentity: 'antigravity', preview: '>' }] } }) };
     return { stdout: '{"ok":true}' };
   };
   const store = new MailboxStore(join(dir, 'mailbox.json'));
@@ -930,7 +937,7 @@ test('Orca idle inspection includes child workspaces and rejects truncated inven
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
 });
 
-test('Orca idle inspection trusts real TUI previews and probes only exact mode placeholders', async () => {
+test('Orca idle inspection requires empty composers and authoritative agent readiness', async () => {
   let lastLine = '  ⏵⏵ bypass permissions on';
   let waitOk = false;
   let waits = 0;
@@ -979,23 +986,23 @@ test('Orca idle inspection trusts real TUI previews and probes only exact mode p
     }
     return { stdout: '{"ok":true}' };
   };
-  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
-  assert.equal(waits, 0);
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
+  assert.equal(waits, 1);
   lastLine = '> unsent draft';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
-  assert.equal(waits, 0, 'an unsent draft is never resolved by a readiness probe');
+  assert.equal(waits, 1, 'an unsent draft is never resolved by a readiness probe');
+  waitOk = true;
   lastLine = '>';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
-  assert.equal(waits, 0);
-  // Only the exact Antigravity mode placeholder on an empty composer may consult the readiness
-  // probe; a changed hint stays busy without one.
+  assert.equal(waits, 2);
+  // A changed placeholder stays busy without another readiness probe.
   lastLine = '> Auto mode: edits & safe commands auto-approved';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
-  assert.equal(waits, 0);
+  assert.equal(waits, 2);
   lastLine = '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)';
   waitOk = true;
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
-  assert.equal(waits, 1);
+  assert.equal(waits, 3);
 });
 
 test('local command executor actually runs a process and captures JSON without shell interpolation', async () => {

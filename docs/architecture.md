@@ -585,5 +585,6 @@ A driver persists `beginWakeDelivery` before an external boundary and settles on
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;
 mail arriving during delivery remains pending. Proven command non-starts back off, while unknown
 outcomes remain fenced across mail arrivals, forced flushes and restarts. Orca drivers retain
-idle proof and target-composer clearing, create independent tabs for rotation, and never reset a
-retained session. Unregistered drivers retain pending obligations with an explicit retry error.
+idle proof and empty target-composer verification, create independent tabs for rotation, and never reset a
+retained session. Any human draft or unconfirmed Turn Pilot recommendation holds mail until the
+composer is empty; wakeups never clear or submit that content. Unregistered drivers retain pending obligations with an explicit retry error.

@@ -4,7 +4,7 @@ import { Kernel } from '../packages/kernel/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import type { NodeService } from '../packages/core-types/index.ts';
-import { spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/plugins-orca/index.ts';
+import { spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isOrcaComposerEmpty, sendOrcaTerminalText } from '../packages/plugins-orca/index.ts';
 import { CommandNotStartedError, runCommand } from '../packages/subprocess/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -544,6 +544,8 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
         ),
       };
     }
+    if (request.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path: join(root, 'child'), worktreeId: 'child', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] }] } }) };
+    if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'term-worker', connected: true, writable: true, preview: '>' }] } }) };
     return { stdout: '{"ok":true}' };
   };
   const service = new WakeupRedriveService({
@@ -1153,76 +1155,11 @@ test('thread show fails loudly for an unknown thread', async t => {
   assert.match(JSON.parse(err.join('\n')).error, /Unknown thread: missing/);
 });
 
-test('Autopilot composer recognition preserves human drafts and clears only before pointer delivery', async t => {
-  const suggestion = '继续检查剩余任务';
-  for (const [preview, prefilled] of [
-    [`• ,1（主推）：${suggestion}\n> ${suggestion}`, true],
-    [`下一步建议\n> ${suggestion}\nstatus bar`, true],
-    [`自动预填\n> ${suggestion}`, true],
-    [`• ,1 (主推)\n> ${suggestion}`, true],
-    [`previous ${suggestion}\n> ${suggestion}`, true],
-    ['history\n> unsent draft', false],
-    ['下一步建议\n>', false],
-    ['> unsent draft\n自动预填', false],
-  ] as const) {
-    assert.equal(isAutopilotComposerPrefill(preview), prefilled, preview);
-  }
-  const root = directory(t);
-  const calls: CommandRequest[] = [];
-  let preview = `• ,1（主推）：${suggestion}\n> ${suggestion}`;
-  const runner: CommandRunner = async request => {
-    calls.push(request);
-    if (request.args[0] === 'worktree' && request.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [
-      { path: root, worktreeId: 'root', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
-    ] } }) };
-    if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [
-      { handle: 'term', connected: true, writable: true, preview },
-    ] } }) };
-    return { stdout: '{"ok":true}' };
-  };
-  assert.deepEqual(await checkOrcaWorkspaceIdle(runner, 'orca', root), { idle: true, composerPrefilled: true, reason: undefined });
-  const childPath = join(root, 'child');
-  for (const childPreview of [
-    `• ,1（主推）：${suggestion}\n> ${suggestion}`,
-    `• ,1（主推）：${suggestion}\n> ${suggestion}\nstatus bar`,
-  ]) {
-    const childRunner: CommandRunner = async request => {
-      if (request.args[0] === 'worktree') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [
-        { path: root, worktreeId: 'root', childWorktreeIds: ['child'], unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
-        { path: childPath, worktreeId: 'child', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] },
-      ] } }) };
-      assert.equal(request.args[1], 'list');
-      return { stdout: JSON.stringify({ ok: true, result: { terminals: [
-        { handle: 'term', connected: true, writable: true, preview: request.args.includes(`path:${childPath}`) ? childPreview : '>' },
-      ] } }) };
-    };
-    const result = await checkOrcaWorkspaceIdle(childRunner, 'orca', root);
-    assert.equal(result.idle, true);
-    assert.equal(Boolean(result.composerPrefilled), false);
-  }
-  preview = 'history\n> unsent draft';
-  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', root)).idle, false);
-  preview = `• ,1（主推）：${suggestion}\n> ${suggestion}\nstatus bar`;
-  const store = new MailboxStore(join(root, 'mailbox.json'));
-  store.enqueue([alert('prefill')], {
-    mailboxId: 'default',
-    wakeTarget: { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term', workspacePath: root } },
-  });
-  const wakeup = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
-  t.after(() => wakeup.stop());
-  assert.equal((await wakeup.flushMailbox('default', { force: true })).woke, true);
-  const sends = terminalSends(calls);
-  assert.equal(sends.length, 2);
-  assert.equal(textOf(sends[0]), '\x15');
-  assert.equal(sends[0].args.includes('--enter'), false);
-  assert.match(textOf(sends[1]), /^You have 1 Dealer message\(s\) in default/);
-  assert.ok(sends[1].args.includes('--enter'));
-  const failedCalls: CommandRequest[] = [];
-  await assert.rejects(sendOrcaTerminalText(async call => {
-    failedCalls.push(call);
-    return { stdout: '{"ok":false}' };
-  }, 'orca', 'term', 'pointer', { clearComposer: true }), /clear failed/);
-  assert.equal(failedCalls.length, 1);
+test('composer emptiness ignores only exact mode placeholders and status chrome', () => {
+  for (const preview of ['', 'history', '>', '>   \n────────\nstatus bar']) assert.equal(isOrcaComposerEmpty(preview), true);
+  assert.equal(isOrcaComposerEmpty('> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)', 'antigravity'), true);
+  assert.equal(isOrcaComposerEmpty('> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)', 'codex'), false);
+  assert.equal(isOrcaComposerEmpty('>\nsecond line'), false);
 });
 
 test('workspace idle inspection scopes composer checks to the terminal the wakeup will write', async t => {
@@ -1265,10 +1202,7 @@ test('workspace idle inspection scopes composer checks to the terminal the wakeu
     { handle: 'human', connected: true, writable: true, agentIdentity: 'antigravity', preview: `• ,1（主推）：${suggestion}\n> ${suggestion}` },
     ...terminals.slice(1),
   ];
-  assert.deepEqual(
-    await checkOrcaWorkspaceIdle(runner, 'orca', root),
-    { idle: true, composerPrefilled: true, reason: undefined },
-  );
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', root)).idle, false);
   assert.deepEqual(
     await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, { targetTerminalHandle: null }),
     { idle: true, reason: undefined },
@@ -2387,6 +2321,8 @@ test('spawn keeps durable custody through launch, comment and pointer failures',
       }
       if (operation === 'worktree set' && failure === 'comment') throw new Error('comment unavailable');
       if (operation === 'terminal send' && failure === 'send') throw new Error('send outcome unknown');
+      if (operation === 'worktree ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path: join(root, failure), worktreeId: failure, unverifiableTerminalCount: 0, agents: [{ state: 'done' }] }] } }) };
+      if (operation === 'terminal list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'task-tab', connected: true, writable: true, preview: '>' }] } }) };
       return { stdout: '{"ok":true}' };
     };
     const receipt = await createOrcaSpawnExecutorPlugin({ store, commandRunner: runner, cwd: root, interactive: true })
@@ -2442,6 +2378,7 @@ test('task tab disappearing after idle proof is replaced without borrowing anoth
       assert.equal(new MailboxStore(store.path).getWakeTarget('task:race')!.deliveryInDoubt, true);
       assert.ok(request.args.includes('--command'));
     }
+    if (request.args[1] === 'wait' && request.args.includes('task-old')) return { stdout: '{"ok":true}' };
     return inventory(request);
   };
   store.enqueue([alert('race')], {
@@ -2556,4 +2493,66 @@ test('redrive fences both dedicated tab creation and non-task shell bootstrap on
       assert.equal(state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === (task ? 'create' : 'send')).length, 1);
     }
   }
+});
+
+for (const preview of [
+  '> human draft',
+  '• ,1（主推）：原始建议\n> 原始建议',
+  '下一步建议\n• 原始建议\n> 用户改写的草稿',
+  '• ,1（主推）：原始建议\n> 原始建议\n第二行草稿',
+  '> unsent draft\n────────\nstatus bar',
+]) {
+  test(`composer drafts block both workspace and terminal-only wakes: ${JSON.stringify(preview)}`, async t => {
+    assert.equal(isOrcaComposerEmpty(preview), false);
+    for (const scoped of [false, true]) {
+      const root = directory(t);
+      const store = new MailboxStore(join(root, 'mailbox.json'));
+      const fake = fakeOrcaWorkspace(root, [{ handle: 'draft', connected: true, writable: true, agentIdentity: 'codex', preview }]);
+      const runner: CommandRunner = async request => request.args[1] === 'show'
+        ? { stdout: JSON.stringify({ ok: true, result: { terminal: fake.state.terminals[0] } }) }
+        : fake.runner(request);
+      const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }), flushIntervalMs: 100_000 });
+      t.after(() => service.stop());
+      store.enqueue([alert(`draft-${scoped}`)], { mailboxId: 'terminal:draft', wakeTarget: {
+        driver: 'orca-terminal', driverConfig: { terminalHandle: 'draft', ...(scoped ? { workspacePath: root } : {}) },
+      } });
+      const result = await service.flushMailbox('terminal:draft', { force: true });
+      assert.equal(result.woke, false);
+      assert.equal(store.getWakeTarget('terminal:draft')?.pendingWake, true);
+      assert.equal(terminalSends(fake.state.calls).length, 0);
+      fake.state.terminals[0].preview = '>\n────────\nstatus bar';
+      assert.equal((await service.flushMailbox('terminal:draft', { force: true })).woke, true);
+      assert.equal(terminalSends(fake.state.calls).length, 1);
+      assert.equal(store.getWakeTarget('terminal:draft')?.pendingWake, false);
+    }
+  });
+}
+
+test('terminal session inference enriches workspace and terminal probes fail closed', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let terminal = { connected: true, writable: true, preview: '>', worktreePath: root };
+  let failedShow = false;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[1] === 'show') {
+      if (failedShow) throw new Error('show unavailable');
+      return { stdout: JSON.stringify({ ok: true, result: { terminal } }) };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => service.stop());
+  assert.equal((await service.resolveSessionWakeTarget('terminal:target'))?.driverConfig?.workspacePath, root);
+  store.enqueue([alert('disconnected')], { mailboxId: 'terminal:target', wakeTarget: {
+    driver: 'orca-terminal', driverConfig: { terminalHandle: 'target' },
+  } });
+  for (const condition of ['disconnected', 'unwritable', 'show-failed']) {
+    terminal = { ...terminal, connected: condition !== 'disconnected', writable: condition !== 'unwritable' };
+    failedShow = condition === 'show-failed';
+    assert.equal((await service.flushMailbox('terminal:target', { force: true })).woke, false);
+    assert.equal(store.getWakeTarget('terminal:target')?.pendingWake, true);
+  }
+  assert.equal(terminalSends(calls).length, 0);
 });

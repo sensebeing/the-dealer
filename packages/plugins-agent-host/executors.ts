@@ -16,7 +16,7 @@ import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 import {
   createInboxExecutorPlugin,
-  createAgentPtyExecutorPlugin,
+  createRawCommandExecutorPlugin,
   renderWave,
   beforeExternalEffect,
   prepareExternalEffect,
@@ -49,7 +49,7 @@ export interface AgentOptions {
   commandRunner?: CommandRunner;
 }
 
-export function createHostAwareAgentPtyExecutorPlugin(options: AgentOptions = {}): ExecutorPlugin {
+export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): ExecutorPlugin {
   return createAgentExecutorPlugin('agent-pty', options);
 }
 
@@ -142,7 +142,7 @@ function createAgentExecutorPlugin(
           ));
       if (!hostMode) {
         const command = options.command ?? 'codex';
-        return createAgentPtyExecutorPlugin({
+        return createRawCommandExecutorPlugin({
           ...options,
           command,
           args: options.args ?? defaultAgentCommandArgs(command),

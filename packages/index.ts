@@ -17,4 +17,4 @@ export * from './plugins-executor/index.ts';
 export * from './cli/index.ts';
 export * from './plugins-lark-notifier/index.ts';
 export * from './plugins-agent-host/index.ts';
-export { deliverAgentHostWakeTarget as deliverPassiveWakeTarget, createHostAwareAgentPtyExecutorPlugin as createAgentPtyExecutorPlugin } from './plugins-agent-host/index.ts';
+export { deliverAgentHostWakeTarget as deliverPassiveWakeTarget } from './plugins-agent-host/index.ts';

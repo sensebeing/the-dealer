@@ -1,20 +1,24 @@
 import { singleLine } from '../subprocess/index.ts';
 export { trustAntigravityWorkspace, defaultAgentLaunchCommand } from '../plugins-agent-host/hosts.ts';
 
-/** Recognize an Autopilot recommendation copied into the terminal composer. */
-export function isAutopilotComposerPrefill(preview: string): boolean {
+/** A human draft or unconfirmed Pilot recommendation owns the composer until submitted. */
+export function isOrcaComposerEmpty(preview: string, agentIdentity?: unknown): boolean {
   const lines = preview.split(/\r?\n/);
-  return lines.some((line, index) => {
-    const draft = /^\s*>\s+(\S.*)$/.exec(line)?.[1]?.trim();
-    return (
-      draft !== undefined &&
-      lines
-        .slice(0, index)
-        .some(
-          (earlier) => /下一步建议|,1（主推）|,1 \(主推\)|自动预填/.test(earlier) || earlier.includes(draft),
-        )
-    );
-  });
+  let promptIndex = -1;
+  let firstLine = '';
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^\s*>\s*(.*)$/.exec(lines[i]);
+    if (match) {
+      promptIndex = i;
+      firstLine = match[1].trim();
+    }
+  }
+  if (promptIndex < 0) return true;
+  for (const line of lines.slice(promptIndex + 1)) {
+    if (/^\s*[─━═\-]{5,}\s*$/.test(line)) break;
+    if (line.trim()) return false;
+  }
+  return firstLine === '' || isAntigravityModePlaceholder('> ' + firstLine, agentIdentity);
 }
 
 /**

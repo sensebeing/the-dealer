@@ -500,6 +500,7 @@ test('bare-shell bootstrap defers task text until the next authoritative idle ti
       handle: 'shell-1', connected: true, writable: true, preview: detected ? '>' : 'user@mac %',
       ...(detected ? { agentIdentity: 'antigravity' } : {}),
     }] } }) };
+    if (call.args[1] === 'wait') return { stdout: '{"ok":true}' };
     assert.equal(call.args[1], 'send');
     return { stdout: '{"ok":true}' };
   };

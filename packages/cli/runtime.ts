@@ -26,7 +26,7 @@ import {
   isDurableQueuedReceipt,
 } from '../core-types/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, orcaAgent, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
-import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityCliExecutorPlugin, createAntigravityAppExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin, createHostAwareAgentPtyExecutorPlugin as createAgentPtyExecutorPlugin } from '../plugins-agent-host/index.ts';
+import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityCliExecutorPlugin, createAntigravityAppExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin, createAgentPtyExecutorPlugin } from '../plugins-agent-host/index.ts';
 import { createNotifyExecutorPlugin, createInboxExecutorPlugin } from '../plugins-executor/index.ts';
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
