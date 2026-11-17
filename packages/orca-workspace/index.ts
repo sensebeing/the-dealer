@@ -350,7 +350,7 @@ export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravi
 }
 
 /** Parse a simple host command, or validate standalone placeholders in an explicit template. */
-function continuationCommandTokens(command: string, template: boolean): string[] {
+function continuationCommandTokens(command: string): string[] {
   const tokens: string[] = [];
   let token = '';
   let tokenStarted = false;
@@ -371,7 +371,7 @@ function continuationCommandTokens(command: string, template: boolean): string[]
     }
     if (escaped) { token += char; escaped = false; continue; }
     if (char === '\\' && quote !== "'") {
-      if (!template && !quote) reject();
+      if (!quote) reject();
       escaped = true;
       continue;
     }
@@ -387,43 +387,80 @@ function continuationCommandTokens(command: string, template: boolean): string[]
   }
   if (quote || escaped) reject();
   if (tokenStarted) tokens.push(token);
+  if (tokens.length === 0 || !tokens[0]) reject();
   return tokens;
 }
 
+function quoteOrcaCommandToken(token: string): string {
+  return /^[A-Za-z0-9_./:=+-]+$/.test(token) ? token : "'" + token.replaceAll("'", "'\\''") + "'";
+}
+
 export function buildOrcaAgentLaunchCommand(options?: {
-  agent?: SupportedOrcaAgent; interactiveCommand?: string; sessionId?: string;
+  agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string;
 }): string {
   const sessionId = options?.sessionId;
   if (sessionId !== undefined && /[\0\r\n]/.test(sessionId)) throw new OrcaTerminalLaunchRejectedError('Invalid Orca conversation ID');
   const trimmedSession = sessionId?.trim() || undefined;
   const agent = options?.agent ?? 'antigravity';
+  const binary = agent === 'antigravity' ? 'agy' : agent;
   const defaultCmd = defaultAgentLaunchCommand(agent);
   const customCmd = options?.interactiveCommand?.trim() || undefined;
-  if (!trimmedSession) {
-    if (customCmd?.includes('{sessionId}')) throw new OrcaTerminalLaunchRejectedError('Orca interactiveCommand placeholder {sessionId} requires a sessionId');
-    return customCmd ?? defaultCmd;
+  const resumeCmd = options?.resumeCommand?.trim() || undefined;
+  if (customCmd?.includes('{sessionId}')) {
+    throw new OrcaTerminalLaunchRejectedError('Orca interactiveCommand must be a fresh-session command without {sessionId}; configure resumeCommand for templated continuation');
   }
+  const customTokens = customCmd ? continuationCommandTokens(customCmd) : undefined;
+  const freshCmd = customTokens?.map(quoteOrcaCommandToken).join(' ');
+  const resumeTokens = resumeCmd ? continuationCommandTokens(resumeCmd) : undefined;
+  if (resumeTokens) {
+    if (!resumeTokens.includes('{sessionId}')) throw new OrcaTerminalLaunchRejectedError('Orca resumeCommand requires a standalone {sessionId} token');
+    if (basename(resumeTokens[0]) !== binary) {
+      if (!customTokens || customTokens[0] !== resumeTokens[0]) {
+        throw new OrcaTerminalLaunchRejectedError('Custom Orca resumeCommand requires a matching fresh-session interactiveCommand');
+      }
+    } else if (customTokens && basename(customTokens[0]) !== binary) {
+      throw new OrcaTerminalLaunchRejectedError('Orca resumeCommand and interactiveCommand must use the same host');
+    }
+  }
+  if (!trimmedSession) return freshCmd ?? defaultCmd;
   const quoted = "'" + trimmedSession.replaceAll("'", "'\\''") + "'";
-  let command = customCmd ?? defaultCmd;
-  if (customCmd && customCmd !== defaultCmd) {
-    const template = customCmd.includes('{sessionId}');
-    const tokens = continuationCommandTokens(customCmd, template);
-    if (template) return customCmd.replaceAll('{sessionId}', quoted);
-    const args = tokens.slice(1);
-    const binary = agent === 'antigravity' ? 'agy' : agent;
+  if (resumeTokens) return resumeTokens.map(token => token === '{sessionId}' ? quoted : quoteOrcaCommandToken(token)).join(' ');
+  let command = defaultCmd;
+  if (customTokens && customCmd !== defaultCmd) {
+    const args = customTokens.slice(1);
     const conflicting = agent === 'antigravity'
       ? args.some(arg => ['run', '--conversation', '-c', '--continue', '-p', '--print', '--prompt', '--'].includes(arg) || arg.startsWith('--conversation='))
       : agent === 'claude'
         ? args.some(arg => ['-p', '--print', '-r', '--resume', '--session-id', '-c', '--continue', '--bg', '--background', '--'].includes(arg) || arg.startsWith('--resume=') || arg.startsWith('--session-id='))
         : args.some(arg => ['exec', 'resume', 'queue', 'login', 'mcp', 'completion', '--'].includes(arg));
-    if (!tokens[0] || basename(tokens[0]) !== binary || conflicting) {
+    if (basename(customTokens[0]) !== binary || conflicting) {
       throw new OrcaTerminalLaunchRejectedError(`Unsupported Orca session continuation command for ${agent}: ${customCmd}`);
     }
-    const quoteToken = (token: string) => /^[A-Za-z0-9_./:=+-]+$/.test(token) ? token : "'" + token.replaceAll("'", "'\\''") + "'";
-    command = tokens.map(quoteToken).join(' ');
+    command = freshCmd!;
   }
   return agent === 'codex' ? `${command} resume ${quoted}`
     : `${command} ${agent === 'claude' ? '--resume' : '--conversation'} ${quoted}`;
+}
+
+/** Both fresh launch and continuation must remain valid when retaining host configuration. */
+export function isOrcaLaunchConfigCompatible(options: {
+  agent?: SupportedOrcaAgent; previousAgent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string;
+}): boolean {
+  const interactiveCommand = options.interactiveCommand?.trim() || undefined;
+  const resumeCommand = options.resumeCommand?.trim() || undefined;
+  if (!interactiveCommand && !resumeCommand) return true;
+  if (!options.agent) return options.previousAgent === undefined;
+  try {
+    buildOrcaAgentLaunchCommand({ ...options, sessionId: undefined });
+    buildOrcaAgentLaunchCommand({ ...options, sessionId: 'probe-session' });
+    const firstToken = continuationCommandTokens(interactiveCommand ?? resumeCommand!)[0];
+    const binary = options.agent === 'antigravity' ? 'agy' : options.agent;
+    return basename(firstToken) === binary ||
+      (options.previousAgent !== undefined && options.previousAgent === options.agent);
+  } catch (error) {
+    if (error instanceof OrcaTerminalLaunchRejectedError) return false;
+    throw error;
+  }
 }
 
 /**
@@ -437,7 +474,7 @@ export async function spawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options: { agent?: SupportedOrcaAgent; interactiveCommand?: string; sessionId?: string } = {},
+  options: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string } = {},
 ): Promise<{ handle: string; raw: unknown }> {
   const launchCommand = buildOrcaAgentLaunchCommand(options);
   let spawned;
@@ -514,7 +551,7 @@ export async function planOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string; dedicatedTab?: boolean },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string; dedicatedTab?: boolean },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
   const targetAgent = options?.agent ?? 'antigravity';
   const listed = await checkedCommand(runner, {
@@ -568,7 +605,7 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string; dedicatedTab?: boolean },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string; dedicatedTab?: boolean },
 ): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
   const plan = await planOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
   if (plan.kind === 'existing') return { handle: plan.handle, spawned: false };

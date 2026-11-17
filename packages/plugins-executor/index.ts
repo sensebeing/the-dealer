@@ -234,6 +234,7 @@ export interface OrcaSpawnOptions extends AgentOptions {
   seaCreatureNaming?: boolean;
   agySettingsPath?: string;
   interactiveCommand?: string;
+  resumeCommand?: string;
   /** Durable task mailbox ledger; always supplied by DealerNodeRuntime. */
   store?: MailboxStore;
   wakeup?: WakeupRedriveService;
@@ -555,6 +556,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         const interactiveCommand = binding?.interactiveCommand?.trim() ||
           config.interactiveCommand?.trim() || options.interactiveCommand?.trim() ||
           defaultAgentLaunchCommand(effectiveAgent);
+        const resumeCommand = binding?.resumeCommand ?? config.resumeCommand ?? options.resumeCommand;
         const mailboxId = `task:${batch[0].id}`;
         const workspaceComment = typeof payload.workspaceComment === 'string' && payload.workspaceComment.trim()
           ? payload.workspaceComment : undefined;
@@ -563,7 +565,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         try {
           // Once committed, the mailbox owns recovery even if Orca cannot launch the agent.
           store.enqueue(batch, { mailboxId, wakeTarget: {
-            mode: 'orca-terminal', agent: effectiveAgent, interactiveCommand,
+            mode: 'orca-terminal', agent: effectiveAgent, interactiveCommand, resumeCommand,
             orcaCommand: command, workspacePath: path, coalesceMs: 0,
             ...(workspaceComment ? { workspaceComment } : {}),
           } });
@@ -571,7 +573,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           let terminal;
           try {
             const launched = await launchFencedOrcaWorkspaceTerminal(store, runner, mailboxId, {
-              command, workspacePath: path, agent: effectiveAgent, interactiveCommand, signal: context.signal,
+              command, workspacePath: path, agent: effectiveAgent, interactiveCommand, resumeCommand, signal: context.signal,
             });
             terminal = launched.raw;
           } catch (launchError) {
@@ -641,6 +643,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
 export interface OrcaWaveOptions {
   agent?: SupportedOrcaAgent;
   interactiveCommand?: string;
+  resumeCommand?: string;
   resolveTopicBinding?: (kind: string, streamKey?: string) => (TopicBindingConfig & { repoRoot?: string }) | undefined;
   runId?: string;
   terminalHandle?: string;
@@ -764,12 +767,13 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           envelopes.at(-1)?.payload?.workspaceComment || binding?.workspaceComment || `Dealer: ${mailboxId} pending`,
         );
         const explicitAgent = binding?.agent ?? config.agent ?? options.agent ?? (hasReceiverTarget ? undefined : payload.agent);
+        const explicitResumeCommand = binding?.resumeCommand ?? config.resumeCommand ?? options.resumeCommand;
         const explicitInteractiveCommand = binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand;
         return {
           ...resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
             runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
             configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
-            configuredSessionId: binding?.sessionId, configuredInteractiveCommand: explicitInteractiveCommand,
+            configuredSessionId: binding?.sessionId, configuredInteractiveCommand: explicitInteractiveCommand, configuredResumeCommand: explicitResumeCommand,
             hasTopicBinding: binding !== undefined, authoritativeConfig: false,
           }),
           orcaCommand: command,

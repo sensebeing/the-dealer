@@ -3,6 +3,7 @@ import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent
 import {
   OrcaTerminalLaunchRejectedError,
   buildOrcaAgentLaunchCommand,
+  isOrcaLaunchConfigCompatible,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
   isOrcaWorkspaceTerminalLive,
@@ -105,12 +106,17 @@ export function resolveCallerOrcaWakeTargetPatch(
     (caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
       (!caller.paneKey || !existing.paneKey || caller.paneKey !== existing.paneKey) &&
       (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId));
+  const nextAgent = switchedIdentity ? caller.agent : (caller.agent ?? existing?.agent);
+  const clearLaunchConfig = (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
+    !isOrcaLaunchConfigCompatible({ agent: nextAgent, previousAgent: existing?.agent,
+      interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
   return {
     mode: 'orca-terminal',
     ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
     ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
+    ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
     ...(switchedIdentity ? {
-      terminalHandle: caller.terminalHandle, paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent,
+      completedWaves: 0, terminalHandle: caller.terminalHandle, paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent,
     } : {
       ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
       ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
@@ -126,17 +132,19 @@ export function resolveConfiguredOrcaWakeTargetPatch(
   input: {
     runId?: string; workspacePath?: string; configuredTerminalHandle?: string;
     configuredAgent?: WakeTargetState['agent']; configuredSessionId?: string;
-    configuredInteractiveCommand?: string; hasTopicBinding: boolean; authoritativeConfig: boolean;
+    configuredInteractiveCommand?: string; configuredResumeCommand?: string; hasTopicBinding: boolean; authoritativeConfig: boolean;
   },
 ): Partial<WakeTargetState> {
   const commandPatch = input.authoritativeConfig || input.configuredInteractiveCommand !== undefined
     ? { interactiveCommand: input.configuredInteractiveCommand } : {};
+  const resumeCommandPatch = input.authoritativeConfig || input.configuredResumeCommand !== undefined
+    ? { resumeCommand: input.configuredResumeCommand } : {};
   const nextConfiguredHandle = input.configuredTerminalHandle?.trim() || undefined;
   if (input.runId) return {
-    mode: 'orca-run', terminalHandle: nextConfiguredHandle, paneKey: undefined,
+    mode: 'orca-run', completedWaves: 0, retiredSessionId: undefined, terminalHandle: nextConfiguredHandle, paneKey: undefined,
     sessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined,
     ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
-    ...commandPatch,
+    ...commandPatch, ...resumeCommandPatch,
   };
   const nextConfiguredSession = input.configuredSessionId?.trim() || undefined;
   const prevConfiguredSession = existing?.configuredSessionId;
@@ -146,10 +154,9 @@ export function resolveConfiguredOrcaWakeTargetPatch(
   const samePinnedHandle = nextConfiguredHandle === undefined || nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig;
   const sameAgent = input.configuredAgent === undefined || existing?.agent === undefined || input.configuredAgent === existing.agent;
   const compatible = sameWorkspace && samePinnedHandle && sameAgent;
-  const baselineRotatedWithoutProvenance = compatible && prevConfiguredSession === undefined &&
-    existing?.sessionId === undefined && existing?.rotateAfterWaves !== undefined &&
-    (existing.terminalHandle !== undefined || existing.paneKey !== undefined || existing.completedWaves > 0);
-  const addedOrChanged = !baselineRotatedWithoutProvenance && input.hasTopicBinding && nextConfiguredSession !== undefined && nextConfiguredSession !== prevConfiguredSession;
+  const alreadyRetired = compatible && nextConfiguredSession !== undefined && nextConfiguredSession === existing?.retiredSessionId;
+  const unchangedConfigured = nextConfiguredSession !== undefined && (nextConfiguredSession === prevConfiguredSession || alreadyRetired);
+  const addedOrChanged = input.hasTopicBinding && nextConfiguredSession !== undefined && !unchangedConfigured;
   const removed = input.hasTopicBinding && nextConfiguredSession === undefined && prevConfiguredSession !== undefined;
   const preserved = {
     terminalHandle: handleUnchangedSinceConfig ? existing?.terminalHandle : (nextConfiguredHandle ?? existing?.terminalHandle),
@@ -157,38 +164,45 @@ export function resolveConfiguredOrcaWakeTargetPatch(
     agent: input.configuredAgent ?? existing?.agent,
   };
   let identity: Partial<WakeTargetState>;
-  if (input.hasTopicBinding && nextConfiguredSession !== undefined && baselineRotatedWithoutProvenance) {
-    identity = { ...preserved, configuredSessionId: nextConfiguredSession };
-  } else if (addedOrChanged) {
+  if (addedOrChanged) {
     const handleBelongsToPrevious = nextConfiguredHandle !== undefined &&
       (nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig);
     identity = compatible && existing?.sessionId === nextConfiguredSession ? preserved : {
+      completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: handleBelongsToPrevious ? undefined : nextConfiguredHandle, paneKey: undefined, sessionId: nextConfiguredSession,
       agent: input.configuredAgent ?? (sameWorkspace && sameAgent ? existing?.agent : undefined),
     };
     identity = { ...identity, configuredSessionId: nextConfiguredSession };
   } else if (removed) {
     identity = existing?.sessionId === prevConfiguredSession || !compatible ? {
+      completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
       agent: input.configuredAgent ?? (compatible ? existing?.agent : undefined),
     } : preserved;
-    identity = { ...identity, configuredSessionId: undefined };
-  } else if (nextConfiguredSession !== undefined && nextConfiguredSession === prevConfiguredSession) {
-    identity = compatible ? preserved : {
+    identity = { ...identity, configuredSessionId: undefined, retiredSessionId: undefined };
+  } else if (unchangedConfigured) {
+    identity = compatible ? { ...preserved, retiredSessionId: existing?.retiredSessionId } : {
+      completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: nextConfiguredHandle, paneKey: undefined,
       sessionId: nextConfiguredSession, agent: input.configuredAgent,
     };
     identity = { ...identity, configuredSessionId: nextConfiguredSession };
   } else {
     identity = compatible ? { ...preserved, configuredSessionId: input.hasTopicBinding ? undefined : existing?.configuredSessionId } : {
+      completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
       configuredSessionId: undefined, agent: input.configuredAgent,
     };
   }
+  const clearLaunchConfig = !input.authoritativeConfig && input.configuredInteractiveCommand === undefined && input.configuredResumeCommand === undefined &&
+    (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
+    !isOrcaLaunchConfigCompatible({ agent: identity.agent, previousAgent: existing?.agent,
+      interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
   return {
     mode: 'orca-terminal', ...identity,
     configuredTerminalHandle: input.hasTopicBinding || nextConfiguredHandle !== undefined ? nextConfiguredHandle : existing?.configuredTerminalHandle,
-    ...commandPatch,
+    ...commandPatch, ...resumeCommandPatch,
+    ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
   };
 }
 
@@ -333,6 +347,7 @@ export async function launchFencedOrcaWorkspaceTerminal(
     workspacePath: string;
     agent?: WakeTargetState['agent'];
     interactiveCommand?: string;
+    resumeCommand?: string;
     sessionId?: string;
     signal?: AbortSignal;
     now?: number;
@@ -353,8 +368,9 @@ export async function launchFencedOrcaWorkspaceTerminal(
     } else {
       launched = await spawnOrcaWorkspaceTerminal(runner, options.command, options.workspacePath, options.signal, { ...options, sessionId: resumeSessionId });
     }
+    const current = store.getWakeTarget(mailboxId);
     const target = store.upsertWakeTarget(mailboxId, {
-      ...(options.resetCompletedWaves ? { completedWaves: 0, sessionId: undefined } : {}),
+      ...(options.resetCompletedWaves ? { completedWaves: 0, sessionId: undefined, retiredSessionId: current?.sessionId ?? current?.configuredSessionId ?? current?.retiredSessionId } : {}),
       paneKey: undefined,
       terminalHandle: launched.handle,
       deliveryInDoubt: undefined,
@@ -927,7 +943,7 @@ export class WakeupRedriveService {
       }
       const workspacePath = target.workspacePath;
       const spawned = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
-        command, workspacePath, agent: target.agent, interactiveCommand: target.interactiveCommand,
+        command, workspacePath, agent: target.agent, interactiveCommand: target.interactiveCommand, resumeCommand: target.resumeCommand,
         now: this.now(), resetCompletedWaves: needsRotation, sessionId: target.sessionId,
       });
       terminalHandle = spawned.handle;
@@ -960,7 +976,7 @@ export class WakeupRedriveService {
       } else {
         const launched = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
           command, workspacePath: target.workspacePath, agent: target.agent,
-          interactiveCommand: target.interactiveCommand, now: this.now(), sessionId: target.sessionId,
+          interactiveCommand: target.interactiveCommand, resumeCommand: target.resumeCommand, now: this.now(), sessionId: target.sessionId,
           ...(plan.kind === 'shell' ? { shellTerminalHandle: plan.handle } : {}),
         });
         terminalHandle = launched.handle;

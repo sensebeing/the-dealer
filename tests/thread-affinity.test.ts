@@ -429,7 +429,7 @@ for (const agent of ['claude', 'codex'] as const) {
     const mailboxId = 'stream:fixed';
     const workspacePath = join(root, 'fixed');
     store.upsertWakeTarget(mailboxId, {
-      mode: 'orca-terminal', workspacePath, agent, terminalHandle: 'runtime-tab', sessionId: 'runtime-session', paneKey: 'runtime:pane', interactiveCommand: 'receiver-command',
+      mode: 'orca-terminal', workspacePath, agent, terminalHandle: 'runtime-tab', sessionId: 'runtime-session', paneKey: 'runtime:pane', interactiveCommand: `${agent === 'claude' ? 'claude' : 'codex'} --model test`,
     });
     const binding = { executor: 'orca-wave', mode: 'fixed', mailboxId, workspacePath } as const;
     const plugin = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => binding });
@@ -440,10 +440,10 @@ for (const agent of ['claude', 'codex'] as const) {
       assert.equal(target.agent, agent);
       assert.equal(target.sessionId, 'runtime-session');
       assert.equal(target.paneKey, 'runtime:pane');
-      assert.equal(target.interactiveCommand, 'receiver-command');
+      assert.equal(target.interactiveCommand, `${agent === 'claude' ? 'claude' : 'codex'} --model test`);
     }
     const explicit = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => ({
-      ...binding, agent: 'antigravity', sessionId: 'configured-session', interactiveCommand: 'configured-command {sessionId}',
+      ...binding, agent: 'antigravity', sessionId: 'configured-session', interactiveCommand: 'configured-command', resumeCommand: 'configured-command {sessionId}',
     }) });
     await explicit.execute([envelope('override')], context, {});
     const target = store.getWakeTarget(mailboxId)!;
@@ -452,7 +452,8 @@ for (const agent of ['claude', 'codex'] as const) {
     assert.equal(target.configuredSessionId, 'configured-session');
     assert.equal(target.terminalHandle, undefined);
     assert.equal(target.paneKey, undefined);
-    assert.equal(target.interactiveCommand, 'configured-command {sessionId}');
+    assert.equal(target.interactiveCommand, 'configured-command');
+    assert.equal(target.resumeCommand, 'configured-command {sessionId}');
   });
 }
 

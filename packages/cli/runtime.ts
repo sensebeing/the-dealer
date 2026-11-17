@@ -1038,7 +1038,7 @@ export class DealerNodeRuntime {
         ...resolveConfiguredOrcaWakeTargetPatch(current, {
           runId, workspacePath, configuredTerminalHandle: terminalHandle,
           configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
-          configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand,
+          configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand, configuredResumeCommand: binding.resumeCommand,
           hasTopicBinding: true, authoritativeConfig: true,
         }),
         workspacePath, worktreeId, runId, repoRoot: projectRoot,

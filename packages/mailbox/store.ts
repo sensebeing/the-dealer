@@ -65,6 +65,7 @@ export interface WakeTargetState {
   readonly agentProfile?: string;
   readonly targetBot?: string;
   readonly sessionId?: string;
+  readonly retiredSessionId?: string;
   readonly configuredSessionId?: string;
   readonly configuredTerminalHandle?: string;
   readonly paneKey?: string;
@@ -74,6 +75,7 @@ export interface WakeTargetState {
   readonly orcaCommand?: string;
   readonly agent?: 'antigravity' | 'claude' | 'codex';
   readonly interactiveCommand?: string;
+  readonly resumeCommand?: string;
   readonly runId?: string;
   readonly worktreeId?: string;
   readonly workspacePath?: string;
@@ -416,6 +418,8 @@ function mergeWakeTarget(
   const conversationMode = optional('conversationMode');
   const agentProfile = optional('agentProfile');
   const targetBot = optional('targetBot');
+  const retiredSessionId = optional('retiredSessionId');
+  const resumeCommand = optional('resumeCommand');
   const sessionId = optional('sessionId');
   const configuredSessionId = optional('configuredSessionId');
   const configuredTerminalHandle = optional('configuredTerminalHandle');
@@ -453,6 +457,8 @@ function mergeWakeTarget(
     ...(conversationMode !== undefined ? { conversationMode } : {}),
     ...(agentProfile !== undefined ? { agentProfile } : {}),
     ...(targetBot !== undefined ? { targetBot } : {}),
+    ...(retiredSessionId !== undefined ? { retiredSessionId } : {}),
+    ...(resumeCommand !== undefined ? { resumeCommand } : {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(configuredSessionId !== undefined ? { configuredSessionId } : {}),
     ...(configuredTerminalHandle !== undefined ? { configuredTerminalHandle } : {}),
@@ -513,6 +519,8 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   for (const field of [
     'agentProfile',
     'targetBot',
+    'retiredSessionId',
+    'resumeCommand',
     'sessionId',
     'configuredSessionId',
     'configuredTerminalHandle',
@@ -548,7 +556,7 @@ function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
   state.wakeTargets[termMailbox] = validateWakeTarget({
     ...current, ...(existing ?? {}), mailboxId: termMailbox, mode: 'orca-terminal', terminalHandle: handle,
-    configuredSessionId: undefined, configuredTerminalHandle: undefined, rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
+    retiredSessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined, rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
     earliestWakeAt: existing?.earliestWakeAt ?? 0,

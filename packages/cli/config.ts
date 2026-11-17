@@ -227,6 +227,7 @@ export interface TopicBindingConfig {
   assignee?: string;
   agent?: 'orca' | 'antigravity' | 'antigravity-cli' | 'antigravity-app' | 'claude' | 'claude-code' | 'claude-app' | 'codex' | 'codex-cli' | 'chatgpt-app' | 'chatgpt-dot' | 'grok-bot';
   interactiveCommand?: string;
+  resumeCommand?: string;
   mode?: 'spawn' | 'wave' | 'fixed' | 'inbox-only';
   conversationMode?: 'spawn' | 'wave' | 'fixed' | 'inbox-only';
   targetBot?: string;
@@ -267,7 +268,7 @@ export interface LarkNotifyConfig {
 
 export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[]): asserts bindings is Record<string, TopicBindingConfig> {
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
-  const strings = ['assignee', 'agent', 'interactiveCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
+  const strings = ['assignee', 'agent', 'interactiveCommand', 'resumeCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
   const booleans = ['noParent', 'autoCreateWorkspace', 'notifyLark'];
   const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves']);
   for (const [kind, binding] of Object.entries(bindings)) {
