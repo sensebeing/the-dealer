@@ -7,6 +7,7 @@ import {
 } from 'node:fs';
 import { resolve } from 'node:path';
 import {
+  canonicalJson,
   isValidMailboxId,
   validateSemanticHeader,
   verifyEnvelope,
@@ -58,7 +59,22 @@ export interface MailboxStateRecord {
   readonly ackedLeaseIds: readonly string[];
 }
 
+const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
+const MAX_BACKOFF_MS = 10_000;
+
+/** Exponential busy-backoff: 1s -> 2s -> 5s -> capped at 10s. */
+export function wakeupBackoffDelay(attemptCount: number): number {
+  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) {
+    throw new Error('Invalid wake attempt count');
+  }
+  if (attemptCount <= DEFAULT_BACKOFF_MS.length) {
+    return DEFAULT_BACKOFF_MS[attemptCount - 1] ?? MAX_BACKOFF_MS;
+  }
+  return MAX_BACKOFF_MS;
+}
+
 export interface WakeTargetState {
+  readonly bindingRevision?: number;
   readonly mailboxId: string;
   /** Registered driver id, or passive for in-process waitForMail targets. */
   readonly driver: string;
@@ -379,7 +395,7 @@ function defaultWakeTarget(mailboxId: string): WakeTargetState {
 }
 
 const WAKE_TARGET_KEYS = new Set([
-  'mailboxId', 'driver', 'driverConfig', 'wakeupPrefix', 'coalesceMs', 'rotateAfterWaves',
+  'bindingRevision', 'mailboxId', 'driver', 'driverConfig', 'wakeupPrefix', 'coalesceMs', 'rotateAfterWaves',
   'completedWaves', 'pendingWake', 'earliestWakeAt', 'attemptCount', 'lastWakeError', 'deliveryInDoubt',
 ]);
 
@@ -416,12 +432,15 @@ function mergeWakeTarget(current: WakeTargetState, patch?: Partial<WakeTargetSta
       next.attemptCount === 0 && current.earliestWakeAt > 0) {
     next.earliestWakeAt = next.coalesceMs === 0 ? 0 : Math.min(current.earliestWakeAt, Date.now() + next.coalesceMs);
   }
-  return next;
+  const changed = current.driver !== next.driver || current.rotateAfterWaves !== next.rotateAfterWaves ||
+    canonicalJson(current.driverConfig ?? {}) !== canonicalJson(next.driverConfig ?? {});
+  return { ...next, bindingRevision: (current.bindingRevision ?? 0) + (changed ? 1 : 0) };
 }
 
 function validateWakeTarget(value: unknown): WakeTargetState {
   if (!isRecord(value) || Object.keys(value).some(key => !WAKE_TARGET_KEYS.has(key))) throw invalidStore();
   const target = value as unknown as WakeTargetState;
+  if (target.bindingRevision !== undefined && !isNonNegativeInteger(target.bindingRevision)) throw invalidStore();
   if (!isValidMailboxId(target.mailboxId) || typeof target.driver !== 'string' ||
       !/^[a-z0-9][a-z0-9:_-]{0,63}$/i.test(target.driver)) throw invalidStore();
   if (target.driverConfig !== undefined && (!isPlainRecord(target.driverConfig) || !isJsonValue(target.driverConfig))) throw invalidStore();
@@ -448,19 +467,24 @@ function pinSessionTargetInState(state: MailboxFileState, id: string, sessionMai
   const sessionMailbox = normalizeMailboxId(sessionMailboxId);
   if (sessionMailbox === id) throw new Error('Session mailbox must differ from rotating mailbox');
   const existing = state.wakeTargets[sessionMailbox];
+  const nextDriver = patch.driver ?? existing?.driver ?? current.driver;
   const hasQueued = state.items.some(item => item.mailboxId === sessionMailbox && item.status === 'queued');
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${sessionMailbox}`);
-  state.wakeTargets[sessionMailbox] = validateWakeTarget({
+  state.wakeTargets[sessionMailbox] = validateWakeTarget(mergeWakeTarget(existing ?? defaultWakeTarget(sessionMailbox), {
     ...current, ...(existing ?? {}), mailboxId: sessionMailbox,
-    driver: patch.driver ?? current.driver,
-    driverConfig: patch.driverConfig ?? current.driverConfig,
+    driver: nextDriver,
+    driverConfig: {
+      ...(nextDriver === current.driver ? current.driverConfig : undefined),
+      ...(existing?.driver === nextDriver ? existing.driverConfig : undefined),
+      ...patch.driverConfig,
+    },
     rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
     earliestWakeAt: existing?.earliestWakeAt ?? 0,
     lastWakeError: existing?.deliveryInDoubt ? existing.lastWakeError : (current.deliveryInDoubt ? current.lastWakeError : existing?.lastWakeError),
     deliveryInDoubt: Boolean(existing?.deliveryInDoubt || current.deliveryInDoubt) ? true : undefined,
-  });
+  }));
   return sessionMailbox;
 }
 
@@ -1173,6 +1197,14 @@ export class MailboxStore {
     };
   }
 
+  resolveLeaseMailbox(leaseId: string): string | undefined {
+    const state = this.read();
+    for (const [candidate, record] of Object.entries(state.mailboxes)) {
+      if (record?.outstanding?.leaseId === leaseId || record?.ackedLeaseIds.includes(leaseId)) return candidate;
+    }
+    return undefined;
+  }
+
   /**
    * Read-only preflight for a caller-supplied `--ack` lease. It mirrors `ack()`'s lookup
    * but never mutates the mailbox, so a command that later fails (or sends nothing) cannot
@@ -1398,10 +1430,11 @@ export class MailboxStore {
    * Fence before an external delivery so a crash or an unknown outcome cannot silently replay it.
    * Only `completeWakeDelivery` (confirmed receipt) or an explicit listener patch clears the fence.
    */
-  beginWakeDelivery(mailboxId: string): WakeTargetState {
+  beginWakeDelivery(mailboxId: string, expectedRevision?: number): WakeTargetState | undefined {
     const id = normalizeMailboxId(mailboxId);
     return this.mutate(state => {
       const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) return undefined;
       if (current.deliveryInDoubt) {
         throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
       }
@@ -1411,6 +1444,88 @@ export class MailboxStore {
       }));
       state.wakeTargets[id] = next;
       return structuredClone(next);
+    });
+  }
+
+  /** Commit only against the binding that authorized this launch. */
+  commitWakeLaunch(
+    mailboxId: string,
+    expectedRevision: number,
+    buildPatch: (lockedCurrent: WakeTargetState) => Partial<WakeTargetState>,
+  ): { committed: boolean; target: WakeTargetState } {
+    const id = normalizeMailboxId(mailboxId);
+    const result = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const committed = (current.bindingRevision ?? 0) === expectedRevision;
+      const patch = committed ? buildPatch(structuredClone(current)) : { attemptCount: 0, earliestWakeAt: 0 };
+      let next = validateWakeTarget(mergeWakeTarget(current, {
+        ...patch, deliveryInDoubt: undefined, pendingWake: true, lastWakeError: undefined,
+      }));
+      if (committed) next = { ...next, bindingRevision: Math.max(next.bindingRevision ?? 0, expectedRevision + 1) };
+      state.wakeTargets[id] = next;
+      return { committed, target: structuredClone(next) };
+    });
+    if (!result.committed) this.events.emit('target', id);
+    return result;
+  }
+
+  /** Settle a retryable attempt only against the binding that authorized it. */
+  deferWakeAttempt(mailboxId: string, expectedRevision: number, error: unknown, now = Date.now(), patch: Partial<WakeTargetState> = {}): { superseded: boolean; target: WakeTargetState } {
+    const id = normalizeMailboxId(mailboxId);
+    const result = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+      const attemptCount = superseded ? 0 : current.attemptCount + 1;
+      const next = validateWakeTarget(mergeWakeTarget(current, {
+        ...(superseded ? {} : patch), pendingWake: true, deliveryInDoubt: undefined, attemptCount,
+        earliestWakeAt: superseded ? 0 : now + wakeupBackoffDelay(attemptCount),
+        lastWakeError: superseded ? undefined : String(error),
+      }));
+      state.wakeTargets[id] = next;
+      return { superseded, target: structuredClone(next) };
+    });
+    if (result.superseded) this.events.emit('target', id);
+    return result;
+  }
+
+  retainPendingWakeIfCurrent(mailboxId: string, expectedRevision: number): WakeTargetState {
+    const id = normalizeMailboxId(mailboxId);
+    const next = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+      const target = validateWakeTarget(mergeWakeTarget(current, {
+        pendingWake: true, ...(superseded ? { attemptCount: 0, earliestWakeAt: 0 } : {}),
+      }));
+      state.wakeTargets[id] = target;
+      return structuredClone(target);
+    });
+    this.events.emit('target', id);
+    return next;
+  }
+
+  disarmWakeTargetIfCurrent(mailboxId: string, expectedRevision: number): { superseded: boolean; target: WakeTargetState } {
+    const id = normalizeMailboxId(mailboxId);
+    const result = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+      const next = validateWakeTarget(mergeWakeTarget(current, superseded ? { pendingWake: true } : {
+        pendingWake: false, attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined,
+      }));
+      state.wakeTargets[id] = next;
+      return { superseded, target: structuredClone(next) };
+    });
+    if (result.superseded) this.events.emit('target', id);
+    return result;
+  }
+
+  updateWakeDriverConfigIfCurrent(mailboxId: string, expectedRevision: number, driverConfig: Record<string, unknown>): { superseded: boolean; target: WakeTargetState } {
+    const id = normalizeMailboxId(mailboxId);
+    return this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      if ((current.bindingRevision ?? 0) !== expectedRevision) return { superseded: true, target: structuredClone(current) };
+      const next = validateWakeTarget(mergeWakeTarget(current, { driverConfig }));
+      state.wakeTargets[id] = next;
+      return { superseded: false, target: structuredClone(next) };
     });
   }
 
@@ -1434,7 +1549,8 @@ export class MailboxStore {
     deliveredSequence: number,
     patch: Partial<WakeTargetState> = {},
     pinnedSession?: SessionMailboxPatch & { sessionMailboxId: string },
-  ): WakeTargetState {
+    expectedRevision?: number,
+  ): WakeTargetState & { superseded?: boolean } {
     const id = normalizeMailboxId(mailboxId);
     let pinnedWakeMailbox: string | undefined;
     const completed = this.mutate(state => {
@@ -1442,6 +1558,16 @@ export class MailboxStore {
         item.mailboxId === id && item.status === 'queued' && item.sequence > deliveredSequence,
       );
       const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) {
+        const hasQueued = state.items.some(item => item.mailboxId === id && item.status === 'queued');
+        const next = validateWakeTarget(mergeWakeTarget(current, {
+          deliveryInDoubt: undefined, lastWakeError: undefined,
+          pendingWake: Boolean(current.pendingWake || hasQueued), attemptCount: 0, earliestWakeAt: 0,
+        }));
+        state.wakeTargets[id] = next;
+        return Object.assign(structuredClone(next), { superseded: true });
+      }
+
       const next = validateWakeTarget(mergeWakeTarget(current, {
         ...patch, pendingWake, attemptCount: 0,
         earliestWakeAt: pendingWake ? current.earliestWakeAt : 0, lastWakeError: undefined,

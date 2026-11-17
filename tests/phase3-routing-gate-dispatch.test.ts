@@ -485,7 +485,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
   await executor.execute(
     [first],
     context,
-    { interactiveCommand: 'agy run --dangerously-skip-permissions', agySettingsPath: settingsPath },
+    { interactiveCommand: 'agy --dangerously-skip-permissions', agySettingsPath: settingsPath },
   );
   assert.deepEqual(commandNames(), [
     'worktree create',
@@ -497,7 +497,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
     'terminal wait',
     'terminal send',
   ]);
-  assert.equal(flagValue(requests[1].args, '--command'), 'agy run --dangerously-skip-permissions');
+  assert.equal(flagValue(requests[1].args, '--command'), 'agy --dangerously-skip-permissions');
   assert.equal(flagValue(requests[2].args, '--comment'), 'dealer: antigravity');
   assert.equal(flagValue(requests[3].args, '--timeout-ms'), '5000');
   assert.equal(flagValue(requests[7].args, '--terminal'), 'term-agy');
@@ -516,7 +516,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
   await executor.execute(
     [envelope({ payload: { interactive: true } })],
     context,
-    { interactiveCommand: 'agy run', agySettingsPath: settingsPath },
+    { interactiveCommand: 'agy', agySettingsPath: settingsPath },
   );
   assert.deepEqual(commandNames(), ['worktree create', 'terminal create', 'terminal wait']);
 
@@ -568,13 +568,13 @@ test('orca-spawn payload.interactive selects the mailbox TUI path', async t => {
   const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'trace' };
 
   await executor.execute([message], context, {
-    interactiveCommand: 'agy run',
+    interactiveCommand: 'agy',
     agySettingsPath: join(dir, 'settings.json'),
   });
 
   const flagValue = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1];
   const created = requests.find(r => r.args[0] === 'terminal' && r.args[1] === 'create')!;
-  assert.equal(flagValue(created.args, '--command'), 'agy run');
+  assert.equal(flagValue(created.args, '--command'), 'agy');
   const mailboxId = `task:${message.id}`;
   const queued = store.list({ mailboxId }).items;
   assert.equal(queued.length, 1);
@@ -592,7 +592,7 @@ test('orca-spawn payload.interactive selects the mailbox TUI path', async t => {
     standalone.execute(
       [envelope({ payload: { interactive: true, wakeupHint: 'Standalone hint' } })],
       context,
-      { interactiveCommand: 'agy run', agySettingsPath: join(dir, 'settings.json') },
+      { interactiveCommand: 'agy', agySettingsPath: join(dir, 'settings.json') },
     ),
     /durable mailbox store/,
   );

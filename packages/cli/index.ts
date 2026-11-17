@@ -1,3 +1,5 @@
+import { reconcileCallerOrcaWakeTarget } from '../plugins-orca/index.ts';
+import type { CallerOrcaIdentity } from '../plugins-orca/index.ts';
 import { pinOrcaTerminalSessionMailbox } from '../plugins-orca/index.ts';
 import { toMailboxTopicBinding } from './config.ts';
 import { randomBytes } from 'node:crypto';
@@ -11,7 +13,7 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { MailboxStore, OutboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
+import { MailboxStore, OutboxStore, resolveBoundMailboxId, normalizeMailboxId } from '../mailbox/index.ts';
 import type { OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
@@ -83,7 +85,7 @@ const stringFlags = [
   'reply-to',
   'reply-mailbox',
   'target-mailbox',
-  'terminal-handle',
+  'terminal-handle', 'caller-agent', 'caller-session-id', 'pane-key',
   'worktree-id',
   'subject',
   'bootstrap-peers',
@@ -664,11 +666,15 @@ async function runInboxCommand(
   const command = action ?? 'list';
   const caller = resolveCallerOrcaBinding(v);
   const mailboxId = (v.mailbox as string | undefined) ?? caller?.mailboxId;
-  if (caller && (mailboxId ?? 'default') === caller.mailboxId) bindCallerWakeTarget(store, caller.mailboxId, caller);
   const checkOnlyFlags =
     v.ack !== undefined || v.peek === true || v.wait === true || v['timeout-ms'] !== undefined;
   if (command === 'check') {
     const timeoutMs = positiveInteger(v['timeout-ms'], '--timeout-ms');
+    if (timeoutMs !== undefined && v.wait !== true) throw new Error('--timeout-ms requires --wait');
+    const targetMailbox = normalizeMailboxId(mailboxId ?? 'default');
+    if (v.peek !== true && (v.ack === undefined || store.resolveLeaseMailbox(String(v.ack)) === targetMailbox)) {
+      reconcileCallerOrcaWakeTarget(store, targetMailbox, caller, { requireBoundOwner: true });
+    }
     const checkOptions = {
       ...(mailboxId !== undefined ? { mailboxId } : {}),
       ...(v.ack !== undefined ? { ackLeaseId: String(v.ack) } : {}),
@@ -681,9 +687,6 @@ async function runInboxCommand(
         ...(signal !== undefined ? { signal } : {}),
       });
     }
-    if (timeoutMs !== undefined) {
-      throw new Error('--timeout-ms requires --wait');
-    }
     return store.check(checkOptions);
   }
   if (command === 'ack') {
@@ -693,7 +696,14 @@ async function runInboxCommand(
     if (v.all === true) {
       throw new Error('--all is only valid with inbox list');
     }
-    return store.ack(required(target ?? v.lease ?? v.ack, 'delivery-id'), mailboxId);
+    const deliveryId = required(target ?? v.lease ?? v.ack, 'delivery-id');
+    const explicitMailbox = v.mailbox as string | undefined;
+    const leaseMailbox = store.resolveLeaseMailbox(deliveryId);
+    const targetAckMailbox = explicitMailbox !== undefined ? normalizeMailboxId(explicitMailbox) : leaseMailbox;
+    if (targetAckMailbox !== undefined && leaseMailbox === targetAckMailbox) {
+      reconcileCallerOrcaWakeTarget(store, targetAckMailbox, caller, { requireBoundOwner: true });
+    }
+    return store.ack(deliveryId, explicitMailbox);
   }
   if (command === 'list') {
     if (checkOnlyFlags) {
@@ -755,12 +765,7 @@ function replyTargetOrThrow(
   return route;
 }
 
-interface CallerOrcaBinding {
-  mailboxId: string;
-  terminalHandle?: string;
-  worktreeId?: string;
-  workspacePath?: string;
-}
+type CallerOrcaBinding = CallerOrcaIdentity;
 
 function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | undefined {
   const terminalHandle = typeof v['terminal-handle'] === 'string' && v['terminal-handle'].trim()
@@ -774,21 +779,17 @@ function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | u
   if (!terminalHandle && !worktreeId && !workspacePath) return undefined;
   const mailboxId = workspacePath ? `worktree:${basename(workspacePath)}`
     : worktreeId ? `worktree:${basename(worktreeId)}` : `terminal:${terminalHandle}`;
-  return { mailboxId, ...(terminalHandle ? { terminalHandle } : {}), ...(worktreeId ? { worktreeId } : {}), ...(workspacePath ? { workspacePath } : {}) };
+  const agent = v['caller-agent'];
+  if (agent !== undefined && !['antigravity', 'claude', 'codex'].includes(agent)) throw new Error('Invalid caller agent');
+  return {
+    mailboxId, terminalHandle, worktreeId, workspacePath, agent,
+    paneKey: v['pane-key']?.trim() || undefined,
+    sessionId: v['caller-session-id']?.trim() || undefined,
+  };
 }
 
 function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): void {
-  if (!caller) return;
-  const existing = store.getWakeTarget(mailboxId);
-  if (existing?.driver === 'orca-run' || existing?.driver === 'agent-host') return;
-  store.upsertWakeTarget(mailboxId, {
-    driver: 'orca-terminal',
-    driverConfig: {
-      ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
-      ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
-      ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
-    },
-  });
+  reconcileCallerOrcaWakeTarget(store, mailboxId, caller);
 }
 
 function settlementOutcome(value: unknown): SettlementOutcome {
@@ -1118,7 +1119,17 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
-    if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '')) {
+    if (['ask', 'reply', 'settle', 'send', 'broadcast', 'inbox'].includes(group ?? '')) {
+      if (v['pane-key'] === undefined) v['pane-key'] = (callerEnv.ORCA_PANE_KEY ?? callerEnv.ORCA_AGENT_PANE)?.trim() || undefined;
+      const conversation = [
+        ['antigravity', callerEnv.ANTIGRAVITY_CONVERSATION_ID?.trim()],
+        ['claude', (callerEnv.CLAUDE_CODE_SESSION_ID ?? callerEnv.CLAUDE_SESSION_ID)?.trim()],
+        ['codex', (callerEnv.CODEX_THREAD_ID ?? callerEnv.CODEX_SESSION_ID)?.trim()],
+      ].find(([, sessionId]) => sessionId);
+      if (conversation) {
+        if (v['caller-agent'] === undefined) v['caller-agent'] = conversation[0];
+        if (v['caller-session-id'] === undefined) v['caller-session-id'] = conversation[1];
+      }
       if (v['terminal-handle'] === undefined && callerEnv.ORCA_TERMINAL_HANDLE?.trim()) v['terminal-handle'] = callerEnv.ORCA_TERMINAL_HANDLE.trim();
       if (v['worktree-id'] === undefined && (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)?.trim()) v['worktree-id'] = (callerEnv.ORCA_WORKTREE_ID ?? callerEnv.ORCA_WORKSPACE_ID)!.trim();
     }
@@ -1164,7 +1175,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       }
     }
     // Preserve caller-relative paths when the daemon has a different cwd.
-    if (['ask', 'reply', 'settle', 'send', 'inbox'].includes(group ?? '') || group === 'project' || group === 'plugin' || (group === 'network' && action === 'mount') || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
+    if (['ask', 'reply', 'settle', 'send', 'broadcast', 'inbox'].includes(group ?? '') || group === 'project' || group === 'plugin' || (group === 'network' && action === 'mount') || (group === 'setup' && ['binding-preset', 'apply-preset'].includes(action))) {
       argv = [...p];
       for (const [key, value] of Object.entries(v)) {
         if (value === true) {

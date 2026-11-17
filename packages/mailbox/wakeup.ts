@@ -1,6 +1,6 @@
 import { CommandNotStartedError, singleLine } from '../subprocess/index.ts';
 import type { Disposable } from '../core-types/index.ts';
-import { normalizeMailboxId } from './store.ts';
+import { normalizeMailboxId, wakeupBackoffDelay } from './store.ts';
 import type { MailboxCheckResult, MailboxItem, MailboxStore, WakeTargetState } from './store.ts';
 
 export interface WakeupDriverContext {
@@ -19,9 +19,10 @@ export type WakeupDriverOutcome =
       readonly warning?: string;
     }
   | { readonly kind: 'noop'; readonly reason: string }
-  | { readonly kind: 'disarm'; readonly reason: string }
+  | { readonly kind: 'disarm'; readonly reason: string; readonly expectedRevision?: number }
   | {
       readonly kind: 'defer';
+      readonly expectedRevision?: number;
       readonly reason: string;
       readonly rotated?: boolean;
       readonly patch?: Partial<WakeTargetState>;
@@ -61,8 +62,6 @@ export interface WakeupMailboxOptions {
 }
 
 const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
-const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
-const MAX_BACKOFF_MS = 10_000;
 const MAX_INLINE_BODY_CHARS = 400;
 
 export function maxPreviewSequence(preview: MailboxCheckResult): number {
@@ -130,16 +129,7 @@ function buildPointerBody(
   );
 }
 
-/** Exponential busy-backoff: 1s -> 2s -> 5s -> capped at 10s. */
-export function wakeupBackoffDelay(attemptCount: number): number {
-  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) {
-    throw new Error('Invalid wake attempt count');
-  }
-  if (attemptCount <= DEFAULT_BACKOFF_MS.length) {
-    return DEFAULT_BACKOFF_MS[attemptCount - 1] ?? MAX_BACKOFF_MS;
-  }
-  return MAX_BACKOFF_MS;
-}
+export { wakeupBackoffDelay } from './store.ts';
 
 /**
  * Record a pre-effect failure: the external boundary was never crossed, so the target stays
@@ -172,13 +162,17 @@ export function settleWakeDeliveryFailure(
   mailboxId: string,
   error: unknown,
   now = Date.now(),
-): void {
+  expectedRevision?: number,
+): boolean {
   if (error instanceof CommandNotStartedError) {
-    recordWakeFailure(store, mailboxId, error, now);
-    return;
+    if (expectedRevision !== undefined) return store.deferWakeAttempt(mailboxId, expectedRevision, error, now).superseded;
+    else recordWakeFailure(store, mailboxId, error, now);
+    return false;
   }
   store.parkWakeDelivery(mailboxId, error);
+  return false;
 }
+
 
 function noWake(mailboxId: string, driver: string, reason: string): WakeupFlushResult {
   return { mailboxId, driver, woke: false, reason };
@@ -305,7 +299,7 @@ export class WakeupRedriveService {
     const operation = Promise.resolve()
       .then(() => this.flushInternal(id, options.force === true))
       .then((result) => {
-        delivered = result.woke;
+        delivered = result.woke || result.reason === 'Wake launch superseded by a newer binding';
         return result;
       })
       .finally(() => {
@@ -378,11 +372,13 @@ export class WakeupRedriveService {
 
   private async flushInternal(mailboxId: string, force: boolean): Promise<WakeupFlushResult> {
     let target: WakeTargetState | undefined;
+    let initialRevision = 0;
     try {
       target = this.store.getWakeTarget(mailboxId);
       if (!target) {
         return noWake(mailboxId, 'passive', 'No wake target');
       }
+      initialRevision = target.bindingRevision ?? 0;
       if (target.deliveryInDoubt) {
         return noWake(
           mailboxId,
@@ -425,7 +421,7 @@ export class WakeupRedriveService {
         );
       }
       const driver = this.drivers.get(target.driver);
-      if (!driver) return this.defer(mailboxId, `Unsupported wakeup driver: ${target.driver}`);
+      if (!driver) return this.defer(mailboxId, initialRevision, `Unsupported wakeup driver: ${target.driver}`);
       const outcome = await driver.deliver({
         store: this.store,
         mailboxId,
@@ -447,32 +443,30 @@ export class WakeupRedriveService {
         };
       }
       if (outcome.kind === 'defer') {
-        const result = this.defer(mailboxId, outcome.reason, outcome.patch);
-        return { ...result, ...(outcome.rotated !== undefined ? { rotated: outcome.rotated } : {}) };
+        const result = this.defer(mailboxId, outcome.expectedRevision ?? initialRevision, outcome.reason, outcome.patch);
+        return result.reason === 'Wake launch superseded by a newer binding' ? result : { ...result, ...(outcome.rotated !== undefined ? { rotated: outcome.rotated } : {}) };
       }
-      if (outcome.kind === 'disarm')
-        this.store.upsertWakeTarget(mailboxId, {
-          pendingWake: false,
-          attemptCount: 0,
-          earliestWakeAt: 0,
-          lastWakeError: undefined,
-        });
+      if (outcome.kind === 'disarm') {
+        const result = this.store.disarmWakeTargetIfCurrent(mailboxId, outcome.expectedRevision ?? initialRevision);
+        if (result.superseded) return noWake(mailboxId, target.driver, 'Wake launch superseded by a newer binding');
+      }
       return noWake(mailboxId, target.driver, outcome.reason);
     } catch (error) {
       this.report(error);
       if (!target) {
         return noWake(mailboxId, 'passive', String(error));
       }
-      if (error instanceof SettledWakeLaunchError) return noWake(mailboxId, target.driver, String(error));
+      if (error instanceof SettledWakeLaunchError) return noWake(mailboxId, target.driver, error.message);
       try {
         // A driver may have persisted a new destination before this attempt failed;
         // settle against the authoritative store state.
         const current = this.store.getWakeTarget(mailboxId);
         if (current?.deliveryInDoubt) {
-          settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
+          const superseded = settleWakeDeliveryFailure(this.store, mailboxId, error, this.now(), initialRevision);
+          if (superseded) return noWake(mailboxId, target.driver, 'Wake launch superseded by a newer binding');
           return noWake(mailboxId, target.driver, String(error));
         }
-        return this.defer(mailboxId, String(error));
+        return this.defer(mailboxId, initialRevision, String(error));
       } catch (settleError) {
         this.report(settleError);
         return noWake(mailboxId, target.driver, String(error));
@@ -484,9 +478,9 @@ export class WakeupRedriveService {
     return preview.deliveryId ? preview.newerQueuedCount > 0 : preview.items.length > 0;
   }
 
-  private defer(mailboxId: string, reason: string, patch?: Partial<WakeTargetState>): WakeupFlushResult {
-    recordWakeFailure(this.store, mailboxId, reason, this.now(), patch);
-    return noWake(mailboxId, this.store.getWakeTarget(mailboxId)?.driver ?? 'passive', reason);
+  private defer(mailboxId: string, expectedRevision: number, reason: string, patch?: Partial<WakeTargetState>): WakeupFlushResult {
+    const result = this.store.deferWakeAttempt(mailboxId, expectedRevision, reason, this.now(), patch);
+    return noWake(mailboxId, result.target.driver, result.superseded ? 'Wake launch superseded by a newer binding' : reason);
   }
 
   private report(error: unknown): void {

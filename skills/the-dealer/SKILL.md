@@ -348,7 +348,22 @@ leg and recomputes the thread state; it refuses `inbound:` ids and refuses a
 message the outbox still holds as `queued` or `delivered` unless you pass
 `--force`.
 Inside Orca, `ORCA_WORKTREE_ID`/`ORCA_TERMINAL_HANDLE` bind the caller's
-worktree or terminal automatically. Omit `--mailbox` for two-way ask/reply/
+worktree or terminal automatically. Mutating caller operations also capture
+`ANTIGRAVITY_CONVERSATION_ID`, `CLAUDE_CODE_SESSION_ID`/`CLAUDE_SESSION_ID`, or
+`CODEX_THREAD_ID`/`CODEX_SESSION_ID`, plus `ORCA_PANE_KEY`/`ORCA_AGENT_PANE`.
+When that workspace sleeps, incoming thread mail reuses the restored pane or
+resumes the recorded conversation in a background tab with auto-permissions,
+without taking over a sibling tab. Session rotation starts a fresh conversation
+and clears the previous session/pane identity while durably recording the retired
+session ID. Newly configured sessions reset the wave count and take effect immediately.
+`interactiveCommand` is the fresh-session launch command and must not contain
+`{sessionId}`. Custom host commands retain their model flags when resuming. For
+opaque wrappers, configure both a fresh `interactiveCommand` (for example,
+`custom-wrapper --auto`) and a matching `resumeCommand` with an unquoted standalone
+`{sessionId}` token (for example, `custom-wrapper --auto --session {sessionId}`).
+Rotation and recovery after rotation use the fresh command; incompatible launch
+settings are cleared when the caller host changes. `inbox list` and `inbox check
+--peek` do not change these bindings. Omit `--mailbox` for two-way ask/reply/
 settle conversations; each side wakes the other's Orca terminal. `dealer ask`
 defaults to `collab.question.v1` when `--topic` is omitted, and
 `--target-mailbox worktree:<name>` addresses a named Orca worktree.
@@ -360,3 +375,8 @@ topic's bound workspace/mailbox; non-Orca callers continue to use the topic bind
 # Lifecycle and updates
 
 Use `dealer node down` for a graceful drain and shutdown, or `dealer node restart` to drain and start again; if the drain cannot quiesce, the daemon keeps serving and the result reports `stopped:false` (`--force` is the explicit override). `dealer self-update` fast-forwards a clean `main` checkout and repairs installed skill links. Running daemons expose a `runtimeFingerprint`; edits to host or linked project files are detected by the daemon's own watcher, which schedules an idle-gated automatic drain and restart. Ordinary commands never restart the daemon synchronously.
+
+Orca conversation identity and continuation policy belong to the receiver-owned
+`plugins-orca` driver configuration; the generic mailbox stores opaque
+`driverConfig` and fences asynchronous launch and settlement with `bindingRevision`.
+A concurrent rebind preserves the newer conversation and redrives its pending mail.

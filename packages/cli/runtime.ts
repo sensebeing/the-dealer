@@ -1,3 +1,4 @@
+import { resolveConfiguredOrcaWakeTargetPatch } from '../plugins-orca/index.ts';
 import { createOrcaWakeupDrivers, pinOrcaTerminalSessionMailbox } from '../plugins-orca/index.ts';
 import { createAgentHostWakeupDriver } from '../plugins-agent-host/index.ts';
 import { toMailboxTopicBinding } from './config.ts';
@@ -1029,30 +1030,25 @@ export class DealerNodeRuntime {
             runId,
             pinnedTerminalHandle: terminalHandle,
           });
-      // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
-      // handle, an Orca Run, or a workspace switch may replace or clear it. Passing every optional
-      // field as an own property is what lets a reconfiguration erase a stale rotation default.
-      const nextTerminalHandle =
-        terminalHandle !== undefined
-          ? terminalHandle
-          : !runId && current?.driver === 'orca-terminal' && current.driverConfig?.workspacePath === workspacePath
-            ? current.driverConfig?.terminalHandle
-            : undefined;
+      const identityPatch = resolveConfiguredOrcaWakeTargetPatch(current, {
+          mailboxId, runId, workspacePath, configuredTerminalHandle: terminalHandle,
+          configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
+          configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand,
+          configuredResumeCommand: binding.resumeCommand, hasTopicBinding: true, authoritativeConfig: true,
+        });
       this.mailbox.upsertWakeTarget(mailboxId, {
-        driver: runId ? 'orca-run' : 'orca-terminal',
+        ...identityPatch,
         wakeupPrefix,
         coalesceMs: coalesceMs ?? 0,
         rotateAfterWaves: resolvedRotateAfterWaves,
         driverConfig: {
+          ...identityPatch.driverConfig,
           workspacePath,
           worktreeId,
           runId,
           repoRoot: projectRoot,
-          agent: binding.agent ? orcaAgent(binding.agent) : undefined,
-          interactiveCommand,
           autoCreateWorkspace,
           workspaceComment,
-          terminalHandle: nextTerminalHandle,
         },
       });
     }

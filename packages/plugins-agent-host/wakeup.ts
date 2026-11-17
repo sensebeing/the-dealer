@@ -60,8 +60,10 @@ export async function deliverAgentHostWakeTarget(
 ): Promise<{ pointer: string; stdout: string; stderr?: string }> {
   const now = options.now ?? Date.now();
   let deliveryBegun = false;
+  let expectedRevision = 0;
   try {
     const state = store.getWakeTarget(mailboxId);
+    expectedRevision = state?.bindingRevision ?? 0;
     const target = state ? { ...readAgentHostDriverConfig(state), ...state } : undefined;
     if (!target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
     const preview = store.check({ mailboxId, peek: true });
@@ -78,7 +80,7 @@ export async function deliverAgentHostWakeTarget(
       targetBot: target.targetBot,
       sessionId: target.sessionId,
     });
-    store.beginWakeDelivery(mailboxId);
+    if (!store.beginWakeDelivery(mailboxId, expectedRevision)) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     deliveryBegun = true;
     const output = await checkedCommand(runner, {
       ...invocation,
@@ -92,19 +94,24 @@ export async function deliverAgentHostWakeTarget(
       output.stdout,
       target.conversationMode ?? 'fixed',
     );
-    store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
+    const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
       driver: continuation.hostAgent ? 'agent-host' : 'passive',
       driverConfig: continuation.hostAgent ? continuation : undefined,
-    });
+    }, undefined, expectedRevision);
+    if (completed.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     return { pointer, stdout: output.stdout, stderr: output.stderr };
   } catch (error) {
     const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
     if (fenced) {
       // A pre-existing fence refuses the attempt before the boundary; it keeps the original
       // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
-      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now);
+      if (deliveryBegun && settleWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision)) {
+        throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
+      }
     } else {
-      recordWakeFailure(store, mailboxId, error, now);
+      if (!(error instanceof SettledWakeLaunchError) && store.deferWakeAttempt(mailboxId, expectedRevision, error, now).superseded) {
+        throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
+      }
     }
     throw error;
   }
@@ -123,6 +130,7 @@ export function createAgentHostWakeupDriver(options: { commandRunner?: CommandRu
         );
         return { kind: 'delivered', pointer: delivered.pointer };
       } catch (error) {
+        if (error instanceof SettledWakeLaunchError) throw error;
         throw new SettledWakeLaunchError(String(error), { cause: error });
       }
     },

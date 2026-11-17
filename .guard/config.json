@@ -98,7 +98,8 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -107,7 +108,8 @@
           "packages/mailbox",
           "packages/plugins-executor"
         ],
-        "layer": "plugin"
+        "layer": "plugin",
+        "role": "Standalone CLI and desktop-app host descriptors, invocation and receipt continuation, host wakeup driver and executors."
       },
       {
         "path": "packages/plugins-orca",
@@ -115,7 +117,8 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -124,7 +127,8 @@
           "packages/plugins-agent-host",
           "packages/plugins-executor"
         ],
-        "layer": "plugin"
+        "layer": "plugin",
+        "role": "Orca workspace and terminal inspection, composer guards, session/pane binding transitions and retirement provenance, validated fresh/continuation TUI commands, wakeup drivers and executors."
       },
       {
         "path": "packages/transport",
@@ -227,14 +231,16 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
           "packages/fs-atomic",
           "packages/subprocess"
         ],
-        "layer": "core"
+        "layer": "core",
+        "role": "Host-agnostic v2 mailbox ledgers with opaque driverConfig, bindingRevision CAS launch and settlement fencing, and WakeupDriver scheduling."
       },
       {
         "path": "packages/plugins-policy",
@@ -289,13 +295,15 @@
         ],
         "boundary_docs": [
           "AGENTS.md",
-          "docs/plugin-guide.md"
+          "docs/plugin-guide.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
           "packages/mailbox",
           "packages/subprocess"
-        ]
+        ],
+        "role": "Generic inbound executor utilities and mailbox authority contracts; concrete host and Orca behavior belongs to their plugins."
       },
       {
         "path": "packages/plugins-lark-notifier",
@@ -320,7 +328,8 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -342,7 +351,8 @@
           "packages/subprocess",
           "packages/plugins-orca",
           "packages/plugins-agent-host"
-        ]
+        ],
+        "role": "CLI and control-socket RPC, daemon composition and binding presets; injects wakeup drivers and delegates Orca binding transitions to plugins-orca."
       }
     ],
     "forbidden_imports": [
@@ -520,6 +530,10 @@
         "rule_id": "guard.service-boundaries",
         "message": "Generic executor utilities must remain host-neutral."
       }
+    ],
+    "architecture_docs": [
+      "AGENTS.md",
+      "docs/architecture.md"
     ]
   }
 }

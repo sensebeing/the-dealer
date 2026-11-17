@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   OrcaTerminalLaunchRejectedError,
   readOrcaTerminal,
@@ -14,7 +15,7 @@ import {
   findOrcaWorktreeByName,
 } from './workspace.ts';
 import type { OrcaIdleResult, SupportedOrcaAgent } from './workspace.ts';
-import { defaultAgentLaunchCommand } from '../plugins-agent-host/hosts.ts';
+import { buildOrcaAgentLaunchCommand, isOrcaLaunchConfigCompatible } from './workspace.ts';
 import { CommandNotStartedError, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
@@ -33,6 +34,12 @@ export interface OrcaTerminalDriverConfig {
   orcaCommand?: string;
   agent?: SupportedOrcaAgent;
   interactiveCommand?: string;
+  sessionId?: string;
+  paneKey?: string;
+  resumeCommand?: string;
+  configuredSessionId?: string;
+  configuredTerminalHandle?: string;
+  retiredSessionId?: string;
   worktreeId?: string;
   workspacePath?: string;
   terminalHandle?: string;
@@ -50,7 +57,7 @@ export function readOrcaDriverConfig(target: Pick<WakeTargetState, 'driverConfig
   const config = target.driverConfig ?? {};
   for (const field of [
     'orcaCommand',
-    'interactiveCommand',
+    'interactiveCommand', 'sessionId', 'paneKey', 'resumeCommand', 'configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId',
     'worktreeId',
     'workspacePath',
     'terminalHandle',
@@ -143,6 +150,183 @@ function needsSessionRotation(
   );
 }
 
+function orcaWakeTargetPatch(patch: Partial<OrcaWakeTarget>): Partial<WakeTargetState> {
+  const { driver, completedWaves, ...driverConfig } = patch;
+  return { ...(driver !== undefined ? { driver } : {}), ...(completedWaves !== undefined ? { completedWaves } : {}), driverConfig };
+}
+
+export function buildLaunchedOrcaWakeTargetPatch(
+  _mailboxId: string,
+  current: WakeTargetState,
+  options: { handle: string; resetCompletedWaves?: boolean },
+): Partial<WakeTargetState> {
+  const binding = readOrcaDriverConfig(current);
+  return orcaWakeTargetPatch({
+    terminalHandle: options.handle, paneKey: undefined,
+    ...(options.resetCompletedWaves ? {
+      completedWaves: 0, sessionId: undefined,
+      retiredSessionId: binding.sessionId ?? binding.configuredSessionId ?? binding.retiredSessionId,
+    } : {}),
+  });
+}
+
+export interface CallerOrcaIdentity {
+  mailboxId: string;
+  workspacePath?: string;
+  worktreeId?: string;
+  terminalHandle?: string;
+  paneKey?: string;
+  agent?: SupportedOrcaAgent;
+  sessionId?: string;
+}
+
+function sameCallerWorkspace(a?: string, b?: string): boolean {
+  if (!a || !b || resolve(a) === resolve(b)) return true;
+  try { return realpathSync(a) === realpathSync(b); } catch { return false; }
+}
+
+function callerOwnsExplicitOrcaWakeTarget(id: string, existing: WakeTargetState | undefined, caller: CallerOrcaIdentity): boolean {
+  if (id === caller.mailboxId) return true;
+  if (caller.terminalHandle && id === `terminal:${caller.terminalHandle}`) {
+    return !existing || existing.driver === 'passive' || sameCallerWorkspace(readOrcaDriverConfig(existing).workspacePath, caller.workspacePath);
+  }
+  if (existing?.driver !== 'orca-terminal') return false;
+  const bound = readOrcaDriverConfig(existing);
+  if (!sameCallerWorkspace(bound.workspacePath, caller.workspacePath)) return false;
+  return Boolean((caller.terminalHandle && bound.terminalHandle === caller.terminalHandle)
+    || (caller.paneKey && bound.paneKey === caller.paneKey));
+}
+
+export function reconcileCallerOrcaWakeTarget(
+  store: MailboxStore, mailboxId: string, caller: CallerOrcaIdentity | undefined,
+  options: { requireBoundOwner?: boolean } = {},
+): WakeTargetState | undefined {
+  if (!caller) return undefined;
+  const id = normalizeMailboxId(mailboxId);
+  const existing = store.getWakeTarget(id);
+  if (existing?.driver === 'orca-run' || existing?.driver === 'agent-host') return undefined;
+  if (options.requireBoundOwner && !callerOwnsExplicitOrcaWakeTarget(id, existing, caller)) return undefined;
+  const updated = store.upsertWakeTarget(id, resolveCallerOrcaWakeTargetPatch(existing, caller));
+  const handle = readOrcaDriverConfig(updated).terminalHandle;
+  if (updated.rotateAfterWaves !== undefined && handle) pinOrcaTerminalSessionMailbox(store, id, handle);
+  return updated;
+}
+
+/** Single owner of caller-driven Orca conversation identity transitions. */
+export function resolveCallerOrcaWakeTargetPatch(
+  snapshot: WakeTargetState | undefined,
+  caller: { workspacePath?: string; worktreeId?: string; terminalHandle?: string; paneKey?: string; agent?: SupportedOrcaAgent; sessionId?: string },
+): Partial<WakeTargetState> {
+  const existing = snapshot && readOrcaWakeTarget(snapshot);
+  const switchedIdentity =
+    (caller.workspacePath && existing?.workspacePath && caller.workspacePath !== existing.workspacePath) ||
+    (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
+    (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
+    (caller.agent && existing?.agent && caller.agent !== existing.agent) ||
+    (caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
+      (!caller.paneKey || !existing.paneKey || caller.paneKey !== existing.paneKey) &&
+      (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId));
+  const nextAgent = switchedIdentity ? caller.agent : (caller.agent ?? existing?.agent);
+  const clearLaunchConfig = (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
+    !isOrcaLaunchConfigCompatible({ agent: nextAgent, previousAgent: existing?.agent,
+      interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
+  return orcaWakeTargetPatch({
+    driver: 'orca-terminal',
+    ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
+    ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
+    ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
+    ...(switchedIdentity ? {
+      completedWaves: 0, terminalHandle: caller.terminalHandle, paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent,
+    } : {
+      ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
+      ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
+      ...(caller.sessionId ? { sessionId: caller.sessionId } : {}),
+      ...(caller.agent ? { agent: caller.agent } : {}),
+    }),
+  });
+}
+
+/** Apply configuration once; rotation retires the runtime session without erasing its provenance. */
+export function resolveConfiguredOrcaWakeTargetPatch(
+  snapshot: WakeTargetState | undefined,
+  input: {
+    mailboxId?: string; runId?: string; workspacePath?: string; configuredTerminalHandle?: string;
+    configuredAgent?: SupportedOrcaAgent; configuredSessionId?: string;
+    configuredInteractiveCommand?: string; configuredResumeCommand?: string; hasTopicBinding: boolean; authoritativeConfig: boolean;
+  },
+): Partial<WakeTargetState> {
+  const existing = snapshot && readOrcaWakeTarget(snapshot);
+  const commandPatch = input.authoritativeConfig || input.configuredInteractiveCommand !== undefined
+    ? { interactiveCommand: input.configuredInteractiveCommand } : {};
+  const resumeCommandPatch = input.authoritativeConfig || input.configuredResumeCommand !== undefined
+    ? { resumeCommand: input.configuredResumeCommand } : {};
+  const nextConfiguredHandle = input.configuredTerminalHandle?.trim() || undefined;
+  if (input.runId) return orcaWakeTargetPatch({
+    driver: 'orca-run', completedWaves: 0, retiredSessionId: undefined, terminalHandle: nextConfiguredHandle, paneKey: undefined,
+    sessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined,
+    ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
+    ...commandPatch, ...resumeCommandPatch,
+  });
+  const nextConfiguredSession = input.configuredSessionId?.trim() || undefined;
+  const prevConfiguredSession = existing?.configuredSessionId;
+  const effectiveWorkspacePath = input.authoritativeConfig ? input.workspacePath : (input.workspacePath ?? existing?.workspacePath);
+  const sameWorkspace = existing?.driver === 'orca-terminal' && existing.workspacePath === effectiveWorkspacePath;
+  const handleUnchangedSinceConfig = nextConfiguredHandle !== undefined && nextConfiguredHandle === existing?.configuredTerminalHandle;
+  const samePinnedHandle = nextConfiguredHandle === undefined || nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig;
+  const sameAgent = input.configuredAgent === undefined || existing?.agent === undefined || input.configuredAgent === existing.agent;
+  const compatible = sameWorkspace && samePinnedHandle && sameAgent;
+  const alreadyRetired = compatible && nextConfiguredSession !== undefined && nextConfiguredSession === existing?.retiredSessionId;
+  const unchangedConfigured = nextConfiguredSession !== undefined && (nextConfiguredSession === prevConfiguredSession || alreadyRetired);
+  const addedOrChanged = input.hasTopicBinding && nextConfiguredSession !== undefined && !unchangedConfigured;
+  const removed = input.hasTopicBinding && nextConfiguredSession === undefined && prevConfiguredSession !== undefined;
+  const preserved = {
+    terminalHandle: handleUnchangedSinceConfig ? existing?.terminalHandle : (nextConfiguredHandle ?? existing?.terminalHandle),
+    paneKey: existing?.paneKey, sessionId: existing?.sessionId,
+    agent: input.configuredAgent ?? existing?.agent,
+  };
+  let identity: Partial<OrcaWakeTarget>;
+  if (addedOrChanged) {
+    const handleBelongsToPrevious = nextConfiguredHandle !== undefined &&
+      (nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig);
+    identity = compatible && existing?.sessionId === nextConfiguredSession ? preserved : {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: handleBelongsToPrevious ? undefined : nextConfiguredHandle, paneKey: undefined, sessionId: nextConfiguredSession,
+      agent: input.configuredAgent ?? (sameWorkspace && sameAgent ? existing?.agent : undefined),
+    };
+    identity = { ...identity, configuredSessionId: nextConfiguredSession };
+  } else if (removed) {
+    identity = existing?.sessionId === prevConfiguredSession || !compatible ? {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
+      agent: input.configuredAgent ?? (compatible ? existing?.agent : undefined),
+    } : preserved;
+    identity = { ...identity, configuredSessionId: undefined, retiredSessionId: undefined };
+  } else if (unchangedConfigured) {
+    identity = compatible ? { ...preserved, retiredSessionId: existing?.retiredSessionId } : {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined,
+      sessionId: nextConfiguredSession, agent: input.configuredAgent,
+    };
+    identity = { ...identity, configuredSessionId: nextConfiguredSession };
+  } else {
+    identity = compatible ? { ...preserved, configuredSessionId: input.hasTopicBinding ? undefined : existing?.configuredSessionId } : {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
+      configuredSessionId: undefined, agent: input.configuredAgent,
+    };
+  }
+  const clearLaunchConfig = !input.authoritativeConfig && input.configuredInteractiveCommand === undefined && input.configuredResumeCommand === undefined &&
+    (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
+    !isOrcaLaunchConfigCompatible({ agent: identity.agent, previousAgent: existing?.agent,
+      interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
+  return orcaWakeTargetPatch({
+    driver: 'orca-terminal', ...identity,
+    configuredTerminalHandle: input.hasTopicBinding || nextConfiguredHandle !== undefined ? nextConfiguredHandle : existing?.configuredTerminalHandle,
+    ...commandPatch, ...resumeCommandPatch,
+    ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
+  });
+}
+
 /** Persist custody before any terminal creation or shell bootstrap, including their unknown outcomes. */
 export async function launchFencedOrcaWorkspaceTerminal(
   store: MailboxStore,
@@ -151,46 +335,39 @@ export async function launchFencedOrcaWorkspaceTerminal(
   options: {
     command: string;
     workspacePath: string;
-    agent?: SupportedOrcaAgent;
+    agent?: WakeTargetState['agent'];
     interactiveCommand?: string;
+    resumeCommand?: string;
+    sessionId?: string;
     signal?: AbortSignal;
     now?: number;
     resetCompletedWaves?: boolean;
+    expectedRevision?: number;
     shellTerminalHandle?: string;
   },
 ) {
-  store.beginWakeDelivery(mailboxId);
+  const resumeSessionId = options.resetCompletedWaves ? undefined : options.sessionId;
+  const expectedRevision = options.expectedRevision ?? store.getWakeTarget(mailboxId)?.bindingRevision ?? 0;
   try {
+    const launchCommand = buildOrcaAgentLaunchCommand({ ...options, sessionId: resumeSessionId });
+    const fenced = store.beginWakeDelivery(mailboxId, expectedRevision);
+    if (!fenced) return { committed: false as const, handle: '', raw: undefined, target: readOrcaWakeTarget(store.getWakeTarget(mailboxId)!) };
     let launched: { handle: string; raw: unknown };
     if (options.shellTerminalHandle) {
-      await sendOrcaTerminalText(
-        runner,
-        options.command,
-        options.shellTerminalHandle,
-        options.interactiveCommand?.trim() || defaultAgentLaunchCommand(options.agent),
-        { cwd: options.workspacePath, signal: options.signal },
-      );
+      await sendOrcaTerminalText(runner, options.command, options.shellTerminalHandle,
+        launchCommand,
+        { cwd: options.workspacePath, signal: options.signal });
       launched = { handle: options.shellTerminalHandle, raw: undefined };
     } else {
-      launched = await spawnOrcaWorkspaceTerminal(
-        runner,
-        options.command,
-        options.workspacePath,
-        options.signal,
-        options,
-      );
+      launched = await spawnOrcaWorkspaceTerminal(runner, options.command, options.workspacePath, options.signal, { ...options, sessionId: resumeSessionId });
     }
-    const target = store.upsertWakeTarget(mailboxId, {
-      ...(options.resetCompletedWaves ? { completedWaves: 0 } : {}),
-      deliveryInDoubt: undefined,
-      pendingWake: true,
-      lastWakeError: undefined,
-      driverConfig: { terminalHandle: launched.handle },
-    });
-    return { ...launched, target: readOrcaWakeTarget(target) };
+    const settled = store.commitWakeLaunch(mailboxId, fenced.bindingRevision ?? 0, current =>
+      buildLaunchedOrcaWakeTargetPatch(mailboxId, current, { handle: launched.handle, resetCompletedWaves: options.resetCompletedWaves }));
+    return { ...launched, ...settled, target: readOrcaWakeTarget(settled.target) };
   } catch (error) {
     if (error instanceof CommandNotStartedError || error instanceof OrcaTerminalLaunchRejectedError) {
-      recordWakeFailure(store, mailboxId, error, options.now);
+      const deferred = store.deferWakeAttempt(mailboxId, expectedRevision, error, options.now);
+      if (deferred.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     } else {
       store.parkWakeDelivery(mailboxId, error);
     }
@@ -211,8 +388,10 @@ export async function deliverSpawnedOrcaTerminalWakeup(
 ): Promise<{ pointer?: string; terminalHandle?: string; sent: boolean }> {
   const now = options.now ?? Date.now();
   let deliveryBegun = false;
+  let expectedRevision = 0;
   try {
     const state = store.getWakeTarget(mailboxId);
+    expectedRevision = state?.bindingRevision ?? 0;
     const target = state ? readOrcaWakeTarget(state) : undefined;
     if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
     const command = target.orcaCommand ?? 'orca';
@@ -234,41 +413,53 @@ export async function deliverSpawnedOrcaTerminalWakeup(
           })
         : await probeOrcaTerminalIdle(runner, command, target.terminalHandle, undefined, options.signal);
     if (!idle.idle) {
-      store.upsertWakeTarget(mailboxId, {
-        pendingWake: true,
-        driverConfig: { terminalHandle: target.terminalHandle },
-      });
+      store.retainPendingWakeIfCurrent(mailboxId, expectedRevision);
       return { terminalHandle: target.terminalHandle, sent: false };
     }
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) {
-      store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
-        driverConfig: { terminalHandle: target.terminalHandle },
-      });
+      store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, expectedRevision);
       return { terminalHandle: target.terminalHandle, sent: false };
     }
-    store.beginWakeDelivery(mailboxId);
+    const fenced = store.beginWakeDelivery(mailboxId, expectedRevision);
+    if (!fenced) return { terminalHandle: target.terminalHandle, sent: false };
     deliveryBegun = true;
     await sendOrcaTerminalText(runner, command, target.terminalHandle, pointer, {
       cwd: target.workspacePath,
       signal: options.signal,
       waitSubmit: 5,
     });
-    store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
-      driverConfig: { terminalHandle: target.terminalHandle },
-    });
+    const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, expectedRevision);
+    if (completed.superseded) return { pointer, terminalHandle: target.terminalHandle, sent: false };
     return { pointer, terminalHandle: target.terminalHandle, sent: true };
   } catch (error) {
     const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
     if (fenced) {
       // A pre-existing fence refuses the attempt before the boundary; it keeps the original
       // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
-      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now);
+      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
     } else {
-      recordWakeFailure(store, mailboxId, error, now);
+      store.deferWakeAttempt(mailboxId, expectedRevision, error, now);
     }
     throw error;
   }
+}
+
+function buildPinnedOrcaSessionDriverConfig(
+  target: OrcaWakeTarget,
+  existingSession: WakeTargetState | undefined,
+  terminalHandle: string,
+): Record<string, unknown> {
+  const existing = existingSession?.driver === 'orca-terminal' ? readOrcaDriverConfig(existingSession) : undefined;
+  const sameHandle = !target.terminalHandle || target.terminalHandle === terminalHandle;
+  return {
+    terminalHandle,
+    sessionId: existing?.sessionId ?? (sameHandle ? target.sessionId : undefined),
+    paneKey: existing?.paneKey ?? (sameHandle ? target.paneKey : undefined),
+    configuredSessionId: undefined,
+    configuredTerminalHandle: undefined,
+    retiredSessionId: undefined,
+  };
 }
 
 export function pinOrcaTerminalSessionMailbox(
@@ -282,7 +473,7 @@ export function pinOrcaTerminalSessionMailbox(
   if (!handle || target?.driver !== 'orca-terminal' || target.rotateAfterWaves === undefined) return id;
   return store.pinSessionMailbox(id, `terminal:${handle}`, {
     driver: 'orca-terminal',
-    driverConfig: { ...target.driverConfig, terminalHandle: handle },
+    driverConfig: buildPinnedOrcaSessionDriverConfig(readOrcaWakeTarget(target), store.getWakeTarget(`terminal:${handle}`), handle),
   });
 }
 
@@ -305,42 +496,51 @@ class OrcaWakeDelivery {
 
   async run(context: WakeupDriverContext): Promise<WakeupDriverOutcome> {
     const { mailboxId, preview } = context;
-    let target = readOrcaWakeTarget(context.target);
-    if (
-      !this.idleCheck &&
-      target.driver === 'orca-terminal' &&
-      target.workspacePath &&
-      target.autoCreateWorkspace === true
-    ) {
-      const workspace = await ensureOrcaWorkspace(this.runner, target.orcaCommand ?? this.command, {
-        workspacePath: target.workspacePath,
-        repoRoot: target.repoRoot,
-        comment: target.workspaceComment,
-      });
-      if (workspace.workspacePath !== target.workspacePath) {
-        target = readOrcaWakeTarget(
-          this.store.upsertWakeTarget(mailboxId, {
-            driverConfig: { workspacePath: workspace.workspacePath },
-          }),
-        );
-      }
-    }
-    const idle = await this.authoritativeIdle(mailboxId, target, preview);
-    if (!idle.idle) {
-      // A workspace whose directory is gone can never become idle again; retrying it forever
-      // would only inflate the backoff ledger. The mail stays queued for a human or a rebind.
+    let activeRevision = context.target.bindingRevision ?? 0;
+    try {
+      let target = readOrcaWakeTarget(context.target);
       if (
         !this.idleCheck &&
-        idle.reason === 'Workspace not found' &&
-        target.autoCreateWorkspace !== true &&
+        target.driver === 'orca-terminal' &&
         target.workspacePath &&
-        !existsSync(target.workspacePath)
+        target.autoCreateWorkspace === true
       ) {
-        return { kind: 'disarm', reason: 'Workspace not found' };
+        const workspace = await ensureOrcaWorkspace(this.runner, target.orcaCommand ?? this.command, {
+          workspacePath: target.workspacePath,
+          repoRoot: target.repoRoot,
+          comment: target.workspaceComment,
+        });
+        if (workspace.workspacePath !== target.workspacePath) {
+          const updated = this.store.updateWakeDriverConfigIfCurrent(mailboxId, target.bindingRevision ?? 0, { workspacePath: workspace.workspacePath });
+          if (updated.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
+          target = readOrcaWakeTarget(updated.target);
+        }
       }
-      return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
+      activeRevision = target.bindingRevision ?? 0;
+      const idle = await this.authoritativeIdle(mailboxId, target, preview);
+      if (!idle.idle) {
+        // A workspace whose directory is gone can never become idle again; retrying it forever
+        // would only inflate the backoff ledger. The mail stays queued for a human or a rebind.
+        if (
+          !this.idleCheck &&
+          idle.reason === 'Workspace not found' &&
+          target.autoCreateWorkspace !== true &&
+          target.workspacePath &&
+          !existsSync(target.workspacePath)
+        ) {
+          return { kind: 'disarm', reason: 'Workspace not found', expectedRevision: target.bindingRevision ?? 0 };
+        }
+        return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
+      }
+      return await this.deliver(mailboxId, target, preview, idle.spawnFreshSession === true, revision => { activeRevision = revision; });
+    } catch (error) {
+      if (error instanceof SettledWakeLaunchError) throw error;
+      if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
+        const superseded = settleWakeDeliveryFailure(this.store, mailboxId, error, this.now(), activeRevision);
+        return { kind: 'noop', reason: superseded ? 'Wake launch superseded by a newer binding' : String(error) };
+      }
+      return { kind: 'defer', reason: String(error), expectedRevision: activeRevision };
     }
-    return await this.deliver(mailboxId, target, preview, idle.spawnFreshSession === true);
   }
 
   /**
@@ -363,24 +563,18 @@ class OrcaWakeDelivery {
     if (this.runner === runCommand && !this.idleCheck && !existsSync(workspacePath)) {
       return false;
     }
-    if (mailboxId.startsWith('task:')) {
-      if (!target.terminalHandle) return true;
-      return (
-        !this.idleCheck &&
-        !(await isOrcaWorkspaceTerminalLive(this.runner, command, workspacePath, target.terminalHandle))
-      );
+    if (needsSessionRotation(target, preview)) return true;
+    if (mailboxId.startsWith('task:') || target.sessionId?.trim() || target.paneKey?.trim()) {
+      if (!target.terminalHandle && !target.paneKey) return true;
+      return !this.idleCheck && !(await isOrcaWorkspaceTerminalLive(
+        this.runner, command, workspacePath, target.terminalHandle, undefined, target.paneKey,
+      ));
     }
     if (target.rotateAfterWaves === undefined) return false;
-    // Rotation always creates an empty tab, so the retained tab (draft or not) cannot gate it.
-    if (needsSessionRotation(target, preview)) {
-      return true;
-    }
-    // The first wave on an unbound workspace opens its own tab instead of hijacking a human's.
-    if (!target.terminalHandle) {
-      return true;
-    }
-    // A tab closed mid-wave or mid-window is replaced instead of falling back to another tab.
-    return !(await isOrcaWorkspaceTerminalLive(this.runner, command, workspacePath, target.terminalHandle));
+    if (!target.terminalHandle && !target.paneKey) return true;
+    return !(await isOrcaWorkspaceTerminalLive(
+      this.runner, command, workspacePath, target.terminalHandle, undefined, target.paneKey,
+    ));
   }
 
   private async authoritativeIdle(
@@ -408,6 +602,7 @@ class OrcaWakeDelivery {
       return withPlan(
         await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
           targetTerminalHandle: spawnFreshSession ? null : target.terminalHandle,
+          targetPaneKey: spawnFreshSession ? undefined : target.paneKey,
           agent: target.agent,
         }),
       );
@@ -428,7 +623,7 @@ class OrcaWakeDelivery {
     target: OrcaWakeTarget,
     reason: string,
   ): Extract<WakeupDriverOutcome, { kind: 'defer' }> {
-    return { kind: 'defer', reason };
+    return { kind: 'defer', reason, expectedRevision: target.bindingRevision ?? 0 };
   }
 
   /**
@@ -468,8 +663,11 @@ class OrcaWakeDelivery {
     target: OrcaWakeTarget,
     preview: MailboxCheckResult,
     freshSession: boolean,
+    setActiveRevision: (revision: number) => void,
   ): Promise<WakeupDriverOutcome> {
     const command = target.orcaCommand ?? this.command;
+    let activeRevision = target.bindingRevision ?? 0;
+    let reboundPatch: Partial<WakeTargetState> = {};
     let terminalHandle = target.terminalHandle;
     const needsRotation = needsSessionRotation(target, preview);
     const spawnFreshSession = !needsRotation && freshSession;
@@ -479,9 +677,9 @@ class OrcaWakeDelivery {
     const replaceTaskTab =
       dedicatedTaskTab &&
       !(needsRotation || spawnFreshSession) &&
-      (!terminalHandle ||
+      ((!terminalHandle && !target.paneKey) ||
         (!this.idleCheck &&
-          !(await isOrcaWorkspaceTerminalLive(this.runner, command, target.workspacePath!, terminalHandle))));
+          !(await isOrcaWorkspaceTerminalLive(this.runner, command, target.workspacePath!, terminalHandle, undefined, target.paneKey))));
 
     if (needsRotation || spawnFreshSession || replaceTaskTab) {
       // Rotation never resets an existing TUI: it opens a new session tab and leaves every old
@@ -495,12 +693,15 @@ class OrcaWakeDelivery {
         command,
         workspacePath,
         agent: target.agent,
-        interactiveCommand: target.interactiveCommand,
+        interactiveCommand: target.interactiveCommand, resumeCommand: target.resumeCommand, sessionId: target.sessionId, expectedRevision: activeRevision,
         now: this.now(),
         resetCompletedWaves: needsRotation,
       });
+      if (!spawned.committed) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
       terminalHandle = spawned.handle;
       target = spawned.target;
+      activeRevision = target.bindingRevision ?? 0;
+      setActiveRevision(activeRevision);
       rotated = needsRotation;
       const idle = await this.waitFreshTabIdle(target, terminalHandle, command);
       if (!idle.idle) {
@@ -514,8 +715,7 @@ class OrcaWakeDelivery {
         return needsRotation ? { ...deferred, rotated: true } : deferred;
       }
     } else if (
-      !dedicatedTaskTab &&
-      (!terminalHandle || !this.idleCheck) &&
+      ((!terminalHandle && !target.paneKey) || !this.idleCheck) &&
       target.workspacePath &&
       target.driver === 'orca-terminal'
     ) {
@@ -525,22 +725,25 @@ class OrcaWakeDelivery {
       // check only resolve when no handle exists yet.
       const plan = await planOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, {
         agent: target.agent,
-        preferredHandle: target.terminalHandle,
+        preferredHandle: target.terminalHandle, preferredPaneKey: target.paneKey, sessionId: target.sessionId, dedicatedTab: dedicatedTaskTab,
       });
       if (plan.kind === 'existing') {
         terminalHandle = plan.handle;
-        target = { ...target, terminalHandle };
+        reboundPatch = plan.handle !== target.terminalHandle ? { driverConfig: { terminalHandle } } : {};
       } else {
         const launched = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
           command,
           workspacePath: target.workspacePath,
           agent: target.agent,
-          interactiveCommand: target.interactiveCommand,
+          interactiveCommand: target.interactiveCommand, resumeCommand: target.resumeCommand, sessionId: target.sessionId, expectedRevision: activeRevision,
           now: this.now(),
           ...(plan.kind === 'shell' ? { shellTerminalHandle: plan.handle } : {}),
         });
-        terminalHandle = launched.handle;
+        if (!launched.committed) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
+      terminalHandle = launched.handle;
         target = launched.target;
+        activeRevision = target.bindingRevision ?? 0;
+        setActiveRevision(activeRevision);
         if (plan.kind === 'shell') {
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
         }
@@ -554,7 +757,8 @@ class OrcaWakeDelivery {
 
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) {
-      this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview));
+      const completed = this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, activeRevision);
+      if (completed.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
       return { kind: 'noop', reason: 'Nothing new to deliver' };
     }
 
@@ -563,7 +767,7 @@ class OrcaWakeDelivery {
       throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
     // The pointer is the only external effect left; fence it so a crash or an unconfirmed send
     // stays parked instead of being replayed by the next tick or restart.
-    this.store.beginWakeDelivery(mailboxId);
+    if (!this.store.beginWakeDelivery(mailboxId, activeRevision)) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
     if (target.driver === 'orca-run') {
       const output = await this.runner({
         command,
@@ -606,18 +810,20 @@ class OrcaWakeDelivery {
       }
     }
 
-    this.store.completeWakeDelivery(
+    const completed = this.store.completeWakeDelivery(
       mailboxId,
       maxPreviewSequence(preview),
-      terminalHandle ? { driverConfig: { terminalHandle } } : {},
+      reboundPatch,
       terminalHandle && target.rotateAfterWaves !== undefined
         ? {
             sessionMailboxId: `terminal:${terminalHandle}`,
             driver: 'orca-terminal',
-            driverConfig: { ...target.driverConfig, terminalHandle },
+            driverConfig: buildPinnedOrcaSessionDriverConfig(target, this.store.getWakeTarget(`terminal:${terminalHandle}`), terminalHandle),
           }
         : undefined,
+      activeRevision,
     );
+    if (completed.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
     return {
       kind: 'delivered',
       pointer,
