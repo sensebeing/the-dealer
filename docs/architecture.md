@@ -102,6 +102,8 @@ flowchart TB
 
 `dispatcher/inbound` 首先使用单目标执行回执的 authoritative `mailboxId`，缺省时通过 payload-aware registry 适配和 mailbox 的地址解析恢复；已交付 session 归属由插件 hook 与 `MailboxStore.pinSessionMailbox` 原子维护。`TopicBindingConfig.metadata` 是唯一开放的非空字符串注解映射；顶层仅接受已声明字段及显式兼容的 `assignee`，未知字段被拒绝，注解不赋予核心 runtime 业务语义。
 
+执行组合根在生成接收端附件路径前，通过 `ExecutionContext.signedEnvelopes` 保留原始签名信封；执行器入库时将映射传给 `MailboxStore.enqueue`，账本独立保存执行投影 `envelope` 与可选原始 `signedEnvelope`。恢复确认直接认证 `signedEnvelope ?? envelope`，mailbox 不清理或重建执行投影以猜测签名内容，旧记录仍可直接验签。
+
 `lark-mirror` 在插件内部创建 `LarkMailboxNotifier`，用 `ctx.provide('larkNotifier', ...)` 发布服务并用 `ctx.effect` 启停。Kernel unload/replacement 自动清理订阅与重试；runtime 通过只读 service getter 更新默认 mailbox 集。
 
 ## 二、 微内核与插件协议设计 (`@the-dealer/kernel`)

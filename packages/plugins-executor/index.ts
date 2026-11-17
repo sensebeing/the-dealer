@@ -128,7 +128,7 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
   const store = options.store ?? new MailboxStore(options.inboxPath!);
   return {
     name: 'inbox',
-    async execute(batch, _context, runtimeConfig) {
+    async execute(batch, context, runtimeConfig) {
       const config = (runtimeConfig ?? {}) as InboxExecutorOptions;
       const wakeup = options.wakeup ?? config.wakeup;
       const groups = new Map<string, MessageEnvelope[]>();
@@ -156,7 +156,7 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
       }
       const inserted: string[] = [];
       for (const { mailboxId, envelopes, wakeTarget } of prepared) {
-        const result = store.enqueue(envelopes, { mailboxId, ...(wakeTarget ? { wakeTarget } : {}) });
+        const result = store.enqueue(envelopes, { ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}), mailboxId, ...(wakeTarget ? { wakeTarget } : {}) });
         inserted.push(...result.inserted);
         if (result.inserted.length > 0) {
           wakeup?.notifyMailbox(mailboxId);

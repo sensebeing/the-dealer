@@ -673,6 +673,8 @@ export interface GateService {
 }
 
 export interface ExecutionContext {
+  /** Original wire-signed envelopes, preserved before receiver payload projection. */
+  signedEnvelopes?: Readonly<Record<string, MessageEnvelope>>;
   networkId: string;
   nodeId: string;
   traceId: string;

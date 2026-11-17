@@ -42,6 +42,7 @@ export interface MailboxItem {
   /** Monotonic insertion order, used to break ties between equal received instants. */
   readonly sequence: number;
   readonly envelope: MessageEnvelope;
+  readonly signedEnvelope?: MessageEnvelope;
 }
 
 export interface DeliveryLease {
@@ -145,6 +146,7 @@ export interface MailboxStoreOptions {
 }
 
 export interface MailboxEnqueueOptions {
+  signedEnvelopes?: Readonly<Record<string, MessageEnvelope>>;
   mailboxId?: string;
   wakeupHint?: string;
   wakeTarget?: Partial<WakeTargetState>;
@@ -597,6 +599,9 @@ function validateItem(value: unknown): MailboxItem {
   if (envelope.id !== item.id) {
     throw invalidStore();
   }
+  if (item.signedEnvelope !== undefined && validateStoredEnvelope(item.signedEnvelope).id !== item.id) {
+    throw invalidStore();
+  }
   return item;
 }
 
@@ -989,8 +994,11 @@ export class MailboxStore {
           continue;
         }
         const cloned = structuredClone(envelope);
-        if (isRecord(cloned.payload) && Array.isArray(cloned.payload.localAttachments) && cloned.payload.localAttachments.length === 0) {
-          delete cloned.payload.localAttachments;
+        let signedEnvelope: MessageEnvelope | undefined;
+        if (options.signedEnvelopes && Object.hasOwn(options.signedEnvelopes, cloned.id)) {
+          const rawSigned = validateStoredEnvelope(options.signedEnvelopes[cloned.id]);
+          if (rawSigned.id !== cloned.id) throw invalidStore();
+          signedEnvelope = structuredClone(rawSigned);
         }
         const payload = isRecord(cloned.payload) ? cloned.payload : {};
         const hint = sanitizeWakeupHint(
@@ -1004,6 +1012,7 @@ export class MailboxStore {
           ...(hint ? { wakeupHint: hint } : {}),
           sequence: state.sequence,
           envelope: cloned,
+          ...(signedEnvelope ? { signedEnvelope } : {}),
         });
         state.sequence += 1;
         conversationalByMailbox.set(mailboxId,
@@ -1270,16 +1279,12 @@ export class MailboxStore {
   }
 
   hasConfirmedEnvelope(networkId: string, senderNodeId: string, entityId: string, minRevision: number): boolean {
-    return this.read().items.some(({ envelope }) => {
-      const revision = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
-      // Materialized paths are receiver-owned metadata, outside the sender's wire signature.
-      const authenticated = verifyEnvelope(envelope) ||
-        (isRecord(envelope.payload) && Object.hasOwn(envelope.payload, 'localAttachments') &&
-          verifyEnvelope({ ...envelope, payload: Object.fromEntries(
-            Object.entries(envelope.payload).filter(([key]) => key !== 'localAttachments'),
-          ) }));
-      return authenticated && envelope.networkId === networkId &&
-        envelope.from.nodeId === senderNodeId && (envelope.idempotencyKey ?? envelope.id) === entityId &&
+    return this.read().items.some(item => {
+      const authenticated = item.signedEnvelope ?? item.envelope;
+      const revision = authenticated.payload?.claimVersion ?? authenticated.payload?.revision ?? 0;
+      return authenticated.id === item.id && verifyEnvelope(authenticated) &&
+        authenticated.networkId === networkId && authenticated.from.nodeId === senderNodeId &&
+        (authenticated.idempotencyKey ?? authenticated.id) === entityId &&
         typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= minRevision;
     });
   }

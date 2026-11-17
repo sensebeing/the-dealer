@@ -235,7 +235,12 @@ after all plugins load. Standalone configuration without external sources reject
 names immediately. `dispatcher.hasExecutor/hasPolicy` inspect the actual live registrations.
 The assembly root's dispatcher decorator applies receiver `executorConfig` and attachment
 materialization uniformly, including external executors; original signed attachments remain
-unchanged. Dispose each registration with `ctx.effect` when unloading the plugin.
+unchanged. `ExecutionContext.signedEnvelopes` preserves the original signed envelopes by ID
+before receiver payload projection. Executors that persist mailbox work pass this map through
+`MailboxEnqueueOptions.signedEnvelopes`: each item stores its execution `envelope` and optional
+original `signedEnvelope` separately. Recovery authenticates `signedEnvelope` when present,
+otherwise the legacy `envelope`, without removing or interpreting projected payload fields.
+Dispose each registration with `ctx.effect` when unloading the plugin.
 
 Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
 pinning; these decisions stay with the host plugin rather than the core mailbox.

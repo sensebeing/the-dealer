@@ -1083,7 +1083,9 @@ export class DealerNodeRuntime {
   private wrapExecutorWithAttachments(executor: ExecutorPlugin<any>): ExecutorPlugin<any> {
     return { ...executor, execute: async (batch, context, config) => {
       const local = [];
+      const signedEnvelopes: Record<string, MessageEnvelope> = { ...(context.signedEnvelopes ?? {}) };
       for (const envelope of batch) {
+        signedEnvelopes[envelope.id] ??= structuredClone(envelope);
         const directory = join(this.stateDir, 'attachments', encodeURIComponent(envelope.id));
         const files: string[] = [];
         for (const [index, attachment] of envelope.attachments.entries()) {
@@ -1095,7 +1097,7 @@ export class DealerNodeRuntime {
         const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload) ? envelope.payload : {};
         local.push({ ...envelope, payload: { ...payload, localAttachments: files } });
       }
-      return executor.execute(local, context, { ...config, ...this.config.executorConfig[executor.name] });
+      return executor.execute(local, { ...context, signedEnvelopes }, { ...config, ...this.config.executorConfig[executor.name] });
     } };
   }
 

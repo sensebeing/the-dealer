@@ -963,7 +963,8 @@ test('Phase 4: both DND crash windows park the signed obligation across restart 
     await restarted.gate.evaluate(newer);
     await restarted.gate.setMode('open');
     assert.equal(restarted.gate.listDndQueue().length, 0);
-    assert.deepEqual(restarted.mailbox.list().items[0].envelope, newer);
+    assert.deepEqual(restarted.mailbox.list().items[0].signedEnvelope, newer);
+    assert.deepEqual(restarted.mailbox.list().items[0].envelope.payload.localAttachments, []);
     await restarted.stop();
   }
 });
@@ -991,9 +992,9 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
     }
     if (evidence.startsWith('materialized')) {
       runtime.mailbox.enqueue([{ ...message,
-        body: evidence === 'materialized-tampered-mailbox' ? 'tampered' : message.body,
         payload: { ...message.payload, localAttachments: [join(root, 'claim.txt')] },
-      }]);
+      }], { signedEnvelopes: { [message.id]: evidence === 'materialized-tampered-mailbox'
+        ? { ...message, body: 'tampered' } : message } });
     }
     if (evidence === 'dnd' || evidence === 'parked') await runtime.gate.evaluate(message);
     const stateDir = runtime.stateDir;
@@ -1092,7 +1093,8 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.deepEqual(restarted.gate.listDndQueue(), []);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
   assert.equal(restarted.mailbox.list().totalCount, 1);
-  assert.deepEqual(restarted.mailbox.list().items[0].envelope, queued.envelope);
+  assert.deepEqual(restarted.mailbox.list().items[0].signedEnvelope, queued.envelope);
+  assert.deepEqual(restarted.mailbox.list().items[0].envelope.payload.localAttachments, []);
 });
 
 test('external project executors and policies share configuration, attachments and lifecycle with builtins', async t => {
@@ -1174,9 +1176,9 @@ test('external project executors and policies share configuration, attachments a
   assert.equal(inboxForged.receipts[0].stage, 'dispatched');
   const persisted = bob.mailbox.listItemsAfterSequence(-1).find(item => item.id === inboxForged.messageId)!;
   assert.ok(persisted);
-  assert.equal(persisted.envelope.payload.localAttachments, undefined);
+  assert.deepEqual(persisted.envelope.payload.localAttachments, []);
   const savedMailbox = JSON.parse(readFileSync(join(bob.stateDir, 'mailbox.json'), 'utf8'));
-  assert.equal(savedMailbox.items.find(item => item.id === inboxForged.messageId).envelope.payload.localAttachments, undefined);
+  assert.deepEqual(savedMailbox.items.find(item => item.id === inboxForged.messageId).envelope.payload.localAttachments, []);
   const dispatcher = bob.kernel.getService('dispatcher');
   assert.equal(dispatcher.hasExecutor('custom-exec'), true);
   assert.equal(dispatcher.hasPolicy('custom-policy'), true);
@@ -1256,4 +1258,35 @@ test('startup script dispatch waits for external executors and policies before m
   await runtime.start();
   const events = readFileSync(join(runtime.stateDir, 'startup-events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(events, [['policy', 'first startup message'], ['executor', 'first startup message']]);
+});
+
+
+test('a sender-signed empty attachment array remains authentic across mailbox and runtime restart', async t => {
+  const root = directory(t);
+  const runtime = await node(t, root, 'signed-empty', {
+    patch: { defaultExecutor: 'inbox', policies: ['dedup-cas'] },
+  });
+  const keys = generateNodeKeyPair();
+  const message = signEnvelope({
+    id: 'signed-empty', traceId: 'signed-empty', networkId: 'local',
+    from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' },
+    routing: { mode: 'unicast' }, kind: 'claim', subject: 'signed empty paths', body: 'original',
+    payload: { claimVersion: 2, localAttachments: [] }, attachments: [],
+    priority: 'normal', createdAt: new Date().toISOString(),
+  }, keys.privateKeyPem);
+  const receipt = await runtime.kernel.getService('dispatcher').dispatch(message);
+  assert.equal(receipt.stage, 'dispatched');
+  const item = runtime.mailbox.list().items[0];
+  assert.deepEqual(item.signedEnvelope, message);
+  assert.deepEqual(item.envelope.payload.localAttachments, []);
+  assert.equal(runtime.mailbox.hasConfirmedEnvelope('local', keys.nodeId, message.id, 2), true);
+  const stateDir = runtime.stateDir;
+  await runtime.stop();
+  const key = JSON.stringify(['local', keys.nodeId, message.id]);
+  writeFileSync(join(stateDir, 'dedup-watermarks.json'), JSON.stringify({ [key]: 2 }));
+  const restored = await new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'mesh') } }).start();
+  t.after(() => restored.stop());
+  assert.deepEqual(restored.mailbox.list().items[0].signedEnvelope, message);
+  assert.equal(restored.mailbox.hasConfirmedEnvelope('local', keys.nodeId, message.id, 2), true);
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'dedup-watermarks.json'), 'utf8'))[key], { revision: 2, status: 'settled' });
 });

@@ -594,6 +594,25 @@ test('invalid mailbox or legacy files fail loudly and locks are released', t => 
   writeFileSync(path, '{"schema":"the-dealer-mailbox/v1","sequence":0,"items":[]}');
   assert.equal(store.list().totalCount, 0);
 
+  const original = envelope('signed');
+  const projected = { ...original, body: 'execution projection' };
+  store.enqueue([projected], { signedEnvelopes: { signed: original } });
+  original.body = 'changed after enqueue';
+  assert.equal(new MailboxStore(path).list().items[0].signedEnvelope?.body, 'body');
+  const valid = readFileSync(path, 'utf8');
+  for (const signedEnvelope of [{ ...envelope('signed'), payload: null }, envelope('wrong-id')]) {
+    const saved = JSON.parse(valid);
+    saved.items[0].signedEnvelope = signedEnvelope;
+    writeFileSync(path, JSON.stringify(saved));
+    assert.throws(() => new MailboxStore(path).list(), /Invalid mailbox store/);
+  }
+  writeFileSync(path, valid);
+  assert.throws(() => store.enqueue([envelope('other')], {
+    signedEnvelopes: { other: envelope('mismatched') },
+  }), /Invalid mailbox store/);
+  assert.equal(readFileSync(path, 'utf8'), valid, 'invalid provenance must not mutate the ledger');
+  assert.equal(existsSync(`${path}.lock`), false);
+
   const badLegacy = join(root, 'bad-inbox.json');
   writeFileSync(badLegacy, '{');
   assert.throws(

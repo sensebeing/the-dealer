@@ -85,7 +85,8 @@ test('topic binding routes signed messages and control frames consistently with 
   assert.equal(items.length, 4);
   for (const item of items) {
     assert.equal(item.mailboxId, 'stream:requests');
-    assert.ok(verifyEnvelope(item.envelope));
+    assert.ok(verifyEnvelope(item.signedEnvelope!));
+    assert.deepEqual(item.envelope.payload.localAttachments, []);
     assert.equal(item.envelope.semantic?.replyMailbox, 'stream:requests');
     assert.equal(item.envelope.payload.executor, undefined);
   }
@@ -372,7 +373,9 @@ test('control frames cannot override inbox using an explicit spawn executor', as
   await runtime.emitter.emit({ networkId: 'local', routing: { mode: 'unicast', targets: ['member:alice'] }, kind: 'request', subject: 'Question', body: 'Help',
     payload: { executor: 'orca-spawn' }, semantic: { type: 'question', targetMailbox: 'default' } });
   assert.equal(runtime.mailbox.listItemsAfterSequence(-1)[0].mailboxId, 'stream:fixed');
-  assert.ok(verifyEnvelope(runtime.mailbox.listItemsAfterSequence(-1)[0].envelope));
+  const item = runtime.mailbox.listItemsAfterSequence(-1)[0];
+  assert.ok(verifyEnvelope(item.signedEnvelope!));
+  assert.deepEqual(item.envelope.payload.localAttachments, []);
 });
 
 test('native bootstrap stores canonical path and blocks newborn TUI until authoritative idle', async t => {
