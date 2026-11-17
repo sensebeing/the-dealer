@@ -26,7 +26,7 @@ import type {
   WakeTargetMode,
   WakeTargetState,
 } from './store.ts';
-import { normalizeMailboxId } from './store.ts';
+import { normalizeMailboxId, wakeupBackoffDelay } from './store.ts';
 import type { AgentConversationMode } from '../agent-host/index.ts';
 
 export interface WakeupRedriveOptions {
@@ -60,8 +60,6 @@ export interface WakeupMailboxOptions {
 }
 
 const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
-const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
-const MAX_BACKOFF_MS = 10_000;
 const MAX_INLINE_BODY_CHARS = 400;
 
 /** Idle verdict plus the delivery plan it was measured against. */
@@ -191,16 +189,7 @@ function buildPointerBody(
   );
 }
 
-/** Exponential busy-backoff: 1s -> 2s -> 5s -> capped at 10s. */
-export function wakeupBackoffDelay(attemptCount: number): number {
-  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) {
-    throw new Error('Invalid wake attempt count');
-  }
-  if (attemptCount <= DEFAULT_BACKOFF_MS.length) {
-    return DEFAULT_BACKOFF_MS[attemptCount - 1] ?? MAX_BACKOFF_MS;
-  }
-  return MAX_BACKOFF_MS;
-}
+export { wakeupBackoffDelay } from './store.ts';
 
 /**
  * Record a pre-effect failure: the external boundary was never crossed, so the target stays
@@ -266,10 +255,8 @@ export async function launchFencedOrcaWorkspaceTerminal(
     return { ...launched, ...settled };
   } catch (error) {
     if (error instanceof CommandNotStartedError || error instanceof OrcaTerminalLaunchRejectedError) {
-      const attemptCount = (store.getWakeTarget(mailboxId)?.attemptCount ?? 0) + 1;
-      store.settleWakeLaunchFailure(mailboxId, expectedRevision, {
-        attemptCount, earliestWakeAt: (options.now ?? Date.now()) + wakeupBackoffDelay(attemptCount), lastWakeError: String(error),
-      });
+      const deferred = store.deferWakeAttempt(mailboxId, expectedRevision, error, options.now);
+      if (deferred.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     } else {
       store.parkWakeDelivery(mailboxId, error);
     }
@@ -283,12 +270,15 @@ export function settleWakeDeliveryFailure(
   mailboxId: string,
   error: unknown,
   now = Date.now(),
-): void {
+  expectedRevision?: number,
+): boolean {
   if (error instanceof CommandNotStartedError) {
-    recordWakeFailure(store, mailboxId, error, now);
-    return;
+    if (expectedRevision !== undefined) return store.deferWakeAttempt(mailboxId, expectedRevision, error, now).superseded;
+    else recordWakeFailure(store, mailboxId, error, now);
+    return false;
   }
   store.parkWakeDelivery(mailboxId, error);
+  return false;
 }
 
 /**
@@ -304,8 +294,10 @@ export async function deliverPassiveWakeTarget(
 ): Promise<{ pointer: string; stdout: string; stderr?: string }> {
   const now = options.now ?? Date.now();
   let deliveryBegun = false;
+  let expectedRevision = 0;
   try {
     const target = store.getWakeTarget(mailboxId);
+    expectedRevision = target?.bindingRevision ?? 0;
     if (!target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
     const preview = store.check({ mailboxId, peek: true });
     const pointer = buildWakeupPointer(mailboxId, target, preview);
@@ -317,20 +309,26 @@ export async function deliverPassiveWakeTarget(
       command: target.interactiveCommand, agentProfile: target.agentProfile,
       targetBot: target.targetBot, sessionId: target.sessionId,
     });
-    store.beginWakeDelivery(mailboxId);
+    const fenced = store.beginWakeDelivery(mailboxId, expectedRevision);
+    if (!fenced) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     deliveryBegun = true;
     const output = await checkedCommand(runner, { ...invocation, cwd: target.workspacePath, signal: options.signal });
-    store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview),
-      resolveAgentHostContinuation(target.hostAgent, mailboxId, target.sessionId, output.stdout, target.conversationMode ?? 'fixed'));
+    const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview),
+      resolveAgentHostContinuation(target.hostAgent, mailboxId, target.sessionId, output.stdout, target.conversationMode ?? 'fixed'), fenced.bindingRevision ?? expectedRevision);
+    if (completed.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     return { pointer, stdout: output.stdout, stderr: output.stderr };
   } catch (error) {
     const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
     if (fenced) {
       // A pre-existing fence refuses the attempt before the boundary; it keeps the original
       // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
-      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now);
+      if (deliveryBegun && settleWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision)) {
+        throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
+      }
     } else {
-      recordWakeFailure(store, mailboxId, error, now);
+      if (!(error instanceof SettledWakeLaunchError) && store.deferWakeAttempt(mailboxId, expectedRevision, error, now).superseded) {
+        throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
+      }
     }
     throw error;
   }
@@ -349,36 +347,40 @@ export async function deliverSpawnedOrcaTerminalWakeup(
 ): Promise<{ pointer?: string; terminalHandle?: string; sent: boolean }> {
   const now = options.now ?? Date.now();
   let deliveryBegun = false;
+  let expectedRevision = 0;
   try {
     const target = store.getWakeTarget(mailboxId);
+    expectedRevision = target?.bindingRevision ?? 0;
     if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
     const command = target.orcaCommand ?? 'orca';
     const preview = store.check({ mailboxId, peek: true });
     const idle = await waitOrcaTerminalIdle(runner, command, target.terminalHandle, target.workspacePath, 5000, options.signal);
     if (!idle.idle) {
-      store.upsertWakeTarget(mailboxId, { pendingWake: true, terminalHandle: target.terminalHandle });
+      store.retainPendingWakeIfCurrent(mailboxId, expectedRevision);
       return { terminalHandle: target.terminalHandle, sent: false };
     }
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) {
-      store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), { terminalHandle: target.terminalHandle });
+      store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, expectedRevision);
       return { terminalHandle: target.terminalHandle, sent: false };
     }
-    if (!store.beginWakeDelivery(mailboxId, target.bindingRevision ?? 0)) return { terminalHandle: target.terminalHandle, sent: false };
+    const fenced = store.beginWakeDelivery(mailboxId, expectedRevision);
+    if (!fenced) return { terminalHandle: target.terminalHandle, sent: false };
     deliveryBegun = true;
     await sendOrcaTerminalText(runner, command, target.terminalHandle, pointer, {
       cwd: target.workspacePath, signal: options.signal, waitSubmit: 5,
     });
-    store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), { terminalHandle: target.terminalHandle });
+    const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, fenced.bindingRevision ?? expectedRevision);
+    if (completed.superseded) return { pointer, terminalHandle: target.terminalHandle, sent: false };
     return { pointer, terminalHandle: target.terminalHandle, sent: true };
   } catch (error) {
     const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
     if (fenced) {
       // A pre-existing fence refuses the attempt before the boundary; it keeps the original
       // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
-      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now);
+      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
     } else {
-      recordWakeFailure(store, mailboxId, error, now);
+      if (!(error instanceof SettledWakeLaunchError)) store.deferWakeAttempt(mailboxId, expectedRevision, error, now);
     }
     throw error;
   }
@@ -567,11 +569,13 @@ export class WakeupRedriveService {
     force: boolean,
   ): Promise<WakeupFlushResult> {
     let target: WakeTargetState | undefined;
+    let activeRevision = 0;
     try {
       target = this.store.getWakeTarget(mailboxId);
       if (!target) {
         return noWake(mailboxId, 'passive', 'No wake target');
       }
+      activeRevision = target.bindingRevision ?? 0;
       if (target.deliveryInDoubt) {
         return noWake(mailboxId, target.mode, target.lastWakeError ?? 'Wake delivery requires reconciliation');
       }
@@ -618,7 +622,7 @@ export class WakeupRedriveService {
         } catch (error) {
           // The delivery helper owns its own settlement; re-settling here would double the backoff.
           this.report(error);
-          return noWake(mailboxId, target.mode, String(error));
+          return noWake(mailboxId, target.mode, error instanceof SettledWakeLaunchError ? error.message : String(error));
         }
       }
       if (!this.idleCheck && target.mode === 'orca-terminal' && target.workspacePath && target.autoCreateWorkspace === true) {
@@ -626,7 +630,10 @@ export class WakeupRedriveService {
           workspacePath: target.workspacePath, repoRoot: target.repoRoot, comment: target.workspaceComment,
         });
         if (workspace.workspacePath !== target.workspacePath) {
-          target = this.store.upsertWakeTarget(mailboxId, { workspacePath: workspace.workspacePath });
+          const updated = this.store.updateWakeWorkspaceIfCurrent(mailboxId, activeRevision, workspace.workspacePath);
+          if (updated.superseded) return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
+          target = updated.target;
+          activeRevision = target.bindingRevision ?? 0;
         }
       }
       const idle = await this.authoritativeIdle(mailboxId, target, preview);
@@ -640,15 +647,11 @@ export class WakeupRedriveService {
           target.workspacePath &&
           !existsSync(target.workspacePath)
         ) {
-          this.store.upsertWakeTarget(mailboxId, {
-            pendingWake: false,
-            attemptCount: 0,
-            earliestWakeAt: 0,
-            lastWakeError: undefined,
-          });
+          const disarmed = this.store.disarmWakeTargetIfCurrent(mailboxId, activeRevision);
+          if (disarmed.superseded) return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
           return noWake(mailboxId, target.mode, 'Workspace not found');
         }
-        return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
+        return this.defer(mailboxId, target.mode, activeRevision, idle.reason ?? 'Workspace is busy');
       }
       return await this.deliver(
         mailboxId,
@@ -656,22 +659,24 @@ export class WakeupRedriveService {
         preview,
         idle.composerPrefilled === true,
         idle.spawnFreshSession === true,
+        revision => { activeRevision = revision; },
       );
     } catch (error) {
       this.report(error);
       if (!target) {
         return noWake(mailboxId, 'passive', String(error));
       }
-      if (error instanceof SettledWakeLaunchError) return noWake(mailboxId, target.mode, String(error));
+      if (error instanceof SettledWakeLaunchError) return noWake(mailboxId, target.mode, error.message);
       try {
         // A rotation may already have persisted a replacement tab before this attempt failed;
-        // defer against the authoritative store state so the retry targets the same tab.
+        // settle against that attempt's revision without modifying a newer caller binding.
         const current = this.store.getWakeTarget(mailboxId);
         if (current?.deliveryInDoubt) {
-          settleWakeDeliveryFailure(this.store, mailboxId, error, this.now());
+          const superseded = settleWakeDeliveryFailure(this.store, mailboxId, error, this.now(), activeRevision);
+          if (superseded) return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
           return noWake(mailboxId, target.mode, String(error));
         }
-        return this.defer(mailboxId, current ?? target, String(error));
+        return this.defer(mailboxId, target.mode, activeRevision, String(error));
       } catch (settleError) {
         this.report(settleError);
         return noWake(mailboxId, target.mode, String(error));
@@ -758,19 +763,9 @@ export class WakeupRedriveService {
     return withPlan({ idle: false, reason: 'Authoritative terminal idle check required' });
   }
 
-  private defer(
-    mailboxId: string,
-    target: WakeTargetState,
-    reason: string,
-  ): WakeupFlushResult {
-    recordWakeFailure(
-      this.store,
-      mailboxId,
-      reason,
-      this.now(),
-      target.terminalHandle !== undefined ? { terminalHandle: target.terminalHandle } : {},
-    );
-    return noWake(mailboxId, target.mode, reason);
+  private defer(mailboxId: string, mode: WakeTargetMode, expectedRevision: number, reason: string): WakeupFlushResult {
+    const result = this.store.deferWakeAttempt(mailboxId, expectedRevision, reason, this.now());
+    return noWake(mailboxId, mode, result.superseded ? 'Wake launch superseded by a newer binding' : reason);
   }
 
   /**
@@ -811,9 +806,11 @@ export class WakeupRedriveService {
     preview: MailboxCheckResult,
     composerPrefilled: boolean,
     freshSession: boolean,
+    setActiveRevision: (revision: number) => void,
   ): Promise<WakeupFlushResult> {
     const command = target.orcaCommand ?? this.command;
-    const expectedRevision = target.bindingRevision ?? 0;
+    let activeRevision = target.bindingRevision ?? 0;
+    let reboundPatch: Partial<WakeTargetState> = {};
     let terminalHandle = target.terminalHandle;
     const needsRotation = needsSessionRotation(target, preview);
     const spawnFreshSession = !needsRotation && freshSession;
@@ -834,23 +831,25 @@ export class WakeupRedriveService {
       const workspacePath = target.workspacePath;
       const spawned = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
         command, workspacePath, agent: target.agent, interactiveCommand: target.interactiveCommand, resumeCommand: readOrcaSessionBinding(target.adapterState, mailboxId).resumeCommand,
-        now: this.now(), resetCompletedWaves: needsRotation, sessionId: target.sessionId, expectedRevision,
+        now: this.now(), resetCompletedWaves: needsRotation, sessionId: target.sessionId, expectedRevision: activeRevision,
       });
       if (!spawned.committed) return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
       terminalHandle = spawned.handle;
       target = spawned.target;
+      activeRevision = target.bindingRevision ?? 0;
+      setActiveRevision(activeRevision);
       composerPrefilled = false;
       rotated = needsRotation;
       const idle = await this.waitFreshTabIdle(target, terminalHandle, command);
       if (!idle.idle) {
         const deferred = this.defer(
           mailboxId,
-          target,
+          target.mode, activeRevision,
           needsRotation
             ? 'Session rotated; waiting for tui-idle before wakeup'
             : 'Terminal spawned; waiting for tui-idle before wakeup',
         );
-        return needsRotation ? { ...deferred, rotated: true } : deferred;
+        return needsRotation && deferred.reason !== 'Wake launch superseded by a newer binding' ? { ...deferred, rotated: true } : deferred;
       }
     } else if ((!terminalHandle || !this.idleCheck) && target.workspacePath && target.mode === 'orca-terminal') {
       // Real Orca mode re-resolves before every send so a terminal closed since the last delivery
@@ -863,27 +862,30 @@ export class WakeupRedriveService {
       });
       if (plan.kind === 'existing') {
         terminalHandle = plan.handle;
-        target = { ...target, terminalHandle };
+        reboundPatch = plan.handle !== target.terminalHandle ? { terminalHandle: plan.handle } : {};
       } else {
         const launched = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
           command, workspacePath: target.workspacePath, agent: target.agent,
-          interactiveCommand: target.interactiveCommand, resumeCommand: readOrcaSessionBinding(target.adapterState, mailboxId).resumeCommand, now: this.now(), sessionId: target.sessionId, expectedRevision,
+          interactiveCommand: target.interactiveCommand, resumeCommand: readOrcaSessionBinding(target.adapterState, mailboxId).resumeCommand, now: this.now(), sessionId: target.sessionId, expectedRevision: activeRevision,
           ...(plan.kind === 'shell' ? { shellTerminalHandle: plan.handle } : {}),
         });
         if (!launched.committed) return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
         terminalHandle = launched.handle;
         target = launched.target;
+        activeRevision = target.bindingRevision ?? 0;
+        setActiveRevision(activeRevision);
         if (plan.kind === 'shell') {
-          return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
+          return this.defer(mailboxId, target.mode, activeRevision, 'Terminal spawned; waiting for tui-idle before wakeup');
         }
         const idle = this.idleCheck ? await this.idleCheck() : await waitOrcaTerminalIdle(this.runner, command, terminalHandle, target.workspacePath, 5000);
-        if (!idle.idle) return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
+        if (!idle.idle) return this.defer(mailboxId, target.mode, activeRevision, 'Terminal spawned; waiting for tui-idle before wakeup');
       }
     }
 
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) {
-      this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview));
+      const completed = this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, activeRevision);
+      if (completed.superseded) return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
       return noWake(mailboxId, target.mode, 'Nothing new to deliver');
     }
 
@@ -891,9 +893,12 @@ export class WakeupRedriveService {
     if (target.mode === 'orca-terminal' && !terminalHandle) throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
     // The pointer is the only external effect left; fence it so a crash or an unconfirmed send
     // stays parked instead of being replayed by the next tick or restart.
-    if (!this.store.beginWakeDelivery(mailboxId, target.bindingRevision ?? 0)) {
+    const fencedSend = this.store.beginWakeDelivery(mailboxId, activeRevision);
+    if (!fencedSend) {
       return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
     }
+    activeRevision = fencedSend.bindingRevision ?? activeRevision;
+    setActiveRevision(activeRevision);
     if (target.mode === 'orca-run') {
       const output = await this.runner({
         command,
@@ -945,7 +950,8 @@ export class WakeupRedriveService {
       }
     }
 
-    this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), terminalHandle ? { terminalHandle } : {});
+    const completed = this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), reboundPatch, activeRevision);
+    if (completed.superseded) return noWake(mailboxId, target.mode, 'Wake launch superseded by a newer binding');
     return {
       mailboxId,
       mode: target.mode,

@@ -24,6 +24,8 @@ import {
   verifyEnvelope,
   settleWakeDeliveryFailure,
   launchFencedOrcaWorkspaceTerminal,
+  deliverSpawnedOrcaTerminalWakeup,
+  deliverPassiveWakeTarget,
 } from '../packages/index.ts';
 import type {
   CommandRequest,
@@ -3130,4 +3132,114 @@ test('generic adapter state drives binding CAS without retry metadata or key-ord
   assert.equal(result.committed, false);
   assert.deepEqual(result.target.adapterState, { pane: 'new' });
   assert.equal(result.target.deliveryInDoubt, undefined);
+});
+
+for (const path of ['fresh-busy', 'redrive-send', 'spawned-busy', 'spawned-send'] as const) {
+  test(`post-await ${path} settlement preserves a newer caller binding`, async t => {
+    const root = directory(t);
+    const mailboxId = 'stream:post-await';
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const fresh = path === 'fresh-busy';
+    const busy = path.endsWith('busy');
+    const spawned = path.startsWith('spawned');
+    const { runner, state } = fakeOrcaWorkspace(root, fresh ? [] : [{
+      handle: 'term-A', connected: true, writable: true, agentIdentity: 'claude', preview: '',
+    }]);
+    store.enqueue([alert('post-await')], { mailboxId, wakeTarget: {
+      mode: 'orca-terminal', workspacePath: root, terminalHandle: 'term-A',
+      agent: 'claude', sessionId: 'A', coalesceMs: 0,
+    } });
+    let entered!: () => void;
+    let release!: () => void;
+    const suspended = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let intercepted = false;
+    const controlledRunner: CommandRunner = async request => {
+      if (!intercepted && request.args[0] === 'terminal' && request.args[1] === (busy ? 'wait' : 'send')) {
+        intercepted = true;
+        entered();
+        await held;
+        if (busy) return { stdout: '{"ok":false}' };
+      }
+      return runner(request);
+    };
+    const service = new WakeupRedriveService({ store, commandRunner: controlledRunner });
+    t.after(() => service.stop());
+    const pending = spawned
+      ? deliverSpawnedOrcaTerminalWakeup(store, controlledRunner, mailboxId)
+      : service.flushMailbox(mailboxId, { force: true });
+    await suspended;
+    // Hold automatic redrive only while inspecting the atomic settlement result.
+    const claim = service.claim(mailboxId);
+    state.terminals.push({ handle: 'term-B', connected: true, writable: true, agentIdentity: 'claude', preview: '' });
+    store.upsertWakeTarget(mailboxId, resolveCallerOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
+      terminalHandle: 'term-B', sessionId: 'B', paneKey: 'pane-B', agent: 'claude',
+    }));
+    release();
+    const result = await pending;
+    if (spawned) assert.equal((result as { sent: boolean }).sent, false);
+    else assert.equal((result as { reason?: string }).reason, 'Wake launch superseded by a newer binding');
+    const current = store.getWakeTarget(mailboxId)!;
+    assert.equal(current.terminalHandle, 'term-B');
+    assert.equal(current.sessionId, 'B');
+    assert.equal(sessionBinding(current).paneKey, 'pane-B');
+    assert.equal(current.pendingWake, true);
+    assert.equal(current.attemptCount, 0);
+    assert.equal(current.earliestWakeAt, 0);
+    if (busy) assert.equal(terminalSends(state.calls).length, 0);
+    claim.dispose();
+    service.notifyMailbox(mailboxId);
+    await until(() => sendsTo(state.calls, 'term-B').length === 1, 'new binding receives the pending pointer');
+    assert.equal(store.getWakeTarget(mailboxId)!.terminalHandle, 'term-B');
+    assert.equal(sendsTo(state.calls, 'term-new-1').length, 0);
+  });
+}
+
+test('passive host completion cannot install continuation over a newer binding', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const mailboxId = 'stream:passive-cas';
+  store.enqueue([alert('passive-cas')], { mailboxId, wakeTarget: {
+    mode: 'passive', hostAgent: 'claude', conversationMode: 'fixed', sessionId: 'A', coalesceMs: 0,
+  } });
+  let entered!: () => void;
+  let release!: () => void;
+  const suspended = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const delivery = deliverPassiveWakeTarget(store, async () => {
+    entered();
+    await held;
+    return { stdout: '{}' };
+  }, mailboxId);
+  await suspended;
+  store.upsertWakeTarget(mailboxId, { sessionId: 'B' });
+  release();
+  await assert.rejects(delivery, /superseded by a newer binding/);
+  const target = store.getWakeTarget(mailboxId)!;
+  assert.equal(target.sessionId, 'B');
+  assert.equal(target.pendingWake, true);
+  assert.equal(target.deliveryInDoubt, undefined);
+  assert.equal(target.attemptCount, 0);
+});
+
+test('stale workspace discovery and missing-workspace disarm preserve the replacement target', t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const mailboxId = 'stream:workspace-cas';
+  const original = store.upsertWakeTarget(mailboxId, {
+    mode: 'orca-terminal', workspacePath: '/old', terminalHandle: 'term-A', sessionId: 'A',
+  });
+  const replacement = store.upsertWakeTarget(mailboxId, {
+    workspacePath: '/new', terminalHandle: 'term-B', sessionId: 'B', pendingWake: true,
+  });
+  const discovered = store.updateWakeWorkspaceIfCurrent(mailboxId, original.bindingRevision!, '/discovered-old');
+  assert.equal(discovered.superseded, true);
+  assert.deepEqual(discovered.target, replacement);
+  const disarmed = store.disarmWakeTargetIfCurrent(mailboxId, original.bindingRevision!);
+  assert.equal(disarmed.superseded, true);
+  assert.equal(disarmed.target.pendingWake, true);
+  assert.equal(disarmed.target.workspacePath, '/new');
+  assert.equal(disarmed.target.terminalHandle, 'term-B');
+  const deferred = store.deferWakeAttempt(mailboxId, original.bindingRevision!, 'old discovery failed');
+  assert.equal(deferred.superseded, true);
+  assert.equal(deferred.target.attemptCount, 0);
+  assert.equal(deferred.target.lastWakeError, undefined);
 });

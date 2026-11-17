@@ -60,6 +60,20 @@ export interface MailboxStateRecord {
 
 export type WakeTargetMode = 'passive' | 'orca-run' | 'orca-terminal';
 
+const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000] as const;
+const MAX_BACKOFF_MS = 10_000;
+
+/** Exponential busy-backoff: 1s -> 2s -> 5s -> capped at 10s. */
+export function wakeupBackoffDelay(attemptCount: number): number {
+  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) {
+    throw new Error('Invalid wake attempt count');
+  }
+  if (attemptCount <= DEFAULT_BACKOFF_MS.length) {
+    return DEFAULT_BACKOFF_MS[attemptCount - 1] ?? MAX_BACKOFF_MS;
+  }
+  return MAX_BACKOFF_MS;
+}
+
 export interface WakeTargetState {
   readonly hostAgent?: 'codex' | 'claude' | 'claude-code' | 'antigravity' | 'chatgpt-dot' | 'grok-bot';
   readonly conversationMode?: ActiveConversationMode;
@@ -1521,20 +1535,64 @@ export class MailboxStore {
     return result;
   }
 
-  /** Settle a confirmed pre-effect failure without backing off a superseding binding. */
-  settleWakeLaunchFailure(mailboxId: string, expectedRevision: number, failure: Partial<WakeTargetState>): WakeTargetState {
+  /** Settle a retryable attempt only against the binding that authorized it. */
+  deferWakeAttempt(mailboxId: string, expectedRevision: number, error: unknown, now = Date.now()): { superseded: boolean; target: WakeTargetState } {
     const id = normalizeMailboxId(mailboxId);
-    let superseded = false;
-    const target = this.mutate(state => {
+    const result = this.mutate(state => {
       const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
-      superseded = (current.bindingRevision ?? 0) !== expectedRevision;
-      const patch = superseded ? { attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined } : failure;
-      const next = validateWakeTarget(mergeWakeTarget(current, { ...patch, pendingWake: true, deliveryInDoubt: undefined }));
+      const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+      const attemptCount = superseded ? 0 : current.attemptCount + 1;
+      const next = validateWakeTarget(mergeWakeTarget(current, {
+        pendingWake: true, deliveryInDoubt: undefined, attemptCount,
+        earliestWakeAt: superseded ? 0 : now + wakeupBackoffDelay(attemptCount),
+        lastWakeError: superseded ? undefined : String(error),
+      }));
       state.wakeTargets[id] = next;
-      return structuredClone(next);
+      return { superseded, target: structuredClone(next) };
     });
-    if (superseded) this.events.emit('target', id);
-    return target;
+    if (result.superseded) this.events.emit('target', id);
+    return result;
+  }
+
+  retainPendingWakeIfCurrent(mailboxId: string, expectedRevision: number): WakeTargetState {
+    const id = normalizeMailboxId(mailboxId);
+    const next = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+      const target = validateWakeTarget(mergeWakeTarget(current, {
+        pendingWake: true, ...(superseded ? { attemptCount: 0, earliestWakeAt: 0 } : {}),
+      }));
+      state.wakeTargets[id] = target;
+      return structuredClone(target);
+    });
+    this.events.emit('target', id);
+    return next;
+  }
+
+  disarmWakeTargetIfCurrent(mailboxId: string, expectedRevision: number): { superseded: boolean; target: WakeTargetState } {
+    const id = normalizeMailboxId(mailboxId);
+    const result = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+      const next = validateWakeTarget(mergeWakeTarget(current, superseded ? { pendingWake: true } : {
+        pendingWake: false, attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined,
+      }));
+      state.wakeTargets[id] = next;
+      return { superseded, target: structuredClone(next) };
+    });
+    if (result.superseded) this.events.emit('target', id);
+    return result;
+  }
+
+  updateWakeWorkspaceIfCurrent(mailboxId: string, expectedRevision: number, workspacePath: string): { superseded: boolean; target: WakeTargetState } {
+    const id = normalizeMailboxId(mailboxId);
+    return this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      if ((current.bindingRevision ?? 0) !== expectedRevision) return { superseded: true, target: structuredClone(current) };
+      const next = validateWakeTarget(mergeWakeTarget(current, { workspacePath }));
+      state.wakeTargets[id] = next;
+      return { superseded: false, target: structuredClone(next) };
+    });
   }
 
   /** Keep an unconfirmed external outcome fenced; later mail, forced flushes and restarts never replay it. */
@@ -1556,7 +1614,8 @@ export class MailboxStore {
     mailboxId: string,
     deliveredSequence: number,
     patch: Partial<WakeTargetState> = {},
-  ): WakeTargetState {
+    expectedRevision?: number,
+  ): WakeTargetState & { superseded?: boolean } {
     const id = normalizeMailboxId(mailboxId);
     let pinnedWakeMailbox: string | undefined;
     const completed = this.mutate(state => {
@@ -1564,6 +1623,15 @@ export class MailboxStore {
         item.mailboxId === id && item.status === 'queued' && item.sequence > deliveredSequence,
       );
       const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) {
+        const hasQueued = state.items.some(item => item.mailboxId === id && item.status === 'queued');
+        const next = validateWakeTarget(mergeWakeTarget(current, {
+          deliveryInDoubt: undefined, lastWakeError: undefined,
+          pendingWake: Boolean(current.pendingWake || hasQueued), attemptCount: 0, earliestWakeAt: 0,
+        }));
+        state.wakeTargets[id] = next;
+        return Object.assign(structuredClone(next), { superseded: true });
+      }
       const next = validateWakeTarget(mergeWakeTarget(current, {
         ...patch, pendingWake, attemptCount: 0,
         earliestWakeAt: pendingWake ? current.earliestWakeAt : 0, lastWakeError: undefined,
