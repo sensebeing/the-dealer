@@ -5002,6 +5002,7 @@ test('keyed mixed multicast reconciles only the original failed sibling', async 
     assert.equal(recoveredResult.messageId, first.id);
     const item = harness.outbox.get(first.id)!;
     assert.equal(item.status, 'delivered');
+    assert.deepEqual(new Set(harness.mailbox.listThreadRecords(first.id)[0].peerNodeIds), new Set([diz, aya]));
     assert.deepEqual(item.failedNodeIds, []);
     assert.deepEqual(item.failedReceipts, {});
     assert.equal(harness.outbox.list({ status: 'all' }).length, 1);
@@ -5031,4 +5032,25 @@ test('signed interrupted dispatch evidence never becomes a durable outbox queue 
   assert.equal(item.failedReceipts[harness.targetCard.nodeId].stage, 'dispatching');
   assert.deepEqual(item.pendingNodeIds, []);
   assert.deepEqual(item.deliveredReceipts, {});
+});
+
+
+test('reconciliation returns a live pending receipt and retains the complete outbound route', async t => {
+  let pending = false;
+  const harness = await emitterHarness(t, { extraMembers: ['aya'], plan: target =>
+    target === harness.targetByMember.get('aya')!.nodeId
+      ? { stage: pending ? 'pending_approval' : 'rejected' } : {} });
+  const input: EmitMessageInput = { networkId: harness.networkId,
+    routing: { mode: 'multicast', targets: ['member:diz', 'member:aya'] }, kind: 'task',
+    subject: 'pending recovery', body: 'preserve observed evidence', payload: {}, idempotencyKey: 'pending-route' };
+  const first = await harness.emitter.emit(input);
+  pending = true;
+  const second = await harness.emitter.emit(input);
+  const aya = harness.targetByMember.get('aya')!.nodeId;
+  assert.equal(second.messageId, first.messageId);
+  assert.equal(second.receipts.find(r => r.fromNodeId === aya)?.stage, 'pending_approval');
+  assert.ok(second.receipts.some(r => r.executionReceipt?.executor === 'outbox'));
+  assert.deepEqual(new Set(harness.mailbox.listThreadRecords(first.messageId)[0].peerNodeIds),
+    new Set([harness.targetCard.nodeId, aya]));
+  assert.deepEqual(harness.sentEvents.at(-1)!.receipts, second.receipts);
 });

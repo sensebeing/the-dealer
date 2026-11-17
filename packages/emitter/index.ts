@@ -817,6 +817,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             spoolBlobHashes: Object.keys(existing.stagedFiles) },
         })));
         const deliveredReceipts: Record<string, DeliveryReceipt> = {};
+        const livePendingReceipts: Record<string, DeliveryReceipt> = {};
         const failedReceipts: Record<string, DeliveryReceipt> = {};
         const failedNodeIds: string[] = [];
         const pendingNodeIds: string[] = [];
@@ -836,6 +837,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             fatalError ??= attempt.error;
             lastError = attempt.error.message;
           } else {
+            if (attempt.receipt) livePendingReceipts[target] = attempt.receipt;
             const prior = existing.deliveredReceipts[target];
             if (isConfirmedHandoffReceipt(prior, { allowQueued: true })) deliveredReceipts[target] = prior;
             else {
@@ -851,9 +853,14 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           inDoubtNodeIds, relaySpooledNodeIds, ...(lastError !== undefined ? { lastError: fatalError?.message ?? lastError } : {}) });
         const receipts = updated.status === 'queued' ? replayObligation(updated).receipts
           : [...Object.values(updated.deliveredReceipts), ...Object.values(updated.failedReceipts)];
-        const committedTargets = targets.filter(target => deliveredReceipts[target] || pendingNodeIds.includes(target));
-        if (committedTargets.length > 0) {
-          ctx.emit('emitter/sent', { envelope: existing.envelope, targetNodeIds: committedTargets, receipts });
+        receipts.push(...Object.values(livePendingReceipts));
+        const newlyCommitted = targets.some(target => deliveredReceipts[target] !== undefined ||
+          livePendingReceipts[target] !== undefined || pendingNodeIds.includes(target));
+        if (newlyCommitted) {
+          const fullCommittedTargets = [...new Set([
+            ...Object.keys(updated.deliveredReceipts), ...Object.keys(livePendingReceipts), ...updated.pendingNodeIds,
+          ])];
+          ctx.emit('emitter/sent', { envelope: existing.envelope, targetNodeIds: fullCommittedTargets, receipts });
         }
         if (fatalError) throw Object.assign(fatalError, { receipts });
         return { messageId: updated.id, traceId: updated.envelope.traceId, receipts };
