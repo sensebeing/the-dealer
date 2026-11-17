@@ -14,6 +14,7 @@ import {
   MailboxStore,
   normalizeMailboxId,
   resolveMailboxId,
+  resolveBoundMailboxId,
 } from '../packages/index.ts';
 import type { MessageEnvelope } from '../packages/index.ts';
 
@@ -626,4 +627,16 @@ test('invalid mailbox or legacy files fail loudly and locks are released', t => 
     /Invalid inbox store/,
   );
   assert.equal(existsSync(badLegacy), true);
+});
+
+test('spawn bindings resolve inbound task identity without changing outbound bound mailboxes', () => {
+  // Thread reverse routes must name the same task mailbox the spawn executor commits.
+  for (const executor of ['orca-spawn', 'orca', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'agent-pty']) {
+    const binding = { executor, mode: 'spawn' as const };
+    const message = envelope('bound-spawn');
+    assert.equal(resolveMailboxId(message, executor, binding), 'task:bound-spawn', executor);
+    assert.equal(resolveBoundMailboxId(message.kind, binding), 'default', 'outbound binding has no stream reply mailbox');
+    assert.equal(resolveMailboxId(message, executor, { ...binding, mailboxId: 'explicit' }), 'explicit');
+    assert.equal(resolveMailboxId(message, executor, binding, 'task:existing'), 'task:existing');
+  }
 });

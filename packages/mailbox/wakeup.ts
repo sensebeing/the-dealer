@@ -572,7 +572,7 @@ export class WakeupRedriveService {
           target = this.store.upsertWakeTarget(mailboxId, { workspacePath: workspace.workspacePath });
         }
       }
-      const idle = await this.authoritativeIdle(target, preview);
+      const idle = await this.authoritativeIdle(mailboxId, target, preview);
       if (!idle.idle) {
         // A workspace whose directory is gone can never become idle again; retrying it forever
         // would only inflate the backoff ledger. The mail stays queued for a human or a rebind.
@@ -632,11 +632,12 @@ export class WakeupRedriveService {
    * independent session tab; a live bound tab keeps receiving the rest of its own wave.
    */
   private async spawnsFreshSession(
+    mailboxId: string,
     target: WakeTargetState,
     preview: MailboxCheckResult,
     command: string,
   ): Promise<boolean> {
-    if (target.mode !== 'orca-terminal' || target.rotateAfterWaves === undefined || !target.workspacePath) {
+    if (target.mode !== 'orca-terminal' || !target.workspacePath) {
       return false;
     }
     const workspacePath = target.workspacePath;
@@ -646,6 +647,8 @@ export class WakeupRedriveService {
     if (this.runner === runCommand && !this.idleCheck && !existsSync(workspacePath)) {
       return false;
     }
+    if (mailboxId.startsWith('task:') && !target.terminalHandle) return true;
+    if (target.rotateAfterWaves === undefined) return false;
     // Rotation always creates an empty tab, so the retained tab (draft or not) cannot gate it.
     if (needsSessionRotation(target, preview)) {
       return true;
@@ -664,11 +667,12 @@ export class WakeupRedriveService {
   }
 
   private async authoritativeIdle(
+    mailboxId: string,
     target: WakeTargetState,
     preview: MailboxCheckResult,
   ): Promise<WakeupIdleDecision> {
     const command = target.orcaCommand ?? this.command;
-    const spawnFreshSession = await this.spawnsFreshSession(target, preview, command);
+    const spawnFreshSession = await this.spawnsFreshSession(mailboxId, target, preview, command);
     const withPlan = (idle: OrcaIdleResult): WakeupIdleDecision =>
       spawnFreshSession ? { ...idle, spawnFreshSession: true } : idle;
     if (this.idleCheck) {

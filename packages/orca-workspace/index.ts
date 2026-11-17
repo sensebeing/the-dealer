@@ -45,6 +45,7 @@ export async function findOrcaWorktreeByName(
 
 /** Only the process boundary may prove that no external process was started. */
 export class CommandNotStartedError extends Error {
+  readonly beforeExternalEffect = true as const;
   constructor(cause: unknown) {
     super(`Command did not start: ${String(cause)}`, { cause });
     this.name = 'CommandNotStartedError';
