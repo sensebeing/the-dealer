@@ -88,7 +88,7 @@ export const runCommand: CommandRunner = request =>
     child.on('close', code =>
       code === 0
         ? resolve({ stdout, stderr, exitCode: code })
-        : reject(new Error(`${request.command} exited ${code}: ${(stderr || stdout).trim()}`)),
+        : reject(Object.assign(new Error(`${request.command} exited ${code}: ${(stderr || stdout).trim()}`), { stdout, stderr, exitCode: code })),
     );
     child.stdin.on('error', reject);
     child.stdin.end(request.input);
@@ -412,35 +412,56 @@ export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravi
  * Create an independent agent terminal tab in an Orca workspace. Session rotation and first-wave
  * delivery both use this so a retained conversation tab is never reset or written into.
  */
+export class OrcaTerminalLaunchRejectedError extends Error {}
+
 export async function spawnOrcaWorkspaceTerminal(
   runner: CommandRunner,
   command: string,
   cwd: string,
   signal?: AbortSignal,
   options: { agent?: SupportedOrcaAgent; interactiveCommand?: string } = {},
-): Promise<{ handle: string }> {
-  const targetAgent = options.agent ?? 'antigravity';
-  const launchCommand = options.interactiveCommand?.trim() || defaultAgentLaunchCommand(targetAgent);
-  const spawned = await checkedCommand(runner, {
-    command,
-    args: [
-      'terminal',
-      'create',
-      '--worktree',
-      `path:${cwd}`,
-      '--command',
-      launchCommand,
-      '--json',
-    ],
-    cwd,
-    signal,
-  });
-  const raw = JSON.parse(spawned.stdout);
-  const handle = raw.result?.terminal?.handle ?? raw.result?.handle;
-  if (handle === undefined || handle === null || handle === '') {
-    throw new Error('Orca terminal create returned no handle');
+): Promise<{ handle: string; raw: unknown }> {
+  const launchCommand = options.interactiveCommand?.trim() || defaultAgentLaunchCommand(options.agent);
+  let spawned;
+  try {
+    spawned = await runner({
+      command,
+      args: ['terminal', 'create', '--worktree', `path:${cwd}`, '--command', launchCommand, '--json'],
+      cwd, signal,
+    });
+  } catch (error) {
+    if (error instanceof CommandNotStartedError || error instanceof OrcaTerminalLaunchRejectedError) throw error;
+    const failure = error as { stdout?: unknown; exitCode?: unknown } | null;
+    if (typeof failure?.stdout === 'string' && failure.exitCode !== null) {
+      let parsed;
+      try {
+        parsed = JSON.parse(failure.stdout.trim());
+      } catch {
+        // Unparseable output cannot confirm refusal.
+      }
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.ok === false) {
+        throw new OrcaTerminalLaunchRejectedError(error instanceof Error ? error.message : String(error), { cause: error });
+      }
+    }
+    throw error;
   }
-  return { handle: String(handle) };
+  let parsed;
+  try {
+    parsed = JSON.parse(spawned.stdout.trim());
+  } catch {
+    // Classified below as an unknown outcome.
+  }
+  const record = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+  if (record && parsed.ok === false) {
+    throw new OrcaTerminalLaunchRejectedError(`${command} rejected terminal launch: ${(spawned.stderr || spawned.stdout).trim()}`);
+  }
+  if (spawned.exitCode !== undefined && spawned.exitCode !== 0) {
+    throw new Error(`${command} exited ${spawned.exitCode}: ${(spawned.stderr || spawned.stdout).trim()}`);
+  }
+  if (!record) throw new Error('Orca terminal create returned invalid JSON');
+  const handle = parsed.result?.terminal?.handle ?? parsed.result?.handle ?? parsed.handle;
+  if (typeof handle !== 'string' || !handle.trim()) throw new Error('Orca terminal create returned no handle');
+  return { handle: handle.trim(), raw: parsed };
 }
 
 /** A persisted handle is reusable only while Orca still reports it connected and writable. */
@@ -467,16 +488,15 @@ export async function isOrcaWorkspaceTerminalLive(
   return terminal !== undefined && terminal.connected === true && terminal.writable !== false;
 }
 
-/** Resolve the freshest connected target-agent terminal in an Orca workspace, spawning one if needed. */
-export async function resolveOrSpawnOrcaWorkspaceTerminal(
+/** Read-only terminal selection: callers must fence the returned launch plan before executing it. */
+export async function planOrcaWorkspaceTerminal(
   runner: CommandRunner,
   command: string,
   cwd: string,
   signal?: AbortSignal,
   options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string },
-): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
+): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
   const targetAgent = options?.agent ?? 'antigravity';
-  const launchCommand = options?.interactiveCommand?.trim() || defaultAgentLaunchCommand(targetAgent);
   const listed = await checkedCommand(runner, {
     command,
     args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
@@ -495,7 +515,7 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
     const bound = terminals.find(
       t => t && String(t.handle) === preferredHandle && t.connected && t.writable !== false,
     );
-    if (bound) return { handle: String(bound.handle), spawned: false };
+    if (bound) return { handle: String(bound.handle), kind: 'existing' };
   }
   const nonOrphanConnected = terminals.filter(
     t => t && t.orphaned !== true && t.connected && t.writable !== false,
@@ -510,21 +530,31 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
     (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
   )[0];
   const preferred = freshest(connected.filter(t => t.agentIdentity === targetAgent || (targetAgent === 'claude' && t.agentIdentity === 'claude-code')));
-  if (preferred) return { handle: String(preferred.handle), spawned: false };
+  if (preferred) return { handle: String(preferred.handle), kind: 'existing' };
   const agent = freshest(connected.filter(t => typeof t.agentIdentity === 'string' && t.agentIdentity.trim()));
-  if (agent) return { handle: String(agent.handle), spawned: false };
+  if (agent) return { handle: String(agent.handle), kind: 'existing' };
   const synthetic = freshest(connected.filter(t => typeof t.preview !== 'string' && typeof t.agentIdentity !== 'string'));
-  if (synthetic) return { handle: String(synthetic.handle), spawned: false };
+  if (synthetic) return { handle: String(synthetic.handle), kind: 'existing' };
   const bareShell = freshest(connected.filter(t => typeof t.preview === 'string' && !t.agentIdentity));
-  if (bareShell) {
-    const handle = String(bareShell.handle);
-    await sendOrcaTerminalText(runner, command, handle, launchCommand, { cwd, signal });
-    return { handle, spawned: true, shellBootstrapped: true };
+  return bareShell ? { kind: 'shell', handle: String(bareShell.handle) } : { kind: 'create' };
+}
+
+/** Resolve and launch for callers that do not own a durable mailbox obligation. */
+export async function resolveOrSpawnOrcaWorkspaceTerminal(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string },
+): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
+  const plan = await planOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
+  if (plan.kind === 'existing') return { handle: plan.handle, spawned: false };
+  if (plan.kind === 'shell') {
+    await sendOrcaTerminalText(runner, command, plan.handle,
+      options?.interactiveCommand?.trim() || defaultAgentLaunchCommand(options?.agent), { cwd, signal });
+    return { handle: plan.handle, spawned: true, shellBootstrapped: true };
   }
-  const spawned = await spawnOrcaWorkspaceTerminal(runner, command, cwd, signal, {
-    agent: targetAgent,
-    interactiveCommand: options?.interactiveCommand,
-  });
+  const spawned = await spawnOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
   return { handle: spawned.handle, spawned: true };
 }
 

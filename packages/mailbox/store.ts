@@ -359,17 +359,20 @@ export function resolveMailboxId(
   if (isNonEmptyString(explicit)) {
     return normalizeMailboxId(explicit, 'payload mailbox');
   }
+  const mode = resolveEffectiveConversationMode({ executor: executorName, binding, payload });
   if (binding && !control && !isNonEmptyString(payload?.executor)) {
     if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
       return normalizeMailboxId(`stream:${payload.streamKey}`);
     }
-    return resolveBoundMailboxId(bindingKind, binding);
+    if (binding.mailboxId !== undefined || isStreamConversationBinding(binding) || mode !== 'spawn') {
+      return resolveBoundMailboxId(bindingKind, binding);
+    }
   }
-  const mode = resolveEffectiveConversationMode({ executor: executorName, binding, payload });
   if (executorName === 'orca-wave' || (executorName === 'orca' && (mode === 'wave' || mode === 'fixed')) || mode === 'wave') {
     return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
   }
-  if (executorName === 'orca-spawn' || (executorName === 'orca' && mode === 'spawn')) {
+  if (executorName === 'orca-spawn' || (mode === 'spawn' && (executorName === 'orca' ||
+    ['codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'agent-pty'].includes(executorName ?? binding?.executor ?? '')))) {
     return normalizeMailboxId(`task:${envelope.id}`, 'task mailbox');
   }
   return 'default';

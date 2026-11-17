@@ -18,8 +18,8 @@ import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
-import { createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
-import { checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
+import { createInboxExecutorPlugin, createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
+import { CommandNotStartedError, checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/orca-workspace/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
 
@@ -590,6 +590,9 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
   const requests: CommandRequest[] = [];
   const commandRunner: CommandRunner = async request => {
     requests.push(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-authority"}}}' };
+    }
     return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: dir } } }) };
   };
   const senderSettings = join(dir, 'sender-settings.json');
@@ -1423,4 +1426,98 @@ test('mock interactive Orca never reads or changes default host trust settings',
   assert.equal(await readFile(settingsPath, 'utf8'), 'not JSON');
   assert.equal(await readFile(deliveriesPath, 'utf8'), 'not JSON');
   assert.equal('retiredWorkspacePaths' in JSON.parse(await readFile(mailboxPath, 'utf8')), false);
+});
+
+test('executor preparation failures restore CAS so repaired configuration can retry the same revision', async t => {
+  // These failures prove no mutating command or enqueue happened; fencing them as unknown
+  // would permanently suppress a legitimate poll after receiver configuration is repaired.
+  const root = await mkdtemp(join(tmpdir(), 'dealer-pre-effect-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const context = { networkId: 'test', nodeId: receiver.nodeId, traceId: 'pre-effect', signal: new AbortController().signal };
+  const good: CommandRunner = async request => ({ stdout: JSON.stringify(
+    request.args[0] === 'worktree' && request.args[1] === 'create'
+      ? { ok: true, result: { path: join(root, 'child') } }
+      : request.args[0] === 'worktree' && request.args[1] === 'list'
+        ? { ok: true, result: { worktrees: [] } }
+        : { ok: true, result: { handle: 'term-agent' } },
+  ) });
+  const spawn = (extra = {}) => createOrcaSpawnExecutorPlugin({ cwd: root, store, commandRunner: good, ...extra });
+  const wave = (extra = {}) => createOrcaWaveExecutorPlugin({ store, ...extra });
+  const pty = (extra = {}) => createAgentPtyExecutorPlugin({ commandRunner: good, ...extra });
+  const cases: Array<{ name: string; broken: ExecutorPlugin; repaired: ExecutorPlugin; payload?: Record<string, unknown>; empty?: boolean }> = [
+    { name: 'unbound project', broken: spawn(), repaired: spawn({ projectRoots: { app: root } }), payload: { projectId: 'app' } },
+    { name: 'foreign parent', broken: spawn({ projectRoots: { app: root }, parentWorktree: 'path:/foreign' }), repaired: spawn({ projectRoots: { app: root }, noParent: true }), payload: { projectId: 'app' } },
+    { name: 'top-level cwd', broken: spawn({ cwd: undefined, noParent: true }), repaired: spawn({ noParent: true }) },
+    { name: 'spawn store', broken: spawn({ interactive: true, store: undefined }), repaired: spawn({ interactive: true }) },
+    { name: 'spawn empty', broken: spawn(), repaired: spawn(), empty: true },
+    { name: 'wave store', broken: wave({ store: undefined }), repaired: wave() },
+    { name: 'wave empty', broken: wave(), repaired: wave(), empty: true },
+    { name: 'wave agent', broken: wave({ agent: 'invalid' }), repaired: wave() },
+    { name: 'wave mode', broken: wave({ resolveTopicBinding: () => ({ executor: 'orca-wave', mode: 'invalid' }) }), repaired: wave() },
+    { name: 'agent mode', broken: pty({ mode: 'invalid' }), repaired: pty() },
+    { name: 'agent invocation', broken: pty({ agent: 'invalid', mode: 'spawn' }), repaired: pty({ agent: 'codex', mode: 'spawn' }) },
+    { name: 'agent empty', broken: pty(), repaired: pty(), empty: true },
+    { name: 'read-only naming', broken: spawn({ seaCreatureNaming: true, commandRunner: async () => { throw new Error('inventory unavailable'); } }), repaired: spawn({ seaCreatureNaming: true, cwd: join(root, 'not-created') }) },
+    { name: 'OS non-start', broken: pty({ commandRunner: async () => { throw new CommandNotStartedError('ENOENT'); } }), repaired: pty() },
+    { name: 'orca inbox store', broken: createOrcaExecutorPlugin({ mode: 'inbox-only' }), repaired: createOrcaExecutorPlugin({ mode: 'inbox-only', store }) },
+    { name: 'orca mode', broken: createOrcaExecutorPlugin({ mode: 'invalid', store }), repaired: createOrcaExecutorPlugin({ store, mode: 'wave' }) },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const watermarksPath = join(root, `dedup-${index}.json`);
+    const policy = createDedupCasPolicyPlugin({ watermarksPath });
+    const message = envelope({ idempotencyKey: scenario.name, payload: { ...scenario.payload, revision: 2 } });
+    await policy.process({ ...message, payload: { ...message.payload, revision: 1 } }, async () => ({ stage: 'settled' }));
+    const prior = await readFile(watermarksPath, 'utf8');
+    await assert.rejects(policy.process(message, async () => ({
+      stage: 'dispatched',
+      executionReceipt: await scenario.broken.execute(scenario.empty ? [] : [message], context),
+    })), (error: any) => error.beforeExternalEffect === true, scenario.name);
+    assert.equal(await readFile(watermarksPath, 'utf8'), prior, scenario.name);
+    assert.equal((await policy.process(message, async () => ({
+      stage: 'dispatched', executionReceipt: await scenario.repaired.execute([message], context),
+    }))).stage, 'dispatched', scenario.name);
+  }
+
+  // A terminal command that never starts does not erase the already-created worktree.
+  const policy = createDedupCasPolicyPlugin();
+  const message = envelope({ idempotencyKey: 'post-create', payload: { revision: 2 } });
+  const executor = spawn({ commandRunner: async (request: CommandRequest) => {
+    if (request.args[0] === 'terminal') throw new CommandNotStartedError('ENOENT');
+    return good(request);
+  } });
+  await assert.rejects(policy.process(message, async () => ({
+    stage: 'dispatched', executionReceipt: await executor.execute([message], context),
+  })), (error: any) => error.beforeExternalEffect !== true);
+  assert.equal((await policy.process(message, async () => ({ stage: 'dispatched' }))).detail, DEDUP_CAS_AMBIGUOUS_DETAIL);
+});
+
+test('inbox and wave prepare every session target before any group takes durable custody', async t => {
+  // A later read-only lookup failure cannot leave an earlier group enqueued while CAS rolls back.
+  const root = await mkdtemp(join(tmpdir(), 'dealer-batch-prepare-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const factory of [createInboxExecutorPlugin, createOrcaWaveExecutorPlugin]) {
+    for (const nonStart of [false, true]) {
+      const store = new MailboxStore(join(root, `${factory.name}-${nonStart}.json`));
+      let repaired = false;
+      const executor = factory({
+        store,
+        resolveTopicBinding: () => ({ executor: 'orca-wave', streamKey: 'topic' }),
+        commandRunner: async () => {
+          if (!repaired) throw nonStart ? new CommandNotStartedError('ENOENT') : new Error('inventory unavailable');
+          return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
+        },
+      });
+      const first = envelope({ idempotencyKey: 'batch', payload: { mailbox: 'terminal:ready', revision: 2 } });
+      const later = envelope({ payload: { mailbox: 'worktree:lookup' } });
+      const policy = createDedupCasPolicyPlugin({ watermarksPath: join(root, `cas-${factory.name}-${nonStart}.json`) });
+      const execute = async () => ({ stage: 'dispatched' as const, executionReceipt:
+        await executor.execute([first, later], { networkId: 'test', nodeId: receiver.nodeId, traceId: 'batch' }) });
+      await assert.rejects(policy.process(first, execute), (error: any) => error.beforeExternalEffect === true);
+      assert.equal(store.listItemsAfterSequence(-1).length, 0);
+      repaired = true;
+      assert.equal((await policy.process(first, execute)).stage, 'dispatched');
+      assert.equal(store.listItemsAfterSequence(-1).length, 2);
+    }
+  }
 });

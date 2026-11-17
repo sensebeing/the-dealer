@@ -1,4 +1,8 @@
-import { checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isAutopilotComposerPrefill, runCommand, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
+import { Kernel } from '../packages/kernel/index.ts';
+import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
+import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
+import type { NodeService } from '../packages/core-types/index.ts';
+import { CommandNotStartedError, spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isAutopilotComposerPrefill, runCommand, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,6 +17,7 @@ import {
   runDealerCli,
   verifyEnvelope,
   settleWakeDeliveryFailure,
+  launchFencedOrcaWorkspaceTerminal,
 } from '../packages/index.ts';
 import type {
   CommandRequest,
@@ -1911,6 +1916,15 @@ test('a removed non-auto-created workspace disarms wake retries but keeps the qu
   assert.deepEqual(await service.flushWakeups(), []);
   assert.equal(calls.length, probes, 'a disarmed target is never probed again');
 
+  // An unspawned task must still disarm on a removed workspace instead of creating a tab.
+  store.enqueue([alert('gone-spawn')], {
+    mailboxId: 'task:gone-spawn',
+    wakeTarget: { mode: 'orca-terminal', workspacePath: gonePath, coalesceMs: 0 },
+  });
+  assert.equal((await service.flushMailbox('task:gone-spawn')).reason, 'Workspace not found');
+  assert.equal(store.getWakeTarget('task:gone-spawn')!.pendingWake, false);
+  assert.equal(calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'create').length, 0);
+
   // A workspace whose directory still exists keeps its durable retry ledger even while Orca's
   // inventory is incomplete; only a path that is truly gone is disarmed.
   store.enqueue([alert('live-reply', { semantic: { type: 'reply', threadId: 'live-task' } })], {
@@ -2097,4 +2111,272 @@ test('pinning a rotating session preserves existing terminal wake fences', async
   store.upsertWakeTarget('stream:inbox', { deliveryInDoubt: true, lastWakeError: 'fenced' });
   assert.equal(store.pinRotatingSessionMailbox('stream:inbox', 'term-2'), 'terminal:term-2');
   assert.equal(store.getWakeTarget('terminal:term-2')?.deliveryInDoubt, true);
+});
+
+test('durable spawn survives the account gate and redrives into one dedicated agent tab', async t => {
+  // A created worktree is already an external effect: terminal launch failure must settle CAS
+  // against a durable task, and recovery must never bootstrap agy inside Terminal 1.
+  const root = directory(t);
+  const workspacePath = join(root, 'child');
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const watermarksPath = join(root, 'dedup.json');
+  const { runner: inventory, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'bare-shell', connected: true, writable: true, preview: 'user@host %' },
+  ]);
+  let accountReady = false;
+  let launches = 0;
+  const accountError = 'The native Antigravity account changed. Select the account again in Accounts before launching agy.';
+  const runner: CommandRunner = async request => {
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      state.calls.push(request);
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: workspacePath } } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      launches += 1;
+      assert.equal(store.list({ mailboxId: 'task:account-gate' }).queuedCount, 1);
+      assert.equal(request.args[request.args.indexOf('--command') + 1], 'agy --dangerously-skip-permissions');
+      if (!accountReady) {
+        state.calls.push(request);
+        return { exitCode: 1, stdout: JSON.stringify({ ok: false, error: { code: 'runtime_error', message: accountError } }) };
+      }
+    }
+    return inventory(request);
+  };
+  const kernel = new Kernel();
+  kernel.ctx.provide('node', { getSelfCard: () => ({ nodeId: 'receiver' }) } as NodeService);
+  await kernel.use(createDispatcherPlugin());
+  t.after(() => kernel.stop());
+  const dispatcher = kernel.ctx.services.dispatcher;
+  dispatcher.registerPolicy(createDedupCasPolicyPlugin({ watermarksPath }));
+  dispatcher.registerExecutor(createOrcaSpawnExecutorPlugin({
+    store, commandRunner: runner, cwd: root, interactive: true, noParent: true,
+  }), {});
+  const message = alert('account-gate', {
+    idempotencyKey: 'feedback:account', payload: { revision: 2, workspaceComment: 'Investigate account feedback' },
+  });
+  assert.equal((await dispatcher.dispatch(message)).stage, 'dispatched');
+  assert.ok(Object.values(JSON.parse(readFileSync(watermarksPath, 'utf8'))).some((entry: any) => entry.status === 'settled'));
+  const duplicate = await dispatcher.dispatch({ ...message, id: 'next-poll' });
+  assert.equal(duplicate.detail, DEDUP_CAS_DUPLICATE_DETAIL);
+  const initial = store.getWakeTarget('task:account-gate')!;
+  assert.equal(initial.pendingWake, true);
+  assert.equal(initial.attemptCount, 1);
+  assert.equal(initial.deliveryInDoubt, undefined);
+  assert.match(initial.lastWakeError!, /native Antigravity account changed/);
+  assert.ok(state.calls.some(call => call.args[0] === 'worktree' && call.args[1] === 'set'));
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  // Reload the durable owner to prove recovery does not depend on the executor's memory.
+  const recovered = new MailboxStore(store.path);
+  const service = new WakeupRedriveService({ store: recovered, commandRunner: runner, flushIntervalMs: 100_000 });
+  t.after(() => service.stop());
+  assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, false);
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.attemptCount, 2);
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.deliveryInDoubt, undefined);
+  accountReady = true;
+  state.waitOk = false;
+  assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, false);
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.terminalHandle, 'term-new-1');
+  assert.equal(state.created, 1);
+  assert.equal(terminalSends(state.calls).length, 0);
+  assert.equal(launches, 3, 'two failed launches and the first dedicated tab');
+
+  // If that tab exits before delivery, recovery must replace it through Orca's account-aware
+  // terminal creation path, never bootstrap the agent in the surviving bare login shell.
+  state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-new-1');
+  assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, false);
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.terminalHandle, 'term-new-2');
+  assert.equal(state.created, 2);
+  assert.equal(terminalSends(state.calls).length, 0);
+  state.waitOk = true;
+  assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, true);
+  assert.equal(launches, 4, 'two failed launches, original tab and replacement; idle deferrals create no tabs');
+  assert.equal(state.created, 2);
+  assert.equal(sendsTo(state.calls, 'bare-shell').length, 0);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 0);
+  const sends = sendsTo(state.calls, 'term-new-2');
+  assert.equal(sends.length, 1);
+  assert.match(textOf(sends[0]), /Dealer Task dispatched to mailbox task:account-gate/);
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.pendingWake, false);
+  assert.ok(state.calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'set').length >= 2);
+});
+
+test('spawn keeps durable custody through launch, comment and pointer failures', async t => {
+  // Preparation failures remain retryable; an attempted pointer remains fenced. Neither
+  // may turn the already-committed task into a failed dispatcher/CAS handoff.
+  const root = directory(t);
+  for (const failure of ['non-start', 'throw', 'rejected', 'rejected-exit1', 'thrown-rejection', 'signal-rejection', 'malformed', 'no-handle', 'comment', 'send']) {
+    const store = new MailboxStore(join(root, `${failure}.json`));
+    const calls: CommandRequest[] = [];
+    const runner: CommandRunner = async request => {
+      calls.push(request);
+      const operation = request.args.slice(0, 2).join(' ');
+      if (operation === 'worktree create') return { stdout: JSON.stringify({ ok: true, result: { path: join(root, failure) } }) };
+      if (operation === 'terminal create') {
+        assert.equal(new MailboxStore(store.path).getWakeTarget(`task:${failure}`)!.deliveryInDoubt, true,
+          'launch uncertainty is durable before the command starts');
+        if (failure === 'non-start') throw new CommandNotStartedError('ENOENT');
+        if (failure === 'throw') throw new Error('connection lost');
+        if (failure === 'rejected-exit1') return { stdout: '{"ok":false}', exitCode: 1 };
+        if (failure === 'thrown-rejection' || failure === 'signal-rejection') {
+          throw Object.assign(new Error('Orca refused or was interrupted'), { stdout: '{"ok":false}', exitCode: failure === 'signal-rejection' ? null : 1 });
+        }
+        if (failure === 'malformed') return { stdout: 'broken JSON' };
+        if (failure === 'rejected') return { stdout: '{"ok":false}' };
+        if (failure === 'no-handle') return { stdout: '{"ok":true}' };
+        return { stdout: '{"ok":true,"result":{"handle":"task-tab"}}' };
+      }
+      if (operation === 'worktree set' && failure === 'comment') throw new Error('comment unavailable');
+      if (operation === 'terminal send' && failure === 'send') throw new Error('send outcome unknown');
+      return { stdout: '{"ok":true}' };
+    };
+    const receipt = await createOrcaSpawnExecutorPlugin({ store, commandRunner: runner, cwd: root, interactive: true })
+      .execute([alert(failure, { payload: { workspaceComment: 'Task summary' } })], {} as ExecutionContext);
+    const target = store.getWakeTarget(`task:${failure}`)!;
+    assert.equal(store.list({ mailboxId: `task:${failure}` }).queuedCount, 1);
+    if (failure === 'comment') {
+      assert.equal(receipt.woke, true);
+      assert.match(String(receipt.warning), /comment unavailable/);
+      assert.equal(target.pendingWake, false);
+    } else {
+      assert.equal(receipt.woke, false);
+      const retryable = ['non-start', 'rejected', 'rejected-exit1', 'thrown-rejection'].includes(failure);
+      assert.equal(target.pendingWake, retryable, failure);
+      assert.ok(receipt.reason);
+      if (retryable) {
+        assert.equal(target.deliveryInDoubt, undefined);
+        assert.equal(target.attemptCount, 1);
+        assert.equal(terminalSends(calls).length, 0);
+      } else {
+        assert.equal(target.deliveryInDoubt, true, 'unknown launch/pointer effects must never be automatically replayed');
+        const before = calls.length;
+        const service = new WakeupRedriveService({ store: new MailboxStore(store.path), commandRunner: runner });
+        t.after(() => service.stop());
+        await service.flushMailbox(`task:${failure}`, { force: true });
+        assert.equal(calls.length, before, 'restart and forced redrive preserve the launch fence');
+      }
+    }
+  }
+});
+
+test('task tab disappearing after idle proof is replaced without borrowing another terminal', async t => {
+  // The dedicated-task policy must survive the final resolution race, not just initial planning.
+  const root = directory(t);
+  const workspacePath = join(root, 'workspace');
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const { runner: inventory, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'task-old', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'bare-shell', connected: true, writable: true, preview: 'user@host %' },
+    { handle: 'other-agent', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  let lists = 0;
+  const runner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      lists++;
+      // First inventory plans reuse; second proves the target idle; third is deliver's final check.
+      if (lists === 3) state.terminals = state.terminals.filter(row => row.handle !== 'task-old');
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      assert.equal(new MailboxStore(store.path).getWakeTarget('task:race')!.deliveryInDoubt, true);
+      assert.ok(request.args.includes('--command'));
+    }
+    return inventory(request);
+  };
+  store.enqueue([alert('race')], { mailboxId: 'task:race', wakeTarget: {
+    mode: 'orca-terminal', workspacePath, terminalHandle: 'task-old', agent: 'antigravity', coalesceMs: 0,
+  } });
+  const service = new WakeupRedriveService({ store, commandRunner: runner });
+  t.after(() => service.stop());
+  state.waitOk = false;
+  const deferred = await service.flushMailbox('task:race', { force: true });
+  assert.equal(deferred.woke, false);
+  assert.equal(state.created, 1);
+  assert.equal(store.getWakeTarget('task:race')!.terminalHandle, 'term-new-1');
+  assert.equal(terminalSends(state.calls).length, 0);
+  state.waitOk = true;
+  assert.equal((await service.flushMailbox('task:race', { force: true })).woke, true);
+  assert.equal(state.created, 1);
+  assert.equal(sendsTo(state.calls, 'bare-shell').length, 0);
+  assert.equal(sendsTo(state.calls, 'other-agent').length, 0);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+});
+
+test('Orca launch classification preserves structured refusal from a real nonzero subprocess', async () => {
+  // runCommand rejects nonzero exits: stdout must survive that boundary for explicit refusal.
+  const refusalRunner: CommandRunner = request => runCommand({
+    ...request, command: process.execPath, cwd: undefined,
+    args: ['-e', 'console.log(JSON.stringify({ok:false})); console.error("account gate"); process.exit(1)'],
+  });
+  await assert.rejects(spawnOrcaWorkspaceTerminal(refusalRunner, 'orca', '/unused'),
+    error => error instanceof OrcaTerminalLaunchRejectedError && /account gate/.test(error.message));
+  await assert.rejects(runCommand({ command: '/definitely-missing-dealer-test', args: [] }),
+    error => error instanceof CommandNotStartedError && !('beforeExternalEffect' in error));
+});
+
+test('launch crash and handle persistence failure stay fenced across restart', async t => {
+  // An absent handle after launch is not evidence that no tab was created.
+  const root = directory(t);
+  for (const failure of ['crash', 'persist']) {
+    const store = new MailboxStore(join(root, `${failure}.json`));
+    const mailboxId = `task:${failure}`;
+    store.enqueue([alert(failure)], { mailboxId, wakeTarget: {
+      mode: 'orca-terminal', workspacePath: root, coalesceMs: 0,
+    } });
+    if (failure === 'crash') {
+      store.beginWakeDelivery(mailboxId); // Simulate a process exit during terminal creation.
+    } else {
+      const upsert = store.upsertWakeTarget.bind(store);
+      t.mock.method(store, 'upsertWakeTarget', (id, patch) => {
+        if (patch.terminalHandle) throw new Error('handle persistence failed');
+        return upsert(id, patch);
+      });
+      await assert.rejects(launchFencedOrcaWorkspaceTerminal(store, async () => ({
+        stdout: '{"ok":true,"result":{"handle":"created-before-disk-error"}}',
+      }), mailboxId, { command: 'orca', workspacePath: root }), /persistence failed/);
+    }
+    const restarted = new MailboxStore(store.path);
+    assert.equal(restarted.getWakeTarget(mailboxId)!.deliveryInDoubt, true);
+    assert.equal(restarted.getWakeTarget(mailboxId)!.pendingWake, false);
+    let calls = 0;
+    const service = new WakeupRedriveService({ store: restarted, commandRunner: async () => {
+      calls++;
+      throw new Error('Must not retry an unknown launch');
+    } });
+    t.after(() => service.stop());
+    await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(calls, 0);
+  }
+});
+
+test('redrive fences both dedicated tab creation and non-task shell bootstrap once', async t => {
+  // Shared launch settlement distinguishes non-start from unknown effects without double backoff.
+  const root = directory(t);
+  for (const task of [false, true]) {
+    for (const nonStart of [false, true]) {
+      const mailboxId = `${task ? 'task' : 'stream'}:launch-${nonStart}`;
+      const store = new MailboxStore(join(root, `${task}-${nonStart}.json`));
+      const { runner: inventory, state } = fakeOrcaWorkspace(root, [
+        { handle: 'shell', connected: true, writable: true, preview: 'user@host %' },
+      ]);
+      const runner: CommandRunner = async request => {
+        if (request.args[0] === 'terminal' && ['create', 'send'].includes(request.args[1])) {
+          state.calls.push(request);
+          assert.equal(new MailboxStore(store.path).getWakeTarget(mailboxId)!.deliveryInDoubt, true);
+          throw nonStart ? new CommandNotStartedError('ENOENT') : new Error('connection lost during launch');
+        }
+        return inventory(request);
+      };
+      store.enqueue([alert(mailboxId)], { mailboxId, wakeTarget: {
+        mode: 'orca-terminal', workspacePath: root, coalesceMs: 0,
+      } });
+      const service = new WakeupRedriveService({ store, commandRunner: runner, idleCheck: async () => ({ idle: true }) });
+      t.after(() => service.stop());
+      assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false);
+      const target = store.getWakeTarget(mailboxId)!;
+      assert.equal(target.pendingWake, nonStart);
+      assert.equal(target.deliveryInDoubt, nonStart ? undefined : true);
+      assert.equal(target.attemptCount, 1, 'the shared helper settles once, including parked outcomes');
+      assert.equal(state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === (task ? 'create' : 'send')).length, 1);
+    }
+  }
 });

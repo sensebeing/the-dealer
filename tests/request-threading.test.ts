@@ -693,3 +693,40 @@ test('Lark mirror flags and envelope filters suppress gate and outbound events i
   await disabled.flush();
   assert.equal(calls.length, 2);
 });
+
+test('runtime inbound reverse routes use task mailboxes for spawn topic bindings', async t => {
+  // Outbound binding resolution remains default, while authenticated inbound routing must
+  // record the task mailbox actually created by either spawn executor.
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'node'), member: 'alice', profile: 'personal-dev',
+    patch: {
+      gateMode: 'open',
+      topicBindings: {
+        'spawn-orca': { executor: 'orca-spawn', noParent: true, workspacePath: root },
+        'spawn-agent': { executor: 'antigravity', mode: 'spawn' },
+      },
+      executorConfig: { 'orca-spawn': { interactive: true } },
+    },
+    wakeupIdleCheck: async () => ({ idle: false }),
+    commandRunner: async request => {
+      if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+        return { stdout: JSON.stringify({ ok: true, result: { path: join(root, 'child') } }) };
+      }
+      if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+        return { stdout: JSON.stringify({ ok: true, result: { handle: 'task-terminal' } }) };
+      }
+      return { stdout: '{"ok":true}' };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  for (const kind of ['spawn-orca', 'spawn-agent']) {
+    await cli(runtime, 'send', '--network', 'local', '--to', 'member:alice', '--topic', kind, '--body', 'Handle this task', '--thread', kind);
+    const records = runtime.mailbox.listThreadRecords(kind);
+    const inbound = records.find(record => record.direction === 'inbound')!;
+    assert.ok(inbound, kind);
+    assert.equal(inbound.envelope!.payload.executor, undefined);
+    assert.equal(inbound.localMailbox, `task:${inbound.messageId}`);
+    assert.equal(runtime.mailbox.list({ mailboxId: inbound.localMailbox }).queuedCount, 1);
+  }
+});
