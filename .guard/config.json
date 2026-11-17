@@ -425,7 +425,7 @@
       {
         "from": "packages/subprocess/",
         "imports": [
-          "../"
+          ".."
         ],
         "rule_id": "guard.service-boundaries",
         "message": "subprocess is a foundation leaf for OS commands and PATH lookup; it must not import sibling packages."
