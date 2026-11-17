@@ -230,7 +230,13 @@ test('Phase 4: polling, CAS dedup, durable busy waves and run-managed delivery a
     ...input('bob', { executor: 'orca-wave', streamKey: 'alerts', revision: 1 }),
     idempotencyKey: 'alert-0',
   });
-  assert.equal(duplicate.receipts[0].stage, 'rejected');
+  assert.equal(duplicate.receipts[0].stage, 'dispatched', 'sender replays its durable handoff');
+  // Bypass sender obligations explicitly to exercise the receiver CAS boundary too.
+  const wireDuplicate = await alice.emitter.emit({
+    ...input('bob', { executor: 'orca-wave', streamKey: 'alerts', revision: 1 }),
+    idempotencyKey: 'alert-0', queueIfOffline: false,
+  });
+  assert.equal(wireDuplicate.receipts[0].stage, 'rejected');
   assert.equal(bob.mailbox.list({ mailboxId: 'stream:alerts' }).queuedCount, 2);
 
   idle = true;
@@ -1031,7 +1037,8 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
     patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
   });
   await connect(alice, bob);
-  const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity' };
+  // This test probes receiver recovery across revisions, not sender obligation replay.
+  const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity', queueIfOffline: false };
   assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'queued');
   const message = bob.gate.listDndQueue()[0].envelope;
   const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);

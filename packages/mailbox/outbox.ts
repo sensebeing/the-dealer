@@ -368,7 +368,6 @@ export class OutboxStore {
     return this.mutate(state => {
       const existing = state.items.find(
         item =>
-          item.status === 'queued' &&
           item.networkId === input.envelope.networkId &&
           item.envelope.idempotencyKey === key,
       );
@@ -399,6 +398,20 @@ export class OutboxStore {
       this.settleItem(item);
       state.items.push(item);
       return { claimed: true, item: clone(item) };
+    });
+  }
+
+  /** Release only a pristine reservation when routing fails before a send can occur. */
+  abandonUnattemptedClaim(id: string): void {
+    this.mutate(state => {
+      const index = state.items.findIndex(item => item.id === id);
+      if (index < 0) return;
+      const item = state.items[index];
+      if (item.status !== 'queued' || item.attempts !== 0 || item.pendingNodeIds.length > 0 ||
+          Object.keys(item.deliveredReceipts).length > 0 || Object.keys(item.failedReceipts).length > 0 ||
+          item.failedNodeIds.length > 0) return;
+      this.removeStagedFiles(item.id, item.stagedFiles);
+      state.items.splice(index, 1);
     });
   }
 

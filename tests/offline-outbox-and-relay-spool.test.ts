@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { request } from 'node:http';
-import { createConnection, createServer, type Socket } from 'node:net';
+import { createConnection, createServer, Socket } from 'node:net';
 import { tmpdir, hostname, networkInterfaces } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -4754,4 +4754,127 @@ test('initial emit and redrive launch live siblings before the first target time
   assert.equal(outcome.deliveredReceipts?.[live]?.stage, 'dispatched');
   assert.deepEqual(outcome.pendingNodeIds, [stalled]);
   assert.deepEqual(outcome.inDoubtNodeIds, [stalled]);
+});
+
+
+test('pre-connect handshake timeout stays retryable through ordinary outbox redrive', async t => {
+  const harness = await emitterHarness(t, { attemptTimeoutMs: 30 });
+  const transport = new P2PTransportService({ discoveryDir: join(harness.dir, 'isolated'), multicast: false });
+  await transport.mountNetwork({ networkId: harness.networkId, passphrase: 'offline-test-only' });
+  t.after(() => transport.dispose());
+  transport.registerPeerEndpoint(harness.networkId, harness.targetCard.nodeId, '127.0.0.1:1');
+  const connect = t.mock.method(Socket.prototype, 'connect', function (this: Socket) { return this; });
+  const send = t.mock.method(harness.kernel.ctx.services.transport, 'sendUnicast',
+    (...args: Parameters<TransportService['sendUnicast']>) => transport.sendUnicast(...args));
+  const emitted = await harness.emitter.emit({
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'task', subject: 'connect timeout', body: 'no bytes sent', payload: {},
+  });
+  connect.mock.restore();
+  send.mock.restore();
+  const item = harness.outbox.get(emitted.messageId)!;
+  assert.deepEqual(item.pendingNodeIds, [harness.targetCard.nodeId]);
+  assert.deepEqual(item.inDoubtNodeIds, []);
+  const redrive = new OutboxRedriveService({ outbox: harness.outbox,
+    deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options) });
+  await redrive.flush({ id: item.id });
+  assert.equal(harness.outbox.get(item.id)?.status, 'delivered');
+  await redrive.stop();
+});
+
+test('terminal keyed delivery replays its signed receipt before auto-routing can shift peers', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['aya'] });
+  let selected = harness.targetCard.nodeId;
+  let routes = 0;
+  harness.kernel.ctx.services.router.registerJudge({ name: 'availability', priority: 1,
+    async decide() { routes++; return { mode: 'unicast', targetNodeIds: [selected], matchedBy: 'judge', reason: 'available' }; } });
+  const input: EmitMessageInput = { networkId: harness.networkId, routing: { mode: 'auto' },
+    kind: 'task', subject: 'keyed auto', body: 'execute once', payload: {}, idempotencyKey: 'stable-auto' };
+  const first = await harness.emitter.emit(input);
+  selected = harness.targetByMember.get('aya')!.nodeId;
+  const second = await harness.emitter.emit(input);
+  assert.equal(routes, 1);
+  assert.equal(harness.sendCalls.length, 1);
+  assert.deepEqual(second, first);
+  assert.equal(second.receipts[0].stage, 'dispatched');
+  assert.equal(second.receipts[0].fromNodeId, harness.targetCard.nodeId);
+});
+
+test('terminal keyed rejections and local failures replay without sending again', async t => {
+  for (const localFailure of [false, true]) {
+    const harness = await emitterHarness(t, { extraMembers: ['aya'],
+      plan: target => target === harness.targetCard.nodeId
+        ? localFailure ? { error: new LocalDeliveryError('invalid wire reply') } : { stage: 'rejected' }
+        : {},
+    });
+    const input: EmitMessageInput = { networkId: harness.networkId,
+      routing: { mode: 'multicast', targets: ['member:diz', 'member:aya'] },
+      kind: 'task', subject: 'terminal key', body: 'retain evidence', payload: {}, idempotencyKey: 'terminal-key' };
+    if (localFailure) {
+      await assert.rejects(harness.emitter.emit(input), /invalid wire reply/);
+      const item = harness.outbox.list({ status: 'failed' })[0];
+      await assert.rejects(harness.emitter.emit(input), (error: any) => {
+        assert.ok(error instanceof LocalDeliveryError);
+        assert.match(error.message, /invalid wire reply/);
+        assert.deepEqual(error.receipts, Object.values(item.deliveredReceipts));
+        return true;
+      });
+    } else {
+      const first = await harness.emitter.emit(input);
+      const second = await harness.emitter.emit(input);
+      assert.equal(second.messageId, first.messageId);
+      assert.equal(second.receipts.length, 2);
+      assert.deepEqual(second.receipts.find(receipt => receipt.stage === 'rejected'),
+        first.receipts.find(receipt => receipt.stage === 'rejected'));
+      assert.ok(second.receipts.every(receipt => receipt.stage !== 'queued'));
+    }
+    assert.equal(harness.sendCalls.length, 2);
+  }
+});
+
+test('pre-send routing failures release a keyed claim and its staged files', async t => {
+  const harness = await emitterHarness(t);
+  let available = false;
+  const route = t.mock.method(harness.kernel.ctx.services.router, 'route', async () => {
+    if (!available) throw new Error('No route matched envelope');
+    return { mode: 'unicast' as const, targetNodeIds: [harness.targetCard.nodeId], matchedBy: 'test', reason: 'available' };
+  });
+  const file = join(harness.dir, 'attachment.txt');
+  writeFileSync(file, 'claim attachment');
+  const input: EmitMessageInput = { networkId: harness.networkId, routing: { mode: 'auto' },
+    kind: 'task', subject: 'retry route', body: 'safe release', payload: {}, idempotencyKey: 'route-key', filePaths: [file] };
+  await assert.rejects(harness.emitter.emit(input), /No route matched envelope/);
+  assert.equal(harness.outbox.list({ status: 'all' }).length, 0);
+  assert.deepEqual(readdirSync(join(harness.dir, 'outbox-blobs')), []);
+  assert.equal(harness.sendCalls.length, 0);
+  available = true;
+  const sent = await harness.emitter.emit(input);
+  assert.equal(sent.receipts[0].stage, 'dispatched');
+  assert.equal(route.mock.callCount(), 2);
+  assert.equal(harness.sendCalls.length, 1);
+});
+
+
+test('claim abandonment preserves obligations once delivery evidence or attempts exist', async t => {
+  const harness = await emitterHarness(t);
+  const target = harness.targetCard.nodeId;
+  for (const state of ['pending', 'attempted', 'delivered', 'failed'] as const) {
+    const envelope = { ...envelopeFor(harness.sender, harness.networkId, target), idempotencyKey: state };
+    const claimed = harness.outbox.claimIdempotency({ envelope });
+    if (state === 'attempted') {
+      harness.outbox.recordAttempt(claimed.item.id, { nextAttemptAt: new Date().toISOString() });
+    } else if (state === 'pending') {
+      harness.outbox.enqueue({ envelope, pendingNodeIds: [target] });
+    } else if (state === 'failed') {
+      harness.outbox.markFailed(claimed.item.id, 'local failure');
+    } else {
+      harness.outbox.markNodeDelivered(claimed.item.id, target, signReceipt({
+        messageId: envelope.id, networkId: harness.networkId, fromNodeId: target,
+        stage: 'dispatched', updatedAt: new Date().toISOString(),
+      }, harness.receiver.privateKeyPem));
+    }
+    const before = harness.outbox.get(claimed.item.id);
+    harness.outbox.abandonUnattemptedClaim(claimed.item.id);
+    assert.deepEqual(harness.outbox.get(claimed.item.id), before);
+  }
 });

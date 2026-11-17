@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createConnection, createServer, Socket } from 'node:net';
 import { Kernel } from '../packages/kernel/index.ts';
-import { generateNodeKeyPair, deriveNetworkKeys, sealNetworkFrame } from '../packages/core-types/index.ts';
+import { generateNodeKeyPair, deriveNetworkKeys, sealNetworkFrame, DeliveryTimeoutError, LocalDeliveryError } from '../packages/core-types/index.ts';
 import type { InboundFrameEvent } from '../packages/core-types/index.ts';
 import { createTransportPlugin, P2PTransportService, blake3 } from '../packages/transport/index.ts';
 import { createNodePlugin, PeerDirectoryService } from '../packages/node/index.ts';
@@ -364,10 +364,10 @@ test('direct frame bounds an unfinished TCP handshake independently of the RPC b
   const connect = t.mock.method(Socket.prototype, 'connect', function (this: Socket) { return this; });
   const started = Date.now();
   await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', {}, 90_000),
-    /Direct connect timeout/);
+    (error: any) => error.code === 'ETIMEDOUT' && !(error instanceof DeliveryTimeoutError));
   assert.ok(Date.now() - started < 3000, 'TCP establishment must not wait for the 90s RPC deadline');
   await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', {}, 20),
-    /Direct connect timeout/);
+    (error: any) => error.code === 'ETIMEDOUT' && !(error instanceof DeliveryTimeoutError));
   connect.mock.restore();
   const closing = t.mock.method(Socket.prototype, 'connect', function (this: Socket) {
     queueMicrotask(() => this.destroy());
@@ -410,4 +410,16 @@ test('direct frame gives a connected slow executor the full RPC timeout', async 
   await once(server, 'listening');
   const endpoint = '127.0.0.1:' + (server.address() as { port: number }).port;
   assert.deepEqual(await internal.directFrame({}, 'target', endpoint, {}, 4000), { senderNodeId: 'target' });
+});
+
+
+test('oversized direct frames reject before opening a socket', async t => {
+  const transport = new P2PTransportService();
+  const internal = transport as unknown as {
+    directFrame(mount: unknown, target: string, address: string, frame: unknown, timeout: number): Promise<unknown>;
+  };
+  const connect = t.mock.method(Socket.prototype, 'connect', function (this: Socket) { return this; });
+  await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', { ciphertext: 'x'.repeat(8 * 1024 * 1024) }, 100),
+    LocalDeliveryError);
+  assert.equal(connect.mock.callCount(), 0);
 });

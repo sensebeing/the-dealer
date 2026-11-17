@@ -590,6 +590,8 @@ export interface OutboxStoreLike {
   enqueue(input: OutboxEnqueueInput): OutboxItem;
   /** Atomically reserve one obligation per (networkId, idempotencyKey) under the store lock. */
   claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
+  /** Release a pristine claim after routing fails before any send. */
+  abandonUnattemptedClaim?(id: string): void;
   /** Terminal local/routing failure with no signed target receipt. */
   markFailed(id: string, lastError: string): OutboxItem | undefined;
 }

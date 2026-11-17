@@ -379,24 +379,32 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               }
             }
           }
+          // Claim before routing so terminal retries cannot select a new execution target.
+          // Concurrent emitters with the same key converge on one envelope/obligation; the store lock is the
+          // only place that decides which caller owns the initial send.
+          let claimedItem: OutboxItem | undefined;
+          if (queueIfOffline && envelope.idempotencyKey && envelope.routing.mode !== 'broadcast') {
+            const claim = outbox.claimIdempotency({
+              envelope,
+              explicitTargets: [...(envelope.routing.targets ?? [])],
+              filePaths: stagedPaths,
+            });
+            if (!claim.claimed) {
+              return replayObligation(claim.item);
+            }
+            claimedItem = claim.item;
+          }
           let route: RouteDecision;
           try {
             route = await router.route(envelope);
+            if (claimedItem && route.mode === 'broadcast') {
+              throw new LocalDeliveryError('Keyed outbox obligation cannot route to broadcast');
+            }
           } catch (error) {
             // An unresolved explicit selector is a peering gap, not a routing bug: the
             // durable outbox retries it once the peer directory learns the member again.
             // Network mount state is irrelevant here; identity resolution is directory-owned.
             if (isUnresolvedTargetError(error) && queueIfOffline) {
-              const claimed = envelope.idempotencyKey
-                ? outbox.claimIdempotency({
-                    envelope,
-                    explicitTargets: [...(input.routing.targets ?? [])],
-                    filePaths: stagedPaths,
-                  })
-                : undefined;
-              if (claimed && !claimed.claimed) {
-                return replayQueued(claimed.item);
-              }
               const detail = error.message;
               outbox.enqueue({
                 envelope,
@@ -413,22 +421,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               });
               return { messageId: envelope.id, traceId: envelope.traceId, receipts: [receipt] };
             }
+            if (claimedItem) outbox.abandonUnattemptedClaim?.(claimedItem.id);
             throw error;
-          }
-          // Atomic claim after routing but before the first byte: concurrent emitters with
-          // the same key converge on one envelope/obligation, and the store lock is the
-          // only place that decides which caller owns the initial send.
-          let claimedItem: OutboxItem | undefined;
-          if (queueIfOffline && envelope.idempotencyKey && route.mode !== 'broadcast') {
-            const claim = outbox.claimIdempotency({
-              envelope,
-              explicitTargets: [...(input.routing.targets ?? [])],
-              filePaths: stagedPaths,
-            });
-            if (!claim.claimed) {
-              return replayQueued(claim.item);
-            }
-            claimedItem = claim.item;
           }
           const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));
           const spoolBlobHashes = [
@@ -779,11 +773,19 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
       };
 
       /** Reuse an already durable obligation without emitting a second outbox entry. */
-      const replayQueued = (existing: OutboxItem): EmitResult => {
+      const replayObligation = (existing: OutboxItem): EmitResult => {
         const receipts: DeliveryReceipt[] = [
           ...Object.values(existing.deliveredReceipts),
           ...Object.values(existing.failedReceipts),
         ];
+        if (existing.status === 'failed' &&
+            !(existing.failedNodeIds.length > 0 &&
+              existing.failedNodeIds.every(id => Boolean(existing.failedReceipts[id])))) {
+          throw Object.assign(new LocalDeliveryError(existing.lastError ?? 'Durable outbox obligation failed'), { receipts });
+        }
+        if (existing.status !== 'queued') {
+          return { messageId: existing.id, traceId: existing.envelope.traceId, receipts };
+        }
         const pending = existing.pendingNodeIds.length > 0
           ? existing.pendingNodeIds
           : [undefined];
