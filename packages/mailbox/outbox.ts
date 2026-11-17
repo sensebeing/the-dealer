@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { envelopeClaimVersion } from '../core-types/index.ts';
+import { envelopeClaimVersion, isConfirmedHandoffReceipt } from '../core-types/index.ts';
 import {
   copyFileAtomically,
   withOwnedLock,
@@ -350,7 +350,7 @@ export class OutboxStore {
   }
 
   /**
-   * Atomically create a newer version or join the highest durable version of a key. The
+   * Atomically create work or join the highest reusable obligation version of a key. The
    * check and the reservation happen under the same store lock, so concurrent emitters
    * cannot both observe "absent" and mint different envelopes/obligations. A claimed item
    * starts with no confirmed delivery and a lease: if the process dies before the first
@@ -373,6 +373,10 @@ export class OutboxStore {
       let highestVersion = -1;
       for (const item of state.items) {
         if (item.networkId !== input.envelope.networkId || item.envelope.idempotencyKey !== key) continue;
+        const receipts = Object.values(item.deliveredReceipts);
+        const reusable = item.status === 'queued' || (item.status === 'delivered' &&
+          receipts.length > 0 && receipts.every(receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: false })));
+        if (!reusable) continue;
         // Legacy claims could contain invalid versions; they cannot outrank valid work.
         const itemVersion = envelopeClaimVersion(item.envelope) ?? 0;
         if (itemVersion > highestVersion) {

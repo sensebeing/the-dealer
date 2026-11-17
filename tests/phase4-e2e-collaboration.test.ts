@@ -1037,8 +1037,8 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
     patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
   });
   await connect(alice, bob);
-  // This test probes receiver recovery across revisions, not sender obligation replay.
-  const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity', queueIfOffline: false };
+  // A prior gate-dnd handoff must not hide the receiver's ambiguous recovery state.
+  const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity' };
   assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'queued');
   const message = bob.gate.listDndQueue()[0].envelope;
   const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);

@@ -4800,35 +4800,28 @@ test('terminal keyed delivery replays its signed receipt before auto-routing can
   assert.equal(second.receipts[0].fromNodeId, harness.targetCard.nodeId);
 });
 
-test('terminal keyed rejections and local failures replay without sending again', async t => {
+test('keyed gate rejections and local failures allow retry and reuse a later execution', async t => {
   for (const localFailure of [false, true]) {
-    const harness = await emitterHarness(t, { extraMembers: ['aya'],
-      plan: target => target === harness.targetCard.nodeId
-        ? localFailure ? { error: new LocalDeliveryError('invalid wire reply') } : { stage: 'rejected' }
-        : {},
+    let recovered = false;
+    const harness = await emitterHarness(t, {
+      plan: () => recovered ? {} : localFailure
+        ? { error: new LocalDeliveryError('invalid wire reply') }
+        : { stage: 'rejected', detail: 'Gate closed' },
     });
     const input: EmitMessageInput = { networkId: harness.networkId,
-      routing: { mode: 'multicast', targets: ['member:diz', 'member:aya'] },
-      kind: 'task', subject: 'terminal key', body: 'retain evidence', payload: {}, idempotencyKey: 'terminal-key' };
-    if (localFailure) {
-      await assert.rejects(harness.emitter.emit(input), /invalid wire reply/);
-      const item = harness.outbox.list({ status: 'failed' })[0];
-      await assert.rejects(harness.emitter.emit(input), (error: any) => {
-        assert.ok(error instanceof LocalDeliveryError);
-        assert.match(error.message, /invalid wire reply/);
-        assert.deepEqual(error.receipts, Object.values(item.deliveredReceipts));
-        return true;
-      });
-    } else {
-      const first = await harness.emitter.emit(input);
-      const second = await harness.emitter.emit(input);
-      assert.equal(second.messageId, first.messageId);
-      assert.equal(second.receipts.length, 2);
-      assert.deepEqual(second.receipts.find(receipt => receipt.stage === 'rejected'),
-        first.receipts.find(receipt => receipt.stage === 'rejected'));
-      assert.ok(second.receipts.every(receipt => receipt.stage !== 'queued'));
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'task', subject: 'retry key', body: 'retry after recovery', payload: {}, idempotencyKey: 'terminal-key' };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (localFailure) await assert.rejects(harness.emitter.emit(input), /invalid wire reply/);
+      else assert.equal((await harness.emitter.emit(input)).receipts[0].detail, 'Gate closed');
     }
     assert.equal(harness.sendCalls.length, 2);
+    assert.equal(harness.outbox.list({ status: 'failed' }).length, 2);
+    recovered = true;
+    const delivered = await harness.emitter.emit(input);
+    assert.equal(delivered.receipts[0].stage, 'dispatched');
+    assert.deepEqual(await harness.emitter.emit(input), delivered);
+    assert.equal(harness.sendCalls.length, 3, 'lookup skips earlier failed items and reuses settled execution');
   }
 });
 
