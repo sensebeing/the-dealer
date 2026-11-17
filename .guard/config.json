@@ -45,7 +45,9 @@
           "AGENTS.md",
           "docs/wire-protocol.md"
         ],
-        "dependencies": []
+        "dependencies": [],
+        "role": "Shared wire contracts, cryptography and deterministic encoding",
+        "layer": "foundation"
       },
       {
         "path": "packages/subprocess",
@@ -55,7 +57,9 @@
         "boundary_docs": [
           "AGENTS.md"
         ],
-        "dependencies": []
+        "dependencies": [],
+        "role": "Host-neutral OS command execution and PATH lookup",
+        "layer": "foundation"
       },
       {
         "path": "packages/process-lock",
@@ -65,7 +69,9 @@
         "boundary_docs": [
           "AGENTS.md"
         ],
-        "dependencies": []
+        "dependencies": [],
+        "role": "Process incarnation identity and stale-owner evidence",
+        "layer": "foundation"
       },
       {
         "path": "packages/fs-atomic",
@@ -77,7 +83,9 @@
         ],
         "dependencies": [
           "packages/process-lock"
-        ]
+        ],
+        "role": "Atomic persistence and recoverable directory locks",
+        "layer": "foundation"
       },
       {
         "path": "packages/kernel",
@@ -90,7 +98,9 @@
         ],
         "dependencies": [
           "packages/core-types"
-        ]
+        ],
+        "role": "Plugin lifecycle, service injection and typed event composition",
+        "layer": "foundation"
       },
       {
         "path": "packages/plugins-agent-host",
@@ -99,7 +109,8 @@
         ],
         "boundary_docs": [
           "AGENTS.md",
-          "docs/architecture.md"
+          "docs/architecture.md",
+          "docs/plugin-guide.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -118,7 +129,8 @@
         ],
         "boundary_docs": [
           "AGENTS.md",
-          "docs/architecture.md"
+          "docs/architecture.md",
+          "docs/plugin-guide.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -142,9 +154,10 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel",
-          "packages/fs-atomic",
-          "native/dealer-iroh-engine"
-        ]
+          "packages/fs-atomic"
+        ],
+        "role": "Network discovery, encrypted frames and attachment transport",
+        "layer": "core"
       },
       {
         "path": "native/dealer-iroh-engine",
@@ -155,7 +168,9 @@
           "AGENTS.md",
           "docs/wire-protocol.md"
         ],
-        "dependencies": []
+        "dependencies": [],
+        "role": "Native Iroh network and blob transport engine",
+        "layer": "foundation"
       },
       {
         "path": "packages/node",
@@ -169,7 +184,9 @@
           "packages/core-types",
           "packages/kernel",
           "packages/fs-atomic"
-        ]
+        ],
+        "role": "Local identity and network-scoped peer directory",
+        "layer": "core"
       },
       {
         "path": "packages/router",
@@ -182,7 +199,9 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel"
-        ]
+        ],
+        "role": "Outbound selector and capability routing",
+        "layer": "core"
       },
       {
         "path": "packages/gate",
@@ -196,7 +215,9 @@
           "packages/core-types",
           "packages/kernel",
           "packages/fs-atomic"
-        ]
+        ],
+        "role": "Inbound admission and durable approval or DND queues",
+        "layer": "core"
       },
       {
         "path": "packages/dispatcher",
@@ -210,7 +231,9 @@
           "packages/core-types",
           "packages/kernel",
           "packages/fs-atomic"
-        ]
+        ],
+        "role": "Policy chain, executor registration and durable delivery ledger",
+        "layer": "core"
       },
       {
         "path": "packages/emitter",
@@ -223,7 +246,9 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel"
-        ]
+        ],
+        "role": "Signed outbound messages, attachment sharing and receipt verification",
+        "layer": "core"
       },
       {
         "path": "packages/mailbox",
@@ -231,8 +256,7 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md",
-          "docs/architecture.md"
+          "AGENTS.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -254,7 +278,9 @@
         "dependencies": [
           "packages/core-types",
           "packages/fs-atomic"
-        ]
+        ],
+        "role": "Deduplication and claim revision CAS policy",
+        "layer": "plugin"
       },
       {
         "path": "packages/plugins-router",
@@ -270,7 +296,9 @@
           "packages/kernel",
           "packages/router",
           "packages/subprocess"
-        ]
+        ],
+        "role": "Local agent, LLM and team registry route judges",
+        "layer": "plugin"
       },
       {
         "path": "packages/plugins-source",
@@ -283,30 +311,14 @@
         ],
         "dependencies": [
           "packages/core-types",
-          "packages/kernel",
           "packages/fs-atomic",
           "packages/subprocess"
-        ]
+        ],
+        "role": "Webhook, polling and script event sources",
+        "layer": "plugin"
       },
       {
         "path": "packages/plugins-executor",
-        "languages": [
-          "TypeScript"
-        ],
-        "boundary_docs": [
-          "AGENTS.md",
-          "docs/plugin-guide.md",
-          "docs/architecture.md"
-        ],
-        "dependencies": [
-          "packages/core-types",
-          "packages/mailbox",
-          "packages/subprocess"
-        ],
-        "role": "Generic inbound executor utilities and mailbox authority contracts; concrete host and Orca behavior belongs to their plugins."
-      },
-      {
-        "path": "packages/plugins-lark-notifier",
         "languages": [
           "TypeScript"
         ],
@@ -316,11 +328,31 @@
         ],
         "dependencies": [
           "packages/core-types",
+          "packages/mailbox",
+          "packages/subprocess"
+        ],
+        "role": "Inbox, notification and raw command executors",
+        "layer": "plugin"
+      },
+      {
+        "path": "packages/plugins-lark-notifier",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/architecture.md",
+          "docs/plugin-guide.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
           "packages/kernel",
           "packages/mailbox",
           "packages/fs-atomic",
           "packages/subprocess"
-        ]
+        ],
+        "role": "Lifecycle-owned Lark mirror of mailbox and admission events",
+        "layer": "plugin"
       },
       {
         "path": "packages/cli",
@@ -329,7 +361,8 @@
         ],
         "boundary_docs": [
           "AGENTS.md",
-          "docs/architecture.md"
+          "docs/architecture.md",
+          "docs/plugin-guide.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -352,188 +385,68 @@
           "packages/plugins-orca",
           "packages/plugins-agent-host"
         ],
-        "role": "CLI and control-socket RPC, daemon composition and binding presets; injects wakeup drivers and delegates Orca binding transitions to plugins-orca."
-      }
-    ],
-    "forbidden_imports": [
-      {
-        "from": "packages/core-types/",
-        "imports": [
-          "../fs-atomic",
-          "../kernel",
-          "../transport",
-          "../node",
-          "../router",
-          "../gate",
-          "../dispatcher",
-          "../emitter",
-          "../mailbox",
-          "../plugins-orca",
-          "../plugins-agent-host",
-          "../plugins-policy",
-          "../plugins-router",
-          "../plugins-source",
-          "../plugins-executor",
-          "../plugins-lark-notifier",
-          "../cli",
-          "../subprocess"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "core-types is the leaf contract layer and must not import runtime packages."
+        "role": "Runtime composition registry, configuration and command entrypoints",
+        "layer": "cli"
       },
       {
-        "from": "packages/kernel/",
-        "imports": [
-          "../transport",
-          "../node",
-          "../router",
-          "../gate",
-          "../dispatcher",
-          "../emitter",
-          "../mailbox",
-          "../plugins-orca",
-          "../plugins-agent-host",
-          "../plugins-policy",
-          "../plugins-router",
-          "../plugins-source",
-          "../plugins-executor",
-          "../plugins-lark-notifier",
-          "../cli",
-          "../subprocess"
+        "path": "packages",
+        "languages": [
+          "TypeScript"
         ],
-        "rule_id": "guard.service-boundaries",
-        "message": "kernel owns lifecycle and dependency injection only; it must not import P2P, routing, gate, mailbox, or executor modules."
-      },
-      {
-        "from": "packages/mailbox/",
-        "imports": [
-          "../plugins-executor",
-          "../cli",
-          "../dispatcher",
-          "../gate",
-          "../router",
-          "../transport",
-          "../plugins-orca",
-          "../plugins-agent-host",
-          "../plugins-policy",
-          "../plugins-router",
-          "../plugins-source",
-          "../plugins-lark-notifier"
+        "layer": "cli",
+        "role": "Public package exports; no runtime ownership",
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
-        "rule_id": "guard.service-boundaries",
-        "message": "mailbox owns opaque durable storage and driver-neutral redrive; all external host behavior is injected by Ring-2 plugins."
-      },
-      {
-        "from": "packages/gate/",
-        "imports": [
-          "../plugins-executor",
-          "../cli",
-          "../plugins-orca"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "gate owns inbound admission only and must not invoke executors directly."
-      },
-      {
-        "from": "packages/subprocess/",
-        "imports": [
-          ".."
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "subprocess is a foundation leaf for OS commands and PATH lookup; it must not import sibling packages."
-      },
-      {
-        "from": "packages/plugins-router/",
-        "imports": [
-          "../plugins-orca"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "plugins-router must use subprocess for generic OS commands, not depend on Orca workspace operations."
-      },
-      {
-        "from": "packages/plugins-source/",
-        "imports": [
-          "../plugins-orca"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "plugins-source must use subprocess for generic OS commands, not depend on Orca workspace operations."
-      },
-      {
-        "from": "packages/plugins-lark-notifier/",
-        "imports": [
-          "../plugins-orca"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "plugins-lark-notifier must use subprocess for generic OS commands, not depend on Orca workspace operations."
-      },
-      {
-        "from": "packages/plugins-agent-host/",
-        "imports": [
-          "../cli"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
-      },
-      {
-        "from": "packages/plugins-orca/",
-        "imports": [
-          "../cli"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
-      },
-      {
-        "from": "packages/plugins-policy/",
-        "imports": [
-          "../cli"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
-      },
-      {
-        "from": "packages/plugins-router/",
-        "imports": [
-          "../cli"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
-      },
-      {
-        "from": "packages/plugins-source/",
-        "imports": [
-          "../cli"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
-      },
-      {
-        "from": "packages/plugins-executor/",
-        "imports": [
-          "../cli"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
-      },
-      {
-        "from": "packages/plugins-lark-notifier/",
-        "imports": [
-          "../cli"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
-      },
-      {
-        "from": "packages/plugins-executor/",
-        "imports": [
-          "../plugins-orca",
-          "../plugins-agent-host"
-        ],
-        "rule_id": "guard.service-boundaries",
-        "message": "Generic executor utilities must remain host-neutral."
+        "dependencies": [
+          "packages/core-types",
+          "packages/process-lock",
+          "packages/kernel",
+          "packages/transport",
+          "packages/node",
+          "packages/emitter",
+          "packages/router",
+          "packages/gate",
+          "packages/dispatcher",
+          "packages/plugins-orca",
+          "packages/subprocess",
+          "packages/mailbox",
+          "packages/plugins-source",
+          "packages/plugins-router",
+          "packages/plugins-policy",
+          "packages/plugins-executor",
+          "packages/cli",
+          "packages/plugins-lark-notifier",
+          "packages/plugins-agent-host"
+        ]
       }
     ],
     "architecture_docs": [
       "AGENTS.md",
-      "docs/architecture.md"
-    ]
+      "docs/architecture.md",
+      "docs/plugin-guide.md"
+    ],
+    "enforce_module_dependencies": true,
+    "layers": {
+      "foundation": [
+        "foundation"
+      ],
+      "core": [
+        "foundation",
+        "core"
+      ],
+      "plugin": [
+        "foundation",
+        "core",
+        "plugin"
+      ],
+      "cli": [
+        "foundation",
+        "core",
+        "plugin",
+        "cli"
+      ]
+    }
   }
 }

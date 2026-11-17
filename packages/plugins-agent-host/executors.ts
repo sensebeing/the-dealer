@@ -221,6 +221,7 @@ function createAgentExecutorPlugin(
           claim = (options.wakeup ?? config.wakeup)?.claim(mailboxId);
           if (store) {
             store.enqueue(batch, {
+              ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}),
               mailboxId,
               wakeTarget: {
                 driver: 'agent-host',

@@ -1,7 +1,7 @@
-import { resolveConfiguredOrcaWakeTargetPatch } from '../plugins-orca/index.ts';
-import { createOrcaWakeupDrivers, pinOrcaTerminalSessionMailbox } from '../plugins-orca/index.ts';
+import { createNotifyExecutorPlugin, createInboxExecutorPlugin } from '../plugins-executor/index.ts';
+import { createOrcaWakeupDrivers } from '../plugins-orca/index.ts';
 import { createAgentHostWakeupDriver } from '../plugins-agent-host/index.ts';
-import { toMailboxTopicBinding } from './config.ts';
+import { createDefaultHostPluginRegistry } from './registry.ts';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, chmodSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -26,14 +26,12 @@ import {
   isDedupCasDuplicateReceipt,
   isDurableQueuedReceipt,
 } from '../core-types/index.ts';
-import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, orcaAgent, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
 import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityCliExecutorPlugin, createAntigravityAppExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin, createAgentPtyExecutorPlugin } from '../plugins-agent-host/index.ts';
-import { createNotifyExecutorPlugin, createInboxExecutorPlugin } from '../plugins-executor/index.ts';
-import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
+import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, WakeupRedriveService } from '../mailbox/index.ts';
-import { resolveOrcaWaveRotateAfterWaves } from '../plugins-orca/index.ts';
+import { MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -174,13 +172,16 @@ export class DealerNodeRuntime {
   outbox!: OutboxStore;
   outboxRedrive!: OutboxRedriveService;
   wakeups!: WakeupRedriveService;
-  larkNotifier?: LarkMailboxNotifier;
+  readonly registry = createDefaultHostPluginRegistry();
+
+  get larkNotifier() {
+    return this.kernel.hasService('larkNotifier') ? this.kernel.getService('larkNotifier') : undefined;
+  }
   private loadedProjects = new Map<string, { manifest: DealerProjectManifest; plugins: LoadedExternalPlugin[]; userPatch?: Partial<RuntimeConfig>; rootPath: string }>();
   private loadedUserPlugins = new Map<string, LoadedExternalPlugin>();
   private externalChanges: Promise<unknown> = Promise.resolve();
   private server?: Server;
-  private registerBuiltinExecutor?: (name: string) => void;
-  private registeredBuiltinNames = new Set<string>();
+  private registerConfiguredExecutor?: (name: string) => void;
   private started = false;
   private ownsLock = false;
   private activeMutatingControlRequests = 0;
@@ -239,7 +240,7 @@ export class DealerNodeRuntime {
   }
 
   persist(): void {
-    validateConfig(this.config);
+    validateConfig(this.config, { executorOverrides: this.options.executorOverrides, registry: this.registry });
     saveJson(join(this.stateDir, 'config.json'), this.config);
     this.writeDaemonFingerprintRecord();
     this.onConfigPersisted?.();
@@ -441,6 +442,7 @@ export class DealerNodeRuntime {
       this.ownsLock = true;
       holdOwnedDirectory(this.stateDir);
     }
+    let startupSourceHold: { release(options?: { start?: boolean }): void } | undefined;
     // Freeze the loaded code once. Subsequent config writes must not adopt disk edits.
     this.loadedDealerEntries = dealerCodeFingerprintEntries();
     try {
@@ -491,7 +493,7 @@ export class DealerNodeRuntime {
         this.config.executors = [...new Set([...this.config.executors, ...profile.executors])];
       }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
-      validateConfig(this.config);
+      validateConfig(this.config, { executorOverrides: this.options.executorOverrides, registry: this.registry });
       this.mailbox = new MailboxStore(join(this.stateDir, 'mailbox.json'), {
         legacyInboxPath:
           this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'),
@@ -552,7 +554,9 @@ export class DealerNodeRuntime {
       );
       await this.kernel.use(
         createDispatcherPlugin({
+          requiredPolicies: () => this.config.policies,
           ledgerPath: join(this.stateDir, 'deliveries.json'),
+          wrapExecutor: executor => this.wrapExecutorWithAttachments(executor),
           resolveKindExecutor: (kind, streamKey) => this.resolveTopicDefaultExecutor(kind, streamKey) ?? this.config.defaultExecutor,
         }),
       );
@@ -564,6 +568,7 @@ export class DealerNodeRuntime {
           },
         }),
       );
+      startupSourceHold = this.emitter.holdSources?.();
       await this.kernel.use(this.integrationPlugin());
       this.outboxRedrive = new OutboxRedriveService({
         outbox: this.outbox,
@@ -593,23 +598,25 @@ export class DealerNodeRuntime {
           );
         },
       });
-      for (const network of this.config.networks) {
-        await this.transport.mountNetwork(network);
-        if (network.admissionMode) {
-          await this.node.updateNetworkAdmissionMode(network.networkId, network.admissionMode);
-        }
-      }
       for (const route of this.config.routes) {
         this.installRoute(route);
-      }
-      for (const source of this.config.sources) {
-        await this.installSource(source);
       }
       for (const project of [...this.config.projects]) {
         await this.linkProject(project.rootPath, project.userPatchPath, { restore: true });
       }
       for (const ref of [...this.config.userPlugins]) {
         await this.installUserPlugin(ref);
+      }
+      this.assertConfiguredPluginsRegistered();
+      for (const network of this.config.networks) {
+        await this.transport.mountNetwork(network);
+        if (network.admissionMode) {
+          await this.node.updateNetworkAdmissionMode(network.networkId, network.admissionMode);
+        }
+      }
+      startupSourceHold?.release({ start: true });
+      for (const source of this.config.sources) {
+        await this.installSource(source);
       }
       const gate = this.kernel.ctx.services.gate as NetworkGateService;
       for (const networkId of this.transport.listMountedNetworks()) {
@@ -630,6 +637,7 @@ export class DealerNodeRuntime {
       this.started = true;
       return this;
     } catch (error) {
+      startupSourceHold?.release({ start: false });
       await this.stop();
       throw error;
     }
@@ -699,6 +707,16 @@ export class DealerNodeRuntime {
     return { plugin, config };
   }
 
+  private assertConfiguredPluginsRegistered(): void {
+    const dispatcher = this.kernel.getService('dispatcher');
+    for (const name of new Set([...this.config.executors, this.config.defaultExecutor])) {
+      if (!dispatcher.hasExecutor(name)) throw new Error(`Unknown executor: ${name}`);
+    }
+    for (const name of this.config.policies) {
+      if (!dispatcher.hasPolicy(name)) throw new Error(`Unknown policy: ${name}`);
+    }
+  }
+
   private async replaceExternal(
     previous: LoadedExternalPlugin[],
     next: LoadedExternalPlugin[],
@@ -713,12 +731,14 @@ export class DealerNodeRuntime {
       occupied.add(entry.plugin.name);
     }
     const config = structuredClone(this.config);
+    const hold = this.emitter.holdSources?.();
     try {
       await this.kernel.applyPatch(previous.map(({ plugin }) => ({ name: plugin.name, enabled: false })));
       for (const entry of next) {
         await this.kernel.use(entry.plugin, entry.config);
       }
       await commit();
+      if (this.started) this.assertConfiguredPluginsRegistered();
       this.persist();
     } catch (error) {
       this.config = config;
@@ -732,6 +752,8 @@ export class DealerNodeRuntime {
         throw new AggregateError([error, rollbackError], 'External plugin change and rollback failed');
       }
       throw error;
+    } finally {
+      hold?.release({ start: !this.stopPromise });
     }
   }
 
@@ -769,7 +791,7 @@ export class DealerNodeRuntime {
       const patchPath = resolve(userPatchPath ?? join(this.stateDir, 'projects', `${manifest.projectId}.patch.json`));
       const userPatch: Record<string, any> | undefined = existsSync(patchPath) ? readPatch(patchPath) : undefined;
       const bindings = userPatch?.topicBindings === undefined ? {} : userPatch.topicBindings;
-      validateTopicBindings(bindings, this.config.executors);
+      validateTopicBindings(bindings, this.config.executors, this.registry);
       for (const [kind, binding] of Object.entries(bindings)) {
         for (const [otherId, other] of this.loadedProjects) {
           const previous = other.userPatch?.topicBindings?.[kind];
@@ -816,6 +838,13 @@ export class DealerNodeRuntime {
           await this.publishSkills();
           this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
           this.loadedProjectEntries.set(manifest.projectId, projectEntries);
+          if (options.restore && onboardingPassphrase && manifest.onboarding?.bootstrapPeers?.length) {
+            const network = this.config.networks.find(entry =>
+              entry.networkId === onboardingNetworkId && entry.passphrase === onboardingPassphrase);
+            if (network) {
+              network.bootstrapPeers = [...new Set([...(network.bootstrapPeers ?? []), ...manifest.onboarding.bootstrapPeers])];
+            }
+          }
           if (onboardingPassphrase && !options.restore && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
             await this.mountNetwork({
               networkId: onboardingNetworkId,
@@ -952,26 +981,31 @@ export class DealerNodeRuntime {
   private executorTopicBinding = (kind: string, streamKey?: string) => {
     const resolved = this.resolveTopicBinding(kind, streamKey);
     if (!resolved) return undefined;
-    const addressing = toMailboxTopicBinding(resolved.binding, this.config.executorConfig);
+    const addressing = this.registry.toMailboxBinding(resolved.binding, this.config.executorConfig);
     return { ...resolved.binding, defaultMode: addressing.mode, stream: addressing.stream, repoRoot: resolved.projectRoot };
   };
 
   private resolveTopicMailboxBinding = (kind: string, streamKey?: string) => {
     const binding = this.resolveTopicBinding(kind, streamKey)?.binding;
-    return binding ? toMailboxTopicBinding(binding, this.config.executorConfig) : undefined;
+    return binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig) : undefined;
   };
 
   private async activateLarkNotifier(): Promise<void> {
-    if (!this.config.larkNotify?.enabled || this.larkNotifier) return;
+    if (!this.config.larkNotify?.enabled) {
+      if (this.larkNotifier) {
+        await this.kernel.applyPatch([{ name: 'lark-mirror', enabled: false }]);
+      }
+      return;
+    }
     const options = {
       store: this.mailbox, config: this.config.larkNotify, stateDir: this.stateDir,
       localNodeId: this.transport.localNodeId, localMember: this.config.member,
+      defaultBoundMailboxes: this.refreshTopicBindings(),
       commandRunner: this.options.commandRunner ?? runCommand,
       onError: (error: unknown) => { this.lastError = String(error); },
     };
-    this.larkNotifier = new LarkMailboxNotifier(options);
+    await this.kernel.use(createLarkMirrorPlugin(options));
     this.refreshTopicBindings();
-    await this.kernel.use(createLarkMirrorPlugin({ ...options, notifier: this.larkNotifier }));
   }
 
   previewAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { cwd?: string }) {
@@ -985,10 +1019,7 @@ export class DealerNodeRuntime {
     const preset = this.previewAgentPreset(options);
     const host = options.host === 'claude' ? 'claude-code' : options.host;
     const mode = options.mode ?? options.conversationMode ?? 'fixed';
-    const defaultExecutor = !options.setDefault ? this.config.defaultExecutor
-      : mode === 'inbox-only' ? 'inbox'
-      : host === 'orca' ? 'orca'
-      : ['codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(host) ? host : preset.binding.executor;
+    const defaultExecutor = options.setDefault ? preset.defaultExecutor : this.config.defaultExecutor;
     this.config.executors = [...new Set([...this.config.executors, preset.binding.executor, defaultExecutor])];
     this.config.topicBindings = { ...this.config.topicBindings, [preset.topic]: preset.binding };
     for (const [name, config] of Object.entries(preset.executorConfig)) {
@@ -999,13 +1030,13 @@ export class DealerNodeRuntime {
       this.config.larkNotify = preset.larkNotify;
       if (this.started) await this.activateLarkNotifier();
     }
-    for (const name of this.config.executors) this.registerBuiltinExecutor?.(name);
+    for (const name of this.config.executors) this.registerConfiguredExecutor?.(name);
     this.refreshTopicBindings();
     this.persist();
     return { applied: preset.topic, host, mode, defaultExecutor, binding: preset.binding, executorConfig: preset.executorConfig, ...(preset.larkNotify ? { larkNotify: preset.larkNotify } : {}) };
   }
 
-  private refreshTopicBindings(): void {
+  private refreshTopicBindings(): string[] {
     const kinds = new Set(Object.keys(this.config.topicBindings ?? {}));
     for (const project of this.loadedProjects.values()) {
       for (const kind of Object.keys(project.userPatch?.topicBindings ?? {})) kinds.add(kind);
@@ -1013,46 +1044,18 @@ export class DealerNodeRuntime {
     const mailboxes: string[] = [];
     for (const kind of kinds) {
       const { binding, projectRoot } = this.resolveTopicBinding(kind)!;
-      const mailboxId = resolveBoundMailboxId(kind, toMailboxTopicBinding(binding, this.config.executorConfig));
+      const mailboxId = resolveBoundMailboxId(kind, this.registry.toMailboxBinding(binding, this.config.executorConfig));
       const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
-          ['orca', 'orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
+          this.registry.executor(manifest.topics?.[kind]?.defaultExecutor ?? '')?.interactiveAgent === true);
       if (notifyLark) mailboxes.push(mailboxId);
-      const effectiveMode = resolveEffectiveConversationMode({ binding: toMailboxTopicBinding(binding, this.config.executorConfig) });
-      if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && effectiveMode !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
-      const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
-      const current = this.mailbox.getWakeTarget(mailboxId);
-      const resolvedRotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
-            mode: effectiveMode,
-            bindingRotateAfterWaves: rotateAfterWaves,
-            waveRotateAfterWaves: this.config.wave?.rotateAfterWaves,
-            managesWorkspace: Boolean(workspacePath),
-            runId,
-            pinnedTerminalHandle: terminalHandle,
-          });
-      const identityPatch = resolveConfiguredOrcaWakeTargetPatch(current, {
-          mailboxId, runId, workspacePath, configuredTerminalHandle: terminalHandle,
-          configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
-          configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand,
-          configuredResumeCommand: binding.resumeCommand, hasTopicBinding: true, authoritativeConfig: true,
-        });
-      this.mailbox.upsertWakeTarget(mailboxId, {
-        ...identityPatch,
-        wakeupPrefix,
-        coalesceMs: coalesceMs ?? 0,
-        rotateAfterWaves: resolvedRotateAfterWaves,
-        driverConfig: {
-          ...identityPatch.driverConfig,
-          workspacePath,
-          worktreeId,
-          runId,
-          repoRoot: projectRoot,
-          autoCreateWorkspace,
-          workspaceComment,
-        },
+      this.registry.executor(binding.executor)?.syncTopicWakeTarget?.({
+        kind, mailboxId, binding, projectRoot, store: this.mailbox, wave: this.config.wave,
+        addressing: this.registry.toMailboxBinding(binding, this.config.executorConfig),
       });
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);
+    return mailboxes;
   }
 
   resolveTopicDefaultExecutor(kind: string, streamKey?: string): string | undefined {
@@ -1084,6 +1087,28 @@ export class DealerNodeRuntime {
     return this.resolveTopicDefaultExecutor(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined) ?? this.config.defaultExecutor;
   }
 
+  /** Every registered executor receives the same attachment and receiver-config boundary. */
+  private wrapExecutorWithAttachments(executor: ExecutorPlugin<any>): ExecutorPlugin<any> {
+    return { ...executor, execute: async (batch, context, config) => {
+      const local = [];
+      const signedEnvelopes: Record<string, MessageEnvelope> = { ...(context.signedEnvelopes ?? {}) };
+      for (const envelope of batch) {
+        signedEnvelopes[envelope.id] ??= structuredClone(envelope);
+        const directory = join(this.stateDir, 'attachments', encodeURIComponent(envelope.id));
+        const files: string[] = [];
+        for (const [index, attachment] of envelope.attachments.entries()) {
+          mkdirSync(directory, { recursive: true, mode: 0o700 });
+          const destination = join(directory, `${index}-${basename(attachment.name)}`);
+          await this.transport.fetchBlobToPath(attachment.ticket, destination);
+          files.push(destination);
+        }
+        const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload) ? envelope.payload : {};
+        local.push({ ...envelope, payload: { ...payload, localAttachments: files } });
+      }
+      return executor.execute(local, { ...context, signedEnvelopes }, { ...config, ...this.config.executorConfig[executor.name] });
+    } };
+  }
+
   private integrationPlugin(): Plugin {
     return {
       name: 'runtime-plugins',
@@ -1107,15 +1132,14 @@ export class DealerNodeRuntime {
               // Mode hints are normalized by the payload-aware binding adapter below, including
               // queued messages whose executor has not yet validated their payload.
               { ...envelope, payload: { ...envelope.payload, mode: undefined, conversationMode: undefined } },
-              binding ? toMailboxTopicBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
+              binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
               this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
-              toMailboxTopicBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
+              this.registry.toMailboxBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
             );
             // Inbound receipts can arrive after a synchronous pointer delivery; preserve its session.
             const target = this.mailbox.getWakeTarget(mailboxId);
-            const handle = target?.driverConfig?.terminalHandle;
-            const localMailbox = target && !target.pendingWake && typeof handle === 'string'
-              ? pinOrcaTerminalSessionMailbox(this.mailbox, mailboxId, handle) : mailboxId;
+            const localMailbox = target
+              ? this.registry.pinDeliveredInboundMailbox(this.mailbox, mailboxId, target) : mailboxId;
             this.mailbox.recordInboundEnvelope(envelope, localMailbox);
           } catch (error) {
             this.lastError = String(error);
@@ -1127,7 +1151,7 @@ export class DealerNodeRuntime {
           if (!resolved) return next(envelope);
           const bindingKind = typeof envelope.payload?.streamKey === 'string'
             ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
-          const replyMailbox = resolveBoundMailboxId(bindingKind, toMailboxTopicBinding(resolved.binding, this.config.executorConfig));
+          const replyMailbox = resolveBoundMailboxId(bindingKind, this.registry.toMailboxBinding(resolved.binding, this.config.executorConfig));
           return next(replyMailbox === 'default' ? envelope : {
             ...envelope, semantic: { ...(envelope.semantic ?? { type: 'message' as const, threadId: envelope.id }), replyMailbox },
           });
@@ -1147,132 +1171,31 @@ export class DealerNodeRuntime {
         const linkedProjectRoots = Object.fromEntries(
           this.config.projects.map(project => [project.projectId, project.rootPath]),
         );
-        const spawnConfig = this.config.executorConfig['orca-spawn'] ?? {};
-        const executors: Record<string, ExecutorPlugin> = {
-          'orca-spawn': createOrcaSpawnExecutorPlugin({
-            resolveTopicBinding: this.executorTopicBinding,
-            ...spawnConfig,
-            projectRoots: {
-              ...linkedProjectRoots,
-              ...(spawnConfig.projectRoots ?? {}),
-            },
-            commandRunner: this.options.commandRunner,
-          }),
-          'orca': createOrcaExecutorPlugin({
-            ...this.config.executorConfig['orca'],
-            store: this.mailbox,
-            wakeup: this.wakeups,
-            resolveTopicBinding: this.executorTopicBinding,
-            projectRoots: linkedProjectRoots,
-            commandRunner: this.options.commandRunner,
-          }),
-          'orca-wave': createOrcaWaveExecutorPlugin({
-            ...this.config.executorConfig['orca-wave'],
-            resolveTopicBinding: this.executorTopicBinding,
-            commandRunner: this.options.commandRunner,
-          }),
-          'codex-cli': createCodexCliExecutorPlugin({ ...this.config.executorConfig['codex-cli'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
-          'codex': createCodexExecutorPlugin({
-            ...this.config.executorConfig['codex'],
-            store: this.mailbox,
-            wakeup: this.wakeups,
-            resolveTopicBinding: this.executorTopicBinding,
-            commandRunner: this.options.commandRunner,
-          }),
-          'claude-app': createClaudeAppExecutorPlugin({ ...this.config.executorConfig['claude-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
-          'chatgpt-app': createChatgptAppExecutorPlugin({ ...this.config.executorConfig['chatgpt-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
-          'claude-code': createClaudeCodeExecutorPlugin({
-            ...this.config.executorConfig['claude-code'],
-            store: this.mailbox,
-            wakeup: this.wakeups,
-            resolveTopicBinding: this.executorTopicBinding,
-            commandRunner: this.options.commandRunner,
-          }),
-          'antigravity-cli': createAntigravityCliExecutorPlugin({ ...this.config.executorConfig['antigravity-cli'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
-          'antigravity-app': createAntigravityAppExecutorPlugin({ ...this.config.executorConfig['antigravity-app'], store: this.mailbox, wakeup: this.wakeups, resolveTopicBinding: this.executorTopicBinding, commandRunner: this.options.commandRunner }),
-          'antigravity': createAntigravityExecutorPlugin({
-            ...this.config.executorConfig['antigravity'],
-            store: this.mailbox,
-            wakeup: this.wakeups,
-            resolveTopicBinding: this.executorTopicBinding,
-            commandRunner: this.options.commandRunner,
-          }),
-          'agent-pty': createAgentPtyExecutorPlugin({
-            ...this.config.executorConfig['agent-pty'],
-            store: this.mailbox,
-            wakeup: this.wakeups,
-            resolveTopicBinding: this.executorTopicBinding,
-            commandRunner: runner,
-          }),
-          inbox: createInboxExecutorPlugin({
-            ...this.config.executorConfig.inbox,
-            resolveTopicBinding: this.resolveTopicMailboxBinding,
-            store: this.mailbox,
-            wakeup: this.wakeups,
-            commandRunner: runner,
-          }),
-          notify: createNotifyExecutorPlugin({
-            inboxPath: join(this.stateDir, 'notifications.jsonl'),
-            ...this.config.executorConfig.notify,
-            commandRunner: runner,
-          }),
-        };
-        for (const executor of this.options.executorOverrides ?? []) {
-          executors[executor.name] = executor;
-        }
-        const registered = new Set<string>();
-        this.registerBuiltinExecutor = name => {
-          if (registered.has(name) || this.registeredBuiltinNames.has(name)) return;
-          const executor = executors[name];
-          if (!executor) throw new Error(`Unknown executor: ${name}`);
-          const wrapped: ExecutorPlugin = {
-            ...executor,
-            execute: async (batch, context, config) => {
-              const local = [];
-              for (const envelope of batch) {
-                const directory = join(this.stateDir, 'attachments', encodeURIComponent(envelope.id));
-                const files: string[] = [];
-                for (const [index, attachment] of envelope.attachments.entries()) {
-                  mkdirSync(directory, { recursive: true, mode: 0o700 });
-                  const destination = join(directory, `${index}-${basename(attachment.name)}`);
-                  await this.transport.fetchBlobToPath(attachment.ticket, destination);
-                  files.push(destination);
-                }
-                const localEnvelope = files.length
-                  ? { ...envelope, payload: { ...envelope.payload, localAttachments: files } }
-                  : envelope;
-                local.push(localEnvelope);
-              }
-              return executor.execute(local, context, { ...config, ...this.config.executorConfig[name] });
-            },
-          };
+        const overrides = new Map((this.options.executorOverrides ?? []).map(executor => [executor.name, executor]));
+        this.registerConfiguredExecutor = name => {
+          if (ctx.services.dispatcher.hasExecutor(name)) return;
+          const descriptor = this.registry.executor(name);
+          const override = overrides.get(name);
+          if (!descriptor && !override) return; // External plugins register after the composition root.
+          const created = descriptor?.create({
+            stateDir: this.stateDir, config: this.config.executorConfig[name] ?? {},
+            store: this.mailbox, wakeup: this.wakeups, wave: this.config.wave,
+            projectRoots: linkedProjectRoots, commandRunner: runner,
+            resolveTopicBinding: this.executorTopicBinding, resolveMailboxBinding: this.resolveTopicMailboxBinding,
+          });
           const registration = ctx.services.dispatcher.registerExecutor(
-            wrapped,
-            name === 'orca-wave' || name === 'orca'
-              ? {
-                  ...this.config.executorConfig[name],
-                  store: this.mailbox,
-                  wakeup: this.wakeups,
-                  wave: this.config.wave,
-                }
-              : name === 'orca-spawn'
-                ? {
-                    ...this.config.executorConfig[name],
-                    store: this.mailbox,
-                    wakeup: this.wakeups,
-                  }
-                : (this.config.executorConfig[name] ?? {}),
+            override ?? created!.plugin, created?.runtimeConfig ?? this.config.executorConfig[name] ?? {},
           );
           ctx.effect(() => () => registration.dispose());
-          registered.add(name);
-          this.registeredBuiltinNames.add(name);
         };
-        for (const name of new Set(this.config.executors)) this.registerBuiltinExecutor(name);
-        if (this.config.policies.includes('dedup-cas')) {
+        for (const name of new Set(this.config.executors)) this.registerConfiguredExecutor(name);
+        for (const name of this.config.policies) {
+          const descriptor = this.registry.policy(name);
+          if (!descriptor) continue;
           let legacyLedger: DeliveryLedger | undefined;
           const registration = ctx.services.dispatcher.registerPolicy(
-            createDedupCasPolicyPlugin({
-              watermarksPath: join(this.stateDir, 'dedup-watermarks.json'),
+            descriptor.create({
+              stateDir: this.stateDir,
               resolveLegacyWatermarkStatus: (key, revision) => {
                 const parts: unknown = JSON.parse(key);
                 if (!Array.isArray(parts) || parts.length !== 3 || parts.some(part => typeof part !== 'string')) {
@@ -1435,17 +1358,9 @@ export class DealerNodeRuntime {
     } else {
       throw new Error(`Unknown source type: ${spec.type}`);
     }
-    let started: Promise<void> = Promise.resolve();
-    const registration = this.emitter.registerSource({
-      name: source.name,
-      start: emitter => {
-        started = Promise.resolve(source.start(emitter));
-        return started;
-      },
-      stop: () => source.stop(),
-    });
+    const registration = this.emitter.registerSource(source);
     try {
-      await started;
+      await registration.started;
       return registration;
     } catch (error) {
       try {
@@ -1738,7 +1653,6 @@ export class DealerNodeRuntime {
     } finally {
       try {
         await this.kernel.stop();
-        this.larkNotifier = undefined;
       } finally {
         if (this.ownsLock) {
           // Only the instance that created the control server may remove its socket.

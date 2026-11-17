@@ -287,6 +287,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         try {
           // Once committed, the mailbox owns recovery even if Orca cannot launch the agent.
           store.enqueue(batch, {
+            ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}),
             mailboxId,
             wakeTarget: {
               driver: 'orca-terminal',
@@ -310,7 +311,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
               interactiveCommand, resumeCommand,
               signal: context.signal,
             });
-            if (!launched.committed) return { executor: 'orca-spawn', executionId: randomUUID(), worktreePath: path, woke: false, reason: 'Wake launch superseded by a newer binding' };
+            if (!launched.committed) return { executor: 'orca-spawn', executionId: randomUUID(), mailboxId, worktreePath: path, woke: false, reason: 'Wake launch superseded by a newer binding' };
             terminal = launched.raw;
           } catch (launchError) {
             if (workspaceComment) {
@@ -438,7 +439,7 @@ function optionalPositiveInteger(value: unknown): number | undefined {
 export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): ExecutorPlugin {
   return {
     name: 'orca-wave',
-    async execute(batch, _context, runtimeConfig) {
+    async execute(batch, context, runtimeConfig) {
       const config = (runtimeConfig ?? {}) as Partial<OrcaWaveOptions>;
       const store = options.store ?? config.store;
       if (!store) {
@@ -612,6 +613,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
       const results: Array<{ mailboxId: string; inserted: string[]; woke: boolean; reason?: string }> = [];
       for (const { mailboxId, group, wakeTarget } of prepared) {
         const enqueued = store.enqueue(group.envelopes, {
+          ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}),
           mailboxId,
           ...(wakeTarget ? { wakeTarget } : {}),
         });

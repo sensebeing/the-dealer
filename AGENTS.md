@@ -26,9 +26,24 @@
 | [`packages/subprocess/index.ts`](packages/subprocess/index.ts) | 零内部依赖的 OS 子进程与 PATH 工具唯一 owner：`CommandRequest` / `CommandRunner`、`CommandNotStartedError`、`runCommand`（`shell: false`）、`checkedCommand`、`findExecutable` 与 `singleLine` | 不持有业务状态、不决定执行策略、不依赖任何其他内部包 |
 | [`packages/plugins-orca/`](packages/plugins-orca/index.ts) | Ring-2 Orca 插件唯一 owner：workspace/worktree/terminal CLI、TUI 空闲与输入框草稿保护、命名、rotation policy、`orca-terminal`/`orca-run` WakeupDriver、Orca executors 与 session mailbox 推断/绑定、sessionId/paneKey 转换、retiredSessionId 退休来源、fresh interactiveCommand / 模板 resumeCommand 验证 | 不持有独立信箱账本，不依赖 CLI；持久化 fence 与原子 session pinning 委托给 MailboxStore |
 | [`packages/emitter/index.ts`](packages/emitter/index.ts) & [`packages/plugins-source/index.ts`](packages/plugins-source/index.ts) | 出站消息制备（`emitter/prepare` waterfall）、附件自动 `shareFile`、Ed25519 信封签名、回执签名校验，以及外部事件源（`webhook` / `poll-watermark` / `script`）生命周期托管 | 不允许 `emitter/prepare` 钩子篡改发送方身份或所属 `networkId` |
-| [`packages/cli/`](packages/cli/index.ts) & [`bin/`](bin/dealer.js) | 内置 Profile（`personal-dev` / `dedicated-worker` / `headless-relay` 及宿主预设 `orca-dev` / `codex-dev` / `claude-dev` / `antigravity-dev`）、声明式 JSON/YAML Patch 解析、独占状态目录 `DealerNodeRuntime`（`0700` 目录 + `runtime.lock` + `0600` 私钥与 Unix Control Socket）及 `dealer` / `dealerd` CLI 入口 | 不在 CLI 层重新实现核心服务已有协议或绕过门禁/签名校验 |
+| [`packages/cli/`](packages/cli/index.ts) & [`bin/`](bin/dealer.js) | 内置 Profile（`personal-dev` / `dedicated-worker` / `headless-relay` 及宿主预设 `orca-dev` / `codex-dev` / `claude-dev` / `antigravity-dev`）、声明式 JSON/YAML Patch 解析、独占状态目录 `DealerNodeRuntime`（`0700` 目录 + `runtime.lock` + `0600` 私钥与 Unix Control Socket）、`HostPluginRegistry` 组合根及 `dealer` / `dealerd` CLI 入口 | 不在 CLI 层重新实现核心服务已有协议或绕过门禁/签名校验 |
 
 ---
+
+## 四层依赖契约
+
+`.guard/config.json` 的 `topology.layers` 是依赖层级上限，`enforce_module_dependencies: true` 同时要求每条实际模块依赖显式声明；同层并不意味着可任意互相依赖。模块文档根为 `packages` / `native`，全局架构文档为本文件、`docs/architecture.md`、`docs/plugin-guide.md`。
+
+| Layer | Modules | Allowed dependency layers |
+| --- | --- | --- |
+| foundation | `core-types`, `process-lock`, `fs-atomic`, `subprocess`, `kernel`, `native/dealer-iroh-engine` | foundation |
+| core | `transport`, `node`, `router`, `gate`, `dispatcher`, `emitter`, `mailbox` | foundation, core |
+| plugin | `plugins-policy`, `plugins-router`, `plugins-source`, `plugins-executor`, `plugins-agent-host`, `plugins-orca`, `plugins-lark-notifier` | foundation, core, plugin |
+| cli | `cli`, public export facade `packages/index.ts` | foundation, core, plugin, cli |
+
+`packages/cli/registry.ts` 的 `HostPluginRegistry` 负责内置 executor/policy 描述符组合与宿主绑定适配；`BUILTIN_EXECUTORS` 从默认注册表派生。Orca 绑定校验、wake target 同步和已交付 session pinning 由 `plugins-orca` hooks 提供，宿主名和 setup 映射来自 `AGENT_HOST_DESCRIPTORS`。`dispatcher` 唯一持有活跃 executor/policy 注册；CLI 注入的统一包装为每个 executor（含外部插件）下载附件并提供 `payload.localAttachments`。全部插件加载后核对 enabled executor/policy，缺失时启动失败。
+
+`plugins-lark-notifier` 的 `lark-mirror` 插件通过 Kernel service 暴露 notifier，`ctx.effect` 管理启动与停止；runtime 仅有只读 service getter。绑定仅在 `metadata` 中接受开放的非空字符串注解；顶层字段严格校验，仅显式保留旧 `assignee` 字符串兼容字段且不参与核心路由决策。`WakeupRedriveService` 只使用注入的 `WakeupDriver`，不解释宿主配置。
 
 ## 2. Engineering Quality Policy
 

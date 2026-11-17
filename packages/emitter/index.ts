@@ -58,6 +58,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
       }
       const keyLocks = new Map<string, Promise<unknown>>();
       const sources = new Map<SourcePlugin, Promise<void>>();
+      let activeHolds = 0;
+      const held = new Map<() => void, () => void>();
       const outbox = settings.outbox;
 
       /**
@@ -752,33 +754,64 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             ...(lastError !== undefined ? { lastError } : {}),
           };
         },
+        holdSources() {
+          activeHolds++;
+          let released = false;
+          return { release(options) {
+            if (released) return;
+            released = true;
+            if (--activeHolds !== 0) return;
+            const pending = [...held];
+            held.clear();
+            for (const [activate, cancel] of pending) {
+              if (options?.start === false) cancel();
+              else activate();
+            }
+          } };
+        },
         registerSource(source) {
-          if (sources.has(source)) {
-            throw new Error('Source already registered');
-          }
-          let started: Promise<void>;
-          try {
-            started = Promise.resolve(source.start(service));
-          } catch (error) {
-            started = Promise.reject(error);
-          }
-          sources.set(source, started);
-          void started.catch(error => settings.onSourceError?.(error));
+          if (sources.has(source)) throw new Error('Source already registered');
           let disposed = false;
+          let started: Promise<void> | undefined;
+          let resolveRegistrationStarted!: () => void;
+          let rejectRegistrationStarted!: (error: unknown) => void;
+          const registrationStarted = new Promise<void>((resolve, reject) => {
+            resolveRegistrationStarted = resolve;
+            rejectRegistrationStarted = reject;
+          });
+          void registrationStarted.catch(() => {});
+          const cancel = () => {
+            if (disposed || started) return;
+            disposed = true;
+            held.delete(activate);
+            sources.delete(source);
+            rejectRegistrationStarted(new Error('Source cancelled before start'));
+          };
+          const activate = () => {
+            held.delete(activate);
+            if (disposed || started) return;
+            try { started = Promise.resolve(source.start(service)); }
+            catch (error) { started = Promise.reject(error); }
+            started.then(resolveRegistrationStarted, rejectRegistrationStarted);
+            void started.catch(error => settings.onSourceError?.(error));
+          };
+          held.set(activate, cancel);
+          sources.set(source, registrationStarted);
+          if (activeHolds === 0) activate();
           const dispose = async () => {
-            if (disposed) {
+            if (disposed) return;
+            if (!started) {
+              cancel();
               return;
             }
             disposed = true;
             try {
               await source.stop();
               await started;
-            } finally {
-              sources.delete(source);
-            }
+            } finally { sources.delete(source); }
           };
           ctx.effect(() => dispose);
-          return { dispose };
+          return { dispose, started: registrationStarted };
         },
       };
 

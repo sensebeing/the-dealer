@@ -27,7 +27,7 @@ export const customAlertSourcePlugin: Plugin<CustomAlertSourceConfig> = {
       },
       stop() {},
     });
-    ctx.effect(() => disposable.dispose());
+    ctx.effect(() => () => disposable.dispose());
   },
 };
 ```
@@ -167,3 +167,84 @@ that project's registrations. Node caches imported modules; restart the daemon
 after editing module source. A failed activation fails the command and restores
 the previous registrations/config where cleanup succeeds; cleanup failures are
 reported, never treated as successful installation.
+
+## 4. Four-layer ownership and executor registration
+
+
+| Layer | Modules | Allowed dependency layers |
+| --- | --- | --- |
+| foundation | `core-types`, `process-lock`, `fs-atomic`, `subprocess`, `kernel`, `native/dealer-iroh-engine` | foundation |
+| core | `transport`, `node`, `router`, `gate`, `dispatcher`, `emitter`, `mailbox` | foundation, core |
+| plugin | `plugins-policy`, `plugins-router`, `plugins-source`, `plugins-executor`, `plugins-agent-host`, `plugins-orca`, `plugins-lark-notifier` | foundation, core, plugin |
+| cli | `cli`, public export facade `packages/index.ts` | foundation, core, plugin, cli |
+
+The layer ceiling and exact module dependencies are both enforced by `.guard/config.json`.
+Plugins must never import `packages/cli`. The CLI assembly root uses `HostPluginRegistry`
+to compose built-in factories and host-owned binding hooks. Host names and setup mappings
+come from `AGENT_HOST_DESCRIPTORS`; adding a host does not require a runtime whitelist.
+`WakeupDriver` implementations live in plugins and are injected into the host-neutral
+`WakeupRedriveService`. Durable mailbox obligations and atomic session pinning remain owned
+by `MailboxStore`.
+
+An external `.dealer/plugins/custom-exec.ts` can register both extension points:
+
+```typescript
+export function createPlugin(config, context) {
+  return {
+    name: 'custom-plugin',
+    inject: ['dispatcher'],
+    apply(ctx) {
+      const policy = ctx.services.dispatcher.registerPolicy({
+        name: 'custom-policy',
+        async process(envelope, next) { return next([envelope]); },
+      });
+      ctx.effect(() => () => policy.dispose());
+      const executor = ctx.services.dispatcher.registerExecutor({
+        name: 'custom-exec',
+        async execute(batch, execution, options) {
+          // Verified attachment bytes have already been fetched to local paths.
+          const paths = batch[0].payload.localAttachments ?? [];
+          return { executor: 'custom-exec', executionId: batch[0].id,
+            detail: `${paths.length} attachments prepared` };
+        },
+      }, config);
+      ctx.effect(() => () => executor.dispose());
+    },
+  };
+}
+```
+
+Declare the plugin in the project manifest (or `userPlugins`), then enable its names:
+
+```json
+{
+  "executors": ["inbox", "custom-exec"],
+  "defaultExecutor": "custom-exec",
+  "executorConfig": { "custom-exec": { "label": "receiver" } },
+  "policies": ["custom-policy"],
+  "topicBindings": {
+    "custom": { "executor": "custom-exec", "mailboxId": "custom", "metadata": { "team": "tools" } }
+  }
+}
+```
+
+Names must match `/^[a-z0-9][a-z0-9._-]{0,63}$/i`. Configuration with project/user plugin
+sources or executor overrides permits external names before import; startup fails with
+`Unknown executor: <name>` or `Unknown policy: <name>` if an enabled name is still absent
+after all plugins load. Standalone configuration without external sources rejects unknown
+names immediately. `dispatcher.hasExecutor/hasPolicy` inspect the actual live registrations.
+The assembly root's dispatcher decorator applies receiver `executorConfig` and attachment
+materialization uniformly, including external executors; original signed attachments remain
+unchanged. `ExecutionContext.signedEnvelopes` preserves the original signed envelopes by ID
+before receiver payload projection. Executors that persist mailbox work pass this map through
+`MailboxEnqueueOptions.signedEnvelopes`: each item stores its execution `envelope` and optional
+original `signedEnvelope` separately. Recovery authenticates `signedEnvelope` when present,
+otherwise the legacy `envelope`, without removing or interpreting projected payload fields.
+Dispose each registration with `ctx.effect` when unloading the plugin.
+
+Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
+pinning; these decisions stay with the host plugin rather than the core mailbox.
+
+`lark-mirror` is an ordinary Kernel plugin: it owns its notifier instance, provides the
+`larkNotifier` service, and stops subscriptions/retries on unload via `ctx.effect`.
+`runtime.larkNotifier` is a read-only service accessor, not a separate lifecycle owner.

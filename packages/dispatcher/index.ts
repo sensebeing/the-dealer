@@ -10,6 +10,9 @@ import type {
 import type { Plugin } from '../kernel/index.ts';
 
 export interface DispatcherConfig {
+  requiredPolicies?: () => readonly string[];
+  /** Composition-root decoration, uniformly applied at the registration boundary. */
+  wrapExecutor?: (executor: ExecutorPlugin<any>) => ExecutorPlugin<any>;
   privateKeyPem?: string;
   ledgerPath?: string;
   defaultExecutor?: string;
@@ -105,6 +108,13 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           executors.keys().next().value
         );
       };
+      const assertRequiredPolicies = () => {
+        for (const name of config.requiredPolicies?.() ?? []) {
+          if (![...policies].some(policy => policy.name === name)) {
+            throw Object.assign(new Error(`Policy unavailable: ${name}`), { beforeExternalEffect: true });
+          }
+        }
+      };
       const core = async (batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> => {
         if (!batch.length) {
           throw Object.assign(new Error('Empty execution batch'), { beforeExternalEffect: true });
@@ -123,6 +133,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             throw new Error(`Execution already attempted: ${e.id} (${prior.stage})`);
           }
         }
+        assertRequiredPolicies();
         for (const e of batch) {
           ledger.set(key(e), { stage: 'dispatching' });
         }
@@ -140,6 +151,8 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         }
       };
       ctx.provide('dispatcher', {
+        hasExecutor(name) { return executors.has(name); },
+        hasPolicy(name) { return [...policies].some(policy => policy.name === name); },
         activeCount() { return active.size; },
         onIdle(listener: () => void) {
           idleListeners.add(listener);
@@ -153,6 +166,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           });
         },
         registerPolicy(policy) {
+          if ([...policies].some(entry => entry.name === policy.name)) throw new Error(`Duplicate policy: ${policy.name}`);
           policies.add(policy);
           return {
             dispose() {
@@ -164,13 +178,14 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           if (executors.has(executor.name)) {
             throw new Error(`Duplicate executor: ${executor.name}`);
           }
+          const wrapped = config.wrapExecutor?.(executor) ?? executor;
           const entry = {
             async execute(batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> {
               const first = batch[0];
               const nodeId = ctx.services.node.getSelfCard(first.networkId).nodeId;
               return {
                 stage: 'dispatched',
-                executionReceipt: await executor.execute(
+                executionReceipt: await wrapped.execute(
                   batch,
                   {
                     networkId: first.networkId,
@@ -205,30 +220,38 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           if (prior) {
             return Promise.resolve(prior);
           }
-          const chain = [...policies];
-          const run = async (
-            index: number,
-            batch: readonly MessageEnvelope[],
-          ): Promise<DispatchReceipt> => {
-            if (index === chain.length) {
-              return core(batch);
-            }
-            // Policies consume individual envelopes; batching policies should be registered last.
-            let result: DispatchReceipt = { stage: 'queued' };
-            for (const e of batch) {
-              let called = false;
-              result = await chain[index].process(e, nextBatch => {
-                if (called) {
-                  throw new Error('Policy next may only be called once');
-                }
-                called = true;
-                return run(index + 1, nextBatch);
-              });
-            }
-            return result;
-          };
           const promise = Promise.resolve()
-            .then(() => run(0, [structuredClone(envelope)]))
+            .then(async () => {
+              if (controller.signal.aborted) {
+                throw Object.assign(new Error('Dispatcher stopped'), { beforeExternalEffect: true });
+              }
+              const settled = ledger.get(id);
+              if (settled) return settled;
+              assertRequiredPolicies();
+              const chain = [...policies];
+              const run = async (
+                index: number,
+                batch: readonly MessageEnvelope[],
+              ): Promise<DispatchReceipt> => {
+                if (index === chain.length) {
+                  return core(batch);
+                }
+                // Policies consume individual envelopes; batching policies should be registered last.
+                let result: DispatchReceipt = { stage: 'queued' };
+                for (const e of batch) {
+                  let called = false;
+                  result = await chain[index].process(e, nextBatch => {
+                    if (called) {
+                      throw new Error('Policy next may only be called once');
+                    }
+                    called = true;
+                    return run(index + 1, nextBatch);
+                  });
+                }
+                return result;
+              };
+              return run(0, [structuredClone(envelope)]);
+            })
             .then(result => {
               // A queued policy owns its pending buffer; do not overwrite a later wave's completed state.
               if (!ledger.get(id)) {

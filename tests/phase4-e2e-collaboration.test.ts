@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, readFileSync, rmSy
 import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   DealerNodeRuntime,
   DEDUP_CAS_DUPLICATE_DETAIL,
@@ -963,13 +964,14 @@ test('Phase 4: both DND crash windows park the signed obligation across restart 
     await restarted.gate.evaluate(newer);
     await restarted.gate.setMode('open');
     assert.equal(restarted.gate.listDndQueue().length, 0);
-    assert.deepEqual(restarted.mailbox.list().items[0].envelope, newer);
+    assert.deepEqual(restarted.mailbox.list().items[0].signedEnvelope, newer);
+    assert.deepEqual(restarted.mailbox.list().items[0].envelope.payload.localAttachments, []);
     await restarted.stop();
   }
 });
 
 test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists status and fences unknown execution', async t => {
-  for (const evidence of ['mailbox', 'dispatched', 'settled', 'failed', 'dispatching', 'missing', 'queued-receipt', 'dnd', 'parked', 'tampered-mailbox'] as const) {
+  for (const evidence of ['mailbox', 'materialized-mailbox', 'materialized-tampered-mailbox', 'dispatched', 'settled', 'failed', 'dispatching', 'missing', 'queued-receipt', 'dnd', 'parked', 'tampered-mailbox'] as const) {
     const root = directory(t);
     const runtime = await node(t, root, evidence, {
       patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
@@ -980,12 +982,20 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
       id: 'legacy', traceId: 'legacy', networkId: 'sensebeing',
       from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' },
       routing: { mode: 'unicast', targets: [runtime.node.getSelfCard('sensebeing').nodeId] },
-      kind: 'task', subject: 'legacy', body: 'legacy obligation', attachments: [],
+      kind: 'task', subject: 'legacy', body: 'legacy obligation',
+      attachments: evidence.startsWith('materialized')
+        ? [{ name: 'claim.txt', mimeType: 'text/plain', sizeBytes: 4, blake3Hash: 'signed-hash', ticket: 'signed-ticket' }] : [],
       priority: 'normal', createdAt: new Date().toISOString(), payload: { claimVersion: 2 },
     }, keys.privateKeyPem);
     const key = JSON.stringify([message.networkId, keys.nodeId, message.id]);
     if (evidence === 'mailbox' || evidence === 'tampered-mailbox') {
       runtime.mailbox.enqueue([evidence === 'mailbox' ? message : { ...message, body: 'tampered' }]);
+    }
+    if (evidence.startsWith('materialized')) {
+      runtime.mailbox.enqueue([{ ...message,
+        payload: { ...message.payload, localAttachments: [join(root, 'claim.txt')] },
+      }], { signedEnvelopes: { [message.id]: evidence === 'materialized-tampered-mailbox'
+        ? { ...message, body: 'tampered' } : message } });
     }
     if (evidence === 'dnd' || evidence === 'parked') await runtime.gate.evaluate(message);
     const stateDir = runtime.stateDir;
@@ -1008,7 +1018,7 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
     const options = { stateDir, transport: { discoveryDir: join(root, 'mesh') } };
     const restarted = new DealerNodeRuntime(options);
     await restarted.start();
-    const status = ['mailbox', 'dispatched', 'settled'].includes(evidence) ? 'settled' : 'unknown';
+    const status = ['mailbox', 'materialized-mailbox', 'dispatched', 'settled'].includes(evidence) ? 'settled' : 'unknown';
     const path = join(stateDir, 'dedup-watermarks.json');
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf8'))[key], { revision: 2, status }, evidence);
     await restarted.stop();
@@ -1021,7 +1031,7 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
     assert.equal(isDedupCasDuplicateReceipt(receipt), status === 'settled', evidence);
     assert.equal(isDedupCasDuplicateReceipt(receipt, { allowQueued: true }), status !== 'unknown', evidence);
     if (status === 'unknown') {
-      const newer = signEnvelope({ ...message, id: 'newer', idempotencyKey: message.id, payload: { claimVersion: 3 } }, keys.privateKeyPem);
+      const newer = signEnvelope({ ...message, id: 'newer', idempotencyKey: message.id, attachments: [], payload: { claimVersion: 3 } }, keys.privateKeyPem);
       assert.equal((await again.kernel.ctx.services.dispatcher.dispatch(newer)).stage, 'dispatched', evidence);
       assert.equal(again.mailbox.hasConfirmedEnvelope(message.networkId, keys.nodeId, message.id, 3), true);
     }
@@ -1084,5 +1094,595 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.deepEqual(restarted.gate.listDndQueue(), []);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
   assert.equal(restarted.mailbox.list().totalCount, 1);
-  assert.deepEqual(restarted.mailbox.list().items[0].envelope, queued.envelope);
+  assert.deepEqual(restarted.mailbox.list().items[0].signedEnvelope, queued.envelope);
+  assert.deepEqual(restarted.mailbox.list().items[0].envelope.payload.localAttachments, []);
+});
+
+test('external project executors and policies share configuration, attachments and lifecycle with builtins', async t => {
+  const root = directory(t);
+  const project = join(root, 'project');
+  mkdirSync(join(project, '.dealer', 'plugins'), { recursive: true });
+  writeFileSync(join(project, '.dealer', 'project.json'), JSON.stringify({
+    schema: 'the-dealer-project/v1', projectId: 'custom', defaultNetworkId: 'sensebeing', skills: [],
+    plugins: [{ name: 'custom-plugin', module: '.dealer/plugins/custom-exec.ts' }],
+  }));
+  writeFileSync(join(project, '.dealer', 'plugins', 'custom-exec.ts'), `
+    import { readFileSync, writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    export function createPlugin(config, context) {
+      return { name: 'custom-plugin', inject: ['dispatcher'], apply(ctx) {
+        let policyCalls = 0;
+        const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+          async process(envelope, next) { policyCalls++; return next([envelope]); }
+        });
+        const executor = ctx.services.dispatcher.registerExecutor({ name: 'custom-exec',
+          async execute(batch, execution, options) {
+            const envelope = batch[0];
+            writeFileSync(join(context.stateDir, 'custom-result.json'), JSON.stringify({
+              policyCalls, marker: options.marker,
+              attachments: envelope.payload.localAttachments.map(path => readFileSync(path, 'utf8')),
+              originalAttachment: envelope.attachments[0]?.name,
+              localAttachments: envelope.payload.localAttachments,
+            }));
+            return { executor: 'custom-exec', executionId: envelope.id, mailboxId: 'custom-receipt' };
+          }
+        }, { marker: 'plugin-default' });
+        ctx.effect(() => () => executor.dispose());
+        ctx.effect(() => () => policy.dispose());
+      } };
+    }
+  `);
+  const alice = await node(t, root, 'custom-alice');
+  const bob = await node(t, root, 'custom-bob', { patch: {
+    projects: [{ projectId: 'custom', rootPath: project }],
+    executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+    executorConfig: { 'custom-exec': { marker: 'receiver-config' } },
+    topicBindings: { custom: { executor: 'custom-exec', mailboxId: 'configured-mailbox', metadata: { team: 'tools' }, assignee: 'alice' } },
+  } });
+  await connect(alice, bob);
+  const auxiliaryModule = join(root, 'auxiliary.ts');
+  writeFileSync(auxiliaryModule, `export default { name: 'auxiliary', apply() {} };`);
+  await bob.installUserPlugin({ name: 'auxiliary', module: auxiliaryModule });
+  const beforeUnlink = structuredClone(bob.config);
+  const beforeStatus = bob.projectStatus();
+  const savedConfig = readFileSync(join(bob.stateDir, 'config.json'), 'utf8');
+  await assert.rejects(bob.unlinkProject('custom'), /Unknown executor: custom-exec/);
+  assert.deepEqual(bob.config, beforeUnlink);
+  assert.deepEqual(bob.projectStatus(), beforeStatus);
+  assert.equal(readFileSync(join(bob.stateDir, 'config.json'), 'utf8'), savedConfig);
+  assert.equal(bob.kernel.getService('dispatcher').hasExecutor('custom-exec'), true);
+  assert.equal(bob.kernel.getService('dispatcher').hasPolicy('custom-policy'), true);
+  const attachment = join(root, 'custom.txt');
+  writeFileSync(attachment, 'external attachment contents');
+  for (const topic of ['custom', 'default-fallback']) {
+    const sent = await cli(alice, 'send', '--network', 'sensebeing', '--to', 'member:custom-bob', '--topic', topic, '--body', 'custom', '--attach', attachment);
+    assert.equal(sent.receipts[0].stage, 'dispatched', JSON.stringify(sent.receipts));
+    assert.deepEqual(JSON.parse(readFileSync(join(bob.stateDir, 'custom-result.json'), 'utf8')), {
+      policyCalls: topic === 'custom' ? 1 : 2, marker: 'receiver-config', attachments: ['external attachment contents'], originalAttachment: 'custom.txt',
+      localAttachments: [join(bob.stateDir, 'attachments', sent.messageId, '0-custom.txt')],
+    });
+    assert.equal(bob.mailbox.listThreadRecords(sent.messageId)[0].localMailbox, 'custom-receipt');
+  }
+  const forgedSecretPath = join(root, 'receiver-secret.txt');
+  writeFileSync(forgedSecretPath, 'must never reach an executor');
+  const forged = await alice.emitter.emit(input('custom-bob', { localAttachments: [forgedSecretPath] }));
+  assert.equal(forged.receipts[0].stage, 'dispatched');
+  const sanitized = JSON.parse(readFileSync(join(bob.stateDir, 'custom-result.json'), 'utf8'));
+  assert.deepEqual(sanitized.localAttachments, []);
+  assert.deepEqual(sanitized.attachments, []);
+  assert.equal(JSON.stringify(sanitized).includes(forgedSecretPath), false);
+  const inboxForged = await alice.emitter.emit(input('custom-bob', {
+    executor: 'inbox', localAttachments: [forgedSecretPath],
+  }));
+  assert.equal(inboxForged.receipts[0].stage, 'dispatched');
+  const persisted = bob.mailbox.listItemsAfterSequence(-1).find(item => item.id === inboxForged.messageId)!;
+  assert.ok(persisted);
+  assert.deepEqual(persisted.envelope.payload.localAttachments, []);
+  const savedMailbox = JSON.parse(readFileSync(join(bob.stateDir, 'mailbox.json'), 'utf8'));
+  assert.deepEqual(savedMailbox.items.find(item => item.id === inboxForged.messageId).envelope.payload.localAttachments, []);
+  const dispatcher = bob.kernel.getService('dispatcher');
+  assert.equal(dispatcher.hasExecutor('custom-exec'), true);
+  assert.equal(dispatcher.hasPolicy('custom-policy'), true);
+  await bob.stop();
+  assert.equal(dispatcher.hasExecutor('custom-exec'), false);
+  assert.equal(dispatcher.hasPolicy('custom-policy'), false);
+});
+
+test('external configuration defers names until plugin loading but rejects unregistered executors and policies', async t => {
+  const root = directory(t);
+  const override = await node(t, root, 'override', {
+    patch: { executors: ['custom-override'], defaultExecutor: 'custom-override', executorConfig: { 'custom-override': {} } },
+    executorOverrides: [{ name: 'custom-override', async execute(batch) {
+      return { executor: 'custom-override', executionId: batch[0].id };
+    } }],
+  });
+  assert.equal(override.kernel.getService('dispatcher').hasExecutor('custom-override'), true);
+  const module = join(root, 'empty-plugin.ts');
+  writeFileSync(module, `export default { name: 'empty-plugin', apply() {} };`);
+  for (const [name, patch, error] of [
+    ['executor', { executors: ['missing-exec', 'inbox'], defaultExecutor: 'missing-exec' }, /Unknown executor: missing-exec/],
+    ['policy', { policies: ['missing-policy'] }, /Unknown policy: missing-policy/],
+    ['identifier', { executors: ['bad name'], defaultExecutor: 'bad name' }, /Unknown executor/],
+  ] as const) {
+    const stateDir = join(root, name);
+    const runtime = new DealerNodeRuntime({ stateDir, profile: 'headless-relay', patch: {
+      userPlugins: [{ name: 'empty-plugin', module }], ...patch,
+    } });
+    await assert.rejects(runtime.start(), error);
+    assert.equal(runtime.kernel.hasService('dispatcher'), false, 'failed start unwinds services');
+    assert.equal(statSync(stateDir).isDirectory(), true);
+  }
+});
+
+
+test('startup script dispatch waits for external executors and policies before mounting traffic', async t => {
+  const root = directory(t);
+  const plugin = join(root, 'startup-plugin.ts');
+  writeFileSync(plugin, `
+    import { appendFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    export function createPlugin(config, context) {
+      return { name: 'startup-plugin', inject: ['dispatcher'], apply(ctx) {
+        const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+          async process(envelope, next) {
+            appendFileSync(join(context.stateDir, 'startup-events.jsonl'), JSON.stringify(['policy', envelope.subject]) + '\\n');
+            return next([envelope]);
+          }
+        });
+        const executor = ctx.services.dispatcher.registerExecutor({ name: 'custom-exec',
+          async execute(batch) {
+            appendFileSync(join(context.stateDir, 'startup-events.jsonl'), JSON.stringify(['executor', batch[0].subject]) + '\\n');
+            return { executor: 'custom-exec', executionId: batch[0].id };
+          }
+        }, {});
+        ctx.effect(() => () => executor.dispose());
+        ctx.effect(() => () => policy.dispose());
+      } };
+    }
+  `);
+  const runtime = new DealerNodeRuntime({ stateDir: join(root, 'state'), member: 'startup', profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+    patch: {
+      networks: [{ networkId: 'sensebeing', passphrase: 'startup-secret' }],
+      userPlugins: [{ name: 'startup-plugin', module: plugin }],
+      executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+      sources: [{ type: 'script', config: { command: 'startup-source' } }],
+    },
+    commandRunner: async request => {
+      assert.equal(request.command, 'startup-source');
+      assert.equal(runtime.kernel.getService('dispatcher').hasExecutor('custom-exec'), true);
+      assert.equal(runtime.kernel.getService('dispatcher').hasPolicy('custom-policy'), true);
+      return { stdout: JSON.stringify({ ...input('startup'), subject: 'first startup message' }) + '\n' };
+    },
+  });
+  t.after(() => runtime.stop());
+  await runtime.start();
+  const events = readFileSync(join(runtime.stateDir, 'startup-events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(events, [['policy', 'first startup message'], ['executor', 'first startup message']]);
+});
+
+
+test('a sender-signed empty attachment array remains authentic across mailbox and runtime restart', async t => {
+  const root = directory(t);
+  const runtime = await node(t, root, 'signed-empty', {
+    patch: { defaultExecutor: 'inbox', policies: ['dedup-cas'] },
+  });
+  const keys = generateNodeKeyPair();
+  const message = signEnvelope({
+    id: 'signed-empty', traceId: 'signed-empty', networkId: 'local',
+    from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' },
+    routing: { mode: 'unicast' }, kind: 'claim', subject: 'signed empty paths', body: 'original',
+    payload: { claimVersion: 2, localAttachments: [] }, attachments: [],
+    priority: 'normal', createdAt: new Date().toISOString(),
+  }, keys.privateKeyPem);
+  const receipt = await runtime.kernel.getService('dispatcher').dispatch(message);
+  assert.equal(receipt.stage, 'dispatched');
+  const item = runtime.mailbox.list().items[0];
+  assert.deepEqual(item.signedEnvelope, message);
+  assert.deepEqual(item.envelope.payload.localAttachments, []);
+  assert.equal(runtime.mailbox.hasConfirmedEnvelope('local', keys.nodeId, message.id, 2), true);
+  const stateDir = runtime.stateDir;
+  await runtime.stop();
+  const key = JSON.stringify(['local', keys.nodeId, message.id]);
+  writeFileSync(join(stateDir, 'dedup-watermarks.json'), JSON.stringify({ [key]: 2 }));
+  const restored = await new DealerNodeRuntime({ stateDir, transport: { discoveryDir: join(root, 'mesh') } }).start();
+  t.after(() => restored.stop());
+  assert.deepEqual(restored.mailbox.list().items[0].signedEnvelope, message);
+  assert.equal(restored.mailbox.hasConfirmedEnvelope('local', keys.nodeId, message.id, 2), true);
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'dedup-watermarks.json'), 'utf8'))[key], { revision: 2, status: 'settled' });
+});
+
+test('external sources wait for later configured policies at startup and never run on failed readiness', async t => {
+  for (const missingPolicy of [false, true]) {
+    const root = directory(t);
+    const module = join(root, 'ordered-plugins.ts');
+    writeFileSync(module, `
+      export const events = [];
+      export function createPlugin(config) {
+        if (config.source) return {
+          name: 'early-source', inject: ['emitter'], apply(ctx) {
+            const registration = ctx.services.emitter.registerSource({
+              name: 'early-source',
+              async start(emitter) {
+                events.push('source');
+                await emitter.emit({ networkId: 'local', routing: { mode: 'unicast', targets: ['member:guarded'] },
+                  kind: 'early', subject: 'first', body: 'first' });
+              },
+              stop() { events.push('source-stop'); },
+            });
+            ctx.effect(() => () => registration.dispose());
+          },
+        };
+        return { name: 'later-policy-executor', inject: ['dispatcher'], apply(ctx) {
+          if (config.candidateSource) {
+            const source = ctx.services.emitter.registerSource({ name: 'candidate-source',
+              start() { events.push('candidate-source'); }, stop() { events.push('candidate-stop'); },
+            });
+            ctx.effect(() => () => source.dispose());
+          }
+          if (!config.missingPolicy) {
+            const registration = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+              async process(envelope, next) { events.push('policy'); return next([envelope]); },
+            });
+            ctx.effect(() => () => registration.dispose());
+          }
+          const registration = ctx.services.dispatcher.registerExecutor({ name: 'custom-exec',
+            async execute(batch) { events.push('executor'); return { executor: 'custom-exec', executionId: batch[0].id }; },
+          }, {});
+          ctx.effect(() => () => registration.dispose());
+        } };
+      }
+    `);
+    const { events } = await import(pathToFileURL(module).href);
+    const runtime = new DealerNodeRuntime({ stateDir: join(root, 'state'), member: 'guarded', profile: 'headless-relay',
+      transport: { discoveryDir: join(root, 'mesh') },
+      patch: { executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+        userPlugins: [
+          { name: 'early-source', module, config: { source: true } },
+          { name: 'later-policy-executor', module, config: { missingPolicy } },
+        ],
+      },
+    });
+    t.after(() => runtime.stop());
+    if (missingPolicy) {
+      await assert.rejects(runtime.start(), /Unknown policy: custom-policy/);
+      assert.deepEqual(events, [], 'startup rejection must not start the early source or execute its message');
+      assert.equal(runtime.kernel.hasService('dispatcher'), false);
+    } else {
+      await runtime.start();
+      await until(() => events.includes('executor'));
+      assert.deepEqual(events, ['source', 'policy', 'executor']);
+      await assert.rejects(runtime.installUserPlugin({ name: 'later-policy-executor', module,
+        config: { missingPolicy: true, candidateSource: true },
+      }), /Unknown policy: custom-policy/);
+      assert.deepEqual(events, ['source', 'policy', 'executor'], 'rollback disposes an unstarted source without starting it');
+      await runtime.removeUserPlugin('early-source');
+      await runtime.installUserPlugin({ name: 'early-source', module, config: { source: true } });
+      await until(() => events.filter(event => event === 'executor').length === 2);
+      assert.deepEqual(events, ['source', 'policy', 'executor', 'source-stop', 'source', 'policy', 'executor'],
+        'live source installation activates its protected first emission');
+      await runtime.stop();
+    }
+  }
+});
+
+test('dispatch fails before execution during policy replacement and rejected removal without poisoning the ledger', async t => {
+  for (const operation of ['replace', 'remove']) {
+    const root = directory(t);
+    const module = join(root, 'policy-plugin.ts');
+    writeFileSync(module, `
+      export const events = [];
+      let executionPause;
+      export function pauseExecution() {
+        let entered, release;
+        const enteredPromise = new Promise(resolve => { entered = resolve; });
+        const released = new Promise(resolve => { release = resolve; });
+        executionPause = { entered, released };
+        return { entered: enteredPromise, release };
+      }
+      let pause;
+      export function pauseRemoval() {
+        let entered, release;
+        const enteredPromise = new Promise(resolve => { entered = resolve; });
+        const released = new Promise(resolve => { release = resolve; });
+        pause = { entered, released };
+        return { entered: enteredPromise, release };
+      }
+      export function createPlugin(config) {
+        return { name: 'policy-plugin', inject: ['dispatcher'], apply(ctx) {
+          const registration = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+            async process(envelope, next) {
+              events.push(config.version);
+              const blocked = executionPause;
+              executionPause = undefined;
+              if (blocked) { blocked.entered(); await blocked.released; }
+              return next([envelope]);
+            },
+          });
+          ctx.effect(() => async () => {
+            registration.dispose();
+            const blocked = pause;
+            pause = undefined;
+            if (blocked) { blocked.entered(); await blocked.released; }
+          });
+        } };
+      }
+    `);
+    const fixture = await import(pathToFileURL(module).href);
+    const runtime = await node(t, root, operation, {
+      patch: { executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+        userPlugins: [{ name: 'policy-plugin', module, config: { version: 'v1' } }],
+      },
+      executorOverrides: [{ name: 'custom-exec', async execute(batch) {
+        fixture.events.push('executor');
+        return { executor: 'custom-exec', executionId: batch[0].id };
+      } }],
+    });
+    const pause = fixture.pauseRemoval();
+    t.after(() => pause.release());
+    const transition = operation === 'replace'
+      ? runtime.installUserPlugin({ name: 'policy-plugin', module, config: { version: 'v2' } })
+      : runtime.removeUserPlugin('policy-plugin');
+    const settledTransition = operation === 'remove'
+      ? assert.rejects(transition, /Unknown policy: custom-policy/) : transition;
+    await pause.entered;
+    const dispatcher = runtime.kernel.getService('dispatcher');
+    assert.equal(dispatcher.hasPolicy('custom-policy'), false);
+    const keys = generateNodeKeyPair();
+    const message = signEnvelope({ id: operation, traceId: operation, networkId: 'local',
+      from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' }, routing: { mode: 'unicast' },
+      kind: 'protected', subject: operation, body: operation, payload: {}, attachments: [],
+      priority: 'normal', createdAt: new Date().toISOString(),
+    }, keys.privateKeyPem);
+    await assert.rejects(dispatcher.dispatch(message), error =>
+      error instanceof Error && /Policy unavailable: custom-policy/.test(error.message) && error['beforeExternalEffect'] === true);
+    assert.deepEqual(fixture.events, []);
+    pause.release();
+    await settledTransition;
+    assert.equal((await dispatcher.dispatch(message)).stage, 'dispatched');
+    assert.deepEqual(fixture.events, [operation === 'replace' ? 'v2' : 'v1', 'executor']);
+    assert.equal(dispatcher.hasPolicy('custom-policy'), true);
+
+    const retryable = signEnvelope({ ...message, id: 'required-policy-retry' }, keys.privateKeyPem);
+    runtime.config.policies.push('missing-policy');
+    await assert.rejects(dispatcher.dispatch(retryable), error =>
+      error instanceof Error && /Policy unavailable: missing-policy/.test(error.message) && error['beforeExternalEffect'] === true);
+    assert.equal(fixture.events.length, 2, 'no policy or executor runs before all required policies are ready');
+    runtime.config.policies.pop();
+    assert.equal((await dispatcher.dispatch(retryable)).stage, 'dispatched', 'readiness failure leaves no terminal ledger receipt');
+    const duringPolicy = signEnvelope({ ...message, id: 'async-policy-removal' }, keys.privateKeyPem);
+    const executionPause = fixture.pauseExecution();
+    const running = dispatcher.dispatch(duringPolicy);
+    const rejected = assert.rejects(running, error => error instanceof Error &&
+      /Policy unavailable: custom-policy/.test(error.message) && error['beforeExternalEffect'] === true);
+    await executionPause.entered;
+    const removalPause = fixture.pauseRemoval();
+    const removing = assert.rejects(runtime.removeUserPlugin('policy-plugin'), /Unknown policy/);
+    await removalPause.entered;
+    const executions = fixture.events.filter(event => event === 'executor').length;
+    executionPause.release();
+    await rejected;
+    assert.equal(fixture.events.filter(event => event === 'executor').length, executions);
+    removalPause.release();
+    await removing;
+    assert.equal((await dispatcher.dispatch(duringPolicy)).stage, 'dispatched');
+    await runtime.stop();
+  }
+});
+
+test('poll settlement completes during policy replacement or rejected removal without waiting on its own teardown', { timeout: 15000 }, async t => {
+  for (const operation of ['replace', 'remove']) {
+    const root = directory(t);
+    const module = join(root, 'poll-policy.ts');
+    writeFileSync(module, `
+      import { createPollWatermarkSourcePlugin } from ${JSON.stringify(pathToFileURL(resolvePath('packages/plugins-source/index.ts')).href)};
+      export const events = [];
+      export let poll;
+      let enter, release;
+      export const entered = new Promise(resolve => { enter = resolve; });
+      const resume = new Promise(resolve => { release = resolve; });
+      export { release };
+      export function createPlugin(config) {
+        return { name: 'poll-policy', inject: ['emitter', 'dispatcher'], apply(ctx) {
+          const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+            process(envelope, next) { events.push(config.version); return next([envelope]); },
+          });
+          const source = createPollWatermarkSourcePlugin({ initialCursor: 0,
+            poll: async cursor => ({ items: [cursor], cursor: cursor + 1 }),
+            toInput: () => ({ networkId: 'local', kind: 'poll', subject: 'poll', body: 'poll', routing: { mode: 'unicast', targets: ['member:poller'] } }),
+            saveCursor: async () => {},
+          });
+          poll = () => source.pollOnce();
+          const registration = ctx.services.emitter.registerSource({ name: 'poll',
+            start(emitter) { return source.start({ ...emitter, async emit(input) { enter(); await resume; return emitter.emit(input); } }); },
+            stop() { events.push('stop'); return source.stop(); },
+          });
+          ctx.effect(() => () => registration.dispose());
+          ctx.effect(() => () => { policy.dispose(); events.push('policy-removed'); });
+        } };
+      }
+    `);
+    const fixture = await import(pathToFileURL(module).href);
+    const runtime = await node(t, root, 'poller', { patch: {
+      executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+      userPlugins: [{ name: 'poll-policy', module, config: { version: 'v1' } }],
+    }, executorOverrides: [{ name: 'custom-exec', async execute(batch) {
+      fixture.events.push('executor'); return { executor: 'custom-exec', executionId: batch[0].id };
+    } }] });
+    const polling = fixture.poll();
+    const rejectedPoll = assert.rejects(polling);
+    await fixture.entered;
+    const changing = operation === 'replace'
+      ? runtime.installUserPlugin({ name: 'poll-policy', module, config: { version: 'v2' } })
+      : runtime.removeUserPlugin('poll-policy');
+    const completed = operation === 'remove' ? assert.rejects(changing, /Unknown policy/) : changing;
+    await until(() => fixture.events.includes('stop'));
+    assert.equal(runtime.kernel.getService('dispatcher').hasPolicy('custom-policy'), false);
+    fixture.release();
+    await rejectedPoll;
+    await completed;
+    assert.equal(fixture.events.includes('executor'), false);
+    await fixture.poll();
+    assert.deepEqual(fixture.events.slice(-2), [operation === 'replace' ? 'v2' : 'v1', 'executor']);
+    await runtime.stop();
+  }
+});
+
+test('rollback restores a policy and its source while discarding candidate sources', { timeout: 15000 }, async t => {
+  const root = directory(t);
+  const module = join(root, 'combined-plugin.ts');
+  writeFileSync(module, `
+    export const events = [];
+    export let emit;
+    export function createPlugin(config) {
+      return { name: 'combined', inject: ['dispatcher', 'emitter'], apply(ctx) {
+        if (!config.broken) {
+          const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+            process(envelope, next) { events.push(config.version + '-policy'); return next([envelope]); },
+          });
+          ctx.effect(() => () => policy.dispose());
+        }
+        const registration = ctx.services.emitter.registerSource({ name: 'combined-source',
+          start(emitter) {
+            events.push(config.version + '-start');
+            emit = () => emitter.emit({ networkId: 'local', kind: 'restored', subject: 'restored', body: 'restored',
+              routing: { mode: 'unicast', targets: ['member:restored'] } });
+          },
+          stop() { events.push(config.version + '-stop'); emit = undefined; },
+        });
+        ctx.effect(() => () => registration.dispose());
+      } };
+    }
+  `);
+  const fixture = await import(pathToFileURL(module).href);
+  const runtime = await node(t, root, 'restored', { patch: {
+    executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+    userPlugins: [{ name: 'combined', module, config: { version: 'v1' } }],
+  }, executorOverrides: [{ name: 'custom-exec', async execute(batch) {
+    fixture.events.push('executor'); return { executor: 'custom-exec', executionId: batch[0].id };
+  } }] });
+  for (const change of [
+    () => runtime.installUserPlugin({ name: 'combined', module, config: { version: 'v2', broken: true } }),
+    () => runtime.removeUserPlugin('combined'),
+  ]) {
+    await assert.rejects(change(), /Unknown policy: custom-policy/);
+    assert.equal(runtime.kernel.getService('dispatcher').hasPolicy('custom-policy'), true);
+    await fixture.emit();
+    assert.deepEqual(fixture.events.slice(-3), ['v1-start', 'v1-policy', 'executor']);
+    assert.equal(fixture.events.some(event => event.startsWith('v2')), false);
+  }
+  await runtime.stop();
+});
+
+test('long-lived source start promises do not block startup or unrelated source installation', { timeout: 10000 }, async t => {
+  const root = directory(t);
+  const module = join(root, 'lifetime-plugin.ts');
+  writeFileSync(module, `
+    export const events = [];
+    export function createPlugin(config) {
+      return { name: config.name, inject: ['emitter'], apply(ctx) {
+        let stopped;
+        const registration = ctx.services.emitter.registerSource({ name: config.name,
+          start() { events.push(config.name + '-start'); return new Promise(resolve => { stopped = resolve; }); },
+          stop() { events.push(config.name + '-stop'); stopped(); },
+        });
+        ctx.effect(() => () => registration.dispose());
+      } };
+    }
+  `);
+  const fixture = await import(pathToFileURL(module).href);
+  const runtime = await node(t, root, 'lifetime', { patch: {
+    userPlugins: [{ name: 'first', module, config: { name: 'first' } }],
+  } });
+  await runtime.installUserPlugin({ name: 'second', module, config: { name: 'second' } });
+  const registration = await runtime.installSource({ type: 'webhook', config: { port: 0 } });
+  assert.deepEqual(fixture.events, ['first-start', 'second-start']);
+  await registration.dispose();
+  await runtime.stop();
+  assert.deepEqual(fixture.events, ['first-start', 'second-start', 'second-stop', 'first-stop']);
+});
+
+test('source add waits for held replacement activation and does not persist a failed startup', { timeout: 10000 }, async t => {
+  const root = directory(t);
+  const module = join(root, 'held-replacement.ts');
+  writeFileSync(module, `
+    let enter, release;
+    export const entered = new Promise(resolve => { enter = resolve; });
+    const resumed = new Promise(resolve => { release = resolve; });
+    export { release };
+    export function createPlugin(config) {
+      return { name: 'held-replacement', apply(ctx) {
+        if (config.pause) ctx.effect(() => async () => { enter(); await resumed; });
+      } };
+    }
+  `);
+  const fixture = await import(pathToFileURL(module).href);
+  let sourceSignal: AbortSignal | undefined;
+  const runtime = await node(t, root, 'held-add', {
+    commandRunner: async request => {
+      sourceSignal = request.signal;
+      throw new Error('Source startup failed');
+    },
+    patch: { userPlugins: [{ name: 'held-replacement', module, config: { pause: true } }] },
+  });
+  t.after(() => fixture.release());
+  const replacement = runtime.installUserPlugin({ name: 'held-replacement', module, config: {} });
+  await fixture.entered;
+  let settled = false;
+  const errors: string[] = [];
+  const adding = runDealerCli(['source', 'add', '--type', 'script', '--command', 'failing-source'], {
+    runtime, stderr: line => errors.push(line), stdout: () => {},
+  }).then(code => { settled = true; return code; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(sourceSignal, undefined, 'held source must not execute');
+  assert.deepEqual(runtime.config.sources, []);
+  assert.deepEqual(JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8')).sources, []);
+  fixture.release();
+  await replacement;
+  assert.equal(await adding, 1);
+  assert.match(errors.join('\n'), /Source startup failed/);
+  assert.equal(sourceSignal?.aborted, true, 'failed registration is disposed');
+  assert.deepEqual(runtime.config.sources, []);
+  assert.deepEqual(JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8')).sources, []);
+  await runtime.stop();
+});
+
+test('held source cancellation rejects only its registration and never reports a source execution error', { timeout: 10000 }, async t => {
+  for (const cancellation of ['release', 'dispose', 'stop']) {
+    const root = directory(t);
+    let runs = 0;
+    const runtime = await node(t, root, `cancel-${cancellation}`, {
+      commandRunner: async () => { runs++; return { stdout: '' }; },
+    });
+    const emitter = runtime.emitter;
+    const hold = emitter.holdSources!();
+    if (cancellation === 'dispose') {
+      const registration = emitter.registerSource({ name: 'cancelled',
+        start() { runs++; }, stop() { assert.fail('never-started source must not be stopped'); },
+      });
+      const rejected = assert.rejects(registration.started!, /Source cancelled before start/);
+      await registration.dispose();
+      await rejected;
+      hold.release();
+    } else {
+      let settled = false;
+      const errors: string[] = [];
+      const adding = runDealerCli(['source', 'add', '--type', 'script', '--command', 'cancelled-source'], {
+        runtime, stderr: line => errors.push(line), stdout: () => {},
+      }).then(code => { settled = true; return code; });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false);
+      if (cancellation === 'release') hold.release({ start: false });
+      else await runtime.stop();
+      assert.equal(await adding, 1);
+      assert.match(errors.join('\n'), /Source cancelled before start/);
+      hold.release();
+    }
+    assert.equal(runs, 0);
+    assert.deepEqual(runtime.config.sources, []);
+    assert.deepEqual(JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8')).sources, []);
+    assert.equal(runtime.lastError, undefined, 'pre-start cancellation is not an execution error');
+    await runtime.stop();
+  }
 });

@@ -14,6 +14,9 @@ import {
 export interface Disposable {
   dispose(): void | Promise<void>;
 }
+export interface SourceRegistration extends Disposable {
+  readonly started?: Promise<void>;
+}
 export type Result<T> = { ok: true; value: T } | { ok: false; error: Error };
 export type AdmissionMode = 'open' | 'approval_required' | 'dnd' | 'closed';
 export type DeliveryStage =
@@ -613,8 +616,9 @@ export interface SourcePlugin {
 }
 
 export interface EmitterService {
+  holdSources?(): { release(options?: { start?: boolean }): void };
   emit<T>(input: EmitMessageInput<T>): Promise<EmitResult>;
-  registerSource(source: SourcePlugin): Disposable;
+  registerSource(source: SourcePlugin): SourceRegistration;
   /** Emitter-owned outbound preparation, routing, send and receipt validation for redrive. */
   redriveOutboxItem?(
     item: OutboxItem,
@@ -673,6 +677,8 @@ export interface GateService {
 }
 
 export interface ExecutionContext {
+  /** Original wire-signed envelopes, preserved before receiver payload projection. */
+  signedEnvelopes?: Readonly<Record<string, MessageEnvelope>>;
   networkId: string;
   nodeId: string;
   traceId: string;
@@ -710,6 +716,8 @@ export interface ExecutorPlugin<C = unknown> {
 }
 
 export interface DispatcherService {
+  hasExecutor(name: string): boolean;
+  hasPolicy(name: string): boolean;
   dispatch(envelope: MessageEnvelope): Promise<DispatchReceipt>;
   registerPolicy(policy: DispatchPolicyPlugin): Disposable;
   registerExecutor<C>(executor: ExecutorPlugin<C>, config: C): Disposable;

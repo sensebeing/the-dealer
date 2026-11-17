@@ -1,3 +1,4 @@
+import { DEFAULT_HOST_PLUGIN_REGISTRY } from './registry.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -66,11 +67,7 @@ export function probeDealerSetup(options: {
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 export function resolveHostExecutor(host: SupportedAgentHost): string {
-  if (host === 'orca' || host === 'antigravity') return 'orca';
-  if (host === 'claude') return 'claude-code';
-  if (host === 'chatgpt-dot') return 'chatgpt-app';
-  if (host === 'grok-bot') return 'agent-pty';
-  return host;
+  return DEFAULT_HOST_PLUGIN_REGISTRY.hostPreset(host).executor;
 }
 
 export function buildOnboardingPrompts(options: {
@@ -127,18 +124,18 @@ export function buildAgentBindingPreset(options: {
   rotateAfterWaves?: number;
 }) {
   const host = options.host === 'claude' ? 'claude-code' : options.host;
-  const entry = AGENT_HOST_CATALOG.find(item => item.host === host);
+  const entry = DEFAULT_HOST_PLUGIN_REGISTRY.hostPreset(host);
   if (!entry) throw new Error(`Unsupported agent host: ${host}`);
   const mode = normalizeConversationModeInput(options) ?? 'fixed';
   if (!(entry.modes as readonly string[]).includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (!['spawn', 'wave', 'fixed', 'inbox-only'].includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
-  if (host === 'grok-bot' && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
-  const managed = host === 'orca' || host === 'antigravity';
+  if (entry.requiresTargetBot && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
+  const managed = entry.managedWorkspace;
   const topic = options.topic ?? 'collab.request.v4';
   const executor = mode === 'inbox-only' ? 'inbox' : resolveHostExecutor(host);
   const binding: TopicBindingConfig = {
     executor, mode,
-    agent: host === 'antigravity' ? 'antigravity' : host === 'orca' ? options.agent ?? 'antigravity' : host,
+    agent: entry.acceptsBindingAgent ? options.agent ?? entry.defaultBindingAgent : entry.defaultBindingAgent,
     ...(mode !== 'spawn' ? { mailboxId: `stream:${topic}` } : {}),
     ...(options.projectId ? { projectId: options.projectId } : {}),
     ...(options.workspacePath ? { workspacePath: resolve(options.workspacePath) } : {}),
@@ -161,10 +158,10 @@ export function buildAgentBindingPreset(options: {
       : {}),
   };
   validateTopicBindings({ [topic]: binding }, [executor]);
-  const executorConfig = (executor === 'orca' || executor === 'orca-spawn') && mode === 'spawn'
+  const executorConfig = managed && mode === 'spawn'
     ? { [executor]: { agent: binding.agent, interactive: true, ...(binding.workspacePath ? { cwd: binding.workspacePath } : {}) } }
     : {};
-  return { topic, binding, executorConfig, summary: `${host}: ${mode} via ${executor}; configure receiver project roots and host CLI before enabling delivery.` };
+  return { topic, binding, executorConfig, defaultExecutor: mode === 'inbox-only' ? 'inbox' : entry.defaultExecutor, summary: `${host}: ${mode} via ${executor}; configure receiver project roots and host CLI before enabling delivery.` };
 }
 
 /** Project defaults and node notification effects shared by preview and application. */

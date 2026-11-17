@@ -1721,3 +1721,6 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   timer.unref();
   return runtime;
 }
+
+export { HostPluginRegistry, createDefaultHostPluginRegistry, DEFAULT_HOST_PLUGIN_REGISTRY } from './registry.ts';
+export type { ExecutorDescriptor, PolicyDescriptor, BuiltinExecutorDeps, BuiltinPolicyDeps } from './registry.ts';
