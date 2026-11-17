@@ -595,17 +595,8 @@ export class DealerNodeRuntime {
           );
         },
       });
-      for (const network of this.config.networks) {
-        await this.transport.mountNetwork(network);
-        if (network.admissionMode) {
-          await this.node.updateNetworkAdmissionMode(network.networkId, network.admissionMode);
-        }
-      }
       for (const route of this.config.routes) {
         this.installRoute(route);
-      }
-      for (const source of this.config.sources) {
-        await this.installSource(source);
       }
       for (const project of [...this.config.projects]) {
         await this.linkProject(project.rootPath, project.userPatchPath, { restore: true });
@@ -614,6 +605,15 @@ export class DealerNodeRuntime {
         await this.installUserPlugin(ref);
       }
       this.assertConfiguredPluginsRegistered();
+      for (const network of this.config.networks) {
+        await this.transport.mountNetwork(network);
+        if (network.admissionMode) {
+          await this.node.updateNetworkAdmissionMode(network.networkId, network.admissionMode);
+        }
+      }
+      for (const source of this.config.sources) {
+        await this.installSource(source);
+      }
       const gate = this.kernel.ctx.services.gate as NetworkGateService;
       for (const networkId of this.transport.listMountedNetworks()) {
         if (gate.getNetworkMode(networkId) !== 'open') continue;
@@ -830,6 +830,13 @@ export class DealerNodeRuntime {
           await this.publishSkills();
           this.config.projects = [...this.config.projects.filter(project => project.projectId !== manifest.projectId), linked];
           this.loadedProjectEntries.set(manifest.projectId, projectEntries);
+          if (options.restore && onboardingPassphrase && manifest.onboarding?.bootstrapPeers?.length) {
+            const network = this.config.networks.find(entry =>
+              entry.networkId === onboardingNetworkId && entry.passphrase === onboardingPassphrase);
+            if (network) {
+              network.bootstrapPeers = [...new Set([...(network.bootstrapPeers ?? []), ...manifest.onboarding.bootstrapPeers])];
+            }
+          }
           if (onboardingPassphrase && !options.restore && !this.transport.listMountedNetworks().includes(onboardingNetworkId)) {
             await this.mountNetwork({
               networkId: onboardingNetworkId,
@@ -1085,7 +1092,8 @@ export class DealerNodeRuntime {
           await this.transport.fetchBlobToPath(attachment.ticket, destination);
           files.push(destination);
         }
-        local.push(files.length ? { ...envelope, payload: { ...envelope.payload, localAttachments: files } } : envelope);
+        const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload) ? envelope.payload : {};
+        local.push({ ...envelope, payload: { ...payload, localAttachments: files } });
       }
       return executor.execute(local, context, { ...config, ...this.config.executorConfig[executor.name] });
     } };

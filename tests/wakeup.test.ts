@@ -898,7 +898,9 @@ test('two-node P2P closed loop verifies signatures and keeps unapproved knocks r
   assert.equal(inboundLeg.localMailbox, 'task:bob1');
   assert.equal(inboundLeg.peerReplyMailbox, 'worktree:alice');
   const delivered = bob.mailbox.list({ mailboxId: 'task:bob1' }).items[0];
-  assert.ok(verifyEnvelope(delivered.envelope));
+  const { localAttachments, ...wirePayload } = delivered.envelope.payload;
+  assert.deepEqual(localAttachments, []);
+  assert.ok(verifyEnvelope({ ...delivered.envelope, payload: wirePayload }));
   assert.equal(delivered.envelope.from.nodeId, alice.transport.localNodeId);
 
   await cli(bob, 'gate', 'mode', 'open', '--network', 'team');
@@ -926,7 +928,9 @@ test('two-node P2P closed loop verifies signatures and keeps unapproved knocks r
   const questionItem = alice.mailbox
     .list({ mailboxId: 'worktree:alice' })
     .items.find(item => item.id === asked.questionId)!;
-  assert.ok(verifyEnvelope(questionItem.envelope));
+  const { localAttachments: questionAttachments, ...questionWirePayload } = questionItem.envelope.payload;
+  assert.deepEqual(questionAttachments, []);
+  assert.ok(verifyEnvelope({ ...questionItem.envelope, payload: questionWirePayload }));
 
   const replied = await cli(
     alice,
@@ -949,7 +953,9 @@ test('two-node P2P closed loop verifies signatures and keeps unapproved knocks r
   const replyItem = bob.mailbox
     .list({ mailboxId: 'task:bob1' })
     .items.find(item => item.id === replied.replyId)!;
-  assert.ok(verifyEnvelope(replyItem.envelope));
+  const { localAttachments: replyAttachments, ...replyWirePayload } = replyItem.envelope.payload;
+  assert.deepEqual(replyAttachments, []);
+  assert.ok(verifyEnvelope({ ...replyItem.envelope, payload: replyWirePayload }));
 
   const settled = await cli(
     bob,

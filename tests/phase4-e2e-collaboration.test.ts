@@ -963,13 +963,13 @@ test('Phase 4: both DND crash windows park the signed obligation across restart 
     await restarted.gate.evaluate(newer);
     await restarted.gate.setMode('open');
     assert.equal(restarted.gate.listDndQueue().length, 0);
-    assert.deepEqual(restarted.mailbox.list().items[0].envelope, newer);
+    assert.deepEqual(restarted.mailbox.list().items[0].envelope, { ...newer, payload: { ...newer.payload, localAttachments: [] } });
     await restarted.stop();
   }
 });
 
 test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists status and fences unknown execution', async t => {
-  for (const evidence of ['mailbox', 'dispatched', 'settled', 'failed', 'dispatching', 'missing', 'queued-receipt', 'dnd', 'parked', 'tampered-mailbox'] as const) {
+  for (const evidence of ['mailbox', 'materialized-mailbox', 'materialized-tampered-mailbox', 'dispatched', 'settled', 'failed', 'dispatching', 'missing', 'queued-receipt', 'dnd', 'parked', 'tampered-mailbox'] as const) {
     const root = directory(t);
     const runtime = await node(t, root, evidence, {
       patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
@@ -980,12 +980,20 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
       id: 'legacy', traceId: 'legacy', networkId: 'sensebeing',
       from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' },
       routing: { mode: 'unicast', targets: [runtime.node.getSelfCard('sensebeing').nodeId] },
-      kind: 'task', subject: 'legacy', body: 'legacy obligation', attachments: [],
+      kind: 'task', subject: 'legacy', body: 'legacy obligation',
+      attachments: evidence.startsWith('materialized')
+        ? [{ name: 'claim.txt', mimeType: 'text/plain', sizeBytes: 4, blake3Hash: 'signed-hash', ticket: 'signed-ticket' }] : [],
       priority: 'normal', createdAt: new Date().toISOString(), payload: { claimVersion: 2 },
     }, keys.privateKeyPem);
     const key = JSON.stringify([message.networkId, keys.nodeId, message.id]);
     if (evidence === 'mailbox' || evidence === 'tampered-mailbox') {
       runtime.mailbox.enqueue([evidence === 'mailbox' ? message : { ...message, body: 'tampered' }]);
+    }
+    if (evidence.startsWith('materialized')) {
+      runtime.mailbox.enqueue([{ ...message,
+        body: evidence === 'materialized-tampered-mailbox' ? 'tampered' : message.body,
+        payload: { ...message.payload, localAttachments: [join(root, 'claim.txt')] },
+      }]);
     }
     if (evidence === 'dnd' || evidence === 'parked') await runtime.gate.evaluate(message);
     const stateDir = runtime.stateDir;
@@ -1008,7 +1016,7 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
     const options = { stateDir, transport: { discoveryDir: join(root, 'mesh') } };
     const restarted = new DealerNodeRuntime(options);
     await restarted.start();
-    const status = ['mailbox', 'dispatched', 'settled'].includes(evidence) ? 'settled' : 'unknown';
+    const status = ['mailbox', 'materialized-mailbox', 'dispatched', 'settled'].includes(evidence) ? 'settled' : 'unknown';
     const path = join(stateDir, 'dedup-watermarks.json');
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf8'))[key], { revision: 2, status }, evidence);
     await restarted.stop();
@@ -1021,7 +1029,7 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
     assert.equal(isDedupCasDuplicateReceipt(receipt), status === 'settled', evidence);
     assert.equal(isDedupCasDuplicateReceipt(receipt, { allowQueued: true }), status !== 'unknown', evidence);
     if (status === 'unknown') {
-      const newer = signEnvelope({ ...message, id: 'newer', idempotencyKey: message.id, payload: { claimVersion: 3 } }, keys.privateKeyPem);
+      const newer = signEnvelope({ ...message, id: 'newer', idempotencyKey: message.id, attachments: [], payload: { claimVersion: 3 } }, keys.privateKeyPem);
       assert.equal((await again.kernel.ctx.services.dispatcher.dispatch(newer)).stage, 'dispatched', evidence);
       assert.equal(again.mailbox.hasConfirmedEnvelope(message.networkId, keys.nodeId, message.id, 3), true);
     }
@@ -1084,7 +1092,7 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.deepEqual(restarted.gate.listDndQueue(), []);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
   assert.equal(restarted.mailbox.list().totalCount, 1);
-  assert.deepEqual(restarted.mailbox.list().items[0].envelope, queued.envelope);
+  assert.deepEqual(restarted.mailbox.list().items[0].envelope, { ...queued.envelope, payload: { ...queued.envelope.payload, localAttachments: [] } });
 });
 
 test('external project executors and policies share configuration, attachments and lifecycle with builtins', async t => {
@@ -1110,7 +1118,8 @@ test('external project executors and policies share configuration, attachments a
             writeFileSync(join(context.stateDir, 'custom-result.json'), JSON.stringify({
               policyCalls, marker: options.marker,
               attachments: envelope.payload.localAttachments.map(path => readFileSync(path, 'utf8')),
-              originalAttachment: envelope.attachments[0].name,
+              originalAttachment: envelope.attachments[0]?.name,
+              localAttachments: envelope.payload.localAttachments,
             }));
             return { executor: 'custom-exec', executionId: envelope.id, mailboxId: 'custom-receipt' };
           }
@@ -1147,9 +1156,18 @@ test('external project executors and policies share configuration, attachments a
     assert.equal(sent.receipts[0].stage, 'dispatched', JSON.stringify(sent.receipts));
     assert.deepEqual(JSON.parse(readFileSync(join(bob.stateDir, 'custom-result.json'), 'utf8')), {
       policyCalls: topic === 'custom' ? 1 : 2, marker: 'receiver-config', attachments: ['external attachment contents'], originalAttachment: 'custom.txt',
+      localAttachments: [join(bob.stateDir, 'attachments', sent.messageId, '0-custom.txt')],
     });
     assert.equal(bob.mailbox.listThreadRecords(sent.messageId)[0].localMailbox, 'custom-receipt');
   }
+  const forgedSecretPath = join(root, 'receiver-secret.txt');
+  writeFileSync(forgedSecretPath, 'must never reach an executor');
+  const forged = await alice.emitter.emit(input('custom-bob', { localAttachments: [forgedSecretPath] }));
+  assert.equal(forged.receipts[0].stage, 'dispatched');
+  const sanitized = JSON.parse(readFileSync(join(bob.stateDir, 'custom-result.json'), 'utf8'));
+  assert.deepEqual(sanitized.localAttachments, []);
+  assert.deepEqual(sanitized.attachments, []);
+  assert.equal(JSON.stringify(sanitized).includes(forgedSecretPath), false);
   const dispatcher = bob.kernel.getService('dispatcher');
   assert.equal(dispatcher.hasExecutor('custom-exec'), true);
   assert.equal(dispatcher.hasPolicy('custom-policy'), true);
@@ -1182,4 +1200,51 @@ test('external configuration defers names until plugin loading but rejects unreg
     assert.equal(runtime.kernel.hasService('dispatcher'), false, 'failed start unwinds services');
     assert.equal(statSync(stateDir).isDirectory(), true);
   }
+});
+
+
+test('startup script dispatch waits for external executors and policies before mounting traffic', async t => {
+  const root = directory(t);
+  const plugin = join(root, 'startup-plugin.ts');
+  writeFileSync(plugin, `
+    import { appendFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    export function createPlugin(config, context) {
+      return { name: 'startup-plugin', inject: ['dispatcher'], apply(ctx) {
+        const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+          async process(envelope, next) {
+            appendFileSync(join(context.stateDir, 'startup-events.jsonl'), JSON.stringify(['policy', envelope.subject]) + '\\n');
+            return next([envelope]);
+          }
+        });
+        const executor = ctx.services.dispatcher.registerExecutor({ name: 'custom-exec',
+          async execute(batch) {
+            appendFileSync(join(context.stateDir, 'startup-events.jsonl'), JSON.stringify(['executor', batch[0].subject]) + '\\n');
+            return { executor: 'custom-exec', executionId: batch[0].id };
+          }
+        }, {});
+        ctx.effect(() => () => executor.dispose());
+        ctx.effect(() => () => policy.dispose());
+      } };
+    }
+  `);
+  const runtime = new DealerNodeRuntime({ stateDir: join(root, 'state'), member: 'startup', profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+    patch: {
+      networks: [{ networkId: 'sensebeing', passphrase: 'startup-secret' }],
+      userPlugins: [{ name: 'startup-plugin', module: plugin }],
+      executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+      sources: [{ type: 'script', config: { command: 'startup-source' } }],
+    },
+    commandRunner: async request => {
+      assert.equal(request.command, 'startup-source');
+      assert.equal(runtime.kernel.getService('dispatcher').hasExecutor('custom-exec'), true);
+      assert.equal(runtime.kernel.getService('dispatcher').hasPolicy('custom-policy'), true);
+      return { stdout: JSON.stringify({ ...input('startup'), subject: 'first startup message' }) + '\n' };
+    },
+  });
+  t.after(() => runtime.stop());
+  await runtime.start();
+  const events = readFileSync(join(runtime.stateDir, 'startup-events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(events, [['policy', 'first startup message'], ['executor', 'first startup message']]);
 });

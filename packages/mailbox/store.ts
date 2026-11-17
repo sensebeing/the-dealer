@@ -1269,7 +1269,13 @@ export class MailboxStore {
   hasConfirmedEnvelope(networkId: string, senderNodeId: string, entityId: string, minRevision: number): boolean {
     return this.read().items.some(({ envelope }) => {
       const revision = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
-      return verifyEnvelope(envelope) && envelope.networkId === networkId &&
+      // Materialized paths are receiver-owned metadata, outside the sender's wire signature.
+      const authenticated = verifyEnvelope(envelope) ||
+        (isRecord(envelope.payload) && Object.hasOwn(envelope.payload, 'localAttachments') &&
+          verifyEnvelope({ ...envelope, payload: Object.fromEntries(
+            Object.entries(envelope.payload).filter(([key]) => key !== 'localAttachments'),
+          ) }));
+      return authenticated && envelope.networkId === networkId &&
         envelope.from.nodeId === senderNodeId && (envelope.idempotencyKey ?? envelope.id) === entityId &&
         typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= minRevision;
     });
