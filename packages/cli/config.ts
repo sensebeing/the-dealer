@@ -474,11 +474,24 @@ export function decodeNetworkInvite(uri: string): NetworkMountConfig {
 }
 
 /** Translate receiver configuration into the mailbox's mode-only addressing contract. */
-export function toMailboxTopicBinding(binding: TopicBindingConfig, executorConfig?: Record<string, Record<string, any>>): MailboxTopicBinding {
+export function toMailboxTopicBinding(binding: TopicBindingConfig, executorConfig?: Record<string, Record<string, any>>, payload?: Record<string, unknown>): MailboxTopicBinding {
   const config = executorConfig?.[binding.executor];
-  const explicit = normalizeConversationModeInput(binding) ?? normalizeConversationModeInput(config);
+  let payloadMode: AgentConversationMode | undefined;
+  let agent: ReturnType<typeof parseAgentHost> | undefined;
+  // Queued payloads have not passed executor validation; malformed hints carry no addressing authority.
+  try {
+    payloadMode = normalizeConversationModeInput(payload);
+  } catch {
+    // Executor validation remains authoritative when delivery is attempted.
+  }
+  try {
+    agent = parseAgentHost(payload?.agent ?? binding.agent ?? config?.agent);
+  } catch {
+    // An absent or malformed host hint cannot select host-backed addressing.
+  }
+  const explicit = payloadMode ?? normalizeConversationModeInput(binding) ?? normalizeConversationModeInput(config);
   const mode = explicit ?? (binding.executor === 'inbox' || binding.executor === 'notify' ||
-    (binding.executor === 'agent-pty' && !usesAgentHostInvocation(binding.agent ?? config?.agent)) ? 'inbox-only'
+    (binding.executor === 'agent-pty' && !usesAgentHostInvocation(agent, explicit)) ? 'inbox-only'
     : binding.executor === 'orca-wave' ? 'wave'
     : binding.executor === 'orca' && (binding.rotateAfterWaves !== undefined || binding.streamKey !== undefined || binding.workspacePath !== undefined || binding.runId !== undefined || binding.terminalHandle !== undefined) ? 'wave'
     : 'spawn');

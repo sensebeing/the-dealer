@@ -31,7 +31,7 @@ import { createNotifyExecutorPlugin, createInboxExecutorPlugin } from '../plugin
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { MailboxStore, OutboxRedriveService, OutboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, WakeupRedriveService } from '../mailbox/index.ts';
+import { MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, WakeupRedriveService } from '../mailbox/index.ts';
 import { resolveOrcaWaveRotateAfterWaves } from '../plugins-orca/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
@@ -1102,11 +1102,18 @@ export class DealerNodeRuntime {
           }
           try {
             const binding = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding;
-            const mailboxId = resolveMailboxId(
-              envelope,
-              binding ? toMailboxTopicBinding(binding, this.config.executorConfig) : undefined,
+            const execution = receipt.stage === 'dispatched' && receipt.executionReceipt;
+            const authoritativeMailbox = execution && typeof execution === 'object' &&
+              typeof execution.mailboxId === 'string' &&
+              (!Array.isArray(execution.mailboxIds) || execution.mailboxIds.length === 1)
+              ? normalizeMailboxId(execution.mailboxId) : undefined;
+            const mailboxId = authoritativeMailbox ?? resolveMailboxId(
+              // Mode hints are normalized by the payload-aware binding adapter below, including
+              // queued messages whose executor has not yet validated their payload.
+              { ...envelope, payload: { ...envelope.payload, mode: undefined, conversationMode: undefined } },
+              binding ? toMailboxTopicBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
               this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
-              toMailboxTopicBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig).mode,
+              toMailboxTopicBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
             );
             // Inbound receipts can arrive after a synchronous pointer delivery; preserve its session.
             const target = this.mailbox.getWakeTarget(mailboxId);

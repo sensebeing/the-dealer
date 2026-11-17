@@ -165,6 +165,8 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
       return {
         executor: 'inbox',
         executionId: randomUUID(),
+        ...(prepared.length === 1 ? { mailboxId: prepared[0].mailboxId } : {}),
+        mailboxIds: prepared.map(item => item.mailboxId),
         count: batch.length,
         inserted,
       };

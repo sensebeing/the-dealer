@@ -1,3 +1,4 @@
+import { toMailboxTopicBinding } from '../packages/cli/config.ts';
 import { readAgentHostDriverConfig } from '../packages/plugins-agent-host/index.ts';
 import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
@@ -1809,3 +1810,79 @@ for (const executor of ['codex-cli', 'agent-pty', 'orca-spawn'] as const) {
     }
   });
 }
+
+test('payload-selected host owns inbound task addressing and thread replies resume its session', async t => {
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'), member: 'solo',
+    transport: { discoveryDir: join(root, 'discovery') },
+    patch: { topicBindings: { review: { executor: 'agent-pty' } } },
+    commandRunner: async request => { calls.push(request); return { stdout: '{}' }; },
+  }).start();
+  t.after(() => runtime.stop());
+  const initial = await runtime.emitter.emit({ networkId: 'local', kind: 'review',
+    routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check this change',
+    payload: { agent: 'claude-code' } });
+  assert.equal(initial.receipts[0].stage, 'dispatched');
+  const mailboxId = `task:${initial.messageId}`;
+  assert.equal(initial.receipts[0].executionReceipt?.mailboxId, mailboxId);
+  const inbound = runtime.mailbox.listThreadRecords(initial.messageId).find(record => record.direction === 'inbound');
+  assert.equal(inbound?.localMailbox, mailboxId);
+  const sessionId = runtime.mailbox.getWakeTarget(mailboxId)?.driverConfig?.sessionId;
+  assert.equal(typeof sessionId, 'string');
+  assert.deepEqual(calls[0].args.slice(0, 3), ['--bg', '--name', sessionId]);
+  const lease = runtime.mailbox.check({ mailboxId });
+  runtime.mailbox.ack(lease.deliveryId!, mailboxId);
+  const reply = await runtime.emitter.emit({ networkId: 'local', kind: 'review',
+    routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Reply', body: 'Use the smaller design',
+    payload: {}, semantic: { type: 'reply', threadId: initial.messageId } });
+  assert.equal(reply.receipts[0].stage, 'dispatched');
+  assert.equal(reply.receipts[0].executionReceipt?.mailboxId, mailboxId);
+  assert.deepEqual(reply.receipts[0].executionReceipt?.mailboxIds, [mailboxId]);
+  await runtime.wakeups.flushMailbox(mailboxId, { force: true });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].args.slice(0, 3), ['--bg', '--resume', sessionId]);
+  assert.match(calls[1].args.at(-1)!, /Use the smaller design/);
+  assert.equal(runtime.mailbox.listThreadRecords(initial.messageId).find(record => record.direction === 'inbound' && record.messageId === reply.messageId)?.localMailbox, mailboxId);
+  assert.equal(runtime.mailbox.list({ mailboxId: 'default' }).queuedCount, 0);
+  // Spawn execution owns its task mailbox even when a sender supplied a competing mailbox hint.
+  const competing = await runtime.emitter.emit({ networkId: 'local', kind: 'review',
+    routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Another task', body: 'New work',
+    payload: { agent: 'claude-code', mailbox: 'sender-hint' } });
+  assert.equal(competing.receipts[0].stage, 'dispatched');
+  assert.equal(competing.receipts[0].executionReceipt?.mailboxId, `task:${competing.messageId}`);
+  assert.equal(runtime.mailbox.listThreadRecords(competing.messageId).find(record => record.direction === 'inbound')?.localMailbox, `task:${competing.messageId}`);
+
+});
+
+test('mailbox addressing fallback accepts valid payload hints and ignores malformed hints', () => {
+  const binding = { executor: 'agent-pty' };
+  assert.equal(toMailboxTopicBinding(binding, {}, { agent: 'claude-code' }).mode, 'spawn');
+  assert.equal(toMailboxTopicBinding(binding, {}, { agent: 'claude-code', conversationMode: 'wave' }).mode, 'wave');
+  assert.equal(toMailboxTopicBinding(binding, {}, { agent: {}, mode: 'invalid' }).mode, 'inbox-only');
+  assert.equal(toMailboxTopicBinding(binding, {}, { mode: 'wave', conversationMode: 'fixed' }).mode, 'inbox-only');
+});
+
+test('queued thread addressing uses payload hints without validating execution prematurely', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'), member: 'solo',
+    transport: { discoveryDir: join(root, 'discovery') },
+    patch: { topicBindings: { review: { executor: 'agent-pty' } } },
+    commandRunner: async () => { assert.fail('queued messages must not execute'); },
+  }).start();
+  t.after(() => runtime.stop());
+  runtime.kernel.getService('dispatcher').registerPolicy({ name: 'hold-payload-validation', async process() { return { stage: 'queued' }; } });
+  for (const [payload, expected] of [
+    [{ agent: 'claude-code' }, 'task'],
+    [{ agent: 'claude-code', mode: 'wave' }, 'stream:review'],
+    [{ agent: {}, mode: 'invalid' }, 'default'],
+  ] as const) {
+    const result = await runtime.emitter.emit({ networkId: 'local', kind: 'review',
+      routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Queued', body: 'Wait', payload });
+    assert.equal(result.receipts[0].stage, 'queued');
+    const inbound = runtime.mailbox.listThreadRecords(result.messageId).find(record => record.direction === 'inbound');
+    assert.equal(inbound?.localMailbox, expected === 'task' ? `task:${result.messageId}` : expected);
+  }
+});

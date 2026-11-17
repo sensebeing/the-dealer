@@ -320,6 +320,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
             return {
               executor: 'orca-spawn',
               executionId: randomUUID(),
+              mailboxId,
               worktreePath: path,
               woke: false,
               reason: String(launchError),
@@ -339,6 +340,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           const receipt = {
             executor: 'orca-spawn',
             executionId: randomUUID(),
+            mailboxId,
             worktreePath: path,
             terminal,
             ...(warning !== undefined ? { warning } : {}),
@@ -357,6 +359,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           return {
             executor: 'orca-spawn',
             executionId: randomUUID(),
+            mailboxId,
             worktreePath: path,
             woke: false,
             reason: String(error),

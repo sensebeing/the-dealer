@@ -273,6 +273,7 @@ function createAgentExecutorPlugin(
           executionId: randomUUID(),
           output: structuredOutput,
           stderr: output.stderr ?? '',
+          ...(mailboxId ? { mailboxId } : {}),
           ...(wakeDelivered ? { woke: true } : {}),
         };
       } finally {
