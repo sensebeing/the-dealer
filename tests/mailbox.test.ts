@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   MailboxStore,
+  WakeupRedriveService,
   normalizeMailboxId,
   resolveMailboxId,
   resolveBoundMailboxId,
@@ -614,11 +615,12 @@ test('spawn bindings resolve inbound task identity without changing outbound bou
   }
 });
 
-test('v1 wake targets upgrade losslessly to strict v2 on the next mutation', t => {
+test('v1 wake targets upgrade losslessly to strict v2 on the next mutation', async t => {
   const { path } = workspace(t);
   const base = { coalesceMs: 12, completedWaves: 3, pendingWake: true, earliestWakeAt: 1234, attemptCount: 2, wakeupPrefix: 'prefix', lastWakeError: 'unconfirmed' };
   const legacy = {
     passive: { ...base, mailboxId: 'passive', mode: 'passive' },
+    residual: { ...base, mailboxId: 'residual', mode: 'passive', workspacePath: '/tmp/ws', interactiveCommand: 'codex' },
     host: { ...base, mailboxId: 'host', mode: 'passive', hostAgent: 'claude-code', sessionId: 's', conversationMode: 'fixed' },
     terminal: { ...base, mailboxId: 'terminal', mode: 'orca-terminal', terminalHandle: 'h', workspacePath: '/workspace', agent: 'codex', rotateAfterWaves: 4, deliveryInDoubt: true },
     run: { ...base, mailboxId: 'run', mode: 'orca-run', runId: 'r', worktreeId: 'w', futureOption: { values: [1, null, true] } },
@@ -638,6 +640,16 @@ test('v1 wake targets upgrade losslessly to strict v2 on the next mutation', t =
   assert.deepEqual(store.getWakeTarget('terminal'), { ...base, mailboxId: 'terminal', driver: 'orca-terminal', rotateAfterWaves: 4, deliveryInDoubt: true, driverConfig: { terminalHandle: 'h', workspacePath: '/workspace', agent: 'codex' } });
   assert.deepEqual(store.getWakeTarget('run')?.driverConfig, { runId: 'r', worktreeId: 'w', futureOption: { values: [1, null, true] } });
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).schema, 'the-dealer-mailbox/v1');
+  assert.equal(store.getWakeTarget('residual')?.driver, 'passive');
+  assert.deepEqual(store.getWakeTarget('residual')?.driverConfig, { workspacePath: '/tmp/ws', interactiveCommand: 'codex' });
+  const wakeups = new WakeupRedriveService({ store, drivers: [{
+    name: 'mock-session', deliver: async () => ({ kind: 'noop', reason: 'unused' }),
+    resolveSessionTarget: id => id === 'residual' ? { driver: 'mock-session' } : undefined,
+  }] });
+  t.after(() => wakeups.stop());
+  assert.equal((await wakeups.resolveSessionWakeTarget('residual'))?.driver, 'mock-session');
+  assert.equal((await wakeups.flushMailbox('residual', { force: true })).woke, true);
+  assert.equal(store.getWakeTarget('residual')?.pendingWake, false);
   store.upsertWakeTarget('passive', { pendingWake: false });
   const persisted = JSON.parse(readFileSync(path, 'utf8'));
   assert.equal(persisted.schema, 'the-dealer-mailbox/v2');

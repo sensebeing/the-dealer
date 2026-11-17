@@ -1466,7 +1466,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
       const resolvedTopic = group === 'send' ? runtime.resolveTopicBinding(topic, streamKey) : undefined;
       const boundTopicMailbox = resolvedTopic
-        ? resolveBoundMailboxId(streamKey ? `${topic}:${streamKey}` : topic, toMailboxTopicBinding(resolvedTopic.binding))
+        ? resolveBoundMailboxId(streamKey ? `${topic}:${streamKey}` : topic, toMailboxTopicBinding(resolvedTopic.binding, runtime.config.executorConfig))
         : undefined;
       const callerMatchesBoundTopic = Boolean(
         callerBinding && resolvedTopic && (

@@ -1762,3 +1762,50 @@ test('installed CLI and daemon run from node_modules with clean JSON output', { 
   assert.equal(code, 0, errors);
   assert.equal(errors, '');
 });
+
+for (const executor of ['codex-cli', 'agent-pty', 'orca-spawn'] as const) {
+  test(`mode-less topic binding preserves executor behavior and thread addressing: ${executor}`, async t => {
+    const root = directory(t);
+    const calls: CommandRequest[] = [];
+    const executorConfig = executor === 'codex-cli' ? { conversationMode: 'fixed', sessionId: 's1' }
+      : executor === 'agent-pty' ? { command: 'raw-tool', args: ['--pipe'] }
+      : { cwd: root, command: 'codex', noParent: true };
+    const runtime = await new DealerNodeRuntime({
+      stateDir: join(root, 'state'), member: 'solo',
+      transport: { discoveryDir: join(root, 'discovery') },
+      patch: { topicBindings: { review: { executor } }, executorConfig: { [executor]: executorConfig } },
+      commandRunner: async request => {
+        calls.push(request);
+        if (request.args[0] === 'worktree' && request.args[1] === 'create')
+          return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: root } } }) };
+        if (request.args[0] === 'terminal' && request.args[1] === 'create')
+          return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle: 'worker' } } }) };
+        return { stdout: '{}' };
+      },
+    }).start();
+    t.after(() => runtime.stop());
+    const result = await runtime.emitter.emit({ networkId: 'local', kind: 'review',
+      routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check this change', payload: {} });
+    assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
+    const thread = runtime.mailbox.listThreads()[0];
+    assert.ok(thread);
+    const inbound = runtime.mailbox.listThreadRecords(thread.threadId).find(record => record.direction === 'inbound');
+    assert.ok(inbound);
+    assert.equal(inbound.localMailbox, executor === 'orca-spawn' ? `task:${inbound.messageId}` : 'default');
+    assert.equal(runtime.resolveTopicBinding('review')?.binding.mode, undefined);
+    if (executor === 'codex-cli') {
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 's1', '--resume']);
+      assert.equal(runtime.mailbox.getWakeTarget('default')?.driver, 'agent-host');
+    } else if (executor === 'agent-pty') {
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].command, 'raw-tool');
+      assert.deepEqual(calls[0].args, ['--pipe']);
+      assert.match(String(calls[0].input), /Check this change/);
+    } else {
+      assert.deepEqual(calls.map(call => call.args.slice(0, 2).join(' ')), ['worktree create', 'terminal create']);
+      const args = calls[1].args;
+      assert.match(args[args.indexOf('--command') + 1], /'codex' 'exec'/);
+    }
+  });
+}

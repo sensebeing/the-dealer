@@ -422,12 +422,9 @@ export function selfUpdate(options: SelfUpdateOptions): any {
         let savedStash: string | undefined;
         const restore = () => {
           if (!savedStash || stashRef() !== savedStash) throw new Error('Temporary update stash is no longer the newest stash');
-          try { git(['stash', 'pop', '--index']); }
-          catch {
-            git(['reset', '--hard', beforeSha]);
-            git(['clean', '-fd']);
-            git(['stash', 'pop']);
-          }
+          git(['reset', '--hard', beforeSha]);
+          git(['clean', '-fd']);
+          git(['stash', 'pop', '--index']);
         };
         if (dirty) {
           const stashBefore = stashRef();
@@ -444,10 +441,8 @@ export function selfUpdate(options: SelfUpdateOptions): any {
         const pulledSha = git(['rev-parse', 'HEAD']);
         let restored = true;
         if (savedStash) {
-          try { git(['stash', 'pop']); }
+          try { git(['stash', 'pop', '--index']); }
           catch {
-            git(['reset', '--hard', beforeSha]);
-            git(['clean', '-fd']);
             restore();
             restored = false;
             status = 'failed';

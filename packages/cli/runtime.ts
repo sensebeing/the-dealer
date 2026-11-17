@@ -950,7 +950,14 @@ export class DealerNodeRuntime {
 
   private executorTopicBinding = (kind: string, streamKey?: string) => {
     const resolved = this.resolveTopicBinding(kind, streamKey);
-    return resolved ? { ...resolved.binding, ...toMailboxTopicBinding(resolved.binding), repoRoot: resolved.projectRoot } : undefined;
+    if (!resolved) return undefined;
+    const addressing = toMailboxTopicBinding(resolved.binding, this.config.executorConfig);
+    return { ...resolved.binding, defaultMode: addressing.mode, stream: addressing.stream, repoRoot: resolved.projectRoot };
+  };
+
+  private resolveTopicMailboxBinding = (kind: string, streamKey?: string) => {
+    const binding = this.resolveTopicBinding(kind, streamKey)?.binding;
+    return binding ? toMailboxTopicBinding(binding, this.config.executorConfig) : undefined;
   };
 
   private async activateLarkNotifier(): Promise<void> {
@@ -1005,12 +1012,12 @@ export class DealerNodeRuntime {
     const mailboxes: string[] = [];
     for (const kind of kinds) {
       const { binding, projectRoot } = this.resolveTopicBinding(kind)!;
-      const mailboxId = resolveBoundMailboxId(kind, toMailboxTopicBinding(binding));
+      const mailboxId = resolveBoundMailboxId(kind, toMailboxTopicBinding(binding, this.config.executorConfig));
       const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
           ['orca', 'orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
       if (notifyLark) mailboxes.push(mailboxId);
-      const effectiveMode = resolveEffectiveConversationMode({ binding: toMailboxTopicBinding(binding) });
+      const effectiveMode = resolveEffectiveConversationMode({ binding: toMailboxTopicBinding(binding, this.config.executorConfig) });
       if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && effectiveMode !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
       const current = this.mailbox.getWakeTarget(mailboxId);
@@ -1097,9 +1104,9 @@ export class DealerNodeRuntime {
             const binding = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding;
             const mailboxId = resolveMailboxId(
               envelope,
-              binding ? toMailboxTopicBinding(binding) : undefined,
+              binding ? toMailboxTopicBinding(binding, this.config.executorConfig) : undefined,
               this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
-              toMailboxTopicBinding({ executor: this.resolveExecutorName(envelope) }).mode,
+              toMailboxTopicBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig).mode,
             );
             // Inbound receipts can arrive after a synchronous pointer delivery; preserve its session.
             const target = this.mailbox.getWakeTarget(mailboxId);
@@ -1117,7 +1124,7 @@ export class DealerNodeRuntime {
           if (!resolved) return next(envelope);
           const bindingKind = typeof envelope.payload?.streamKey === 'string'
             ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
-          const replyMailbox = resolveBoundMailboxId(bindingKind, toMailboxTopicBinding(resolved.binding));
+          const replyMailbox = resolveBoundMailboxId(bindingKind, toMailboxTopicBinding(resolved.binding, this.config.executorConfig));
           return next(replyMailbox === 'default' ? envelope : {
             ...envelope, semantic: { ...(envelope.semantic ?? { type: 'message' as const, threadId: envelope.id }), replyMailbox },
           });
@@ -1196,7 +1203,7 @@ export class DealerNodeRuntime {
           }),
           inbox: createInboxExecutorPlugin({
             ...this.config.executorConfig.inbox,
-            resolveTopicBinding: this.executorTopicBinding,
+            resolveTopicBinding: this.resolveTopicMailboxBinding,
             store: this.mailbox,
             wakeup: this.wakeups,
             commandRunner: runner,

@@ -36,6 +36,8 @@ import {
 } from '../plugins-executor/index.ts';
 
 export interface OrcaTopicBinding extends MailboxTopicBinding {
+  /** Addressing fallback; never an explicitly requested interactive conversation mode. */
+  defaultMode?: AgentConversationMode;
   executor?: string;
   agent?: string;
   noParent?: boolean;
@@ -648,7 +650,7 @@ export function createOrcaExecutorPlugin(options: OrcaSpawnOptions & OrcaWaveOpt
             binding,
             config as { mode?: unknown; conversationMode?: unknown },
             options as { mode?: unknown; conversationMode?: unknown },
-            { mode: 'spawn' },
+            { mode: binding?.defaultMode ?? 'spawn' },
           ],
         }),
       );

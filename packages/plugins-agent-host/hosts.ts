@@ -28,6 +28,12 @@ export function normalizeAgentHost(agent: SupportedAgentHost): SupportedAgentHos
   return descriptor.canonical;
 }
 
+/** Whether the generic agent executor uses a host session instead of a raw command pipe. */
+export function usesAgentHostInvocation(agent?: SupportedAgentHost, mode?: AgentConversationMode, namedHost = false): boolean {
+  return mode !== undefined || namedHost || (agent !== undefined &&
+    ['antigravity', 'antigravity-app', 'claude-code', 'claude-app', 'chatgpt-dot', 'grok-bot'].includes(normalizeAgentHost(agent)));
+}
+
 export function resolveAgentSessionId(
   mailboxId: string,
   sessionId?: string,

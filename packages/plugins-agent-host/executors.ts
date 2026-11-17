@@ -4,6 +4,7 @@ import { normalizeConversationModeInput } from '../core-types/index.ts';
 import {
   buildAgentHostInvocation,
   resolveAgentSessionId,
+  usesAgentHostInvocation,
   normalizeAgentHost,
   trustAntigravityWorkspace,
   parseAgentHost,
@@ -133,13 +134,7 @@ function createAgentExecutorPlugin(
         throw beforeExternalEffect(new Error('Invalid agent conversationMode'));
       }
       const canonicalHost = agent ? prepareExternalEffect(() => normalizeAgentHost(agent)) : undefined;
-      const hostMode =
-        rawMode !== undefined ||
-        Boolean(host) ||
-        (canonicalHost !== undefined &&
-          ['antigravity', 'antigravity-app', 'claude-code', 'claude-app', 'chatgpt-dot', 'grok-bot'].includes(
-            canonicalHost,
-          ));
+      const hostMode = prepareExternalEffect(() => usesAgentHostInvocation(agent, rawMode, Boolean(host)));
       if (!hostMode) {
         const command = options.command ?? 'codex';
         return createRawCommandExecutorPlugin({
@@ -168,7 +163,12 @@ function createAgentExecutorPlugin(
           mailboxId =
             conversationMode === 'spawn'
               ? `task:${first.id}`
-              : prepareExternalEffect(() => resolveMailboxId(first, binding, undefined, 'inbox-only'));
+              : prepareExternalEffect(() => resolveMailboxId(first, {
+                  mailboxId: binding?.mailboxId,
+                  streamKey: binding?.streamKey,
+                  stream: binding?.stream,
+                  mode: conversationMode,
+                }, undefined, 'inbox-only'));
           const terminalPrompt =
             typeof payload.terminalPrompt === 'string'
               ? payload.terminalPrompt.trim() || undefined

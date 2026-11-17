@@ -765,8 +765,10 @@ for (const scenario of ['clean-restore', 'conflict', 'pull-failed'] as const) {
     const { root, checkout, writer, beforeSha, update } = updateCheckoutFixture(t);
     writeFileSync(join(checkout, 'tracked.txt'), 'local staged\n');
     git(checkout, ['add', 'tracked.txt']);
+    writeFileSync(join(checkout, 'tracked.txt'), 'local working tree\n');
     writeFileSync(join(checkout, 'untracked.txt'), 'local untracked\n');
     const beforeStatus = git(checkout, ['status', '--porcelain']);
+    const beforeIndex = git(checkout, ['diff', '--cached']);
     writeFileSync(join(writer, scenario === 'conflict' ? 'tracked.txt' : 'upstream.txt'), 'upstream\n');
     git(writer, ['add', '.']);
     git(writer, ['commit', '-m', 'upstream']);
@@ -777,7 +779,9 @@ for (const scenario of ['clean-restore', 'conflict', 'pull-failed'] as const) {
     assert.equal(report.sourceStatus, scenario === 'clean-restore' ? 'updated' : scenario === 'conflict' ? 'stash_conflict_rolled_back' : 'error');
     assert.equal(report.status, scenario === 'clean-restore' ? 'updated' : 'failed');
     assert.equal(git(checkout, ['rev-parse', 'HEAD']), scenario === 'clean-restore' ? upstreamSha : beforeSha);
-    assert.equal(readFileSync(join(checkout, 'tracked.txt'), 'utf8'), 'local staged\n');
+    assert.equal(readFileSync(join(checkout, 'tracked.txt'), 'utf8'), 'local working tree\n');
+    assert.equal(git(checkout, ['diff', '--cached']), beforeIndex);
+    assert.equal(git(checkout, ['status', '--porcelain']), beforeStatus);
     assert.equal(readFileSync(join(checkout, 'untracked.txt'), 'utf8'), 'local untracked\n');
     assert.equal(git(checkout, ['stash', 'list']), '');
     assert.equal(git(checkout, ['ls-files', '--unmerged']), '');

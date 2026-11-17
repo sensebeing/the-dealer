@@ -686,7 +686,7 @@ function loadState(raw: string): MailboxFileState {
         else driverConfig[field] = entry;
       }
       const configured = Object.keys(driverConfig).length > 0;
-      const driver = value.mode === 'passive' && configured ? 'agent-host' : value.mode;
+      const driver = value.mode === 'passive' && isNonEmptyString(driverConfig.hostAgent) ? 'agent-host' : value.mode;
       wakeTargets[key] = { ...core, driver, ...(configured ? { driverConfig } : {}) };
     }
     if (validateWakeTarget(wakeTargets[key]).mailboxId !== key) {

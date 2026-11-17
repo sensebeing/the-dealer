@@ -1,4 +1,4 @@
-import { parseAgentHost } from '../plugins-agent-host/index.ts';
+import { parseAgentHost, usesAgentHostInvocation } from '../plugins-agent-host/index.ts';
 import { orcaAgent } from '../plugins-orca/index.ts';
 import type { MailboxTopicBinding } from '../mailbox/index.ts';
 import { validateLarkNotify } from '../plugins-lark-notifier/index.ts';
@@ -474,9 +474,11 @@ export function decodeNetworkInvite(uri: string): NetworkMountConfig {
 }
 
 /** Translate receiver configuration into the mailbox's mode-only addressing contract. */
-export function toMailboxTopicBinding(binding: TopicBindingConfig): MailboxTopicBinding {
-  const explicit = normalizeConversationModeInput(binding);
-  const mode = explicit ?? (binding.executor === 'inbox' ? 'inbox-only'
+export function toMailboxTopicBinding(binding: TopicBindingConfig, executorConfig?: Record<string, Record<string, any>>): MailboxTopicBinding {
+  const config = executorConfig?.[binding.executor];
+  const explicit = normalizeConversationModeInput(binding) ?? normalizeConversationModeInput(config);
+  const mode = explicit ?? (binding.executor === 'inbox' || binding.executor === 'notify' ||
+    (binding.executor === 'agent-pty' && !usesAgentHostInvocation(binding.agent ?? config?.agent)) ? 'inbox-only'
     : binding.executor === 'orca-wave' ? 'wave'
     : binding.executor === 'orca' && (binding.rotateAfterWaves !== undefined || binding.streamKey !== undefined || binding.workspacePath !== undefined || binding.runId !== undefined || binding.terminalHandle !== undefined) ? 'wave'
     : 'spawn');
