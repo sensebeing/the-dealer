@@ -1601,3 +1601,88 @@ test('long-lived source start promises do not block startup or unrelated source 
   await runtime.stop();
   assert.deepEqual(fixture.events, ['first-start', 'second-start', 'second-stop', 'first-stop']);
 });
+
+test('source add waits for held replacement activation and does not persist a failed startup', { timeout: 10000 }, async t => {
+  const root = directory(t);
+  const module = join(root, 'held-replacement.ts');
+  writeFileSync(module, `
+    let enter, release;
+    export const entered = new Promise(resolve => { enter = resolve; });
+    const resumed = new Promise(resolve => { release = resolve; });
+    export { release };
+    export function createPlugin(config) {
+      return { name: 'held-replacement', apply(ctx) {
+        if (config.pause) ctx.effect(() => async () => { enter(); await resumed; });
+      } };
+    }
+  `);
+  const fixture = await import(pathToFileURL(module).href);
+  let sourceSignal: AbortSignal | undefined;
+  const runtime = await node(t, root, 'held-add', {
+    commandRunner: async request => {
+      sourceSignal = request.signal;
+      throw new Error('Source startup failed');
+    },
+    patch: { userPlugins: [{ name: 'held-replacement', module, config: { pause: true } }] },
+  });
+  t.after(() => fixture.release());
+  const replacement = runtime.installUserPlugin({ name: 'held-replacement', module, config: {} });
+  await fixture.entered;
+  let settled = false;
+  const errors: string[] = [];
+  const adding = runDealerCli(['source', 'add', '--type', 'script', '--command', 'failing-source'], {
+    runtime, stderr: line => errors.push(line), stdout: () => {},
+  }).then(code => { settled = true; return code; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(sourceSignal, undefined, 'held source must not execute');
+  assert.deepEqual(runtime.config.sources, []);
+  assert.deepEqual(JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8')).sources, []);
+  fixture.release();
+  await replacement;
+  assert.equal(await adding, 1);
+  assert.match(errors.join('\n'), /Source startup failed/);
+  assert.equal(sourceSignal?.aborted, true, 'failed registration is disposed');
+  assert.deepEqual(runtime.config.sources, []);
+  assert.deepEqual(JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8')).sources, []);
+  await runtime.stop();
+});
+
+test('held source cancellation rejects only its registration and never reports a source execution error', { timeout: 10000 }, async t => {
+  for (const cancellation of ['release', 'dispose', 'stop']) {
+    const root = directory(t);
+    let runs = 0;
+    const runtime = await node(t, root, `cancel-${cancellation}`, {
+      commandRunner: async () => { runs++; return { stdout: '' }; },
+    });
+    const emitter = runtime.emitter;
+    const hold = emitter.holdSources!();
+    if (cancellation === 'dispose') {
+      const registration = emitter.registerSource({ name: 'cancelled',
+        start() { runs++; }, stop() { assert.fail('never-started source must not be stopped'); },
+      });
+      const rejected = assert.rejects(registration.started!, /Source cancelled before start/);
+      await registration.dispose();
+      await rejected;
+      hold.release();
+    } else {
+      let settled = false;
+      const errors: string[] = [];
+      const adding = runDealerCli(['source', 'add', '--type', 'script', '--command', 'cancelled-source'], {
+        runtime, stderr: line => errors.push(line), stdout: () => {},
+      }).then(code => { settled = true; return code; });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false);
+      if (cancellation === 'release') hold.release({ start: false });
+      else await runtime.stop();
+      assert.equal(await adding, 1);
+      assert.match(errors.join('\n'), /Source cancelled before start/);
+      hold.release();
+    }
+    assert.equal(runs, 0);
+    assert.deepEqual(runtime.config.sources, []);
+    assert.deepEqual(JSON.parse(readFileSync(join(runtime.stateDir, 'config.json'), 'utf8')).sources, []);
+    assert.equal(runtime.lastError, undefined, 'pre-start cancellation is not an execution error');
+    await runtime.stop();
+  }
+});

@@ -1358,17 +1358,9 @@ export class DealerNodeRuntime {
     } else {
       throw new Error(`Unknown source type: ${spec.type}`);
     }
-    let started: Promise<void> = Promise.resolve();
-    const registration = this.emitter.registerSource({
-      name: source.name,
-      start: emitter => {
-        started = Promise.resolve(source.start(emitter));
-        return started;
-      },
-      stop: () => source.stop(),
-    });
+    const registration = this.emitter.registerSource(source);
     try {
-      await started;
+      await registration.started;
       return registration;
     } catch (error) {
       try {
