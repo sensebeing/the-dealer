@@ -613,13 +613,7 @@ export class DealerNodeRuntime {
       for (const ref of [...this.config.userPlugins]) {
         await this.installUserPlugin(ref);
       }
-      const dispatcher = this.kernel.getService('dispatcher');
-      for (const name of new Set([...this.config.executors, this.config.defaultExecutor])) {
-        if (!dispatcher.hasExecutor(name)) throw new Error(`Unknown executor: ${name}`);
-      }
-      for (const name of this.config.policies) {
-        if (!dispatcher.hasPolicy(name)) throw new Error(`Unknown policy: ${name}`);
-      }
+      this.assertConfiguredPluginsRegistered();
       const gate = this.kernel.ctx.services.gate as NetworkGateService;
       for (const networkId of this.transport.listMountedNetworks()) {
         if (gate.getNetworkMode(networkId) !== 'open') continue;
@@ -708,6 +702,16 @@ export class DealerNodeRuntime {
     return { plugin, config };
   }
 
+  private assertConfiguredPluginsRegistered(): void {
+    const dispatcher = this.kernel.getService('dispatcher');
+    for (const name of new Set([...this.config.executors, this.config.defaultExecutor])) {
+      if (!dispatcher.hasExecutor(name)) throw new Error(`Unknown executor: ${name}`);
+    }
+    for (const name of this.config.policies) {
+      if (!dispatcher.hasPolicy(name)) throw new Error(`Unknown policy: ${name}`);
+    }
+  }
+
   private async replaceExternal(
     previous: LoadedExternalPlugin[],
     next: LoadedExternalPlugin[],
@@ -728,6 +732,7 @@ export class DealerNodeRuntime {
         await this.kernel.use(entry.plugin, entry.config);
       }
       await commit();
+      if (this.started) this.assertConfiguredPluginsRegistered();
       this.persist();
     } catch (error) {
       this.config = config;
@@ -971,7 +976,12 @@ export class DealerNodeRuntime {
   };
 
   private async activateLarkNotifier(): Promise<void> {
-    if (!this.config.larkNotify?.enabled || this.larkNotifier) return;
+    if (!this.config.larkNotify?.enabled) {
+      if (this.larkNotifier) {
+        await this.kernel.applyPatch([{ name: 'lark-mirror', enabled: false }]);
+      }
+      return;
+    }
     const options = {
       store: this.mailbox, config: this.config.larkNotify, stateDir: this.stateDir,
       localNodeId: this.transport.localNodeId, localMember: this.config.member,

@@ -237,9 +237,7 @@ The assembly root's dispatcher decorator applies receiver `executorConfig` and a
 materialization uniformly, including external executors; original signed attachments remain
 unchanged. Dispose each registration with `ctx.effect` when unloading the plugin.
 
-Use `metadata` for non-empty string project annotations. Legacy top-level string extensions
-such as `assignee` are accepted and preserved without migration or runtime interpretation;
-empty values remain invalid. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
+Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
 pinning; these decisions stay with the host plugin rather than the core mailbox.
 
 `lark-mirror` is an ordinary Kernel plugin: it owns its notifier instance, provides the

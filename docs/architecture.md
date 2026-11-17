@@ -100,7 +100,7 @@ flowchart TB
 
 外部 project/user 插件通过 `ctx.services.dispatcher.registerExecutor/registerPolicy` 注册，和内置执行器共用同一活跃注册表与附件包装；可在 `executors`、`defaultExecutor`、`executorConfig`、`policies`、`topicBindings` 中引用。配置含外部来源或 executor overrides 时只预校验标识符，全部插件加载后逐一核对实际注册，未注册即拒绝启动。没有外部来源的独立配置仍拒绝未知名字。
 
-`dispatcher/inbound` 首先使用单目标执行回执的 authoritative `mailboxId`，缺省时通过 payload-aware registry 适配和 mailbox 的地址解析恢复；已交付 session 归属由插件 hook 与 `MailboxStore.pinSessionMailbox` 原子维护。`TopicBindingConfig.metadata` 和旧顶层非空字符串 annotations 均为 opaque 项目字段，不赋予核心 runtime 业务语义。
+`dispatcher/inbound` 首先使用单目标执行回执的 authoritative `mailboxId`，缺省时通过 payload-aware registry 适配和 mailbox 的地址解析恢复；已交付 session 归属由插件 hook 与 `MailboxStore.pinSessionMailbox` 原子维护。`TopicBindingConfig.metadata` 是唯一开放的非空字符串注解映射；顶层仅接受已声明字段及显式兼容的 `assignee`，未知字段被拒绝，注解不赋予核心 runtime 业务语义。
 
 `lark-mirror` 在插件内部创建 `LarkMailboxNotifier`，用 `ctx.provide('larkNotifier', ...)` 发布服务并用 `ctx.effect` 启停。Kernel unload/replacement 自动清理订阅与重试；runtime 通过只读 service getter 更新默认 mailbox 集。
 

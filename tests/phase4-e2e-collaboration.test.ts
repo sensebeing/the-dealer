@@ -1128,6 +1128,18 @@ test('external project executors and policies share configuration, attachments a
     topicBindings: { custom: { executor: 'custom-exec', mailboxId: 'configured-mailbox', metadata: { team: 'tools' }, assignee: 'alice' } },
   } });
   await connect(alice, bob);
+  const auxiliaryModule = join(root, 'auxiliary.ts');
+  writeFileSync(auxiliaryModule, `export default { name: 'auxiliary', apply() {} };`);
+  await bob.installUserPlugin({ name: 'auxiliary', module: auxiliaryModule });
+  const beforeUnlink = structuredClone(bob.config);
+  const beforeStatus = bob.projectStatus();
+  const savedConfig = readFileSync(join(bob.stateDir, 'config.json'), 'utf8');
+  await assert.rejects(bob.unlinkProject('custom'), /Unknown executor: custom-exec/);
+  assert.deepEqual(bob.config, beforeUnlink);
+  assert.deepEqual(bob.projectStatus(), beforeStatus);
+  assert.equal(readFileSync(join(bob.stateDir, 'config.json'), 'utf8'), savedConfig);
+  assert.equal(bob.kernel.getService('dispatcher').hasExecutor('custom-exec'), true);
+  assert.equal(bob.kernel.getService('dispatcher').hasPolicy('custom-policy'), true);
   const attachment = join(root, 'custom.txt');
   writeFileSync(attachment, 'external attachment contents');
   for (const topic of ['custom', 'default-fallback']) {

@@ -399,7 +399,7 @@ test('preset enables live Lark delivery and inherits only the selected project d
   assert.equal((await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', topic: 'selected', projectId: 'two' })).binding.notifyLark, true);
   const notifier = runtime.larkNotifier;
   await runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', topic: 'explicit', notifyLark: true });
-  assert.equal(runtime.larkNotifier, notifier, 'repeated activation reuses the notifier');
+  assert.notEqual(runtime.larkNotifier, notifier, 'repeated activation replaces the notifier through kernel lifecycle');
   runtime.mailbox.enqueue([message('live')], { mailboxId: 'stream:explicit' });
   await runtime.larkNotifier!.flush();
   assert.ok(calls.some(call => call.command === 'lark-cli' && call.args.includes('+messages-send')));

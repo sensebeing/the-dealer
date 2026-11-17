@@ -1,3 +1,4 @@
+import { parseAgentHost } from '../plugins-agent-host/index.ts';
 import { DEFAULT_HOST_PLUGIN_REGISTRY, isPluginName } from './registry.ts';
 import type { HostPluginRegistry } from './registry.ts';
 import type { MailboxTopicBinding } from '../mailbox/index.ts';
@@ -231,9 +232,9 @@ export function initProjectScaffold(
 
 export interface TopicBindingConfig {
   noParent?: boolean;
-  /** Opaque project annotations; legacy top-level string annotations are preserved verbatim. */
+  /** Opaque project annotations; assignee is the sole legacy top-level annotation. */
   metadata?: Record<string, string>;
-  [pluginField: string]: unknown;
+  assignee?: string;
   agent?: 'orca' | 'antigravity' | 'antigravity-cli' | 'antigravity-app' | 'claude' | 'claude-code' | 'claude-app' | 'codex' | 'codex-cli' | 'chatgpt-app' | 'chatgpt-dot' | 'grok-bot';
   interactiveCommand?: string;
   mode?: AgentConversationMode;
@@ -259,24 +260,29 @@ export interface TopicBindingConfig {
 
 export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[], registry: HostPluginRegistry = DEFAULT_HOST_PLUGIN_REGISTRY): asserts bindings is Record<string, TopicBindingConfig> {
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
-  const strings = ['agent', 'interactiveCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
+  const strings = ['assignee', 'agent', 'interactiveCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
   const booleans = ['noParent', 'autoCreateWorkspace', 'notifyLark'];
   const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves', 'metadata']);
   for (const [kind, binding] of Object.entries(bindings)) {
     if (isRecord(binding)) {
       try {
+        if (binding.agent !== undefined) parseAgentHost(binding.agent);
         const normalizedMode = normalizeConversationModeInput(binding);
         if (normalizedMode !== undefined) {
           binding.mode = normalizedMode;
           delete binding.conversationMode;
         }
-        registry.executor(binding.executor)?.validateBinding?.(binding as TopicBindingConfig, kind);
+        const descriptor = registry.executor(binding.executor);
+        if (binding.mode === 'inbox-only' && descriptor?.acceptsInboxOnly !== true) {
+          throw new Error(`Invalid topic binding: ${kind}`);
+        }
+        descriptor?.validateBinding?.(binding as TopicBindingConfig, kind);
       } catch {
         throw new Error(`Invalid topic binding: ${kind}`);
       }
     }
     if (!nonempty(kind) || (kind.includes(':') && (!nonempty(kind.slice(0, kind.indexOf(':'))) || !nonempty(kind.slice(kind.indexOf(':') + 1)))) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
-        Object.keys(binding).some(key => !allowed.has(key) && (!isPluginName(key) || !nonempty(binding[key]))) ||
+        Object.keys(binding).some(key => !allowed.has(key)) ||
         (binding.metadata !== undefined && (!isRecord(binding.metadata) || Object.entries(binding.metadata).some(([key, value]) => !isPluginName(key) || !nonempty(value)))) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||
         booleans.some(key => binding[key] !== undefined && typeof binding[key] !== 'boolean') ||

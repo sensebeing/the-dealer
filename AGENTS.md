@@ -43,7 +43,7 @@
 
 `packages/cli/registry.ts` 的 `HostPluginRegistry` 负责内置 executor/policy 描述符组合与宿主绑定适配；`BUILTIN_EXECUTORS` 从默认注册表派生。Orca 绑定校验、wake target 同步和已交付 session pinning 由 `plugins-orca` hooks 提供，宿主名和 setup 映射来自 `AGENT_HOST_DESCRIPTORS`。`dispatcher` 唯一持有活跃 executor/policy 注册；CLI 注入的统一包装为每个 executor（含外部插件）下载附件并提供 `payload.localAttachments`。全部插件加载后核对 enabled executor/policy，缺失时启动失败。
 
-`plugins-lark-notifier` 的 `lark-mirror` 插件通过 Kernel service 暴露 notifier，`ctx.effect` 管理启动与停止；runtime 仅有只读 service getter。绑定的 `metadata` 与旧式顶层字符串扩展字段均为 opaque 非空字符串，旧 `assignee` 无损保留且不参与核心路由决策。`WakeupRedriveService` 只使用注入的 `WakeupDriver`，不解释宿主配置。
+`plugins-lark-notifier` 的 `lark-mirror` 插件通过 Kernel service 暴露 notifier，`ctx.effect` 管理启动与停止；runtime 仅有只读 service getter。绑定仅在 `metadata` 中接受开放的非空字符串注解；顶层字段严格校验，仅显式保留旧 `assignee` 字符串兼容字段且不参与核心路由决策。`WakeupRedriveService` 只使用注入的 `WakeupDriver`，不解释宿主配置。
 
 ## 2. Engineering Quality Policy
 

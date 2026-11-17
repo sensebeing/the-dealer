@@ -336,10 +336,14 @@ test('receiver resolves compound stream bindings without sender preparation and 
   assert.equal(resolveBoundMailboxId('wave.alert.v1:tools-alert', toMailboxTopicBinding({ executor: 'orca-wave' })), 'stream:tools-alert');
   assert.equal(resolveBoundMailboxId('wave.alert.v1:tools-alert', toMailboxTopicBinding({ executor: 'orca-wave', streamKey: 'custom' })), 'stream:custom');
   assert.equal(resolveMailboxId(envelope('explicit', { payload: { executor: 'orca-wave' } }), toMailboxTopicBinding({ executor: 'orca-wave', streamKey: 'bound' }), undefined, toMailboxTopicBinding({ executor: 'orca-wave' }).mode), 'stream:bound');
-  for (const binding of [{ executor: 'orca-spawn', noParent: 'yes' }, { executor: 'orca-spawn', assignee: '' }, { executor: 'orca-spawn', metadata: { team: '' } }, { executor: 'orca-spawn', metadata: [] }]) {
-    assert.throws(() => validateTopicBindings({ topic: binding }, ['orca-spawn']), /Invalid/);
+  for (const binding of [{ executor: 'orca-spawn', noParent: 'yes' }, { executor: 'orca-spawn', assignee: '' }, { executor: 'orca-spawn', metadata: { team: '' } }, { executor: 'orca-spawn', metadata: [] }, { executor: 'orca-spawn', worktreePath: '/typo' }, { executor: 'orca', mailbox: 'stream:x' }]) {
+    assert.throws(() => validateTopicBindings({ topic: binding }, ['orca-spawn', 'orca']), /Invalid topic binding/);
   }
-  const annotations = { topic: { executor: 'orca-spawn', assignee: 'alice', metadata: { team: 'tools' }, owner: 'receiver' } };
+  for (const binding of [{ executor: 'external', agent: 'unknown-host' }, { executor: 'external', mode: 'inbox-only' }]) {
+    assert.throws(() => validateTopicBindings({ topic: binding }, ['external']), /Invalid topic binding/);
+  }
+  validateTopicBindings({ topic: { executor: 'external', agent: 'codex', mode: 'spawn' } }, ['external']);
+  const annotations = { topic: { executor: 'orca-spawn', assignee: 'alice', metadata: { team: 'tools', owner: 'receiver' } } };
   const originalAnnotations = structuredClone(annotations);
   validateTopicBindings(annotations, ['orca-spawn']);
   assert.deepEqual(annotations, originalAnnotations, 'generic metadata and legacy project fields round-trip losslessly');

@@ -758,3 +758,35 @@ test('runtime inbound reverse routes use task mailboxes for spawn topic bindings
     assert.equal(runtime.mailbox.list({ mailboxId: inbound.localMailbox }).queuedCount, 1);
   }
 });
+
+
+test('runtime replaces and disables the Lark mirror through kernel lifecycle', async t => {
+  const root = directory(t);
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({
+    stateDir: root, profile: 'headless-relay',
+    commandRunner: async call => {
+      calls.push(call);
+      return { stdout: '{"message_id":"notified"}' };
+    },
+    patch: { larkNotify: { enabled: true, target: { userId: 'before' }, mailboxes: ['default'] } },
+  }).start();
+  t.after(() => runtime.stop());
+  const previous = runtime.larkNotifier!;
+  runtime.config.larkNotify = { ...runtime.config.larkNotify!, target: { userId: 'after' } };
+  await runtime.applyAgentPreset({ host: 'codex', mode: 'inbox-only', topic: 'live', notifyLark: true });
+  const replacement = runtime.larkNotifier!;
+  assert.notEqual(replacement, previous);
+  assert.equal(runtime.kernel.getService('larkNotifier'), replacement);
+  runtime.mailbox.enqueue([envelope('after-reconfigure')]);
+  await replacement.flush();
+  await previous.flush();
+  assert.equal(calls.length, 1, 'only the replacement subscribes to mailbox events');
+  assert.equal(argument(calls[0], '--user-id'), 'after');
+  runtime.config.larkNotify.enabled = false;
+  await runtime['activateLarkNotifier']();
+  assert.equal(runtime.larkNotifier, undefined);
+  runtime.mailbox.enqueue([envelope('after-disable')]);
+  await replacement.flush();
+  assert.equal(calls.length, 1, 'disabled notifier has no active subscription');
+});

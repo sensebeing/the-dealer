@@ -50,10 +50,7 @@ export class HostPluginRegistry {
   private policies = new Map<string, PolicyDescriptor>();
   registerExecutor(descriptor: ExecutorDescriptor): void {
     if (!isPluginName(descriptor.name) || this.executors.has(descriptor.name)) throw new Error(`Invalid or duplicate executor descriptor: ${descriptor.name}`);
-    this.executors.set(descriptor.name, { ...descriptor, validateBinding: (binding, kind) => {
-      if (binding.mode === 'inbox-only' && !descriptor.acceptsInboxOnly) throw new Error(`Invalid topic binding: ${kind}`);
-      descriptor.validateBinding?.(binding, kind);
-    } });
+    this.executors.set(descriptor.name, descriptor);
   }
   registerPolicy(descriptor: PolicyDescriptor): void {
     if (!isPluginName(descriptor.name) || this.policies.has(descriptor.name)) throw new Error(`Invalid or duplicate policy descriptor: ${descriptor.name}`);
@@ -99,9 +96,6 @@ function mailboxBinding(binding: TopicBindingConfig, mode: AgentConversationMode
   return { ...(binding.mailboxId !== undefined ? { mailboxId: binding.mailboxId } : {}),
     ...(binding.streamKey !== undefined ? { streamKey: binding.streamKey } : {}), mode };
 }
-function validateAgent(binding: TopicBindingConfig): void {
-  if (binding.agent !== undefined) parseAgentHost(binding.agent);
-}
 function agentOptions(deps: BuiltinExecutorDeps) {
   return { ...deps.config, store: deps.store, wakeup: deps.wakeup,
     resolveTopicBinding: deps.resolveTopicBinding, commandRunner: deps.commandRunner };
@@ -123,13 +117,12 @@ export function createDefaultHostPluginRegistry(): HostPluginRegistry {
     if (!('executor' in host) || registry.executor(host.executor)) continue;
     registry.registerExecutor({ name: host.executor, interactiveAgent: true,
       validateBinding: binding => {
-        validateAgent(binding);
         if (binding.mode !== undefined && !(('executorModes' in host ? host.executorModes : host.modes) as readonly string[]).includes(binding.mode)) throw new Error('Unsupported host conversation mode');
       },
       create: deps => ({ plugin: createNamedHostExecutorPlugin(host.executor, host.host, agentOptions(deps)) }),
     });
   }
-  registry.registerExecutor({ name: 'agent-pty', interactiveAgent: true, validateBinding: validateAgent,
+  registry.registerExecutor({ name: 'agent-pty', interactiveAgent: true,
     toMailboxBinding: (binding, config, payload) => {
       const explicit = explicitMode(binding, config, payload);
       let agent: ReturnType<typeof parseAgentHost> | undefined;
@@ -139,11 +132,11 @@ export function createDefaultHostPluginRegistry(): HostPluginRegistry {
     },
     create: deps => ({ plugin: createAgentPtyExecutorPlugin(agentOptions(deps)) }),
   });
-  registry.registerExecutor({ name: 'inbox', acceptsInboxOnly: true, validateBinding: validateAgent,
+  registry.registerExecutor({ name: 'inbox', acceptsInboxOnly: true,
     toMailboxBinding: (binding, config, payload) => mailboxBinding(binding, explicitMode(binding, config, payload) ?? 'inbox-only'),
     create: deps => ({ plugin: createInboxExecutorPlugin({ ...agentOptions(deps), resolveTopicBinding: deps.resolveMailboxBinding }) }),
   });
-  registry.registerExecutor({ name: 'notify', validateBinding: validateAgent,
+  registry.registerExecutor({ name: 'notify',
     toMailboxBinding: (binding, config, payload) => mailboxBinding(binding, explicitMode(binding, config, payload) ?? 'inbox-only'),
     create: deps => ({ plugin: createNotifyExecutorPlugin({ inboxPath: join(deps.stateDir, 'notifications.jsonl'), ...deps.config, commandRunner: deps.commandRunner }) }),
   });
