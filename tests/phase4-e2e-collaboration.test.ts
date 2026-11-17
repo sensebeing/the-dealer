@@ -223,7 +223,6 @@ test('Phase 4: polling, CAS dedup, durable busy waves and run-managed delivery a
     },
   });
   const registration = alice.emitter.registerSource(source);
-  await alice.emitter.whenSourcesStarted?.();
   await source.pollOnce();
   await source.pollOnce();
   assert.equal(cursor, 2);
@@ -1351,26 +1350,36 @@ test('external sources wait for later configured policies at startup and never r
       assert.equal(runtime.kernel.hasService('dispatcher'), false);
     } else {
       await runtime.start();
+      await until(() => events.includes('executor'));
       assert.deepEqual(events, ['source', 'policy', 'executor']);
       await assert.rejects(runtime.installUserPlugin({ name: 'later-policy-executor', module,
         config: { missingPolicy: true, candidateSource: true },
       }), /Unknown policy: custom-policy/);
-      assert.deepEqual(events, ['source', 'policy', 'executor'], 'rollback disposes an unstarted source without waiting on its transition gate');
+      assert.deepEqual(events, ['source', 'policy', 'executor'], 'rollback disposes an unstarted source without starting it');
       await runtime.removeUserPlugin('early-source');
       await runtime.installUserPlugin({ name: 'early-source', module, config: { source: true } });
+      await until(() => events.filter(event => event === 'executor').length === 2);
       assert.deepEqual(events, ['source', 'policy', 'executor', 'source-stop', 'source', 'policy', 'executor'],
-        'live source installation waits until its protected first emission finishes');
+        'live source installation activates its protected first emission');
       await runtime.stop();
     }
   }
 });
 
-test('dispatch waits through policy replacement and rejected removal, and missing policy never poisons the ledger', async t => {
+test('dispatch fails before execution during policy replacement and rejected removal without poisoning the ledger', async t => {
   for (const operation of ['replace', 'remove']) {
     const root = directory(t);
     const module = join(root, 'policy-plugin.ts');
     writeFileSync(module, `
       export const events = [];
+      let executionPause;
+      export function pauseExecution() {
+        let entered, release;
+        const enteredPromise = new Promise(resolve => { entered = resolve; });
+        const released = new Promise(resolve => { release = resolve; });
+        executionPause = { entered, released };
+        return { entered: enteredPromise, release };
+      }
       let pause;
       export function pauseRemoval() {
         let entered, release;
@@ -1382,7 +1391,13 @@ test('dispatch waits through policy replacement and rejected removal, and missin
       export function createPlugin(config) {
         return { name: 'policy-plugin', inject: ['dispatcher'], apply(ctx) {
           const registration = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
-            async process(envelope, next) { events.push(config.version); return next([envelope]); },
+            async process(envelope, next) {
+              events.push(config.version);
+              const blocked = executionPause;
+              executionPause = undefined;
+              if (blocked) { blocked.entered(); await blocked.released; }
+              return next([envelope]);
+            },
           });
           ctx.effect(() => async () => {
             registration.dispose();
@@ -1419,14 +1434,12 @@ test('dispatch waits through policy replacement and rejected removal, and missin
       kind: 'protected', subject: operation, body: operation, payload: {}, attachments: [],
       priority: 'normal', createdAt: new Date().toISOString(),
     }, keys.privateKeyPem);
-    let dispatched = false;
-    const pending = dispatcher.dispatch(message).then(result => { dispatched = true; return result; });
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(dispatched, false);
+    await assert.rejects(dispatcher.dispatch(message), error =>
+      error instanceof Error && /Policy unavailable: custom-policy/.test(error.message) && error['beforeExternalEffect'] === true);
     assert.deepEqual(fixture.events, []);
     pause.release();
     await settledTransition;
-    assert.equal((await pending).stage, 'dispatched');
+    assert.equal((await dispatcher.dispatch(message)).stage, 'dispatched');
     assert.deepEqual(fixture.events, [operation === 'replace' ? 'v2' : 'v1', 'executor']);
     assert.equal(dispatcher.hasPolicy('custom-policy'), true);
 
@@ -1437,6 +1450,154 @@ test('dispatch waits through policy replacement and rejected removal, and missin
     assert.equal(fixture.events.length, 2, 'no policy or executor runs before all required policies are ready');
     runtime.config.policies.pop();
     assert.equal((await dispatcher.dispatch(retryable)).stage, 'dispatched', 'readiness failure leaves no terminal ledger receipt');
+    const duringPolicy = signEnvelope({ ...message, id: 'async-policy-removal' }, keys.privateKeyPem);
+    const executionPause = fixture.pauseExecution();
+    const running = dispatcher.dispatch(duringPolicy);
+    const rejected = assert.rejects(running, error => error instanceof Error &&
+      /Policy unavailable: custom-policy/.test(error.message) && error['beforeExternalEffect'] === true);
+    await executionPause.entered;
+    const removalPause = fixture.pauseRemoval();
+    const removing = assert.rejects(runtime.removeUserPlugin('policy-plugin'), /Unknown policy/);
+    await removalPause.entered;
+    const executions = fixture.events.filter(event => event === 'executor').length;
+    executionPause.release();
+    await rejected;
+    assert.equal(fixture.events.filter(event => event === 'executor').length, executions);
+    removalPause.release();
+    await removing;
+    assert.equal((await dispatcher.dispatch(duringPolicy)).stage, 'dispatched');
     await runtime.stop();
   }
+});
+
+test('poll settlement completes during policy replacement or rejected removal without waiting on its own teardown', { timeout: 15000 }, async t => {
+  for (const operation of ['replace', 'remove']) {
+    const root = directory(t);
+    const module = join(root, 'poll-policy.ts');
+    writeFileSync(module, `
+      import { createPollWatermarkSourcePlugin } from ${JSON.stringify(pathToFileURL(resolvePath('packages/plugins-source/index.ts')).href)};
+      export const events = [];
+      export let poll;
+      let enter, release;
+      export const entered = new Promise(resolve => { enter = resolve; });
+      const resume = new Promise(resolve => { release = resolve; });
+      export { release };
+      export function createPlugin(config) {
+        return { name: 'poll-policy', inject: ['emitter', 'dispatcher'], apply(ctx) {
+          const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+            process(envelope, next) { events.push(config.version); return next([envelope]); },
+          });
+          const source = createPollWatermarkSourcePlugin({ initialCursor: 0,
+            poll: async cursor => ({ items: [cursor], cursor: cursor + 1 }),
+            toInput: () => ({ networkId: 'local', kind: 'poll', subject: 'poll', body: 'poll', routing: { mode: 'unicast', targets: ['member:poller'] } }),
+            saveCursor: async () => {},
+          });
+          poll = () => source.pollOnce();
+          const registration = ctx.services.emitter.registerSource({ name: 'poll',
+            start(emitter) { return source.start({ ...emitter, async emit(input) { enter(); await resume; return emitter.emit(input); } }); },
+            stop() { events.push('stop'); return source.stop(); },
+          });
+          ctx.effect(() => () => registration.dispose());
+          ctx.effect(() => () => { policy.dispose(); events.push('policy-removed'); });
+        } };
+      }
+    `);
+    const fixture = await import(pathToFileURL(module).href);
+    const runtime = await node(t, root, 'poller', { patch: {
+      executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+      userPlugins: [{ name: 'poll-policy', module, config: { version: 'v1' } }],
+    }, executorOverrides: [{ name: 'custom-exec', async execute(batch) {
+      fixture.events.push('executor'); return { executor: 'custom-exec', executionId: batch[0].id };
+    } }] });
+    const polling = fixture.poll();
+    const rejectedPoll = assert.rejects(polling);
+    await fixture.entered;
+    const changing = operation === 'replace'
+      ? runtime.installUserPlugin({ name: 'poll-policy', module, config: { version: 'v2' } })
+      : runtime.removeUserPlugin('poll-policy');
+    const completed = operation === 'remove' ? assert.rejects(changing, /Unknown policy/) : changing;
+    await until(() => fixture.events.includes('stop'));
+    assert.equal(runtime.kernel.getService('dispatcher').hasPolicy('custom-policy'), false);
+    fixture.release();
+    await rejectedPoll;
+    await completed;
+    assert.equal(fixture.events.includes('executor'), false);
+    await fixture.poll();
+    assert.deepEqual(fixture.events.slice(-2), [operation === 'replace' ? 'v2' : 'v1', 'executor']);
+    await runtime.stop();
+  }
+});
+
+test('rollback restores a policy and its source while discarding candidate sources', { timeout: 15000 }, async t => {
+  const root = directory(t);
+  const module = join(root, 'combined-plugin.ts');
+  writeFileSync(module, `
+    export const events = [];
+    export let emit;
+    export function createPlugin(config) {
+      return { name: 'combined', inject: ['dispatcher', 'emitter'], apply(ctx) {
+        if (!config.broken) {
+          const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+            process(envelope, next) { events.push(config.version + '-policy'); return next([envelope]); },
+          });
+          ctx.effect(() => () => policy.dispose());
+        }
+        const registration = ctx.services.emitter.registerSource({ name: 'combined-source',
+          start(emitter) {
+            events.push(config.version + '-start');
+            emit = () => emitter.emit({ networkId: 'local', kind: 'restored', subject: 'restored', body: 'restored',
+              routing: { mode: 'unicast', targets: ['member:restored'] } });
+          },
+          stop() { events.push(config.version + '-stop'); emit = undefined; },
+        });
+        ctx.effect(() => () => registration.dispose());
+      } };
+    }
+  `);
+  const fixture = await import(pathToFileURL(module).href);
+  const runtime = await node(t, root, 'restored', { patch: {
+    executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+    userPlugins: [{ name: 'combined', module, config: { version: 'v1' } }],
+  }, executorOverrides: [{ name: 'custom-exec', async execute(batch) {
+    fixture.events.push('executor'); return { executor: 'custom-exec', executionId: batch[0].id };
+  } }] });
+  for (const change of [
+    () => runtime.installUserPlugin({ name: 'combined', module, config: { version: 'v2', broken: true } }),
+    () => runtime.removeUserPlugin('combined'),
+  ]) {
+    await assert.rejects(change(), /Unknown policy: custom-policy/);
+    assert.equal(runtime.kernel.getService('dispatcher').hasPolicy('custom-policy'), true);
+    await fixture.emit();
+    assert.deepEqual(fixture.events.slice(-3), ['v1-start', 'v1-policy', 'executor']);
+    assert.equal(fixture.events.some(event => event.startsWith('v2')), false);
+  }
+  await runtime.stop();
+});
+
+test('long-lived source start promises do not block startup or unrelated source installation', { timeout: 10000 }, async t => {
+  const root = directory(t);
+  const module = join(root, 'lifetime-plugin.ts');
+  writeFileSync(module, `
+    export const events = [];
+    export function createPlugin(config) {
+      return { name: config.name, inject: ['emitter'], apply(ctx) {
+        let stopped;
+        const registration = ctx.services.emitter.registerSource({ name: config.name,
+          start() { events.push(config.name + '-start'); return new Promise(resolve => { stopped = resolve; }); },
+          stop() { events.push(config.name + '-stop'); stopped(); },
+        });
+        ctx.effect(() => () => registration.dispose());
+      } };
+    }
+  `);
+  const fixture = await import(pathToFileURL(module).href);
+  const runtime = await node(t, root, 'lifetime', { patch: {
+    userPlugins: [{ name: 'first', module, config: { name: 'first' } }],
+  } });
+  await runtime.installUserPlugin({ name: 'second', module, config: { name: 'second' } });
+  const registration = await runtime.installSource({ type: 'webhook', config: { port: 0 } });
+  assert.deepEqual(fixture.events, ['first-start', 'second-start']);
+  await registration.dispose();
+  await runtime.stop();
+  assert.deepEqual(fixture.events, ['first-start', 'second-start', 'second-stop', 'first-stop']);
 });

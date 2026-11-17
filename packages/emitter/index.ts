@@ -33,7 +33,6 @@ import type {
 import type { Plugin } from '../kernel/index.ts';
 
 export interface EmitterConfig {
-  beforeSourceStart?: () => Promise<boolean> | boolean;
   privateKeyPem?: string;
   onSourceError?: (error: unknown) => void;
   /** Durable offline fallback; when absent, unreachable targets fail emit as before. */
@@ -59,6 +58,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
       }
       const keyLocks = new Map<string, Promise<unknown>>();
       const sources = new Map<SourcePlugin, Promise<void>>();
+      let activeHolds = 0;
+      const held = new Set<() => void>();
       const outbox = settings.outbox;
 
       /**
@@ -753,37 +754,53 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             ...(lastError !== undefined ? { lastError } : {}),
           };
         },
-        async whenSourcesStarted() {
-          await Promise.allSettled([...sources.values()]);
+        holdSources() {
+          activeHolds++;
+          let released = false;
+          return { release(options) {
+            if (released) return;
+            released = true;
+            if (--activeHolds !== 0) return;
+            const pending = [...held];
+            held.clear();
+            if (options?.start === false) return;
+            for (const activate of pending) activate();
+          } };
         },
         registerSource(source) {
-          if (sources.has(source)) {
-            throw new Error('Source already registered');
-          }
+          if (sources.has(source)) throw new Error('Source already registered');
           let disposed = false;
-          let startedRunning = false;
-          const started = Promise.resolve()
-            .then(() => settings.beforeSourceStart ? settings.beforeSourceStart() : true)
-            .then(shouldStart => {
-              if (disposed || !shouldStart) return;
-              startedRunning = true;
-              return source.start(service);
-            });
-          sources.set(source, started);
-          void started.catch(error => settings.onSourceError?.(error));
+          let started: Promise<void> | undefined;
+          let resolveLifetime!: () => void;
+          let rejectLifetime!: (error: unknown) => void;
+          const lifetime = new Promise<void>((resolve, reject) => {
+            resolveLifetime = resolve;
+            rejectLifetime = reject;
+          });
+          const activate = () => {
+            held.delete(activate);
+            if (disposed || started) return;
+            try { started = Promise.resolve(source.start(service)); }
+            catch (error) { started = Promise.reject(error); }
+            started.then(resolveLifetime, rejectLifetime);
+          };
+          held.add(activate);
+          sources.set(source, lifetime);
+          void lifetime.catch(error => settings.onSourceError?.(error));
+          if (activeHolds === 0) activate();
           const dispose = async () => {
             if (disposed) return;
             disposed = true;
-            try {
-              // A deferred source has no effects to stop. Waiting on its readiness gate here
-              // would deadlock rollback, which must dispose it before releasing that gate.
-              if (startedRunning) {
-                await source.stop();
-                await started.catch(() => {});
-              }
-            } finally {
+            held.delete(activate);
+            if (!started) {
+              resolveLifetime();
               sources.delete(source);
+              return;
             }
+            try {
+              await source.stop();
+              await started;
+            } finally { sources.delete(source); }
           };
           ctx.effect(() => dispose);
           return { dispose };

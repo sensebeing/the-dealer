@@ -613,7 +613,7 @@ export interface SourcePlugin {
 }
 
 export interface EmitterService {
-  whenSourcesStarted?(): Promise<void>;
+  holdSources?(): { release(options?: { start?: boolean }): void };
   emit<T>(input: EmitMessageInput<T>): Promise<EmitResult>;
   registerSource(source: SourcePlugin): Disposable;
   /** Emitter-owned outbound preparation, routing, send and receipt validation for redrive. */

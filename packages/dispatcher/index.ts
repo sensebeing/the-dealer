@@ -10,7 +10,6 @@ import type {
 import type { Plugin } from '../kernel/index.ts';
 
 export interface DispatcherConfig {
-  beforeDispatch?: () => Promise<void> | void;
   requiredPolicies?: () => readonly string[];
   /** Composition-root decoration, uniformly applied at the registration boundary. */
   wrapExecutor?: (executor: ExecutorPlugin<any>) => ExecutorPlugin<any>;
@@ -109,6 +108,13 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           executors.keys().next().value
         );
       };
+      const assertRequiredPolicies = () => {
+        for (const name of config.requiredPolicies?.() ?? []) {
+          if (![...policies].some(policy => policy.name === name)) {
+            throw Object.assign(new Error(`Policy unavailable: ${name}`), { beforeExternalEffect: true });
+          }
+        }
+      };
       const core = async (batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> => {
         if (!batch.length) {
           throw Object.assign(new Error('Empty execution batch'), { beforeExternalEffect: true });
@@ -127,6 +133,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             throw new Error(`Execution already attempted: ${e.id} (${prior.stage})`);
           }
         }
+        assertRequiredPolicies();
         for (const e of batch) {
           ledger.set(key(e), { stage: 'dispatching' });
         }
@@ -215,17 +222,12 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           }
           const promise = Promise.resolve()
             .then(async () => {
-              await config.beforeDispatch?.();
               if (controller.signal.aborted) {
                 throw Object.assign(new Error('Dispatcher stopped'), { beforeExternalEffect: true });
               }
               const settled = ledger.get(id);
               if (settled) return settled;
-              for (const name of config.requiredPolicies?.() ?? []) {
-                if (![...policies].some(policy => policy.name === name)) {
-                  throw Object.assign(new Error(`Policy unavailable: ${name}`), { beforeExternalEffect: true });
-                }
-              }
+              assertRequiredPolicies();
               const chain = [...policies];
               const run = async (
                 index: number,
