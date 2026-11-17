@@ -252,6 +252,10 @@ export function trustAntigravityWorkspace(workspacePath: string, settingsPath?: 
 export const AGENT_HOST_DESCRIPTORS = [
   {
     host: 'orca',
+    defaultBindingAgent: 'antigravity',
+    managedWorkspace: true,
+    bindingExecutor: 'orca',
+    executor: 'orca',
     canonical: 'orca',
     command: 'orca',
     surface: 'cli',
@@ -261,6 +265,10 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'antigravity',
+    executorModes: ['spawn', 'fixed', 'inbox-only'] as const,
+    managedWorkspace: true,
+    bindingExecutor: 'orca',
+    executor: 'antigravity',
     canonical: 'antigravity',
     command: 'agy',
     launchCommand: 'agy --dangerously-skip-permissions',
@@ -271,6 +279,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'claude-code',
+    executor: 'claude-code',
     canonical: 'claude-code',
     command: 'claude',
     launchCommand: 'claude --dangerously-skip-permissions',
@@ -283,6 +292,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'codex',
+    executor: 'codex',
     canonical: 'codex',
     command: 'codex',
     launchCommand: 'codex --dangerously-bypass-approvals-and-sandbox',
@@ -295,6 +305,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'chatgpt-dot',
+    bindingExecutor: 'chatgpt-app',
     canonical: 'chatgpt-dot',
     command: 'dot',
     surface: 'cli',
@@ -304,6 +315,8 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'grok-bot',
+    requiresTargetBot: true,
+    bindingExecutor: 'agent-pty',
     canonical: 'grok-bot',
     command: 'grok-bot',
     surface: 'cli',
@@ -313,6 +326,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'claude-app',
+    executor: 'claude-app',
     canonical: 'claude-app',
     command: 'claude-app',
     surface: 'app',
@@ -323,6 +337,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'chatgpt-app',
+    executor: 'chatgpt-app',
     canonical: 'chatgpt-dot',
     command: 'dot',
     surface: 'app',
@@ -333,6 +348,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'antigravity-app',
+    executor: 'antigravity-app',
     canonical: 'antigravity-app',
     command: 'antigravity-app',
     surface: 'app',
@@ -343,6 +359,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'codex-cli',
+    executor: 'codex-cli',
     canonical: 'codex',
     command: 'codex',
     surface: 'cli',
@@ -352,6 +369,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'antigravity-cli',
+    executor: 'antigravity-cli',
     canonical: 'antigravity',
     command: 'agy',
     surface: 'cli',
@@ -361,6 +379,7 @@ export const AGENT_HOST_DESCRIPTORS = [
   },
   {
     host: 'claude',
+    bindingExecutor: 'claude-code',
     canonical: 'claude-code',
     command: 'claude',
     surface: 'cli',

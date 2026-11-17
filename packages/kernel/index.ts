@@ -388,6 +388,10 @@ export class Kernel {
     });
   }
 
+  hasService(name: keyof Services): boolean {
+    return this.#services.has(name);
+  }
+
   getService<K extends keyof Services>(name: K): Services[K] {
     const service = this.#services.get(name);
     if (!service) {

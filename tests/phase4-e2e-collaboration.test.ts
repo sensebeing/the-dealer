@@ -1086,3 +1086,88 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.equal(restarted.mailbox.list().totalCount, 1);
   assert.deepEqual(restarted.mailbox.list().items[0].envelope, queued.envelope);
 });
+
+test('external project executors and policies share configuration, attachments and lifecycle with builtins', async t => {
+  const root = directory(t);
+  const project = join(root, 'project');
+  mkdirSync(join(project, '.dealer', 'plugins'), { recursive: true });
+  writeFileSync(join(project, '.dealer', 'project.json'), JSON.stringify({
+    schema: 'the-dealer-project/v1', projectId: 'custom', defaultNetworkId: 'sensebeing', skills: [],
+    plugins: [{ name: 'custom-plugin', module: '.dealer/plugins/custom-exec.ts' }],
+  }));
+  writeFileSync(join(project, '.dealer', 'plugins', 'custom-exec.ts'), `
+    import { readFileSync, writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    export function createPlugin(config, context) {
+      return { name: 'custom-plugin', inject: ['dispatcher'], apply(ctx) {
+        let policyCalls = 0;
+        const policy = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+          async process(envelope, next) { policyCalls++; return next([envelope]); }
+        });
+        const executor = ctx.services.dispatcher.registerExecutor({ name: 'custom-exec',
+          async execute(batch, execution, options) {
+            const envelope = batch[0];
+            writeFileSync(join(context.stateDir, 'custom-result.json'), JSON.stringify({
+              policyCalls, marker: options.marker,
+              attachments: envelope.payload.localAttachments.map(path => readFileSync(path, 'utf8')),
+              originalAttachment: envelope.attachments[0].name,
+            }));
+            return { executor: 'custom-exec', executionId: envelope.id, mailboxId: 'custom-receipt' };
+          }
+        }, { marker: 'plugin-default' });
+        ctx.effect(() => () => executor.dispose());
+        ctx.effect(() => () => policy.dispose());
+      } };
+    }
+  `);
+  const alice = await node(t, root, 'custom-alice');
+  const bob = await node(t, root, 'custom-bob', { patch: {
+    projects: [{ projectId: 'custom', rootPath: project }],
+    executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+    executorConfig: { 'custom-exec': { marker: 'receiver-config' } },
+    topicBindings: { custom: { executor: 'custom-exec', mailboxId: 'configured-mailbox', metadata: { team: 'tools' }, assignee: 'alice' } },
+  } });
+  await connect(alice, bob);
+  const attachment = join(root, 'custom.txt');
+  writeFileSync(attachment, 'external attachment contents');
+  for (const topic of ['custom', 'default-fallback']) {
+    const sent = await cli(alice, 'send', '--network', 'sensebeing', '--to', 'member:custom-bob', '--topic', topic, '--body', 'custom', '--attach', attachment);
+    assert.equal(sent.receipts[0].stage, 'dispatched', JSON.stringify(sent.receipts));
+    assert.deepEqual(JSON.parse(readFileSync(join(bob.stateDir, 'custom-result.json'), 'utf8')), {
+      policyCalls: topic === 'custom' ? 1 : 2, marker: 'receiver-config', attachments: ['external attachment contents'], originalAttachment: 'custom.txt',
+    });
+    assert.equal(bob.mailbox.listThreadRecords(sent.messageId)[0].localMailbox, 'custom-receipt');
+  }
+  const dispatcher = bob.kernel.getService('dispatcher');
+  assert.equal(dispatcher.hasExecutor('custom-exec'), true);
+  assert.equal(dispatcher.hasPolicy('custom-policy'), true);
+  await bob.stop();
+  assert.equal(dispatcher.hasExecutor('custom-exec'), false);
+  assert.equal(dispatcher.hasPolicy('custom-policy'), false);
+});
+
+test('external configuration defers names until plugin loading but rejects unregistered executors and policies', async t => {
+  const root = directory(t);
+  const override = await node(t, root, 'override', {
+    patch: { executors: ['custom-override'], defaultExecutor: 'custom-override', executorConfig: { 'custom-override': {} } },
+    executorOverrides: [{ name: 'custom-override', async execute(batch) {
+      return { executor: 'custom-override', executionId: batch[0].id };
+    } }],
+  });
+  assert.equal(override.kernel.getService('dispatcher').hasExecutor('custom-override'), true);
+  const module = join(root, 'empty-plugin.ts');
+  writeFileSync(module, `export default { name: 'empty-plugin', apply() {} };`);
+  for (const [name, patch, error] of [
+    ['executor', { executors: ['missing-exec', 'inbox'], defaultExecutor: 'missing-exec' }, /Unknown executor: missing-exec/],
+    ['policy', { policies: ['missing-policy'] }, /Unknown policy: missing-policy/],
+    ['identifier', { executors: ['bad name'], defaultExecutor: 'bad name' }, /Unknown executor/],
+  ] as const) {
+    const stateDir = join(root, name);
+    const runtime = new DealerNodeRuntime({ stateDir, profile: 'headless-relay', patch: {
+      userPlugins: [{ name: 'empty-plugin', module }], ...patch,
+    } });
+    await assert.rejects(runtime.start(), error);
+    assert.equal(runtime.kernel.hasService('dispatcher'), false, 'failed start unwinds services');
+    assert.equal(statSync(stateDir).isDirectory(), true);
+  }
+});

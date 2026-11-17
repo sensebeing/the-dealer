@@ -353,6 +353,13 @@ test('runtime notifier refreshes linked mailboxes and broadcast preserves explic
   runtime.mailbox.enqueue([envelope('after-unlink')], { mailboxId: 'stream:personal' });
   await runtime.larkNotifier!.flush();
   assert.equal(calls.length, 1);
+  const notifier = runtime.larkNotifier!;
+  assert.equal(runtime.kernel.getService('larkNotifier'), notifier);
+  await runtime.kernel.applyPatch([{ name: 'lark-mirror', enabled: false }]);
+  assert.equal(runtime.larkNotifier, undefined);
+  runtime.mailbox.enqueue([envelope('after-plugin-stop')]);
+  await notifier.flush();
+  assert.equal(calls.length, 1, 'kernel unload stops the mailbox subscription');
 });
 
 test('control frames cannot override inbox using an explicit spawn executor', async t => {

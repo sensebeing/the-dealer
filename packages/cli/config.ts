@@ -1,5 +1,5 @@
-import { parseAgentHost, usesAgentHostInvocation } from '../plugins-agent-host/index.ts';
-import { orcaAgent } from '../plugins-orca/index.ts';
+import { DEFAULT_HOST_PLUGIN_REGISTRY, isPluginName } from './registry.ts';
+import type { HostPluginRegistry } from './registry.ts';
 import type { MailboxTopicBinding } from '../mailbox/index.ts';
 import { validateLarkNotify } from '../plugins-lark-notifier/index.ts';
 import type { LarkNotifyConfig } from '../plugins-lark-notifier/index.ts';
@@ -26,14 +26,14 @@ export const BUILT_IN_PROFILES: Readonly<Record<string, BuiltInProfile>> = Objec
     name: 'personal-dev',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['orca', 'orca-spawn', 'orca-wave', 'codex-cli', 'codex', 'claude-code', 'antigravity-cli', 'antigravity', 'claude-app', 'chatgpt-app', 'antigravity-app', 'agent-pty', 'notify', 'inbox'],
+    executors: DEFAULT_HOST_PLUGIN_REGISTRY.executorNames(),
     defaultExecutor: 'orca-spawn',
   },
   'dedicated-worker': {
     name: 'dedicated-worker',
     gateMode: 'open',
     policies: ['dedup-cas'],
-    executors: ['orca', 'orca-spawn', 'orca-wave', 'codex-cli', 'codex', 'claude-code', 'antigravity-cli', 'antigravity', 'claude-app', 'chatgpt-app', 'antigravity-app', 'agent-pty', 'inbox'],
+    executors: DEFAULT_HOST_PLUGIN_REGISTRY.executorNames().filter(name => name !== 'notify'),
     defaultExecutor: 'orca-spawn',
   },
   'orca-dev': {
@@ -231,7 +231,9 @@ export function initProjectScaffold(
 
 export interface TopicBindingConfig {
   noParent?: boolean;
-  assignee?: string;
+  /** Opaque project annotations; legacy top-level string annotations are preserved verbatim. */
+  metadata?: Record<string, string>;
+  [pluginField: string]: unknown;
   agent?: 'orca' | 'antigravity' | 'antigravity-cli' | 'antigravity-app' | 'claude' | 'claude-code' | 'claude-app' | 'codex' | 'codex-cli' | 'chatgpt-app' | 'chatgpt-dot' | 'grok-bot';
   interactiveCommand?: string;
   mode?: AgentConversationMode;
@@ -255,39 +257,34 @@ export interface TopicBindingConfig {
   notifyLark?: boolean;
 }
 
-export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[]): asserts bindings is Record<string, TopicBindingConfig> {
+export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[], registry: HostPluginRegistry = DEFAULT_HOST_PLUGIN_REGISTRY): asserts bindings is Record<string, TopicBindingConfig> {
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
-  const strings = ['assignee', 'agent', 'interactiveCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
+  const strings = ['agent', 'interactiveCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
   const booleans = ['noParent', 'autoCreateWorkspace', 'notifyLark'];
-  const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves']);
+  const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves', 'metadata']);
   for (const [kind, binding] of Object.entries(bindings)) {
     if (isRecord(binding)) {
       try {
-        if (binding.agent !== undefined) {
-          parseAgentHost(binding.agent);
-          if (['orca', 'orca-wave', 'orca-spawn'].includes(binding.executor)) orcaAgent(binding.agent);
-        }
         const normalizedMode = normalizeConversationModeInput(binding);
         if (normalizedMode !== undefined) {
           binding.mode = normalizedMode;
           delete binding.conversationMode;
         }
+        registry.executor(binding.executor)?.validateBinding?.(binding as TopicBindingConfig, kind);
       } catch {
         throw new Error(`Invalid topic binding: ${kind}`);
       }
     }
     if (!nonempty(kind) || (kind.includes(':') && (!nonempty(kind.slice(0, kind.indexOf(':'))) || !nonempty(kind.slice(kind.indexOf(':') + 1)))) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
-        (binding.mode === 'inbox-only' && binding.executor !== 'inbox') ||
-        (binding.executor === 'antigravity-cli' && binding.mode !== undefined && binding.mode !== 'spawn' && binding.mode !== 'inbox-only') ||
-        (binding.executor === 'antigravity' && binding.mode === 'wave') ||
-        Object.keys(binding).some(key => !allowed.has(key)) ||
+        Object.keys(binding).some(key => !allowed.has(key) && (!isPluginName(key) || !nonempty(binding[key]))) ||
+        (binding.metadata !== undefined && (!isRecord(binding.metadata) || Object.entries(binding.metadata).some(([key, value]) => !isPluginName(key) || !nonempty(value)))) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||
         booleans.some(key => binding[key] !== undefined && typeof binding[key] !== 'boolean') ||
         (binding.coalesceMs !== undefined && (!Number.isSafeInteger(binding.coalesceMs) || binding.coalesceMs < 0)) ||
         (binding.rotateAfterWaves !== undefined && (!Number.isSafeInteger(binding.rotateAfterWaves) || binding.rotateAfterWaves < 1)) ||
         (binding.mailboxId !== undefined && !isValidMailboxId(binding.mailboxId)) ||
         (binding.streamKey !== undefined && !isValidMailboxId(`stream:${binding.streamKey}`)) ||
-        (isStreamConversationBinding(toMailboxTopicBinding(binding as unknown as TopicBindingConfig)) && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
+        (isStreamConversationBinding(registry.toMailboxBinding(binding as unknown as TopicBindingConfig)) && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
         (binding.projectId !== undefined && !validProjectId(binding.projectId))) {
       throw new Error(`Invalid topic binding: ${kind}`);
     }
@@ -377,11 +374,14 @@ export function readPatch(path: string): Partial<RuntimeConfig> {
   return root;
 }
 
-export const BUILTIN_EXECUTORS = ['orca', 'orca-spawn', 'orca-wave', 'codex-cli', 'codex', 'claude-code', 'antigravity-cli', 'antigravity', 'claude-app', 'chatgpt-app', 'antigravity-app', 'agent-pty', 'notify', 'inbox'];
+export const BUILTIN_EXECUTORS = DEFAULT_HOST_PLUGIN_REGISTRY.executorNames();
 
-export function validateConfig(config: RuntimeConfig): void {
+export function validateConfig(config: RuntimeConfig, options: { executorOverrides?: readonly { name: string }[]; registry?: HostPluginRegistry } = {}): void {
+  const registry = options.registry ?? DEFAULT_HOST_PLUGIN_REGISTRY;
+  const external = Boolean(config.userPlugins?.length || config.projects?.length || options.executorOverrides?.length);
+  const validExecutor = (name: unknown) => isPluginName(name) && (external || registry.executor(name) !== undefined);
   validatePluginRefs(config.userPlugins);
-  validateTopicBindings(config.topicBindings === undefined ? {} : config.topicBindings, config.executors);
+  validateTopicBindings(config.topicBindings === undefined ? {} : config.topicBindings, config.executors, registry);
   if (config.larkNotify !== undefined) validateLarkNotify(config.larkNotify);
   if (!Array.isArray(config.projects)) {
     throw new Error('Projects must be an array');
@@ -408,14 +408,14 @@ export function validateConfig(config: RuntimeConfig): void {
   if (!config.executors.includes(config.defaultExecutor)) {
     throw new Error('Default executor must be enabled');
   }
-  if (config.executors.some(e => !BUILTIN_EXECUTORS.includes(e))) {
+  if (config.executors.some(e => !validExecutor(e))) {
     throw new Error('Unknown executor');
   }
   if (!isRecord(config.executorConfig)) {
     throw new Error('Invalid executorConfig');
   }
   for (const [executor, options] of Object.entries(config.executorConfig)) {
-    if (!BUILTIN_EXECUTORS.includes(executor)) {
+    if (!validExecutor(executor)) {
       throw new Error('Unknown executor');
     }
     if (!isRecord(options)) {
@@ -427,7 +427,7 @@ export function validateConfig(config: RuntimeConfig): void {
   }
   // Legacy configs persist the retired wave-coalescer policy; durable mailbox wakeup replaced it.
   config.policies = config.policies.filter(policy => policy !== 'wave-coalescer');
-  if (config.policies.some(policy => policy !== 'dedup-cas')) {
+  if (config.policies.some(policy => !isPluginName(policy) || (!external && !registry.policy(policy)))) {
     throw new Error('Unknown policy');
   }
   for (const network of config.networks) {
@@ -475,30 +475,5 @@ export function decodeNetworkInvite(uri: string): NetworkMountConfig {
 
 /** Translate receiver configuration into the mailbox's mode-only addressing contract. */
 export function toMailboxTopicBinding(binding: TopicBindingConfig, executorConfig?: Record<string, Record<string, any>>, payload?: Record<string, unknown>): MailboxTopicBinding {
-  const config = executorConfig?.[binding.executor];
-  let payloadMode: AgentConversationMode | undefined;
-  let agent: ReturnType<typeof parseAgentHost> | undefined;
-  // Queued payloads have not passed executor validation; malformed hints carry no addressing authority.
-  try {
-    payloadMode = normalizeConversationModeInput(payload);
-  } catch {
-    // Executor validation remains authoritative when delivery is attempted.
-  }
-  try {
-    agent = parseAgentHost(payload?.agent ?? binding.agent ?? config?.agent);
-  } catch {
-    // An absent or malformed host hint cannot select host-backed addressing.
-  }
-  const explicit = payloadMode ?? normalizeConversationModeInput(binding) ?? normalizeConversationModeInput(config);
-  const mode = explicit ?? (binding.executor === 'inbox' || binding.executor === 'notify' ||
-    (binding.executor === 'agent-pty' && !usesAgentHostInvocation(agent, explicit)) ? 'inbox-only'
-    : binding.executor === 'orca-wave' ? 'wave'
-    : binding.executor === 'orca' && (binding.rotateAfterWaves !== undefined || binding.streamKey !== undefined || binding.workspacePath !== undefined || binding.runId !== undefined || binding.terminalHandle !== undefined) ? 'wave'
-    : 'spawn');
-  return {
-    ...(binding.mailboxId !== undefined ? { mailboxId: binding.mailboxId } : {}),
-    ...(binding.streamKey !== undefined ? { streamKey: binding.streamKey } : {}),
-    mode,
-    ...(binding.executor === 'orca-wave' || (binding.executor === 'orca' && (mode === 'wave' || mode === 'fixed')) ? { stream: true } : {}),
-  };
+  return DEFAULT_HOST_PLUGIN_REGISTRY.toMailboxBinding(binding, executorConfig, payload);
 }

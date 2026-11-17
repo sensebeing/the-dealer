@@ -85,6 +85,25 @@ flowchart TB
 
 ---
 
+### 四层工程拓扑与组合根
+
+依赖上限及精确模块边由 `.guard/config.json` 共同强制执行。即便层级允许，未列入模块 `dependencies` 的导入仍被拒绝；`guard topology audit --json` 对全仓检查未登记模块、缺失文档与过期依赖。
+
+| Layer | Modules | Allowed dependency layers |
+| --- | --- | --- |
+| foundation | `core-types`, `process-lock`, `fs-atomic`, `subprocess`, `kernel`, `native/dealer-iroh-engine` | foundation |
+| core | `transport`, `node`, `router`, `gate`, `dispatcher`, `emitter`, `mailbox` | foundation, core |
+| plugin | `plugins-policy`, `plugins-router`, `plugins-source`, `plugins-executor`, `plugins-agent-host`, `plugins-orca`, `plugins-lark-notifier` | foundation, core, plugin |
+| cli | `cli`, public export facade `packages/index.ts` | foundation, core, plugin, cli |
+
+`HostPluginRegistry`（`packages/cli/registry.ts`）组合内置 executor/policy 工厂。它从宿主插件的 `AGENT_HOST_DESCRIPTORS` 派生命名宿主执行器和 setup 映射，调用 Orca 插件的绑定校验、mode/stream 适配、wake target 同步与 session pinning hooks。CLI 不再维护第二份 executor/policy 白名单。`toMailboxTopicBinding` 是默认 registry 的兼容入口，保留 payload-aware `agent-pty` 与显式 mode 优先级。
+
+外部 project/user 插件通过 `ctx.services.dispatcher.registerExecutor/registerPolicy` 注册，和内置执行器共用同一活跃注册表与附件包装；可在 `executors`、`defaultExecutor`、`executorConfig`、`policies`、`topicBindings` 中引用。配置含外部来源或 executor overrides 时只预校验标识符，全部插件加载后逐一核对实际注册，未注册即拒绝启动。没有外部来源的独立配置仍拒绝未知名字。
+
+`dispatcher/inbound` 首先使用单目标执行回执的 authoritative `mailboxId`，缺省时通过 payload-aware registry 适配和 mailbox 的地址解析恢复；已交付 session 归属由插件 hook 与 `MailboxStore.pinSessionMailbox` 原子维护。`TopicBindingConfig.metadata` 和旧顶层非空字符串 annotations 均为 opaque 项目字段，不赋予核心 runtime 业务语义。
+
+`lark-mirror` 在插件内部创建 `LarkMailboxNotifier`，用 `ctx.provide('larkNotifier', ...)` 发布服务并用 `ctx.effect` 启停。Kernel unload/replacement 自动清理订阅与重试；runtime 通过只读 service getter 更新默认 mailbox 集。
+
 ## 二、 微内核与插件协议设计 (`@the-dealer/kernel`)
 
 完全对齐 DeepSeek Harness (`Cordis`) 的五项核心原语，保证架构极简且具备无限扩展能力：
@@ -418,7 +437,7 @@ export interface ExecutorPlugin<C = unknown> {
 }
 ```
 
-#### 官方核心内置插件清单（100% 覆盖并升维 `alter-service` 全部场景）
+#### 内置服务与插件职责
 
 1. **调度策略插件 (`packages/plugins-policy/`)**：
    - **`plugin-policy-dedup-cas`**：基于 `idempotencyKey` 与单调代次水位（`claim_version / revision`）的本地持久化状态账本，确保同一事件精确派发一次，故障重启后沿用原回执对账，绝不重复建工作区。
@@ -552,8 +571,7 @@ notification or file sinks, with no Lark webhook transport.
 
 `notifyGateApprovals` and `mirrorOutboundThreads` default to true. Default watched
 mailboxes omit compound topic/stream bindings and project topics with background
-first-class `orca`, desktop app, terminal CLI, or `inbox` defaults (with mode `spawn` / `wave` / `fixed` / `inbox-only`); legacy `orca-wave`, `orca-spawn`, and `agent-pty` remain compatible; explicit `notifyLark` overrides
-that choice. Inbox topics and top-level request bindings remain included. See
+executors whose registry descriptors set `interactiveAgent: true`; explicit `notifyLark` overrides that choice. Inbox topics and top-level request bindings remain included. See
 [request threading](request-threading.md) for filters and configuration.
 
 ### Automatic upgrades and restart
@@ -572,7 +590,7 @@ that choice. Inbox topics and top-level request bindings remain included. See
 | `packages/plugins-orca` | Workspace and terminal operations, composer quirks, rotation policy, session inference, Orca drivers and executors | Consumes host launch conventions and mailbox primitives; never imports CLI |
 | `packages/plugins-executor` | Inbox, notification and raw command/pipe executors, shared preparation/error classification | No host-specific plugin imports; session inference uses the injected redrive service |
 | `packages/plugins-lark-notifier` | Lark configuration type/validation and notification delivery | CLI re-exports its configuration; the plugin never imports CLI |
-| `packages/cli` | Assembly root and `toMailboxTopicBinding` translation from receiver configuration | Registers all wakeup drivers and supplies mode-only mailbox addressing |
+| `packages/cli` | `HostPluginRegistry` assembly root and receiver configuration translation | Registers all wakeup drivers and supplies mode-only mailbox addressing |
 
 `the-dealer-mailbox/v1` files load without rewriting. The next successful mutation atomically
 writes v2, preserving driver-specific fields inside `driverConfig`, existing leases, threads,

@@ -9,6 +9,10 @@ import type { MailboxItem, MailboxStore } from '../mailbox/store.ts';
 import { findExecutable, checkedCommand, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 
+declare module '../kernel/index.ts' {
+  interface Services { larkNotifier: LarkMailboxNotifier; }
+}
+
 interface NotifyState {
   schema: 'the-dealer-lark-notify/v1';
   cursorSequence: number;
@@ -77,7 +81,7 @@ export class LarkMailboxNotifier {
     this.state = readState(this.statePath);
     this.boundMailboxes = [...(options.defaultBoundMailboxes ?? [])];
   }
-  setDefaultBoundMailboxes(mailboxes: string[]): void {
+  setDefaultBoundMailboxes(mailboxes: readonly string[]): void {
     this.boundMailboxes = [...mailboxes];
   }
   start(): void {
@@ -282,6 +286,7 @@ export function createLarkMirrorPlugin(options: LarkMailboxNotifierOptions & { n
     inject: ['gate'],
     apply(ctx) {
       const notifier = options.notifier ?? new LarkMailboxNotifier(options);
+      ctx.provide('larkNotifier', notifier);
       ctx.on('gate/pending-approval', item => notifier.notifyApproval(item));
       ctx.on('emitter/sent', ({ envelope, targetNodeIds }) => notifier.notifyOutbound(envelope, targetNodeIds));
       for (const item of ctx.services.gate?.listPendingApprovals?.() ?? []) notifier.notifyApproval(item);

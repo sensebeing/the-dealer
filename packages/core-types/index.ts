@@ -710,6 +710,8 @@ export interface ExecutorPlugin<C = unknown> {
 }
 
 export interface DispatcherService {
+  hasExecutor(name: string): boolean;
+  hasPolicy(name: string): boolean;
   dispatch(envelope: MessageEnvelope): Promise<DispatchReceipt>;
   registerPolicy(policy: DispatchPolicyPlugin): Disposable;
   registerExecutor<C>(executor: ExecutorPlugin<C>, config: C): Disposable;

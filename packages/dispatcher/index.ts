@@ -10,6 +10,8 @@ import type {
 import type { Plugin } from '../kernel/index.ts';
 
 export interface DispatcherConfig {
+  /** Composition-root decoration, uniformly applied at the registration boundary. */
+  wrapExecutor?: (executor: ExecutorPlugin<any>) => ExecutorPlugin<any>;
   privateKeyPem?: string;
   ledgerPath?: string;
   defaultExecutor?: string;
@@ -140,6 +142,8 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         }
       };
       ctx.provide('dispatcher', {
+        hasExecutor(name) { return executors.has(name); },
+        hasPolicy(name) { return [...policies].some(policy => policy.name === name); },
         activeCount() { return active.size; },
         onIdle(listener: () => void) {
           idleListeners.add(listener);
@@ -153,6 +157,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           });
         },
         registerPolicy(policy) {
+          if ([...policies].some(entry => entry.name === policy.name)) throw new Error(`Duplicate policy: ${policy.name}`);
           policies.add(policy);
           return {
             dispose() {
@@ -164,13 +169,14 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           if (executors.has(executor.name)) {
             throw new Error(`Duplicate executor: ${executor.name}`);
           }
+          const wrapped = config.wrapExecutor?.(executor) ?? executor;
           const entry = {
             async execute(batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> {
               const first = batch[0];
               const nodeId = ctx.services.node.getSelfCard(first.networkId).nodeId;
               return {
                 stage: 'dispatched',
-                executionReceipt: await executor.execute(
+                executionReceipt: await wrapped.execute(
                   batch,
                   {
                     networkId: first.networkId,
