@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   OrcaTerminalLaunchRejectedError,
   readOrcaTerminal,
@@ -167,6 +168,48 @@ export function buildLaunchedOrcaWakeTargetPatch(
       retiredSessionId: binding.sessionId ?? binding.configuredSessionId ?? binding.retiredSessionId,
     } : {}),
   });
+}
+
+export interface CallerOrcaIdentity {
+  mailboxId: string;
+  workspacePath?: string;
+  worktreeId?: string;
+  terminalHandle?: string;
+  paneKey?: string;
+  agent?: SupportedOrcaAgent;
+  sessionId?: string;
+}
+
+function sameCallerWorkspace(a?: string, b?: string): boolean {
+  if (!a || !b || resolve(a) === resolve(b)) return true;
+  try { return realpathSync(a) === realpathSync(b); } catch { return false; }
+}
+
+function callerOwnsExplicitOrcaWakeTarget(id: string, existing: WakeTargetState | undefined, caller: CallerOrcaIdentity): boolean {
+  if (id === caller.mailboxId) return true;
+  if (caller.terminalHandle && id === `terminal:${caller.terminalHandle}`) {
+    return !existing || existing.driver === 'passive' || sameCallerWorkspace(readOrcaDriverConfig(existing).workspacePath, caller.workspacePath);
+  }
+  if (existing?.driver !== 'orca-terminal') return false;
+  const bound = readOrcaDriverConfig(existing);
+  if (!sameCallerWorkspace(bound.workspacePath, caller.workspacePath)) return false;
+  return Boolean((caller.terminalHandle && bound.terminalHandle === caller.terminalHandle)
+    || (caller.paneKey && bound.paneKey === caller.paneKey));
+}
+
+export function reconcileCallerOrcaWakeTarget(
+  store: MailboxStore, mailboxId: string, caller: CallerOrcaIdentity | undefined,
+  options: { requireBoundOwner?: boolean } = {},
+): WakeTargetState | undefined {
+  if (!caller) return undefined;
+  const id = normalizeMailboxId(mailboxId);
+  const existing = store.getWakeTarget(id);
+  if (existing?.driver === 'orca-run' || existing?.driver === 'agent-host') return undefined;
+  if (options.requireBoundOwner && !callerOwnsExplicitOrcaWakeTarget(id, existing, caller)) return undefined;
+  const updated = store.upsertWakeTarget(id, resolveCallerOrcaWakeTargetPatch(existing, caller));
+  const handle = readOrcaDriverConfig(updated).terminalHandle;
+  if (updated.rotateAfterWaves !== undefined && handle) pinOrcaTerminalSessionMailbox(store, id, handle);
+  return updated;
 }
 
 /** Single owner of caller-driven Orca conversation identity transitions. */

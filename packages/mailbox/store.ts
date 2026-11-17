@@ -1197,6 +1197,14 @@ export class MailboxStore {
     };
   }
 
+  resolveLeaseMailbox(leaseId: string): string | undefined {
+    const state = this.read();
+    for (const [candidate, record] of Object.entries(state.mailboxes)) {
+      if (record?.outstanding?.leaseId === leaseId || record?.ackedLeaseIds.includes(leaseId)) return candidate;
+    }
+    return undefined;
+  }
+
   /**
    * Read-only preflight for a caller-supplied `--ack` lease. It mirrors `ack()`'s lookup
    * but never mutates the mailbox, so a command that later fails (or sends nothing) cannot

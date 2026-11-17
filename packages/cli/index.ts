@@ -1,4 +1,5 @@
-import { resolveCallerOrcaWakeTargetPatch } from '../plugins-orca/index.ts';
+import { reconcileCallerOrcaWakeTarget } from '../plugins-orca/index.ts';
+import type { CallerOrcaIdentity } from '../plugins-orca/index.ts';
 import { pinOrcaTerminalSessionMailbox } from '../plugins-orca/index.ts';
 import { toMailboxTopicBinding } from './config.ts';
 import { randomBytes } from 'node:crypto';
@@ -12,7 +13,7 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { MailboxStore, OutboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
+import { MailboxStore, OutboxStore, resolveBoundMailboxId, normalizeMailboxId } from '../mailbox/index.ts';
 import type { OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
@@ -665,11 +666,15 @@ async function runInboxCommand(
   const command = action ?? 'list';
   const caller = resolveCallerOrcaBinding(v);
   const mailboxId = (v.mailbox as string | undefined) ?? caller?.mailboxId;
-  if (command !== 'list' && v.peek !== true && caller && (mailboxId ?? 'default') === caller.mailboxId) bindCallerWakeTarget(store, caller.mailboxId, caller);
   const checkOnlyFlags =
     v.ack !== undefined || v.peek === true || v.wait === true || v['timeout-ms'] !== undefined;
   if (command === 'check') {
     const timeoutMs = positiveInteger(v['timeout-ms'], '--timeout-ms');
+    if (timeoutMs !== undefined && v.wait !== true) throw new Error('--timeout-ms requires --wait');
+    const targetMailbox = normalizeMailboxId(mailboxId ?? 'default');
+    if (v.peek !== true && (v.ack === undefined || store.resolveLeaseMailbox(String(v.ack)) === targetMailbox)) {
+      reconcileCallerOrcaWakeTarget(store, targetMailbox, caller, { requireBoundOwner: true });
+    }
     const checkOptions = {
       ...(mailboxId !== undefined ? { mailboxId } : {}),
       ...(v.ack !== undefined ? { ackLeaseId: String(v.ack) } : {}),
@@ -682,9 +687,6 @@ async function runInboxCommand(
         ...(signal !== undefined ? { signal } : {}),
       });
     }
-    if (timeoutMs !== undefined) {
-      throw new Error('--timeout-ms requires --wait');
-    }
     return store.check(checkOptions);
   }
   if (command === 'ack') {
@@ -694,7 +696,14 @@ async function runInboxCommand(
     if (v.all === true) {
       throw new Error('--all is only valid with inbox list');
     }
-    return store.ack(required(target ?? v.lease ?? v.ack, 'delivery-id'), mailboxId);
+    const deliveryId = required(target ?? v.lease ?? v.ack, 'delivery-id');
+    const explicitMailbox = v.mailbox as string | undefined;
+    const leaseMailbox = store.resolveLeaseMailbox(deliveryId);
+    const targetAckMailbox = explicitMailbox !== undefined ? normalizeMailboxId(explicitMailbox) : leaseMailbox;
+    if (targetAckMailbox !== undefined && leaseMailbox === targetAckMailbox) {
+      reconcileCallerOrcaWakeTarget(store, targetAckMailbox, caller, { requireBoundOwner: true });
+    }
+    return store.ack(deliveryId, explicitMailbox);
   }
   if (command === 'list') {
     if (checkOnlyFlags) {
@@ -756,15 +765,7 @@ function replyTargetOrThrow(
   return route;
 }
 
-interface CallerOrcaBinding {
-  paneKey?: string;
-  agent?: 'antigravity' | 'claude' | 'codex';
-  sessionId?: string;
-  mailboxId: string;
-  terminalHandle?: string;
-  worktreeId?: string;
-  workspacePath?: string;
-}
+type CallerOrcaBinding = CallerOrcaIdentity;
 
 function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | undefined {
   const terminalHandle = typeof v['terminal-handle'] === 'string' && v['terminal-handle'].trim()
@@ -788,10 +789,7 @@ function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | u
 }
 
 function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): void {
-  if (!caller) return;
-  const existing = store.getWakeTarget(mailboxId);
-  if (existing?.driver === 'orca-run' || existing?.driver === 'agent-host') return;
-  store.upsertWakeTarget(mailboxId, resolveCallerOrcaWakeTargetPatch(existing, caller));
+  reconcileCallerOrcaWakeTarget(store, mailboxId, caller);
 }
 
 function settlementOutcome(value: unknown): SettlementOutcome {

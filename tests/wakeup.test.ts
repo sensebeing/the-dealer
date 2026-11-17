@@ -3456,3 +3456,94 @@ for (const mailboxId of ['worktree:standalone', 'terminal:term-standalone']) {
     assert.equal(store.list({ mailboxId }).queuedCount, 3);
   });
 }
+
+for (const kind of ['task', 'stream'] as const) {
+  test(`generated ${kind} inbox commands capture only their owning worker and resume after sleep`, async t => {
+    const root = directory(t);
+    const workspacePath = join(root, 'worker');
+    const fake = fakeOrcaWorkspace(workspacePath);
+    const runner: CommandRunner = async request => request.args[0] === 'worktree' && request.args[1] === 'create'
+      ? { stdout: JSON.stringify({ ok: true, result: { worktree: { path: workspacePath } } }) }
+      : fake.runner(request);
+    const runtime = await makeNode(t, root, 'explicit', { commandRunner: runner });
+    await runtime.wakeups.stop();
+    const store = runtime.mailbox;
+    const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+    t.after(() => service.stop());
+    const mailboxId = `${kind}:generated-worker`;
+    const binding = { executor: 'orca-wave', mailboxId, workspacePath, rotateAfterWaves: 1 };
+    const wave = createOrcaWaveExecutorPlugin({ store, commandRunner: runner, resolveTopicBinding: () => binding });
+    const first = alert('generated-worker', { semantic: { type: 'message', threadId: 'thread-wave-1' } });
+    store.recordInboundEnvelope(first, mailboxId);
+    if (kind === 'task') {
+      await createOrcaSpawnExecutorPlugin({ store, commandRunner: runner, command: 'codex', cwd: workspacePath, interactive: true }).execute([first], {} as ExecutionContext);
+    } else {
+      await wave.execute([first], {} as ExecutionContext);
+      assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+    }
+    const promptCommand = (id: string) => {
+      const text = terminalSends(fake.state.calls).map(textOf).reverse().find(text => text.includes(`dealer inbox check --mailbox ${id} --json`));
+      assert.ok(text, `missing generated command for ${id}`);
+      return text.match(/`(dealer inbox check --mailbox [^`]+)`/)![1].split(' ').slice(1);
+    };
+    const claim = service.claim(mailboxId);
+    const command = promptCommand(mailboxId);
+    const handle = store.getWakeTarget(mailboxId)!.driverConfig!.terminalHandle as string;
+    const env = { ORCA_WORKTREE_ID: `repo::${workspacePath}`, ORCA_TERMINAL_HANDLE: handle,
+      ORCA_PANE_KEY: 'worker:pane', [kind === 'task' ? 'CODEX_THREAD_ID' : 'CLAUDE_CODE_SESSION_ID']: 'worker-session' };
+    const invoke = async (args: string[], caller = env, expected = 0) => {
+      const out: string[] = [], err: string[] = [];
+      const code = await runDealerCli(args, { runtime, env: caller, stdout: line => out.push(line), stderr: line => err.push(line) });
+      assert.equal(code, expected, err.join('\n'));
+      return code === 0 ? JSON.parse(out.join('\n')) : undefined;
+    };
+    const before = store.getWakeTarget(mailboxId);
+    const foreign = { ...env, ORCA_TERMINAL_HANDLE: 'term-foreign', ORCA_PANE_KEY: 'foreign:pane' };
+    await invoke(['inbox', 'list', '--mailbox', mailboxId, '--json']);
+    await invoke([...command, '--peek']);
+    await invoke([...command, '--timeout-ms', '1'], env, 1);
+    assert.deepEqual(store.getWakeTarget(mailboxId), before);
+    const foreignLease = await invoke(command, foreign);
+    assert.deepEqual(store.getWakeTarget(mailboxId), before);
+    await invoke(['inbox', 'ack', foreignLease.deliveryId, '--json'], foreign);
+    assert.deepEqual(store.getWakeTarget(mailboxId)!.driverConfig, before!.driverConfig);
+    assert.equal(store.getWakeTarget('terminal:term-foreign'), undefined);
+    assert.equal(store.getWakeTarget('worktree:worker'), undefined);
+    // Requeue after the foreign lease was legitimately acknowledged; identity was not trusted.
+    store.enqueue([alert('worker-consume')], { mailboxId });
+    const lease = await invoke(command);
+    assert.equal(store.getWakeTarget(mailboxId)!.driverConfig!.sessionId, 'worker-session');
+    await invoke(['inbox', 'ack', lease.deliveryId, ...(kind === 'stream' ? ['--mailbox', mailboxId] : []), '--json']);
+    const pinned = `terminal:${handle}`;
+    if (kind === 'stream') {
+      assert.equal(store.getWakeTarget(pinned)!.driverConfig!.sessionId, 'worker-session');
+      assert.equal(store.getWakeTarget(pinned)!.driverConfig!.paneKey, 'worker:pane');
+      await wave.execute([alert('wave-two', { semantic: { type: 'message', threadId: 'thread-wave-2' } })], {} as ExecutionContext);
+      claim.dispose();
+      const rotatedResult = await service.flushMailbox(mailboxId, { force: true });
+      assert.equal(rotatedResult.rotated, true, JSON.stringify(rotatedResult));
+      const create = fake.state.calls.filter(c => c.args[1] === 'create').at(-1)!;
+      assert.equal(create.args[create.args.indexOf('--command') + 1], 'claude --dangerously-skip-permissions');
+    } else {
+      await invoke(command, { ...env, ORCA_TERMINAL_HANDLE: 'term-restored' });
+      assert.equal(store.getWakeTarget(mailboxId)!.driverConfig!.terminalHandle, 'term-restored');
+    }
+    fake.state.terminals = [];
+    const recoveryMailbox = kind === 'stream' ? pinned : mailboxId;
+    if (kind === 'stream') {
+      await wave.execute([alert('old-thread-followup', { semantic: { type: 'message', threadId: 'thread-wave-1' } })], {} as ExecutionContext);
+      assert.equal(store.list({ mailboxId: pinned }).queuedCount, 1);
+    } else store.enqueue([alert('task-followup')], { mailboxId });
+    claim.dispose();
+    const recoveryResult = await service.flushMailbox(recoveryMailbox, { force: true });
+    assert.equal(recoveryResult.woke, true, JSON.stringify(recoveryResult));
+    const create = fake.state.calls.filter(c => c.args[1] === 'create').at(-1)!;
+    assert.equal(create.args[create.args.indexOf('--command') + 1], kind === 'task'
+      ? "codex --dangerously-bypass-approvals-and-sandbox resume 'worker-session'"
+      : "claude --dangerously-skip-permissions --resume 'worker-session'");
+    const resumedHandle = store.getWakeTarget(recoveryMailbox)!.driverConfig!.terminalHandle as string;
+    await invoke(promptCommand(recoveryMailbox), { ...env, ORCA_TERMINAL_HANDLE: resumedHandle, ORCA_PANE_KEY: 'resumed:pane' });
+    assert.equal(store.getWakeTarget(recoveryMailbox)!.driverConfig!.paneKey, 'resumed:pane');
+    await runtime.stop();
+  });
+}
