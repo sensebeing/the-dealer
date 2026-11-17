@@ -1,3 +1,6 @@
+import { createOrcaWakeupDrivers, pinOrcaTerminalSessionMailbox } from '../plugins-orca/index.ts';
+import { createAgentHostWakeupDriver } from '../plugins-agent-host/index.ts';
+import { toMailboxTopicBinding } from './config.ts';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, chmodSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -22,27 +25,14 @@ import {
   isDedupCasDuplicateReceipt,
   isDurableQueuedReceipt,
 } from '../core-types/index.ts';
-import {
-  createOrcaSpawnExecutorPlugin,
-  createOrcaExecutorPlugin,
-  orcaAgent,
-  createOrcaWaveExecutorPlugin,
-  createCodexExecutorPlugin,
-  createCodexCliExecutorPlugin,
-  createClaudeAppExecutorPlugin,
-  createChatgptAppExecutorPlugin,
-  createAntigravityCliExecutorPlugin,
-  createAntigravityAppExecutorPlugin,
-  createClaudeCodeExecutorPlugin,
-  createAntigravityExecutorPlugin,
-  createAgentPtyExecutorPlugin,
-  createNotifyExecutorPlugin,
-  createInboxExecutorPlugin,
-} from '../plugins-executor/index.ts';
+import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, orcaAgent, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
+import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityCliExecutorPlugin, createAntigravityAppExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin, createHostAwareAgentPtyExecutorPlugin as createAgentPtyExecutorPlugin } from '../plugins-agent-host/index.ts';
+import { createNotifyExecutorPlugin, createInboxExecutorPlugin } from '../plugins-executor/index.ts';
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { MailboxStore, OutboxRedriveService, OutboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
+import { MailboxStore, OutboxRedriveService, OutboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, WakeupRedriveService } from '../mailbox/index.ts';
+import { resolveOrcaWaveRotateAfterWaves } from '../plugins-orca/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -511,14 +501,12 @@ export class DealerNodeRuntime {
       );
       this.wakeups = new WakeupRedriveService({
         store: this.mailbox,
-        commandRunner: this.options.commandRunner ?? runCommand,
+        drivers: [
+          ...createOrcaWakeupDrivers({ commandRunner: this.options.commandRunner ?? runCommand, idleCheck: this.options.wakeupIdleCheck }),
+          createAgentHostWakeupDriver({ commandRunner: this.options.commandRunner ?? runCommand }),
+        ],
         flushIntervalMs: this.config.wave?.flushIntervalMs ?? 1_000,
-        onError: error => {
-          this.lastError = String(error);
-        },
-        ...(this.options.wakeupIdleCheck
-          ? { idleCheck: this.options.wakeupIdleCheck }
-          : {}),
+        onError: error => { this.lastError = String(error); },
       });
       const keyPath = join(this.stateDir, 'identity.json');
       const keyPair = existsSync(keyPath) ? JSON.parse(readFileSync(keyPath, 'utf8')) : generateNodeKeyPair();
@@ -962,7 +950,7 @@ export class DealerNodeRuntime {
 
   private executorTopicBinding = (kind: string, streamKey?: string) => {
     const resolved = this.resolveTopicBinding(kind, streamKey);
-    return resolved ? { ...resolved.binding, repoRoot: resolved.projectRoot } : undefined;
+    return resolved ? { ...resolved.binding, ...toMailboxTopicBinding(resolved.binding), repoRoot: resolved.projectRoot } : undefined;
   };
 
   private async activateLarkNotifier(): Promise<void> {
@@ -1017,12 +1005,12 @@ export class DealerNodeRuntime {
     const mailboxes: string[] = [];
     for (const kind of kinds) {
       const { binding, projectRoot } = this.resolveTopicBinding(kind)!;
-      const mailboxId = resolveBoundMailboxId(kind, binding);
+      const mailboxId = resolveBoundMailboxId(kind, toMailboxTopicBinding(binding));
       const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
         : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
           ['orca', 'orca-wave', 'orca-spawn', 'agent-pty', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app'].includes(manifest.topics?.[kind]?.defaultExecutor ?? ''));
       if (notifyLark) mailboxes.push(mailboxId);
-      const effectiveMode = resolveEffectiveConversationMode({ executor: binding.executor, binding });
+      const effectiveMode = resolveEffectiveConversationMode({ binding: toMailboxTopicBinding(binding) });
       if (!((binding.executor === 'orca-wave' || (binding.executor === 'orca' && effectiveMode !== 'spawn')) && (binding.workspacePath || binding.runId || binding.terminalHandle))) continue;
       const { workspacePath, worktreeId, runId, terminalHandle, autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs, rotateAfterWaves, interactiveCommand } = binding;
       const current = this.mailbox.getWakeTarget(mailboxId);
@@ -1040,16 +1028,25 @@ export class DealerNodeRuntime {
       const nextTerminalHandle =
         terminalHandle !== undefined
           ? terminalHandle
-          : !runId && current?.mode === 'orca-terminal' && current.workspacePath === workspacePath
-            ? current.terminalHandle
+          : !runId && current?.driver === 'orca-terminal' && current.driverConfig?.workspacePath === workspacePath
+            ? current.driverConfig?.terminalHandle
             : undefined;
       this.mailbox.upsertWakeTarget(mailboxId, {
-        mode: runId ? 'orca-run' : 'orca-terminal',
-        workspacePath, worktreeId, runId, repoRoot: projectRoot,
-        agent: binding.agent ? orcaAgent(binding.agent) : undefined, interactiveCommand,
-        autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
+        driver: runId ? 'orca-run' : 'orca-terminal',
+        wakeupPrefix,
+        coalesceMs: coalesceMs ?? 0,
         rotateAfterWaves: resolvedRotateAfterWaves,
-        terminalHandle: nextTerminalHandle,
+        driverConfig: {
+          workspacePath,
+          worktreeId,
+          runId,
+          repoRoot: projectRoot,
+          agent: binding.agent ? orcaAgent(binding.agent) : undefined,
+          interactiveCommand,
+          autoCreateWorkspace,
+          workspaceComment,
+          terminalHandle: nextTerminalHandle,
+        },
       });
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);
@@ -1097,13 +1094,19 @@ export class DealerNodeRuntime {
             return;
           }
           try {
+            const binding = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding;
             const mailboxId = resolveMailboxId(
               envelope,
-              this.resolveExecutorName(envelope),
-              this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding,
+              binding ? toMailboxTopicBinding(binding) : undefined,
               this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
+              toMailboxTopicBinding({ executor: this.resolveExecutorName(envelope) }).mode,
             );
-            this.mailbox.recordInboundEnvelope(envelope, mailboxId);
+            // Inbound receipts can arrive after a synchronous pointer delivery; preserve its session.
+            const target = this.mailbox.getWakeTarget(mailboxId);
+            const handle = target?.driverConfig?.terminalHandle;
+            const localMailbox = target && !target.pendingWake && typeof handle === 'string'
+              ? pinOrcaTerminalSessionMailbox(this.mailbox, mailboxId, handle) : mailboxId;
+            this.mailbox.recordInboundEnvelope(envelope, localMailbox);
           } catch (error) {
             this.lastError = String(error);
           }
@@ -1114,7 +1117,7 @@ export class DealerNodeRuntime {
           if (!resolved) return next(envelope);
           const bindingKind = typeof envelope.payload?.streamKey === 'string'
             ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
-          const replyMailbox = resolveBoundMailboxId(bindingKind, resolved.binding);
+          const replyMailbox = resolveBoundMailboxId(bindingKind, toMailboxTopicBinding(resolved.binding));
           return next(replyMailbox === 'default' ? envelope : {
             ...envelope, semantic: { ...(envelope.semantic ?? { type: 'message' as const, threadId: envelope.id }), replyMailbox },
           });
@@ -1197,7 +1200,6 @@ export class DealerNodeRuntime {
             store: this.mailbox,
             wakeup: this.wakeups,
             commandRunner: runner,
-            orcaCommand: 'orca',
           }),
           notify: createNotifyExecutorPlugin({
             inboxPath: join(this.stateDir, 'notifications.jsonl'),

@@ -1,3 +1,5 @@
+import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createOrcaWakeupDrivers } from '../packages/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -83,10 +85,12 @@ test('thread replies wake the originating worktree session instead of the topic 
     originMailbox,
   );
   store.upsertWakeTarget(originMailbox, {
-    mode: 'orca-terminal',
-    workspacePath: originWorkspace,
-    worktreeId: 'wt-halfbeak-2',
-    terminalHandle: 'term_origin',
+    driver: 'orca-terminal',
+    driverConfig: {
+      workspacePath: originWorkspace,
+      worktreeId: 'wt-halfbeak-2',
+      terminalHandle: 'term_origin',
+    },
   });
 
   const calls: CommandRequest[] = [];
@@ -96,8 +100,7 @@ test('thread replies wake the originating worktree session instead of the topic 
   };
   const wakeup = new WakeupRedriveService({
     store,
-    commandRunner: runner,
-    idleCheck: async () => ({ idle: true }),
+    drivers: createTestWakeupDrivers({ commandRunner: runner, idleCheck: async () => ({ idle: true }) }),
   });
   t.after(() => wakeup.stop());
   const plugin = createOrcaWaveExecutorPlugin({
@@ -131,9 +134,9 @@ test('thread replies wake the originating worktree session instead of the topic 
   assert.equal(store.list({ mailboxId: originMailbox }).queuedCount, 1);
   assert.equal(store.list({ mailboxId: 'stream:inbox' }).totalCount, 0);
   const preserved = store.getWakeTarget(originMailbox)!;
-  assert.equal(preserved.workspacePath, originWorkspace);
-  assert.equal(preserved.worktreeId, 'wt-halfbeak-2');
-  assert.equal(preserved.terminalHandle, 'term_origin');
+  assert.equal(preserved.driverConfig?.workspacePath, originWorkspace);
+  assert.equal(preserved.driverConfig?.worktreeId, 'wt-halfbeak-2');
+  assert.equal(preserved.driverConfig?.terminalHandle, 'term_origin');
   assert.equal(preserved.rotateAfterWaves, undefined);
   assert.equal(store.getWakeTarget('stream:inbox'), undefined);
   assert.equal(terminalSends(calls).length, 1);
@@ -155,8 +158,8 @@ test('thread replies wake the originating worktree session instead of the topic 
   assert.equal(store.list({ mailboxId: originMailbox }).queuedCount, 2);
   assert.equal(store.list({ mailboxId: 'stream:inbox' }).totalCount, 0);
   const stillPreserved = store.getWakeTarget(originMailbox)!;
-  assert.equal(stillPreserved.workspacePath, originWorkspace);
-  assert.equal(stillPreserved.terminalHandle, 'term_origin');
+  assert.equal(stillPreserved.driverConfig?.workspacePath, originWorkspace);
+  assert.equal(stillPreserved.driverConfig?.terminalHandle, 'term_origin');
   assert.equal(stillPreserved.rotateAfterWaves, undefined);
   assert.equal(terminalSends(calls).length, 1);
   assert.equal(terminalOf(terminalSends(calls)[0]), 'term_origin');
@@ -187,8 +190,10 @@ test('a session mailbox with no live wake target infers its Orca worktree', asyn
     [peer.nodeId],
     'worktree:halfbeak-2',
   );
+  const wakeup = new WakeupRedriveService({ store, drivers: createOrcaWakeupDrivers({ commandRunner: runner }), flushIntervalMs: 100_000 });
+  t.after(() => wakeup.stop());
   const plugin = createOrcaWaveExecutorPlugin({
-    store,
+    store, wakeup,
     commandRunner: runner,
     resolveTopicBinding: () => ({
       executor: 'orca-wave',
@@ -204,9 +209,9 @@ test('a session mailbox with no live wake target infers its Orca worktree', asyn
   );
   assert.equal(store.list({ mailboxId: 'worktree:halfbeak-2' }).queuedCount, 1);
   const inferred = store.getWakeTarget('worktree:halfbeak-2')!;
-  assert.equal(inferred.mode, 'orca-terminal');
-  assert.equal(inferred.workspacePath, '/orca/halfbeak-2');
-  assert.equal(inferred.worktreeId, 'wt-2');
+  assert.equal(inferred.driver, 'orca-terminal');
+  assert.equal(inferred.driverConfig?.workspacePath, '/orca/halfbeak-2');
+  assert.equal(inferred.driverConfig?.worktreeId, 'wt-2');
   assert.equal(inferred.rotateAfterWaves, undefined);
   assert.equal(store.getWakeTarget('stream:inbox'), undefined);
 });

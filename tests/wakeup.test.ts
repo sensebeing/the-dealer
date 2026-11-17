@@ -1,8 +1,10 @@
+import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { pinOrcaTerminalSessionMailbox } from '../packages/plugins-orca/index.ts';
 import { Kernel } from '../packages/kernel/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import type { NodeService } from '../packages/core-types/index.ts';
-import { spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/orca-workspace/index.ts';
+import { spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isAutopilotComposerPrefill, sendOrcaTerminalText } from '../packages/plugins-orca/index.ts';
 import { CommandNotStartedError, runCommand } from '../packages/subprocess/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -250,20 +252,18 @@ test('unacked recovery pointer suppresses rotation, and the acknowledged wave op
   ]);
   const service = new WakeupRedriveService({
     store,
-    commandRunner: runner,
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
   });
   t.after(() => service.stop());
   const enqueue = (ids: readonly string[]) =>
     store.enqueue(ids.map(id => alert(id)), {
       mailboxId: 'stream:alerts',
       wakeTarget: {
-        mode: 'orca-terminal',
-        terminalHandle: 'term-alerts',
-        workspacePath,
+        driver: 'orca-terminal',
         coalesceMs: 0,
         rotateAfterWaves: 1,
-        workspaceComment: 'Dealer: alerts',
+        driverConfig: { terminalHandle: 'term-alerts', workspacePath, workspaceComment: 'Dealer: alerts' },
       },
     });
 
@@ -297,7 +297,7 @@ test('unacked recovery pointer suppresses rotation, and the acknowledged wave op
   assert.equal(rotated.length, 1);
   assert.match(textOf(rotated[0]), /^You have 1 Dealer message\(s\) in stream:alerts/);
   assert.equal(/[\r\n]/.test(textOf(rotated[0])), false);
-  assert.equal(store.getWakeTarget('stream:alerts')!.terminalHandle, 'term-new-1');
+  assert.equal(store.getWakeTarget('stream:alerts')!.driverConfig?.terminalHandle, 'term-new-1');
   assert.equal(store.getWakeTarget('stream:alerts')!.completedWaves, 0);
   // The retained tab keeps its history: it is never reset, cleared or written to again.
   assert.equal(sendsTo(state.calls, 'term-alerts').length, 2);
@@ -314,19 +314,18 @@ test('rotation persists the new session tab before tui-idle and the next tick re
   ]);
   const service = new WakeupRedriveService({
     store,
-    commandRunner: runner,
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
   });
   t.after(() => service.stop());
   store.enqueue([alert('rotate-now')], {
     mailboxId: 'stream:rotate',
     wakeTarget: {
-      mode: 'orca-terminal',
-      workspacePath,
-      terminalHandle: 'term-rotate',
+      driver: 'orca-terminal',
       coalesceMs: 0,
       rotateAfterWaves: 1,
       completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-rotate' },
     },
   });
 
@@ -336,7 +335,7 @@ test('rotation persists the new session tab before tui-idle and the next tick re
   assert.equal(first.rotated, true);
   assert.equal(first.reason, 'Session rotated; waiting for tui-idle before wakeup');
   assert.equal(state.created, 1);
-  assert.equal(store.getWakeTarget('stream:rotate')!.terminalHandle, 'term-new-1');
+  assert.equal(store.getWakeTarget('stream:rotate')!.driverConfig?.terminalHandle, 'term-new-1');
   assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
   assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, true);
   assert.equal(terminalSends(state.calls).length, 0, 'no pointer is written before the TUI is idle');
@@ -367,14 +366,19 @@ test(`the per-wave default opens a session tab and never hijacks a retained comp
   ]);
   const service = new WakeupRedriveService({
     store,
-    commandRunner: runner,
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
   });
   t.after(() => service.stop());
   const enqueue = (ids: readonly string[]) =>
     store.enqueue(ids.map(id => alert(id)), {
       mailboxId: 'stream:wave',
-      wakeTarget: { mode: 'orca-terminal', workspacePath, coalesceMs: 0, rotateAfterWaves: 1 },
+      wakeTarget: {
+        driver: 'orca-terminal',
+        coalesceMs: 0,
+        rotateAfterWaves: 1,
+        driverConfig: { workspacePath },
+      },
     });
 
   enqueue(['a']);
@@ -384,7 +388,7 @@ test(`the per-wave default opens a session tab and never hijacks a retained comp
   assert.equal(sendsTo(state.calls, 'term-human').length, 0, 'a human tab is never hijacked');
   assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
   assert.equal(terminalSends(state.calls).some(call => textOf(call) === '\x15'), false, 'a fresh tab needs no composer clear');
-  assert.equal(store.getWakeTarget('stream:wave')!.terminalHandle, 'term-new-1');
+  assert.equal(store.getWakeTarget('stream:wave')!.driverConfig?.terminalHandle, 'term-new-1');
 
   // Messages merged before the acknowledgement keep using this wave's own tab.
   enqueue(['b']);
@@ -399,7 +403,7 @@ test(`the per-wave default opens a session tab and never hijacks a retained comp
   await service.flushMailbox('stream:wave', { force: true });
   assert.equal(state.created, 2);
   assert.equal(sendsTo(state.calls, 'term-human').length, 0);
-  assert.equal(store.getWakeTarget('stream:wave')!.terminalHandle, 'term-new-2');
+  assert.equal(store.getWakeTarget('stream:wave')!.driverConfig?.terminalHandle, 'term-new-2');
   assert.ok(sendsTo(state.calls, 'term-new-2').length >= 1);
   assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
 });
@@ -414,16 +418,18 @@ test('an explicit rotateAfterWaves above one reuses the bound tab until the thre
   ]);
   const service = new WakeupRedriveService({
     store,
-    commandRunner: runner,
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
   });
   t.after(() => service.stop());
   const enqueue = (id: string) =>
     store.enqueue([alert(id)], {
       mailboxId: 'stream:alerts',
       wakeTarget: {
-        mode: 'orca-terminal', terminalHandle: 'term-alerts', workspacePath,
-        coalesceMs: 0, rotateAfterWaves: 2,
+        driver: 'orca-terminal',
+        coalesceMs: 0,
+        rotateAfterWaves: 2,
+        driverConfig: { terminalHandle: 'term-alerts', workspacePath },
       },
     });
   const ack = () => {
@@ -444,7 +450,7 @@ test('an explicit rotateAfterWaves above one reuses the bound tab until the thre
   enqueue('three');
   await service.flushMailbox('stream:alerts');
   assert.equal(state.created, 1);
-  assert.equal(store.getWakeTarget('stream:alerts')!.terminalHandle, 'term-new-1');
+  assert.equal(store.getWakeTarget('stream:alerts')!.driverConfig?.terminalHandle, 'term-new-1');
   assert.equal(store.getWakeTarget('stream:alerts')!.completedWaves, 0);
   assert.match(textOf(sendsTo(state.calls, 'term-new-1')[0]), /^You have 1 Dealer message\(s\) in stream:alerts/);
   assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
@@ -460,16 +466,18 @@ for (const rotateAfterWaves of [1, 2] as const) {
     ]);
     const service = new WakeupRedriveService({
       store,
-      commandRunner: runner,
       flushIntervalMs: 100_000,
+      drivers: createTestWakeupDrivers({ commandRunner: runner }),
     });
     t.after(() => service.stop());
     const enqueue = (id: string) =>
       store.enqueue([alert(id)], {
         mailboxId: 'stream:retained',
         wakeTarget: {
-          mode: 'orca-terminal', terminalHandle: 'term-retained', workspacePath,
-          coalesceMs: 0, rotateAfterWaves,
+          driver: 'orca-terminal',
+          coalesceMs: 0,
+          rotateAfterWaves,
+          driverConfig: { terminalHandle: 'term-retained', workspacePath },
         },
       });
     const ack = () => {
@@ -502,7 +510,7 @@ for (const rotateAfterWaves of [1, 2] as const) {
       retainedSends,
       'the retained tab is never written to again',
     );
-    assert.equal(store.getWakeTarget('stream:retained')!.terminalHandle, 'term-new-1');
+    assert.equal(store.getWakeTarget('stream:retained')!.driverConfig?.terminalHandle, 'term-new-1');
     assert.equal(store.getWakeTarget('stream:retained')!.completedWaves, 0);
     const fresh = sendsTo(state.calls, 'term-new-1');
     assert.equal(fresh.length, 1);
@@ -540,9 +548,8 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
   };
   const service = new WakeupRedriveService({
     store,
-    commandRunner: runner,
-    idleCheck: async () => ({ idle }),
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner, idleCheck: async () => ({ idle }) }),
   });
   t.after(() => service.stop());
   const executor = createOrcaSpawnExecutorPlugin({
@@ -695,10 +702,9 @@ test('single-machine loopback send -> ask -> reply -> settle keeps both thread l
   );
 
   runtime.mailbox.upsertWakeTarget('task:w1', {
-    mode: 'orca-terminal',
-    terminalHandle: 'term-w1',
-    workspacePath: join(root, 'workspace-w1'),
+    driver: 'orca-terminal',
     coalesceMs: 0,
+    driverConfig: { terminalHandle: 'term-w1', workspacePath: join(root, 'workspace-w1') },
   });
   const replied = await cli(
     runtime,
@@ -1008,9 +1014,9 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   await runDealerCli(['ask', '--network', 'team', '--to', 'member:bob', '--target-mailbox', 'worktree:bob-wt', '--body', 'Please review'], { runtime: alice, env: aliceEnv, stdout: line => askOut.push(line) });
   const asked = JSON.parse(askOut.join('\n'));
   assert.equal(asked.replyMailbox, 'worktree:alice-wt');
-  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.mode, 'orca-terminal');
-  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-alice');
-  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.workspacePath, aliceWtPath);
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.driver, 'orca-terminal');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.driverConfig?.terminalHandle, 'term-alice');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.driverConfig?.workspacePath, aliceWtPath);
   await until(() => bob.mailbox.list({ mailboxId: 'worktree:bob-wt' }).totalCount > 0, 'Bob inbound mailbox');
   await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-bob')), 'Bob terminal wake');
   const checkOut: string[] = [];
@@ -1023,9 +1029,9 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   const replied = JSON.parse(replyOut.join('\n'));
   assert.equal(replied.replyMailbox, 'worktree:bob-wt');
   assert.equal(replied.targetMailbox, 'worktree:alice-wt');
-  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.mode, 'orca-terminal');
-  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.terminalHandle, 'term-bob');
-  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.workspacePath, bobWtPath);
+  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.driver, 'orca-terminal');
+  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.driverConfig?.terminalHandle, 'term-bob');
+  assert.equal(bob.mailbox.getWakeTarget('worktree:bob-wt')?.driverConfig?.workspacePath, bobWtPath);
   await until(() => alice.mailbox.list({ mailboxId: 'worktree:alice-wt' }).totalCount > 0, 'Alice reply mailbox');
   await until(() => calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-alice')), 'Alice terminal wake');
   const aliceCheckOut: string[] = [];
@@ -1054,7 +1060,7 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
     return { code, stdout, stderr };
   });
   await runDealerCli(['inbox', 'check', '--json'], { stateDir: alice.stateDir, env: { ORCA_TERMINAL_HANDLE: 'term-rpc', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` }, stdout: () => {} });
-  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.terminalHandle, 'term-rpc');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.driverConfig?.terminalHandle, 'term-rpc');
 
   await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{' }), 'orca', 'alice-wt'), /Unexpected end|JSON/);
   await assert.rejects(() => findOrcaWorktreeByName(async () => ({ stdout: '{"ok":false}' }), 'orca', 'alice-wt'), /Orca worktree ps failed/);
@@ -1102,7 +1108,7 @@ test('dealer send binds an Orca caller mailbox when the topic is locally bound',
   const inbound = runtime.mailbox.listItemsAfterSequence(-1).find(item => item.envelope?.id === sent.messageId);
   assert.equal(inbound?.mailboxId, 'stream:prod-release');
   assert.equal(inbound?.envelope?.semantic?.replyMailbox, 'worktree:caller-wt');
-  assert.equal(runtime.mailbox.getWakeTarget('worktree:caller-wt')?.terminalHandle, 'term-caller');
+  assert.equal(runtime.mailbox.getWakeTarget('worktree:caller-wt')?.driverConfig?.terminalHandle, 'term-caller');
 
   const checkedOut: string[] = [];
   await runDealerCli(['inbox', 'check', '--mailbox', 'stream:prod-release', '--json'], {
@@ -1198,8 +1204,11 @@ test('Autopilot composer recognition preserves human drafts and clears only befo
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', root)).idle, false);
   preview = `• ,1（主推）：${suggestion}\n> ${suggestion}\nstatus bar`;
   const store = new MailboxStore(join(root, 'mailbox.json'));
-  store.enqueue([alert('prefill')], { mailboxId: 'default', wakeTarget: { mode: 'orca-terminal', terminalHandle: 'term', workspacePath: root } });
-  const wakeup = new WakeupRedriveService({ store, commandRunner: runner });
+  store.enqueue([alert('prefill')], {
+    mailboxId: 'default',
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term', workspacePath: root } },
+  });
+  const wakeup = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
   t.after(() => wakeup.stop());
   assert.equal((await wakeup.flushMailbox('default', { force: true })).woke, true);
   const sends = terminalSends(calls);
@@ -1319,17 +1328,20 @@ test('a TUI mode placeholder on an empty composer never wedges a bound wave deli
     }
     return { stdout: '{"ok":true}' };
   };
-  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
   t.after(() => service.stop());
   store.enqueue([alert('placeholder')], {
     mailboxId: 'stream:placeholder',
     wakeTarget: {
-      mode: 'orca-terminal',
-      terminalHandle: 'term-agy',
-      workspacePath,
+      driver: 'orca-terminal',
       coalesceMs: 0,
       rotateAfterWaves: 10,
       completedWaves: 1,
+      driverConfig: { terminalHandle: 'term-agy', workspacePath },
     },
   });
 
@@ -1380,12 +1392,18 @@ test('an unsent human draft stays busy even when tui-idle reports a title-idle a
       0,
       'an unsent draft is never resolved by a readiness probe',
     );
-    const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+    const service = new WakeupRedriveService({
+      store,
+      flushIntervalMs: 100_000,
+      drivers: createTestWakeupDrivers({ commandRunner: runner }),
+    });
     t.after(() => service.stop());
     store.enqueue([alert(`draft-${agentIdentity}`)], {
       mailboxId: 'stream:draft',
       wakeTarget: {
-        mode: 'orca-terminal', terminalHandle: 'term-draft', workspacePath, coalesceMs: 0,
+        driver: 'orca-terminal',
+        coalesceMs: 0,
+        driverConfig: { terminalHandle: 'term-draft', workspacePath },
       },
     });
 
@@ -1440,13 +1458,18 @@ test('fresh-tab delivery is not blocked by a disconnected retained tab', async t
   ]);
   const service = new WakeupRedriveService({
     store,
-    commandRunner: runner,
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
   });
   t.after(() => service.stop());
   store.enqueue([alert('fresh-dead')], {
     mailboxId: 'stream:fresh-dead',
-    wakeTarget: { mode: 'orca-terminal', workspacePath, coalesceMs: 0, rotateAfterWaves: 1 },
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      driverConfig: { workspacePath },
+    },
   });
 
   const delivered = await service.flushMailbox('stream:fresh-dead');
@@ -1467,16 +1490,18 @@ test('rotation is not blocked by a non-writable retained tab', async t => {
   ]);
   const service = new WakeupRedriveService({
     store,
-    commandRunner: runner,
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
   });
   t.after(() => service.stop());
   const enqueue = (id: string) =>
     store.enqueue([alert(id)], {
       mailboxId: 'stream:rotate-readonly',
       wakeTarget: {
-        mode: 'orca-terminal', terminalHandle: 'term-bound', workspacePath,
-        coalesceMs: 0, rotateAfterWaves: 1,
+        driver: 'orca-terminal',
+        coalesceMs: 0,
+        rotateAfterWaves: 1,
+        driverConfig: { terminalHandle: 'term-bound', workspacePath },
       },
     });
 
@@ -1533,13 +1558,13 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
   t.after(() => first.stop());
   const target = first.mailbox.getWakeTarget('stream:collab.request.v4')!;
   assert.equal(target.rotateAfterWaves, 1);
-  first.mailbox.upsertWakeTarget('stream:collab.request.v4', { terminalHandle: 'runtime-tab' });
+  first.mailbox.upsertWakeTarget('stream:collab.request.v4', { driverConfig: { terminalHandle: 'runtime-tab' } });
   await first.stop();
 
   const second = await make().start();
   t.after(() => second.stop());
   assert.equal(
-    second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle,
+    second.mailbox.getWakeTarget('stream:collab.request.v4')!.driverConfig?.terminalHandle,
     'runtime-tab',
     'a restart must not erase the live tab resolved at runtime',
   );
@@ -1549,11 +1574,11 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
   await second.applyAgentPreset({
     host: 'orca', conversationMode: 'fixed', topic: 'collab.request.v4', workspacePath,
   });
-  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle, 'runtime-tab');
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.driverConfig?.terminalHandle, 'runtime-tab');
   await second.applyAgentPreset({
     host: 'orca', conversationMode: 'fixed', topic: 'collab.request.v4', workspacePath: join(root, 'other'),
   });
-  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle, undefined);
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.driverConfig?.terminalHandle, undefined);
 
   // Reconfiguring the binding to an explicitly pinned tab or an Orca Run clears the stale
   // rotation default; any preset application re-reads every binding.
@@ -1568,7 +1593,7 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
     host: 'codex', conversationMode: 'inbox-only', topic: 'reconfiguration.trigger',
   });
   const pinned = second.mailbox.getWakeTarget('stream:collab.request.v4')!;
-  assert.equal(pinned.terminalHandle, 'explicit-tab');
+  assert.equal(pinned.driverConfig?.terminalHandle, 'explicit-tab');
   assert.equal(pinned.rotateAfterWaves, undefined, 'an explicitly pinned tab never rotates');
 
   second.config.topicBindings = {
@@ -1582,18 +1607,23 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
     host: 'codex', conversationMode: 'inbox-only', topic: 'reconfiguration.trigger',
   });
   const runBound = second.mailbox.getWakeTarget('stream:collab.request.v4')!;
-  assert.equal(runBound.mode, 'orca-run');
-  assert.equal(runBound.terminalHandle, undefined, 'an Orca Run clears the stale pinned tab');
+  assert.equal(runBound.driver, 'orca-run');
+  assert.equal(runBound.driverConfig?.terminalHandle, undefined, 'an Orca Run clears the stale pinned tab');
   assert.equal(runBound.rotateAfterWaves, undefined, 'an Orca Run owns its coordinator session');
 });
 
 test('inline wakeup previews include bounded latest body, semantic sender and thread on one line', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   const calls: CommandRequest[] = [];
-  const wakeup = new WakeupRedriveService({ store, commandRunner: async call => {
-    calls.push(call);
-    return { stdout: '{"ok":true}' };
-  } });
+  const wakeup = new WakeupRedriveService({
+    store,
+    drivers: createTestWakeupDrivers({
+      commandRunner: async (call) => {
+        calls.push(call);
+        return { stdout: '{"ok":true}' };
+      },
+    }),
+  });
   t.after(() => wakeup.stop());
   for (const [id, body, semantic] of [
     ['long', 'x'.repeat(450) + '\r\nend', { type: 'question', threadId: 'thread-1' }],
@@ -1601,7 +1631,7 @@ test('inline wakeup previews include bounded latest body, semantic sender and th
     ['empty', ' \n ', undefined],
   ] as const) {
     const claim = wakeup.claim(id);
-    store.enqueue([alert(id, { body, semantic })], { mailboxId: id, wakeTarget: { mode: 'orca-run', runId: 'run' } });
+    store.enqueue([alert(id, { body, semantic })], { mailboxId: id, wakeTarget: { driver: 'orca-run', driverConfig: { runId: 'run' } } });
     await wakeup.flushMailbox(id);
     claim.dispose();
     const result = await wakeup.flushMailbox(id, { force: true });
@@ -1622,12 +1652,14 @@ test('only newly inserted conversational frames bypass coalescing and never rese
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   for (const type of ['question', 'reply', 'settle'] as const) {
     store.enqueue([alert(type, { semantic: { type, threadId: 'thread', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } })], {
-      mailboxId: type, wakeTarget: { mode: 'orca-run', runId: 'run', coalesceMs: 5000 },
+      mailboxId: type,
+      wakeTarget: { driver: 'orca-run', coalesceMs: 5000, driverConfig: { runId: 'run' } },
     });
     assert.equal(store.getWakeTarget(type)?.earliestWakeAt, 10_000);
   }
   store.enqueue([alert('normal'), alert('control', { semantic: { type: 'reply', threadId: 'thread' } })], {
-    mailboxId: 'mixed', wakeTarget: { mode: 'orca-run', runId: 'run', coalesceMs: 5000 },
+    mailboxId: 'mixed',
+    wakeTarget: { driver: 'orca-run', coalesceMs: 5000, driverConfig: { runId: 'run' } },
   });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 15_000);
   store.enqueue([alert('normal'), alert('new-control', { semantic: { type: 'question', threadId: 'thread' } })], { mailboxId: 'mixed' });
@@ -1636,10 +1668,16 @@ test('only newly inserted conversational frames bypass coalescing and never rese
   store.enqueue([alert('retry', { semantic: { type: 'settle', threadId: 'thread', outcome: 'succeeded' } })], { mailboxId: 'mixed' });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 30_000);
   const calls: CommandRequest[] = [];
-  const wakeup = new WakeupRedriveService({ store, now: () => 10_000, commandRunner: async call => {
-    calls.push(call);
-    return { stdout: '{"ok":true}' };
-  } });
+  const wakeup = new WakeupRedriveService({
+    store,
+    now: () => 10_000,
+    drivers: createTestWakeupDrivers({
+      commandRunner: async (call) => {
+        calls.push(call);
+        return { stdout: '{"ok":true}' };
+      },
+    }),
+  });
   t.after(() => wakeup.stop());
   assert.equal((await wakeup.flushReady()).filter(result => result.woke).length, 3);
   assert.equal(calls.length, 3);
@@ -1667,18 +1705,36 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
     const mailboxId = 'box';
     store.enqueue([alert('old')], { mailboxId });
     store.check({ mailboxId });
-    store.enqueue([alert('first', { semantic: { type: 'reply', threadId: 'old' } })], { mailboxId,
-      wakeTarget: { mode, ...(mode === 'passive' ? { hostAgent: 'claude-code', conversationMode: 'spawn' } : {}), runId: 'run', terminalHandle: 'term' } });
+    store.enqueue([alert('first', { semantic: { type: 'reply', threadId: 'old' } })], {
+      mailboxId,
+      wakeTarget: {
+        driver: mode === 'passive' ? 'agent-host' : mode,
+        driverConfig: {
+          ...(mode === 'passive' ? { hostAgent: 'claude-code', conversationMode: 'spawn' } : {}),
+          runId: 'run',
+          terminalHandle: 'term',
+        },
+      },
+    });
     let release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const pointers: string[] = [];
-    const service = new WakeupRedriveService({ store, flushIntervalMs: 100_000, idleCheck: async () => ({ idle: true }), commandRunner: async call => {
-      if (mode !== 'orca-terminal' || call.args[1] === 'send') {
-        pointers.push(mode === 'passive' ? call.args.at(-1)! : mode === 'orca-run' ? bodyOf(call) : textOf(call));
-        if (pointers.length === 1) await held;
-      }
-      return { stdout: '{"ok":true}' };
-    } });
+    const service = new WakeupRedriveService({
+      store,
+      flushIntervalMs: 100_000,
+      drivers: createTestWakeupDrivers({
+        idleCheck: async () => ({ idle: true }),
+        commandRunner: async (call) => {
+          if (mode !== 'orca-terminal' || call.args[1] === 'send') {
+            pointers.push(
+              mode === 'passive' ? call.args.at(-1)! : mode === 'orca-run' ? bodyOf(call) : textOf(call),
+            );
+            if (pointers.length === 1) await held;
+          }
+          return { stdout: '{"ok":true}' };
+        },
+      }),
+    });
     t.after(() => service.stop());
     const first = service.flushMailbox(mailboxId);
     await until(() => pointers.length === 1, 'first command starts');
@@ -1689,8 +1745,8 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
     assert.match(pointers[0], /Latest \(reply from sender, thread old\)/);
     assert.match(pointers[1], /Second reply/);
     if (mode === 'passive') {
-      assert.equal(store.getWakeTarget(mailboxId)?.conversationMode, 'fixed');
-      assert.equal(store.getWakeTarget(mailboxId)?.sessionId, 'box');
+      assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.conversationMode, 'fixed');
+      assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'box');
     }
   });
 }
@@ -1700,15 +1756,23 @@ test('sequence settlement remains finite when wall clock order differs from arri
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   store.enqueue([alert('leased')], { mailboxId: 'box' });
   store.check({ mailboxId: 'box' });
-  store.enqueue([alert('later-clock')], { mailboxId: 'box', wakeTarget: { mode: 'passive', hostAgent: 'codex', sessionId: 'existing' } });
+  store.enqueue([alert('later-clock')], {
+    mailboxId: 'box',
+    wakeTarget: { driver: 'agent-host', driverConfig: { hostAgent: 'codex', sessionId: 'existing' } },
+  });
   t.mock.timers.setTime(10_000);
   store.enqueue([alert('later-sequence')], { mailboxId: 'box' });
   assert.equal(store.check({ mailboxId: 'box', peek: true }).latestQueued?.id, 'later-clock');
   let calls = 0;
-  const wakeup = new WakeupRedriveService({ store, commandRunner: async () => {
-    calls++;
-    return { stdout: '{}' };
-  } });
+  const wakeup = new WakeupRedriveService({
+    store,
+    drivers: createTestWakeupDrivers({
+      commandRunner: async () => {
+        calls++;
+        return { stdout: '{}' };
+      },
+    }),
+  });
   t.after(() => wakeup.stop());
   await wakeup.flushMailbox('box', { force: true });
   assert.equal(calls, 1);
@@ -1718,18 +1782,28 @@ test('sequence settlement remains finite when wall clock order differs from arri
 test('in-flight ordinary arrivals retain enqueue coalescing deadline while replies remain immediate', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
-  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
-    mode: 'passive', hostAgent: 'claude-code', conversationMode: 'fixed', sessionId: 'session', coalesceMs: 5000,
-  } });
+  store.enqueue([alert('first')], {
+    mailboxId: 'box',
+    wakeTarget: {
+      driver: 'agent-host',
+      coalesceMs: 5000,
+      driverConfig: { hostAgent: 'claude-code', conversationMode: 'fixed', sessionId: 'session' },
+    },
+  });
   let calls = 0;
-  const wakeup = new WakeupRedriveService({ store, commandRunner: async () => {
-    calls++;
-    if (calls === 1) {
-      t.mock.timers.setTime(11_000);
-      store.enqueue([alert('ordinary')], { mailboxId: 'box' });
-    }
-    return { stdout: '{}' };
-  } });
+  const wakeup = new WakeupRedriveService({
+    store,
+    drivers: createTestWakeupDrivers({
+      commandRunner: async () => {
+        calls++;
+        if (calls === 1) {
+          t.mock.timers.setTime(11_000);
+          store.enqueue([alert('ordinary')], { mailboxId: 'box' });
+        }
+        return { stdout: '{}' };
+      },
+    }),
+  });
   t.after(() => wakeup.stop());
   await wakeup.flushMailbox('box', { force: true });
   assert.equal(calls, 1);
@@ -1760,22 +1834,26 @@ test('spawned terminal handles persist across deferral and completion', async t 
     return { stdout: '{"ok":true}' };
   };
   const service = new WakeupRedriveService({
-    store, commandRunner: runner,
-    idleCheck: async () => ({ idle: ++idleChecks !== 2 }),
+    store,
     flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({
+      commandRunner: runner,
+      idleCheck: async () => ({ idle: ++idleChecks !== 2 }),
+    }),
   });
   t.after(() => service.stop());
 
-  store.enqueue([alert('deferred')], { mailboxId: 'stream:deferred', wakeTarget: {
-    mode: 'orca-terminal', workspacePath: '/fixed',
-  } });
+  store.enqueue([alert('deferred')], {
+    mailboxId: 'stream:deferred',
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: '/fixed' } },
+  });
   const deferred = await service.flushMailbox('stream:deferred');
   assert.equal(deferred.woke, false);
   assert.match(deferred.reason!, /Terminal spawned/);
-  assert.equal(store.getWakeTarget('stream:deferred')!.terminalHandle, 'term-1');
+  assert.equal(store.getWakeTarget('stream:deferred')!.driverConfig?.terminalHandle, 'term-1');
   const delivered = await service.flushMailbox('stream:deferred', { force: true });
   assert.equal(delivered.woke, true);
-  assert.equal(store.getWakeTarget('stream:deferred')!.terminalHandle, 'term-1');
+  assert.equal(store.getWakeTarget('stream:deferred')!.driverConfig?.terminalHandle, 'term-1');
   assert.equal(store.getWakeTarget('stream:deferred')!.pendingWake, false);
   const send = calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'send').at(-1)!;
   assert.equal(send.args[send.args.indexOf('--terminal') + 1], 'term-1');
@@ -1786,12 +1864,13 @@ test('spawned terminal handles persist across deferral and completion', async t 
   );
 
   idleChecks = 10;
-  store.enqueue([alert('direct')], { mailboxId: 'stream:direct', wakeTarget: {
-    mode: 'orca-terminal', workspacePath: '/fixed-direct',
-  } });
+  store.enqueue([alert('direct')], {
+    mailboxId: 'stream:direct',
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: '/fixed-direct' } },
+  });
   const direct = await service.flushMailbox('stream:direct');
   assert.equal(direct.woke, true);
-  assert.equal(store.getWakeTarget('stream:direct')!.terminalHandle, 'term-2');
+  assert.equal(store.getWakeTarget('stream:direct')!.driverConfig?.terminalHandle, 'term-2');
   assert.equal(store.getWakeTarget('stream:direct')!.pendingWake, false);
 });
 
@@ -1818,11 +1897,16 @@ test('a closed persisted terminal is rebound to the live one before the pointer 
     }
     return { stdout: '{"ok":true}' };
   };
-  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 100_000 });
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
   t.after(() => service.stop());
-  store.enqueue([alert('heal')], { mailboxId: 'box', wakeTarget: {
-    mode: 'orca-terminal', workspacePath, terminalHandle: 'term-dead',
-  } });
+  store.enqueue([alert('heal')], {
+    mailboxId: 'box',
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'term-dead' } },
+  });
 
   // Resolution runs before the external send, so the closed handle is replaced on the first
   // attempt instead of failing into the backoff ledger.
@@ -1843,7 +1927,7 @@ test('a closed persisted terminal is rebound to the live one before the pointer 
     'the live terminal is reused instead of spawning another',
   );
   const target = store.getWakeTarget('box')!;
-  assert.equal(target.terminalHandle, 'term-live');
+  assert.equal(target.driverConfig?.terminalHandle, 'term-live');
   assert.equal(target.pendingWake, false);
   assert.equal(target.deliveryInDoubt, undefined);
 });
@@ -1894,13 +1978,19 @@ test('a removed non-auto-created workspace disarms wake retries but keeps the qu
     return { stdout: '{"ok":true}' };
   };
   const service = new WakeupRedriveService({
-    store, commandRunner: runner, flushIntervalMs: 100_000,
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
   });
   t.after(() => service.stop());
 
   store.enqueue([alert('gone-reply', { semantic: { type: 'reply', threadId: 'gone-task' } })], {
     mailboxId: 'worktree:gone',
-    wakeTarget: { mode: 'orca-terminal', terminalHandle: 'term-gone', workspacePath: gonePath, coalesceMs: 0 },
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      driverConfig: { terminalHandle: 'term-gone', workspacePath: gonePath },
+    },
   });
   const results = await service.flushWakeups();
   assert.equal(results.length, 1);
@@ -1920,7 +2010,7 @@ test('a removed non-auto-created workspace disarms wake retries but keeps the qu
   // An unspawned task must still disarm on a removed workspace instead of creating a tab.
   store.enqueue([alert('gone-spawn')], {
     mailboxId: 'task:gone-spawn',
-    wakeTarget: { mode: 'orca-terminal', workspacePath: gonePath, coalesceMs: 0 },
+    wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: { workspacePath: gonePath } },
   });
   assert.equal((await service.flushMailbox('task:gone-spawn')).reason, 'Workspace not found');
   assert.equal(store.getWakeTarget('task:gone-spawn')!.pendingWake, false);
@@ -1930,7 +2020,11 @@ test('a removed non-auto-created workspace disarms wake retries but keeps the qu
   // inventory is incomplete; only a path that is truly gone is disarmed.
   store.enqueue([alert('live-reply', { semantic: { type: 'reply', threadId: 'live-task' } })], {
     mailboxId: 'worktree:live',
-    wakeTarget: { mode: 'orca-terminal', terminalHandle: 'term-live', workspacePath: livePath, coalesceMs: 0 },
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      driverConfig: { terminalHandle: 'term-live', workspacePath: livePath },
+    },
   });
   const deferred = await service.flushMailbox('worktree:live', { force: true });
   assert.equal(deferred.woke, false);
@@ -1942,9 +2036,7 @@ test('a removed non-auto-created workspace disarms wake retries but keeps the qu
 test('a persisted unknown-effect fence survives reload and blocks delivery', async t => {
   const root = directory(t);
   const path = join(root, 'mailbox.json');
-  new MailboxStore(path).enqueue([alert('legacy')], { mailboxId: 'box', wakeTarget: {
-    mode: 'orca-run', runId: 'run-legacy',
-  } });
+  new MailboxStore(path).enqueue([alert('legacy')], { mailboxId: 'box', wakeTarget: { driver: 'orca-run', driverConfig: { runId: 'run-legacy' } } });
   // Reproduce the persisted shape of a send whose external outcome was never confirmed.
   const raw = JSON.parse(readFileSync(path, 'utf8'));
   raw.wakeTargets.box = {
@@ -1958,10 +2050,16 @@ test('a persisted unknown-effect fence survives reload and blocks delivery', asy
   assert.equal(loaded.pendingWake, false);
 
   const calls: CommandRequest[] = [];
-  const service = new WakeupRedriveService({ store, flushIntervalMs: 100_000, commandRunner: async request => {
-    calls.push(request);
-    return { stdout: '{"ok":true}' };
-  } });
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({
+      commandRunner: async (request) => {
+        calls.push(request);
+        return { stdout: '{"ok":true}' };
+      },
+    }),
+  });
   t.after(() => service.stop());
   assert.deepEqual(await service.flushReady(), []);
   const forced = await service.flushMailbox('box', { force: true });
@@ -1975,17 +2073,33 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
   test(`${mode} uncertain external delivery is fenced against retries, later mail and restart`, async t => {
     const file = join(directory(t), 'mailbox.json');
     const store = new MailboxStore(file);
-    store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
-      mode, ...(mode === 'passive' ? { hostAgent: 'claude-code' as const, conversationMode: 'spawn' as const } : {}), runId: 'run', terminalHandle: 'term',
-    } });
+    store.enqueue([alert('first')], {
+      mailboxId: 'box',
+      wakeTarget: {
+        driver: mode === 'passive' ? 'agent-host' : mode,
+        driverConfig: {
+          ...(mode === 'passive'
+            ? { hostAgent: 'claude-code' as const, conversationMode: 'spawn' as const }
+            : {}),
+          runId: 'run',
+          terminalHandle: 'term',
+        },
+      },
+    });
     let effects = 0;
-    const wakeup = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async call => {
-      if (mode !== 'orca-terminal' || call.args[1] === 'send') {
-        effects++;
-        throw new Error('accepted then result lost');
-      }
-      return { stdout: '{"ok":true}' };
-    } });
+    const wakeup = new WakeupRedriveService({
+      store,
+      drivers: createTestWakeupDrivers({
+        idleCheck: async () => ({ idle: true }),
+        commandRunner: async (call) => {
+          if (mode !== 'orca-terminal' || call.args[1] === 'send') {
+            effects++;
+            throw new Error('accepted then result lost');
+          }
+          return { stdout: '{"ok":true}' };
+        },
+      }),
+    });
     t.after(() => wakeup.stop());
     assert.equal((await wakeup.flushMailbox('box')).woke, false);
     assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
@@ -1994,10 +2108,16 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
     assert.equal(effects, 1);
     await wakeup.stop();
     const restarted = new MailboxStore(file);
-    const recovery = new WakeupRedriveService({ store: restarted, idleCheck: async () => ({ idle: true }), commandRunner: async () => {
-      effects++;
-      return { stdout: '{"ok":true}' };
-    } });
+    const recovery = new WakeupRedriveService({
+      store: restarted,
+      drivers: createTestWakeupDrivers({
+        idleCheck: async () => ({ idle: true }),
+        commandRunner: async () => {
+          effects++;
+          return { stdout: '{"ok":true}' };
+        },
+      }),
+    });
     t.after(() => recovery.stop());
     restarted.enqueue([alert('next')], { mailboxId: 'box' });
     assert.deepEqual(await recovery.flushReady(), []);
@@ -2010,12 +2130,20 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
 test('a restart with an unfinished external wake remains fenced even without a failure callback', async t => {
   const file = join(directory(t), 'mailbox.json');
   const store = new MailboxStore(file);
-  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: { mode: 'passive', hostAgent: 'claude-code' } });
+  store.enqueue([alert('first')], {
+    mailboxId: 'box',
+    wakeTarget: { driver: 'agent-host', driverConfig: { hostAgent: 'claude-code' } },
+  });
   store.beginWakeDelivery('box');
   const restarted = new MailboxStore(file);
-  const service = new WakeupRedriveService({ store: restarted, commandRunner: async () => {
-    assert.fail('unknown delivery must not be replayed');
-  } });
+  const service = new WakeupRedriveService({
+    store: restarted,
+    drivers: createTestWakeupDrivers({
+      commandRunner: async () => {
+        assert.fail('unknown delivery must not be replayed');
+      },
+    }),
+  });
   t.after(() => service.stop());
   assert.equal((await service.flushMailbox('box', { force: true })).woke, false);
   assert.equal(restarted.getWakeTarget('box')?.deliveryInDoubt, true);
@@ -2025,11 +2153,20 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
   test(`${mode} pre-effect command failure backs off and resumes safely after repair`, async t => {
     const root = directory(t);
     const store = new MailboxStore(join(root, 'mailbox.json'));
-    store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: {
-      mode, ...(mode === 'passive' ? { hostAgent: 'claude-code' as const } : {}), runId: 'run', terminalHandle: 'term',
-      interactiveCommand: join(root, 'missing'), orcaCommand: join(root, 'missing'),
-    } });
-    const failing = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }) });
+    store.enqueue([alert('first')], {
+      mailboxId: 'box',
+      wakeTarget: {
+        driver: mode === 'passive' ? 'agent-host' : mode,
+        driverConfig: {
+          ...(mode === 'passive' ? { hostAgent: 'claude-code' as const } : {}),
+          runId: 'run',
+          terminalHandle: 'term',
+          interactiveCommand: join(root, 'missing'),
+          orcaCommand: join(root, 'missing'),
+        },
+      },
+    });
+    const failing = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ idleCheck: async () => ({ idle: true }) }) });
     t.after(() => failing.stop());
     assert.equal((await failing.flushMailbox('box')).woke, false);
     const failed = store.getWakeTarget('box')!;
@@ -2039,7 +2176,13 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
     assert.ok(failed.earliestWakeAt > Date.now());
     assert.match(failed.lastWakeError!, /did not start|ENOENT/);
     await failing.stop();
-    const repaired = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async () => ({ stdout: '{"ok":true}' }) });
+    const repaired = new WakeupRedriveService({
+      store,
+      drivers: createTestWakeupDrivers({
+        idleCheck: async () => ({ idle: true }),
+        commandRunner: async () => ({ stdout: '{"ok":true}' }),
+      }),
+    });
     t.after(() => repaired.stop());
     assert.equal((await repaired.flushMailbox('box', { force: true })).woke, true);
     assert.equal(store.getWakeTarget('box')?.pendingWake, false);
@@ -2049,20 +2192,26 @@ for (const mode of ['passive', 'orca-run', 'orca-terminal'] as const) {
 test('local Orca target validation does not create an unknown-effect fence', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   let effects = 0;
-  const service = new WakeupRedriveService({ store, idleCheck: async () => ({ idle: true }), commandRunner: async () => {
-    effects++;
-    return { stdout: '{"ok":true}' };
-  } });
+  const service = new WakeupRedriveService({
+    store,
+    drivers: createTestWakeupDrivers({
+      idleCheck: async () => ({ idle: true }),
+      commandRunner: async () => {
+        effects++;
+        return { stdout: '{"ok":true}' };
+      },
+    }),
+  });
   t.after(() => service.stop());
   const claim = service.claim('box');
-  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: { mode: 'orca-run' } });
+  store.enqueue([alert('first')], { mailboxId: 'box', wakeTarget: { driver: 'orca-run' } });
   claim.dispose();
   assert.equal((await service.flushMailbox('box')).woke, false);
   assert.equal(effects, 0);
   assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
   assert.equal(store.getWakeTarget('box')?.pendingWake, true);
   assert.equal(store.getWakeTarget('box')?.attemptCount, 1);
-  store.upsertWakeTarget('box', { runId: 'repaired' });
+  store.upsertWakeTarget('box', { driverConfig: { runId: 'repaired' } });
   assert.equal((await service.flushMailbox('box', { force: true })).woke, true);
   assert.equal(effects, 1);
 });
@@ -2082,35 +2231,40 @@ test('Orca sender retry preserves delivery fences', async t => {
   assert.ok(calls[1]?.args.includes('--allow-self'));
   assert.equal(calls[1]?.env?.ORCA_TERMINAL_ID, 'term-1');
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
-  store.upsertWakeTarget('box', { mode: 'orca-terminal', terminalHandle: 'term-1' });
+  store.upsertWakeTarget('box', { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term-1' } });
   settleWakeDeliveryFailure(store, 'box', new Error('no_active_sender_terminal'));
   assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
 });
 
 test('rotating inbound delivery preserves terminal thread affinity across call order', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
-  store.upsertWakeTarget('stream:inbox', { mode: 'orca-terminal', rotateAfterWaves: 1, terminalHandle: 'term-1', coalesceMs: 0 });
+  store.upsertWakeTarget('stream:inbox', {
+    driver: 'orca-terminal',
+    rotateAfterWaves: 1,
+    coalesceMs: 0,
+    driverConfig: { terminalHandle: 'term-1' },
+  });
   const inbound = alert('thread-a', { semantic: { type: 'message', threadId: 'thread-a', replyMailbox: 'default' } });
   store.enqueue([inbound], { mailboxId: 'stream:inbox' });
-  store.completeWakeDelivery('stream:inbox', 0, { terminalHandle: 'term-1' });
-  store.recordInboundEnvelope(inbound, 'stream:inbox');
+  store.completeWakeDelivery('stream:inbox', 0, { driverConfig: { terminalHandle: 'term-1' } });
+  store.recordInboundEnvelope(inbound, pinOrcaTerminalSessionMailbox(store, 'stream:inbox', 'term-1'));
   assert.equal(store.resolveThreadLocalMailbox('thread-a'), 'terminal:term-1');
   assert.equal(store.getWakeTarget('terminal:term-1')?.rotateAfterWaves, undefined);
 });
 
 test('pinning a rotating session preserves existing terminal wake fences', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
-  store.upsertWakeTarget('stream:inbox', { mode: 'orca-terminal', rotateAfterWaves: 1, terminalHandle: 'term-1' });
-  store.upsertWakeTarget('terminal:term-1', { mode: 'orca-terminal', terminalHandle: 'term-1', pendingWake: true });
+  store.upsertWakeTarget('stream:inbox', { driver: 'orca-terminal', rotateAfterWaves: 1, driverConfig: { terminalHandle: 'term-1' } });
+  store.upsertWakeTarget('terminal:term-1', { driver: 'orca-terminal', pendingWake: true, driverConfig: { terminalHandle: 'term-1' } });
   const notifications: string[] = [];
   const subscription = store.onWakeTarget(mailbox => notifications.push(mailbox));
   t.after(() => subscription.dispose());
-  assert.equal(store.pinRotatingSessionMailbox('stream:inbox', 'term-1'), 'terminal:term-1');
+  assert.equal(pinOrcaTerminalSessionMailbox(store, 'stream:inbox', 'term-1'), 'terminal:term-1');
   const target = store.getWakeTarget('terminal:term-1');
   assert.equal(target?.pendingWake, true);
   assert.ok(notifications.includes('terminal:term-1'));
   store.upsertWakeTarget('stream:inbox', { deliveryInDoubt: true, lastWakeError: 'fenced' });
-  assert.equal(store.pinRotatingSessionMailbox('stream:inbox', 'term-2'), 'terminal:term-2');
+  assert.equal(pinOrcaTerminalSessionMailbox(store, 'stream:inbox', 'term-2'), 'terminal:term-2');
   assert.equal(store.getWakeTarget('terminal:term-2')?.deliveryInDoubt, true);
 });
 
@@ -2169,7 +2323,11 @@ test('durable spawn survives the account gate and redrives into one dedicated ag
 
   // Reload the durable owner to prove recovery does not depend on the executor's memory.
   const recovered = new MailboxStore(store.path);
-  const service = new WakeupRedriveService({ store: recovered, commandRunner: runner, flushIntervalMs: 100_000 });
+  const service = new WakeupRedriveService({
+    store: recovered,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
   t.after(() => service.stop());
   assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, false);
   assert.equal(recovered.getWakeTarget('task:account-gate')!.attemptCount, 2);
@@ -2177,7 +2335,7 @@ test('durable spawn survives the account gate and redrives into one dedicated ag
   accountReady = true;
   state.waitOk = false;
   assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, false);
-  assert.equal(recovered.getWakeTarget('task:account-gate')!.terminalHandle, 'term-new-1');
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.driverConfig?.terminalHandle, 'term-new-1');
   assert.equal(state.created, 1);
   assert.equal(terminalSends(state.calls).length, 0);
   assert.equal(launches, 3, 'two failed launches and the first dedicated tab');
@@ -2186,7 +2344,7 @@ test('durable spawn survives the account gate and redrives into one dedicated ag
   // terminal creation path, never bootstrap the agent in the surviving bare login shell.
   state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-new-1');
   assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, false);
-  assert.equal(recovered.getWakeTarget('task:account-gate')!.terminalHandle, 'term-new-2');
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.driverConfig?.terminalHandle, 'term-new-2');
   assert.equal(state.created, 2);
   assert.equal(terminalSends(state.calls).length, 0);
   state.waitOk = true;
@@ -2251,7 +2409,10 @@ test('spawn keeps durable custody through launch, comment and pointer failures',
       } else {
         assert.equal(target.deliveryInDoubt, true, 'unknown launch/pointer effects must never be automatically replayed');
         const before = calls.length;
-        const service = new WakeupRedriveService({ store: new MailboxStore(store.path), commandRunner: runner });
+        const service = new WakeupRedriveService({
+          store: new MailboxStore(store.path),
+          drivers: createTestWakeupDrivers({ commandRunner: runner }),
+        });
         t.after(() => service.stop());
         await service.flushMailbox(`task:${failure}`, { force: true });
         assert.equal(calls.length, before, 'restart and forced redrive preserve the launch fence');
@@ -2283,16 +2444,21 @@ test('task tab disappearing after idle proof is replaced without borrowing anoth
     }
     return inventory(request);
   };
-  store.enqueue([alert('race')], { mailboxId: 'task:race', wakeTarget: {
-    mode: 'orca-terminal', workspacePath, terminalHandle: 'task-old', agent: 'antigravity', coalesceMs: 0,
-  } });
-  const service = new WakeupRedriveService({ store, commandRunner: runner });
+  store.enqueue([alert('race')], {
+    mailboxId: 'task:race',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      driverConfig: { workspacePath, terminalHandle: 'task-old', agent: 'antigravity' },
+    },
+  });
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
   t.after(() => service.stop());
   state.waitOk = false;
   const deferred = await service.flushMailbox('task:race', { force: true });
   assert.equal(deferred.woke, false);
   assert.equal(state.created, 1);
-  assert.equal(store.getWakeTarget('task:race')!.terminalHandle, 'term-new-1');
+  assert.equal(store.getWakeTarget('task:race')!.driverConfig?.terminalHandle, 'term-new-1');
   assert.equal(terminalSends(state.calls).length, 0);
   state.waitOk = true;
   assert.equal((await service.flushMailbox('task:race', { force: true })).woke, true);
@@ -2320,15 +2486,16 @@ test('launch crash and handle persistence failure stay fenced across restart', a
   for (const failure of ['crash', 'persist']) {
     const store = new MailboxStore(join(root, `${failure}.json`));
     const mailboxId = `task:${failure}`;
-    store.enqueue([alert(failure)], { mailboxId, wakeTarget: {
-      mode: 'orca-terminal', workspacePath: root, coalesceMs: 0,
-    } });
+    store.enqueue([alert(failure)], {
+      mailboxId,
+      wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: { workspacePath: root } },
+    });
     if (failure === 'crash') {
       store.beginWakeDelivery(mailboxId); // Simulate a process exit during terminal creation.
     } else {
       const upsert = store.upsertWakeTarget.bind(store);
       t.mock.method(store, 'upsertWakeTarget', (id, patch) => {
-        if (patch.terminalHandle) throw new Error('handle persistence failed');
+        if (patch.driverConfig?.terminalHandle) throw new Error('handle persistence failed');
         return upsert(id, patch);
       });
       await assert.rejects(launchFencedOrcaWorkspaceTerminal(store, async () => ({
@@ -2339,10 +2506,15 @@ test('launch crash and handle persistence failure stay fenced across restart', a
     assert.equal(restarted.getWakeTarget(mailboxId)!.deliveryInDoubt, true);
     assert.equal(restarted.getWakeTarget(mailboxId)!.pendingWake, false);
     let calls = 0;
-    const service = new WakeupRedriveService({ store: restarted, commandRunner: async () => {
-      calls++;
-      throw new Error('Must not retry an unknown launch');
-    } });
+    const service = new WakeupRedriveService({
+      store: restarted,
+      drivers: createTestWakeupDrivers({
+        commandRunner: async () => {
+          calls++;
+          throw new Error('Must not retry an unknown launch');
+        },
+      }),
+    });
     t.after(() => service.stop());
     await service.flushMailbox(mailboxId, { force: true });
     assert.equal(calls, 0);
@@ -2367,10 +2539,14 @@ test('redrive fences both dedicated tab creation and non-task shell bootstrap on
         }
         return inventory(request);
       };
-      store.enqueue([alert(mailboxId)], { mailboxId, wakeTarget: {
-        mode: 'orca-terminal', workspacePath: root, coalesceMs: 0,
-      } });
-      const service = new WakeupRedriveService({ store, commandRunner: runner, idleCheck: async () => ({ idle: true }) });
+      store.enqueue([alert(mailboxId)], {
+        mailboxId,
+        wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: { workspacePath: root } },
+      });
+      const service = new WakeupRedriveService({
+        store,
+        drivers: createTestWakeupDrivers({ commandRunner: runner, idleCheck: async () => ({ idle: true }) }),
+      });
       t.after(() => service.stop());
       assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false);
       const target = store.getWakeTarget(mailboxId)!;

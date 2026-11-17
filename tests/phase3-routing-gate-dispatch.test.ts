@@ -1,3 +1,5 @@
+import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createOrcaWakeupDrivers } from '../packages/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,8 +20,10 @@ import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
-import { createInboxExecutorPlugin, createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
-import { checkOrcaWorkspaceIdle } from '../packages/orca-workspace/index.ts';
+import { createInboxExecutorPlugin, createNotifyExecutorPlugin } from '../packages/plugins-executor/index.ts';
+import { createHostAwareAgentPtyExecutorPlugin as createAgentPtyExecutorPlugin } from '../packages/plugins-agent-host/index.ts';
+import { createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-orca/index.ts';
+import { checkOrcaWorkspaceIdle } from '../packages/plugins-orca/index.ts';
 import { CommandNotStartedError, checkedCommand, runCommand } from '../packages/subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/subprocess/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
@@ -187,7 +191,10 @@ test('all official executors deliver via Emitter using injected commands and not
   const commandRunner: CommandRunner = async request => { requests.push(request); return { stdout: request.args[0] === 'worktree' && request.args[1] === 'create' ? JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/isolated' } } }) : '{"ok":true}' }; };
   const dir = await mkdtemp(join(tmpdir(), 'dealer-inbox-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const store = new MailboxStore(join(dir, 'mailbox.json'));
-  const wakeup = new WakeupRedriveService({ store, commandRunner, idleCheck: async () => ({ idle: true }) });
+  const wakeup = new WakeupRedriveService({
+    store,
+    drivers: createTestWakeupDrivers({ commandRunner, idleCheck: async () => ({ idle: true }) }),
+  });
   t.after(() => wakeup.stop());
   for (const executor of [createOrcaSpawnExecutorPlugin({ commandRunner }), createOrcaWaveExecutorPlugin({ runId: 'run-test', commandRunner, store, wakeup }), createAgentPtyExecutorPlugin({ commandRunner }), createNotifyExecutorPlugin({ inboxPath: join(dir, 'inbox.jsonl') })]) {
     dispatcher.registerExecutor(executor, {});
@@ -1377,7 +1384,7 @@ test('mailbox loads legacy workspace history without losing mailbox obligations 
   const message = envelope();
   store.enqueue([message], { mailboxId: 'historical' });
   store.recordInboundEnvelope(message, 'historical');
-  store.upsertWakeTarget('historical', { workspacePath: '/old/nautilus' });
+  store.upsertWakeTarget('historical', { driverConfig: { workspacePath: '/old/nautilus' } });
   const original = JSON.parse(await readFile(path, 'utf8'));
   await writeFile(path, JSON.stringify({ ...original, retiredWorkspacePaths: ['/old/nautilus'] }));
   const loaded = new MailboxStore(path);
@@ -1501,13 +1508,16 @@ test('inbox and wave prepare every session target before any group takes durable
     for (const nonStart of [false, true]) {
       const store = new MailboxStore(join(root, `${factory.name}-${nonStart}.json`));
       let repaired = false;
-      const executor = factory({
-        store,
-        resolveTopicBinding: () => ({ executor: 'orca-wave', streamKey: 'topic' }),
-        commandRunner: async () => {
+      const wakeup = new WakeupRedriveService({ store, flushIntervalMs: 100_000,
+        drivers: createOrcaWakeupDrivers({ commandRunner: async () => {
           if (!repaired) throw nonStart ? new CommandNotStartedError('ENOENT') : new Error('inventory unavailable');
           return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
-        },
+        } }),
+      });
+      t.after(() => wakeup.stop());
+      const executor = factory({
+        store, wakeup,
+        resolveTopicBinding: () => ({ mode: 'wave', streamKey: 'topic' }),
       });
       const first = envelope({ idempotencyKey: 'batch', payload: { mailbox: 'terminal:ready', revision: 2 } });
       const later = envelope({ payload: { mailbox: 'worktree:lookup' } });

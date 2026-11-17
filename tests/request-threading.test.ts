@@ -1,3 +1,4 @@
+import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -74,7 +75,7 @@ test('topic binding routes signed messages and control frames consistently with 
     wakeupIdleCheck: async () => ({ idle: false }),
   }).start();
   t.after(() => runtime.stop());
-  assert.equal(runtime.mailbox.getWakeTarget('stream:requests')?.workspacePath, '/fixed');
+  assert.equal(runtime.mailbox.getWakeTarget('stream:requests')?.driverConfig?.workspacePath, '/fixed');
   await cli(runtime, 'send', '--network', 'local', '--to', `member:alice`, '--topic', 'request', '--body', 'first', '--thread', 'thread-main');
   for (const type of ['question', 'reply', 'settle'] as const) {
     await runtime.emitter.emit({ networkId: 'local', routing: { mode: 'unicast', targets: ['member:alice'] }, kind: 'request', subject: type, body: type, payload: {},
@@ -109,7 +110,7 @@ test('linked bindings override defaults, validate conflicts and refresh on unlin
   writeFileSync(patch, JSON.stringify({ topicBindings: { request: { executor: 'orca-wave', streamKey: 'linked', workspacePath: '/fixed', autoCreateWorkspace: true } } }));
   await runtime.linkProject(project, patch);
   assert.equal(runtime.resolveExecutorName({ kind: 'request' }), 'orca-wave');
-  assert.equal(runtime.mailbox.getWakeTarget('stream:linked')?.repoRoot, project);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:linked')?.driverConfig?.repoRoot, project);
   const updated = JSON.parse(readFileSync(patch, 'utf8'));
   updated.topicBindings.request.coalesceMs = 5000;
   writeFileSync(patch, JSON.stringify(updated));
@@ -222,9 +223,23 @@ test('spawned terminals wait for idle before a prefixed pointer is injected', as
     }
     return { stdout: '{"ok":true}' };
   };
-  const service = new WakeupRedriveService({ store, commandRunner: runner, idleCheck: async () => ({ idle: ++idleCalls !== 2 }), flushIntervalMs: 60000 });
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 60000,
+    drivers: createTestWakeupDrivers({
+      commandRunner: runner,
+      idleCheck: async () => ({ idle: ++idleCalls !== 2 }),
+    }),
+  });
   t.after(() => service.stop());
-  store.enqueue([envelope('spawn')], { mailboxId: 'stream:fixed', wakeTarget: { mode: 'orca-terminal', workspacePath: '/fixed', wakeupPrefix: 'Read guide\nthen handle' } });
+  store.enqueue([envelope('spawn')], {
+    mailboxId: 'stream:fixed',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      wakeupPrefix: 'Read guide\nthen handle',
+      driverConfig: { workspacePath: '/fixed' },
+    },
+  });
   const first = await service.flushMailbox('stream:fixed');
   assert.match(first.reason!, /Terminal spawned/);
   assert.equal(calls.some(call => call.args[1] === 'send'), false);
@@ -326,7 +341,7 @@ test('runtime notifier refreshes linked mailboxes and broadcast preserves explic
   const patch = join(root, 'binding.json');
   writeFileSync(patch, JSON.stringify({ topicBindings: { request: { executor: 'orca-wave', streamKey: 'personal', runId: 'run_personal' } } }));
   await runtime.linkProject(project, patch);
-  assert.equal(runtime.mailbox.getWakeTarget('stream:personal')?.mode, 'orca-run');
+  assert.equal(runtime.mailbox.getWakeTarget('stream:personal')?.driver, 'orca-run');
   await cli(runtime, 'send', '--to', 'member:alice', '--network', 'local', '--topic', 'request', '--body', 'broadcast', '--thread', 'broadcast-thread');
   await runtime.larkNotifier!.flush();
   assert.equal(calls.length, 1);
@@ -374,11 +389,16 @@ test('native bootstrap stores canonical path and blocks newborn TUI until author
     if (call.args[1] === 'wait') return { stdout: JSON.stringify({ ok: ready }) };
     return { stdout: '{"ok":true}' };
   };
-  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 60000 });
+  const service = new WakeupRedriveService({ store, flushIntervalMs: 60000, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
   t.after(() => service.stop());
-  store.enqueue([envelope('newborn')], { wakeTarget: { mode: 'orca-terminal', workspacePath: join(root, 'desired'), repoRoot: root, autoCreateWorkspace: true } });
+  store.enqueue([envelope('newborn')], {
+    wakeTarget: {
+      driver: 'orca-terminal',
+      driverConfig: { workspacePath: join(root, 'desired'), repoRoot: root, autoCreateWorkspace: true },
+    },
+  });
   await service.flushMailbox('default');
-  assert.equal(store.getWakeTarget('default')?.workspacePath, path);
+  assert.equal(store.getWakeTarget('default')?.driverConfig?.workspacePath, path);
   assert.ok(calls.some(call => call.args.includes('5000')));
   assert.equal(calls.some(call => call.args[1] === 'send'), false);
   ready = true;
@@ -483,9 +503,9 @@ test('bare-shell bootstrap defers task text until the next authoritative idle ti
     assert.equal(call.args[1], 'send');
     return { stdout: '{"ok":true}' };
   };
-  const service = new WakeupRedriveService({ store, commandRunner: runner, flushIntervalMs: 60000 });
+  const service = new WakeupRedriveService({ store, flushIntervalMs: 60000, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
   t.after(() => service.stop());
-  store.enqueue([envelope('shell-bootstrap')], { wakeTarget: { mode: 'orca-terminal', workspacePath: root } });
+  store.enqueue([envelope('shell-bootstrap')], { wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: root } } });
   const first = await service.flushMailbox('default');
   assert.equal(first.woke, false);
   assert.match(first.reason!, /Terminal spawned; waiting for tui-idle/);

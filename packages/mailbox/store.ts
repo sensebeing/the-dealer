@@ -13,13 +13,14 @@ import {
 } from '../core-types/index.ts';
 import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-types/index.ts';
 import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
-import { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES, normalizeConversationModeInput } from '../agent-host/index.ts';
-import type { AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
-export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../agent-host/index.ts';
-export type { AgentConversationMode, ActiveConversationMode } from '../agent-host/index.ts';
-export { normalizeConversationModeInput } from '../agent-host/index.ts';
+import { normalizeConversationModeInput } from '../core-types/index.ts';
+import type { AgentConversationMode } from '../core-types/index.ts';
+export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
+export type { AgentConversationMode, ActiveConversationMode } from '../core-types/index.ts';
+export { normalizeConversationModeInput } from '../core-types/index.ts';
 
-export const MAILBOX_SCHEMA = 'the-dealer-mailbox/v1';
+export const MAILBOX_SCHEMA = 'the-dealer-mailbox/v2';
+export const LEGACY_MAILBOX_V1_SCHEMA = 'the-dealer-mailbox/v1';
 const LEGACY_INBOX_SCHEMA = 'the-dealer-inbox/v1';
 const MAX_ACKED_LEASE_HISTORY = 256;
 const MAX_WAKEUP_HINT_LENGTH = 120;
@@ -57,28 +58,13 @@ export interface MailboxStateRecord {
   readonly ackedLeaseIds: readonly string[];
 }
 
-export type WakeTargetMode = 'passive' | 'orca-run' | 'orca-terminal';
-
 export interface WakeTargetState {
-  readonly hostAgent?: 'codex' | 'claude' | 'claude-code' | 'antigravity' | 'chatgpt-dot' | 'grok-bot';
-  readonly conversationMode?: ActiveConversationMode;
-  readonly agentProfile?: string;
-  readonly targetBot?: string;
-  readonly sessionId?: string;
-
   readonly mailboxId: string;
-  readonly mode: WakeTargetMode;
-  readonly orcaCommand?: string;
-  readonly agent?: 'antigravity' | 'claude' | 'codex';
-  readonly interactiveCommand?: string;
-  readonly runId?: string;
-  readonly worktreeId?: string;
-  readonly workspacePath?: string;
-  readonly terminalHandle?: string;
-  readonly repoRoot?: string;
-  readonly autoCreateWorkspace?: boolean;
+  /** Registered driver id, or passive for in-process waitForMail targets. */
+  readonly driver: string;
+  /** JSON configuration owned and interpreted exclusively by the registered driver. */
+  readonly driverConfig?: Readonly<Record<string, unknown>>;
   readonly wakeupPrefix?: string;
-  readonly workspaceComment?: string;
   readonly coalesceMs: number;
   readonly rotateAfterWaves?: number;
   readonly completedWaves: number;
@@ -280,51 +266,46 @@ export function normalizeMailboxId(value: unknown, label = 'mailbox id'): string
 /**
  * Deterministic logical mailbox resolution shared by the inbox executor, wake targets and
  * thread reverse routes. Single-owner precedence: semantic target, thread-local affinity,
- * explicit payload mailbox, topic binding / executor channel, default.
+ * explicit payload mailbox, mode/stream topic binding, default.
  */
 export interface MailboxTopicBinding {
-  executor: string;
   mailboxId?: string;
   streamKey?: string;
   mode?: AgentConversationMode;
   conversationMode?: AgentConversationMode;
-  workspacePath?: string;
-  worktreeId?: string;
-  runId?: string;
-  terminalHandle?: string;
-  rotateAfterWaves?: number;
+  /** Receiver-owned addressing policy independent of the delivery driver. */
+  stream?: boolean;
 }
 
-export function resolveEffectiveConversationMode(options: { executor?: string; binding?: Partial<MailboxTopicBinding>; payload?: Record<string, unknown>; sources?: ReadonlyArray<{ mode?: unknown; conversationMode?: unknown } | undefined>; fallbackMode?: unknown }): AgentConversationMode {
+export function resolveEffectiveConversationMode(options: {
+  binding?: Partial<MailboxTopicBinding>;
+  payload?: Record<string, unknown>;
+  sources?: ReadonlyArray<{ mode?: unknown; conversationMode?: unknown } | undefined>;
+  fallbackMode?: AgentConversationMode;
+} = {}): AgentConversationMode {
   const layers = options.sources ?? [options.payload, options.binding, options.fallbackMode !== undefined ? { mode: options.fallbackMode } : undefined];
   for (const layer of layers) {
     const resolved = normalizeConversationModeInput(layer);
     if (resolved !== undefined) return resolved;
   }
-  const executor = options.executor ?? options.binding?.executor;
-  if (executor === 'inbox') return 'inbox-only';
-  if (executor === 'orca-wave') return 'wave';
-  if (executor === 'orca-spawn') return 'spawn';
-  if (executor === 'orca') return (options.binding?.rotateAfterWaves !== undefined || options.binding?.streamKey !== undefined || options.binding?.workspacePath !== undefined || options.binding?.runId !== undefined || options.binding?.terminalHandle !== undefined) ? 'wave' : 'spawn';
-  return 'spawn';
+  return options.binding?.streamKey !== undefined ? 'wave' : 'inbox-only';
 }
 
-export function isStreamConversationBinding(binding: Partial<MailboxTopicBinding>): boolean {
-  const mode = resolveEffectiveConversationMode({ executor: binding.executor, binding });
-  return binding.executor === 'orca-wave' || (binding.executor === 'orca' && (mode === 'wave' || mode === 'fixed')) || mode === 'wave';
+export function isStreamConversationBinding(binding: Partial<MailboxTopicBinding>, fallbackMode?: AgentConversationMode): boolean {
+  return binding.stream === true || resolveEffectiveConversationMode({ binding, fallbackMode }) === 'wave';
 }
 
-export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding): string {
+export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding, fallbackMode?: AgentConversationMode): string {
   if (binding.mailboxId !== undefined) return normalizeMailboxId(binding.mailboxId);
-  return isStreamConversationBinding(binding)
+  return isStreamConversationBinding(binding, fallbackMode)
     ? normalizeMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`) : 'default';
 }
 
 export function resolveMailboxId(
   envelope: MessageEnvelope,
-  executorName?: string,
   binding?: MailboxTopicBinding,
   threadLocalMailbox?: string,
+  fallbackMode?: AgentConversationMode,
 ): string {
   const semantic = envelope.semantic;
   const payload = isRecord(envelope.payload)
@@ -345,7 +326,7 @@ export function resolveMailboxId(
   }
   // Control frames follow the topic binding only when the sender named no destination.
   if (binding && control && (semantic?.targetMailbox === undefined || semantic.targetMailbox === 'default')) {
-    const bound = resolveBoundMailboxId(bindingKind, binding);
+    const bound = resolveBoundMailboxId(bindingKind, binding, fallbackMode);
     if (bound !== 'default') {
       return bound;
     }
@@ -359,20 +340,19 @@ export function resolveMailboxId(
   if (isNonEmptyString(explicit)) {
     return normalizeMailboxId(explicit, 'payload mailbox');
   }
-  const mode = resolveEffectiveConversationMode({ executor: executorName, binding, payload });
+  const mode = resolveEffectiveConversationMode({ binding, payload, fallbackMode });
   if (binding && !control && !isNonEmptyString(payload?.executor)) {
-    if (executorName === 'orca-wave' && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
+    if (isStreamConversationBinding(binding, fallbackMode) && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
       return normalizeMailboxId(`stream:${payload.streamKey}`);
     }
-    if (binding.mailboxId !== undefined || isStreamConversationBinding(binding) || mode !== 'spawn') {
-      return resolveBoundMailboxId(bindingKind, binding);
+    if (binding.mailboxId !== undefined || isStreamConversationBinding(binding, fallbackMode) || mode !== 'spawn') {
+      return resolveBoundMailboxId(bindingKind, binding, fallbackMode);
     }
   }
-  if (executorName === 'orca-wave' || (executorName === 'orca' && (mode === 'wave' || mode === 'fixed')) || mode === 'wave') {
+  if (mode === 'wave' || binding?.stream === true) {
     return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
   }
-  if (executorName === 'orca-spawn' || (mode === 'spawn' && (executorName === 'orca' ||
-    ['codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'agent-pty'].includes(executorName ?? binding?.executor ?? '')))) {
+  if (mode === 'spawn') {
     return normalizeMailboxId(`task:${envelope.id}`, 'task mailbox');
   }
   return 'default';
@@ -389,7 +369,7 @@ function sanitizeWakeupHint(value: unknown): string | undefined {
 function defaultWakeTarget(mailboxId: string): WakeTargetState {
   return {
     mailboxId,
-    mode: 'passive',
+    driver: 'passive',
     coalesceMs: 0,
     completedWaves: 0,
     pendingWake: false,
@@ -398,152 +378,90 @@ function defaultWakeTarget(mailboxId: string): WakeTargetState {
   };
 }
 
-function mergeWakeTarget(
-  current: WakeTargetState,
-  patch: Partial<WakeTargetState> | undefined,
-): WakeTargetState {
-  if (!patch) {
-    return current;
-  }
-  // Optional fields are cleared by passing them explicitly as undefined; a JSON round trip
-  // cannot express that, so own-property presence is the only reliable signal.
-  const optional = <K extends keyof WakeTargetState>(key: K): WakeTargetState[K] | undefined =>
-    Object.hasOwn(patch, key) ? patch[key] : current[key];
-  const hostAgent = optional('hostAgent');
-  const conversationMode = optional('conversationMode');
-  const agentProfile = optional('agentProfile');
-  const targetBot = optional('targetBot');
-  const sessionId = optional('sessionId');
-  const agent = optional('agent');
-  const interactiveCommand = optional('interactiveCommand');
-  const orcaCommand = optional('orcaCommand');
-  const runId = optional('runId');
-  const worktreeId = optional('worktreeId');
-  const workspacePath = optional('workspacePath');
-  const terminalHandle = optional('terminalHandle');
-  const repoRoot = optional('repoRoot');
-  const autoCreateWorkspace = optional('autoCreateWorkspace');
-  const wakeupPrefix = optional('wakeupPrefix');
-  const workspaceComment = optional('workspaceComment');
-  const rotateAfterWaves = optional('rotateAfterWaves');
-  const lastWakeError = optional('lastWakeError');
-  const deliveryInDoubt = optional('deliveryInDoubt');
-  const nextCoalesceMs = patch.coalesceMs ?? current.coalesceMs;
-  const nextAttemptCount = patch.attemptCount ?? current.attemptCount;
-  let earliestWakeAt = patch.earliestWakeAt ?? current.earliestWakeAt;
-  if (patch.earliestWakeAt === undefined && patch.coalesceMs !== undefined &&
-      nextAttemptCount === 0 && current.earliestWakeAt > 0) {
-    earliestWakeAt = nextCoalesceMs === 0 ? 0 : Math.min(current.earliestWakeAt, Date.now() + nextCoalesceMs);
-  }
-  return {
-    mailboxId: current.mailboxId,
-    mode: patch.mode ?? current.mode,
-    coalesceMs: nextCoalesceMs,
-    completedWaves: patch.completedWaves ?? current.completedWaves,
-    pendingWake: patch.pendingWake ?? current.pendingWake,
-    earliestWakeAt,
-    attemptCount: nextAttemptCount,
-    ...(hostAgent !== undefined ? { hostAgent } : {}),
-    ...(conversationMode !== undefined ? { conversationMode } : {}),
-    ...(agentProfile !== undefined ? { agentProfile } : {}),
-    ...(targetBot !== undefined ? { targetBot } : {}),
-    ...(sessionId !== undefined ? { sessionId } : {}),
-    ...(agent !== undefined ? { agent } : {}),
-    ...(interactiveCommand !== undefined ? { interactiveCommand } : {}),
-    ...(orcaCommand !== undefined ? { orcaCommand } : {}),
-    ...(runId !== undefined ? { runId } : {}),
-    ...(worktreeId !== undefined ? { worktreeId } : {}),
-    ...(workspacePath !== undefined ? { workspacePath } : {}),
-    ...(terminalHandle !== undefined ? { terminalHandle } : {}),
-    ...(repoRoot !== undefined ? { repoRoot } : {}),
-    ...(autoCreateWorkspace !== undefined ? { autoCreateWorkspace } : {}),
-    ...(wakeupPrefix !== undefined ? { wakeupPrefix } : {}),
-    ...(workspaceComment !== undefined ? { workspaceComment } : {}),
-    ...(rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),
-    ...(lastWakeError !== undefined ? { lastWakeError } : {}),
-    ...(deliveryInDoubt !== undefined ? { deliveryInDoubt } : {}),
-  };
+const WAKE_TARGET_KEYS = new Set([
+  'mailboxId', 'driver', 'driverConfig', 'wakeupPrefix', 'coalesceMs', 'rotateAfterWaves',
+  'completedWaves', 'pendingWake', 'earliestWakeAt', 'attemptCount', 'lastWakeError', 'deliveryInDoubt',
+]);
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 
-const WAKE_TARGET_MODES: readonly WakeTargetMode[] = [
-  'passive',
-  'orca-run',
-  'orca-terminal',
-];
+function isJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return Array.from(value).every(isJsonValue);
+  return isPlainRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function mergeWakeTarget(current: WakeTargetState, patch?: Partial<WakeTargetState>): WakeTargetState {
+  if (!patch) return current;
+  if (Object.keys(patch).some(key => !WAKE_TARGET_KEYS.has(key))) throw invalidStore();
+  const next = { ...current, ...patch, mailboxId: current.mailboxId };
+  // A driver change cannot inherit another driver's opaque configuration.
+  const sameDriver = patch.driver === undefined || patch.driver === current.driver;
+  if (Object.hasOwn(patch, 'driverConfig')) {
+    if (patch.driverConfig === undefined) delete next.driverConfig;
+    else {
+      if (!isPlainRecord(patch.driverConfig)) throw invalidStore();
+      const config = { ...(sameDriver ? current.driverConfig : {}), ...patch.driverConfig };
+      for (const key of Object.keys(config)) if (config[key] === undefined) delete config[key];
+      next.driverConfig = structuredClone(config);
+    }
+  } else if (!sameDriver) delete next.driverConfig;
+  for (const key of ['driver', 'coalesceMs', 'completedWaves', 'pendingWake', 'earliestWakeAt', 'attemptCount'] as const) {
+    if (patch[key] === undefined) Object.assign(next, { [key]: current[key] });
+  }
+  if (patch.earliestWakeAt === undefined && patch.coalesceMs !== undefined &&
+      next.attemptCount === 0 && current.earliestWakeAt > 0) {
+    next.earliestWakeAt = next.coalesceMs === 0 ? 0 : Math.min(current.earliestWakeAt, Date.now() + next.coalesceMs);
+  }
+  return next;
+}
 
 function validateWakeTarget(value: unknown): WakeTargetState {
-  if (!isRecord(value)) {
-    throw invalidStore();
-  }
+  if (!isRecord(value) || Object.keys(value).some(key => !WAKE_TARGET_KEYS.has(key))) throw invalidStore();
   const target = value as unknown as WakeTargetState;
+  if (!isValidMailboxId(target.mailboxId) || typeof target.driver !== 'string' ||
+      !/^[a-z0-9][a-z0-9:_-]{0,63}$/i.test(target.driver)) throw invalidStore();
+  if (target.driverConfig !== undefined && (!isPlainRecord(target.driverConfig) || !isJsonValue(target.driverConfig))) throw invalidStore();
   if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
-  if (target.hostAgent !== undefined && !['codex', 'codex-cli', 'claude', 'claude-code', 'claude-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
-  if (target.conversationMode !== undefined && !ACTIVE_CONVERSATION_MODES.includes(target.conversationMode)) throw invalidStore();
-  if (target.agent !== undefined && !['antigravity', 'claude', 'codex'].includes(target.agent)) throw invalidStore();
-  if (!isValidMailboxId(target.mailboxId) || !WAKE_TARGET_MODES.includes(target.mode)) {
-    throw invalidStore();
-  }
-  if (typeof target.coalesceMs !== 'number' || !Number.isFinite(target.coalesceMs) || target.coalesceMs < 0) {
-    throw invalidStore();
-  }
-  if (!isNonNegativeInteger(target.completedWaves) || !isNonNegativeInteger(target.attemptCount)) {
-    throw invalidStore();
-  }
-  if (typeof target.pendingWake !== 'boolean') {
-    throw invalidStore();
-  }
-  if (typeof target.earliestWakeAt !== 'number' || !Number.isFinite(target.earliestWakeAt)) {
-    throw invalidStore();
-  }
-  if (
-    target.rotateAfterWaves !== undefined &&
-    (!isNonNegativeInteger(target.rotateAfterWaves) || target.rotateAfterWaves === 0)
-  ) {
-    throw invalidStore();
-  }
-  for (const field of [
-    'agentProfile',
-    'targetBot',
-    'sessionId',
-    'interactiveCommand',
-    'orcaCommand',
-    'runId',
-    'worktreeId',
-    'workspacePath',
-    'terminalHandle',
-    'workspaceComment',
-    'repoRoot',
-    'wakeupPrefix',
-    'lastWakeError',
-  ] as const) {
-    if (target[field] !== undefined && typeof target[field] !== 'string') {
-      throw invalidStore();
-    }
-  }
-  if (target.autoCreateWorkspace !== undefined && typeof target.autoCreateWorkspace !== 'boolean') {
-    throw invalidStore();
+  if (typeof target.coalesceMs !== 'number' || !Number.isFinite(target.coalesceMs) || target.coalesceMs < 0) throw invalidStore();
+  if (!isNonNegativeInteger(target.completedWaves) || !isNonNegativeInteger(target.attemptCount)) throw invalidStore();
+  if (typeof target.pendingWake !== 'boolean') throw invalidStore();
+  if (typeof target.earliestWakeAt !== 'number' || !Number.isFinite(target.earliestWakeAt)) throw invalidStore();
+  if (target.rotateAfterWaves !== undefined && (!isNonNegativeInteger(target.rotateAfterWaves) || target.rotateAfterWaves === 0)) throw invalidStore();
+  for (const field of ['wakeupPrefix', 'lastWakeError'] as const) {
+    if (target[field] !== undefined && typeof target[field] !== 'string') throw invalidStore();
   }
   return target;
 }
 
-function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle: string): string {
+export interface SessionMailboxPatch {
+  driver?: string;
+  driverConfig?: Record<string, unknown>;
+}
+
+function pinSessionTargetInState(state: MailboxFileState, id: string, sessionMailboxId: string, patch: SessionMailboxPatch = {}): string {
   const current = state.wakeTargets[id];
-  const handle = rawHandle.trim();
-  if (!handle || current?.mode !== 'orca-terminal' || current.rotateAfterWaves === undefined) return id;
-  const termMailbox = `terminal:${handle}`;
-  const existing = state.wakeTargets[termMailbox];
-  const hasQueued = state.items.some(item => item.mailboxId === termMailbox && item.status === 'queued');
-  const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
-  state.wakeTargets[termMailbox] = validateWakeTarget({
-    ...current, ...(existing ?? {}), mailboxId: termMailbox, mode: 'orca-terminal', terminalHandle: handle,
+  if (current?.rotateAfterWaves === undefined) return id;
+  const sessionMailbox = normalizeMailboxId(sessionMailboxId);
+  if (sessionMailbox === id) throw new Error('Session mailbox must differ from rotating mailbox');
+  const existing = state.wakeTargets[sessionMailbox];
+  const hasQueued = state.items.some(item => item.mailboxId === sessionMailbox && item.status === 'queued');
+  const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${sessionMailbox}`);
+  state.wakeTargets[sessionMailbox] = validateWakeTarget({
+    ...current, ...(existing ?? {}), mailboxId: sessionMailbox,
+    driver: patch.driver ?? current.driver,
+    driverConfig: patch.driverConfig ?? current.driverConfig,
     rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
     earliestWakeAt: existing?.earliestWakeAt ?? 0,
     lastWakeError: existing?.deliveryInDoubt ? existing.lastWakeError : (current.deliveryInDoubt ? current.lastWakeError : existing?.lastWakeError),
     deliveryInDoubt: Boolean(existing?.deliveryInDoubt || current.deliveryInDoubt) ? true : undefined,
-  } as any);
-  return termMailbox;
+  });
+  return sessionMailbox;
 }
 
 const THREAD_STATES: readonly ThreadRouteRecord['state'][] = ['open', 'replied', 'settled'];
@@ -741,7 +659,7 @@ function loadState(raw: string): MailboxFileState {
   } catch {
     throw invalidStore();
   }
-  if (!isRecord(parsed) || parsed.schema !== MAILBOX_SCHEMA) {
+  if (!isRecord(parsed) || (parsed.schema !== MAILBOX_SCHEMA && parsed.schema !== LEGACY_MAILBOX_V1_SCHEMA)) {
     throw invalidStore();
   }
   if (!isNonNegativeInteger(parsed.sequence) || !Array.isArray(parsed.items)) {
@@ -758,7 +676,20 @@ function loadState(raw: string): MailboxFileState {
     validateMailboxRecord(key, value);
   }
   for (const [key, value] of Object.entries(wakeTargets)) {
-    if (validateWakeTarget(value).mailboxId !== key) {
+    if (parsed.schema === LEGACY_MAILBOX_V1_SCHEMA) {
+      if (!isRecord(value) || typeof value.mode !== 'string') throw invalidStore();
+      const core: Record<string, unknown> = {};
+      const driverConfig: Record<string, unknown> = {};
+      for (const [field, entry] of Object.entries(value)) {
+        if (field === 'mode' || entry === undefined) continue;
+        if (WAKE_TARGET_KEYS.has(field) && field !== 'driver' && field !== 'driverConfig') core[field] = entry;
+        else driverConfig[field] = entry;
+      }
+      const configured = Object.keys(driverConfig).length > 0;
+      const driver = value.mode === 'passive' && configured ? 'agent-host' : value.mode;
+      wakeTargets[key] = { ...core, driver, ...(configured ? { driverConfig } : {}) };
+    }
+    if (validateWakeTarget(wakeTargets[key]).mailboxId !== key) {
       throw invalidStore();
     }
   }
@@ -1045,7 +976,6 @@ export class MailboxStore {
         }
         const mailboxId = explicitMailbox ?? resolveMailboxId(
           envelope,
-          'inbox',
           undefined,
           this.threadLocalMailboxFromState(
             state,
@@ -1503,6 +1433,7 @@ export class MailboxStore {
     mailboxId: string,
     deliveredSequence: number,
     patch: Partial<WakeTargetState> = {},
+    pinnedSession?: SessionMailboxPatch & { sessionMailboxId: string },
   ): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
     let pinnedWakeMailbox: string | undefined;
@@ -1517,9 +1448,8 @@ export class MailboxStore {
         deliveryInDoubt: undefined,
       }));
       state.wakeTargets[id] = next;
-      if (current.mode === 'orca-terminal' && current.rotateAfterWaves !== undefined &&
-          typeof next.terminalHandle === 'string' && next.terminalHandle.trim()) {
-        const termMailbox = pinRotatingTargetInState(state, id, next.terminalHandle);
+      if (pinnedSession && current.rotateAfterWaves !== undefined) {
+        const termMailbox = pinSessionTargetInState(state, id, pinnedSession.sessionMailboxId, pinnedSession);
         if (state.wakeTargets[termMailbox]?.pendingWake && !state.wakeTargets[termMailbox]?.deliveryInDoubt) pinnedWakeMailbox = termMailbox;
         const delivered = state.items.filter(item => item.mailboxId === id && item.sequence <= deliveredSequence);
         const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
@@ -1537,12 +1467,11 @@ export class MailboxStore {
     return completed;
   }
 
-  pinRotatingSessionMailbox(mailboxId: string, terminalHandle?: string): string {
+  pinSessionMailbox(mailboxId: string, sessionMailboxId: string, sessionPatch?: SessionMailboxPatch): string {
     const id = normalizeMailboxId(mailboxId);
-    if (typeof terminalHandle !== 'string' || !terminalHandle.trim()) return id;
     let notify = false;
     const pinned = this.mutate(state => {
-      const mailbox = pinRotatingTargetInState(state, id, terminalHandle);
+      const mailbox = pinSessionTargetInState(state, id, sessionMailboxId, sessionPatch);
       notify = Boolean(state.wakeTargets[mailbox]?.pendingWake && !state.wakeTargets[mailbox]?.deliveryInDoubt);
       return mailbox;
     });
@@ -1625,10 +1554,6 @@ export class MailboxStore {
     localMailbox: string,
   ): ThreadRouteRecord {
     const local = normalizeMailboxId(localMailbox, 'local mailbox');
-    const rotatingTarget = this.read().wakeTargets[local];
-    const effectiveLocal = rotatingTarget?.mode === 'orca-terminal' && rotatingTarget.rotateAfterWaves !== undefined &&
-      typeof rotatingTarget.terminalHandle === 'string' && rotatingTarget.terminalHandle.trim() && !rotatingTarget.pendingWake
-      ? `terminal:${rotatingTarget.terminalHandle.trim()}` : local;
     if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
       throw new Error('Invalid envelope: missing id');
     }
@@ -1652,7 +1577,7 @@ export class MailboxStore {
         peerNodeIds: [envelope.from.nodeId],
         networkId: envelope.networkId,
         peerReplyMailbox,
-        localMailbox: effectiveLocal,
+        localMailbox: local,
         traceId: envelope.traceId,
         kind: envelope.kind,
         subject: envelope.subject,

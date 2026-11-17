@@ -1,5 +1,9 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { writeFileAtomically } from '../fs-atomic/index.ts';
+import { defaultAgentLaunchCommand, trustAntigravityWorkspace } from '../plugins-agent-host/hosts.ts';
+import { isAutopilotComposerPrefill, isAntigravityModePlaceholder } from './tui-quirks.ts';
+import { beforeExternalEffect } from '../plugins-executor/index.ts';
+import { execFileSync } from 'node:child_process';
+import { randomInt } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { CommandNotStartedError, runCommand, checkedCommand, singleLine } from '../subprocess/index.ts';
@@ -21,10 +25,13 @@ export async function findOrcaWorktreeByName(
   if (!raw.result || raw.result.truncated || !Array.isArray(raw.result.worktrees)) {
     throw new Error('Incomplete Orca workspace inventory');
   }
-  const row = raw.result.worktrees.find((item: any) =>
-    item && item.isArchived !== true && item.archived !== true &&
-    ((typeof item.displayName === 'string' && item.displayName === name) ||
-     (typeof item.path === 'string' && basename(item.path) === name)),
+  const row = raw.result.worktrees.find(
+    (item: any) =>
+      item &&
+      item.isArchived !== true &&
+      item.archived !== true &&
+      ((typeof item.displayName === 'string' && item.displayName === name) ||
+        (typeof item.path === 'string' && basename(item.path) === name)),
   );
   if (!row || typeof row.path !== 'string' || typeof row.worktreeId !== 'string') return undefined;
   return { workspacePath: row.path, worktreeId: row.worktreeId };
@@ -48,38 +55,6 @@ export interface OrcaTerminalRow {
   leafId?: string;
 }
 
-/** Recognize an Autopilot recommendation copied into the terminal composer. */
-export function isAutopilotComposerPrefill(preview: string): boolean {
-  const lines = preview.split(/\r?\n/);
-  return lines.some((line, index) => {
-    const draft = /^\s*>\s+(\S.*)$/.exec(line)?.[1]?.trim();
-    return draft !== undefined && lines.slice(0, index).some(earlier =>
-      /下一步建议|,1（主推）|,1 \(主推\)|自动预填/.test(earlier) || earlier.includes(draft),
-    );
-  });
-}
-
-/**
- * Antigravity (agy >= 1.5.9) draws these exact execution-mode hints inside an empty `> `
- * composer. Orca's plain-text preview strips the dim styling, so only this vocabulary can mark a
- * `> ` line as a placeholder: everything else remains indistinguishable from an unsent human
- * draft. A changed hint or an unknown agent fails closed, keeping the composer busy.
- */
-const ANTIGRAVITY_MODE_PLACEHOLDERS: ReadonlySet<string> = new Set([
-  '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
-  '> Plan mode: research & plan only (shift+tab to cycle)',
-  '> Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
-  '> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
-]);
-
-/** True only for an exact Antigravity mode hint on an Antigravity-owned composer line. */
-export function isAntigravityModePlaceholder(
-  previewLine: string,
-  agentIdentity?: unknown,
-): boolean {
-  return agentIdentity === 'antigravity' && ANTIGRAVITY_MODE_PLACEHOLDERS.has(singleLine(previewLine));
-}
-
 export interface OrcaWorkspaceIdleOptions {
   /**
    * The terminal this wakeup will write into. `null` means delivery creates an independent session
@@ -96,18 +71,22 @@ function reusableTerminalCandidates(
   terminals: readonly OrcaTerminalRow[],
   agent?: SupportedOrcaAgent,
 ): OrcaTerminalRow[] {
-  const nonOrphaned = terminals.filter(terminal => terminal.orphaned !== true);
+  const nonOrphaned = terminals.filter((terminal) => terminal.orphaned !== true);
   const pool = nonOrphaned.length > 0 ? nonOrphaned : [...terminals];
   const matchesAgent = (terminal: OrcaTerminalRow): boolean =>
     agent !== undefined &&
     (terminal.agentIdentity === agent || (agent === 'claude' && terminal.agentIdentity === 'claude-code'));
   const tiers = [
     pool.filter(matchesAgent),
-    pool.filter(terminal => typeof terminal.agentIdentity === 'string' && terminal.agentIdentity.trim().length > 0),
-    pool.filter(terminal => typeof terminal.preview !== 'string' && typeof terminal.agentIdentity !== 'string'),
-    pool.filter(terminal => typeof terminal.preview === 'string' && !terminal.agentIdentity),
+    pool.filter(
+      (terminal) => typeof terminal.agentIdentity === 'string' && terminal.agentIdentity.trim().length > 0,
+    ),
+    pool.filter(
+      (terminal) => typeof terminal.preview !== 'string' && typeof terminal.agentIdentity !== 'string',
+    ),
+    pool.filter((terminal) => typeof terminal.preview === 'string' && !terminal.agentIdentity),
   ];
-  return tiers.find(tier => tier.length > 0) ?? pool;
+  return tiers.find((tier) => tier.length > 0) ?? pool;
 }
 
 /**
@@ -149,7 +128,7 @@ export async function checkOrcaWorkspaceIdle(
     agents?: { state?: string; paneKey?: string; parentPaneKey?: string }[];
   };
   const rows: Workspace[] = inventory.worktrees;
-  const root = rows.find(row => row.path === cwd);
+  const root = rows.find((row) => row.path === cwd);
   if (!root) {
     return { idle: false, reason: 'Workspace not found' };
   }
@@ -168,25 +147,38 @@ export async function checkOrcaWorkspaceIdle(
       signal,
     });
     const terminals = JSON.parse(listed.stdout);
-    if (
-      terminals.ok !== true ||
-      terminals.result?.truncated ||
-      !Array.isArray(terminals.result?.terminals)
-    ) {
+    if (terminals.ok !== true || terminals.result?.truncated || !Array.isArray(terminals.result?.terminals)) {
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
-    const targetTerm = row.path === cwd && typeof options?.targetTerminalHandle === 'string'
-      ? handles.find(t => String(t.handle) === options.targetTerminalHandle) : undefined;
-    const targetPaneKey = targetTerm?.tabId && targetTerm?.leafId ? `${targetTerm.tabId}:${targetTerm.leafId}` : undefined;
+    const targetTerm =
+      row.path === cwd && typeof options?.targetTerminalHandle === 'string'
+        ? handles.find((t) => String(t.handle) === options.targetTerminalHandle)
+        : undefined;
+    const targetPaneKey =
+      targetTerm?.tabId && targetTerm?.leafId ? `${targetTerm.tabId}:${targetTerm.leafId}` : undefined;
     if (targetPaneKey === undefined) {
-      if (row.unverifiableTerminalCount !== 0 || !row.agents || row.agents.some(agent => agent.state !== 'done')) return false;
+      if (
+        row.unverifiableTerminalCount !== 0 ||
+        !row.agents ||
+        row.agents.some((agent) => agent.state !== 'done')
+      )
+        return false;
     } else {
-      if (!row.agents || row.agents.filter(agent => agent.paneKey === targetPaneKey || (!agent.paneKey && handles.length <= 1)).some(agent => agent.state !== 'done')) return false;
+      if (
+        !row.agents ||
+        row.agents
+          .filter((agent) => agent.paneKey === targetPaneKey || (!agent.paneKey && handles.length <= 1))
+          .some((agent) => agent.state !== 'done')
+      )
+        return false;
     }
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
-    const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
-    if (targetPaneKey === undefined && observableHandles.filter(t => Boolean(t.connected)).length < (row.agents?.length ?? 0)) {
+    const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
+    if (
+      targetPaneKey === undefined &&
+      observableHandles.filter((t) => Boolean(t.connected)).length < (row.agents?.length ?? 0)
+    ) {
       return false;
     }
     // Liveness and composer state only matter for terminals this wakeup may actually write into:
@@ -194,11 +186,12 @@ export async function checkOrcaWorkspaceIdle(
     // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
     // rebind could reuse when it was closed).
     const rootTarget = row.path === cwd ? options?.targetTerminalHandle : undefined;
-    const targetPresent = typeof rootTarget === 'string' &&
-      observableHandles.some(t => String(t.handle) === rootTarget);
-    const reuseHandles = typeof rootTarget === 'string' && !targetPresent
-      ? new Set(reusableTerminalCandidates(observableHandles, options?.agent).map(t => String(t.handle)))
-      : undefined;
+    const targetPresent =
+      typeof rootTarget === 'string' && observableHandles.some((t) => String(t.handle) === rootTarget);
+    const reuseHandles =
+      typeof rootTarget === 'string' && !targetPresent
+        ? new Set(reusableTerminalCandidates(observableHandles, options?.agent).map((t) => String(t.handle)))
+        : undefined;
     const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
       if (row.path !== cwd) return true;
       if (rootTarget === null) return false;
@@ -227,7 +220,7 @@ export async function checkOrcaWorkspaceIdle(
         // Autopilot recommendations may prefill the composer below an idle agent.
         const lastLine = terminal.preview
           .split(/\r?\n/)
-          .filter(line => line.trim())
+          .filter((line) => line.trim())
           .at(-1);
         if (isAutopilotComposerPrefill(terminal.preview)) {
           if (row.path === cwd) {
@@ -250,8 +243,18 @@ export async function checkOrcaWorkspaceIdle(
       }
     }
     for (const id of row.childWorktreeIds ?? []) {
-      const child = rows.find(item => item.worktreeId === id);
-      if (targetPaneKey && child?.agents?.length && child.agents.every(agent => typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && agent.parentPaneKey !== targetPaneKey)) continue;
+      const child = rows.find((item) => item.worktreeId === id);
+      if (
+        targetPaneKey &&
+        child?.agents?.length &&
+        child.agents.every(
+          (agent) =>
+            typeof agent.parentPaneKey === 'string' &&
+            agent.parentPaneKey.length > 0 &&
+            agent.parentPaneKey !== targetPaneKey,
+        )
+      )
+        continue;
       if (!child || !(await idleTree(child))) {
         return false;
       }
@@ -259,7 +262,11 @@ export async function checkOrcaWorkspaceIdle(
     return true;
   };
   const idle = await idleTree(root);
-  return { idle, ...(idle && composerPrefilled ? { composerPrefilled: true } : {}), reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable' };
+  return {
+    idle,
+    ...(idle && composerPrefilled ? { composerPrefilled: true } : {}),
+    reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable',
+  };
 }
 
 /** Bounded `terminal wait --for tui-idle`; timeout, busy, or command failure is never idle. */
@@ -311,23 +318,7 @@ export async function probeOrcaTerminalIdle(
     : { idle: false, reason: `Terminal idle probe failed: ${result.reason ?? 'Terminal is busy'}` };
 }
 
-/**
- * Shared interactive Antigravity launcher for fixed and task workspaces.
- * Antigravity accounts are owned by Orca's native account pool and `agy-switch`; the launcher
- * never probes for or delegates to the retired Magpie wrapper (which still exists on hosts for
- * Claude Code and Codex routing).
- */
-export function defaultAntigravityLaunchCommand(): string {
-  return 'agy --dangerously-skip-permissions';
-}
-
 export type SupportedOrcaAgent = 'antigravity' | 'claude' | 'codex';
-
-export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravity'): string {
-  if (agent === 'claude') return 'claude --dangerously-skip-permissions';
-  if (agent === 'codex') return 'codex --dangerously-bypass-approvals-and-sandbox';
-  return defaultAntigravityLaunchCommand();
-}
 
 /**
  * Create an independent agent terminal tab in an Orca workspace. Session rotation and first-wave
@@ -348,10 +339,12 @@ export async function spawnOrcaWorkspaceTerminal(
     spawned = await runner({
       command,
       args: ['terminal', 'create', '--worktree', `path:${cwd}`, '--command', launchCommand, '--json'],
-      cwd, signal,
+      cwd,
+      signal,
     });
   } catch (error) {
-    if (error instanceof CommandNotStartedError || error instanceof OrcaTerminalLaunchRejectedError) throw error;
+    if (error instanceof CommandNotStartedError || error instanceof OrcaTerminalLaunchRejectedError)
+      throw error;
     const failure = error as { stdout?: unknown; exitCode?: unknown } | null;
     if (typeof failure?.stdout === 'string' && failure.exitCode !== null) {
       let parsed;
@@ -361,7 +354,9 @@ export async function spawnOrcaWorkspaceTerminal(
         // Unparseable output cannot confirm refusal.
       }
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.ok === false) {
-        throw new OrcaTerminalLaunchRejectedError(error instanceof Error ? error.message : String(error), { cause: error });
+        throw new OrcaTerminalLaunchRejectedError(error instanceof Error ? error.message : String(error), {
+          cause: error,
+        });
       }
     }
     throw error;
@@ -374,14 +369,17 @@ export async function spawnOrcaWorkspaceTerminal(
   }
   const record = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
   if (record && parsed.ok === false) {
-    throw new OrcaTerminalLaunchRejectedError(`${command} rejected terminal launch: ${(spawned.stderr || spawned.stdout).trim()}`);
+    throw new OrcaTerminalLaunchRejectedError(
+      `${command} rejected terminal launch: ${(spawned.stderr || spawned.stdout).trim()}`,
+    );
   }
   if (spawned.exitCode !== undefined && spawned.exitCode !== 0) {
     throw new Error(`${command} exited ${spawned.exitCode}: ${(spawned.stderr || spawned.stdout).trim()}`);
   }
   if (!record) throw new Error('Orca terminal create returned invalid JSON');
   const handle = parsed.result?.terminal?.handle ?? parsed.result?.handle ?? parsed.handle;
-  if (typeof handle !== 'string' || !handle.trim()) throw new Error('Orca terminal create returned no handle');
+  if (typeof handle !== 'string' || !handle.trim())
+    throw new Error('Orca terminal create returned no handle');
   return { handle: handle.trim(), raw: parsed };
 }
 
@@ -404,7 +402,7 @@ export async function isOrcaWorkspaceTerminalLive(
     throw new Error('Incomplete Orca terminal inventory');
   }
   const terminal = (inventory.result.terminals as OrcaTerminalRow[]).find(
-    row => row && String(row.handle) === terminalHandle,
+    (row) => row && String(row.handle) === terminalHandle,
   );
   return terminal !== undefined && terminal.connected === true && terminal.writable !== false;
 }
@@ -434,29 +432,42 @@ export async function planOrcaWorkspaceTerminal(
   const preferredHandle = options?.preferredHandle;
   if (preferredHandle) {
     const bound = terminals.find(
-      t => t && String(t.handle) === preferredHandle && t.connected && t.writable !== false,
+      (t) => t && String(t.handle) === preferredHandle && t.connected && t.writable !== false,
     );
     if (bound) return { handle: String(bound.handle), kind: 'existing' };
   }
   const nonOrphanConnected = terminals.filter(
-    t => t && t.orphaned !== true && t.connected && t.writable !== false,
+    (t) => t && t.orphaned !== true && t.connected && t.writable !== false,
   );
-  const connected = nonOrphanConnected.length > 0
-    ? nonOrphanConnected
-    : terminals.filter(
-      t => t && t.connected && t.writable !== false &&
-        typeof t.agentIdentity === 'string' && t.agentIdentity.trim().length > 0,
-    );
-  const freshest = (rows: OrcaTerminalRow[]) => rows.sort(
-    (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
-  )[0];
-  const preferred = freshest(connected.filter(t => t.agentIdentity === targetAgent || (targetAgent === 'claude' && t.agentIdentity === 'claude-code')));
+  const connected =
+    nonOrphanConnected.length > 0
+      ? nonOrphanConnected
+      : terminals.filter(
+          (t) =>
+            t &&
+            t.connected &&
+            t.writable !== false &&
+            typeof t.agentIdentity === 'string' &&
+            t.agentIdentity.trim().length > 0,
+        );
+  const freshest = (rows: OrcaTerminalRow[]) =>
+    rows.sort((a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0))[0];
+  const preferred = freshest(
+    connected.filter(
+      (t) =>
+        t.agentIdentity === targetAgent || (targetAgent === 'claude' && t.agentIdentity === 'claude-code'),
+    ),
+  );
   if (preferred) return { handle: String(preferred.handle), kind: 'existing' };
-  const agent = freshest(connected.filter(t => typeof t.agentIdentity === 'string' && t.agentIdentity.trim()));
+  const agent = freshest(
+    connected.filter((t) => typeof t.agentIdentity === 'string' && t.agentIdentity.trim()),
+  );
   if (agent) return { handle: String(agent.handle), kind: 'existing' };
-  const synthetic = freshest(connected.filter(t => typeof t.preview !== 'string' && typeof t.agentIdentity !== 'string'));
+  const synthetic = freshest(
+    connected.filter((t) => typeof t.preview !== 'string' && typeof t.agentIdentity !== 'string'),
+  );
   if (synthetic) return { handle: String(synthetic.handle), kind: 'existing' };
-  const bareShell = freshest(connected.filter(t => typeof t.preview === 'string' && !t.agentIdentity));
+  const bareShell = freshest(connected.filter((t) => typeof t.preview === 'string' && !t.agentIdentity));
   return bareShell ? { kind: 'shell', handle: String(bareShell.handle) } : { kind: 'create' };
 }
 
@@ -471,8 +482,13 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   const plan = await planOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
   if (plan.kind === 'existing') return { handle: plan.handle, spawned: false };
   if (plan.kind === 'shell') {
-    await sendOrcaTerminalText(runner, command, plan.handle,
-      options?.interactiveCommand?.trim() || defaultAgentLaunchCommand(options?.agent), { cwd, signal });
+    await sendOrcaTerminalText(
+      runner,
+      command,
+      plan.handle,
+      options?.interactiveCommand?.trim() || defaultAgentLaunchCommand(options?.agent),
+      { cwd, signal },
+    );
     return { handle: plan.handle, spawned: true, shellBootstrapped: true };
   }
   const spawned = await spawnOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
@@ -504,9 +520,7 @@ export async function sendOrcaTerminalText(
     '--text',
     singleLine(text),
     '--enter',
-    ...(options.waitSubmit !== undefined
-      ? ['--wait-submit', String(options.waitSubmit)]
-      : []),
+    ...(options.waitSubmit !== undefined ? ['--wait-submit', String(options.waitSubmit)] : []),
     '--json',
   ];
   let output;
@@ -514,7 +528,13 @@ export async function sendOrcaTerminalText(
     output = await checkedCommand(runner, { command, args, cwd: options.cwd, signal: options.signal });
   } catch (error) {
     if (!String(error).includes('no_active_sender_terminal')) throw error;
-    output = await checkedCommand(runner, { command, args: [...args, '--allow-self'], cwd: options.cwd, signal: options.signal, env: { ...process.env, ORCA_TERMINAL_ID: terminalHandle } });
+    output = await checkedCommand(runner, {
+      command,
+      args: [...args, '--allow-self'],
+      cwd: options.cwd,
+      signal: options.signal,
+      env: { ...process.env, ORCA_TERMINAL_ID: terminalHandle },
+    });
   }
   if (JSON.parse(output.stdout).ok === false) {
     throw new Error('Orca terminal send failed');
@@ -548,71 +568,241 @@ export async function setOrcaWorkspaceComment(
   }
 }
 
-/**
- * Trust a workspace in Antigravity by adding it to trustedWorkspaces.
- * Missing settings files start from an empty object, then the file is replaced atomically.
- */
-export function trustAntigravityWorkspace(workspacePath: string, settingsPath?: string): void {
-  const file = settingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
-  let settings: Record<string, unknown> = {};
-  if (existsSync(file)) {
-    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw new Error(`Antigravity settings at ${file} must be a JSON object`);
-    }
-    settings = parsed as Record<string, unknown>;
-  }
-  const trusted = Array.isArray(settings.trustedWorkspaces)
-    ? settings.trustedWorkspaces.filter((entry): entry is string => typeof entry === 'string')
-    : [];
-  const candidates = existsSync(workspacePath)
-    ? [workspacePath, realpathSync(workspacePath)]
-    : [workspacePath];
-  for (const candidate of candidates) {
-    if (!trusted.includes(candidate)) {
-      trusted.push(candidate);
-    }
-  }
-  settings.trustedWorkspaces = trusted;
-  writeFileAtomically(file, `${JSON.stringify(settings, null, 2)}\n`);
-}
-
 export async function ensureOrcaWorkspace(
   runner: CommandRunner,
   command: string,
-  options: { workspacePath: string; repoRoot?: string; comment?: string; trustAntigravity?: boolean; agySettingsPath?: string; signal?: AbortSignal },
+  options: {
+    workspacePath: string;
+    repoRoot?: string;
+    comment?: string;
+    trustAntigravity?: boolean;
+    agySettingsPath?: string;
+    signal?: AbortSignal;
+  },
 ): Promise<{ workspacePath: string; created: boolean }> {
   const cwd = options.repoRoot ?? dirname(options.workspacePath);
-  const listed = await checkedCommand(runner, { command, args: ['worktree', 'list', '--json'], cwd: existsSync(cwd) ? cwd : undefined, signal: options.signal });
+  const listed = await checkedCommand(runner, {
+    command,
+    args: ['worktree', 'list', '--json'],
+    cwd: existsSync(cwd) ? cwd : undefined,
+    signal: options.signal,
+  });
   const raw = JSON.parse(listed.stdout);
   const rows = raw.result?.worktrees ?? raw.worktrees ?? (Array.isArray(raw.result) ? raw.result : undefined);
-  if (raw.ok === false || !Array.isArray(rows) || raw.result?.truncated) throw new Error('Incomplete Orca workspace inventory');
+  if (raw.ok === false || !Array.isArray(rows) || raw.result?.truncated)
+    throw new Error('Incomplete Orca workspace inventory');
   const canonical = (path: string): string => {
     const absolute = resolve(path);
     if (existsSync(absolute)) return realpathSync(absolute);
     const parent = dirname(absolute);
     return parent === absolute ? absolute : join(canonical(parent), basename(absolute));
   };
-  const found = rows.find(row => typeof row.path === 'string' && canonical(row.path) === canonical(options.workspacePath));
+  const found = rows.find(
+    (row) => typeof row.path === 'string' && canonical(row.path) === canonical(options.workspacePath),
+  );
   if (found) return { workspacePath: found.path, created: false };
-  if (!options.repoRoot) throw new Error('Creating a fixed Orca workspace requires a receiver-local repoRoot');
+  if (!options.repoRoot)
+    throw new Error('Creating a fixed Orca workspace requires a receiver-local repoRoot');
   const created = await checkedCommand(runner, {
-    command, args: ['worktree', 'create', '--no-parent', '--name', basename(options.workspacePath), ...(options.comment ? ['--comment', options.comment] : []), '--json'],
-    cwd: options.repoRoot, signal: options.signal,
+    command,
+    args: [
+      'worktree',
+      'create',
+      '--no-parent',
+      '--name',
+      basename(options.workspacePath),
+      ...(options.comment ? ['--comment', options.comment] : []),
+      '--json',
+    ],
+    cwd: options.repoRoot,
+    signal: options.signal,
   });
   const response = JSON.parse(created.stdout);
   const path = response.result?.path ?? response.result?.worktree?.path;
-  if (response.ok === false || typeof path !== 'string' || !path.trim()) throw new Error('Orca workspace creation returned no path');
+  if (response.ok === false || typeof path !== 'string' || !path.trim())
+    throw new Error('Orca workspace creation returned no path');
   const settings = options.agySettingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
   const temporaryRoot = tmpdir();
-  const mayTrust = options.agySettingsPath !== undefined ||
+  const mayTrust =
+    options.agySettingsPath !== undefined ||
     (runner === runCommand && (!temporaryRoot || !canonical(path).startsWith(canonical(temporaryRoot))));
-  if (options.trustAntigravity !== false && mayTrust && (options.agySettingsPath !== undefined || existsSync(settings))) {
+  if (
+    options.trustAntigravity !== false &&
+    mayTrust &&
+    (options.agySettingsPath !== undefined || existsSync(settings))
+  ) {
     trustAntigravityWorkspace(path, settings);
   }
   return { workspacePath: path, created: true };
 }
 
-export async function resolveOrcaWorkspaceTerminal(runner: CommandRunner, command: string, cwd: string, signal?: AbortSignal): Promise<string> {
+export async function resolveOrcaWorkspaceTerminal(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string> {
   return (await resolveOrSpawnOrcaWorkspaceTerminal(runner, command, cwd, signal)).handle;
+}
+export function orcaAgent(value: unknown): SupportedOrcaAgent {
+  if (value === undefined) return 'antigravity';
+  if (value === 'antigravity' || value === 'antigravity-cli') return 'antigravity';
+  if (value === 'claude' || value === 'claude-code') return 'claude';
+  if (value === 'codex' || value === 'codex-cli') return 'codex';
+  throw beforeExternalEffect(new Error(`Unsupported Orca agent: ${String(value)}`));
+}
+
+/** Orca-compatible creature vocabulary for randomly suffixed worktree names. */
+export const SEA_CREATURE_POOL = [
+  'nautilus',
+  'seahorse',
+  'starfish',
+  'dolphin',
+  'octopus',
+  'jellyfish',
+  'stingray',
+  'manatee',
+  'narwhal',
+  'walrus',
+  'beluga',
+  'dugong',
+  'axolotl',
+  'coral',
+  'halibut',
+  'lamprey',
+  'mackerel',
+  'oarfish',
+  'pollock',
+  'remora',
+  'sardine',
+  'triggerfish',
+  'bonefish',
+  'cuttlefish',
+  'manta',
+  'killifish',
+  'lionfish',
+  'mudskipper',
+  'needlefish',
+  'paddlefish',
+  'triton',
+  'rockfish',
+  'sawfish',
+  'tilefish',
+  'weakfish',
+  'yellowtail',
+  'wahoo',
+  'tautog',
+  'sculpin',
+  'pomfret',
+  'coelacanth',
+  'lumpfish',
+  'hogfish',
+  'porpoise',
+  'dace',
+  'blenny',
+  'abalone',
+  'barnacle',
+  'cockle',
+  'krill',
+  'limpet',
+  'mussel',
+  'oyster',
+  'scallop',
+  'urchin',
+  'whelk',
+  'conch',
+  'prawn',
+  'hammerhead',
+  'anemone',
+  'wobbegong',
+  'hydroid',
+  'isopod',
+  'nudibranch',
+  'salp',
+  'tunicate',
+  'chimaera',
+  'copepod',
+  'amphipod',
+  'anglerfish',
+] as const;
+
+export interface PickSeaCreatureNameOptions {
+  runner: CommandRunner;
+  command: string;
+  cwd?: string;
+  issuedNames?: Set<string>;
+  signal?: AbortSignal;
+  randomBelow?: (max: number) => number;
+}
+
+export async function pickSeaCreatureName(options: PickSeaCreatureNameOptions): Promise<string> {
+  try {
+    const { runner, command, cwd, issuedNames, signal, randomBelow = (max) => randomInt(max) } = options;
+    const listed = await checkedCommand(runner, {
+      command,
+      args: ['worktree', 'list', '--json'],
+      cwd,
+      signal,
+    });
+    const raw = JSON.parse(listed.stdout) as {
+      ok?: boolean;
+      result?: { worktrees?: { path?: unknown; displayName?: unknown; branch?: unknown }[] };
+    };
+    if (raw.ok === false) {
+      throw new Error('Orca worktree listing failed');
+    }
+    const existing = new Set<string>();
+    for (const row of raw.result?.worktrees ?? []) {
+      if (typeof row.path === 'string' && row.path) {
+        existing.add(basename(row.path).trim().toLowerCase());
+      }
+      if (typeof row.displayName === 'string' && row.displayName) {
+        existing.add(row.displayName.trim().toLowerCase());
+      }
+      // Branch refs such as refs/heads/ben.xu/seahorse collide once their basename matches a creature.
+      if (typeof row.branch === 'string' && row.branch) {
+        existing.add(basename(row.branch).trim().toLowerCase());
+      }
+    }
+    // Local branches outlive removed worktrees; never reuse a creature whose branch still exists.
+    if (typeof cwd === 'string' && existsSync(cwd)) {
+      try {
+        const branches = execFileSync(
+          'git',
+          ['-C', cwd, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+          { encoding: 'utf8' },
+        );
+        for (const branch of branches.split('\n')) {
+          if (branch.trim()) {
+            existing.add(branch.trim().toLowerCase());
+            existing.add(basename(branch.trim()).toLowerCase());
+          }
+        }
+      } catch {
+        // A non-git directory has no local branches to collide with.
+      }
+    }
+    for (const name of issuedNames ?? []) {
+      existing.add(name.trim().toLowerCase());
+    }
+    const checkedRandomBelow = (max: number): number => {
+      const value = randomBelow(max);
+      if (!Number.isInteger(value) || value < 0 || value >= max) {
+        throw new RangeError(`randomBelow(${max}) must return an integer in [0, ${max})`);
+      }
+      return value;
+    };
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+      const creature = SEA_CREATURE_POOL[checkedRandomBelow(SEA_CREATURE_POOL.length)];
+      const suffix = 100_000 + checkedRandomBelow(900_000);
+      const candidate = `${creature}-${suffix}`;
+      if (!existing.has(candidate)) {
+        issuedNames?.add(candidate);
+        return candidate;
+      }
+    }
+    throw new Error('Sea-creature worktree names exhausted');
+  } catch (error) {
+    throw beforeExternalEffect(error instanceof Error ? error : new Error(String(error)));
+  }
 }
