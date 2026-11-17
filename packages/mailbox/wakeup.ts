@@ -647,7 +647,12 @@ export class WakeupRedriveService {
     if (this.runner === runCommand && !this.idleCheck && !existsSync(workspacePath)) {
       return false;
     }
-    if (mailboxId.startsWith('task:') && !target.terminalHandle) return true;
+    if (mailboxId.startsWith('task:')) {
+      if (!target.terminalHandle) return true;
+      return !this.idleCheck && !(await isOrcaWorkspaceTerminalLive(
+        this.runner, command, workspacePath, target.terminalHandle,
+      ));
+    }
     if (target.rotateAfterWaves === undefined) return false;
     // Rotation always creates an empty tab, so the retained tab (draft or not) cannot gate it.
     if (needsSessionRotation(target, preview)) {

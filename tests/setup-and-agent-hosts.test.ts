@@ -1194,6 +1194,15 @@ for (const [name, factory, command] of [
       if (name === 'codex') assert.equal(calls[0].args[0], mode === 'spawn' ? 'exec' : 'queue');
       if (name === 'claude-code') assert.equal(calls[0].args[1], mode === 'spawn' ? '--name' : '--resume');
       if (name === 'antigravity') {
+        // Invalid invocation configuration must fail before trusting the workspace: a
+        // pre-effect error cannot leave a settings mutation behind.
+        await assert.rejects(
+          createAntigravityExecutorPlugin({ ...options, agySettingsPath: settings })
+            .execute([message('invalid-invocation', { mode: 'wave' })], context, {}),
+          (error: Error & { beforeExternalEffect?: boolean }) =>
+            error.beforeExternalEffect === true && /Standalone Antigravity CLI/.test(error.message),
+        );
+        assert.equal(existsSync(settings), false);
         await createAntigravityExecutorPlugin({ ...options, agySettingsPath: settings,
           commandRunner: async request => {
             assert.ok(JSON.parse(readFileSync(settings, 'utf8')).trustedWorkspaces.includes(root));

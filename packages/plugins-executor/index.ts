@@ -162,14 +162,14 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
           const targetBot = payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot;
           const sessionId = payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId;
           effectiveSessionId = prepareExternalEffect(() => resolveAgentSessionId(mailboxId, sessionId, agent ?? 'codex'));
-          if ((canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app') && cwd && (agySettingsPath !== undefined || (options.commandRunner === undefined || options.commandRunner === runCommand))) {
-            trustAntigravityWorkspace(cwd, agySettingsPath);
-          }
           const invocation = prepareExternalEffect(() => buildAgentHostInvocation({
             agent: agent ?? 'codex', conversationMode, mailboxId,
             promptText: singleLine(terminalPrompt ?? renderWave(batch)),
             cwd, command, agentProfile, targetBot, sessionId: effectiveSessionId,
           }));
+          if ((canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app') && cwd && (agySettingsPath !== undefined || (options.commandRunner === undefined || options.commandRunner === runCommand))) {
+            trustAntigravityWorkspace(cwd, agySettingsPath);
+          }
           claim = (options.wakeup ?? config.wakeup)?.claim(mailboxId);
           if (store) {
             store.enqueue(batch, { mailboxId, wakeTarget: {

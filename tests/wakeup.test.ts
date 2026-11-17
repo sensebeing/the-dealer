@@ -2178,12 +2178,22 @@ test('durable spawn survives the account gate and redrives into one dedicated ag
   assert.equal(recovered.getWakeTarget('task:account-gate')!.terminalHandle, 'term-new-1');
   assert.equal(state.created, 1);
   assert.equal(terminalSends(state.calls).length, 0);
+  assert.equal(launches, 3, 'two failed launches and the first dedicated tab');
+
+  // If that tab exits before delivery, recovery must replace it through Orca's account-aware
+  // terminal creation path, never bootstrap the agent in the surviving bare login shell.
+  state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-new-1');
+  assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, false);
+  assert.equal(recovered.getWakeTarget('task:account-gate')!.terminalHandle, 'term-new-2');
+  assert.equal(state.created, 2);
+  assert.equal(terminalSends(state.calls).length, 0);
   state.waitOk = true;
   assert.equal((await service.flushMailbox('task:account-gate', { force: true })).woke, true);
-  assert.equal(launches, 3, 'two failed launches and one successful tab; idle deferral reuses its handle');
-  assert.equal(state.created, 1);
+  assert.equal(launches, 4, 'two failed launches, original tab and replacement; idle deferrals create no tabs');
+  assert.equal(state.created, 2);
   assert.equal(sendsTo(state.calls, 'bare-shell').length, 0);
-  const sends = sendsTo(state.calls, 'term-new-1');
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 0);
+  const sends = sendsTo(state.calls, 'term-new-2');
   assert.equal(sends.length, 1);
   assert.match(textOf(sends[0]), /Dealer Task dispatched to mailbox task:account-gate/);
   assert.equal(recovered.getWakeTarget('task:account-gate')!.pendingWake, false);
