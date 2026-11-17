@@ -1,3 +1,4 @@
+import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import { runCommand, CommandNotStartedError } from '../packages/orca-workspace/index.ts';
 import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/agent-host/index.ts';
 import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
@@ -847,12 +848,14 @@ for (const scenario of [
   });
 }
 
-test('failed host execution leaves durable mail and does not report success', async t => {
+test('failed host execution confirms durable custody without claiming a successful wake', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
   const plugin = createAgentPtyExecutorPlugin({ store, agent: 'codex', conversationMode: 'spawn',
     commandRunner: async () => ({ stdout: '', stderr: 'host rejected command', exitCode: 2 }) });
-  await assert.rejects(plugin.execute([message('failed')], context, {}), /exited 2/);
+  const receipt = await plugin.execute([message('failed')], context, {});
+  assert.equal(receipt.woke, false);
+  assert.match(String(receipt.reason), /exited 2/);
   assert.equal(new MailboxStore(join(root, 'mailbox.json')).getWakeTarget('task:failed')?.mode, 'passive');
   const failed = store.getWakeTarget('task:failed')!;
   assert.equal(failed.pendingWake, false);
@@ -1524,9 +1527,11 @@ test('agent executor preserves an in-flight arrival and releases its claim for i
 test('ambiguous host launch remains parked across restart and later arrivals', async t => {
   const file = join(directory(t), 'mailbox.json');
   const store = new MailboxStore(file);
-  await assert.rejects(createClaudeCodeExecutorPlugin({ store, commandRunner: async () => {
+  const receipt = await createClaudeCodeExecutorPlugin({ store, commandRunner: async () => {
     throw new Error('accepted then connection lost');
-  } }).execute([message('recover')], context, {}), /connection lost/);
+  } }).execute([message('recover')], context, {});
+  assert.equal(receipt.woke, false);
+  assert.match(String(receipt.reason), /connection lost/);
   assert.equal(store.getWakeTarget('task:recover')?.deliveryInDoubt, true);
   assert.equal(store.getWakeTarget('task:recover')?.pendingWake, false);
   const restarted = new MailboxStore(file);
@@ -1599,8 +1604,10 @@ test('aborted host launch retains its unknown-effect fence without claim-release
   };
   const wakeup = new WakeupRedriveService({ store, commandRunner: runner });
   t.after(() => wakeup.stop());
-  await assert.rejects(createClaudeCodeExecutorPlugin({ store, wakeup, commandRunner: runner })
-    .execute([message('aborted')], { ...context, signal: controller.signal }, {}), /accepted before abort/);
+  const receipt = await createClaudeCodeExecutorPlugin({ store, wakeup, commandRunner: runner })
+    .execute([message('aborted')], { ...context, signal: controller.signal }, {});
+  assert.equal(receipt.woke, false);
+  assert.match(String(receipt.reason), /accepted before abort/);
   await wakeup.flushMailbox('task:aborted', { force: true });
   assert.equal(calls, 1);
   assert.equal(store.getWakeTarget('task:aborted')?.deliveryInDoubt, true);
@@ -1633,8 +1640,18 @@ test('command boundary distinguishes absent executables, synchronous validation 
 test('initial host ENOENT is retryable and recovery binds the actual Codex receipt', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
-  await assert.rejects(createCodexExecutorPlugin({ store, command: join(root, 'missing'), sessionId: 'not-created' })
-    .execute([message('pre-effect')], context, {}), CommandNotStartedError);
+  const policy = createDedupCasPolicyPlugin();
+  const input = { ...message('pre-effect', { revision: 1 }), idempotencyKey: 'pre-effect' };
+  const executor = createCodexExecutorPlugin({ store, command: join(root, 'missing'), sessionId: 'not-created' });
+  const receipt = await policy.process(input, async batch => ({
+    stage: 'dispatched', executionReceipt: await executor.execute(batch, context, {}),
+  }));
+  assert.equal(receipt.executionReceipt?.woke, false);
+  assert.match(String(receipt.executionReceipt?.reason), /Command did not start/);
+  const duplicate = await policy.process({ ...input, id: 'next-poll' }, async () => {
+    assert.fail('A pending durable task must not create a second task on the next poll');
+  });
+  assert.equal(duplicate.detail, DEDUP_CAS_DUPLICATE_DETAIL);
   const target = store.getWakeTarget('task:pre-effect')!;
   assert.equal(target.deliveryInDoubt, undefined);
   assert.equal(target.pendingWake, true);

@@ -11,10 +11,11 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup, recordWakeFailure } from '../mailbox/index.ts';
+import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup, launchFencedOrcaWorkspaceTerminal } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   checkedCommand,
+  CommandNotStartedError,
   setOrcaWorkspaceComment,
   trustAntigravityWorkspace,
   defaultAgentLaunchCommand,
@@ -63,6 +64,18 @@ function prepareExternalEffect<T>(prepare: () => T): T {
   } catch (error) {
     throw beforeExternalEffect(error instanceof Error ? error : new Error(String(error)));
   }
+}
+
+async function prepareExternalEffectAsync<T>(prepare: () => Promise<T>): Promise<T> {
+  try {
+    return await prepare();
+  } catch (error) {
+    throw beforeExternalEffect(error instanceof Error ? error : new Error(String(error)));
+  }
+}
+
+function rethrowBeforeCommandStart(error: unknown): never {
+  throw error instanceof CommandNotStartedError ? beforeExternalEffect(error) : error;
 }
 
 function agentArgs(command: string): string[] {
@@ -187,11 +200,15 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
         let output;
         if (store && mailboxId) {
           // The mailbox owner builds the pointer and settles the lease for both initial and redrive paths.
-          const delivered = await deliverPassiveWakeTarget(store, runner, mailboxId, { signal: context.signal });
-          output = { stdout: delivered.stdout, stderr: delivered.stderr };
-          wakeDelivered = true;
+          try {
+            const delivered = await deliverPassiveWakeTarget(store, runner, mailboxId, { signal: context.signal });
+            output = { stdout: delivered.stdout, stderr: delivered.stderr };
+            wakeDelivered = true;
+          } catch (error) {
+            return { executor: name, executionId: randomUUID(), mailboxId, woke: false, reason: String(error) };
+          }
         } else {
-          output = await checkedCommand(runner, { ...request, signal: context.signal });
+          output = await checkedCommand(runner, { ...request, signal: context.signal }).catch(rethrowBeforeCommandStart);
         }
         let structuredOutput: unknown;
         try {
@@ -199,7 +216,7 @@ function createAgentExecutorPlugin(name: string, options: AgentOptions, host?: S
         } catch {
           structuredOutput = output.stdout;
         }
-        return { executor: name, executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '' };
+        return { executor: name, executionId: randomUUID(), output: structuredOutput, stderr: output.stderr ?? '', ...(wakeDelivered ? { woke: true } : {}) };
       } finally {
         claim?.dispose();
         if (wakeDelivered && mailboxId) (options.wakeup ?? config.wakeup)?.notifyMailbox(mailboxId);
@@ -500,7 +517,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         args: createArgs,
         cwd: worktreeCwd,
         signal: context.signal,
-      });
+      }).catch(rethrowBeforeCommandStart);
       const raw = JSON.parse(created.stdout);
       if (raw.ok === false) {
         throw new Error('Orca worktree creation failed');
@@ -554,32 +571,21 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           } });
           committed = true;
           let terminal;
-          let handle: string;
           try {
-            const launched = await checkedCommand(runner, {
-              command,
-              args: ['terminal', 'create', '--worktree', `path:${path}`, '--command', interactiveCommand, '--json'],
-              cwd: path, signal: context.signal,
+            const launched = await launchFencedOrcaWorkspaceTerminal(store, runner, mailboxId, {
+              command, workspacePath: path, agent: effectiveAgent, interactiveCommand, signal: context.signal,
             });
-            terminal = JSON.parse(launched.stdout);
-            if (terminal.ok === false) throw new Error('Orca terminal launch failed');
-            const terminalHandle = terminal.result?.terminal?.handle ?? terminal.result?.handle ?? terminal.handle;
-            if (typeof terminalHandle !== 'string' || !terminalHandle.trim()) {
-              throw new Error('Orca terminal create returned no handle');
-            }
-            handle = terminalHandle;
+            terminal = launched.raw;
           } catch (launchError) {
             if (workspaceComment) {
               try {
                 await setOrcaWorkspaceComment(runner, command, path, workspaceComment, { cwd: path, signal: context.signal });
               } catch {
-                // The durable target retains the comment for the next successful wake.
+                // The durable target retains the comment for a later reconciled wake.
               }
             }
-            recordWakeFailure(store, mailboxId, launchError);
             return { executor: 'orca-spawn', executionId: randomUUID(), worktreePath: path, woke: false, reason: String(launchError) };
           }
-          store.upsertWakeTarget(mailboxId, { terminalHandle: handle });
           let warning: string | undefined;
           if (workspaceComment) {
             try {
@@ -619,8 +625,6 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         args: ['terminal', 'create', '--worktree', `path:${path}`, '--command', agentCommand, '--json'],
         cwd: path,
         signal: context.signal,
-      }).catch(error => {
-        throw new Error(String(error), { cause: error });
       });
       const terminal = JSON.parse(launched.stdout);
       if (terminal.ok === false) {
@@ -821,7 +825,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         const usesTopicBinding = group.binding === undefined || mailboxId === boundMailboxId;
         const wakeTarget = usesTopicBinding
           ? prepareExternalEffect(() => topicWakeTarget(group.envelopes, group.binding, mailboxId))
-          : await resolveSessionWakeTarget(store, runner, command, mailboxId);
+          : await prepareExternalEffectAsync(() => resolveSessionWakeTarget(store, runner, command, mailboxId));
         prepared.push({ mailboxId, group, wakeTarget });
       }
       const results: Array<{ mailboxId: string; inserted: string[]; woke: boolean; reason?: string }> = [];
@@ -933,9 +937,13 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
         group.push(envelope);
         groups.set(mailboxId, group);
       }
-      const inserted: string[] = [];
+      const prepared = [];
       for (const [mailboxId, envelopes] of groups) {
-        const wakeTarget = await resolveSessionWakeTarget(store, runner, orcaCommand, mailboxId);
+        const wakeTarget = await prepareExternalEffectAsync(() => resolveSessionWakeTarget(store, runner, orcaCommand, mailboxId));
+        prepared.push({ mailboxId, envelopes, wakeTarget });
+      }
+      const inserted: string[] = [];
+      for (const { mailboxId, envelopes, wakeTarget } of prepared) {
         const result = store.enqueue(envelopes, { mailboxId, ...(wakeTarget ? { wakeTarget } : {}) });
         inserted.push(...result.inserted);
         if (result.inserted.length > 0) {

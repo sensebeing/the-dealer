@@ -18,7 +18,7 @@ import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
-import { createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
+import { createInboxExecutorPlugin, createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
 import { CommandNotStartedError, checkedCommand, checkOrcaWorkspaceIdle, runCommand } from '../packages/orca-workspace/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/orca-workspace/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
@@ -590,6 +590,9 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
   const requests: CommandRequest[] = [];
   const commandRunner: CommandRunner = async request => {
     requests.push(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-authority"}}}' };
+    }
     return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: dir } } }) };
   };
   const senderSettings = join(dir, 'sender-settings.json');
@@ -1487,4 +1490,34 @@ test('executor preparation failures restore CAS so repaired configuration can re
     stage: 'dispatched', executionReceipt: await executor.execute([message], context),
   })), (error: any) => error.beforeExternalEffect !== true);
   assert.equal((await policy.process(message, async () => ({ stage: 'dispatched' }))).detail, DEDUP_CAS_AMBIGUOUS_DETAIL);
+});
+
+test('inbox and wave prepare every session target before any group takes durable custody', async t => {
+  // A later read-only lookup failure cannot leave an earlier group enqueued while CAS rolls back.
+  const root = await mkdtemp(join(tmpdir(), 'dealer-batch-prepare-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const factory of [createInboxExecutorPlugin, createOrcaWaveExecutorPlugin]) {
+    for (const nonStart of [false, true]) {
+      const store = new MailboxStore(join(root, `${factory.name}-${nonStart}.json`));
+      let repaired = false;
+      const executor = factory({
+        store,
+        resolveTopicBinding: () => ({ executor: 'orca-wave', streamKey: 'topic' }),
+        commandRunner: async () => {
+          if (!repaired) throw nonStart ? new CommandNotStartedError('ENOENT') : new Error('inventory unavailable');
+          return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
+        },
+      });
+      const first = envelope({ idempotencyKey: 'batch', payload: { mailbox: 'terminal:ready', revision: 2 } });
+      const later = envelope({ payload: { mailbox: 'worktree:lookup' } });
+      const policy = createDedupCasPolicyPlugin({ watermarksPath: join(root, `cas-${factory.name}-${nonStart}.json`) });
+      const execute = async () => ({ stage: 'dispatched' as const, executionReceipt:
+        await executor.execute([first, later], { networkId: 'test', nodeId: receiver.nodeId, traceId: 'batch' }) });
+      await assert.rejects(policy.process(first, execute), (error: any) => error.beforeExternalEffect === true);
+      assert.equal(store.listItemsAfterSequence(-1).length, 0);
+      repaired = true;
+      assert.equal((await policy.process(first, execute)).stage, 'dispatched');
+      assert.equal(store.listItemsAfterSequence(-1).length, 2);
+    }
+  }
 });
