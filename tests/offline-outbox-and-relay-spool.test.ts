@@ -4878,3 +4878,50 @@ test('claim abandonment preserves obligations once delivery evidence or attempts
     assert.deepEqual(harness.outbox.get(claimed.item.id), before);
   }
 });
+
+
+test('keyed claims replay the highest version and dispatch only strictly newer work', async t => {
+  const harness = await emitterHarness(t);
+  const router = t.mock.method(harness.kernel.ctx.services.router, 'route');
+  const input: EmitMessageInput = { networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] }, kind: 'task',
+    subject: 'versioned claim', body: 'entity work', payload: {}, idempotencyKey: 'entity' };
+  const first = await harness.emitter.emit({ ...input, payload: { claimVersion: 1, revision: 99 } });
+  for (const payload of [{ claimVersion: 1 }, { revision: 1 }, { revision: 0 }, {}]) {
+    assert.deepEqual(await harness.emitter.emit({ ...input, payload }), first);
+  }
+  assert.equal(router.mock.callCount(), 1);
+  assert.equal(harness.sendCalls.length, 1);
+  const second = await harness.emitter.emit({ ...input, payload: { revision: 2 } });
+  assert.notEqual(second.messageId, first.messageId);
+  assert.equal(second.receipts[0].stage, 'dispatched');
+  for (const payload of [{ claimVersion: 1 }, { claimVersion: 2 }, { revision: 2 }, {}]) {
+    assert.deepEqual(await harness.emitter.emit({ ...input, payload }), second);
+  }
+  assert.equal(router.mock.callCount(), 2);
+  assert.equal(harness.sendCalls.length, 2);
+  const third = await harness.emitter.emit({ ...input, payload: { claimVersion: 3 } });
+  assert.notEqual(third.messageId, second.messageId);
+  assert.equal(third.receipts[0].stage, 'dispatched');
+  assert.equal(harness.outbox.list({ status: 'delivered' }).length, 3);
+  for (const claimVersion of ['4', -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(harness.emitter.emit({ ...input, payload: { claimVersion } }), /Invalid claim version/);
+  }
+  assert.equal(router.mock.callCount(), 3);
+  assert.equal(harness.sendCalls.length, 3);
+});
+
+test('outbox retains prepare-normalized targets for unresolved and resolved offline sends', async t => {
+  for (const target of ['member:missing', 'member:diz']) {
+    const harness = await emitterHarness(t, { plan: id => ({ error: new PeerUnreachableError(id) }) });
+    harness.kernel.ctx.on('emitter/prepare', envelope => ({ ...envelope,
+      routing: { ...envelope.routing, targets: [target] } }));
+    const sent = await harness.emitter.emit({ networkId: harness.networkId,
+      routing: { mode: 'unicast', targets: ['area:runtime'] }, kind: 'task',
+      subject: 'normalized route', body: 'offline work', payload: {}, idempotencyKey: 'normalized' });
+    const queued = harness.outbox.get(sent.messageId)!;
+    assert.equal(queued.status, 'queued');
+    assert.deepEqual(queued.explicitTargets, [target]);
+    assert.deepEqual(queued.envelope.routing.targets, [target]);
+  }
+});

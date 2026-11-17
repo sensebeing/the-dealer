@@ -408,7 +408,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               const detail = error.message;
               outbox.enqueue({
                 envelope,
-                explicitTargets: [...(input.routing.targets ?? [])],
+                explicitTargets: [...(envelope.routing.targets ?? [])],
                 pendingNodeIds: [],
                 filePaths: stagedPaths,
                 lastError: detail,
@@ -516,7 +516,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           if (queueIfOffline && (pendingNodeIds.length > 0 || claimedItem !== undefined)) {
             outbox.enqueue({
               envelope,
-              explicitTargets: [...(input.routing.targets ?? [])],
+              explicitTargets: [...(envelope.routing.targets ?? [])],
               pendingNodeIds,
               deliveredReceipts,
               failedReceipts,

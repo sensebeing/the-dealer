@@ -120,6 +120,12 @@ export interface MessageEnvelope<T = Record<string, unknown>> {
   signature: string;
 }
 
+/** Shared sender/receiver CAS version; null means the supplied version is invalid. */
+export function envelopeClaimVersion(envelope: Pick<MessageEnvelope, 'payload'>): number | null {
+  const raw = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0 ? raw : null;
+}
+
 export interface DeliveryReceipt {
   messageId: string;
   networkId: string;
@@ -588,7 +594,7 @@ export interface OutboxDeliveryOutcome {
 /** Persistence surface the emitter needs; the concrete OutboxStore implements it. */
 export interface OutboxStoreLike {
   enqueue(input: OutboxEnqueueInput): OutboxItem;
-  /** Atomically reserve one obligation per (networkId, idempotencyKey) under the store lock. */
+  /** Atomically reserve monotonic versions per (networkId, idempotencyKey) under the store lock. */
   claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
   /** Release a pristine claim after routing fails before any send. */
   abandonUnattemptedClaim?(id: string): void;

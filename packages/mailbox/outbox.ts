@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { envelopeClaimVersion } from '../core-types/index.ts';
 import {
   copyFileAtomically,
   withOwnedLock,
@@ -349,7 +350,7 @@ export class OutboxStore {
   }
 
   /**
-   * Atomically create or join the single durable obligation for an idempotency key. The
+   * Atomically create a newer version or join the highest durable version of a key. The
    * check and the reservation happen under the same store lock, so concurrent emitters
    * cannot both observe "absent" and mint different envelopes/obligations. A claimed item
    * starts with no confirmed delivery and a lease: if the process dies before the first
@@ -363,15 +364,23 @@ export class OutboxStore {
     if (!key) {
       throw new Error('Outbox claim requires an idempotency key');
     }
+    const version = envelopeClaimVersion(input.envelope);
+    if (version === null) throw new Error('Invalid claim version');
     const id = input.envelope.id;
     const now = new Date().toISOString();
     return this.mutate(state => {
-      const existing = state.items.find(
-        item =>
-          item.networkId === input.envelope.networkId &&
-          item.envelope.idempotencyKey === key,
-      );
-      if (existing) {
+      let existing: OutboxItem | undefined;
+      let highestVersion = -1;
+      for (const item of state.items) {
+        if (item.networkId !== input.envelope.networkId || item.envelope.idempotencyKey !== key) continue;
+        // Legacy claims could contain invalid versions; they cannot outrank valid work.
+        const itemVersion = envelopeClaimVersion(item.envelope) ?? 0;
+        if (itemVersion > highestVersion) {
+          existing = item;
+          highestVersion = itemVersion;
+        }
+      }
+      if (existing && highestVersion >= version) {
         return { claimed: false, item: clone(existing) };
       }
       const leaseMs = Number.isFinite(input.leaseMs) && (input.leaseMs ?? 0) > 0
