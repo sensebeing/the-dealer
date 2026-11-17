@@ -1,23 +1,21 @@
 import { existsSync } from 'node:fs';
 import { buildAgentHostInvocation, resolveAgentHostContinuation } from '../agent-host/index.ts';
 import {
-  CommandNotStartedError,
   OrcaTerminalLaunchRejectedError,
   defaultAgentLaunchCommand,
-  checkedCommand,
   checkOrcaWorkspaceIdle,
   ensureOrcaWorkspace,
   isOrcaWorkspaceTerminalLive,
   planOrcaWorkspaceTerminal,
   probeOrcaTerminalIdle,
-  runCommand,
   sendOrcaTerminalText,
   setOrcaWorkspaceComment,
-  singleLine,
   spawnOrcaWorkspaceTerminal,
   waitOrcaTerminalIdle,
 } from '../orca-workspace/index.ts';
-import type { CommandRunner, OrcaIdleResult } from '../orca-workspace/index.ts';
+import { CommandNotStartedError, checkedCommand, runCommand, singleLine } from '../subprocess/index.ts';
+import type { OrcaIdleResult } from '../orca-workspace/index.ts';
+import type { CommandRunner } from '../subprocess/index.ts';
 import type { Disposable } from '../core-types/index.ts';
 import type {
   MailboxCheckResult,

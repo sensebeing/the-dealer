@@ -130,6 +130,15 @@ export interface Services {
 
 ---
 
+### 通用进程工具与 Orca 适配边界
+
+| 模块 | 唯一职责 | 非职责边界 |
+| :--- | :--- | :--- |
+| [`packages/subprocess/index.ts`](../packages/subprocess/index.ts) | 零内部依赖的 `CommandRequest` / `CommandRunner`、`CommandNotStartedError`、`runCommand`、`checkedCommand`、`findExecutable` 与 `singleLine` | 仅提供通用 OS 子进程、PATH 查找与单行文本工具；不依赖其他内部包，不决定业务执行策略 |
+| [`packages/orca-workspace/index.ts`](../packages/orca-workspace/index.ts) | Orca 工作区/终端空闲检查、终端解析、受控投递与工作区备注 | 使用 `subprocess` 执行命令，不重新导出通用进程工具；非 Orca 调用方直接依赖 `subprocess` |
+
+`runCommand` 始终使用 `shell: false` 参数数组；确认进程未启动时抛出 `CommandNotStartedError`，非零退出仍拒绝并携带 `stdout`、`stderr`、`exitCode`。守护进程代码指纹递归覆盖 `packages/`，因此自动包含 `subprocess`。
+
 ## 三、 六大核心工程模块详细设计与接口契约
 
 ### 模块 1：`transport` — 基于 Iroh 的多网络挂载与 P2P 传输底座 (`@the-dealer/transport`)
@@ -480,7 +489,8 @@ the-dealer/                                 # 独立开源仓库根目录（建�
 │   ├── gate/                               # @the-dealer/gate：open / approval_required / dnd / closed 状态机与 ACL 规则
 │   ├── dispatcher/                         # @the-dealer/dispatcher：入站账本、Policy 链与 Executor 宿主
 │   ├── mailbox/                            # @the-dealer/mailbox：持久化信箱账本、租约、方向化线程路由、出站 outbox 重驱与 WakeupRedriveService
-│   ├── orca-workspace/                     # Orca 工作区/终端空闲检查、终端解析与单行投递的唯一 owner
+│   ├── subprocess/                         # 通用 OS 子进程、PATH 查找与单行文本工具；零内部包依赖
+│   ├── orca-workspace/                     # Orca 工作区/终端空闲检查、终端解析与受控投递；通用命令由 subprocess 提供
 │   ├── plugins-source/                     # 官方内置发送触发源插件包
 │   │   ├── source-webhook/                 # 本地 HTTP Webhook 接收器
 │   │   ├── source-poll-watermark/          # 通用单水位轮询触发器（可配置对接 Lark / SourceHub / Monitor）

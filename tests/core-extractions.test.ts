@@ -14,6 +14,9 @@ import {
   createOrcaSpawnExecutorPlugin, initProjectScaffold, runDealerCli, rpc,
 } from '../packages/index.ts';
 import type { DeliveryReceipt, EmitterService, MessageEnvelope, NodeCard, CommandRequest } from '../packages/index.ts';
+import * as subprocess from '../packages/subprocess/index.ts';
+import * as publicApi from '../packages/index.ts';
+import { dealerCodeFingerprintEntries } from '../packages/cli/auto-update.ts';
 
 function directory(t: TestContext): string {
   const path = mkdtempSync(join(tmpdir(), 'dealer-extractions-'));
@@ -31,6 +34,15 @@ function emitter(receipts: readonly DeliveryReceipt[]): EmitterService {
   return { emit: async () => ({ messageId: 'receipt', traceId: 'receipt', receipts: [...receipts] }), registerSource() { throw new Error('unused'); } };
 }
 const receipt = (stage: string, executionReceipt?: Record<string, unknown>, detail?: string) => ({ stage, executionReceipt, detail }) as DeliveryReceipt;
+
+test('subprocess leaf exports remain public and participate in daemon code fingerprints', () => {
+  for (const name of ['runCommand', 'checkedCommand', 'CommandNotStartedError', 'findExecutable', 'singleLine'] as const) {
+    assert.equal(typeof subprocess[name], 'function', name);
+    assert.equal(publicApi[name], subprocess[name], name);
+  }
+  assert.equal(subprocess.singleLine('  command\n with\t arguments  '), 'command with arguments');
+  assert.ok(dealerCodeFingerprintEntries().some(([path]) => path === 'dealer/packages/subprocess/index.ts'));
+});
 
 test('atomic cursor snapshots restart, preserve previous JSON on serialization failure, and fail on corruption', t => {
   const path = join(directory(t), 'nested/cursor.json');

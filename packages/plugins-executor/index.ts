@@ -14,16 +14,14 @@ import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-
 import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup, launchFencedOrcaWorkspaceTerminal } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
-  checkedCommand,
-  CommandNotStartedError,
   setOrcaWorkspaceComment,
   trustAntigravityWorkspace,
   defaultAgentLaunchCommand,
-  singleLine,
-  runCommand,
   findOrcaWorktreeByName,
 } from '../orca-workspace/index.ts';
-import type { CommandRunner, SupportedOrcaAgent } from '../orca-workspace/index.ts';
+import { checkedCommand, CommandNotStartedError, singleLine, runCommand } from '../subprocess/index.ts';
+import type { SupportedOrcaAgent } from '../orca-workspace/index.ts';
+import type { CommandRunner } from '../subprocess/index.ts';
 
 export function renderWave(batch: readonly MessageEnvelope[]): string {
   return batch

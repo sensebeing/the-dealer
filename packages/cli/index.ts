@@ -1,7 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { probeDealerSetup, buildOnboardingPrompts, resolveAgentBindingPreset, readAgentPresetContext } from './setup.ts';
 import type { SupportedAgentHost, AgentConversationMode } from '../plugins-executor/index.ts';
-import type { SupportedOrcaAgent } from '../orca-workspace/index.ts';
 import { existsSync, readFileSync, rmSync, watch } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1193,7 +1192,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           host: required(v.host, '--host') as SupportedAgentHost,
           mode: v.mode as AgentConversationMode | undefined,
           topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
-          agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
+          agent: v.agent as Parameters<typeof resolveAgentBindingPreset>[0]['agent'], agentProfile: v['agent-profile'],
           targetBot: v['target-bot'], sessionId: v['session-id'], notifyLark: v['notify-lark'], cwd: v.root,
         };
         result = options.runtime ? options.runtime.previewAgentPreset(presetOptions)
@@ -1295,7 +1294,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         host: required(v.host, '--host') as SupportedAgentHost,
         mode: v.mode as AgentConversationMode | undefined,
         topic: v.topic, projectId: v.project, workspacePath: v['workspace-path'],
-        agent: v.agent as SupportedOrcaAgent | undefined, agentProfile: v['agent-profile'],
+        agent: v.agent as Parameters<typeof resolveAgentBindingPreset>[0]['agent'], agentProfile: v['agent-profile'],
         targetBot: v['target-bot'], sessionId: v['session-id'],
         notifyLark: v['notify-lark'], setDefault: v['set-default'], cwd: v.root,
       });

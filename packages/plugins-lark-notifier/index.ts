@@ -5,9 +5,8 @@ import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type { Disposable, MessageEnvelope, PendingApprovalItem } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 import type { MailboxItem, MailboxStore } from '../mailbox/store.ts';
-import { findExecutable } from '../orca-workspace/executable.ts';
-import { checkedCommand, runCommand } from '../orca-workspace/index.ts';
-import type { CommandRunner } from '../orca-workspace/index.ts';
+import { findExecutable, checkedCommand, runCommand } from '../subprocess/index.ts';
+import type { CommandRunner } from '../subprocess/index.ts';
 import type { LarkNotifyConfig } from '../cli/config.ts';
 import { validateLarkNotify } from '../cli/config.ts';
 
