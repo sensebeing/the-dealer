@@ -7,6 +7,7 @@ import {
 } from 'node:fs';
 import { resolve } from 'node:path';
 import {
+  canonicalJson,
   isValidMailboxId,
   validateSemanticHeader,
   verifyEnvelope,
@@ -65,17 +66,14 @@ export interface WakeTargetState {
   readonly agentProfile?: string;
   readonly targetBot?: string;
   readonly sessionId?: string;
-  readonly retiredSessionId?: string;
-  readonly configuredSessionId?: string;
-  readonly configuredTerminalHandle?: string;
-  readonly paneKey?: string;
+  readonly adapterState?: Readonly<Record<string, string>>;
+  readonly bindingRevision?: number;
 
   readonly mailboxId: string;
   readonly mode: WakeTargetMode;
   readonly orcaCommand?: string;
   readonly agent?: 'antigravity' | 'claude' | 'codex';
   readonly interactiveCommand?: string;
-  readonly resumeCommand?: string;
   readonly runId?: string;
   readonly worktreeId?: string;
   readonly workspacePath?: string;
@@ -414,16 +412,13 @@ function mergeWakeTarget(
   // cannot express that, so own-property presence is the only reliable signal.
   const optional = <K extends keyof WakeTargetState>(key: K): WakeTargetState[K] | undefined =>
     Object.hasOwn(patch, key) ? patch[key] : current[key];
+  const rawAdapterState = optional('adapterState');
+  const adapterState = rawAdapterState && Object.keys(rawAdapterState).length > 0 ? { ...rawAdapterState } : undefined;
   const hostAgent = optional('hostAgent');
   const conversationMode = optional('conversationMode');
   const agentProfile = optional('agentProfile');
   const targetBot = optional('targetBot');
-  const retiredSessionId = optional('retiredSessionId');
-  const resumeCommand = optional('resumeCommand');
   const sessionId = optional('sessionId');
-  const configuredSessionId = optional('configuredSessionId');
-  const configuredTerminalHandle = optional('configuredTerminalHandle');
-  const paneKey = optional('paneKey');
   const agent = optional('agent');
   const interactiveCommand = optional('interactiveCommand');
   const orcaCommand = optional('orcaCommand');
@@ -445,7 +440,8 @@ function mergeWakeTarget(
       nextAttemptCount === 0 && current.earliestWakeAt > 0) {
     earliestWakeAt = nextCoalesceMs === 0 ? 0 : Math.min(current.earliestWakeAt, Date.now() + nextCoalesceMs);
   }
-  return {
+  const merged: WakeTargetState = {
+    ...(adapterState ? { adapterState } : {}),
     mailboxId: current.mailboxId,
     mode: patch.mode ?? current.mode,
     coalesceMs: nextCoalesceMs,
@@ -457,12 +453,7 @@ function mergeWakeTarget(
     ...(conversationMode !== undefined ? { conversationMode } : {}),
     ...(agentProfile !== undefined ? { agentProfile } : {}),
     ...(targetBot !== undefined ? { targetBot } : {}),
-    ...(retiredSessionId !== undefined ? { retiredSessionId } : {}),
-    ...(resumeCommand !== undefined ? { resumeCommand } : {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
-    ...(configuredSessionId !== undefined ? { configuredSessionId } : {}),
-    ...(configuredTerminalHandle !== undefined ? { configuredTerminalHandle } : {}),
-    ...(paneKey !== undefined ? { paneKey } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(interactiveCommand !== undefined ? { interactiveCommand } : {}),
     ...(orcaCommand !== undefined ? { orcaCommand } : {}),
@@ -478,6 +469,10 @@ function mergeWakeTarget(
     ...(lastWakeError !== undefined ? { lastWakeError } : {}),
     ...(deliveryInDoubt !== undefined ? { deliveryInDoubt } : {}),
   };
+  const fields: readonly (keyof WakeTargetState)[] = ['mode', 'hostAgent', 'conversationMode', 'agentProfile', 'targetBot', 'sessionId', 'orcaCommand', 'agent', 'interactiveCommand', 'runId', 'worktreeId', 'workspacePath', 'terminalHandle', 'rotateAfterWaves'];
+  const changed = fields.some(key => current[key] !== merged[key]) || canonicalJson(current.adapterState ?? {}) !== canonicalJson(merged.adapterState ?? {});
+  return { ...merged, bindingRevision: (current.bindingRevision ?? 0) + (changed ? 1 : 0) };
+
 }
 
 const WAKE_TARGET_MODES: readonly WakeTargetMode[] = [
@@ -491,6 +486,10 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     throw invalidStore();
   }
   const target = value as unknown as WakeTargetState;
+  if (target.bindingRevision !== undefined && !isNonNegativeInteger(target.bindingRevision)) throw invalidStore();
+  if (target.adapterState !== undefined && (!isRecord(target.adapterState) ||
+      !Object.entries(target.adapterState).every(([key, entry]) => isNonEmptyString(key) && isNonEmptyString(entry)))) throw invalidStore();
+
   if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
   if (target.hostAgent !== undefined && !['codex', 'codex-cli', 'claude', 'claude-code', 'claude-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(target.hostAgent)) throw invalidStore();
   if (target.conversationMode !== undefined && !ACTIVE_CONVERSATION_MODES.includes(target.conversationMode)) throw invalidStore();
@@ -519,12 +518,7 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   for (const field of [
     'agentProfile',
     'targetBot',
-    'retiredSessionId',
-    'resumeCommand',
     'sessionId',
-    'configuredSessionId',
-    'configuredTerminalHandle',
-    'paneKey',
     'interactiveCommand',
     'orcaCommand',
     'runId',
@@ -543,7 +537,7 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   if (target.autoCreateWorkspace !== undefined && typeof target.autoCreateWorkspace !== 'boolean') {
     throw invalidStore();
   }
-  return target;
+  return { ...target, ...(target.adapterState ? { adapterState: { ...target.adapterState } } : {}) };
 }
 
 function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle: string): string {
@@ -556,7 +550,7 @@ function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
   state.wakeTargets[termMailbox] = validateWakeTarget({
     ...current, ...(existing ?? {}), mailboxId: termMailbox, mode: 'orca-terminal', terminalHandle: handle,
-    retiredSessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined, rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
+    rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
     earliestWakeAt: existing?.earliestWakeAt ?? 0,
@@ -1488,10 +1482,11 @@ export class MailboxStore {
    * Fence before an external delivery so a crash or an unknown outcome cannot silently replay it.
    * Only `completeWakeDelivery` (confirmed receipt) or an explicit listener patch clears the fence.
    */
-  beginWakeDelivery(mailboxId: string): WakeTargetState {
+  beginWakeDelivery(mailboxId: string, expectedRevision?: number): WakeTargetState | undefined {
     const id = normalizeMailboxId(mailboxId);
     return this.mutate(state => {
       const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) return undefined;
       if (current.deliveryInDoubt) {
         throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
       }
@@ -1502,6 +1497,44 @@ export class MailboxStore {
       state.wakeTargets[id] = next;
       return structuredClone(next);
     });
+  }
+
+  /** Commit only against the binding that authorized this launch. */
+  commitWakeLaunch(
+    mailboxId: string,
+    expectedRevision: number,
+    buildPatch: (lockedCurrent: WakeTargetState) => Partial<WakeTargetState>,
+  ): { committed: boolean; target: WakeTargetState } {
+    const id = normalizeMailboxId(mailboxId);
+    const result = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      const committed = (current.bindingRevision ?? 0) === expectedRevision;
+      const patch = committed ? buildPatch(structuredClone(current)) : { attemptCount: 0, earliestWakeAt: 0 };
+      let next = validateWakeTarget(mergeWakeTarget(current, {
+        ...patch, deliveryInDoubt: undefined, pendingWake: true, lastWakeError: undefined,
+      }));
+      if (committed) next = { ...next, bindingRevision: Math.max(next.bindingRevision ?? 0, expectedRevision + 1) };
+      state.wakeTargets[id] = next;
+      return { committed, target: structuredClone(next) };
+    });
+    if (!result.committed) this.events.emit('target', id);
+    return result;
+  }
+
+  /** Settle a confirmed pre-effect failure without backing off a superseding binding. */
+  settleWakeLaunchFailure(mailboxId: string, expectedRevision: number, failure: Partial<WakeTargetState>): WakeTargetState {
+    const id = normalizeMailboxId(mailboxId);
+    let superseded = false;
+    const target = this.mutate(state => {
+      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+      superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+      const patch = superseded ? { attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined } : failure;
+      const next = validateWakeTarget(mergeWakeTarget(current, { ...patch, pendingWake: true, deliveryInDoubt: undefined }));
+      state.wakeTargets[id] = next;
+      return structuredClone(next);
+    });
+    if (superseded) this.events.emit('target', id);
+    return target;
   }
 
   /** Keep an unconfirmed external outcome fenced; later mail, forced flushes and restarts never replay it. */

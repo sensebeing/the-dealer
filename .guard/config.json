@@ -98,9 +98,11 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
-        "dependencies": []
+        "dependencies": [],
+        "role": "Stateless invocation and JSON-receipt continuation builder for standalone CLI and desktop-app agent hosts (excluding Orca workspace TUI tabs)."
       },
       {
         "path": "packages/orca-workspace",
@@ -108,12 +110,14 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/fs-atomic",
           "packages/subprocess"
-        ]
+        ],
+        "role": "Sole adapter owner of Orca CLI workspace/terminal inspection, Orca TUI session/pane binding transitions and retirement provenance, and validated fresh/continuation TUI launch commands."
       },
       {
         "path": "packages/transport",
@@ -216,7 +220,8 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -224,7 +229,8 @@
           "packages/orca-workspace",
           "packages/fs-atomic",
           "packages/subprocess"
-        ]
+        ],
+        "role": "Host-agnostic durable mailbox and outbox ledgers, bindingRevision CAS launch fencing, and WakeupRedriveService scheduling."
       },
       {
         "path": "packages/plugins-policy",
@@ -281,7 +287,8 @@
         ],
         "boundary_docs": [
           "AGENTS.md",
-          "docs/plugin-guide.md"
+          "docs/plugin-guide.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -290,7 +297,8 @@
           "packages/orca-workspace",
           "packages/cli",
           "packages/subprocess"
-        ]
+        ],
+        "role": "Inbound task, wave, inbox, and notification executors delegating standalone host invocations to agent-host and Orca TUI workspace/session semantics to mailbox and orca-workspace."
       },
       {
         "path": "packages/plugins-lark-notifier",
@@ -315,7 +323,8 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -335,7 +344,8 @@
           "packages/process-lock",
           "packages/fs-atomic",
           "packages/subprocess"
-        ]
+        ],
+        "role": "CLI, control-socket RPC, daemon runtime, and binding presets routing caller and configured Orca wake-target updates through mailbox."
       }
     ],
     "forbidden_imports": [
@@ -460,8 +470,12 @@
           "../orca-workspace"
         ],
         "rule_id": "guard.service-boundaries",
-        "message": "cli must use subprocess for generic OS commands, not depend on Orca workspace operations."
+        "message": "cli must not import orca-workspace directly; route Orca wake-target updates through mailbox and use subprocess for generic OS commands."
       }
+    ],
+    "architecture_docs": [
+      "AGENTS.md",
+      "docs/architecture.md"
     ]
   }
 }

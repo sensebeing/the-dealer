@@ -343,6 +343,193 @@ export function defaultAntigravityLaunchCommand(): string {
 
 export type SupportedOrcaAgent = 'antigravity' | 'claude' | 'codex';
 
+export interface OrcaSessionBinding {
+  readonly paneKey?: string;
+  readonly resumeCommand?: string;
+  readonly configuredMailboxId?: string;
+  readonly configuredSessionId?: string;
+  readonly configuredTerminalHandle?: string;
+  readonly retiredSessionId?: string;
+}
+
+export interface OrcaWakeTargetSnapshot {
+  readonly mailboxId?: string;
+  readonly mode?: 'passive' | 'orca-run' | 'orca-terminal';
+  readonly hostAgent?: string;
+  readonly workspacePath?: string;
+  readonly worktreeId?: string;
+  readonly terminalHandle?: string;
+  readonly agent?: SupportedOrcaAgent;
+  readonly sessionId?: string;
+  readonly interactiveCommand?: string;
+  readonly completedWaves?: number;
+  readonly rotateAfterWaves?: number;
+  readonly adapterState?: Readonly<Record<string, string>>;
+}
+
+const ORCA_SESSION_KEYS = ['paneKey', 'resumeCommand', 'configuredMailboxId', 'configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId'] as const;
+
+export function readOrcaSessionBinding(adapterState?: Readonly<Record<string, string>>, mailboxId?: string): OrcaSessionBinding {
+  const binding = Object.fromEntries(ORCA_SESSION_KEYS.flatMap(key => adapterState?.[key] ? [[key, adapterState[key]]] : [])) as OrcaSessionBinding;
+  if (mailboxId !== undefined && binding.configuredMailboxId !== undefined && binding.configuredMailboxId !== mailboxId) {
+    return { paneKey: binding.paneKey, resumeCommand: binding.resumeCommand };
+  }
+  return binding;
+}
+
+export function writeOrcaSessionBinding(binding: OrcaSessionBinding): Record<string, string> | undefined {
+  const state = Object.fromEntries(ORCA_SESSION_KEYS.flatMap(key => binding[key]?.trim() ? [[key, binding[key]!]] : []));
+  return Object.keys(state).length ? state : undefined;
+}
+
+function orcaWakeTargetPatch(
+  existing: OrcaWakeTargetSnapshot | undefined,
+  patch: Partial<OrcaWakeTargetSnapshot & OrcaSessionBinding>,
+  mailboxId?: string,
+): Partial<OrcaWakeTargetSnapshot> {
+  const { paneKey, resumeCommand, configuredMailboxId, configuredSessionId, configuredTerminalHandle, retiredSessionId, ...generic } = patch;
+  const binding = { ...readOrcaSessionBinding(existing?.adapterState, mailboxId) };
+  for (const key of ORCA_SESSION_KEYS) {
+    if (Object.hasOwn(patch, key)) Object.assign(binding, { [key]: patch[key] });
+  }
+  if (mailboxId && (binding.configuredSessionId || binding.configuredTerminalHandle || binding.retiredSessionId)) {
+    binding.configuredMailboxId = mailboxId;
+  }
+  return { ...generic, adapterState: writeOrcaSessionBinding(binding) };
+}
+
+export function buildLaunchedOrcaWakeTargetPatch(
+  mailboxId: string,
+  current: OrcaWakeTargetSnapshot,
+  options: { handle: string; resetCompletedWaves?: boolean },
+): Partial<OrcaWakeTargetSnapshot> {
+  const binding = readOrcaSessionBinding(current.adapterState, mailboxId);
+  return orcaWakeTargetPatch(current, {
+    terminalHandle: options.handle, paneKey: undefined,
+    ...(options.resetCompletedWaves ? {
+      completedWaves: 0, sessionId: undefined,
+      retiredSessionId: current.sessionId ?? binding.configuredSessionId ?? binding.retiredSessionId,
+    } : {}),
+  }, mailboxId);
+}
+
+/** Single owner of caller-driven Orca conversation identity transitions. */
+export function resolveCallerOrcaWakeTargetPatch(
+  snapshot: OrcaWakeTargetSnapshot | undefined,
+  caller: { workspacePath?: string; worktreeId?: string; terminalHandle?: string; paneKey?: string; agent?: SupportedOrcaAgent; sessionId?: string },
+): Partial<OrcaWakeTargetSnapshot> {
+  const mailboxId = snapshot?.mailboxId;
+  const existing = snapshot && { ...snapshot, ...readOrcaSessionBinding(snapshot.adapterState, mailboxId) };
+  const switchedIdentity =
+    (caller.workspacePath && existing?.workspacePath && caller.workspacePath !== existing.workspacePath) ||
+    (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
+    (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
+    (caller.agent && existing?.agent && caller.agent !== existing.agent) ||
+    (caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
+      (!caller.paneKey || !existing.paneKey || caller.paneKey !== existing.paneKey) &&
+      (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId));
+  const nextAgent = switchedIdentity ? caller.agent : (caller.agent ?? existing?.agent);
+  const clearLaunchConfig = (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
+    !isOrcaLaunchConfigCompatible({ agent: nextAgent, previousAgent: existing?.agent,
+      interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
+  return orcaWakeTargetPatch(snapshot, {
+    mode: 'orca-terminal',
+    ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
+    ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
+    ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
+    ...(switchedIdentity ? {
+      completedWaves: 0, terminalHandle: caller.terminalHandle, paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent,
+    } : {
+      ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
+      ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
+      ...(caller.sessionId ? { sessionId: caller.sessionId } : {}),
+      ...(caller.agent ? { agent: caller.agent } : {}),
+    }),
+  }, mailboxId);
+}
+
+/** Apply configuration once; rotation retires the runtime session without erasing its provenance. */
+export function resolveConfiguredOrcaWakeTargetPatch(
+  snapshot: OrcaWakeTargetSnapshot | undefined,
+  input: {
+    mailboxId?: string; runId?: string; workspacePath?: string; configuredTerminalHandle?: string;
+    configuredAgent?: SupportedOrcaAgent; configuredSessionId?: string;
+    configuredInteractiveCommand?: string; configuredResumeCommand?: string; hasTopicBinding: boolean; authoritativeConfig: boolean;
+  },
+): Partial<OrcaWakeTargetSnapshot> {
+  const mailboxId = input.mailboxId ?? snapshot?.mailboxId;
+  const existing = snapshot && { ...snapshot, ...readOrcaSessionBinding(snapshot.adapterState, mailboxId) };
+  const commandPatch = input.authoritativeConfig || input.configuredInteractiveCommand !== undefined
+    ? { interactiveCommand: input.configuredInteractiveCommand } : {};
+  const resumeCommandPatch = input.authoritativeConfig || input.configuredResumeCommand !== undefined
+    ? { resumeCommand: input.configuredResumeCommand } : {};
+  const nextConfiguredHandle = input.configuredTerminalHandle?.trim() || undefined;
+  if (input.runId) return orcaWakeTargetPatch(snapshot, {
+    mode: 'orca-run', completedWaves: 0, retiredSessionId: undefined, terminalHandle: nextConfiguredHandle, paneKey: undefined,
+    sessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined,
+    ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
+    ...commandPatch, ...resumeCommandPatch,
+  }, mailboxId);
+  const nextConfiguredSession = input.configuredSessionId?.trim() || undefined;
+  const prevConfiguredSession = existing?.configuredSessionId;
+  const effectiveWorkspacePath = input.authoritativeConfig ? input.workspacePath : (input.workspacePath ?? existing?.workspacePath);
+  const sameWorkspace = existing?.mode === 'orca-terminal' && existing.workspacePath === effectiveWorkspacePath;
+  const handleUnchangedSinceConfig = nextConfiguredHandle !== undefined && nextConfiguredHandle === existing?.configuredTerminalHandle;
+  const samePinnedHandle = nextConfiguredHandle === undefined || nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig;
+  const sameAgent = input.configuredAgent === undefined || existing?.agent === undefined || input.configuredAgent === existing.agent;
+  const compatible = sameWorkspace && samePinnedHandle && sameAgent;
+  const alreadyRetired = compatible && nextConfiguredSession !== undefined && nextConfiguredSession === existing?.retiredSessionId;
+  const unchangedConfigured = nextConfiguredSession !== undefined && (nextConfiguredSession === prevConfiguredSession || alreadyRetired);
+  const addedOrChanged = input.hasTopicBinding && nextConfiguredSession !== undefined && !unchangedConfigured;
+  const removed = input.hasTopicBinding && nextConfiguredSession === undefined && prevConfiguredSession !== undefined;
+  const preserved = {
+    terminalHandle: handleUnchangedSinceConfig ? existing?.terminalHandle : (nextConfiguredHandle ?? existing?.terminalHandle),
+    paneKey: existing?.paneKey, sessionId: existing?.sessionId,
+    agent: input.configuredAgent ?? existing?.agent,
+  };
+  let identity: Partial<OrcaWakeTargetSnapshot & OrcaSessionBinding>;
+  if (addedOrChanged) {
+    const handleBelongsToPrevious = nextConfiguredHandle !== undefined &&
+      (nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig);
+    identity = compatible && existing?.sessionId === nextConfiguredSession ? preserved : {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: handleBelongsToPrevious ? undefined : nextConfiguredHandle, paneKey: undefined, sessionId: nextConfiguredSession,
+      agent: input.configuredAgent ?? (sameWorkspace && sameAgent ? existing?.agent : undefined),
+    };
+    identity = { ...identity, configuredSessionId: nextConfiguredSession };
+  } else if (removed) {
+    identity = existing?.sessionId === prevConfiguredSession || !compatible ? {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
+      agent: input.configuredAgent ?? (compatible ? existing?.agent : undefined),
+    } : preserved;
+    identity = { ...identity, configuredSessionId: undefined, retiredSessionId: undefined };
+  } else if (unchangedConfigured) {
+    identity = compatible ? { ...preserved, retiredSessionId: existing?.retiredSessionId } : {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined,
+      sessionId: nextConfiguredSession, agent: input.configuredAgent,
+    };
+    identity = { ...identity, configuredSessionId: nextConfiguredSession };
+  } else {
+    identity = compatible ? { ...preserved, configuredSessionId: input.hasTopicBinding ? undefined : existing?.configuredSessionId } : {
+      completedWaves: 0, retiredSessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
+      configuredSessionId: undefined, agent: input.configuredAgent,
+    };
+  }
+  const clearLaunchConfig = !input.authoritativeConfig && input.configuredInteractiveCommand === undefined && input.configuredResumeCommand === undefined &&
+    (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
+    !isOrcaLaunchConfigCompatible({ agent: identity.agent, previousAgent: existing?.agent,
+      interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
+  return orcaWakeTargetPatch(snapshot, {
+    mode: 'orca-terminal', ...identity,
+    configuredTerminalHandle: input.hasTopicBinding || nextConfiguredHandle !== undefined ? nextConfiguredHandle : existing?.configuredTerminalHandle,
+    ...commandPatch, ...resumeCommandPatch,
+    ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
+  }, mailboxId);
+}
+
 export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravity'): string {
   if (agent === 'claude') return 'claude --dangerously-skip-permissions';
   if (agent === 'codex') return 'codex --dangerously-bypass-approvals-and-sandbox';
@@ -395,6 +582,19 @@ function quoteOrcaCommandToken(token: string): string {
   return /^[A-Za-z0-9_./:=+-]+$/.test(token) ? token : "'" + token.replaceAll("'", "'\\''") + "'";
 }
 
+function knownOrcaHostForBinary(token: string): SupportedOrcaAgent | undefined {
+  const binary = basename(token);
+  return binary === 'agy' ? 'antigravity' : binary === 'claude' || binary === 'codex' ? binary : undefined;
+}
+
+function hasConflictingFreshHostArgs(host: SupportedOrcaAgent, args: readonly string[]): boolean {
+  return host === 'antigravity'
+    ? args.some(arg => ['run', '--conversation', '-c', '--continue', '-p', '--print', '--prompt', '--new-project', '--'].includes(arg) || arg.startsWith('--conversation=') || arg.startsWith('--prompt='))
+    : host === 'claude'
+      ? args.some(arg => ['-p', '--print', '-r', '--resume', '--session-id', '-c', '--continue', '--bg', '--background', '--'].includes(arg) || arg.startsWith('--resume=') || arg.startsWith('--session-id='))
+      : args.some(arg => ['exec', 'resume', 'queue', 'login', 'mcp', 'completion', '--last', '--'].includes(arg));
+}
+
 export function buildOrcaAgentLaunchCommand(options?: {
   agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string;
 }): string {
@@ -412,14 +612,24 @@ export function buildOrcaAgentLaunchCommand(options?: {
   const customTokens = customCmd ? continuationCommandTokens(customCmd) : undefined;
   const freshCmd = customTokens?.map(quoteOrcaCommandToken).join(' ');
   const resumeTokens = resumeCmd ? continuationCommandTokens(resumeCmd) : undefined;
+  if (customTokens) {
+    const customHost = knownOrcaHostForBinary(customTokens[0]);
+    if (customHost !== undefined) {
+      if (customHost !== agent) throw new OrcaTerminalLaunchRejectedError(`Orca interactiveCommand host ${customHost} does not match target agent ${agent}: ${customCmd}`);
+      if (hasConflictingFreshHostArgs(customHost, customTokens.slice(1))) throw new OrcaTerminalLaunchRejectedError(`Orca interactiveCommand must be a fresh interactive launch command without embedded continuation or non-interactive flags: ${customCmd}`);
+    }
+  }
   if (resumeTokens) {
     if (!resumeTokens.includes('{sessionId}')) throw new OrcaTerminalLaunchRejectedError('Orca resumeCommand requires a standalone {sessionId} token');
-    if (basename(resumeTokens[0]) !== binary) {
-      if (!customTokens || customTokens[0] !== resumeTokens[0]) {
-        throw new OrcaTerminalLaunchRejectedError('Custom Orca resumeCommand requires a matching fresh-session interactiveCommand');
+    const resumeHost = knownOrcaHostForBinary(resumeTokens[0]);
+    if (resumeHost !== undefined) {
+      if (resumeHost !== agent) throw new OrcaTerminalLaunchRejectedError('Orca resumeCommand must match the target host');
+      if (resumeTokens.slice(1).some(arg => ['run', 'exec', 'queue', '-p', '--print', '--prompt', '--bg', '--background', '-c', '--continue', '--last', '--'].includes(arg) || ['--prompt=', '--conversation=', '--resume=', '--session-id='].some(prefix => arg.startsWith(prefix)))) {
+        throw new OrcaTerminalLaunchRejectedError('Orca resumeCommand contains conflicting continuation or non-interactive arguments');
       }
-    } else if (customTokens && basename(customTokens[0]) !== binary) {
-      throw new OrcaTerminalLaunchRejectedError('Orca resumeCommand and interactiveCommand must use the same host');
+      if (customTokens && knownOrcaHostForBinary(customTokens[0]) !== agent) throw new OrcaTerminalLaunchRejectedError('Orca resumeCommand and interactiveCommand must use the same host');
+    } else if (!customTokens || customTokens[0] !== resumeTokens[0]) {
+      throw new OrcaTerminalLaunchRejectedError('Custom Orca resumeCommand requires a matching fresh-session interactiveCommand');
     }
   }
   if (!trimmedSession) return freshCmd ?? defaultCmd;
@@ -427,13 +637,7 @@ export function buildOrcaAgentLaunchCommand(options?: {
   if (resumeTokens) return resumeTokens.map(token => token === '{sessionId}' ? quoted : quoteOrcaCommandToken(token)).join(' ');
   let command = defaultCmd;
   if (customTokens && customCmd !== defaultCmd) {
-    const args = customTokens.slice(1);
-    const conflicting = agent === 'antigravity'
-      ? args.some(arg => ['run', '--conversation', '-c', '--continue', '-p', '--print', '--prompt', '--'].includes(arg) || arg.startsWith('--conversation='))
-      : agent === 'claude'
-        ? args.some(arg => ['-p', '--print', '-r', '--resume', '--session-id', '-c', '--continue', '--bg', '--background', '--'].includes(arg) || arg.startsWith('--resume=') || arg.startsWith('--session-id='))
-        : args.some(arg => ['exec', 'resume', 'queue', 'login', 'mcp', 'completion', '--'].includes(arg));
-    if (basename(customTokens[0]) !== binary || conflicting) {
+    if (basename(customTokens[0]) !== binary) {
       throw new OrcaTerminalLaunchRejectedError(`Unsupported Orca session continuation command for ${agent}: ${customCmd}`);
     }
     command = freshCmd!;

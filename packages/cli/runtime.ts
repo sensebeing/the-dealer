@@ -1036,6 +1036,7 @@ export class DealerNodeRuntime {
           });
       this.mailbox.upsertWakeTarget(mailboxId, {
         ...resolveConfiguredOrcaWakeTargetPatch(current, {
+          mailboxId,
           runId, workspacePath, configuredTerminalHandle: terminalHandle,
           configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
           configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand, configuredResumeCommand: binding.resumeCommand,

@@ -11,7 +11,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, resolveConfiguredOrcaWakeTargetPatch, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup, launchFencedOrcaWorkspaceTerminal } from '../mailbox/index.ts';
+import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, resolveConfiguredOrcaWakeTargetPatch, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup, launchFencedOrcaWorkspaceTerminal, writeOrcaSessionBinding } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   setOrcaWorkspaceComment,
@@ -565,7 +565,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
         try {
           // Once committed, the mailbox owns recovery even if Orca cannot launch the agent.
           store.enqueue(batch, { mailboxId, wakeTarget: {
-            mode: 'orca-terminal', agent: effectiveAgent, interactiveCommand, resumeCommand,
+            mode: 'orca-terminal', agent: effectiveAgent, interactiveCommand, adapterState: writeOrcaSessionBinding({ resumeCommand }),
             orcaCommand: command, workspacePath: path, coalesceMs: 0,
             ...(workspaceComment ? { workspaceComment } : {}),
           } });
@@ -575,6 +575,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
             const launched = await launchFencedOrcaWorkspaceTerminal(store, runner, mailboxId, {
               command, workspacePath: path, agent: effectiveAgent, interactiveCommand, resumeCommand, signal: context.signal,
             });
+            if (!launched.committed) return { executor: 'orca-spawn', executionId: randomUUID(), worktreePath: path, woke: false, reason: 'Wake launch superseded by a newer binding' };
             terminal = launched.raw;
           } catch (launchError) {
             if (workspaceComment) {
@@ -771,6 +772,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         const explicitInteractiveCommand = binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand;
         return {
           ...resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
+            mailboxId,
             runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
             configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
             configuredSessionId: binding?.sessionId, configuredInteractiveCommand: explicitInteractiveCommand, configuredResumeCommand: explicitResumeCommand,
