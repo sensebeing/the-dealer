@@ -66,6 +66,7 @@ export interface WakeTargetState {
   readonly targetBot?: string;
   readonly sessionId?: string;
   readonly configuredSessionId?: string;
+  readonly configuredTerminalHandle?: string;
   readonly paneKey?: string;
 
   readonly mailboxId: string;
@@ -417,6 +418,7 @@ function mergeWakeTarget(
   const targetBot = optional('targetBot');
   const sessionId = optional('sessionId');
   const configuredSessionId = optional('configuredSessionId');
+  const configuredTerminalHandle = optional('configuredTerminalHandle');
   const paneKey = optional('paneKey');
   const agent = optional('agent');
   const interactiveCommand = optional('interactiveCommand');
@@ -453,6 +455,7 @@ function mergeWakeTarget(
     ...(targetBot !== undefined ? { targetBot } : {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(configuredSessionId !== undefined ? { configuredSessionId } : {}),
+    ...(configuredTerminalHandle !== undefined ? { configuredTerminalHandle } : {}),
     ...(paneKey !== undefined ? { paneKey } : {}),
     ...(agent !== undefined ? { agent } : {}),
     ...(interactiveCommand !== undefined ? { interactiveCommand } : {}),
@@ -512,6 +515,7 @@ function validateWakeTarget(value: unknown): WakeTargetState {
     'targetBot',
     'sessionId',
     'configuredSessionId',
+    'configuredTerminalHandle',
     'paneKey',
     'interactiveCommand',
     'orcaCommand',
@@ -544,7 +548,7 @@ function pinRotatingTargetInState(state: MailboxFileState, id: string, rawHandle
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${termMailbox}`);
   state.wakeTargets[termMailbox] = validateWakeTarget({
     ...current, ...(existing ?? {}), mailboxId: termMailbox, mode: 'orca-terminal', terminalHandle: handle,
-    configuredSessionId: undefined, rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
+    configuredSessionId: undefined, configuredTerminalHandle: undefined, rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
     earliestWakeAt: existing?.earliestWakeAt ?? 0,

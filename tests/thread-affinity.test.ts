@@ -455,3 +455,37 @@ for (const agent of ['claude', 'codex'] as const) {
     assert.equal(target.interactiveCommand, 'configured-command {sessionId}');
   });
 }
+
+test('partial unbound wave ingestion preserves the established runtime session', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const mailboxId = 'stream:partial';
+  const workspacePath = '/receiver/workspace';
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => { calls.push(request); return { stdout: '{"ok":true}' }; };
+  const plugin = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => undefined });
+  await plugin.execute([envelope('initial', { kind: 'partial', payload: { workspacePath } })], context, {});
+  store.upsertWakeTarget(mailboxId, { terminalHandle: 'term-owner', paneKey: 'owner:pane', sessionId: 'session-owner', agent: 'claude',
+    configuredSessionId: 'retired-config', configuredTerminalHandle: 'original-config-handle',
+  });
+  const wakeup = new WakeupRedriveService({ store, commandRunner: runner, idleCheck: async () => ({ idle: true }) });
+  t.after(() => wakeup.stop());
+  const next = createOrcaWaveExecutorPlugin({ store, wakeup, resolveTopicBinding: () => undefined });
+  await next.execute([envelope('follow-up', { kind: 'partial', payload: {} })], context, {});
+  const target = store.getWakeTarget(mailboxId)!;
+  assert.equal(target.workspacePath, workspacePath);
+  assert.equal(target.terminalHandle, 'term-owner');
+  assert.equal(target.paneKey, 'owner:pane');
+  assert.equal(target.sessionId, 'session-owner');
+  assert.equal(target.agent, 'claude');
+  assert.equal(target.configuredSessionId, 'retired-config');
+  assert.equal(target.configuredTerminalHandle, 'original-config-handle');
+  assert.equal(terminalSends(calls).length, 1);
+  assert.equal(terminalOf(terminalSends(calls)[0]), 'term-owner');
+  assert.equal(calls.some(call => call.args[1] === 'create'), false);
+  await plugin.execute([envelope('replacement', { kind: 'partial', payload: { workspacePath: '/receiver/replacement' } })], context, {});
+  const replaced = store.getWakeTarget(mailboxId)!;
+  assert.equal(replaced.workspacePath, '/receiver/replacement');
+  assert.equal(replaced.sessionId, undefined);
+  assert.equal(replaced.terminalHandle, undefined);
+  assert.equal(replaced.paneKey, undefined);
+});

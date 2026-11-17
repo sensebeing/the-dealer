@@ -770,7 +770,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
             runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
             configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
             configuredSessionId: binding?.sessionId, configuredInteractiveCommand: explicitInteractiveCommand,
-            hasTopicBinding: binding !== undefined, clearOmittedInteractiveCommand: false,
+            hasTopicBinding: binding !== undefined, authoritativeConfig: false,
           }),
           orcaCommand: command,
           coalesceMs,

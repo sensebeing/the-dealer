@@ -1039,7 +1039,7 @@ export class DealerNodeRuntime {
           runId, workspacePath, configuredTerminalHandle: terminalHandle,
           configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
           configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand,
-          hasTopicBinding: true, clearOmittedInteractiveCommand: true,
+          hasTopicBinding: true, authoritativeConfig: true,
         }),
         workspacePath, worktreeId, runId, repoRoot: projectRoot,
         autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,

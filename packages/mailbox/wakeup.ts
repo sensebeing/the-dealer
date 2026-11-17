@@ -126,56 +126,70 @@ export function resolveConfiguredOrcaWakeTargetPatch(
   input: {
     runId?: string; workspacePath?: string; configuredTerminalHandle?: string;
     configuredAgent?: WakeTargetState['agent']; configuredSessionId?: string;
-    configuredInteractiveCommand?: string; hasTopicBinding: boolean; clearOmittedInteractiveCommand: boolean;
+    configuredInteractiveCommand?: string; hasTopicBinding: boolean; authoritativeConfig: boolean;
   },
 ): Partial<WakeTargetState> {
-  const commandPatch = input.clearOmittedInteractiveCommand || input.configuredInteractiveCommand !== undefined
+  const commandPatch = input.authoritativeConfig || input.configuredInteractiveCommand !== undefined
     ? { interactiveCommand: input.configuredInteractiveCommand } : {};
+  const nextConfiguredHandle = input.configuredTerminalHandle?.trim() || undefined;
   if (input.runId) return {
-    mode: 'orca-run', terminalHandle: input.configuredTerminalHandle, paneKey: undefined,
-    sessionId: undefined, configuredSessionId: undefined,
+    mode: 'orca-run', terminalHandle: nextConfiguredHandle, paneKey: undefined,
+    sessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined,
     ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
     ...commandPatch,
   };
   const nextConfiguredSession = input.configuredSessionId?.trim() || undefined;
   const prevConfiguredSession = existing?.configuredSessionId;
-  const sameWorkspace = existing?.mode === 'orca-terminal' && existing.workspacePath === input.workspacePath;
-  const samePinnedHandle = input.configuredTerminalHandle === undefined || input.configuredTerminalHandle === existing?.terminalHandle;
+  const effectiveWorkspacePath = input.authoritativeConfig ? input.workspacePath : (input.workspacePath ?? existing?.workspacePath);
+  const sameWorkspace = existing?.mode === 'orca-terminal' && existing.workspacePath === effectiveWorkspacePath;
+  const handleUnchangedSinceConfig = nextConfiguredHandle !== undefined && nextConfiguredHandle === existing?.configuredTerminalHandle;
+  const samePinnedHandle = nextConfiguredHandle === undefined || nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig;
   const sameAgent = input.configuredAgent === undefined || existing?.agent === undefined || input.configuredAgent === existing.agent;
   const compatible = sameWorkspace && samePinnedHandle && sameAgent;
-  const addedOrChanged = input.hasTopicBinding && nextConfiguredSession !== undefined && nextConfiguredSession !== prevConfiguredSession;
+  const baselineRotatedWithoutProvenance = compatible && prevConfiguredSession === undefined &&
+    existing?.sessionId === undefined && existing?.rotateAfterWaves !== undefined &&
+    (existing.terminalHandle !== undefined || existing.paneKey !== undefined || existing.completedWaves > 0);
+  const addedOrChanged = !baselineRotatedWithoutProvenance && input.hasTopicBinding && nextConfiguredSession !== undefined && nextConfiguredSession !== prevConfiguredSession;
   const removed = input.hasTopicBinding && nextConfiguredSession === undefined && prevConfiguredSession !== undefined;
   const preserved = {
-    terminalHandle: input.configuredTerminalHandle ?? existing?.terminalHandle,
+    terminalHandle: handleUnchangedSinceConfig ? existing?.terminalHandle : (nextConfiguredHandle ?? existing?.terminalHandle),
     paneKey: existing?.paneKey, sessionId: existing?.sessionId,
     agent: input.configuredAgent ?? existing?.agent,
   };
   let identity: Partial<WakeTargetState>;
-  if (addedOrChanged) {
+  if (input.hasTopicBinding && nextConfiguredSession !== undefined && baselineRotatedWithoutProvenance) {
+    identity = { ...preserved, configuredSessionId: nextConfiguredSession };
+  } else if (addedOrChanged) {
+    const handleBelongsToPrevious = nextConfiguredHandle !== undefined &&
+      (nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig);
     identity = compatible && existing?.sessionId === nextConfiguredSession ? preserved : {
-      terminalHandle: input.configuredTerminalHandle, paneKey: undefined, sessionId: nextConfiguredSession,
+      terminalHandle: handleBelongsToPrevious ? undefined : nextConfiguredHandle, paneKey: undefined, sessionId: nextConfiguredSession,
       agent: input.configuredAgent ?? (sameWorkspace && sameAgent ? existing?.agent : undefined),
     };
     identity = { ...identity, configuredSessionId: nextConfiguredSession };
   } else if (removed) {
     identity = existing?.sessionId === prevConfiguredSession || !compatible ? {
-      terminalHandle: input.configuredTerminalHandle, paneKey: undefined, sessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
       agent: input.configuredAgent ?? (compatible ? existing?.agent : undefined),
     } : preserved;
     identity = { ...identity, configuredSessionId: undefined };
   } else if (nextConfiguredSession !== undefined && nextConfiguredSession === prevConfiguredSession) {
     identity = compatible ? preserved : {
-      terminalHandle: input.configuredTerminalHandle, paneKey: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined,
       sessionId: nextConfiguredSession, agent: input.configuredAgent,
     };
     identity = { ...identity, configuredSessionId: nextConfiguredSession };
   } else {
     identity = compatible ? { ...preserved, configuredSessionId: input.hasTopicBinding ? undefined : existing?.configuredSessionId } : {
-      terminalHandle: input.configuredTerminalHandle, paneKey: undefined, sessionId: undefined,
+      terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
       configuredSessionId: undefined, agent: input.configuredAgent,
     };
   }
-  return { mode: 'orca-terminal', ...identity, ...commandPatch };
+  return {
+    mode: 'orca-terminal', ...identity,
+    configuredTerminalHandle: input.hasTopicBinding || nextConfiguredHandle !== undefined ? nextConfiguredHandle : existing?.configuredTerminalHandle,
+    ...commandPatch,
+  };
 }
 
 /**
