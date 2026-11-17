@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, readFileSync, rmSy
 import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   DealerNodeRuntime,
   DEDUP_CAS_DUPLICATE_DETAIL,
@@ -222,6 +223,7 @@ test('Phase 4: polling, CAS dedup, durable busy waves and run-managed delivery a
     },
   });
   const registration = alice.emitter.registerSource(source);
+  await alice.emitter.whenSourcesStarted?.();
   await source.pollOnce();
   await source.pollOnce();
   assert.equal(cursor, 2);
@@ -1289,4 +1291,152 @@ test('a sender-signed empty attachment array remains authentic across mailbox an
   assert.deepEqual(restored.mailbox.list().items[0].signedEnvelope, message);
   assert.equal(restored.mailbox.hasConfirmedEnvelope('local', keys.nodeId, message.id, 2), true);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'dedup-watermarks.json'), 'utf8'))[key], { revision: 2, status: 'settled' });
+});
+
+test('external sources wait for later configured policies at startup and never run on failed readiness', async t => {
+  for (const missingPolicy of [false, true]) {
+    const root = directory(t);
+    const module = join(root, 'ordered-plugins.ts');
+    writeFileSync(module, `
+      export const events = [];
+      export function createPlugin(config) {
+        if (config.source) return {
+          name: 'early-source', inject: ['emitter'], apply(ctx) {
+            const registration = ctx.services.emitter.registerSource({
+              name: 'early-source',
+              async start(emitter) {
+                events.push('source');
+                await emitter.emit({ networkId: 'local', routing: { mode: 'unicast', targets: ['member:guarded'] },
+                  kind: 'early', subject: 'first', body: 'first' });
+              },
+              stop() { events.push('source-stop'); },
+            });
+            ctx.effect(() => () => registration.dispose());
+          },
+        };
+        return { name: 'later-policy-executor', inject: ['dispatcher'], apply(ctx) {
+          if (config.candidateSource) {
+            const source = ctx.services.emitter.registerSource({ name: 'candidate-source',
+              start() { events.push('candidate-source'); }, stop() { events.push('candidate-stop'); },
+            });
+            ctx.effect(() => () => source.dispose());
+          }
+          if (!config.missingPolicy) {
+            const registration = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+              async process(envelope, next) { events.push('policy'); return next([envelope]); },
+            });
+            ctx.effect(() => () => registration.dispose());
+          }
+          const registration = ctx.services.dispatcher.registerExecutor({ name: 'custom-exec',
+            async execute(batch) { events.push('executor'); return { executor: 'custom-exec', executionId: batch[0].id }; },
+          }, {});
+          ctx.effect(() => () => registration.dispose());
+        } };
+      }
+    `);
+    const { events } = await import(pathToFileURL(module).href);
+    const runtime = new DealerNodeRuntime({ stateDir: join(root, 'state'), member: 'guarded', profile: 'headless-relay',
+      transport: { discoveryDir: join(root, 'mesh') },
+      patch: { executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+        userPlugins: [
+          { name: 'early-source', module, config: { source: true } },
+          { name: 'later-policy-executor', module, config: { missingPolicy } },
+        ],
+      },
+    });
+    t.after(() => runtime.stop());
+    if (missingPolicy) {
+      await assert.rejects(runtime.start(), /Unknown policy: custom-policy/);
+      assert.deepEqual(events, [], 'startup rejection must not start the early source or execute its message');
+      assert.equal(runtime.kernel.hasService('dispatcher'), false);
+    } else {
+      await runtime.start();
+      assert.deepEqual(events, ['source', 'policy', 'executor']);
+      await assert.rejects(runtime.installUserPlugin({ name: 'later-policy-executor', module,
+        config: { missingPolicy: true, candidateSource: true },
+      }), /Unknown policy: custom-policy/);
+      assert.deepEqual(events, ['source', 'policy', 'executor'], 'rollback disposes an unstarted source without waiting on its transition gate');
+      await runtime.removeUserPlugin('early-source');
+      await runtime.installUserPlugin({ name: 'early-source', module, config: { source: true } });
+      assert.deepEqual(events, ['source', 'policy', 'executor', 'source-stop', 'source', 'policy', 'executor'],
+        'live source installation waits until its protected first emission finishes');
+      await runtime.stop();
+    }
+  }
+});
+
+test('dispatch waits through policy replacement and rejected removal, and missing policy never poisons the ledger', async t => {
+  for (const operation of ['replace', 'remove']) {
+    const root = directory(t);
+    const module = join(root, 'policy-plugin.ts');
+    writeFileSync(module, `
+      export const events = [];
+      let pause;
+      export function pauseRemoval() {
+        let entered, release;
+        const enteredPromise = new Promise(resolve => { entered = resolve; });
+        const released = new Promise(resolve => { release = resolve; });
+        pause = { entered, released };
+        return { entered: enteredPromise, release };
+      }
+      export function createPlugin(config) {
+        return { name: 'policy-plugin', inject: ['dispatcher'], apply(ctx) {
+          const registration = ctx.services.dispatcher.registerPolicy({ name: 'custom-policy',
+            async process(envelope, next) { events.push(config.version); return next([envelope]); },
+          });
+          ctx.effect(() => async () => {
+            registration.dispose();
+            const blocked = pause;
+            pause = undefined;
+            if (blocked) { blocked.entered(); await blocked.released; }
+          });
+        } };
+      }
+    `);
+    const fixture = await import(pathToFileURL(module).href);
+    const runtime = await node(t, root, operation, {
+      patch: { executors: ['custom-exec', 'inbox'], defaultExecutor: 'custom-exec', policies: ['custom-policy'],
+        userPlugins: [{ name: 'policy-plugin', module, config: { version: 'v1' } }],
+      },
+      executorOverrides: [{ name: 'custom-exec', async execute(batch) {
+        fixture.events.push('executor');
+        return { executor: 'custom-exec', executionId: batch[0].id };
+      } }],
+    });
+    const pause = fixture.pauseRemoval();
+    t.after(() => pause.release());
+    const transition = operation === 'replace'
+      ? runtime.installUserPlugin({ name: 'policy-plugin', module, config: { version: 'v2' } })
+      : runtime.removeUserPlugin('policy-plugin');
+    const settledTransition = operation === 'remove'
+      ? assert.rejects(transition, /Unknown policy: custom-policy/) : transition;
+    await pause.entered;
+    const dispatcher = runtime.kernel.getService('dispatcher');
+    assert.equal(dispatcher.hasPolicy('custom-policy'), false);
+    const keys = generateNodeKeyPair();
+    const message = signEnvelope({ id: operation, traceId: operation, networkId: 'local',
+      from: { nodeId: keys.nodeId, member: 'sender', nodeName: 'sender' }, routing: { mode: 'unicast' },
+      kind: 'protected', subject: operation, body: operation, payload: {}, attachments: [],
+      priority: 'normal', createdAt: new Date().toISOString(),
+    }, keys.privateKeyPem);
+    let dispatched = false;
+    const pending = dispatcher.dispatch(message).then(result => { dispatched = true; return result; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(dispatched, false);
+    assert.deepEqual(fixture.events, []);
+    pause.release();
+    await settledTransition;
+    assert.equal((await pending).stage, 'dispatched');
+    assert.deepEqual(fixture.events, [operation === 'replace' ? 'v2' : 'v1', 'executor']);
+    assert.equal(dispatcher.hasPolicy('custom-policy'), true);
+
+    const retryable = signEnvelope({ ...message, id: 'required-policy-retry' }, keys.privateKeyPem);
+    runtime.config.policies.push('missing-policy');
+    await assert.rejects(dispatcher.dispatch(retryable), error =>
+      error instanceof Error && /Policy unavailable: missing-policy/.test(error.message) && error['beforeExternalEffect'] === true);
+    assert.equal(fixture.events.length, 2, 'no policy or executor runs before all required policies are ready');
+    runtime.config.policies.pop();
+    assert.equal((await dispatcher.dispatch(retryable)).stage, 'dispatched', 'readiness failure leaves no terminal ledger receipt');
+    await runtime.stop();
+  }
 });

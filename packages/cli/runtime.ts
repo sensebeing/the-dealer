@@ -182,6 +182,9 @@ export class DealerNodeRuntime {
   private externalChanges: Promise<unknown> = Promise.resolve();
   private server?: Server;
   private registerConfiguredExecutor?: (name: string) => void;
+  private startupGate?: Promise<boolean>;
+  private releaseStartupGate?: (ok: boolean) => void;
+  private transitionGate?: Promise<boolean>;
   private started = false;
   private ownsLock = false;
   private activeMutatingControlRequests = 0;
@@ -442,6 +445,7 @@ export class DealerNodeRuntime {
       this.ownsLock = true;
       holdOwnedDirectory(this.stateDir);
     }
+    this.startupGate = new Promise<boolean>(resolve => { this.releaseStartupGate = resolve; });
     // Freeze the loaded code once. Subsequent config writes must not adopt disk edits.
     this.loadedDealerEntries = dealerCodeFingerprintEntries();
     try {
@@ -553,6 +557,13 @@ export class DealerNodeRuntime {
       );
       await this.kernel.use(
         createDispatcherPlugin({
+          requiredPolicies: () => this.config.policies,
+          beforeDispatch: async () => {
+            if (this.startupGate && !(await this.startupGate)) {
+              throw Object.assign(new Error('Runtime stopped before startup completed'), { beforeExternalEffect: true });
+            }
+            while (this.transitionGate) await this.transitionGate;
+          },
           ledgerPath: join(this.stateDir, 'deliveries.json'),
           wrapExecutor: executor => this.wrapExecutorWithAttachments(executor),
           resolveKindExecutor: (kind, streamKey) => this.resolveTopicDefaultExecutor(kind, streamKey) ?? this.config.defaultExecutor,
@@ -560,6 +571,13 @@ export class DealerNodeRuntime {
       );
       await this.kernel.use(
         createEmitterPlugin({
+          beforeSourceStart: async () => {
+            if (this.startupGate && !(await this.startupGate)) return false;
+            while (this.transitionGate) {
+              if (!(await this.transitionGate)) return false;
+            }
+            return !this.stopPromise;
+          },
           outbox: this.outbox,
           onSourceError: error => {
             this.lastError = String(error);
@@ -611,6 +629,10 @@ export class DealerNodeRuntime {
           await this.node.updateNetworkAdmissionMode(network.networkId, network.admissionMode);
         }
       }
+      this.releaseStartupGate?.(true);
+      this.startupGate = undefined;
+      this.releaseStartupGate = undefined;
+      await this.emitter.whenSourcesStarted?.();
       for (const source of this.config.sources) {
         await this.installSource(source);
       }
@@ -633,6 +655,9 @@ export class DealerNodeRuntime {
       this.started = true;
       return this;
     } catch (error) {
+      this.releaseStartupGate?.(false);
+      this.startupGate = undefined;
+      this.releaseStartupGate = undefined;
       await this.stop();
       throw error;
     }
@@ -726,6 +751,9 @@ export class DealerNodeRuntime {
       occupied.add(entry.plugin.name);
     }
     const config = structuredClone(this.config);
+    let releaseTransition!: (ok: boolean) => void;
+    let succeeded = false;
+    this.transitionGate = new Promise<boolean>(resolve => { releaseTransition = resolve; });
     try {
       await this.kernel.applyPatch(previous.map(({ plugin }) => ({ name: plugin.name, enabled: false })));
       for (const entry of next) {
@@ -734,6 +762,7 @@ export class DealerNodeRuntime {
       await commit();
       if (this.started) this.assertConfiguredPluginsRegistered();
       this.persist();
+      succeeded = true;
     } catch (error) {
       this.config = config;
       try {
@@ -746,7 +775,11 @@ export class DealerNodeRuntime {
         throw new AggregateError([error, rollbackError], 'External plugin change and rollback failed');
       }
       throw error;
+    } finally {
+      this.transitionGate = undefined;
+      releaseTransition(succeeded);
     }
+    if (this.startupGate === undefined) await this.emitter.whenSourcesStarted?.();
   }
 
   private async publishSkills(): Promise<void> {
@@ -1360,6 +1393,7 @@ export class DealerNodeRuntime {
       stop: () => source.stop(),
     });
     try {
+      await this.emitter.whenSourcesStarted?.();
       await started;
       return registration;
     } catch (error) {
@@ -1645,6 +1679,9 @@ export class DealerNodeRuntime {
   }
 
   private async finishStop(): Promise<void> {
+    this.releaseStartupGate?.(false);
+    this.startupGate = undefined;
+    this.releaseStartupGate = undefined;
     const hadServer = this.server !== undefined;
     try {
       // Stop redrive first: it must not start new sends while transport and kernel unwind.

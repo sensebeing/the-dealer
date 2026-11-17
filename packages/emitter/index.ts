@@ -33,6 +33,7 @@ import type {
 import type { Plugin } from '../kernel/index.ts';
 
 export interface EmitterConfig {
+  beforeSourceStart?: () => Promise<boolean> | boolean;
   privateKeyPem?: string;
   onSourceError?: (error: unknown) => void;
   /** Durable offline fallback; when absent, unreachable targets fail emit as before. */
@@ -752,27 +753,34 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             ...(lastError !== undefined ? { lastError } : {}),
           };
         },
+        async whenSourcesStarted() {
+          await Promise.allSettled([...sources.values()]);
+        },
         registerSource(source) {
           if (sources.has(source)) {
             throw new Error('Source already registered');
           }
-          let started: Promise<void>;
-          try {
-            started = Promise.resolve(source.start(service));
-          } catch (error) {
-            started = Promise.reject(error);
-          }
+          let disposed = false;
+          let startedRunning = false;
+          const started = Promise.resolve()
+            .then(() => settings.beforeSourceStart ? settings.beforeSourceStart() : true)
+            .then(shouldStart => {
+              if (disposed || !shouldStart) return;
+              startedRunning = true;
+              return source.start(service);
+            });
           sources.set(source, started);
           void started.catch(error => settings.onSourceError?.(error));
-          let disposed = false;
           const dispose = async () => {
-            if (disposed) {
-              return;
-            }
+            if (disposed) return;
             disposed = true;
             try {
-              await source.stop();
-              await started;
+              // A deferred source has no effects to stop. Waiting on its readiness gate here
+              // would deadlock rollback, which must dispose it before releasing that gate.
+              if (startedRunning) {
+                await source.stop();
+                await started.catch(() => {});
+              }
             } finally {
               sources.delete(source);
             }
