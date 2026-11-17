@@ -1,6 +1,9 @@
+import { pinOrcaTerminalSessionMailbox } from '../plugins-orca/index.ts';
+import { toMailboxTopicBinding } from './config.ts';
 import { randomBytes } from 'node:crypto';
 import { probeDealerSetup, buildOnboardingPrompts, resolveAgentBindingPreset, readAgentPresetContext } from './setup.ts';
-import type { SupportedAgentHost, AgentConversationMode } from '../plugins-executor/index.ts';
+import type { SupportedAgentHost } from '../plugins-agent-host/index.ts';
+import type { AgentConversationMode } from '../core-types/index.ts';
 import { existsSync, readFileSync, rmSync, watch } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -777,12 +780,14 @@ function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | u
 function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: CallerOrcaBinding | undefined): void {
   if (!caller) return;
   const existing = store.getWakeTarget(mailboxId);
-  if (existing?.mode === 'orca-run' || (existing?.mode === 'passive' && existing.hostAgent !== undefined)) return;
+  if (existing?.driver === 'orca-run' || existing?.driver === 'agent-host') return;
   store.upsertWakeTarget(mailboxId, {
-    mode: 'orca-terminal',
-    ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
-    ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
-    ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
+    driver: 'orca-terminal',
+    driverConfig: {
+      ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
+      ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
+      ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
+    },
   });
 }
 
@@ -909,7 +914,7 @@ async function runSessionCommand(
         replyTo,
         typeof v.network === 'string' && v.network ? String(v.network) : undefined,
       );
-      const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
+      const replyMailbox = pinOrcaTerminalSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
       bindCallerWakeTarget(store, replyMailbox, caller);
       assertAckLease();
       const body = required(v.body, '--body');
@@ -958,7 +963,7 @@ async function runSessionCommand(
       throw new Error('Choose exactly one of --to or --auto-route');
     }
     assertAckLease();
-    const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller?.terminalHandle);
+    const replyMailbox = pinOrcaTerminalSessionMailbox(store, callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller?.terminalHandle);
     bindCallerWakeTarget(store, replyMailbox, caller);
     const targetMailbox =
       typeof v['target-mailbox'] === 'string' && v['target-mailbox']
@@ -1006,7 +1011,7 @@ async function runSessionCommand(
 
   const messageId = required(positional, 'message-id');
   const route = replyTargetOrThrow(store, messageId);
-  const replyMailbox = store.pinRotatingSessionMailbox(callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
+  const replyMailbox = pinOrcaTerminalSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
   bindCallerWakeTarget(store, replyMailbox, caller);
   assertAckLease();
 
@@ -1461,7 +1466,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
       const resolvedTopic = group === 'send' ? runtime.resolveTopicBinding(topic, streamKey) : undefined;
       const boundTopicMailbox = resolvedTopic
-        ? resolveBoundMailboxId(streamKey ? `${topic}:${streamKey}` : topic, resolvedTopic.binding)
+        ? resolveBoundMailboxId(streamKey ? `${topic}:${streamKey}` : topic, toMailboxTopicBinding(resolvedTopic.binding, runtime.config.executorConfig))
         : undefined;
       const callerMatchesBoundTopic = Boolean(
         callerBinding && resolvedTopic && (
@@ -1484,7 +1489,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
               : (callerMatchesBoundTopic && resolvedTopic?.binding.rotateAfterWaves !== undefined
                 ? boundTopicMailbox
                 : undefined)));
-      if (callerBinding && replyMailbox) replyMailbox = runtime.mailbox.pinRotatingSessionMailbox(replyMailbox, callerBinding.terminalHandle);
+      if (callerBinding && replyMailbox) replyMailbox = pinOrcaTerminalSessionMailbox(runtime.mailbox, replyMailbox, callerBinding.terminalHandle);
       if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
       result = await runtime.emitter.emit({
         networkId,

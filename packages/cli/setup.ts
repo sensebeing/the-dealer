@@ -3,24 +3,15 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { redactProjectManifest, readProjectManifest, validateTopicBindings } from './config.ts';
 import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, TopicBindingConfig } from './config.ts';
-import { CONVERSATION_MODES, resolveOrcaWaveRotateAfterWaves } from '../mailbox/index.ts';
+import { CONVERSATION_MODES } from '../mailbox/index.ts';
+import { resolveOrcaWaveRotateAfterWaves } from '../plugins-orca/index.ts';
 import { findExecutable } from '../subprocess/index.ts';
-import type { AgentConversationMode, SupportedAgentHost } from '../plugins-executor/index.ts';
-import { normalizeConversationModeInput } from '../agent-host/index.ts';
+import type { AgentConversationMode } from '../core-types/index.ts';
+import type { SupportedAgentHost } from '../plugins-agent-host/index.ts';
+import { normalizeConversationModeInput } from '../core-types/index.ts';
 
-export const AGENT_HOST_CATALOG = [
-  { host: 'orca', command: 'orca', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agent', 'workspacePath'], description: 'Orca managed worktrees and idle-gated conversations.' },
-  { host: 'antigravity', command: 'agy', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity in Orca managed worktrees.' },
-  { host: 'claude-code', command: 'claude', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Claude Code conversations.' },
-  { host: 'codex', command: 'codex', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Codex execution.' },
-  { host: 'chatgpt-dot', command: 'dot', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT Dot bridge.' },
-  { host: 'grok-bot', command: 'grok-bot', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['targetBot', 'sessionId'], description: 'Grok bridge.' },
-  { host: 'claude-app', command: 'claude-app', surface: 'app', app: 'Claude', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Claude app bridge.' },
-  { host: 'chatgpt-app', command: 'dot', surface: 'app', app: 'ChatGPT', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'targetBot', 'sessionId'], description: 'ChatGPT app bridge.' },
-  { host: 'antigravity-app', command: 'antigravity-app', surface: 'app', app: 'Antigravity', modes: CONVERSATION_MODES, selectors: ['workspacePath'], description: 'Antigravity app bridge.' },
-  { host: 'codex-cli', command: 'codex', surface: 'cli', modes: CONVERSATION_MODES, selectors: ['agentProfile', 'sessionId'], description: 'Codex CLI bridge.' },
-  { host: 'antigravity-cli', command: 'agy', surface: 'cli', modes: ['spawn', 'inbox-only'] as const, selectors: ['workspacePath'], description: 'Antigravity CLI bridge.' },
-] as const;
+export { AGENT_HOST_DESCRIPTORS as AGENT_HOST_CATALOG } from '../plugins-agent-host/hosts.ts';
+import { AGENT_HOST_DESCRIPTORS as AGENT_HOST_CATALOG } from '../plugins-agent-host/hosts.ts';
 
 function readOptionalJson(path: string): any {
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;

@@ -1,3 +1,4 @@
+import { isValidMailboxId } from '../core-types/index.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -7,8 +8,6 @@ import type { Plugin } from '../kernel/index.ts';
 import type { MailboxItem, MailboxStore } from '../mailbox/store.ts';
 import { findExecutable, checkedCommand, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import type { LarkNotifyConfig } from '../cli/config.ts';
-import { validateLarkNotify } from '../cli/config.ts';
 
 interface NotifyState {
   schema: 'the-dealer-lark-notify/v1';
@@ -292,4 +291,46 @@ export function createLarkMirrorPlugin(options: LarkMailboxNotifierOptions & { n
       });
     },
   };
+}
+
+export interface LarkNotifyConfig {
+  enabled: boolean;
+  command?: string;
+  profile?: string;
+  as?: 'bot' | 'user';
+  target?: { chatId?: string; userId?: string };
+  mailboxes?: string[];
+  excludeMailboxes?: string[];
+  includeKinds?: string[];
+  excludeKinds?: string[];
+  skipSelfMessages?: boolean;
+  notifyGateApprovals?: boolean;
+  mirrorOutboundThreads?: boolean;
+  statePath?: string;
+  retryBaseMs?: number;
+}
+
+export function validateLarkNotify(config: unknown): asserts config is LarkNotifyConfig {
+  const strings = ['command', 'profile', 'statePath'];
+  const arrays = ['mailboxes', 'excludeMailboxes', 'includeKinds', 'excludeKinds'];
+  const booleans = ['skipSelfMessages', 'notifyGateApprovals', 'mirrorOutboundThreads'];
+  const allowed = new Set(['enabled', 'as', 'target', 'retryBaseMs', ...booleans, ...strings, ...arrays]);
+  if (!record(config) || typeof config.enabled !== 'boolean' ||
+      Object.keys(config).some(key => !allowed.has(key)) ||
+      strings.some(key => config[key] !== undefined && !nonempty(config[key])) ||
+      arrays.some(key => config[key] !== undefined && (!Array.isArray(config[key]) || config[key].some((value: unknown) => !nonempty(value)))) ||
+      (config.as !== undefined && !['bot', 'user'].includes(config.as)) ||
+      booleans.some(key => config[key] !== undefined && typeof config[key] !== 'boolean') ||
+      (config.retryBaseMs !== undefined && (!Number.isSafeInteger(config.retryBaseMs) || config.retryBaseMs < 1))) {
+    throw new Error('Invalid larkNotify');
+  }
+  if (config.target !== undefined && (!record(config.target) ||
+      Object.keys(config.target).some(key => !['chatId', 'userId'].includes(key)) ||
+      ['chatId', 'userId'].some(key => config.target[key] !== undefined && !nonempty(config.target[key])) ||
+      (config.target.chatId !== undefined && config.target.userId !== undefined))) {
+    throw new Error('Invalid larkNotify target');
+  }
+  for (const key of ['mailboxes', 'excludeMailboxes']) {
+    if (config[key]?.some((id: string) => !isValidMailboxId(id))) throw new Error('Invalid notification mailbox');
+  }
 }

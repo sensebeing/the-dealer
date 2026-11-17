@@ -6,3 +6,9 @@ target/
 .serena/
 *.log
 .DS_Store
+package-lock.json
+.claude/
+.agents/
+.gemini/
+.codex/
+coverage/
