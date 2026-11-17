@@ -358,6 +358,7 @@ function continuationCommandTokens(command: string, template: boolean): string[]
   const reject = () => { throw new OrcaTerminalLaunchRejectedError(`Unsupported Orca session continuation command: ${command}`); };
   for (let i = 0; i < command.length; i++) {
     const char = command[i];
+    if (/[\0\r\n]/.test(char)) reject();
     if (command.startsWith('{sessionId}', i)) {
       if (quote || escaped || (i > 0 && !/\s/.test(command[i - 1])) ||
           (i + 11 < command.length && !/\s/.test(command[i + 11]))) reject();
@@ -371,7 +372,7 @@ function continuationCommandTokens(command: string, template: boolean): string[]
       escaped = true;
       continue;
     }
-    if (!template && (/[\0\r\n]/.test(char) || (!quote && /[;|&$<>`]/.test(char)) || (quote === '"' && /[$`]/.test(char)))) reject();
+    if (!template && ((!quote && /[;|&$<>`]/.test(char)) || (quote === '"' && /[$`]/.test(char)))) reject();
     if (quote) {
       if (char === quote) quote = '';
       else token += char;
@@ -407,9 +408,9 @@ export function buildOrcaAgentLaunchCommand(options?: {
     const args = tokens.slice(1);
     const binary = agent === 'antigravity' ? 'agy' : agent;
     const conflicting = agent === 'antigravity'
-      ? args.some(arg => arg === 'run' || arg === '--conversation' || arg.startsWith('--conversation='))
+      ? args.some(arg => ['run', '--conversation', '-c', '--continue', '-p', '--print', '--prompt', '--'].includes(arg) || arg.startsWith('--conversation='))
       : agent === 'claude'
-        ? args.some(arg => ['-p', '--print', '-r', '--resume', '--session-id'].includes(arg) || arg.startsWith('--resume=') || arg.startsWith('--session-id='))
+        ? args.some(arg => ['-p', '--print', '-r', '--resume', '--session-id', '-c', '--continue', '--bg', '--background', '--'].includes(arg) || arg.startsWith('--resume=') || arg.startsWith('--session-id='))
         : args.some(arg => ['exec', 'resume', 'queue', 'login', 'mcp', 'completion', '--'].includes(arg));
     if (!tokens[0] || basename(tokens[0]) !== binary || conflicting) {
       throw new OrcaTerminalLaunchRejectedError(`Unsupported Orca session continuation command for ${agent}: ${customCmd}`);

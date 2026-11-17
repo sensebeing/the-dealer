@@ -2741,6 +2741,7 @@ for (const [agent, command, suffix] of [
   ['codex', 'codex --dangerously-bypass-approvals-and-sandbox --model gpt-5', " resume 'A'"],
   ['claude', 'custom-wrapper --session {sessionId}', 'template'],
   ['claude', 'custom-wrapper --flag', 'reject'],
+  ['claude', 'wrapper {sessionId}\nother', 'reject'],
 ] as const) {
   test(`custom continuation through wakeup: ${command}`, async t => {
     const root = directory(t);
@@ -2823,7 +2824,56 @@ test('custom continuation rejects ambiguous syntax, quoted placeholders and conf
     ['antigravity', 'agy run'], ['antigravity', 'agy --conversation=A'],
     ['codex', 'codex exec'], ['codex', 'codex resume A'], ['codex', 'codex --'], ['codex', 'codex mcp'],
   ] as const) assert.throws(() => buildOrcaAgentLaunchCommand({ agent, interactiveCommand, sessionId: 'A' }), OrcaTerminalLaunchRejectedError);
+  for (const [agent, flags] of [
+    ['antigravity', ['-c', '--continue', '-p', '--print', '--prompt', '--']],
+    ['claude', ['-c', '--continue', '--bg', '--background', '--']],
+  ] as const) {
+    for (const flag of flags) assert.throws(() => buildOrcaAgentLaunchCommand({
+      agent, sessionId: 'A', interactiveCommand: `${agent === 'antigravity' ? 'agy' : agent} ${flag}`,
+    }), OrcaTerminalLaunchRejectedError);
+  }
   assert.throws(() => buildOrcaAgentLaunchCommand({ interactiveCommand: 'wrapper {sessionId}' }), /requires a sessionId/);
   assert.equal(buildOrcaAgentLaunchCommand({ agent: 'claude', interactiveCommand: '"/opt/claude" --model "opus"', sessionId: 'A' }), '"/opt/claude" --model "opus" --resume \'A\'');
   assert.equal(buildOrcaAgentLaunchCommand({ interactiveCommand: 'wrapper {sessionId} {sessionId}', sessionId: "a'b" }), "wrapper 'a'\\''b' 'a'\\''b'");
 });
+
+for (const source of ['refresh', 'wave'] as const) {
+  test(`${source} commits mail before rejecting an unsupported configured continuation`, async t => {
+    const root = directory(t);
+    const stateDir = join(root, 'state');
+    const workspacePath = join(root, 'workspace');
+    const mailboxId = 'stream:unsupported';
+    const { runner, state } = fakeOrcaWorkspace(workspacePath);
+    new MailboxStore(join(stateDir, 'mailbox.json')).upsertWakeTarget(mailboxId, {
+      mode: 'orca-terminal', workspacePath, sessionId: 'A', configuredSessionId: 'A', agent: 'claude',
+      interactiveCommand: 'claude --dangerously-skip-permissions',
+    });
+    const binding = { executor: 'orca-wave', mailboxId, workspacePath, sessionId: 'A', agent: 'claude',
+      interactiveCommand: 'custom-wrapper --flag',
+    };
+    const runtime = await new DealerNodeRuntime({
+      stateDir, member: 'worker', name: 'worker', profile: 'headless-relay',
+      transport: { discoveryDir: join(root, 'mesh') }, commandRunner: runner,
+      patch: { defaultExecutor: 'inbox', executors: ['orca-wave', 'inbox'], topicBindings: {
+        unsupported: { ...binding, interactiveCommand: source === 'refresh' ? binding.interactiveCommand : 'claude --dangerously-skip-permissions' },
+      } },
+    }).start();
+    t.after(() => runtime.stop());
+    await runtime.wakeups.stop();
+    const service = new WakeupRedriveService({ store: runtime.mailbox, commandRunner: runner });
+    t.after(() => service.stop());
+    if (source === 'wave') {
+      const plugin = createOrcaWaveExecutorPlugin({ store: runtime.mailbox, resolveTopicBinding: () => binding, commandRunner: runner });
+      await plugin.execute([alert('unsupported')], { networkId: 'team', nodeId: 'receiver', traceId: 'unsupported' }, {});
+    } else runtime.mailbox.enqueue([alert('unsupported')], { mailboxId });
+    assert.equal(runtime.mailbox.list({ mailboxId }).queuedCount, 1);
+    assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false);
+    const target = runtime.mailbox.getWakeTarget(mailboxId)!;
+    assert.equal(target.pendingWake, true);
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.match(target.lastWakeError!, /Unsupported Orca session continuation command/);
+    assert.equal(runtime.mailbox.list({ mailboxId }).queuedCount, 1);
+    assert.equal(state.created, 0);
+    assert.equal(terminalSends(state.calls).length, 0);
+  });
+}

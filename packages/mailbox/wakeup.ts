@@ -175,10 +175,6 @@ export function resolveConfiguredOrcaWakeTargetPatch(
       configuredSessionId: undefined, agent: input.configuredAgent,
     };
   }
-  if (input.configuredInteractiveCommand !== undefined && existing?.interactiveCommand !== undefined &&
-      input.configuredInteractiveCommand !== existing.interactiveCommand) {
-    buildOrcaAgentLaunchCommand({ agent: identity.agent, sessionId: identity.sessionId, interactiveCommand: input.configuredInteractiveCommand });
-  }
   return { mode: 'orca-terminal', ...identity, ...commandPatch };
 }
 
