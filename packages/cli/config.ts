@@ -1,10 +1,17 @@
+import { parseAgentHost, usesAgentHostInvocation } from '../plugins-agent-host/index.ts';
+import { orcaAgent } from '../plugins-orca/index.ts';
+import type { MailboxTopicBinding } from '../mailbox/index.ts';
+import { validateLarkNotify } from '../plugins-lark-notifier/index.ts';
+import type { LarkNotifyConfig } from '../plugins-lark-notifier/index.ts';
+export { validateLarkNotify } from '../plugins-lark-notifier/index.ts';
+export type { LarkNotifyConfig } from '../plugins-lark-notifier/index.ts';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 import { isValidMailboxId } from '../core-types/index.ts';
-import type { AdmissionMode, NetworkMountConfig } from '../core-types/index.ts';
+import type { AdmissionMode, NetworkMountConfig, AgentConversationMode } from '../core-types/index.ts';
 import { CONVERSATION_MODES, isStreamConversationBinding } from '../mailbox/index.ts';
-import { normalizeConversationModeInput } from '../agent-host/index.ts';
+import { normalizeConversationModeInput } from '../core-types/index.ts';
 
 export interface BuiltInProfile {
   name: string;
@@ -228,8 +235,8 @@ export interface TopicBindingConfig {
   agent?: 'orca' | 'antigravity' | 'antigravity-cli' | 'antigravity-app' | 'claude' | 'claude-code' | 'claude-app' | 'codex' | 'codex-cli' | 'chatgpt-app' | 'chatgpt-dot' | 'grok-bot';
   interactiveCommand?: string;
   resumeCommand?: string;
-  mode?: 'spawn' | 'wave' | 'fixed' | 'inbox-only';
-  conversationMode?: 'spawn' | 'wave' | 'fixed' | 'inbox-only';
+  mode?: AgentConversationMode;
+  conversationMode?: AgentConversationMode;
   targetBot?: string;
   agentProfile?: string;
   sessionId?: string;
@@ -249,23 +256,6 @@ export interface TopicBindingConfig {
   notifyLark?: boolean;
 }
 
-export interface LarkNotifyConfig {
-  enabled: boolean;
-  command?: string;
-  profile?: string;
-  as?: 'bot' | 'user';
-  target?: { chatId?: string; userId?: string };
-  mailboxes?: string[];
-  excludeMailboxes?: string[];
-  includeKinds?: string[];
-  excludeKinds?: string[];
-  skipSelfMessages?: boolean;
-  notifyGateApprovals?: boolean;
-  mirrorOutboundThreads?: boolean;
-  statePath?: string;
-  retryBaseMs?: number;
-}
-
 export function validateTopicBindings(bindings: unknown, enabledExecutors: readonly string[]): asserts bindings is Record<string, TopicBindingConfig> {
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
   const strings = ['assignee', 'agent', 'interactiveCommand', 'resumeCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
@@ -274,6 +264,10 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
   for (const [kind, binding] of Object.entries(bindings)) {
     if (isRecord(binding)) {
       try {
+        if (binding.agent !== undefined) {
+          parseAgentHost(binding.agent);
+          if (['orca', 'orca-wave', 'orca-spawn'].includes(binding.executor)) orcaAgent(binding.agent);
+        }
         const normalizedMode = normalizeConversationModeInput(binding);
         if (normalizedMode !== undefined) {
           binding.mode = normalizedMode;
@@ -284,14 +278,9 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
       }
     }
     if (!nonempty(kind) || (kind.includes(':') && (!nonempty(kind.slice(0, kind.indexOf(':'))) || !nonempty(kind.slice(kind.indexOf(':') + 1)))) || !isRecord(binding) || !enabledExecutors.includes(binding.executor) ||
-        (binding.agent !== undefined && !['orca', 'antigravity', 'antigravity-cli', 'antigravity-app', 'claude', 'claude-code', 'claude-app', 'codex', 'codex-cli', 'chatgpt-app', 'chatgpt-dot', 'grok-bot'].includes(binding.agent)) ||
-        (binding.mode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.mode)) ||
-        (binding.conversationMode !== undefined && !['spawn', 'wave', 'fixed', 'inbox-only'].includes(binding.conversationMode)) ||
-        (binding.mode !== undefined && binding.conversationMode !== undefined && binding.mode !== binding.conversationMode) ||
         (binding.mode === 'inbox-only' && binding.executor !== 'inbox') ||
         (binding.executor === 'antigravity-cli' && binding.mode !== undefined && binding.mode !== 'spawn' && binding.mode !== 'inbox-only') ||
         (binding.executor === 'antigravity' && binding.mode === 'wave') ||
-        (['orca', 'orca-wave', 'orca-spawn'].includes(binding.executor) && binding.agent !== undefined && !['antigravity', 'antigravity-cli', 'claude', 'claude-code', 'codex', 'codex-cli'].includes(binding.agent)) ||
         Object.keys(binding).some(key => !allowed.has(key)) ||
         strings.some(key => binding[key] !== undefined && !nonempty(binding[key])) ||
         booleans.some(key => binding[key] !== undefined && typeof binding[key] !== 'boolean') ||
@@ -299,35 +288,10 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
         (binding.rotateAfterWaves !== undefined && (!Number.isSafeInteger(binding.rotateAfterWaves) || binding.rotateAfterWaves < 1)) ||
         (binding.mailboxId !== undefined && !isValidMailboxId(binding.mailboxId)) ||
         (binding.streamKey !== undefined && !isValidMailboxId(`stream:${binding.streamKey}`)) ||
-        (isStreamConversationBinding(binding) && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
+        (isStreamConversationBinding(toMailboxTopicBinding(binding as unknown as TopicBindingConfig)) && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||
         (binding.projectId !== undefined && !validProjectId(binding.projectId))) {
       throw new Error(`Invalid topic binding: ${kind}`);
     }
-  }
-}
-
-export function validateLarkNotify(config: unknown): asserts config is LarkNotifyConfig {
-  const strings = ['command', 'profile', 'statePath'];
-  const arrays = ['mailboxes', 'excludeMailboxes', 'includeKinds', 'excludeKinds'];
-  const booleans = ['skipSelfMessages', 'notifyGateApprovals', 'mirrorOutboundThreads'];
-  const allowed = new Set(['enabled', 'as', 'target', 'retryBaseMs', ...booleans, ...strings, ...arrays]);
-  if (!isRecord(config) || typeof config.enabled !== 'boolean' ||
-      Object.keys(config).some(key => !allowed.has(key)) ||
-      strings.some(key => config[key] !== undefined && !nonempty(config[key])) ||
-      arrays.some(key => config[key] !== undefined && (!Array.isArray(config[key]) || config[key].some((value: unknown) => !nonempty(value)))) ||
-      (config.as !== undefined && !['bot', 'user'].includes(config.as)) ||
-      booleans.some(key => config[key] !== undefined && typeof config[key] !== 'boolean') ||
-      (config.retryBaseMs !== undefined && (!Number.isSafeInteger(config.retryBaseMs) || config.retryBaseMs < 1))) {
-    throw new Error('Invalid larkNotify');
-  }
-  if (config.target !== undefined && (!isRecord(config.target) ||
-      Object.keys(config.target).some(key => !['chatId', 'userId'].includes(key)) ||
-      ['chatId', 'userId'].some(key => config.target[key] !== undefined && !nonempty(config.target[key])) ||
-      (config.target.chatId !== undefined && config.target.userId !== undefined))) {
-    throw new Error('Invalid larkNotify target');
-  }
-  for (const key of ['mailboxes', 'excludeMailboxes']) {
-    if (config[key]?.some((id: string) => !isValidMailboxId(id))) throw new Error('Invalid notification mailbox');
   }
 }
 
@@ -507,5 +471,35 @@ export function decodeNetworkInvite(uri: string): NetworkMountConfig {
     networkId: decodeURIComponent(url.pathname.slice(1)),
     passphrase,
     bootstrapPeers: url.searchParams.getAll('seed'),
+  };
+}
+
+/** Translate receiver configuration into the mailbox's mode-only addressing contract. */
+export function toMailboxTopicBinding(binding: TopicBindingConfig, executorConfig?: Record<string, Record<string, any>>, payload?: Record<string, unknown>): MailboxTopicBinding {
+  const config = executorConfig?.[binding.executor];
+  let payloadMode: AgentConversationMode | undefined;
+  let agent: ReturnType<typeof parseAgentHost> | undefined;
+  // Queued payloads have not passed executor validation; malformed hints carry no addressing authority.
+  try {
+    payloadMode = normalizeConversationModeInput(payload);
+  } catch {
+    // Executor validation remains authoritative when delivery is attempted.
+  }
+  try {
+    agent = parseAgentHost(payload?.agent ?? binding.agent ?? config?.agent);
+  } catch {
+    // An absent or malformed host hint cannot select host-backed addressing.
+  }
+  const explicit = payloadMode ?? normalizeConversationModeInput(binding) ?? normalizeConversationModeInput(config);
+  const mode = explicit ?? (binding.executor === 'inbox' || binding.executor === 'notify' ||
+    (binding.executor === 'agent-pty' && !usesAgentHostInvocation(agent, explicit)) ? 'inbox-only'
+    : binding.executor === 'orca-wave' ? 'wave'
+    : binding.executor === 'orca' && (binding.rotateAfterWaves !== undefined || binding.streamKey !== undefined || binding.workspacePath !== undefined || binding.runId !== undefined || binding.terminalHandle !== undefined) ? 'wave'
+    : 'spawn');
+  return {
+    ...(binding.mailboxId !== undefined ? { mailboxId: binding.mailboxId } : {}),
+    ...(binding.streamKey !== undefined ? { streamKey: binding.streamKey } : {}),
+    mode,
+    ...(binding.executor === 'orca-wave' || (binding.executor === 'orca' && (mode === 'wave' || mode === 'fixed')) ? { stream: true } : {}),
   };
 }

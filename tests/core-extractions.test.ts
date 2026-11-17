@@ -1,3 +1,4 @@
+import { toMailboxTopicBinding } from '../packages/cli/config.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -317,7 +318,7 @@ test('receiver resolves compound stream bindings without sender preparation and 
     assert.equal(runtime.resolveExecutorName(message), 'orca-wave');
     const result = await runtime.kernel.ctx.services.dispatcher.dispatch(message);
     assert.equal(result.stage, 'dispatched');
-    assert.equal(runtime.mailbox.getWakeTarget(`stream:${streamKey}`)?.workspacePath, workspace);
+    assert.equal(runtime.mailbox.getWakeTarget(`stream:${streamKey}`)?.driverConfig?.workspacePath, workspace);
     const items = runtime.mailbox.listItemsAfterSequence(-1).filter(item => item.mailboxId === `stream:${streamKey}`);
     assert.equal(items.length, 1);
     assert.deepEqual(items[0].envelope, message);
@@ -332,9 +333,9 @@ test('receiver resolves compound stream bindings without sender preparation and 
   assert.equal(outbound.semantic?.replyMailbox, 'stream:tools-alert');
   assert.equal(outbound.semantic?.targetMailbox, 'remote-mailbox');
   assert.equal(runtime.resolveExecutorName(envelope('fallback')), 'inbox');
-  assert.equal(resolveBoundMailboxId('wave.alert.v1:tools-alert', { executor: 'orca-wave' }), 'stream:tools-alert');
-  assert.equal(resolveBoundMailboxId('wave.alert.v1:tools-alert', { executor: 'orca-wave', streamKey: 'custom' }), 'stream:custom');
-  assert.equal(resolveMailboxId(envelope('explicit', { payload: { executor: 'orca-wave' } }), 'orca-wave', { executor: 'orca-wave', streamKey: 'bound' }), 'stream:bound');
+  assert.equal(resolveBoundMailboxId('wave.alert.v1:tools-alert', toMailboxTopicBinding({ executor: 'orca-wave' })), 'stream:tools-alert');
+  assert.equal(resolveBoundMailboxId('wave.alert.v1:tools-alert', toMailboxTopicBinding({ executor: 'orca-wave', streamKey: 'custom' })), 'stream:custom');
+  assert.equal(resolveMailboxId(envelope('explicit', { payload: { executor: 'orca-wave' } }), toMailboxTopicBinding({ executor: 'orca-wave', streamKey: 'bound' }), undefined, toMailboxTopicBinding({ executor: 'orca-wave' }).mode), 'stream:bound');
   for (const binding of [{ executor: 'orca-spawn', noParent: 'yes' }, { executor: 'orca-spawn', assignee: '' }]) {
     assert.throws(() => validateTopicBindings({ topic: binding }, ['orca-spawn']), /Invalid/);
   }

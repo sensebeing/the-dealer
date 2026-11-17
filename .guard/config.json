@@ -93,19 +93,7 @@
         ]
       },
       {
-        "path": "packages/agent-host",
-        "languages": [
-          "TypeScript"
-        ],
-        "boundary_docs": [
-          "AGENTS.md",
-          "docs/architecture.md"
-        ],
-        "dependencies": [],
-        "role": "Stateless invocation and JSON-receipt continuation builder for standalone CLI and desktop-app agent hosts (excluding Orca workspace TUI tabs)."
-      },
-      {
-        "path": "packages/orca-workspace",
+        "path": "packages/plugins-agent-host",
         "languages": [
           "TypeScript"
         ],
@@ -114,10 +102,33 @@
           "docs/architecture.md"
         ],
         "dependencies": [
+          "packages/core-types",
           "packages/fs-atomic",
-          "packages/subprocess"
+          "packages/subprocess",
+          "packages/mailbox",
+          "packages/plugins-executor"
         ],
-        "role": "Sole adapter owner of Orca CLI workspace/terminal inspection, Orca TUI session/pane binding transitions and retirement provenance, and validated fresh/continuation TUI launch commands."
+        "layer": "plugin",
+        "role": "Standalone CLI and desktop-app host descriptors, invocation and receipt continuation, host wakeup driver and executors."
+      },
+      {
+        "path": "packages/plugins-orca",
+        "languages": [
+          "TypeScript"
+        ],
+        "boundary_docs": [
+          "AGENTS.md",
+          "docs/architecture.md"
+        ],
+        "dependencies": [
+          "packages/core-types",
+          "packages/subprocess",
+          "packages/mailbox",
+          "packages/plugins-agent-host",
+          "packages/plugins-executor"
+        ],
+        "layer": "plugin",
+        "role": "Orca workspace and terminal inspection, composer guards, session/pane binding transitions and retirement provenance, validated fresh/continuation TUI commands, wakeup drivers and executors."
       },
       {
         "path": "packages/transport",
@@ -225,12 +236,11 @@
         ],
         "dependencies": [
           "packages/core-types",
-          "packages/agent-host",
-          "packages/orca-workspace",
           "packages/fs-atomic",
           "packages/subprocess"
         ],
-        "role": "Host-agnostic durable mailbox and outbox ledgers, bindingRevision CAS launch fencing, and WakeupRedriveService scheduling."
+        "layer": "core",
+        "role": "Host-agnostic v2 mailbox ledgers with opaque driverConfig, bindingRevision CAS launch and settlement fencing, and WakeupDriver scheduling."
       },
       {
         "path": "packages/plugins-policy",
@@ -274,8 +284,6 @@
         "dependencies": [
           "packages/core-types",
           "packages/kernel",
-          "packages/plugins-policy",
-          "packages/plugins-router",
           "packages/fs-atomic",
           "packages/subprocess"
         ]
@@ -292,13 +300,10 @@
         ],
         "dependencies": [
           "packages/core-types",
-          "packages/agent-host",
           "packages/mailbox",
-          "packages/orca-workspace",
-          "packages/cli",
           "packages/subprocess"
         ],
-        "role": "Inbound task, wave, inbox, and notification executors delegating standalone host invocations to agent-host and Orca TUI workspace/session semantics to mailbox and orca-workspace."
+        "role": "Generic inbound executor utilities and mailbox authority contracts; concrete host and Orca behavior belongs to their plugins."
       },
       {
         "path": "packages/plugins-lark-notifier",
@@ -343,9 +348,11 @@
           "packages/plugins-lark-notifier",
           "packages/process-lock",
           "packages/fs-atomic",
-          "packages/subprocess"
+          "packages/subprocess",
+          "packages/plugins-orca",
+          "packages/plugins-agent-host"
         ],
-        "role": "CLI, control-socket RPC, daemon runtime, and binding presets routing caller and configured Orca wake-target updates through mailbox."
+        "role": "CLI and control-socket RPC, daemon composition and binding presets; injects wakeup drivers and delegates Orca binding transitions to plugins-orca."
       }
     ],
     "forbidden_imports": [
@@ -361,8 +368,8 @@
           "../dispatcher",
           "../emitter",
           "../mailbox",
-          "../orca-workspace",
-          "../agent-host",
+          "../plugins-orca",
+          "../plugins-agent-host",
           "../plugins-policy",
           "../plugins-router",
           "../plugins-source",
@@ -384,8 +391,8 @@
           "../dispatcher",
           "../emitter",
           "../mailbox",
-          "../orca-workspace",
-          "../agent-host",
+          "../plugins-orca",
+          "../plugins-agent-host",
           "../plugins-policy",
           "../plugins-router",
           "../plugins-source",
@@ -398,18 +405,6 @@
         "message": "kernel owns lifecycle and dependency injection only; it must not import P2P, routing, gate, mailbox, or executor modules."
       },
       {
-        "from": "packages/agent-host/",
-        "imports": [
-          "../mailbox",
-          "../plugins-executor",
-          "../cli",
-          "../dispatcher",
-          "../gate"
-        ],
-        "rule_id": "guard.code-organization",
-        "message": "agent-host is a shared leaf builder for host CLI invocations and must not depend on mailbox or executor packages."
-      },
-      {
         "from": "packages/mailbox/",
         "imports": [
           "../plugins-executor",
@@ -417,17 +412,23 @@
           "../dispatcher",
           "../gate",
           "../router",
-          "../transport"
+          "../transport",
+          "../plugins-orca",
+          "../plugins-agent-host",
+          "../plugins-policy",
+          "../plugins-router",
+          "../plugins-source",
+          "../plugins-lark-notifier"
         ],
         "rule_id": "guard.service-boundaries",
-        "message": "mailbox owns durable storage and wakeup redrive; use agent-host and orca-workspace rather than importing plugins-executor or cli."
+        "message": "mailbox owns opaque durable storage and driver-neutral redrive; all external host behavior is injected by Ring-2 plugins."
       },
       {
         "from": "packages/gate/",
         "imports": [
           "../plugins-executor",
           "../cli",
-          "../orca-workspace"
+          "../plugins-orca"
         ],
         "rule_id": "guard.service-boundaries",
         "message": "gate owns inbound admission only and must not invoke executors directly."
@@ -443,7 +444,7 @@
       {
         "from": "packages/plugins-router/",
         "imports": [
-          "../orca-workspace"
+          "../plugins-orca"
         ],
         "rule_id": "guard.service-boundaries",
         "message": "plugins-router must use subprocess for generic OS commands, not depend on Orca workspace operations."
@@ -451,7 +452,7 @@
       {
         "from": "packages/plugins-source/",
         "imports": [
-          "../orca-workspace"
+          "../plugins-orca"
         ],
         "rule_id": "guard.service-boundaries",
         "message": "plugins-source must use subprocess for generic OS commands, not depend on Orca workspace operations."
@@ -459,18 +460,75 @@
       {
         "from": "packages/plugins-lark-notifier/",
         "imports": [
-          "../orca-workspace"
+          "../plugins-orca"
         ],
         "rule_id": "guard.service-boundaries",
         "message": "plugins-lark-notifier must use subprocess for generic OS commands, not depend on Orca workspace operations."
       },
       {
-        "from": "packages/cli/",
+        "from": "packages/plugins-agent-host/",
         "imports": [
-          "../orca-workspace"
+          "../cli"
         ],
         "rule_id": "guard.service-boundaries",
-        "message": "cli must not import orca-workspace directly; route Orca wake-target updates through mailbox and use subprocess for generic OS commands."
+        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
+      },
+      {
+        "from": "packages/plugins-orca/",
+        "imports": [
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
+      },
+      {
+        "from": "packages/plugins-policy/",
+        "imports": [
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
+      },
+      {
+        "from": "packages/plugins-router/",
+        "imports": [
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
+      },
+      {
+        "from": "packages/plugins-source/",
+        "imports": [
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
+      },
+      {
+        "from": "packages/plugins-executor/",
+        "imports": [
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
+      },
+      {
+        "from": "packages/plugins-lark-notifier/",
+        "imports": [
+          "../cli"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Plugins expose structural contracts to the CLI assembly root; plugins must not depend on CLI configuration or runtime."
+      },
+      {
+        "from": "packages/plugins-executor/",
+        "imports": [
+          "../plugins-orca",
+          "../plugins-agent-host"
+        ],
+        "rule_id": "guard.service-boundaries",
+        "message": "Generic executor utilities must remain host-neutral."
       }
     ],
     "architecture_docs": [

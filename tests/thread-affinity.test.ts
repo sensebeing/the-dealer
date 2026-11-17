@@ -1,3 +1,5 @@
+import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createOrcaWakeupDrivers } from '../packages/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,8 +9,6 @@ import { join } from 'node:path';
 import {
   DealerNodeRuntime,
   MailboxStore,
-  readOrcaSessionBinding,
-  writeOrcaSessionBinding,
   WakeupRedriveService,
   createOrcaWaveExecutorPlugin,
   runDealerCli,
@@ -20,9 +20,7 @@ import type {
   MessageEnvelope,
 } from '../packages/index.ts';
 
-function sessionBinding(target: { adapterState?: Readonly<Record<string, string>>; mailboxId?: string } | undefined) {
-  return readOrcaSessionBinding(target?.adapterState, target?.mailboxId);
-}
+function sessionBinding(target) { return target?.driverConfig ?? {}; }
 
 function directory(t: TestContext): string {
   const root = mkdtempSync(join(tmpdir(), 'dealer-thread-affinity-'));
@@ -89,10 +87,12 @@ test('thread replies wake the originating worktree session instead of the topic 
     originMailbox,
   );
   store.upsertWakeTarget(originMailbox, {
-    mode: 'orca-terminal',
-    workspacePath: originWorkspace,
-    worktreeId: 'wt-halfbeak-2',
-    terminalHandle: 'term_origin',
+    driver: 'orca-terminal',
+    driverConfig: {
+      workspacePath: originWorkspace,
+      worktreeId: 'wt-halfbeak-2',
+      terminalHandle: 'term_origin',
+    },
   });
 
   const calls: CommandRequest[] = [];
@@ -102,8 +102,7 @@ test('thread replies wake the originating worktree session instead of the topic 
   };
   const wakeup = new WakeupRedriveService({
     store,
-    commandRunner: runner,
-    idleCheck: async () => ({ idle: true }),
+    drivers: createTestWakeupDrivers({ commandRunner: runner, idleCheck: async () => ({ idle: true }) }),
   });
   t.after(() => wakeup.stop());
   const plugin = createOrcaWaveExecutorPlugin({
@@ -137,9 +136,9 @@ test('thread replies wake the originating worktree session instead of the topic 
   assert.equal(store.list({ mailboxId: originMailbox }).queuedCount, 1);
   assert.equal(store.list({ mailboxId: 'stream:inbox' }).totalCount, 0);
   const preserved = store.getWakeTarget(originMailbox)!;
-  assert.equal(preserved.workspacePath, originWorkspace);
-  assert.equal(preserved.worktreeId, 'wt-halfbeak-2');
-  assert.equal(preserved.terminalHandle, 'term_origin');
+  assert.equal(preserved.driverConfig?.workspacePath, originWorkspace);
+  assert.equal(preserved.driverConfig?.worktreeId, 'wt-halfbeak-2');
+  assert.equal(preserved.driverConfig?.terminalHandle, 'term_origin');
   assert.equal(preserved.rotateAfterWaves, undefined);
   assert.equal(store.getWakeTarget('stream:inbox'), undefined);
   assert.equal(terminalSends(calls).length, 1);
@@ -161,8 +160,8 @@ test('thread replies wake the originating worktree session instead of the topic 
   assert.equal(store.list({ mailboxId: originMailbox }).queuedCount, 2);
   assert.equal(store.list({ mailboxId: 'stream:inbox' }).totalCount, 0);
   const stillPreserved = store.getWakeTarget(originMailbox)!;
-  assert.equal(stillPreserved.workspacePath, originWorkspace);
-  assert.equal(stillPreserved.terminalHandle, 'term_origin');
+  assert.equal(stillPreserved.driverConfig?.workspacePath, originWorkspace);
+  assert.equal(stillPreserved.driverConfig?.terminalHandle, 'term_origin');
   assert.equal(stillPreserved.rotateAfterWaves, undefined);
   assert.equal(terminalSends(calls).length, 1);
   assert.equal(terminalOf(terminalSends(calls)[0]), 'term_origin');
@@ -193,8 +192,10 @@ test('a session mailbox with no live wake target infers its Orca worktree', asyn
     [peer.nodeId],
     'worktree:halfbeak-2',
   );
+  const wakeup = new WakeupRedriveService({ store, drivers: createOrcaWakeupDrivers({ commandRunner: runner }), flushIntervalMs: 100_000 });
+  t.after(() => wakeup.stop());
   const plugin = createOrcaWaveExecutorPlugin({
-    store,
+    store, wakeup,
     commandRunner: runner,
     resolveTopicBinding: () => undefined,
   });
@@ -205,9 +206,9 @@ test('a session mailbox with no live wake target infers its Orca worktree', asyn
   );
   assert.equal(store.list({ mailboxId: 'worktree:halfbeak-2' }).queuedCount, 1);
   const inferred = store.getWakeTarget('worktree:halfbeak-2')!;
-  assert.equal(inferred.mode, 'orca-terminal');
-  assert.equal(inferred.workspacePath, '/orca/halfbeak-2');
-  assert.equal(inferred.worktreeId, 'wt-2');
+  assert.equal(inferred.driver, 'orca-terminal');
+  assert.equal(inferred.driverConfig?.workspacePath, '/orca/halfbeak-2');
+  assert.equal(inferred.driverConfig?.worktreeId, 'wt-2');
   assert.equal(inferred.rotateAfterWaves, undefined);
   assert.equal(store.getWakeTarget('stream:inbox'), undefined);
 });
@@ -414,8 +415,8 @@ for (const agent of ['claude', 'codex'] as const) {
     const root = directory(t);
     const store = new MailboxStore(join(root, 'mailbox.json'));
     const mailboxId = 'worktree:origin';
-    const identity = { workspacePath: join(root, 'origin'), agent, sessionId: 'original-session', adapterState: writeOrcaSessionBinding({ paneKey: 'original:pane' }), interactiveCommand: 'receiver-command' };
-    store.upsertWakeTarget(mailboxId, { mode: 'orca-terminal', ...identity });
+    const identity = { workspacePath: join(root, 'origin'), agent, sessionId: 'original-session', ...{ paneKey: 'original:pane' }, interactiveCommand: 'receiver-command' };
+    store.upsertWakeTarget(mailboxId, { driver: 'orca-terminal', driverConfig: { ...identity }});
     store.recordOutboundEnvelope(envelope('request', {
       semantic: { type: 'message', threadId: 'original-thread', replyMailbox: mailboxId },
     }), [peer.nodeId], mailboxId);
@@ -425,7 +426,7 @@ for (const agent of ['claude', 'codex'] as const) {
       payload: { workspacePath: '/sender/impostor', agent: 'antigravity' },
     })], context, {});
     const target = store.getWakeTarget(mailboxId)!;
-    for (const key of Object.keys(identity) as Array<keyof typeof identity>) assert.deepEqual(target[key], identity[key], key);
+    for (const key of Object.keys(identity) as Array<keyof typeof identity>) assert.deepEqual(target.driverConfig?.[key], identity[key], key);
     assert.equal(store.list({ mailboxId }).queuedCount, 1);
   });
 
@@ -434,31 +435,29 @@ for (const agent of ['claude', 'codex'] as const) {
     const store = new MailboxStore(join(root, 'mailbox.json'));
     const mailboxId = 'stream:fixed';
     const workspacePath = join(root, 'fixed');
-    store.upsertWakeTarget(mailboxId, {
-       adapterState: writeOrcaSessionBinding({ paneKey: 'runtime:pane' }), mode: 'orca-terminal', workspacePath, agent, terminalHandle: 'runtime-tab', sessionId: 'runtime-session', interactiveCommand: `${agent === 'claude' ? 'claude' : 'codex'} --model test`,
-    });
+    store.upsertWakeTarget(mailboxId, { driver: 'orca-terminal', driverConfig: {...{ paneKey: 'runtime:pane' }, workspacePath, agent, terminalHandle: 'runtime-tab', sessionId: 'runtime-session', interactiveCommand: `${agent === 'claude' ? 'claude' : 'codex'} --model test`}});
     const binding = { executor: 'orca-wave', mode: 'fixed', mailboxId, workspacePath } as const;
     const plugin = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => binding });
     for (const id of ['first', 'next']) {
       await plugin.execute([envelope(id, { payload: { workspacePath: '/sender/impostor', agent: 'antigravity' } })], context, {});
       const target = store.getWakeTarget(mailboxId)!;
-      assert.equal(target.workspacePath, workspacePath);
-      assert.equal(target.agent, agent);
-      assert.equal(target.sessionId, 'runtime-session');
+      assert.equal(target.driverConfig?.workspacePath, workspacePath);
+      assert.equal(target.driverConfig?.agent, agent);
+      assert.equal(target.driverConfig?.sessionId, 'runtime-session');
       assert.equal(sessionBinding(target).paneKey, 'runtime:pane');
-      assert.equal(target.interactiveCommand, `${agent === 'claude' ? 'claude' : 'codex'} --model test`);
+      assert.equal(target.driverConfig?.interactiveCommand, `${agent === 'claude' ? 'claude' : 'codex'} --model test`);
     }
     const explicit = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => ({
       ...binding, agent: 'antigravity', sessionId: 'configured-session', interactiveCommand: 'configured-command', resumeCommand: 'configured-command {sessionId}',
     }) });
     await explicit.execute([envelope('override')], context, {});
     const target = store.getWakeTarget(mailboxId)!;
-    assert.equal(target.agent, 'antigravity');
-    assert.equal(target.sessionId, 'configured-session');
+    assert.equal(target.driverConfig?.agent, 'antigravity');
+    assert.equal(target.driverConfig?.sessionId, 'configured-session');
     assert.equal(sessionBinding(target).configuredSessionId, 'configured-session');
-    assert.equal(target.terminalHandle, undefined);
+    assert.equal(target.driverConfig?.terminalHandle, undefined);
     assert.equal(sessionBinding(target).paneKey, undefined);
-    assert.equal(target.interactiveCommand, 'configured-command');
+    assert.equal(target.driverConfig?.interactiveCommand, 'configured-command');
     assert.equal(sessionBinding(target).resumeCommand, 'configured-command {sessionId}');
   });
 }
@@ -471,19 +470,17 @@ test('partial unbound wave ingestion preserves the established runtime session',
   const runner: CommandRunner = async request => { calls.push(request); return { stdout: '{"ok":true}' }; };
   const plugin = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => undefined });
   await plugin.execute([envelope('initial', { kind: 'partial', payload: { workspacePath } })], context, {});
-  store.upsertWakeTarget(mailboxId, { terminalHandle: 'term-owner', sessionId: 'session-owner', agent: 'claude',
-     adapterState: writeOrcaSessionBinding({ paneKey: 'owner:pane', configuredSessionId: 'retired-config', configuredTerminalHandle: 'original-config-handle' }),
-  });
-  const wakeup = new WakeupRedriveService({ store, commandRunner: runner, idleCheck: async () => ({ idle: true }) });
+  store.upsertWakeTarget(mailboxId, { driverConfig: { terminalHandle: 'term-owner', sessionId: 'session-owner', agent: 'claude',...{ paneKey: 'owner:pane', configuredSessionId: 'retired-config', configuredTerminalHandle: 'original-config-handle' }}});
+  const wakeup = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner, idleCheck: async () => ({ idle: true }) })});
   t.after(() => wakeup.stop());
   const next = createOrcaWaveExecutorPlugin({ store, wakeup, resolveTopicBinding: () => undefined });
   await next.execute([envelope('follow-up', { kind: 'partial', payload: {} })], context, {});
   const target = store.getWakeTarget(mailboxId)!;
-  assert.equal(target.workspacePath, workspacePath);
-  assert.equal(target.terminalHandle, 'term-owner');
+  assert.equal(target.driverConfig?.workspacePath, workspacePath);
+  assert.equal(target.driverConfig?.terminalHandle, 'term-owner');
   assert.equal(sessionBinding(target).paneKey, 'owner:pane');
-  assert.equal(target.sessionId, 'session-owner');
-  assert.equal(target.agent, 'claude');
+  assert.equal(target.driverConfig?.sessionId, 'session-owner');
+  assert.equal(target.driverConfig?.agent, 'claude');
   assert.equal(sessionBinding(target).configuredSessionId, 'retired-config');
   assert.equal(sessionBinding(target).configuredTerminalHandle, 'original-config-handle');
   assert.equal(terminalSends(calls).length, 1);
@@ -491,8 +488,8 @@ test('partial unbound wave ingestion preserves the established runtime session',
   assert.equal(calls.some(call => call.args[1] === 'create'), false);
   await plugin.execute([envelope('replacement', { kind: 'partial', payload: { workspacePath: '/receiver/replacement' } })], context, {});
   const replaced = store.getWakeTarget(mailboxId)!;
-  assert.equal(replaced.workspacePath, '/receiver/replacement');
-  assert.equal(replaced.sessionId, undefined);
-  assert.equal(replaced.terminalHandle, undefined);
+  assert.equal(replaced.driverConfig?.workspacePath, '/receiver/replacement');
+  assert.equal(replaced.driverConfig?.sessionId, undefined);
+  assert.equal(replaced.driverConfig?.terminalHandle, undefined);
   assert.equal(sessionBinding(replaced).paneKey, undefined);
 });

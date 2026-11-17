@@ -1059,3 +1059,22 @@ export function unsealNetworkFrame<T = unknown>(
     );
   }
 }
+
+export const CONVERSATION_MODES = ['spawn', 'wave', 'fixed', 'inbox-only'] as const;
+export type AgentConversationMode = (typeof CONVERSATION_MODES)[number];
+export const ACTIVE_CONVERSATION_MODES = ['spawn', 'wave', 'fixed'] as const;
+export type ActiveConversationMode = (typeof ACTIVE_CONVERSATION_MODES)[number];
+export function normalizeConversationModeInput(
+  input?: { mode?: unknown; conversationMode?: unknown },
+): AgentConversationMode | undefined {
+  if (!input) return undefined;
+  if (input.mode !== undefined && input.conversationMode !== undefined && input.mode !== input.conversationMode) {
+    throw new Error('Conflicting mode and conversationMode');
+  }
+  const raw = input.mode ?? input.conversationMode;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !CONVERSATION_MODES.includes(raw as AgentConversationMode)) {
+    throw new Error(`Invalid conversation mode: ${String(raw)}`);
+  }
+  return raw as AgentConversationMode;
+}

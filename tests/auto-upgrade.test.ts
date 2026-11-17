@@ -396,7 +396,8 @@ test('dealer self-update fast-forwards clean main, syncs skill symlinks, skips d
   rmSync(reclaimDir, { recursive: true, force: true });
   writeFileSync(join(checkout, 'untracked.txt'), 'dirty checkout\n');
   const dirty = selfUpdate(updateOptions);
-  assert.equal(dirty.sourceStatus, 'skipped_dirty_checkout');
+  assert.equal(dirty.sourceStatus, 'up_to_date');
+  assert.equal(dirty.stashedLocalChanges, true);
   rmSync(join(checkout, 'untracked.txt'), { force: true });
   git(checkout, ['checkout', '-b', 'feat']);
   const offMain = selfUpdate(updateOptions);
@@ -736,5 +737,80 @@ test('background auto-update retries errors after fifteen minutes and successes 
     }));
     maybeTriggerBackgroundAutoUpdate({ stateDir });
     assert.equal(calls.length, expected, sourceStatus + ':' + minutes);
+  }
+});
+
+function updateCheckoutFixture(t: { after: (fn: () => void) => void }) {
+  const { root, stateDir } = isolatedState();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const origin = join(root, 'origin.git');
+  git(root, ['init', '--bare', '--initial-branch=main', origin]);
+  const checkout = join(root, 'checkout');
+  git(root, ['clone', origin, checkout]);
+  for (const [key, value] of [['user.name', 'Test'], ['user.email', 'test@example.com']]) git(checkout, ['config', key, value]);
+  writeFileSync(join(checkout, 'tracked.txt'), 'original\n');
+  git(checkout, ['add', '.']);
+  git(checkout, ['commit', '-m', 'initial']);
+  git(checkout, ['push', '-u', 'origin', 'main']);
+  const beforeSha = git(checkout, ['rev-parse', 'HEAD']);
+  const writer = join(root, 'writer');
+  git(root, ['clone', origin, writer]);
+  for (const [key, value] of [['user.name', 'Test'], ['user.email', 'test@example.com']]) git(writer, ['config', key, value]);
+  const update = () => selfUpdate({ stateDir, checkoutDir: checkout, homeDir: join(root, 'home'), geminiDir: join(root, 'gemini') });
+  return { root, checkout, writer, beforeSha, update };
+}
+
+for (const scenario of ['clean-restore', 'conflict', 'pull-failed'] as const) {
+  test(`dirty self-update preserves tracked, staged and untracked files: ${scenario}`, t => {
+    const { root, checkout, writer, beforeSha, update } = updateCheckoutFixture(t);
+    writeFileSync(join(checkout, 'tracked.txt'), 'local staged\n');
+    git(checkout, ['add', 'tracked.txt']);
+    writeFileSync(join(checkout, 'tracked.txt'), 'local working tree\n');
+    writeFileSync(join(checkout, 'untracked.txt'), 'local untracked\n');
+    const beforeStatus = git(checkout, ['status', '--porcelain']);
+    const beforeIndex = git(checkout, ['diff', '--cached']);
+    writeFileSync(join(writer, scenario === 'conflict' ? 'tracked.txt' : 'upstream.txt'), 'upstream\n');
+    git(writer, ['add', '.']);
+    git(writer, ['commit', '-m', 'upstream']);
+    git(writer, ['push']);
+    const upstreamSha = git(writer, ['rev-parse', 'HEAD']);
+    if (scenario === 'pull-failed') git(checkout, ['remote', 'set-url', 'origin', join(root, 'missing.git')]);
+    const report = update();
+    assert.equal(report.sourceStatus, scenario === 'clean-restore' ? 'updated' : scenario === 'conflict' ? 'stash_conflict_rolled_back' : 'error');
+    assert.equal(report.status, scenario === 'clean-restore' ? 'updated' : 'failed');
+    assert.equal(git(checkout, ['rev-parse', 'HEAD']), scenario === 'clean-restore' ? upstreamSha : beforeSha);
+    assert.equal(readFileSync(join(checkout, 'tracked.txt'), 'utf8'), 'local working tree\n');
+    assert.equal(git(checkout, ['diff', '--cached']), beforeIndex);
+    assert.equal(git(checkout, ['status', '--porcelain']), beforeStatus);
+    assert.equal(readFileSync(join(checkout, 'untracked.txt'), 'utf8'), 'local untracked\n');
+    assert.equal(git(checkout, ['stash', 'list']), '');
+    assert.equal(git(checkout, ['ls-files', '--unmerged']), '');
+    if (scenario === 'clean-restore') assert.equal(report.stashedLocalChanges, true);
+    else assert.equal(git(checkout, ['status', '--porcelain']), beforeStatus);
+    if (scenario === 'conflict') {
+      assert.equal(report.headSha, beforeSha);
+      assert.equal(report.error, 'Local changes conflicted with upstream update; rolled back cleanly to previous HEAD');
+      assert.equal(existsSync(join(checkout, 'upstream.txt')), false);
+    }
+  });
+}
+
+test('self-update preserves dirty feature branches and refuses existing merge/rebase state', t => {
+  const { checkout, beforeSha, update } = updateCheckoutFixture(t);
+  git(checkout, ['checkout', '-b', 'feature']);
+  writeFileSync(join(checkout, 'tracked.txt'), 'do not touch\n');
+  assert.equal(update().sourceStatus, 'skipped_non_main_branch');
+  git(checkout, ['checkout', 'main']);
+  for (const marker of ['MERGE_HEAD', 'rebase-merge', 'rebase-apply']) {
+    const file = join(checkout, '.git', marker);
+    if (marker === 'MERGE_HEAD') writeFileSync(file, beforeSha + '\n');
+    else mkdirSync(file);
+    const report = update();
+    assert.equal(report.sourceStatus, 'conflicted_checkout');
+    assert.equal(report.status, 'failed');
+    assert.equal(report.error, 'Checkout has unresolved merge or rebase state');
+    assert.equal(readFileSync(join(checkout, 'tracked.txt'), 'utf8'), 'do not touch\n');
+    assert.equal(git(checkout, ['stash', 'list']), '');
+    rmSync(file, { recursive: true });
   }
 });

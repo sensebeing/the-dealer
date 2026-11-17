@@ -1,3 +1,5 @@
+import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createOrcaWakeupDrivers } from '../packages/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,8 +20,10 @@ import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../packages/plugins-router/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL, isDedupCasDuplicateReceipt, isDurableQueuedReceipt, isConfirmedHandoffReceipt } from '../packages/plugins-policy/index.ts';
 import { MailboxStore, WakeupRedriveService, buildTaskPreamble } from '../packages/mailbox/index.ts';
-import { createInboxExecutorPlugin, createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, createAgentPtyExecutorPlugin, createNotifyExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-executor/index.ts';
-import { checkOrcaWorkspaceIdle } from '../packages/orca-workspace/index.ts';
+import { createInboxExecutorPlugin, createNotifyExecutorPlugin } from '../packages/plugins-executor/index.ts';
+import { createAgentPtyExecutorPlugin } from '../packages/plugins-agent-host/index.ts';
+import { createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, trustAntigravityWorkspace, SEA_CREATURE_POOL, pickSeaCreatureName } from '../packages/plugins-orca/index.ts';
+import { checkOrcaWorkspaceIdle } from '../packages/plugins-orca/index.ts';
 import { CommandNotStartedError, checkedCommand, runCommand } from '../packages/subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/subprocess/index.ts';
 import { createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../packages/plugins-source/index.ts';
@@ -187,7 +191,10 @@ test('all official executors deliver via Emitter using injected commands and not
   const commandRunner: CommandRunner = async request => { requests.push(request); return { stdout: request.args[0] === 'worktree' && request.args[1] === 'create' ? JSON.stringify({ ok: true, result: { worktree: { path: '/tmp/isolated' } } }) : '{"ok":true}' }; };
   const dir = await mkdtemp(join(tmpdir(), 'dealer-inbox-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const store = new MailboxStore(join(dir, 'mailbox.json'));
-  const wakeup = new WakeupRedriveService({ store, commandRunner, idleCheck: async () => ({ idle: true }) });
+  const wakeup = new WakeupRedriveService({
+    store,
+    drivers: createTestWakeupDrivers({ commandRunner, idleCheck: async () => ({ idle: true }) }),
+  });
   t.after(() => wakeup.stop());
   for (const executor of [createOrcaSpawnExecutorPlugin({ commandRunner }), createOrcaWaveExecutorPlugin({ runId: 'run-test', commandRunner, store, wakeup }), createAgentPtyExecutorPlugin({ commandRunner }), createNotifyExecutorPlugin({ inboxPath: join(dir, 'inbox.jsonl') })]) {
     dispatcher.registerExecutor(executor, {});
@@ -459,6 +466,8 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
     if (request.args[0] === 'terminal' && request.args[1] === 'wait' && waitFails) {
       throw new Error('wait timed out');
     }
+    if (request.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path: dir, worktreeId: 'root', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] }] } }) };
+    if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'term-agy', connected: true, writable: true, agentIdentity: 'antigravity', preview: '>' }] } }) };
     return { stdout: '{"ok":true}' };
   };
   const store = new MailboxStore(join(dir, 'mailbox.json'));
@@ -483,19 +492,22 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
     'terminal create',
     'worktree set',
     'terminal wait',
+    'worktree ps',
+    'terminal list',
+    'terminal wait',
     'terminal send',
   ]);
   assert.equal(flagValue(requests[1].args, '--command'), 'agy --dangerously-skip-permissions');
   assert.equal(flagValue(requests[2].args, '--comment'), 'dealer: antigravity');
   assert.equal(flagValue(requests[3].args, '--timeout-ms'), '5000');
-  assert.equal(flagValue(requests[4].args, '--terminal'), 'term-agy');
+  assert.equal(flagValue(requests[7].args, '--terminal'), 'term-agy');
   assert.equal(
-    flagValue(requests[4].args, '--text'),
+    flagValue(requests[7].args, '--text'),
     buildTaskPreamble(`task:${first.id}`, first.id, undefined, first.body || first.subject),
   );
-  assert.ok(flagValue(requests[4].args, '--text').startsWith('Details — Dealer Task dispatched to mailbox '));
-  assert.ok(requests[4].args.includes('--enter'));
-  assert.equal(flagValue(requests[4].args, '--wait-submit'), '5');
+  assert.ok(flagValue(requests[7].args, '--text').startsWith('Details — Dealer Task dispatched to mailbox '));
+  assert.ok(requests[7].args.includes('--enter'));
+  assert.equal(flagValue(requests[7].args, '--wait-submit'), '5');
   const trusted = JSON.parse(await readFile(settingsPath, 'utf8')).trustedWorkspaces;
   assert.ok(trusted.includes(dir));
 
@@ -540,6 +552,8 @@ test('orca-spawn payload.interactive selects the mailbox TUI path', async t => {
         stdout: JSON.stringify({ ok: true, result: { terminal: { handle: 'term-interactive' } } }),
       };
     }
+    if (request.args[1] === 'ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path: dir, worktreeId: 'root', unverifiableTerminalCount: 0, agents: [{ state: 'done' }] }] } }) };
+    if (request.args[1] === 'list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'term-interactive', connected: true, writable: true, agentIdentity: 'antigravity', preview: '>' }] } }) };
     return { stdout: '{"ok":true}' };
   };
   const store = new MailboxStore(join(dir, 'mailbox.json'));
@@ -923,7 +937,7 @@ test('Orca idle inspection includes child workspaces and rejects truncated inven
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
 });
 
-test('Orca idle inspection trusts real TUI previews and probes only exact mode placeholders', async () => {
+test('Orca idle inspection requires empty composers and authoritative agent readiness', async () => {
   let lastLine = '  ⏵⏵ bypass permissions on';
   let waitOk = false;
   let waits = 0;
@@ -972,23 +986,23 @@ test('Orca idle inspection trusts real TUI previews and probes only exact mode p
     }
     return { stdout: '{"ok":true}' };
   };
-  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
-  assert.equal(waits, 0);
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
+  assert.equal(waits, 1);
   lastLine = '> unsent draft';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
-  assert.equal(waits, 0, 'an unsent draft is never resolved by a readiness probe');
+  assert.equal(waits, 1, 'an unsent draft is never resolved by a readiness probe');
+  waitOk = true;
   lastLine = '>';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
-  assert.equal(waits, 0);
-  // Only the exact Antigravity mode placeholder on an empty composer may consult the readiness
-  // probe; a changed hint stays busy without one.
+  assert.equal(waits, 2);
+  // A changed placeholder stays busy without another readiness probe.
   lastLine = '> Auto mode: edits & safe commands auto-approved';
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, false);
-  assert.equal(waits, 0);
+  assert.equal(waits, 2);
   lastLine = '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)';
   waitOk = true;
   assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', '/workspace')).idle, true);
-  assert.equal(waits, 1);
+  assert.equal(waits, 3);
 });
 
 test('local command executor actually runs a process and captures JSON without shell interpolation', async () => {
@@ -1377,7 +1391,7 @@ test('mailbox loads legacy workspace history without losing mailbox obligations 
   const message = envelope();
   store.enqueue([message], { mailboxId: 'historical' });
   store.recordInboundEnvelope(message, 'historical');
-  store.upsertWakeTarget('historical', { workspacePath: '/old/nautilus' });
+  store.upsertWakeTarget('historical', { driverConfig: { workspacePath: '/old/nautilus' } });
   const original = JSON.parse(await readFile(path, 'utf8'));
   await writeFile(path, JSON.stringify({ ...original, retiredWorkspacePaths: ['/old/nautilus'] }));
   const loaded = new MailboxStore(path);
@@ -1501,13 +1515,16 @@ test('inbox and wave prepare every session target before any group takes durable
     for (const nonStart of [false, true]) {
       const store = new MailboxStore(join(root, `${factory.name}-${nonStart}.json`));
       let repaired = false;
-      const executor = factory({
-        store,
-        resolveTopicBinding: () => ({ executor: 'orca-wave', streamKey: 'topic' }),
-        commandRunner: async () => {
+      const wakeup = new WakeupRedriveService({ store, flushIntervalMs: 100_000,
+        drivers: createOrcaWakeupDrivers({ commandRunner: async () => {
           if (!repaired) throw nonStart ? new CommandNotStartedError('ENOENT') : new Error('inventory unavailable');
           return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
-        },
+        } }),
+      });
+      t.after(() => wakeup.stop());
+      const executor = factory({
+        store, wakeup,
+        resolveTopicBinding: () => ({ mode: 'wave', streamKey: 'topic' }),
       });
       const first = envelope({ idempotencyKey: 'batch', payload: { mailbox: 'terminal:ready', revision: 2 } });
       const later = envelope({ payload: { mailbox: 'worktree:lookup' } });

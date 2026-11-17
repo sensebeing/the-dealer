@@ -1,3 +1,4 @@
+import { toMailboxTopicBinding } from '../packages/cli/config.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -12,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   MailboxStore,
+  WakeupRedriveService,
   normalizeMailboxId,
   resolveMailboxId,
   resolveBoundMailboxId,
@@ -143,7 +145,7 @@ test('mailbox resolution is deterministic and logically isolated', t => {
       replyMailbox: 'worktree:main',
     },
   });
-  assert.equal(resolveMailboxId(semantic, 'inbox'), 'stream:alerts');
+  assert.equal(resolveMailboxId(semantic, undefined, undefined, toMailboxTopicBinding({ executor: 'inbox' }).mode), 'stream:alerts');
   const payload = envelope('two', { payload: { mailbox: 'task:msg1' } });
   assert.equal(resolveMailboxId(payload), 'task:msg1');
   const both = envelope('three', {
@@ -152,11 +154,11 @@ test('mailbox resolution is deterministic and logically isolated', t => {
   });
   assert.equal(resolveMailboxId(both), 'semantic:mailbox');
   assert.equal(
-    resolveMailboxId(envelope('wave', { kind: 'alerts', payload: { streamKey: 'dev' } }), 'orca-wave'),
+    resolveMailboxId(envelope('wave', { kind: 'alerts', payload: { streamKey: 'dev' } }), undefined, undefined, toMailboxTopicBinding({ executor: 'orca-wave' }).mode),
     'stream:dev',
   );
-  assert.equal(resolveMailboxId(envelope('spawn'), 'orca-spawn'), 'task:spawn');
-  assert.equal(resolveMailboxId(envelope('plain'), 'inbox'), 'default');
+  assert.equal(resolveMailboxId(envelope('spawn'), undefined, undefined, toMailboxTopicBinding({ executor: 'orca-spawn' }).mode), 'task:spawn');
+  assert.equal(resolveMailboxId(envelope('plain'), undefined, undefined, toMailboxTopicBinding({ executor: 'inbox' }).mode), 'default');
   assert.throws(
     () => resolveMailboxId(envelope('bad', { payload: { mailbox: 'bad\nid' } })),
     /Invalid payload mailbox/,
@@ -193,52 +195,28 @@ test('thread affinity outranks topic bindings while explicit session targets out
   const binding = { executor: 'orca-wave', mailboxId: 'stream:inbox' };
   // An explicit payload mailbox is a concrete destination and outranks the generic topic binding.
   assert.equal(
-    resolveMailboxId(
-      envelope('explicit-payload', { payload: { mailbox: 'task:custom' } }),
-      'inbox',
-      binding,
-    ),
+    resolveMailboxId(envelope('explicit-payload', { payload: { mailbox: 'task:custom' } }), toMailboxTopicBinding(binding), undefined, toMailboxTopicBinding({ executor: 'inbox' }).mode),
     'task:custom',
   );
   assert.equal(
-    resolveMailboxId(
-      envelope('thread-reply', { semantic: { type: 'message', threadId: 'thread-affinity' } }),
-      'orca-wave',
-      binding,
-      store.resolveThreadLocalMailbox('thread-affinity'),
-    ),
+    resolveMailboxId(envelope('thread-reply', { semantic: { type: 'message', threadId: 'thread-affinity' } }), toMailboxTopicBinding(binding), store.resolveThreadLocalMailbox('thread-affinity'), toMailboxTopicBinding({ executor: 'orca-wave' }).mode),
     'worktree:origin',
   );
   assert.equal(
-    resolveMailboxId(
-      envelope('control-reply', { semantic: { type: 'reply', threadId: 'thread-affinity' } }),
-      'inbox',
-      binding,
-      store.resolveThreadLocalMailbox('thread-affinity'),
-    ),
+    resolveMailboxId(envelope('control-reply', { semantic: { type: 'reply', threadId: 'thread-affinity' } }), toMailboxTopicBinding(binding), store.resolveThreadLocalMailbox('thread-affinity'), toMailboxTopicBinding({ executor: 'inbox' }).mode),
     'worktree:origin',
   );
   assert.equal(
-    resolveMailboxId(
-      envelope('explicit-session', {
+    resolveMailboxId(envelope('explicit-session', {
         semantic: { type: 'message', threadId: 'thread-affinity', targetMailbox: 'worktree:explicit' },
-      }),
-      'orca-wave',
-      binding,
-      'worktree:origin',
-    ),
+      }), toMailboxTopicBinding(binding), 'worktree:origin', toMailboxTopicBinding({ executor: 'orca-wave' }).mode),
     'worktree:explicit',
   );
   assert.equal(
-    resolveMailboxId(
-      envelope('new-thread', {
+    resolveMailboxId(envelope('new-thread', {
         payload: { streamKey: 'inbox' },
         semantic: { type: 'question', threadId: 'new-thread', targetMailbox: 'default' },
-      }),
-      'inbox',
-      binding,
-      undefined,
-    ),
+      }), toMailboxTopicBinding(binding), undefined, toMailboxTopicBinding({ executor: 'inbox' }).mode),
     'stream:inbox',
   );
 });
@@ -344,28 +322,24 @@ test('peek wait reports queued mail without minting a lease', async t => {
 test('wake targets coalesce, survive restarts, clear on lease and count completed waves', t => {
   const { path } = workspace(t);
   const store = new MailboxStore(path);
-  const created = store.upsertWakeTarget('default', {
-    mode: 'orca-run',
-    runId: 'run_1',
-    coalesceMs: 50,
-  });
+  const created = store.upsertWakeTarget('default', { driver: 'orca-run', coalesceMs: 50, driverConfig: { runId: 'run_1' } });
   assert.equal(created.pendingWake, false);
   const before = Date.now();
   store.enqueue([envelope('a')], {
-    wakeTarget: { mode: 'orca-terminal', terminalHandle: 'term_1' },
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term_1' } },
   });
   const pending = store.listPendingWakeTargets(before + 1_000);
   assert.equal(pending.length, 1);
-  assert.equal(pending[0].mode, 'orca-terminal');
-  assert.equal(pending[0].runId, 'run_1');
-  assert.equal(pending[0].terminalHandle, 'term_1');
+  assert.equal(pending[0].driver, 'orca-terminal');
+  assert.equal(pending[0].driverConfig?.runId, undefined); // Switching drivers clears incompatible config.
+  assert.equal(pending[0].driverConfig?.terminalHandle, 'term_1');
   assert.equal(pending[0].pendingWake, true);
   assert.ok(pending[0].earliestWakeAt >= before + 50);
   assert.deepEqual(store.listPendingWakeTargets(before), []);
 
   const reopened = new MailboxStore(path);
   assert.equal(
-    reopened.listPendingWakeTargets(Date.now() + 1_000)[0].terminalHandle,
+    reopened.listPendingWakeTargets(Date.now() + 1_000)[0].driverConfig?.terminalHandle,
     'term_1',
   );
 
@@ -634,9 +608,109 @@ test('spawn bindings resolve inbound task identity without changing outbound bou
   for (const executor of ['orca-spawn', 'orca', 'codex', 'codex-cli', 'claude-code', 'claude-app', 'chatgpt-app', 'antigravity', 'antigravity-cli', 'antigravity-app', 'agent-pty']) {
     const binding = { executor, mode: 'spawn' as const };
     const message = envelope('bound-spawn');
-    assert.equal(resolveMailboxId(message, executor, binding), 'task:bound-spawn', executor);
-    assert.equal(resolveBoundMailboxId(message.kind, binding), 'default', 'outbound binding has no stream reply mailbox');
-    assert.equal(resolveMailboxId(message, executor, { ...binding, mailboxId: 'explicit' }), 'explicit');
-    assert.equal(resolveMailboxId(message, executor, binding, 'task:existing'), 'task:existing');
+    assert.equal(resolveMailboxId(message, toMailboxTopicBinding(binding), undefined, toMailboxTopicBinding({ executor: executor }).mode), 'task:bound-spawn', executor);
+    assert.equal(resolveBoundMailboxId(message.kind, toMailboxTopicBinding(binding)), 'default', 'outbound binding has no stream reply mailbox');
+    assert.equal(resolveMailboxId(message, toMailboxTopicBinding({ ...binding, mailboxId: 'explicit' }), undefined, toMailboxTopicBinding({ executor: executor }).mode), 'explicit');
+    assert.equal(resolveMailboxId(message, toMailboxTopicBinding(binding), 'task:existing', toMailboxTopicBinding({ executor: executor }).mode), 'task:existing');
   }
+});
+
+test('v1 wake targets upgrade losslessly to strict v2 on the next mutation', async t => {
+  const { path } = workspace(t);
+  const base = { coalesceMs: 12, completedWaves: 3, pendingWake: true, earliestWakeAt: 1234, attemptCount: 2, wakeupPrefix: 'prefix', lastWakeError: 'unconfirmed' };
+  const legacy = {
+    passive: { ...base, mailboxId: 'passive', mode: 'passive' },
+    residual: { ...base, mailboxId: 'residual', mode: 'passive', workspacePath: '/tmp/ws', interactiveCommand: 'codex' },
+    host: { ...base, mailboxId: 'host', mode: 'passive', hostAgent: 'claude-code', sessionId: 's', conversationMode: 'fixed' },
+    terminal: { ...base, mailboxId: 'terminal', mode: 'orca-terminal', terminalHandle: 'h', workspacePath: '/workspace', agent: 'codex', rotateAfterWaves: 4, deliveryInDoubt: true },
+    run: { ...base, mailboxId: 'run', mode: 'orca-run', runId: 'r', worktreeId: 'w', futureOption: { values: [1, null, true] } },
+  };
+  const seed = new MailboxStore(path);
+  const message = envelope('preserved');
+  seed.enqueue([message]);
+  seed.recordInboundEnvelope(message, 'default');
+  const lease = seed.check();
+  const original = JSON.parse(readFileSync(path, 'utf8'));
+  writeFileSync(path, JSON.stringify({ ...original, schema: 'the-dealer-mailbox/v1', wakeTargets: legacy }));
+  const store = new MailboxStore(path);
+  assert.equal(store.getWakeTarget('passive')?.driver, 'passive');
+  assert.equal(store.getWakeTarget('passive')?.driverConfig, undefined);
+  assert.equal(store.getWakeTarget('host')?.driver, 'agent-host');
+  assert.deepEqual(store.getWakeTarget('host')?.driverConfig, { hostAgent: 'claude-code', sessionId: 's', conversationMode: 'fixed' });
+  assert.deepEqual(store.getWakeTarget('terminal'), { ...base, mailboxId: 'terminal', driver: 'orca-terminal', rotateAfterWaves: 4, deliveryInDoubt: true, driverConfig: { terminalHandle: 'h', workspacePath: '/workspace', agent: 'codex' } });
+  assert.deepEqual(store.getWakeTarget('run')?.driverConfig, { runId: 'r', worktreeId: 'w', futureOption: { values: [1, null, true] } });
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).schema, 'the-dealer-mailbox/v1');
+  assert.equal(store.getWakeTarget('residual')?.driver, 'passive');
+  assert.deepEqual(store.getWakeTarget('residual')?.driverConfig, { workspacePath: '/tmp/ws', interactiveCommand: 'codex' });
+  const wakeups = new WakeupRedriveService({ store, drivers: [{
+    name: 'mock-session', deliver: async () => ({ kind: 'noop', reason: 'unused' }),
+    resolveSessionTarget: id => id === 'residual' ? { driver: 'mock-session' } : undefined,
+  }] });
+  t.after(() => wakeups.stop());
+  assert.equal((await wakeups.resolveSessionWakeTarget('residual'))?.driver, 'mock-session');
+  assert.equal((await wakeups.flushMailbox('residual', { force: true })).woke, true);
+  assert.equal(store.getWakeTarget('residual')?.pendingWake, false);
+  store.upsertWakeTarget('passive', { pendingWake: false });
+  const persisted = JSON.parse(readFileSync(path, 'utf8'));
+  assert.equal(persisted.schema, 'the-dealer-mailbox/v2');
+  assert.deepEqual(persisted.items, original.items);
+  assert.deepEqual(persisted.mailboxes, original.mailboxes);
+  assert.deepEqual(persisted.threads, original.threads);
+  assert.equal(new MailboxStore(path).check({ peek: true }).deliveryId, lease.deliveryId);
+  assert.deepEqual(new MailboxStore(path).getWakeTarget('terminal'), store.getWakeTarget('terminal'));
+  assert.deepEqual(new MailboxStore(path).getWakeTarget('host'), store.getWakeTarget('host'));
+  persisted.wakeTargets.run.unknown = 'reject';
+  writeFileSync(path, JSON.stringify(persisted));
+  assert.throws(() => new MailboxStore(path).getWakeTarget('run'), /Invalid mailbox store/);
+});
+
+test('opaque driver configuration merges deletions, clears on driver switch, and rejects non-JSON values', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const input = { nested: { keep: [true, null, 2] }, remove: 'value' };
+  store.upsertWakeTarget('box', { driver: 'mock:one', driverConfig: input });
+  input.nested.keep.push(false);
+  store.upsertWakeTarget('box', { driverConfig: { remove: undefined, added: 'new' } });
+  assert.deepEqual(new MailboxStore(path).getWakeTarget('box')?.driverConfig, { nested: { keep: [true, null, 2] }, added: 'new' });
+  for (const value of [NaN, Infinity, { nested: undefined }, new Date(), () => {}]) {
+    assert.throws(() => store.upsertWakeTarget('box', { driverConfig: { invalid: value } }));
+  }
+  for (const driver of ['', ' spaced', 'trailing ', 'a'.repeat(65), 'bad/driver']) {
+    assert.throws(() => store.upsertWakeTarget('box', { driver }));
+  }
+  assert.throws(() => store.upsertWakeTarget('box', { staleField: true } as never));
+  store.upsertWakeTarget('box', { driver: 'mock:two', driverConfig: { fresh: true } });
+  assert.deepEqual(store.getWakeTarget('box')?.driverConfig, { fresh: true });
+  store.upsertWakeTarget('box', { driver: 'mock:three' });
+  assert.equal(store.getWakeTarget('box')?.driverConfig, undefined);
+  store.upsertWakeTarget('box', { driverConfig: { fresh: true } });
+  store.upsertWakeTarget('box', { driverConfig: undefined });
+  assert.equal(store.getWakeTarget('box')?.driverConfig, undefined);
+});
+
+test('generic session pinning atomically binds delivered threads and preserves existing session fences', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const first = envelope('first', { semantic: { type: 'message', threadId: 'first' } });
+  const newer = envelope('newer', { semantic: { type: 'message', threadId: 'newer' } });
+  store.enqueue([first], { mailboxId: 'stream:test', wakeTarget: { driver: 'mock', rotateAfterWaves: 2, wakeupPrefix: 'check --mailbox stream:test', driverConfig: { destination: 'next' } } });
+  store.recordInboundEnvelope(first, 'stream:test');
+  store.upsertWakeTarget('session:one', { driver: 'mock', completedWaves: 7, pendingWake: true, deliveryInDoubt: true, lastWakeError: 'unknown prior send' });
+  const observed = store.check({ mailboxId: 'stream:test', peek: true }).items[0].sequence;
+  store.beginWakeDelivery('stream:test');
+  store.enqueue([newer], { mailboxId: 'stream:test' });
+  store.recordInboundEnvelope(newer, 'stream:test');
+  store.completeWakeDelivery('stream:test', observed, {}, { sessionMailboxId: 'session:one', driverConfig: { destination: 'one' } });
+  assert.equal(store.getWakeTarget('stream:test')?.pendingWake, true);
+  assert.equal(store.resolveThreadLocalMailbox('first'), 'session:one');
+  assert.equal(store.resolveThreadLocalMailbox('newer'), 'stream:test');
+  const pinned = new MailboxStore(path).getWakeTarget('session:one')!;
+  assert.equal(pinned.rotateAfterWaves, undefined);
+  assert.equal(pinned.completedWaves, 7);
+  assert.equal(pinned.deliveryInDoubt, true);
+  assert.equal(pinned.pendingWake, true);
+  assert.equal(pinned.lastWakeError, 'unknown prior send');
+  assert.equal(pinned.wakeupPrefix, 'check --mailbox session:one');
+  assert.equal(store.pinSessionMailbox('default', 'session:ignored'), 'default');
+  assert.equal(store.getWakeTarget('session:ignored'), undefined);
 });
