@@ -120,7 +120,7 @@
           "packages/plugins-executor"
         ],
         "layer": "plugin",
-        "role": "Host descriptors, invocation, trust and session wakeup drivers"
+        "role": "Standalone CLI and desktop-app host descriptors, invocation and receipt continuation, host wakeup driver and executors."
       },
       {
         "path": "packages/plugins-orca",
@@ -140,7 +140,7 @@
           "packages/plugins-executor"
         ],
         "layer": "plugin",
-        "role": "Orca workspace, terminal, binding and session delivery adapters"
+        "role": "Orca workspace and terminal inspection, composer guards, session/pane binding transitions and retirement provenance, validated fresh/continuation TUI commands, wakeup drivers and executors."
       },
       {
         "path": "packages/transport",
@@ -264,7 +264,7 @@
           "packages/subprocess"
         ],
         "layer": "core",
-        "role": "Durable mailboxes and driver-neutral wakeup or outbox redrive"
+        "role": "Host-agnostic v2 mailbox ledgers with opaque driverConfig, bindingRevision CAS launch and settlement fencing, and WakeupDriver scheduling."
       },
       {
         "path": "packages/plugins-policy",

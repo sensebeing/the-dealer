@@ -1,3 +1,4 @@
+import { resolveConfiguredOrcaWakeTargetPatch } from './wakeup.ts';
 import { execFileSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -21,6 +22,7 @@ import {
 } from '../plugins-agent-host/hosts.ts';
 import {
   resolveOrcaWaveRotateAfterWaves,
+  createOrcaTerminalWakeupDriver,
   deliverSpawnedOrcaTerminalWakeup,
   launchFencedOrcaWorkspaceTerminal,
 } from './wakeup.ts';
@@ -48,6 +50,7 @@ export interface OrcaTopicBinding extends MailboxTopicBinding {
   runId?: string;
   terminalHandle?: string;
   interactiveCommand?: string;
+  resumeCommand?: string;
   autoCreateWorkspace?: boolean;
   workspaceComment?: string;
   wakeupPrefix?: string;
@@ -73,6 +76,7 @@ export interface OrcaSpawnOptions {
   seaCreatureNaming?: boolean;
   agySettingsPath?: string;
   interactiveCommand?: string;
+  resumeCommand?: string;
   /** Durable task mailbox ledger; always supplied by DealerNodeRuntime. */
   store?: MailboxStore;
   wakeup?: WakeupRedriveService;
@@ -272,6 +276,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           config.interactiveCommand?.trim() ||
           options.interactiveCommand?.trim() ||
           defaultAgentLaunchCommand(effectiveAgent);
+        const resumeCommand = binding?.resumeCommand ?? config.resumeCommand ?? options.resumeCommand;
         const mailboxId = `task:${batch[0].id}`;
         const workspaceComment =
           typeof payload.workspaceComment === 'string' && payload.workspaceComment.trim()
@@ -289,7 +294,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
               coalesceMs: 0,
               driverConfig: {
                 agent: effectiveAgent,
-                interactiveCommand,
+                interactiveCommand, resumeCommand,
                 orcaCommand: command,
                 workspacePath: path,
                 ...(workspaceComment ? { workspaceComment } : {}),
@@ -303,9 +308,10 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
               command,
               workspacePath: path,
               agent: effectiveAgent,
-              interactiveCommand,
+              interactiveCommand, resumeCommand,
               signal: context.signal,
             });
+            if (!launched.committed) return { executor: 'orca-spawn', executionId: randomUUID(), mailboxId, worktreePath: path, woke: false, reason: 'Wake launch superseded by a newer binding' };
             terminal = launched.raw;
           } catch (launchError) {
             if (workspaceComment) {
@@ -402,6 +408,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
 export interface OrcaWaveOptions {
   agent?: SupportedOrcaAgent;
   interactiveCommand?: string;
+  resumeCommand?: string;
   resolveTopicBinding?: (kind: string, streamKey?: string) => OrcaTopicBinding | undefined;
   runId?: string;
   terminalHandle?: string;
@@ -512,8 +519,17 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
             binding?.workspaceComment ||
             `Dealer: ${mailboxId} pending`,
         );
+        const explicitAgent = binding?.agent ?? config.agent ?? options.agent ?? (hasReceiverTarget ? undefined : payload.agent);
+        const identityPatch = resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
+          mailboxId, runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
+          configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
+          configuredSessionId: binding?.sessionId,
+          configuredInteractiveCommand: binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
+          configuredResumeCommand: binding?.resumeCommand ?? config.resumeCommand ?? options.resumeCommand,
+          hasTopicBinding: binding !== undefined, authoritativeConfig: false,
+        });
         return {
-          driver: runId ? 'orca-run' : 'orca-terminal',
+          ...identityPatch,
           coalesceMs,
           ...(binding?.wakeupPrefix ? { wakeupPrefix: binding.wakeupPrefix } : {}),
           ...(effectiveMode === 'fixed'
@@ -522,9 +538,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
               ? { rotateAfterWaves }
               : {}),
           driverConfig: {
-            agent: orcaAgent(binding?.agent ?? config.agent ?? options.agent ?? payload.agent),
-            interactiveCommand:
-              binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
+            ...identityPatch.driverConfig,
             orcaCommand: command,
             ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
             ...(binding?.autoCreateWorkspace !== undefined
@@ -533,7 +547,6 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
             ...(runId ? { runId } : {}),
             ...(cwd ? { workspacePath: cwd } : {}),
             ...(worktreeId ? { worktreeId } : {}),
-            ...(terminalHandle ? { terminalHandle } : {}),
             workspaceComment,
           },
         };
@@ -582,12 +595,19 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         // Only the topic's own bound mailbox may use the receiver binding. A thread- or
         // session-scoped mailbox keeps the wake target its originating session already bound, so
         // a reply wakes that terminal instead of rotating it into the generic topic workspace.
-        const usesTopicBinding = group.binding === undefined || mailboxId === boundMailboxId;
+        const isSessionScopedMailbox = mailboxId.startsWith('worktree:') || mailboxId.startsWith('terminal:') || mailboxId.startsWith('task:');
+        const usesTopicBinding = group.binding !== undefined ? mailboxId === boundMailboxId : !isSessionScopedMailbox;
         const wakeTarget = usesTopicBinding
           ? prepareExternalEffect(() => topicWakeTarget(group.envelopes, group.binding, mailboxId))
-          : await prepareExternalEffectAsync(() =>
-              Promise.resolve(wakeup?.resolveSessionWakeTarget(mailboxId)),
-            );
+          : await prepareExternalEffectAsync(async () => {
+              if (wakeup) return wakeup.resolveSessionWakeTarget(mailboxId);
+              const current = store.getWakeTarget(mailboxId);
+              if (!current || current.driver === 'passive') {
+                return createOrcaTerminalWakeupDriver({ commandRunner: runner, orcaCommand: command })
+                  .resolveSessionTarget?.(mailboxId, store);
+              }
+              return undefined;
+            });
         prepared.push({ mailboxId, group, wakeTarget });
       }
       const results: Array<{ mailboxId: string; inserted: string[]; woke: boolean; reason?: string }> = [];
