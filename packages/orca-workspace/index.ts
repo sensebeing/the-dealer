@@ -188,16 +188,22 @@ export async function checkOrcaWorkspaceIdle(
     const targetTerm = row.path === cwd
       ? handles.find(t => t.connected && t.writable !== false && String(t.handle) === options?.targetTerminalHandle)
         ?? handles.find(t => matchesPane(t, options?.targetPaneKey)) : undefined;
-    const targetPaneKey = targetTerm?.tabId && targetTerm?.leafId ? `${targetTerm.tabId}:${targetTerm.leafId}`
-      : targetTerm && typeof targetTerm.recordedPaneKey === 'string' ? targetTerm.recordedPaneKey : undefined;
-    if (targetPaneKey === undefined) {
+    const targetPaneKeys = new Set<string>();
+    if (typeof targetTerm?.tabId === 'string' && targetTerm.tabId &&
+        typeof targetTerm.leafId === 'string' && targetTerm.leafId) {
+      targetPaneKeys.add(`${targetTerm.tabId}:${targetTerm.leafId}`);
+    }
+    if (typeof targetTerm?.recordedPaneKey === 'string' && targetTerm.recordedPaneKey) {
+      targetPaneKeys.add(targetTerm.recordedPaneKey);
+    }
+    if (targetPaneKeys.size === 0) {
       if (row.unverifiableTerminalCount !== 0 || !row.agents || row.agents.some(agent => agent.state !== 'done')) return false;
     } else {
-      if (!row.agents || row.agents.filter(agent => agent.paneKey === targetPaneKey || (!agent.paneKey && handles.length <= 1)).some(agent => agent.state !== 'done')) return false;
+      if (!row.agents || row.agents.filter(agent => (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) || (!agent.paneKey && handles.length <= 1)).some(agent => agent.state !== 'done')) return false;
     }
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
     const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
-    if (targetPaneKey === undefined && observableHandles.filter(t => Boolean(t.connected)).length < (row.agents?.length ?? 0)) {
+    if (targetPaneKeys.size === 0 && observableHandles.filter(t => Boolean(t.connected)).length < (row.agents?.length ?? 0)) {
       return false;
     }
     // Liveness and composer state only matter for terminals this wakeup may actually write into:
@@ -263,7 +269,7 @@ export async function checkOrcaWorkspaceIdle(
     }
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find(item => item.worktreeId === id);
-      if (targetPaneKey && child?.agents?.length && child.agents.every(agent => typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && agent.parentPaneKey !== targetPaneKey)) continue;
+      if (targetPaneKeys.size > 0 && child?.agents?.length && child.agents.every(agent => typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey))) continue;
       if (!child || !(await idleTree(child))) {
         return false;
       }
@@ -445,7 +451,7 @@ export async function planOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string; dedicatedTab?: boolean },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
   const targetAgent = options?.agent ?? 'antigravity';
   const listed = await checkedCommand(runner, {
@@ -470,7 +476,7 @@ export async function planOrcaWorkspaceTerminal(
   }
   const pane = terminals.find(t => t && matchesPane(t, options?.preferredPaneKey));
   if (pane) return { kind: 'existing', handle: String(pane.handle) };
-  if (options?.sessionId?.trim()) return { kind: 'create' };
+  if (options?.dedicatedTab || options?.sessionId?.trim()) return { kind: 'create' };
   const nonOrphanConnected = terminals.filter(
     t => t && t.orphaned !== true && t.connected && t.writable !== false,
   );
@@ -499,7 +505,7 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; preferredHandle?: string; preferredPaneKey?: string; sessionId?: string; dedicatedTab?: boolean },
 ): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
   const plan = await planOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
   if (plan.kind === 'existing') return { handle: plan.handle, spawned: false };

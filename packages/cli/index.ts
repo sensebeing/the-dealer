@@ -798,7 +798,8 @@ function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: Ca
     ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
     ...(caller.agent ? { agent: caller.agent } : {}),
     ...(caller.sessionId ? { sessionId: caller.sessionId } :
-      caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle
+      caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
+        (!caller.paneKey || caller.paneKey !== existing.paneKey)
         ? { sessionId: undefined, paneKey: caller.paneKey } : {}),
   });
 }

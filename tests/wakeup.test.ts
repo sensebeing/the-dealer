@@ -2445,6 +2445,9 @@ for (const [agent, envKey, resumeCommand] of [
     assert.equal(resumed.paneKey, undefined);
     await invoke(['inbox', 'check'], { ...env, ORCA_TERMINAL_HANDLE: 'term-new-1', [envKey]: '' });
     assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, 'original-session');
+    await invoke(['inbox', 'check'], { ...env, ORCA_TERMINAL_HANDLE: 'term-restored-shell', [envKey]: '' });
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, 'original-session');
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.terminalHandle, 'term-restored-shell');
     await invoke(['inbox', 'check'], { ...env, ORCA_TERMINAL_HANDLE: 'term-shell', ORCA_PANE_KEY: '', [envKey]: '' });
     assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, undefined);
     assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.paneKey, undefined);
@@ -2505,3 +2508,70 @@ test('rotating mailbox pins the active conversation identity durably', t => {
   assert.equal(pinned.paneKey, 'tab:leaf');
   assert.equal(pinned.rotateAfterWaves, undefined);
 });
+
+for (const busyOwner of ['restored', 'child'] as const) {
+  test(`restored orphan pane gates its ${busyOwner} agent by recorded identity`, async t => {
+    const root = directory(t);
+    const workspacePath = join(root, 'restored');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const { runner, state } = fakeOrcaWorkspace(workspacePath, [{
+      handle: 'term-restored', connected: true, writable: true, orphaned: true,
+      tabId: 'pty:5afdf9f6', leafId: 'pty:5afdf9f6', recordedPaneKey: 'tab:leaf',
+      agentIdentity: 'antigravity', preview: '',
+    }]);
+    let busy = true;
+    const service = new WakeupRedriveService({ store, commandRunner: async request => {
+      state.agents = [{ state: busy && busyOwner === 'restored' ? 'working' : 'done', paneKey: 'tab:leaf' }];
+      const output = await runner(request);
+      if (busyOwner === 'child' && request.args[0] === 'worktree' && request.args[1] === 'ps') {
+        const inventory = JSON.parse(output.stdout);
+        inventory.result.worktrees[0].childWorktreeIds = ['child'];
+        inventory.result.worktrees.push({ path: join(workspacePath, 'child'), worktreeId: 'child',
+          unverifiableTerminalCount: 0, agents: [{ state: busy ? 'working' : 'done', parentPaneKey: 'tab:leaf' }],
+        });
+        return { stdout: JSON.stringify(inventory) };
+      }
+      return output;
+    } });
+    t.after(() => service.stop());
+    store.enqueue([alert('restored-busy')], { mailboxId: 'worktree:restored', wakeTarget: {
+      mode: 'orca-terminal', workspacePath, terminalHandle: 'term-old', paneKey: 'tab:leaf', sessionId: 'original', coalesceMs: 0,
+    } });
+    assert.equal((await service.flushMailbox('worktree:restored', { force: true })).woke, false);
+    assert.equal(terminalSends(state.calls).length, 0);
+    busy = false;
+    assert.equal((await service.flushMailbox('worktree:restored', { force: true })).woke, true);
+    assert.equal(state.created, 0);
+    assert.equal(sendsTo(state.calls, 'term-restored').length, 1);
+  });
+}
+
+for (const siblingAgent of ['antigravity', undefined]) {
+  test(`dedicated task cannot rebind to ${siblingAgent ?? 'shell'} after its pane exits during selection`, async t => {
+    const root = directory(t);
+    const workspacePath = join(root, 'task');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+      { handle: 'term-task', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+      { handle: 'term-sibling', connected: true, writable: true, agentIdentity: siblingAgent, preview: '' },
+    ]);
+    let lists = 0;
+    const service = new WakeupRedriveService({ store, commandRunner: async request => {
+      // Initial liveness, authoritative idle, and replacement check see the task tab;
+      // it exits just before the final read-only selection inventory.
+      if (request.args[0] === 'terminal' && request.args[1] === 'list' && ++lists === 4) {
+        state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-task');
+      }
+      return runner(request);
+    } });
+    t.after(() => service.stop());
+    store.enqueue([alert('task-race')], { mailboxId: 'task:isolated', wakeTarget: {
+      mode: 'orca-terminal', workspacePath, terminalHandle: 'term-task', coalesceMs: 0,
+    } });
+    const result = await service.flushMailbox('task:isolated', { force: true });
+    assert.equal(result.woke, true);
+    assert.equal(state.created, 1);
+    assert.equal(sendsTo(state.calls, 'term-sibling').length, 0);
+    assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+  });
+}

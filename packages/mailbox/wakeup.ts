@@ -852,7 +852,7 @@ export class WakeupRedriveService {
       // check only resolve when no handle exists yet.
       const plan = await planOrcaWorkspaceTerminal(this.runner, command, target.workspacePath, undefined, {
         agent: target.agent, preferredHandle: target.terminalHandle,
-        preferredPaneKey: target.paneKey, sessionId: target.sessionId,
+        preferredPaneKey: target.paneKey, sessionId: target.sessionId, dedicatedTab: dedicatedTaskTab,
       });
       if (plan.kind === 'existing') {
         terminalHandle = plan.handle;
