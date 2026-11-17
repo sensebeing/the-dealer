@@ -22,6 +22,7 @@ import {
 } from '../plugins-agent-host/hosts.ts';
 import {
   resolveOrcaWaveRotateAfterWaves,
+  createOrcaTerminalWakeupDriver,
   deliverSpawnedOrcaTerminalWakeup,
   launchFencedOrcaWorkspaceTerminal,
 } from './wakeup.ts';
@@ -597,9 +598,15 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         const usesTopicBinding = group.binding !== undefined ? mailboxId === boundMailboxId : !isSessionScopedMailbox;
         const wakeTarget = usesTopicBinding
           ? prepareExternalEffect(() => topicWakeTarget(group.envelopes, group.binding, mailboxId))
-          : await prepareExternalEffectAsync(() =>
-              Promise.resolve(wakeup?.resolveSessionWakeTarget(mailboxId)),
-            );
+          : await prepareExternalEffectAsync(async () => {
+              if (wakeup) return wakeup.resolveSessionWakeTarget(mailboxId);
+              const current = store.getWakeTarget(mailboxId);
+              if (!current || current.driver === 'passive') {
+                return createOrcaTerminalWakeupDriver({ commandRunner: runner, orcaCommand: command })
+                  .resolveSessionTarget?.(mailboxId, store);
+              }
+              return undefined;
+            });
         prepared.push({ mailboxId, group, wakeTarget });
       }
       const results: Array<{ mailboxId: string; inserted: string[]; woke: boolean; reason?: string }> = [];

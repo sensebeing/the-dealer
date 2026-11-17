@@ -402,6 +402,23 @@ export async function deliverSpawnedOrcaTerminalWakeup(
   }
 }
 
+function buildPinnedOrcaSessionDriverConfig(
+  target: OrcaWakeTarget,
+  existingSession: WakeTargetState | undefined,
+  terminalHandle: string,
+): Record<string, unknown> {
+  const existing = existingSession?.driver === 'orca-terminal' ? readOrcaDriverConfig(existingSession) : undefined;
+  const sameHandle = !target.terminalHandle || target.terminalHandle === terminalHandle;
+  return {
+    terminalHandle,
+    sessionId: existing?.sessionId ?? (sameHandle ? target.sessionId : undefined),
+    paneKey: existing?.paneKey ?? (sameHandle ? target.paneKey : undefined),
+    configuredSessionId: undefined,
+    configuredTerminalHandle: undefined,
+    retiredSessionId: undefined,
+  };
+}
+
 export function pinOrcaTerminalSessionMailbox(
   store: MailboxStore,
   mailboxId: string,
@@ -413,7 +430,7 @@ export function pinOrcaTerminalSessionMailbox(
   if (!handle || target?.driver !== 'orca-terminal' || target.rotateAfterWaves === undefined) return id;
   return store.pinSessionMailbox(id, `terminal:${handle}`, {
     driver: 'orca-terminal',
-    driverConfig: serializeOrcaDriverConfig({ ...target.driverConfig, terminalHandle: handle, configuredSessionId: undefined, configuredTerminalHandle: undefined, retiredSessionId: undefined }),
+    driverConfig: buildPinnedOrcaSessionDriverConfig(readOrcaWakeTarget(target), store.getWakeTarget(`terminal:${handle}`), handle),
   });
 }
 
@@ -758,7 +775,7 @@ class OrcaWakeDelivery {
         ? {
             sessionMailboxId: `terminal:${terminalHandle}`,
             driver: 'orca-terminal',
-            driverConfig: serializeOrcaDriverConfig({ ...target.driverConfig, terminalHandle, configuredSessionId: undefined, configuredTerminalHandle: undefined, retiredSessionId: undefined }),
+            driverConfig: buildPinnedOrcaSessionDriverConfig(target, this.store.getWakeTarget(`terminal:${terminalHandle}`), terminalHandle),
           }
         : undefined,
       activeRevision,

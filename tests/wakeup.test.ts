@@ -3363,3 +3363,96 @@ test('stale workspace discovery and missing-workspace disarm preserve the replac
   assert.equal(deferred.target.attemptCount, 0);
   assert.equal(deferred.target.lastWakeError, undefined);
 });
+
+test('rotating wave pinning preserves session-owned identity and clears parent provenance', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:pinned-identity';
+  const sessionMailbox = 'terminal:term-1';
+  const { runner, state } = fakeOrcaWorkspace(root, [{
+    handle: 'term-1', connected: true, writable: true, agentIdentity: 'claude', preview: '',
+  }]);
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => service.stop());
+  store.enqueue([alert('pinned-first')], { mailboxId, wakeTarget: {
+    driver: 'orca-terminal', rotateAfterWaves: 2, coalesceMs: 0,
+    driverConfig: { workspacePath: root, terminalHandle: 'term-1', agent: 'claude',
+      sessionId: 'parent-session', paneKey: 'parent:pane', configuredSessionId: 'parent-session' },
+  } });
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+  store.upsertWakeTarget(sessionMailbox, {
+    driverConfig: { sessionId: 'conv-1', paneKey: 'pane-1', interactiveCommand: 'claude --model opus',
+      configuredSessionId: 'obsolete', configuredTerminalHandle: 'obsolete-handle', retiredSessionId: 'obsolete' },
+  });
+  const assertPinnedIdentity = () => {
+    const config = store.getWakeTarget(sessionMailbox)!.driverConfig!;
+    assert.equal(config.sessionId, 'conv-1');
+    assert.equal(config.paneKey, 'pane-1');
+    assert.equal(config.interactiveCommand, 'claude --model opus');
+    for (const key of ['configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId']) {
+      assert.equal(Object.hasOwn(config, key), false, key);
+    }
+  };
+  pinOrcaTerminalSessionMailbox(store, mailboxId, 'term-1');
+  assertPinnedIdentity();
+  store.ack(store.check({ mailboxId }).deliveryId!);
+  // Exercise the completion path independently from explicit pinning.
+  store.upsertWakeTarget(sessionMailbox, { driverConfig: {
+    configuredSessionId: 'obsolete-again', retiredSessionId: 'obsolete-again',
+  } });
+  store.enqueue([alert('pinned-second')], { mailboxId });
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+  assert.equal(sendsTo(state.calls, 'term-1').length, 2);
+  assertPinnedIdentity();
+  store.ack(store.check({ mailboxId }).deliveryId!);
+  store.enqueue([alert('pinned-third')], { mailboxId });
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).rotated, true);
+  const newHandle = store.getWakeTarget(mailboxId)!.driverConfig!.terminalHandle as string;
+  assert.notEqual(newHandle, 'term-1');
+  store.upsertWakeTarget(mailboxId, resolveCallerOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
+    terminalHandle: newHandle, sessionId: 'conv-2', paneKey: 'pane-2', agent: 'claude',
+  }));
+  // A late command in the old tab cannot inherit the new wave's conversation.
+  pinOrcaTerminalSessionMailbox(store, mailboxId, 'term-1');
+  assertPinnedIdentity();
+  pinOrcaTerminalSessionMailbox(store, mailboxId, 'term-unrecorded');
+  const unrecorded = store.getWakeTarget('terminal:term-unrecorded')!.driverConfig!;
+  assert.equal(unrecorded.sessionId, undefined);
+  assert.equal(unrecorded.paneKey, undefined);
+  assert.equal(unrecorded.workspacePath, root);
+  assert.equal(unrecorded.terminalHandle, 'term-unrecorded');
+});
+
+for (const mailboxId of ['worktree:standalone', 'terminal:term-standalone']) {
+  test(`standalone wave executor resolves ${mailboxId} without a redrive service`, async t => {
+    const root = directory(t);
+    const workspacePath = join(root, 'standalone');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const calls: CommandRequest[] = [];
+    const runner: CommandRunner = async request => {
+      calls.push(request);
+      if (request.args[0] === 'worktree') return { stdout: JSON.stringify({
+        ok: true, result: { truncated: false, worktrees: [{ path: workspacePath, worktreeId: 'receiver-worktree' }] },
+      }) };
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: { worktreePath: workspacePath } } }) };
+    };
+    const executor = createOrcaWaveExecutorPlugin({ store, commandRunner: runner });
+    for (const initial of ['missing', 'passive', 'bound'] as const) {
+      if (initial === 'passive') store.upsertWakeTarget(mailboxId, { driver: 'passive' });
+      if (initial === 'bound') store.upsertWakeTarget(mailboxId, { driverConfig: { sessionId: 'preserved' } });
+      const beforeCalls = calls.length;
+      await executor.execute([alert(`standalone-${initial}`, {
+        semantic: { type: 'message', threadId: `standalone-${initial}`, targetMailbox: mailboxId },
+        payload: { workspacePath: '/sender/impostor' },
+      })], { networkId: 'team', nodeId: 'receiver', traceId: 'standalone' }, {});
+      const target = store.getWakeTarget(mailboxId)!;
+      assert.equal(target.driver, 'orca-terminal');
+      assert.equal(target.driverConfig!.workspacePath, workspacePath);
+      if (initial === 'bound') {
+        assert.equal(target.driverConfig!.sessionId, 'preserved');
+        assert.equal(calls.length, beforeCalls);
+      } else assert.ok(calls.length > beforeCalls);
+    }
+    assert.equal(store.list({ mailboxId }).queuedCount, 3);
+  });
+}

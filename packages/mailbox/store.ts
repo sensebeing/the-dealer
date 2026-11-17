@@ -467,12 +467,17 @@ function pinSessionTargetInState(state: MailboxFileState, id: string, sessionMai
   const sessionMailbox = normalizeMailboxId(sessionMailboxId);
   if (sessionMailbox === id) throw new Error('Session mailbox must differ from rotating mailbox');
   const existing = state.wakeTargets[sessionMailbox];
+  const nextDriver = patch.driver ?? existing?.driver ?? current.driver;
   const hasQueued = state.items.some(item => item.mailboxId === sessionMailbox && item.status === 'queued');
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${sessionMailbox}`);
   state.wakeTargets[sessionMailbox] = validateWakeTarget(mergeWakeTarget(existing ?? defaultWakeTarget(sessionMailbox), {
     ...current, ...(existing ?? {}), mailboxId: sessionMailbox,
-    driver: patch.driver ?? current.driver,
-    driverConfig: patch.driverConfig ?? current.driverConfig,
+    driver: nextDriver,
+    driverConfig: {
+      ...(nextDriver === current.driver ? current.driverConfig : undefined),
+      ...(existing?.driver === nextDriver ? existing.driverConfig : undefined),
+      ...patch.driverConfig,
+    },
     rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
