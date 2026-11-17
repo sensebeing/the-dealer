@@ -170,7 +170,9 @@ export function isDedupCasDuplicateReceipt(
 export function isTerminalDeliveryFailure(
   receipt: HandoffReceipt | null | undefined,
 ): boolean {
-  return receipt?.stage === 'rejected' || receipt?.stage === 'failed';
+  // Live dispatches await their in-process promise; a returned dispatching receipt
+  // is persisted interrupted execution, never an offline obligation to requeue.
+  return receipt?.stage === 'rejected' || receipt?.stage === 'failed' || receipt?.stage === 'dispatching';
 }
 
 export function isConfirmedHandoffReceipt(
@@ -512,6 +514,8 @@ export interface OutboxItem {
 }
 
 export interface OutboxEnqueueInput {
+  /** Replace outcomes only for these original targets; confirmed execution is immutable. */
+  reconcileNodeIds?: readonly string[];
   envelope: MessageEnvelope;
   explicitTargets: string[];
   pendingNodeIds: string[];
@@ -596,8 +600,8 @@ export interface OutboxStoreLike {
   enqueue(input: OutboxEnqueueInput): OutboxItem;
   /** Atomically reserve monotonic versions per (networkId, idempotencyKey) under the store lock. */
   claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
-  /** Release a pristine claim after routing fails before any send. */
-  abandonUnattemptedClaim?(id: string): void;
+  /** Read the highest matching version without reserving or changing an obligation. */
+  findKeyedObligation?(networkId: string, key: string, minVersion: number): OutboxItem | undefined;
   /** Terminal local/routing failure with no signed target receipt. */
   markFailed(id: string, lastError: string): OutboxItem | undefined;
 }

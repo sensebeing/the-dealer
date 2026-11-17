@@ -675,7 +675,7 @@ async function emitterHarness(
     plan?: (
       targetNodeId: string,
       callIndex: number,
-    ) => { stage?: DeliveryStage; detail?: string; error?: Error; delayMs?: number } | undefined;
+    ) => { stage?: DeliveryStage; detail?: string; error?: Error; delayMs?: number; executionReceipt?: Record<string, unknown> } | undefined;
   } = {},
 ) {
   const dir = directory(t);
@@ -770,6 +770,7 @@ async function emitterHarness(
           networkId: targetNetworkId,
           fromNodeId: targetNodeId,
           stage: plan.stage ?? options.stage ?? 'dispatched',
+          ...(plan.executionReceipt ? { executionReceipt: plan.executionReceipt } : {}),
           ...(plan.detail !== undefined
             ? { detail: plan.detail }
             : options.stage === 'rejected'
@@ -857,7 +858,7 @@ async function emitterHarness(
 }
 
 test('redrive settles signed rejection or dispatcher failure as terminal failed', async t => {
-  for (const stage of ['rejected', 'failed'] as const) {
+  for (const stage of ['rejected', 'failed', 'dispatching'] as const) {
     const harness = await emitterHarness(t, { stage });
     const envelope = envelopeFor(harness.sender, harness.networkId, harness.targetCard.nodeId);
     const sourcePath = join(harness.dir, `evidence-${stage}.txt`);
@@ -1565,25 +1566,28 @@ test('session --ack validates before sending and only burns the lease after comm
     throwing.store.assertAckableLease(throwing.leaseId);
     assert.equal(inboundStatus(throwing.store, throwing.inboundId), 'leased');
 
-    // A terminally rejected send is not a committed handoff: the lease stays leased.
-    const rejecting = sessionHarness(t, async () => ({
-      messageId: 'msg_outbound_session',
-      traceId: 'trace_outbound_session',
-      receipts: [receiptFor({ stage: 'rejected', detail: 'gate closed' })],
-    }));
-    const rejected = await run(
-      rejecting.runtime,
-      argsFor(group, rejecting.inboundId, rejecting.leaseId),
-    );
-    assert.equal(rejected.code, 0, rejected.stderr);
-    assert.equal(rejecting.emitCalls.length, 1);
-    rejecting.store.assertAckableLease(rejecting.leaseId);
-    assert.equal(inboundStatus(rejecting.store, rejecting.inboundId), 'leased');
-    assert.equal(
-      JSON.parse(rejected.stdout.join('')).acked,
-      false,
-      'a terminal rejection must report that the lease was preserved',
-    );
+    for (const stage of ['rejected', 'dispatching'] as const) {
+      // A terminally rejected send is not a committed handoff: the lease stays leased.
+      const rejecting = sessionHarness(t, async () => ({
+        messageId: 'msg_outbound_session',
+        traceId: 'trace_outbound_session',
+        receipts: [receiptFor({ stage, detail: 'execution not committed' })],
+      }));
+      const rejected = await run(
+        rejecting.runtime,
+        argsFor(group, rejecting.inboundId, rejecting.leaseId),
+      );
+      assert.equal(rejected.code, 0, rejected.stderr);
+      assert.equal(rejecting.emitCalls.length, 1);
+      rejecting.store.assertAckableLease(rejecting.leaseId);
+      assert.equal(inboundStatus(rejecting.store, rejecting.inboundId), 'leased');
+      assert.equal(
+        JSON.parse(rejected.stdout.join('')).acked,
+        false,
+        'a terminal rejection must report that the lease was preserved',
+      );
+
+    }
 
     // A live handoff or a durable outbox obligation commits the send and only then acks.
     const queued = sessionHarness(t, async () => ({
@@ -4816,7 +4820,7 @@ test('keyed gate rejections and local failures allow retry and reuse a later exe
       else assert.equal((await harness.emitter.emit(input)).receipts[0].detail, 'Gate closed');
     }
     assert.equal(harness.sendCalls.length, 2);
-    assert.equal(harness.outbox.list({ status: 'failed' }).length, 2);
+    assert.equal(harness.outbox.list({ status: 'failed' }).length, 1);
     recovered = true;
     const delivered = await harness.emitter.emit(input);
     assert.equal(delivered.receipts[0].stage, 'dispatched');
@@ -4825,7 +4829,7 @@ test('keyed gate rejections and local failures allow retry and reuse a later exe
   }
 });
 
-test('pre-send routing failures release a keyed claim and its staged files', async t => {
+test('pre-send routing failures leave no keyed claim or staged files', async t => {
   const harness = await emitterHarness(t);
   let available = false;
   const route = t.mock.method(harness.kernel.ctx.services.router, 'route', async () => {
@@ -4838,38 +4842,13 @@ test('pre-send routing failures release a keyed claim and its staged files', asy
     kind: 'task', subject: 'retry route', body: 'safe release', payload: {}, idempotencyKey: 'route-key', filePaths: [file] };
   await assert.rejects(harness.emitter.emit(input), /No route matched envelope/);
   assert.equal(harness.outbox.list({ status: 'all' }).length, 0);
-  assert.deepEqual(readdirSync(join(harness.dir, 'outbox-blobs')), []);
+  assert.equal(existsSync(join(harness.dir, 'outbox-blobs')), false);
   assert.equal(harness.sendCalls.length, 0);
   available = true;
   const sent = await harness.emitter.emit(input);
   assert.equal(sent.receipts[0].stage, 'dispatched');
   assert.equal(route.mock.callCount(), 2);
   assert.equal(harness.sendCalls.length, 1);
-});
-
-
-test('claim abandonment preserves obligations once delivery evidence or attempts exist', async t => {
-  const harness = await emitterHarness(t);
-  const target = harness.targetCard.nodeId;
-  for (const state of ['pending', 'attempted', 'delivered', 'failed'] as const) {
-    const envelope = { ...envelopeFor(harness.sender, harness.networkId, target), idempotencyKey: state };
-    const claimed = harness.outbox.claimIdempotency({ envelope });
-    if (state === 'attempted') {
-      harness.outbox.recordAttempt(claimed.item.id, { nextAttemptAt: new Date().toISOString() });
-    } else if (state === 'pending') {
-      harness.outbox.enqueue({ envelope, pendingNodeIds: [target] });
-    } else if (state === 'failed') {
-      harness.outbox.markFailed(claimed.item.id, 'local failure');
-    } else {
-      harness.outbox.markNodeDelivered(claimed.item.id, target, signReceipt({
-        messageId: envelope.id, networkId: harness.networkId, fromNodeId: target,
-        stage: 'dispatched', updatedAt: new Date().toISOString(),
-      }, harness.receiver.privateKeyPem));
-    }
-    const before = harness.outbox.get(claimed.item.id);
-    harness.outbox.abandonUnattemptedClaim(claimed.item.id);
-    assert.deepEqual(harness.outbox.get(claimed.item.id), before);
-  }
 });
 
 
@@ -4917,4 +4896,139 @@ test('outbox retains prepare-normalized targets for unresolved and resolved offl
     assert.deepEqual(queued.explicitTargets, [target]);
     assert.deepEqual(queued.envelope.routing.targets, [target]);
   }
+});
+
+
+test('concurrent keyed routing failures never publish a temporary durable obligation', async t => {
+  const harness = await emitterHarness(t);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let available = false;
+  const route = t.mock.method(harness.kernel.ctx.services.router, 'route', async () => {
+    entered();
+    await blocked;
+    if (!available) throw new Error('No route matched envelope');
+    return { mode: 'unicast' as const, targetNodeIds: [harness.targetCard.nodeId], matchedBy: 'test', reason: 'ready' };
+  });
+  const input: EmitMessageInput = { networkId: harness.networkId, routing: { mode: 'auto' },
+    kind: 'task', subject: 'concurrent routes', body: 'no phantom queue', payload: {}, idempotencyKey: 'race' };
+  const results = Promise.allSettled([harness.emitter.emit(input), harness.emitter.emit(input)]);
+  await started;
+  assert.deepEqual(harness.outbox.list({ status: 'all' }), []);
+  release();
+  for (const result of await results) {
+    assert.equal(result.status, 'rejected');
+    if (result.status === 'rejected') assert.match(result.reason.message, /No route matched envelope/);
+  }
+  assert.equal(route.mock.callCount(), 2);
+  assert.deepEqual(harness.sentEvents, []);
+  assert.deepEqual(harness.outbox.list({ status: 'all' }), []);
+  available = true;
+  assert.equal((await harness.emitter.emit(input)).receipts[0].stage, 'dispatched');
+});
+
+test('keyed DND retries retain the original target and staged attachment online and offline', async t => {
+  let offline = false;
+  let settled = false;
+  const harness = await emitterHarness(t, { extraMembers: ['aya'], plan: target => offline
+    ? { error: new PeerUnreachableError(target) } : settled ? {}
+      : { stage: 'queued', executionReceipt: { executor: 'gate-dnd', durable: true, handoff: 'queued' } } });
+  let selected = harness.targetCard.nodeId;
+  const route = t.mock.method(harness.kernel.ctx.services.router, 'route', async () => ({
+    mode: 'unicast' as const, targetNodeIds: [selected], matchedBy: 'test', reason: 'available',
+  }));
+  const file = join(harness.dir, 'dnd.txt');
+  writeFileSync(file, 'durable attachment');
+  const input: EmitMessageInput = { networkId: harness.networkId, routing: { mode: 'auto' },
+    kind: 'task', subject: 'dnd identity', body: 'preserve target', payload: {},
+    idempotencyKey: 'dnd-key', filePaths: [file] };
+  const first = await harness.emitter.emit(input);
+  const staged = harness.outbox.get(first.messageId)!.stagedFiles;
+  assert.equal(Object.keys(staged).length, 1);
+  selected = harness.targetByMember.get('aya')!.nodeId;
+  const online = await harness.emitter.emit(input);
+  assert.equal(online.messageId, first.messageId);
+  assert.equal(online.receipts[0].executionReceipt?.executor, 'gate-dnd');
+  offline = true;
+  const missing = await harness.emitter.emit(input);
+  assert.equal(missing.messageId, first.messageId);
+  assert.deepEqual(missing.receipts, online.receipts, 'offline cannot downgrade prior durable custody');
+  assert.ok(Object.values(staged).every(path => existsSync(path)));
+  offline = false;
+  settled = true;
+  const delivered = await harness.emitter.emit(input);
+  assert.equal(delivered.messageId, first.messageId);
+  assert.equal(delivered.receipts[0].stage, 'dispatched');
+  assert.ok(Object.values(staged).every(path => !existsSync(path)));
+  assert.equal(route.mock.callCount(), 1);
+  assert.ok(harness.sendCalls.every(call => call.targetNodeId === harness.targetCard.nodeId));
+  assert.ok(harness.sendCalls.every(call => call.envelope.id === first.messageId));
+});
+
+test('keyed mixed multicast reconciles only the original failed sibling', async t => {
+  for (const localFailure of [false, true]) {
+    let recovered = false;
+    const harness = await emitterHarness(t, { extraMembers: ['aya', 'bo'], plan: target =>
+      target === harness.targetByMember.get('aya')!.nodeId && !recovered
+        ? localFailure ? { error: new LocalDeliveryError('local protocol failure') } : { stage: 'rejected', detail: 'Gate closed' }
+        : {} });
+    const diz = harness.targetCard.nodeId;
+    const aya = harness.targetByMember.get('aya')!.nodeId;
+    const bo = harness.targetByMember.get('bo')!.nodeId;
+    let selected = [diz, aya];
+    const route = t.mock.method(harness.kernel.ctx.services.router, 'route', async () => ({
+      mode: 'multicast' as const, targetNodeIds: selected, matchedBy: 'test', reason: 'available',
+    }));
+    const input: EmitMessageInput = { networkId: harness.networkId, routing: { mode: 'auto' },
+      kind: 'task', subject: 'mixed obligation', body: 'pin siblings', payload: {}, idempotencyKey: 'mixed' };
+    if (localFailure) await assert.rejects(harness.emitter.emit(input), /local protocol failure/);
+    else await harness.emitter.emit(input);
+    const first = harness.outbox.list({ status: 'failed' })[0];
+    selected = [bo];
+    if (localFailure) await assert.rejects(harness.emitter.emit(input), (error: any) => {
+      assert.deepEqual(error.receipts, [first.deliveredReceipts[diz]]);
+      return /local protocol failure/.test(error.message);
+    });
+    else {
+      const retry = await harness.emitter.emit(input);
+      assert.equal(retry.messageId, first.id);
+      assert.deepEqual(retry.receipts.find(r => r.fromNodeId === diz), first.deliveredReceipts[diz]);
+      assert.equal(retry.receipts.find(r => r.fromNodeId === aya)?.stage, 'rejected');
+    }
+    recovered = true;
+    const recoveredResult = await harness.emitter.emit(input);
+    assert.equal(recoveredResult.messageId, first.id);
+    const item = harness.outbox.get(first.id)!;
+    assert.equal(item.status, 'delivered');
+    assert.deepEqual(item.failedNodeIds, []);
+    assert.deepEqual(item.failedReceipts, {});
+    assert.equal(harness.outbox.list({ status: 'all' }).length, 1);
+    assert.equal(harness.sendCalls.filter(c => c.targetNodeId === diz).length, 1);
+    assert.equal(harness.sendCalls.filter(c => c.targetNodeId === aya).length, 3);
+    assert.equal(harness.sendCalls.filter(c => c.targetNodeId === bo).length, 0);
+    assert.equal(route.mock.callCount(), 1);
+    assert.ok(harness.sendCalls.every(c => c.envelope.id === first.id));
+  }
+});
+
+
+test('signed interrupted dispatch evidence never becomes a durable outbox queue receipt', async t => {
+  const harness = await emitterHarness(t, { stage: 'dispatching' });
+  const input: EmitMessageInput = { networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] }, kind: 'task', subject: 'interrupted',
+    body: 'unknown execution is fenced', payload: {}, idempotencyKey: 'interrupted-key' };
+  const first = await harness.emitter.emit(input);
+  const second = await harness.emitter.emit(input);
+  assert.equal(second.messageId, first.messageId);
+  for (const result of [first, second]) {
+    assert.equal(result.receipts.length, 1);
+    assert.equal(result.receipts[0].stage, 'dispatching');
+  }
+  const item = harness.outbox.get(first.messageId)!;
+  assert.equal(item.status, 'failed');
+  assert.equal(item.failedReceipts[harness.targetCard.nodeId].stage, 'dispatching');
+  assert.deepEqual(item.pendingNodeIds, []);
+  assert.deepEqual(item.deliveredReceipts, {});
 });

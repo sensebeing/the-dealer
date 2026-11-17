@@ -36,6 +36,21 @@ export type {
   OutboxListFilter,
 } from '../core-types/index.ts';
 
+/** The same lookup governs read-only replay and atomic creation under the store lock. */
+function highestKeyedObligation(items: readonly OutboxItem[], networkId: string, key: string, minVersion: number): OutboxItem | undefined {
+  let existing: OutboxItem | undefined;
+  let highestVersion = minVersion;
+  for (const item of items) {
+    if (item.networkId !== networkId || item.envelope.idempotencyKey !== key) continue;
+    const version = envelopeClaimVersion(item.envelope) ?? 0;
+    if (version >= highestVersion) {
+      existing = item;
+      highestVersion = version;
+    }
+  }
+  return existing;
+}
+
 export const OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
 const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
 const MIN_ATTEMPT_DELAY_MS = 2_000;
@@ -256,7 +271,8 @@ export class OutboxStore {
     }
     if (Object.keys(item.deliveredReceipts).length > 0) {
       item.status = 'delivered';
-      if (Object.keys(item.stagedFiles).length > 0) {
+      if (Object.keys(item.stagedFiles).length > 0 &&
+          Object.values(item.deliveredReceipts).every(receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: false }))) {
         this.removeStagedFiles(item.id, item.stagedFiles);
         item.stagedFiles = {};
       }
@@ -277,14 +293,31 @@ export class OutboxStore {
     return this.mutate(state => {
       const index = state.items.findIndex(item => item.id === id);
       const existing = index >= 0 ? state.items[index] : undefined;
+      const settled = Object.fromEntries(Object.entries(existing?.deliveredReceipts ?? {}).filter(
+        ([, receipt]) => isConfirmedHandoffReceipt(receipt, { allowQueued: false }),
+      ));
+      // Reconciliation replaces only named unsettled outcomes, never confirmed execution.
+      for (const nodeId of input.reconcileNodeIds ?? []) {
+        if (!existing || settled[nodeId]) continue;
+        delete existing.deliveredReceipts[nodeId];
+        delete existing.failedReceipts[nodeId];
+        existing.failedNodeIds = existing.failedNodeIds.filter(id => id !== nodeId);
+        existing.pendingNodeIds = existing.pendingNodeIds.filter(id => id !== nodeId);
+        existing.inDoubtNodeIds = existing.inDoubtNodeIds.filter(id => id !== nodeId);
+        existing.relaySpooledNodeIds = existing.relaySpooledNodeIds.filter(id => id !== nodeId);
+      }
       const deliveredReceipts = {
         ...(existing?.deliveredReceipts ?? {}),
         ...structuredClone(input.deliveredReceipts ?? {}),
+        ...settled,
       };
       const failedReceipts = {
         ...(existing?.failedReceipts ?? {}),
         ...structuredClone(input.failedReceipts ?? {}),
       };
+      for (const nodeId of Object.keys(input.failedReceipts ?? {})) {
+        if (!settled[nodeId] && !input.deliveredReceipts?.[nodeId]) delete deliveredReceipts[nodeId];
+      }
       const failedNodeIds = [...new Set([
         ...(existing?.failedNodeIds ?? []),
         ...(input.failedNodeIds ?? []),
@@ -349,6 +382,11 @@ export class OutboxStore {
     return item ? clone(item) : undefined;
   }
 
+  findKeyedObligation(networkId: string, key: string, minVersion: number): OutboxItem | undefined {
+    const item = highestKeyedObligation(this.read().items, networkId, key, minVersion);
+    return item ? clone(item) : undefined;
+  }
+
   /**
    * Atomically create work or join the highest reusable obligation version of a key. The
    * check and the reservation happen under the same store lock, so concurrent emitters
@@ -369,22 +407,8 @@ export class OutboxStore {
     const id = input.envelope.id;
     const now = new Date().toISOString();
     return this.mutate(state => {
-      let existing: OutboxItem | undefined;
-      let highestVersion = -1;
-      for (const item of state.items) {
-        if (item.networkId !== input.envelope.networkId || item.envelope.idempotencyKey !== key) continue;
-        const receipts = Object.values(item.deliveredReceipts);
-        const reusable = item.status === 'queued' || (item.status === 'delivered' &&
-          receipts.length > 0 && receipts.every(receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: false })));
-        if (!reusable) continue;
-        // Legacy claims could contain invalid versions; they cannot outrank valid work.
-        const itemVersion = envelopeClaimVersion(item.envelope) ?? 0;
-        if (itemVersion > highestVersion) {
-          existing = item;
-          highestVersion = itemVersion;
-        }
-      }
-      if (existing && highestVersion >= version) {
+      const existing = highestKeyedObligation(state.items, input.envelope.networkId, key, version);
+      if (existing) {
         return { claimed: false, item: clone(existing) };
       }
       const leaseMs = Number.isFinite(input.leaseMs) && (input.leaseMs ?? 0) > 0
@@ -411,20 +435,6 @@ export class OutboxStore {
       this.settleItem(item);
       state.items.push(item);
       return { claimed: true, item: clone(item) };
-    });
-  }
-
-  /** Release only a pristine reservation when routing fails before a send can occur. */
-  abandonUnattemptedClaim(id: string): void {
-    this.mutate(state => {
-      const index = state.items.findIndex(item => item.id === id);
-      if (index < 0) return;
-      const item = state.items[index];
-      if (item.status !== 'queued' || item.attempts !== 0 || item.pendingNodeIds.length > 0 ||
-          Object.keys(item.deliveredReceipts).length > 0 || Object.keys(item.failedReceipts).length > 0 ||
-          item.failedNodeIds.length > 0) return;
-      this.removeStagedFiles(item.id, item.stagedFiles);
-      state.items.splice(index, 1);
     });
   }
 
