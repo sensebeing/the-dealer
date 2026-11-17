@@ -4685,6 +4685,10 @@ test('prepare rejects blank injected keys and deletion of caller keys', async t 
     await assert.rejects(harness.emitter.emit({ ...input, idempotencyKey: 'caller-key' }),
       /Prepare hook cannot change caller idempotencyKey/);
     if (key !== undefined) await assert.rejects(harness.emitter.emit(input), /non-empty string/);
+    for (const callerKey of ['', '   ']) {
+      await assert.rejects(harness.emitter.emit({ ...input, idempotencyKey: callerKey }),
+        /idempotencyKey must be a non-empty string/);
+    }
     assert.equal(harness.sendCalls.length, 0);
   }
 });

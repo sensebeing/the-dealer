@@ -7,6 +7,8 @@ import { join, resolve as resolvePath } from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   DealerNodeRuntime,
+  DEDUP_CAS_DUPLICATE_DETAIL,
+  DEDUP_CAS_AMBIGUOUS_DETAIL,
   generateNodeKeyPair,
   signEnvelope,
   isDedupCasDuplicateReceipt,
@@ -727,6 +729,8 @@ export default (_config: any, context: any) => {
           ...input,
           userPlugin: true,
           factoryPolicy: policy.name,
+          duplicateDetail: context.api.DEDUP_CAS_DUPLICATE_DETAIL,
+          ambiguousDetail: context.api.DEDUP_CAS_AMBIGUOUS_DETAIL,
           duplicateReceiptRecognized: context.api.isDedupCasDuplicateReceipt(duplicate),
           dispatchedReceiptRecognized: context.api.isDedupCasDuplicateReceipt(first),
         });
@@ -744,6 +748,8 @@ export default (_config: any, context: any) => {
   assert.equal(afterRestart.body, 'overlay');
   assert.equal(afterRestart.userPlugin, true);
   assert.equal(afterRestart.factoryPolicy, 'dedup-cas');
+  assert.equal(afterRestart.duplicateDetail, DEDUP_CAS_DUPLICATE_DETAIL);
+  assert.equal(afterRestart.ambiguousDetail, DEDUP_CAS_AMBIGUOUS_DETAIL);
   assert.equal(afterRestart.duplicateReceiptRecognized, false);
   assert.equal(afterRestart.dispatchedReceiptRecognized, false);
   assert.equal((await cli(restored, 'project', 'status')).userPlugins[0].name, 'user-example');

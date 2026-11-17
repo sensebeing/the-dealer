@@ -263,6 +263,10 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
       /** Previously unresolved explicit selectors converge their reply route once resolved. */
       const service: EmitterService = {
         async emit<T>(input: EmitMessageInput<T>) {
+          if (input.idempotencyKey !== undefined &&
+              (typeof input.idempotencyKey !== 'string' || !input.idempotencyKey.trim())) {
+            throw new Error('idempotencyKey must be a non-empty string');
+          }
           const { transport, node, router } = ctx.services;
           const self = node.getSelfCard(input.networkId);
           const mounted = transport.listMountedNetworks().includes(input.networkId);
@@ -319,7 +323,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             traceId: input.traceId ?? randomUUID(),
             networkId: input.networkId,
             ...(input.replyToId ? { replyToId: input.replyToId } : {}),
-            ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+            ...(input.idempotencyKey !== undefined ? { idempotencyKey: input.idempotencyKey } : {}),
             ...(semantic ? { semantic } : {}),
             from: { nodeId: self.nodeId, ...self.identity },
             routing: input.routing,
