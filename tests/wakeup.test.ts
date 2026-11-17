@@ -1551,7 +1551,9 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
   t.after(() => first.stop());
   const target = first.mailbox.getWakeTarget('stream:collab.request.v4')!;
   assert.equal(target.rotateAfterWaves, 1);
-  first.mailbox.upsertWakeTarget('stream:collab.request.v4', { terminalHandle: 'runtime-tab' });
+  first.mailbox.upsertWakeTarget('stream:collab.request.v4', {
+    terminalHandle: 'runtime-tab', agent: 'claude', sessionId: 'runtime-session', paneKey: 'runtime:pane',
+  });
   await first.stop();
 
   const second = await make().start();
@@ -1562,6 +1564,9 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
     'a restart must not erase the live tab resolved at runtime',
   );
   assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.rotateAfterWaves, 1);
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.agent, 'claude');
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.sessionId, 'runtime-session');
+  assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.paneKey, 'runtime:pane');
 
   // Refreshing the same binding keeps the runtime handle; switching workspaces clears it.
   await second.applyAgentPreset({
@@ -1603,6 +1608,29 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
   assert.equal(runBound.mode, 'orca-run');
   assert.equal(runBound.terminalHandle, undefined, 'an Orca Run clears the stale pinned tab');
   assert.equal(runBound.rotateAfterWaves, undefined, 'an Orca Run owns its coordinator session');
+
+  for (const change of [
+    { workspacePath: join(root, 'changed') },
+    { terminalHandle: 'different-tab' },
+    { runId: 'different-run' },
+    { terminalHandle: 'runtime-tab' },
+    { sessionId: 'configured-session' },
+  ]) {
+    second.mailbox.upsertWakeTarget('stream:collab.request.v4', {
+      mode: 'orca-terminal', workspacePath, terminalHandle: 'runtime-tab',
+      agent: 'codex', sessionId: 'runtime-session', paneKey: 'runtime:pane',
+    });
+    second.config.topicBindings = {
+      'collab.request.v4': { executor: 'orca-wave', mailboxId: 'stream:collab.request.v4', workspacePath, ...change },
+    };
+    await second.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', topic: 'reconfiguration.trigger' });
+    const refreshed = second.mailbox.getWakeTarget('stream:collab.request.v4')!;
+    const preserved = change.terminalHandle === 'runtime-tab' || change.sessionId !== undefined;
+    assert.equal(refreshed.sessionId, change.sessionId ?? (preserved ? 'runtime-session' : undefined));
+    assert.equal(refreshed.paneKey, preserved ? 'runtime:pane' : undefined);
+    assert.equal(refreshed.agent, preserved ? 'codex' : undefined);
+  }
+
 });
 
 test('inline wakeup previews include bounded latest body, semantic sender and thread on one line', async t => {

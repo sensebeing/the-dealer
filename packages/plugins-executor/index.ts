@@ -763,10 +763,13 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         const workspaceComment = String(
           envelopes.at(-1)?.payload?.workspaceComment || binding?.workspaceComment || `Dealer: ${mailboxId} pending`,
         );
+        const explicitAgent = binding?.agent ?? config.agent ?? options.agent ?? (hasReceiverTarget ? undefined : payload.agent);
+        const explicitInteractiveCommand = binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand;
         return {
           mode: runId ? 'orca-run' : 'orca-terminal',
-          agent: orcaAgent(binding?.agent ?? config.agent ?? options.agent ?? payload.agent),
-          interactiveCommand: binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
+          ...(explicitAgent !== undefined ? { agent: orcaAgent(explicitAgent) } : {}),
+          ...(explicitInteractiveCommand !== undefined ? { interactiveCommand: explicitInteractiveCommand } : {}),
+          ...(binding?.sessionId ? { sessionId: binding.sessionId } : {}),
           orcaCommand: command,
           coalesceMs,
           ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
@@ -820,7 +823,8 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         // Only the topic's own bound mailbox may use the receiver binding. A thread- or
         // session-scoped mailbox keeps the wake target its originating session already bound, so
         // a reply wakes that terminal instead of rotating it into the generic topic workspace.
-        const usesTopicBinding = group.binding === undefined || mailboxId === boundMailboxId;
+        const isSessionScopedMailbox = mailboxId.startsWith('worktree:') || mailboxId.startsWith('terminal:') || mailboxId.startsWith('task:');
+        const usesTopicBinding = group.binding !== undefined ? mailboxId === boundMailboxId : !isSessionScopedMailbox;
         const wakeTarget = usesTopicBinding
           ? prepareExternalEffect(() => topicWakeTarget(group.envelopes, group.binding, mailboxId))
           : await prepareExternalEffectAsync(() => resolveSessionWakeTarget(store, runner, command, mailboxId));

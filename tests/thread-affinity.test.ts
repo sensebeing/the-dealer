@@ -190,15 +190,10 @@ test('a session mailbox with no live wake target infers its Orca worktree', asyn
   const plugin = createOrcaWaveExecutorPlugin({
     store,
     commandRunner: runner,
-    resolveTopicBinding: () => ({
-      executor: 'orca-wave',
-      mailboxId: 'stream:inbox',
-      workspacePath: '/tmp/inbox',
-      rotateAfterWaves: 1,
-    }),
+    resolveTopicBinding: () => undefined,
   });
   await plugin.execute(
-    [envelope('peer-reply-2', { from: peer, semantic: { type: 'message', threadId: 'thread-affinity-2' } })],
+    [envelope('peer-reply-2', { from: peer, semantic: { type: 'message', threadId: 'thread-affinity-2' }, payload: { workspacePath: '/sender/impostor', agent: 'antigravity' } })],
     context,
     {},
   );
@@ -407,3 +402,53 @@ test('dealer send --thread follows the newest inbound leg of a thread we origina
     replyMailbox: originMailbox,
   });
 });
+
+for (const agent of ['claude', 'codex'] as const) {
+  test(`unbound orca-wave thread routing preserves the receiver ${agent} session`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const mailboxId = 'worktree:origin';
+    const identity = { workspacePath: join(root, 'origin'), agent, sessionId: 'original-session', paneKey: 'original:pane', interactiveCommand: 'receiver-command' };
+    store.upsertWakeTarget(mailboxId, { mode: 'orca-terminal', ...identity });
+    store.recordOutboundEnvelope(envelope('request', {
+      semantic: { type: 'message', threadId: 'original-thread', replyMailbox: mailboxId },
+    }), [peer.nodeId], mailboxId);
+    const plugin = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => undefined });
+    await plugin.execute([envelope('reply', {
+      from: peer, semantic: { type: 'message', threadId: 'original-thread' },
+      payload: { workspacePath: '/sender/impostor', agent: 'antigravity' },
+    })], context, {});
+    const target = store.getWakeTarget(mailboxId)!;
+    for (const key of Object.keys(identity) as Array<keyof typeof identity>) assert.equal(target[key], identity[key], key);
+    assert.equal(store.list({ mailboxId }).queuedCount, 1);
+  });
+
+  test(`fixed orca-wave ingestion preserves runtime ${agent} identity without explicit overrides`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const mailboxId = 'stream:fixed';
+    const workspacePath = join(root, 'fixed');
+    store.upsertWakeTarget(mailboxId, {
+      mode: 'orca-terminal', workspacePath, agent, sessionId: 'runtime-session', paneKey: 'runtime:pane', interactiveCommand: 'receiver-command',
+    });
+    const binding = { executor: 'orca-wave', mode: 'fixed', mailboxId, workspacePath } as const;
+    const plugin = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => binding });
+    for (const id of ['first', 'next']) {
+      await plugin.execute([envelope(id, { payload: { workspacePath: '/sender/impostor', agent: 'antigravity' } })], context, {});
+      const target = store.getWakeTarget(mailboxId)!;
+      assert.equal(target.workspacePath, workspacePath);
+      assert.equal(target.agent, agent);
+      assert.equal(target.sessionId, 'runtime-session');
+      assert.equal(target.paneKey, 'runtime:pane');
+      assert.equal(target.interactiveCommand, 'receiver-command');
+    }
+    const explicit = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => ({
+      ...binding, agent: 'antigravity', sessionId: 'configured-session', interactiveCommand: 'configured-command',
+    }) });
+    await explicit.execute([envelope('override')], context, {});
+    const target = store.getWakeTarget(mailboxId)!;
+    assert.equal(target.agent, 'antigravity');
+    assert.equal(target.sessionId, 'configured-session');
+    assert.equal(target.interactiveCommand, 'configured-command');
+  });
+}

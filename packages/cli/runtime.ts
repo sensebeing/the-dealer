@@ -1037,16 +1037,18 @@ export class DealerNodeRuntime {
       // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
       // handle, an Orca Run, or a workspace switch may replace or clear it. Passing every optional
       // field as an own property is what lets a reconfiguration erase a stale rotation default.
-      const nextTerminalHandle =
-        terminalHandle !== undefined
-          ? terminalHandle
-          : !runId && current?.mode === 'orca-terminal' && current.workspacePath === workspacePath
-            ? current.terminalHandle
-            : undefined;
+      const preserveRuntimeSession = !runId && current?.mode === 'orca-terminal' &&
+        current.workspacePath === workspacePath &&
+        (terminalHandle === undefined || terminalHandle === current.terminalHandle);
+      const nextTerminalHandle = terminalHandle !== undefined
+        ? terminalHandle : preserveRuntimeSession ? current.terminalHandle : undefined;
       this.mailbox.upsertWakeTarget(mailboxId, {
         mode: runId ? 'orca-run' : 'orca-terminal',
         workspacePath, worktreeId, runId, repoRoot: projectRoot,
-        agent: binding.agent ? orcaAgent(binding.agent) : undefined, interactiveCommand,
+        agent: binding.agent ? orcaAgent(binding.agent) : (preserveRuntimeSession ? current.agent : undefined),
+        sessionId: binding.sessionId ?? (preserveRuntimeSession ? current.sessionId : undefined),
+        paneKey: preserveRuntimeSession ? current.paneKey : undefined,
+        interactiveCommand,
         autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
         rotateAfterWaves: resolvedRotateAfterWaves,
         terminalHandle: nextTerminalHandle,
