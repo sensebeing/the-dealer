@@ -1155,7 +1155,11 @@ test('project linking merges newly published onboarding bootstrap peers into a m
   await restored.start();
   t.after(() => restored.stop());
   assert.deepEqual(restored.transport.getNetworkConfig('merge-team')?.bootstrapPeers,
-    ['127.0.0.1:45671', '127.0.0.1:45672', '127.0.0.1:45673']);
+    ['127.0.0.1:45671', '127.0.0.1:45672']);
+  await restored.mountNetwork({ networkId: 'merge-team', passphrase: 'offline-test-only' });
+  await restored.linkProject(root);
+  assert.deepEqual(restored.transport.getNetworkConfig('merge-team')?.bootstrapPeers ?? [], []);
+  assert.equal(restored.transport.getNetworkConfig('merge-team')?.passphrase, 'offline-test-only');
 });
 
 

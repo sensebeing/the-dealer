@@ -6,8 +6,7 @@ import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { createConnection, createServer } from 'node:net';
-import type { Socket } from 'node:net';
+import { createConnection, createServer, Socket } from 'node:net';
 import { Kernel } from '../packages/kernel/index.ts';
 import { generateNodeKeyPair, deriveNetworkKeys, sealNetworkFrame } from '../packages/core-types/index.ts';
 import type { InboundFrameEvent } from '../packages/core-types/index.ts';
@@ -354,4 +353,61 @@ test('exchange splits its remaining budget across fallback seeds so a live relay
   // and the whole exchange stays inside the caller's deadline.
   assert.deepEqual(received, [`${sender.localNodeId}:broadcast`]);
   assert.ok(elapsed < 3_500, `fallback relay took ${Math.round(elapsed)}ms of a 3000ms exchange budget`);
+});
+
+test('direct frame bounds an unfinished TCP handshake independently of the RPC budget', async t => {
+  const transport = new P2PTransportService({ socketTimeoutMs: 90_000 });
+  const internal = transport as unknown as {
+    directFrame(mount: unknown, target: string, address: string, frame: unknown, timeout: number): Promise<unknown>;
+  };
+  // Model a kernel SYN blackhole without dialing an external or machine-specific address.
+  const connect = t.mock.method(Socket.prototype, 'connect', function (this: Socket) { return this; });
+  const started = Date.now();
+  await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', {}, 90_000),
+    /Direct connect timeout/);
+  assert.ok(Date.now() - started < 3000, 'TCP establishment must not wait for the 90s RPC deadline');
+  await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', {}, 20),
+    /Direct connect timeout/);
+  connect.mock.restore();
+  const closing = t.mock.method(Socket.prototype, 'connect', function (this: Socket) {
+    queueMicrotask(() => this.destroy());
+    return this;
+  });
+  await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', {}, 90_000));
+  closing.mock.restore();
+  const server = createServer(socket => socket.end());
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const port = (server.address() as { port: number }).port;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:' + port, {}, 90_000), /ECONNREFUSED/);
+});
+
+test('direct frame gives a connected slow executor the full RPC timeout', async t => {
+  const transport = new P2PTransportService({ socketTimeoutMs: 4000 });
+  const internal = transport as unknown as {
+    directFrame(mount: unknown, target: string, address: string, frame: unknown, timeout: number): Promise<unknown>;
+  };
+  const sockets = new Set<Socket>();
+  const server = createServer(socket => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.once('data', () => {
+      const timer = setTimeout(() => {
+        const body = encode({ frame: { senderNodeId: 'target' } });
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(body.length);
+        socket.end(Buffer.concat([header, body]));
+      }, 1700);
+      socket.once('close', () => clearTimeout(timer));
+    });
+  });
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const endpoint = '127.0.0.1:' + (server.address() as { port: number }).port;
+  assert.deepEqual(await internal.directFrame({}, 'target', endpoint, {}, 4000), { senderNodeId: 'target' });
 });

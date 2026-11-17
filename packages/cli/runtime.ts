@@ -829,13 +829,13 @@ export class DealerNodeRuntime {
               passphrase: onboardingPassphrase,
               ...(manifest.onboarding?.bootstrapPeers?.length ? { bootstrapPeers: manifest.onboarding.bootstrapPeers } : {}),
             });
-          } else if (onboardingPassphrase && this.transport.listMountedNetworks().includes(onboardingNetworkId) &&
+          } else if (!options.restore && onboardingPassphrase && this.transport.listMountedNetworks().includes(onboardingNetworkId) &&
                      manifest.onboarding?.bootstrapPeers?.length) {
-            // Linking or restoring a project also adds newly published project seeds to
+            // Explicitly linking a project adds newly published project seeds to
             // an already-mounted network instead of requiring a manual remount.
             const current = this.transport.getNetworkConfig(onboardingNetworkId);
             const mergedSeeds = [...new Set([...(current?.bootstrapPeers ?? []), ...manifest.onboarding.bootstrapPeers])];
-            if (current && mergedSeeds.length > (current.bootstrapPeers?.length ?? 0)) {
+            if (current && current.passphrase === onboardingPassphrase && mergedSeeds.length > (current.bootstrapPeers?.length ?? 0)) {
               await this.mountNetwork({ ...current, bootstrapPeers: mergedSeeds });
             }
           }

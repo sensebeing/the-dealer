@@ -423,7 +423,8 @@ export function selfUpdate(options: SelfUpdateOptions): any {
     sourceStatus = 'error';
     error = String(caught);
   }
-  const report = { ...previous, lastCheckedAt: checkedAt, ...(status === 'updated' ? { lastUpdatedAt: new Date().toISOString() } : {}), status, sourceStatus, ...(headSha ? { headSha } : {}), syncedSkills, restartedDaemon: false, ...(error ? { error } : {}) };
+  const { error: _previousError, ...restPrevious } = previous;
+  const report = { ...restPrevious, lastCheckedAt: checkedAt, ...(status === 'updated' ? { lastUpdatedAt: new Date().toISOString() } : {}), status, sourceStatus, ...(headSha ? { headSha } : {}), syncedSkills, restartedDaemon: false, ...(error ? { error } : {}) };
   atomicJson(join(options.stateDir, 'auto-update.json'), report);
   writeFileSync(join(options.stateDir, 'auto-update.log'), `${JSON.stringify(report)}\n`, { flag: 'a', mode: 0o600 });
   rmSync(lock, { recursive: true, force: true });
@@ -440,11 +441,12 @@ export function maybeTriggerBackgroundAutoUpdate(options: SelfUpdateOptions): vo
   const state = readAutoUpdateStatus(options.stateDir);
   const last = state?.lastCheckedAt ? Date.parse(state.lastCheckedAt) : 0;
   const now = Date.now();
-  if (last && now - last < 6 * 3600_000) {
+  const cooldownMs = state?.sourceStatus === 'error' ? 15 * 60_000 : 6 * 3600_000;
+  if (last && now - last < cooldownMs) {
     return;
   }
   // Local file changes are restarted exclusively by runDealerDaemon's idle-gated fs.watch;
-  // this background check only refreshes upstream code on its six-hour cooldown.
+  // this background check refreshes upstream code, retrying transient errors sooner.
   const bin = fileURLToPath(new URL('../../bin/dealer.js', import.meta.url));
   const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, 'self-update', '--quiet', '--json'], { detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: options.stateDir } });
   child.unref();

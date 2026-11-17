@@ -128,6 +128,8 @@ dealer send --network sensebeing --auto-route --topic triage --body '{"category"
 dealer broadcast --network sensebeing --topic team.announcement --body 'Review window starts now' --json
 ```
 
+For repeatable requests, use `dealer send --idempotency-key <key>` with the same non-empty key on retries; the sender reuses the durable outbox obligation instead of emitting another request.
+
 Choose exactly one of `--to` and `--auto-route`. Selectors include
 `member:bob`, `bob@laptop`, `skill:ios-crash`, and a full `ed25519:` NodeId.
 `--urgency normal|high|critical` maps critical to the wire's urgent priority.

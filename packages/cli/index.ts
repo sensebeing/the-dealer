@@ -32,7 +32,7 @@ export * from './auto-update.ts';
 const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'include-acked', 'help', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
-  'thread',
+  'thread', 'idempotency-key',
   'state',
   'limit',
   'root',
@@ -1102,7 +1102,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         ok: true,
         usage: 'dealer <send|reply|ask|settle|inbox|thread|outbox|worktree|node|project|setup|route|source> [options]',
         commands: {
-          send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--attach <path>] [--json]',
+          send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--idempotency-key <key>] [--attach <path>] [--json]',
           reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
           ask: 'dealer ask <messageId> --body <text> [--ack <leaseId>] [--json]',
           settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
@@ -1438,6 +1438,8 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         throw new Error('Invalid urgency');
       }
       const networkId = required(v.network, '--network');
+      const idempotencyKey = v['idempotency-key'] === undefined
+        ? undefined : required(v['idempotency-key']?.trim(), '--idempotency-key');
       const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
       // A message on an existing thread belongs to the session that started it: the thread's
       // recorded routes take precedence over the topic's generic binding. Resolution is scoped to
@@ -1488,6 +1490,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       result = await runtime.emitter.emit({
         networkId,
         kind: topic,
+        ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
         subject:
           typeof v.subject === 'string' && v.subject ? String(v.subject) : topic,
         body,

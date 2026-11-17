@@ -344,6 +344,13 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           ) {
             throw new Error('Prepare hook cannot change sender or network identity');
           }
+          if (input.idempotencyKey !== undefined && prepared.idempotencyKey !== input.idempotencyKey) {
+            throw new Error('Prepare hook cannot change caller idempotencyKey');
+          }
+          if (prepared.idempotencyKey !== undefined &&
+              (typeof prepared.idempotencyKey !== 'string' || !prepared.idempotencyKey.trim())) {
+            throw new Error('idempotencyKey must be a non-empty string');
+          }
           // Hooks may inject a semantic header without a threadId; normalize it against the
           // authenticated message id before the final signature.
           const preparedSemantic =
@@ -376,7 +383,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             // durable outbox retries it once the peer directory learns the member again.
             // Network mount state is irrelevant here; identity resolution is directory-owned.
             if (isUnresolvedTargetError(error) && queueIfOffline) {
-              const claimed = input.idempotencyKey
+              const claimed = envelope.idempotencyKey
                 ? outbox.claimIdempotency({
                     envelope,
                     explicitTargets: [...(input.routing.targets ?? [])],
@@ -408,7 +415,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           // the same key converge on one envelope/obligation, and the store lock is the
           // only place that decides which caller owns the initial send.
           let claimedItem: OutboxItem | undefined;
-          if (queueIfOffline && input.idempotencyKey && route.mode !== 'broadcast') {
+          if (queueIfOffline && envelope.idempotencyKey && route.mode !== 'broadcast') {
             const claim = outbox.claimIdempotency({
               envelope,
               explicitTargets: [...(input.routing.targets ?? [])],
@@ -452,13 +459,16 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             await transport.broadcast(envelope.networkId, envelope.routing.topic ?? 'messages', frame);
           } else {
             const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
-            for (const target of route.targetNodeIds) {
-              const attempt = await attemptTarget(envelope, target, frame, {
+            const attempts = await Promise.all(route.targetNodeIds.map(target =>
+              attemptTarget(envelope, target, frame, {
                 deadline,
                 mounted,
                 queueIfOffline,
                 spoolOptions,
-              });
+              }),
+            ));
+            for (const [index, target] of route.targetNodeIds.entries()) {
+              const attempt = attempts[index];
               if (attempt.status === 'delivered') {
                 deliveredReceipts[target] = attempt.receipt;
                 observedReceipts.push(attempt.receipt);
@@ -646,16 +656,12 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const failures: OutboxDeliveryFailure[] = [];
           const attemptedTargets = new Set<string>();
           let lastError: string | undefined;
-          // The total attempt deadline lives here, not in an outer race: every receipt
-          // already obtained is returned even when a later target consumes the budget.
+          // All targets share a deadline but start independently; a dead peer cannot
+          // consume a live sibling's send budget. Fold evidence in target order.
           const deadline = Date.now() + (options.timeoutMs ?? 10_000);
-          for (const target of targets) {
-            if (Date.now() >= deadline) {
-              // Never attempted, so the bytes certainly cannot have executed there.
-              pendingNodeIds.push(target);
-              continue;
-            }
-            const attempt = await attemptTarget(item.envelope, target, frame, {
+          const attempts = await Promise.all(targets.map(target => {
+            if (Date.now() >= deadline) return undefined;
+            return attemptTarget(item.envelope, target, frame, {
               deadline,
               mounted,
               queueIfOffline: true,
@@ -665,6 +671,14 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 spoolBlobHashes,
               },
             });
+          }));
+          for (const [index, target] of targets.entries()) {
+            const attempt = attempts[index];
+            if (attempt === undefined) {
+              // Never attempted, so preserve any prior in-doubt evidence below.
+              pendingNodeIds.push(target);
+              continue;
+            }
             if (attempt.status === 'delivered') {
               attemptedTargets.add(target);
               deliveredReceipts[target] = attempt.receipt;

@@ -4653,3 +4653,101 @@ test('a mounted transport purges pre-existing self-spooled snapshot and journal 
     'the dropped self entries are compacted into one clean snapshot',
   );
 });
+
+test('prepare keys claim one sender obligation for resolved and unresolved targets', async t => {
+  for (const selector of ['member:diz', 'member:unknown']) {
+    const harness = await emitterHarness(t, {
+      plan: target => ({ error: new PeerUnreachableError(target) }),
+    });
+    harness.kernel.ctx.on('emitter/prepare', envelope => ({ ...envelope, idempotencyKey: 'topic-request' }));
+    const input: EmitMessageInput = {
+      networkId: harness.networkId, routing: { mode: 'unicast', targets: [selector] },
+      kind: 'task', subject: 'prepare key', body: 'one request', payload: {},
+    };
+    const [first, second] = await Promise.all([harness.emitter.emit(input), harness.emitter.emit(input)]);
+    assert.equal(first.messageId, second.messageId);
+    assert.equal(harness.outbox.list({ status: 'all' }).length, 1);
+    assert.equal(harness.sendCalls.length, selector === 'member:diz' ? 1 : 0);
+    assert.equal(harness.outbox.list({ status: 'all' })[0].envelope.idempotencyKey, 'topic-request');
+    await assert.rejects(harness.emitter.emit({ ...input, idempotencyKey: 'caller-key' }),
+      /Prepare hook cannot change caller idempotencyKey/);
+  }
+});
+
+test('prepare rejects blank injected keys and deletion of caller keys', async t => {
+  for (const key of ['', '   ', undefined]) {
+    const harness = await emitterHarness(t);
+    harness.kernel.ctx.on('emitter/prepare', envelope => ({ ...envelope, idempotencyKey: key }));
+    const input: EmitMessageInput = {
+      networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'task', subject: 'invalid key', body: 'no send', payload: {},
+    };
+    await assert.rejects(harness.emitter.emit({ ...input, idempotencyKey: 'caller-key' }),
+      /Prepare hook cannot change caller idempotencyKey/);
+    if (key !== undefined) await assert.rejects(harness.emitter.emit(input), /non-empty string/);
+    assert.equal(harness.sendCalls.length, 0);
+  }
+});
+
+test('send CLI forwards idempotency keys and rejects blank keys', async t => {
+  const runtime = runtimeFor(directory(t), 'ben');
+  await runtime.start();
+  t.after(() => runtime.stop());
+  const args = ['send', '--network', 'local', '--to', 'member:missing', '--topic', 'request',
+    '--body', 'retry me', '--json', '--idempotency-key'];
+  const send = async (key: string) => {
+    const lines: string[] = [];
+    const errors: string[] = [];
+    const code = await runDealerCli([...args, key], {
+      runtime, stdout: line => lines.push(line), stderr: line => errors.push(line),
+    });
+    return { code, lines, errors };
+  };
+  const first = await send('request-key');
+  const second = await send('request-key');
+  assert.equal(first.code, 0);
+  assert.equal(second.code, 0);
+  assert.equal(JSON.parse(first.lines.join('\n')).messageId, JSON.parse(second.lines.join('\n')).messageId);
+  assert.equal(runtime.outbox.list({ status: 'all' })[0].envelope.idempotencyKey, 'request-key');
+  for (const key of ['', '   ']) {
+    const invalid = await send(key);
+    assert.equal(invalid.code, 1);
+    assert.match(invalid.errors.join('\n'), /--idempotency-key/);
+  }
+  assert.equal(runtime.outbox.list({ status: 'all' }).length, 1);
+});
+
+test('initial emit and redrive launch live siblings before the first target times out', async t => {
+  let stalled: string;
+  let offline = false;
+  const harness = await emitterHarness(t, {
+    extraMembers: ['aya'], attemptTimeoutMs: 100,
+    plan: target => offline ? { error: new PeerUnreachableError(target) }
+      : target === stalled ? { delayMs: 1000 } : {},
+  });
+  const targets = harness.targetCards.map(card => card.nodeId).sort();
+  stalled = targets[0];
+  const live = targets[1];
+  const input: EmitMessageInput = {
+    networkId: harness.networkId, routing: { mode: 'multicast', targets },
+    kind: 'task', subject: 'live sibling', body: 'must start concurrently', payload: {},
+  };
+  const emitted = await harness.emitter.emit(input);
+  assert.equal(harness.sendCalls.length, 2);
+  assert.ok(harness.sendCalls[1].opts!.timeoutMs! > 50, 'live sibling receives its own send budget');
+  assert.equal(emitted.receipts.find(receipt => receipt.fromNodeId === live)?.stage, 'dispatched');
+  const initial = harness.outbox.get(emitted.messageId)!;
+  assert.deepEqual(initial.pendingNodeIds, [stalled]);
+  assert.deepEqual(initial.inDoubtNodeIds, [stalled]);
+
+  offline = true;
+  const queued = await harness.emitter.emit({ ...input, subject: 'redrive sibling' });
+  offline = false;
+  const before = harness.sendCalls.length;
+  const outcome = await harness.emitter.redriveOutboxItem!(harness.outbox.get(queued.messageId)!, { timeoutMs: 100 });
+  assert.equal(harness.sendCalls.length - before, 2);
+  assert.ok(harness.sendCalls[before + 1].opts!.timeoutMs! > 50);
+  assert.equal(outcome.deliveredReceipts?.[live]?.stage, 'dispatched');
+  assert.deepEqual(outcome.pendingNodeIds, [stalled]);
+  assert.deepEqual(outcome.inDoubtNodeIds, [stalled]);
+});
