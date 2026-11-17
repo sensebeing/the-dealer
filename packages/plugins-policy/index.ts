@@ -8,6 +8,7 @@ import {
   DEDUP_CAS_AMBIGUOUS_DETAIL,
   DEDUP_CAS_DUPLICATE_DETAIL,
   isDurableQueuedReceipt,
+  envelopeClaimVersion,
 } from '../core-types/index.ts';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 export {
@@ -72,8 +73,8 @@ export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): Dispa
         envelope.from.nodeId,
         options.entityKey?.(envelope) ?? envelope.idempotencyKey ?? envelope.id,
       ]);
-      const raw = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
-      if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) {
+      const raw = envelopeClaimVersion(envelope);
+      if (raw === null) {
         return { stage: 'rejected', detail: 'Invalid claim version' };
       }
       const previous = locks.get(key) ?? Promise.resolve();

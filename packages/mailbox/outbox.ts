@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { envelopeClaimVersion, isConfirmedHandoffReceipt } from '../core-types/index.ts';
 import {
   copyFileAtomically,
   withOwnedLock,
@@ -34,6 +35,21 @@ export type {
   OutboxItemStatus,
   OutboxListFilter,
 } from '../core-types/index.ts';
+
+/** The same lookup governs read-only replay and atomic creation under the store lock. */
+function highestKeyedObligation(items: readonly OutboxItem[], networkId: string, key: string, minVersion: number): OutboxItem | undefined {
+  let existing: OutboxItem | undefined;
+  let highestVersion = minVersion;
+  for (const item of items) {
+    if (item.networkId !== networkId || item.envelope.idempotencyKey !== key) continue;
+    const version = envelopeClaimVersion(item.envelope) ?? 0;
+    if (version >= highestVersion) {
+      existing = item;
+      highestVersion = version;
+    }
+  }
+  return existing;
+}
 
 export const OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
 const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
@@ -255,7 +271,8 @@ export class OutboxStore {
     }
     if (Object.keys(item.deliveredReceipts).length > 0) {
       item.status = 'delivered';
-      if (Object.keys(item.stagedFiles).length > 0) {
+      if (Object.keys(item.stagedFiles).length > 0 &&
+          Object.values(item.deliveredReceipts).every(receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: false }))) {
         this.removeStagedFiles(item.id, item.stagedFiles);
         item.stagedFiles = {};
       }
@@ -276,14 +293,31 @@ export class OutboxStore {
     return this.mutate(state => {
       const index = state.items.findIndex(item => item.id === id);
       const existing = index >= 0 ? state.items[index] : undefined;
+      const settled = Object.fromEntries(Object.entries(existing?.deliveredReceipts ?? {}).filter(
+        ([, receipt]) => isConfirmedHandoffReceipt(receipt, { allowQueued: false }),
+      ));
+      // Reconciliation replaces only named unsettled outcomes, never confirmed execution.
+      for (const nodeId of input.reconcileNodeIds ?? []) {
+        if (!existing || settled[nodeId]) continue;
+        delete existing.deliveredReceipts[nodeId];
+        delete existing.failedReceipts[nodeId];
+        existing.failedNodeIds = existing.failedNodeIds.filter(id => id !== nodeId);
+        existing.pendingNodeIds = existing.pendingNodeIds.filter(id => id !== nodeId);
+        existing.inDoubtNodeIds = existing.inDoubtNodeIds.filter(id => id !== nodeId);
+        existing.relaySpooledNodeIds = existing.relaySpooledNodeIds.filter(id => id !== nodeId);
+      }
       const deliveredReceipts = {
         ...(existing?.deliveredReceipts ?? {}),
         ...structuredClone(input.deliveredReceipts ?? {}),
+        ...settled,
       };
       const failedReceipts = {
         ...(existing?.failedReceipts ?? {}),
         ...structuredClone(input.failedReceipts ?? {}),
       };
+      for (const nodeId of Object.keys(input.failedReceipts ?? {})) {
+        if (!settled[nodeId] && !input.deliveredReceipts?.[nodeId]) delete deliveredReceipts[nodeId];
+      }
       const failedNodeIds = [...new Set([
         ...(existing?.failedNodeIds ?? []),
         ...(input.failedNodeIds ?? []),
@@ -348,8 +382,13 @@ export class OutboxStore {
     return item ? clone(item) : undefined;
   }
 
+  findKeyedObligation(networkId: string, key: string, minVersion: number): OutboxItem | undefined {
+    const item = highestKeyedObligation(this.read().items, networkId, key, minVersion);
+    return item ? clone(item) : undefined;
+  }
+
   /**
-   * Atomically create or join the single durable obligation for an idempotency key. The
+   * Atomically create work or join the highest reusable obligation version of a key. The
    * check and the reservation happen under the same store lock, so concurrent emitters
    * cannot both observe "absent" and mint different envelopes/obligations. A claimed item
    * starts with no confirmed delivery and a lease: if the process dies before the first
@@ -363,15 +402,12 @@ export class OutboxStore {
     if (!key) {
       throw new Error('Outbox claim requires an idempotency key');
     }
+    const version = envelopeClaimVersion(input.envelope);
+    if (version === null) throw new Error('Invalid claim version');
     const id = input.envelope.id;
     const now = new Date().toISOString();
     return this.mutate(state => {
-      const existing = state.items.find(
-        item =>
-          item.status === 'queued' &&
-          item.networkId === input.envelope.networkId &&
-          item.envelope.idempotencyKey === key,
-      );
+      const existing = highestKeyedObligation(state.items, input.envelope.networkId, key, version);
       if (existing) {
         return { claimed: false, item: clone(existing) };
       }

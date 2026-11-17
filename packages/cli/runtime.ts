@@ -16,7 +16,7 @@ import { createGatePlugin } from '../gate/index.ts';
 import type { NetworkGateService } from '../gate/index.ts';
 import { createDispatcherPlugin, DeliveryLedger } from '../dispatcher/index.ts';
 import { createEmitterPlugin } from '../emitter/index.ts';
-import { createDedupCasPolicyPlugin } from '../plugins-policy/index.ts';
+import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL, DEDUP_CAS_AMBIGUOUS_DETAIL } from '../plugins-policy/index.ts';
 import {
   isConfirmedHandoffReceipt,
   isDedupCasDuplicateReceipt,
@@ -90,6 +90,8 @@ export interface ExternalPluginContext {
     createPollWatermarkSourcePlugin: typeof createPollWatermarkSourcePlugin;
     createScriptSourcePlugin: typeof createScriptSourcePlugin;
     createDedupCasPolicyPlugin: typeof createDedupCasPolicyPlugin;
+    DEDUP_CAS_DUPLICATE_DETAIL: typeof DEDUP_CAS_DUPLICATE_DETAIL;
+    DEDUP_CAS_AMBIGUOUS_DETAIL: typeof DEDUP_CAS_AMBIGUOUS_DETAIL;
     isConfirmedHandoffReceipt: typeof isConfirmedHandoffReceipt;
     isDedupCasDuplicateReceipt: typeof isDedupCasDuplicateReceipt;
     isDurableQueuedReceipt: typeof isDurableQueuedReceipt;
@@ -674,6 +676,8 @@ export class DealerNodeRuntime {
         createPollWatermarkSourcePlugin,
         createScriptSourcePlugin,
         createDedupCasPolicyPlugin,
+        DEDUP_CAS_DUPLICATE_DETAIL,
+        DEDUP_CAS_AMBIGUOUS_DETAIL,
         isConfirmedHandoffReceipt,
         isDedupCasDuplicateReceipt,
         isDurableQueuedReceipt,
@@ -831,11 +835,11 @@ export class DealerNodeRuntime {
             });
           } else if (onboardingPassphrase && this.transport.listMountedNetworks().includes(onboardingNetworkId) &&
                      manifest.onboarding?.bootstrapPeers?.length) {
-            // Linking or restoring a project also adds newly published project seeds to
+            // Linking or restoring a project adds newly published project seeds to
             // an already-mounted network instead of requiring a manual remount.
             const current = this.transport.getNetworkConfig(onboardingNetworkId);
             const mergedSeeds = [...new Set([...(current?.bootstrapPeers ?? []), ...manifest.onboarding.bootstrapPeers])];
-            if (current && mergedSeeds.length > (current.bootstrapPeers?.length ?? 0)) {
+            if (current && current.passphrase === onboardingPassphrase && mergedSeeds.length > (current.bootstrapPeers?.length ?? 0)) {
               await this.mountNetwork({ ...current, bootstrapPeers: mergedSeeds });
             }
           }

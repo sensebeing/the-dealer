@@ -2332,10 +2332,25 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs: number,
   ): Promise<SealedNetworkFrame> {
+    const wirePacket = packet({ type: 'frame', frame });
     const socket = this.track(createConnection(parseEndpoint(address)));
-    socket.setTimeout(timeoutMs);
+    // track owns timeout classification; disable its RPC timer until TCP connects.
+    socket.setTimeout(0);
+    const connectTimer = setTimeout(() => {
+      socket.destroy(Object.assign(new Error('Direct connect timeout'), { code: 'ETIMEDOUT' }));
+    }, Math.max(1, Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS)));
+    const onConnect = () => {
+      clearTimeout(connectTimer);
+      socket.setTimeout(timeoutMs);
+      try {
+        socket.write(wirePacket);
+      } catch (error) {
+        socket.destroy(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    socket.once('connect', onConnect);
     try {
-      socket.write(packet({ type: 'frame', frame }));
+      // Read immediately so pre-connect errors and shutdown closes settle this call too.
       const response = await new SocketReader(socket).json();
       if (response?.error) {
         throw new LocalDeliveryError(String(response.error));
@@ -2345,6 +2360,8 @@ export class P2PTransportService implements TransportService {
       }
       return response.frame;
     } finally {
+      socket.off('connect', onConnect);
+      clearTimeout(connectTimer);
       socket.destroy();
     }
   }

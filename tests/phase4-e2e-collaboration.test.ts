@@ -7,6 +7,8 @@ import { join, resolve as resolvePath } from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   DealerNodeRuntime,
+  DEDUP_CAS_DUPLICATE_DETAIL,
+  DEDUP_CAS_AMBIGUOUS_DETAIL,
   generateNodeKeyPair,
   signEnvelope,
   isDedupCasDuplicateReceipt,
@@ -228,7 +230,13 @@ test('Phase 4: polling, CAS dedup, durable busy waves and run-managed delivery a
     ...input('bob', { executor: 'orca-wave', streamKey: 'alerts', revision: 1 }),
     idempotencyKey: 'alert-0',
   });
-  assert.equal(duplicate.receipts[0].stage, 'rejected');
+  assert.equal(duplicate.receipts[0].stage, 'dispatched', 'sender replays its durable handoff');
+  // Bypass sender obligations explicitly to exercise the receiver CAS boundary too.
+  const wireDuplicate = await alice.emitter.emit({
+    ...input('bob', { executor: 'orca-wave', streamKey: 'alerts', revision: 1 }),
+    idempotencyKey: 'alert-0', queueIfOffline: false,
+  });
+  assert.equal(wireDuplicate.receipts[0].stage, 'rejected');
   assert.equal(bob.mailbox.list({ mailboxId: 'stream:alerts' }).queuedCount, 2);
 
   idle = true;
@@ -727,6 +735,8 @@ export default (_config: any, context: any) => {
           ...input,
           userPlugin: true,
           factoryPolicy: policy.name,
+          duplicateDetail: context.api.DEDUP_CAS_DUPLICATE_DETAIL,
+          ambiguousDetail: context.api.DEDUP_CAS_AMBIGUOUS_DETAIL,
           duplicateReceiptRecognized: context.api.isDedupCasDuplicateReceipt(duplicate),
           dispatchedReceiptRecognized: context.api.isDedupCasDuplicateReceipt(first),
         });
@@ -744,6 +754,8 @@ export default (_config: any, context: any) => {
   assert.equal(afterRestart.body, 'overlay');
   assert.equal(afterRestart.userPlugin, true);
   assert.equal(afterRestart.factoryPolicy, 'dedup-cas');
+  assert.equal(afterRestart.duplicateDetail, DEDUP_CAS_DUPLICATE_DETAIL);
+  assert.equal(afterRestart.ambiguousDetail, DEDUP_CAS_AMBIGUOUS_DETAIL);
   assert.equal(afterRestart.duplicateReceiptRecognized, false);
   assert.equal(afterRestart.dispatchedReceiptRecognized, false);
   assert.equal((await cli(restored, 'project', 'status')).userPlugins[0].name, 'user-example');
@@ -1025,6 +1037,7 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
     patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
   });
   await connect(alice, bob);
+  // A prior gate-dnd handoff must not hide the receiver's ambiguous recovery state.
   const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity' };
   assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'queued');
   const message = bob.gate.listDndQueue()[0].envelope;

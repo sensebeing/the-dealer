@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import childProcess, { execFileSync, spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { computeRuntimeFingerprint, readDaemonFingerprint, selfUpdate } from '../packages/cli/auto-update.ts';
+import { computeRuntimeFingerprint, readDaemonFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from '../packages/cli/auto-update.ts';
 import { DealerNodeRuntime, ensureDaemonRunning, restartDaemon, stopDaemonIfRunning } from '../packages/cli/index.ts';
 
 const dealerBin = fileURLToPath(new URL('../bin/dealer.js', import.meta.url));
@@ -353,6 +354,12 @@ test('dealer self-update fast-forwards clean main, syncs skill symlinks, skips d
     assert.equal(realpathSync(link), realpathSync(join(checkout, 'skills', 'the-dealer')));
   }
   const updateOptions = { stateDir, checkoutDir: checkout, homeDir: home, geminiDir: gemini };
+  writeFileSync(join(stateDir, 'auto-update.json'), JSON.stringify({ ...report, error: 'old HTTP2 failure' }));
+  const recovered = selfUpdate(updateOptions);
+  assert.equal(recovered.sourceStatus, 'up_to_date');
+  assert.equal(Object.hasOwn(recovered, 'error'), false);
+  assert.equal(Object.hasOwn(JSON.parse(readFileSync(join(stateDir, 'auto-update.json'), 'utf8')), 'error'), false);
+
   const lockDir = join(stateDir, 'auto-update.lock');
   const daemonOwner = JSON.parse(readFileSync(join(stateDir, 'runtime.lock', 'owner.json'), 'utf8'));
   mkdirSync(lockDir);
@@ -698,4 +705,36 @@ test('a completed drain waits out a slow stop hook without reporting a false def
   assert.notEqual(readDaemonOwner(stateDir).instanceId, before.instanceId);
   const status = await dealer(['node', 'status'], stateDir);
   assert.equal(status.running, true);
+});
+
+test('background auto-update retries errors after fifteen minutes and successes after six hours', t => {
+  const { root, stateDir } = isolatedState();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const previous = { enabled: process.env.DEALER_AUTO_UPDATE, disabled: process.env.DEALER_DISABLE_AUTO_UPDATE };
+  process.env.DEALER_AUTO_UPDATE = '1';
+  delete process.env.DEALER_DISABLE_AUTO_UPDATE;
+  t.after(() => {
+    for (const [key, value] of [['DEALER_AUTO_UPDATE', previous.enabled], ['DEALER_DISABLE_AUTO_UPDATE', previous.disabled]] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  });
+  const calls: unknown[][] = [];
+  const mocked = t.mock.method(childProcess, 'spawn', (...args: unknown[]) => {
+    calls.push(args);
+    return { unref() {} };
+  });
+  syncBuiltinESMExports();
+  for (const [sourceStatus, minutes, expected] of [
+    ['error', 14, 0], ['error', 16, 1], ['up_to_date', 16, 1],
+    ['up_to_date', 359, 1], ['up_to_date', 361, 2],
+  ] as const) {
+    writeFileSync(join(stateDir, 'auto-update.json'), JSON.stringify({
+      sourceStatus, lastCheckedAt: new Date(Date.now() - minutes * 60_000).toISOString(),
+    }));
+    maybeTriggerBackgroundAutoUpdate({ stateDir });
+    assert.equal(calls.length, expected, sourceStatus + ':' + minutes);
+  }
 });
