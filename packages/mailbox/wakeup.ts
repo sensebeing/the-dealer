@@ -92,6 +92,96 @@ export interface OrcaWaveRotateAfterWavesInput {
   pinnedTerminalHandle?: string;
 }
 
+/** Single owner of caller-driven Orca conversation identity transitions. */
+export function resolveCallerOrcaWakeTargetPatch(
+  existing: WakeTargetState | undefined,
+  caller: { workspacePath?: string; worktreeId?: string; terminalHandle?: string; paneKey?: string; agent?: WakeTargetState['agent']; sessionId?: string },
+): Partial<WakeTargetState> {
+  const switchedIdentity =
+    (caller.workspacePath && existing?.workspacePath && caller.workspacePath !== existing.workspacePath) ||
+    (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
+    (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
+    (caller.agent && existing?.agent && caller.agent !== existing.agent) ||
+    (caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
+      (!caller.paneKey || !existing.paneKey || caller.paneKey !== existing.paneKey) &&
+      (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId));
+  return {
+    mode: 'orca-terminal',
+    ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
+    ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
+    ...(switchedIdentity ? {
+      terminalHandle: caller.terminalHandle, paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent,
+    } : {
+      ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
+      ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
+      ...(caller.sessionId ? { sessionId: caller.sessionId } : {}),
+      ...(caller.agent ? { agent: caller.agent } : {}),
+    }),
+  };
+}
+
+/** Apply configuration once; rotation retires the runtime session without erasing its provenance. */
+export function resolveConfiguredOrcaWakeTargetPatch(
+  existing: WakeTargetState | undefined,
+  input: {
+    runId?: string; workspacePath?: string; configuredTerminalHandle?: string;
+    configuredAgent?: WakeTargetState['agent']; configuredSessionId?: string;
+    configuredInteractiveCommand?: string; hasTopicBinding: boolean; clearOmittedInteractiveCommand: boolean;
+  },
+): Partial<WakeTargetState> {
+  const commandPatch = input.clearOmittedInteractiveCommand || input.configuredInteractiveCommand !== undefined
+    ? { interactiveCommand: input.configuredInteractiveCommand } : {};
+  if (input.runId) return {
+    mode: 'orca-run', terminalHandle: input.configuredTerminalHandle, paneKey: undefined,
+    sessionId: undefined, configuredSessionId: undefined,
+    ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
+    ...commandPatch,
+  };
+  const nextConfiguredSession = input.configuredSessionId?.trim() || undefined;
+  const prevConfiguredSession = existing?.configuredSessionId;
+  const sameWorkspace = existing?.mode === 'orca-terminal' && existing.workspacePath === input.workspacePath;
+  const samePinnedHandle = input.configuredTerminalHandle === undefined || input.configuredTerminalHandle === existing?.terminalHandle;
+  const sameAgent = input.configuredAgent === undefined || existing?.agent === undefined || input.configuredAgent === existing.agent;
+  const compatible = sameWorkspace && samePinnedHandle && sameAgent;
+  const addedOrChanged = input.hasTopicBinding && nextConfiguredSession !== undefined && nextConfiguredSession !== prevConfiguredSession;
+  const removed = input.hasTopicBinding && nextConfiguredSession === undefined && prevConfiguredSession !== undefined;
+  const preserved = {
+    terminalHandle: input.configuredTerminalHandle ?? existing?.terminalHandle,
+    paneKey: existing?.paneKey, sessionId: existing?.sessionId,
+    agent: input.configuredAgent ?? existing?.agent,
+  };
+  let identity: Partial<WakeTargetState>;
+  if (addedOrChanged) {
+    identity = compatible && existing?.sessionId === nextConfiguredSession ? preserved : {
+      terminalHandle: input.configuredTerminalHandle, paneKey: undefined, sessionId: nextConfiguredSession,
+      agent: input.configuredAgent ?? (sameWorkspace && sameAgent ? existing?.agent : undefined),
+    };
+    identity = { ...identity, configuredSessionId: nextConfiguredSession };
+  } else if (removed) {
+    identity = existing?.sessionId === prevConfiguredSession || !compatible ? {
+      terminalHandle: input.configuredTerminalHandle, paneKey: undefined, sessionId: undefined,
+      agent: input.configuredAgent ?? (compatible ? existing?.agent : undefined),
+    } : preserved;
+    identity = { ...identity, configuredSessionId: undefined };
+  } else if (nextConfiguredSession !== undefined && nextConfiguredSession === prevConfiguredSession) {
+    identity = compatible ? preserved : {
+      terminalHandle: input.configuredTerminalHandle, paneKey: undefined,
+      sessionId: nextConfiguredSession, agent: input.configuredAgent,
+    };
+    identity = { ...identity, configuredSessionId: nextConfiguredSession };
+  } else {
+    identity = compatible ? { ...preserved, configuredSessionId: input.hasTopicBinding ? undefined : existing?.configuredSessionId } : {
+      terminalHandle: input.configuredTerminalHandle, paneKey: undefined, sessionId: undefined,
+      configuredSessionId: undefined, agent: input.configuredAgent,
+    };
+  }
+  if (input.configuredInteractiveCommand !== undefined && existing?.interactiveCommand !== undefined &&
+      input.configuredInteractiveCommand !== existing.interactiveCommand) {
+    buildOrcaAgentLaunchCommand({ agent: identity.agent, sessionId: identity.sessionId, interactiveCommand: input.configuredInteractiveCommand });
+  }
+  return { mode: 'orca-terminal', ...identity, ...commandPatch };
+}
+
 /**
  * The single owner of the managed Orca fixed-workspace rotation policy. Preset generation,
  * binding refresh, and wave enqueue all resolve their effective threshold here so the rule can
@@ -240,10 +330,10 @@ export async function launchFencedOrcaWorkspaceTerminal(
     shellTerminalHandle?: string;
   },
 ) {
-  const resumeSessionId = options.resetCompletedWaves ? undefined : options.sessionId?.trim() || undefined;
-  const launchCommand = buildOrcaAgentLaunchCommand({ ...options, sessionId: resumeSessionId });
-  store.beginWakeDelivery(mailboxId);
+  const resumeSessionId = options.resetCompletedWaves ? undefined : options.sessionId;
   try {
+    const launchCommand = buildOrcaAgentLaunchCommand({ ...options, sessionId: resumeSessionId });
+    store.beginWakeDelivery(mailboxId);
     let launched: { handle: string; raw: unknown };
     if (options.shellTerminalHandle) {
       await sendOrcaTerminalText(runner, options.command, options.shellTerminalHandle,
@@ -701,7 +791,7 @@ export class WakeupRedriveService {
       return false;
     }
     if (needsSessionRotation(target, preview)) return true;
-    if (mailboxId.startsWith('task:') || target.sessionId?.trim()) {
+    if (mailboxId.startsWith('task:') || target.sessionId?.trim() || target.paneKey?.trim()) {
       if (!target.terminalHandle && !target.paneKey) return true;
       return !this.idleCheck && !(await isOrcaWorkspaceTerminalLive(
         this.runner, command, workspacePath, target.terminalHandle, undefined, target.paneKey,

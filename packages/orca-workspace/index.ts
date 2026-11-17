@@ -188,6 +188,8 @@ export async function checkOrcaWorkspaceIdle(
     const targetTerm = row.path === cwd
       ? handles.find(t => t.connected && t.writable !== false && String(t.handle) === options?.targetTerminalHandle)
         ?? handles.find(t => matchesPane(t, options?.targetPaneKey)) : undefined;
+    // An explicitly owned pane that disappeared requires an independent tab, never a sibling.
+    if (row.path === cwd && options?.targetPaneKey?.trim() && !targetTerm) return true;
     const targetPaneKeys = new Set<string>();
     if (typeof targetTerm?.tabId === 'string' && targetTerm.tabId &&
         typeof targetTerm.leafId === 'string' && targetTerm.leafId) {
@@ -347,20 +349,75 @@ export function defaultAgentLaunchCommand(agent: SupportedOrcaAgent = 'antigravi
   return defaultAntigravityLaunchCommand();
 }
 
+/** Parse a simple host command, or validate standalone placeholders in an explicit template. */
+function continuationCommandTokens(command: string, template: boolean): string[] {
+  const tokens: string[] = [];
+  let token = '';
+  let quote = '';
+  let escaped = false;
+  const reject = () => { throw new OrcaTerminalLaunchRejectedError(`Unsupported Orca session continuation command: ${command}`); };
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (command.startsWith('{sessionId}', i)) {
+      if (quote || escaped || (i > 0 && !/\s/.test(command[i - 1])) ||
+          (i + 11 < command.length && !/\s/.test(command[i + 11]))) reject();
+      token += '{sessionId}';
+      i += 10;
+      continue;
+    }
+    if (escaped) { token += char; escaped = false; continue; }
+    if (char === '\\' && quote !== "'") {
+      if (!template && !quote) reject();
+      escaped = true;
+      continue;
+    }
+    if (!template && (/[\0\r\n]/.test(char) || (!quote && /[;|&$<>`]/.test(char)) || (quote === '"' && /[$`]/.test(char)))) reject();
+    if (quote) {
+      if (char === quote) quote = '';
+      else token += char;
+    } else if (char === "'" || char === '"') quote = char;
+    else if (/\s/.test(char)) {
+      if (token) tokens.push(token);
+      token = '';
+    } else token += char;
+  }
+  if (quote || escaped) reject();
+  if (token) tokens.push(token);
+  return tokens;
+}
+
 export function buildOrcaAgentLaunchCommand(options?: {
   agent?: SupportedOrcaAgent; interactiveCommand?: string; sessionId?: string;
 }): string {
   const sessionId = options?.sessionId;
-  if (sessionId !== undefined && /[\0\r\n]/.test(sessionId)) throw new Error('Invalid Orca conversation ID');
+  if (sessionId !== undefined && /[\0\r\n]/.test(sessionId)) throw new OrcaTerminalLaunchRejectedError('Invalid Orca conversation ID');
+  const trimmedSession = sessionId?.trim() || undefined;
   const agent = options?.agent ?? 'antigravity';
   const defaultCmd = defaultAgentLaunchCommand(agent);
-  const customCmd = options?.interactiveCommand?.trim();
-  if (sessionId?.trim() && (!customCmd || customCmd === defaultCmd)) {
-    const quoted = "'" + sessionId.trim().replaceAll("'", "'\\''") + "'";
-    if (agent === 'codex') return `${defaultCmd} resume ${quoted}`;
-    return `${defaultCmd} ${agent === 'claude' ? '--resume' : '--conversation'} ${quoted}`;
+  const customCmd = options?.interactiveCommand?.trim() || undefined;
+  if (!trimmedSession) {
+    if (customCmd?.includes('{sessionId}')) throw new OrcaTerminalLaunchRejectedError('Orca interactiveCommand placeholder {sessionId} requires a sessionId');
+    return customCmd ?? defaultCmd;
   }
-  return customCmd || defaultCmd;
+  const quoted = "'" + trimmedSession.replaceAll("'", "'\\''") + "'";
+  if (customCmd && customCmd !== defaultCmd) {
+    const template = customCmd.includes('{sessionId}');
+    const tokens = continuationCommandTokens(customCmd, template);
+    if (template) return customCmd.replaceAll('{sessionId}', quoted);
+    const args = tokens.slice(1);
+    const binary = agent === 'antigravity' ? 'agy' : agent;
+    const conflicting = agent === 'antigravity'
+      ? args.some(arg => arg === 'run' || arg === '--conversation' || arg.startsWith('--conversation='))
+      : agent === 'claude'
+        ? args.some(arg => ['-p', '--print', '-r', '--resume', '--session-id'].includes(arg) || arg.startsWith('--resume=') || arg.startsWith('--session-id='))
+        : args.some(arg => ['exec', 'resume', 'queue', 'login', 'mcp', 'completion', '--'].includes(arg));
+    if (!tokens[0] || basename(tokens[0]) !== binary || conflicting) {
+      throw new OrcaTerminalLaunchRejectedError(`Unsupported Orca session continuation command for ${agent}: ${customCmd}`);
+    }
+  }
+  const command = customCmd ?? defaultCmd;
+  return agent === 'codex' ? `${command} resume ${quoted}`
+    : `${command} ${agent === 'claude' ? '--resume' : '--conversation'} ${quoted}`;
 }
 
 /**
@@ -476,7 +533,7 @@ export async function planOrcaWorkspaceTerminal(
   }
   const pane = terminals.find(t => t && matchesPane(t, options?.preferredPaneKey));
   if (pane) return { kind: 'existing', handle: String(pane.handle) };
-  if (options?.dedicatedTab || options?.sessionId?.trim()) return { kind: 'create' };
+  if (options?.dedicatedTab || options?.sessionId?.trim() || options?.preferredPaneKey?.trim()) return { kind: 'create' };
   const nonOrphanConnected = terminals.filter(
     t => t && t.orphaned !== true && t.connected && t.writable !== false,
   );

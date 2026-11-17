@@ -8,7 +8,7 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { MailboxStore, OutboxStore, resolveBoundMailboxId } from '../mailbox/index.ts';
+import { MailboxStore, OutboxStore, resolveCallerOrcaWakeTargetPatch, resolveBoundMailboxId } from '../mailbox/index.ts';
 import type { OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
@@ -790,23 +790,7 @@ function bindCallerWakeTarget(store: MailboxStore, mailboxId: string, caller: Ca
   if (!caller) return;
   const existing = store.getWakeTarget(mailboxId);
   if (existing?.mode === 'orca-run' || (existing?.mode === 'passive' && existing.hostAgent !== undefined)) return;
-  const switchedIdentity =
-    (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
-    (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
-    (caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
-      (!caller.paneKey || !existing.paneKey || caller.paneKey !== existing.paneKey) &&
-      (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId));
-  store.upsertWakeTarget(mailboxId, {
-    mode: 'orca-terminal',
-    ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
-    ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
-    ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
-    ...(switchedIdentity ? { paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent } : {
-      ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
-      ...(caller.sessionId ? { sessionId: caller.sessionId } : {}),
-      ...(caller.agent ? { agent: caller.agent } : {}),
-    }),
-  });
+  store.upsertWakeTarget(mailboxId, resolveCallerOrcaWakeTargetPatch(existing, caller));
 }
 
 function settlementOutcome(value: unknown): SettlementOutcome {

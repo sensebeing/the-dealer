@@ -42,7 +42,7 @@ import {
 import { createLarkMirrorPlugin, LarkMailboxNotifier } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { MailboxStore, OutboxRedriveService, OutboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, WakeupRedriveService } from '../mailbox/index.ts';
+import { MailboxStore, OutboxRedriveService, OutboxStore, resolveMailboxId, resolveBoundMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, resolveConfiguredOrcaWakeTargetPatch, WakeupRedriveService } from '../mailbox/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -1034,24 +1034,16 @@ export class DealerNodeRuntime {
             runId,
             pinnedTerminalHandle: terminalHandle,
           });
-      // A handle resolved or rotated at runtime is runtime truth: only an explicitly configured
-      // handle, an Orca Run, or a workspace switch may replace or clear it. Passing every optional
-      // field as an own property is what lets a reconfiguration erase a stale rotation default.
-      const preserveRuntimeSession = !runId && current?.mode === 'orca-terminal' &&
-        current.workspacePath === workspacePath &&
-        (terminalHandle === undefined || terminalHandle === current.terminalHandle);
-      const nextTerminalHandle = terminalHandle !== undefined
-        ? terminalHandle : preserveRuntimeSession ? current.terminalHandle : undefined;
       this.mailbox.upsertWakeTarget(mailboxId, {
-        mode: runId ? 'orca-run' : 'orca-terminal',
+        ...resolveConfiguredOrcaWakeTargetPatch(current, {
+          runId, workspacePath, configuredTerminalHandle: terminalHandle,
+          configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
+          configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand,
+          hasTopicBinding: true, clearOmittedInteractiveCommand: true,
+        }),
         workspacePath, worktreeId, runId, repoRoot: projectRoot,
-        agent: binding.agent ? orcaAgent(binding.agent) : (preserveRuntimeSession ? current.agent : undefined),
-        sessionId: binding.sessionId ?? (preserveRuntimeSession ? current.sessionId : undefined),
-        paneKey: preserveRuntimeSession ? current.paneKey : undefined,
-        interactiveCommand,
         autoCreateWorkspace, workspaceComment, wakeupPrefix, coalesceMs: coalesceMs ?? 0,
         rotateAfterWaves: resolvedRotateAfterWaves,
-        terminalHandle: nextTerminalHandle,
       });
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);

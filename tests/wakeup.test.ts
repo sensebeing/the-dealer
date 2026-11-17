@@ -15,6 +15,9 @@ import {
   MailboxStore,
   WakeupRedriveService,
   createOrcaSpawnExecutorPlugin,
+  createOrcaWaveExecutorPlugin,
+  resolveConfiguredOrcaWakeTargetPatch,
+  resolveCallerOrcaWakeTargetPatch,
   runDealerCli,
   verifyEnvelope,
   settleWakeDeliveryFailure,
@@ -1570,7 +1573,7 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
 
   // Refreshing the same binding keeps the runtime handle; switching workspaces clears it.
   await second.applyAgentPreset({
-    host: 'orca', conversationMode: 'fixed', topic: 'collab.request.v4', workspacePath,
+    host: 'orca', agent: 'claude', conversationMode: 'fixed', topic: 'collab.request.v4', workspacePath,
   });
   assert.equal(second.mailbox.getWakeTarget('stream:collab.request.v4')!.terminalHandle, 'runtime-tab');
   await second.applyAgentPreset({
@@ -1627,7 +1630,7 @@ test('refreshTopicBindings keeps a runtime-resolved terminal handle across resta
     const refreshed = second.mailbox.getWakeTarget('stream:collab.request.v4')!;
     const preserved = change.terminalHandle === 'runtime-tab' || change.sessionId !== undefined;
     assert.equal(refreshed.sessionId, change.sessionId ?? (preserved ? 'runtime-session' : undefined));
-    assert.equal(refreshed.paneKey, preserved ? 'runtime:pane' : undefined);
+    assert.equal(refreshed.paneKey, change.terminalHandle === 'runtime-tab' ? 'runtime:pane' : undefined);
     assert.equal(refreshed.agent, preserved ? 'codex' : undefined);
   }
 
@@ -2521,7 +2524,7 @@ for (const mailboxId of ['worktree:bound', 'task:bound']) {
 test('Orca resume commands quote conversation IDs and reject control characters before launch', async () => {
   assert.equal(buildOrcaAgentLaunchCommand({ agent: 'claude', sessionId: "a'b;$(touch nope)" }),
     "claude --dangerously-skip-permissions --resume 'a'\\''b;$(touch nope)'");
-  assert.equal(buildOrcaAgentLaunchCommand({ sessionId: 'session', interactiveCommand: 'custom-agent --flag' }), 'custom-agent --flag');
+  assert.throws(() => buildOrcaAgentLaunchCommand({ sessionId: 'session', interactiveCommand: 'custom-agent --flag' }), OrcaTerminalLaunchRejectedError);
   assert.equal(buildOrcaAgentLaunchCommand({ sessionId: 'session', interactiveCommand: 'agy --dangerously-skip-permissions' }), "agy --dangerously-skip-permissions --conversation 'session'");
   let calls = 0;
   for (const sessionId of ['bad\nvalue', 'bad\rvalue', 'bad\0value']) {
@@ -2535,7 +2538,7 @@ test('rotating mailbox pins the active conversation identity durably', t => {
   const store = new MailboxStore(file);
   store.upsertWakeTarget('stream:wave', {
     mode: 'orca-terminal', workspacePath: '/workspace', terminalHandle: 'term-original',
-    agent: 'codex', sessionId: 'original-session', paneKey: 'tab:leaf', rotateAfterWaves: 1,
+    agent: 'codex', sessionId: 'original-session', configuredSessionId: 'original-session', paneKey: 'tab:leaf', rotateAfterWaves: 1,
   });
   assert.equal(store.pinRotatingSessionMailbox('stream:wave', 'term-original'), 'terminal:term-original');
   const pinned = new MailboxStore(file).getWakeTarget('terminal:term-original')!;
@@ -2543,6 +2546,7 @@ test('rotating mailbox pins the active conversation identity durably', t => {
   assert.equal(pinned.sessionId, 'original-session');
   assert.equal(pinned.paneKey, 'tab:leaf');
   assert.equal(pinned.rotateAfterWaves, undefined);
+  assert.equal(pinned.configuredSessionId, undefined);
 });
 
 for (const busyOwner of ['restored', 'child'] as const) {
@@ -2637,4 +2641,189 @@ test('caller identity transitions clear omitted fields only when identity change
     const actual = runtime.mailbox.getWakeTarget(mailboxId)!;
     assert.deepEqual({ agent: actual.agent, sessionId: actual.sessionId, paneKey: actual.paneKey }, expected, name);
   }
+});
+
+for (const source of ['refresh', 'wave'] as const) {
+  test(`${source} replaces configured sessions and never resurrects a rotated session during recovery`, async t => {
+    const root = directory(t);
+    const workspacePath = join(root, 'configured');
+    const mailboxId = 'stream:configured';
+    const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+      { handle: 'term-A', connected: true, writable: true, agentIdentity: 'claude', preview: '', tabId: 'pane', leafId: 'A' },
+    ]);
+    const binding = { executor: 'orca-wave', mailboxId, workspacePath, agent: 'claude' as const, sessionId: 'B', rotateAfterWaves: 1 };
+    const options = { stateDir: join(root, 'state'), member: 'worker', name: 'worker', profile: 'headless-relay',
+      transport: { discoveryDir: join(root, 'mesh') }, commandRunner: runner,
+      patch: { defaultExecutor: 'inbox', executors: ['orca-wave', 'inbox'], topicBindings: { configured: binding }, wave: { flushIntervalMs: 100_000 } },
+    };
+    let runtime = await new DealerNodeRuntime(options).start();
+    t.after(() => runtime.stop());
+    await runtime.wakeups.stop();
+    runtime.mailbox.upsertWakeTarget(mailboxId, { mode: 'orca-terminal', workspacePath,
+      agent: 'claude', sessionId: 'A', paneKey: 'pane:A', terminalHandle: 'term-A', configuredSessionId: undefined,
+    });
+    const refresh = () => runtime.applyAgentPreset({ host: 'codex', conversationMode: 'inbox-only', topic: 'refresh.trigger' });
+    const ingest = async (id: string) => {
+      if (source === 'refresh') {
+        await refresh();
+        runtime.mailbox.enqueue([alert(id)], { mailboxId });
+      } else {
+        const plugin = createOrcaWaveExecutorPlugin({ store: runtime.mailbox, resolveTopicBinding: () => binding, commandRunner: runner });
+        await plugin.execute([alert(id)], { networkId: 'team', nodeId: 'receiver', traceId: id }, {});
+      }
+    };
+    let service = new WakeupRedriveService({ store: runtime.mailbox, commandRunner: runner });
+    t.after(() => service.stop());
+    await ingest('wave-one');
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.terminalHandle, undefined);
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.paneKey, undefined);
+    assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+    assert.equal(sendsTo(state.calls, 'term-A').length, 0);
+    const firstCreate = state.calls.find(call => call.args[1] === 'create')!;
+    assert.equal(firstCreate.args[firstCreate.args.indexOf('--command') + 1], "claude --dangerously-skip-permissions --resume 'B'");
+    const firstLease = runtime.mailbox.check({ mailboxId });
+    runtime.mailbox.ack(firstLease.deliveryId!);
+    await ingest('wave-two');
+    assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, undefined);
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.configuredSessionId, 'B');
+    runtime.mailbox.check({ mailboxId });
+    await service.stop();
+    await runtime.stop();
+    runtime = await new DealerNodeRuntime(options).start();
+    await runtime.wakeups.stop();
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, undefined, 'restart must not restore retired B');
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.configuredSessionId, 'B');
+    service = new WakeupRedriveService({ store: runtime.mailbox, commandRunner: runner });
+    state.terminals = state.terminals.filter(terminal => terminal.handle === 'term-A');
+    await ingest('recovery-mail');
+    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.sessionId, undefined, 'ingestion must not restore retired B');
+    assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+    const creates = state.calls.filter(call => call.args[1] === 'create');
+    assert.equal(creates.length, 3);
+    for (const create of creates.slice(1)) assert.equal(create.args[create.args.indexOf('--command') + 1], 'claude --dangerously-skip-permissions');
+    assert.equal(sendsTo(state.calls, 'term-A').length, 0);
+  });
+}
+
+for (const disappearsLate of [false, true]) {
+  for (const agent of ['antigravity', undefined]) {
+    test(`pane-only isolation from ${agent ?? 'shell'} when pane disappears ${disappearsLate ? 'during selection' : 'before flush'}`, async t => {
+      const root = directory(t);
+      const workspacePath = join(root, 'pane-only');
+      const store = new MailboxStore(join(root, 'mailbox.json'));
+      const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+        { handle: 'term-sibling', connected: true, writable: true, agentIdentity: agent, preview: '' },
+        ...(disappearsLate ? [{ handle: 'term-bound', connected: true, writable: true, agentIdentity: 'antigravity', preview: '', tabId: 'gone', leafId: 'pane' }] : []),
+      ]);
+      let lists = 0;
+      const service = new WakeupRedriveService({ store, commandRunner: async request => {
+        if (request.args[0] === 'terminal' && request.args[1] === 'list' && ++lists === 3 && disappearsLate) {
+          state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-bound');
+        }
+        return runner(request);
+      } });
+      t.after(() => service.stop());
+      store.enqueue([alert('pane-only')], { mailboxId: 'worktree:pane-only', wakeTarget: {
+        mode: 'orca-terminal', workspacePath, paneKey: 'gone:pane', coalesceMs: 0,
+      } });
+      assert.equal((await service.flushMailbox('worktree:pane-only', { force: true })).woke, true);
+      assert.equal(state.created, 1);
+      assert.equal(sendsTo(state.calls, 'term-sibling').length, 0);
+      assert.equal(store.getWakeTarget('worktree:pane-only')!.paneKey, undefined);
+    });
+  }
+}
+
+for (const [agent, command, suffix] of [
+  ['claude', 'claude --dangerously-skip-permissions --model opus', " --resume 'A'"],
+  ['antigravity', 'agy --dangerously-skip-permissions --model gemini-2.5-pro', " --conversation 'A'"],
+  ['codex', 'codex --dangerously-bypass-approvals-and-sandbox --model gpt-5', " resume 'A'"],
+  ['claude', 'custom-wrapper --session {sessionId}', 'template'],
+  ['claude', 'custom-wrapper --flag', 'reject'],
+] as const) {
+  test(`custom continuation through wakeup: ${command}`, async t => {
+    const root = directory(t);
+    const workspacePath = join(root, 'custom');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const { runner, state } = fakeOrcaWorkspace(workspacePath);
+    const service = new WakeupRedriveService({ store, commandRunner: runner });
+    t.after(() => service.stop());
+    store.enqueue([alert('custom')], { mailboxId: 'worktree:custom', wakeTarget: {
+      mode: 'orca-terminal', workspacePath, agent, sessionId: 'A', interactiveCommand: command, coalesceMs: 0,
+    } });
+    const result = await service.flushMailbox('worktree:custom', { force: true });
+    const target = store.getWakeTarget('worktree:custom')!;
+    if (suffix === 'reject') {
+      assert.equal(result.woke, false);
+      assert.equal(state.created, 0);
+      assert.equal(terminalSends(state.calls).length, 0);
+      assert.equal(store.list({ mailboxId: 'worktree:custom' }).queuedCount, 1);
+      assert.equal(target.pendingWake, true);
+      assert.equal(target.deliveryInDoubt, undefined);
+      assert.match(target.lastWakeError!, /Unsupported Orca session continuation command/);
+    } else {
+      assert.equal(result.woke, true);
+      const create = state.calls.find(call => call.args[1] === 'create')!;
+      assert.equal(create.args[create.args.indexOf('--command') + 1], suffix === 'template' ? "custom-wrapper --session 'A'" : command + suffix);
+      assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+      assert.equal(target.sessionId, 'A');
+    }
+  });
+}
+
+test('session transition owner retires configuration and invalidates incompatible caller identities', t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const existing = store.upsertWakeTarget('stream:identity', {
+    mode: 'orca-terminal', workspacePath: '/workspace', agent: 'claude', terminalHandle: 'term-A',
+    sessionId: 'A', paneKey: 'pane:A', configuredSessionId: 'A',
+  });
+  const input = { workspacePath: '/workspace', hasTopicBinding: true, clearOmittedInteractiveCommand: true };
+  const removed = resolveConfiguredOrcaWakeTargetPatch(existing, input);
+  assert.equal(removed.configuredSessionId, undefined);
+  assert.equal(removed.terminalHandle, undefined);
+  assert.equal(removed.sessionId, undefined);
+  const rotated = { ...existing, terminalHandle: 'term-fresh', sessionId: undefined, paneKey: undefined };
+  const removeAfterRotation = resolveConfiguredOrcaWakeTargetPatch(rotated, input);
+  assert.equal(removeAfterRotation.terminalHandle, 'term-fresh');
+  assert.equal(removeAfterRotation.configuredSessionId, undefined);
+  const changedTarget = resolveConfiguredOrcaWakeTargetPatch(rotated, { ...input, workspacePath: '/other', configuredSessionId: 'A' });
+  assert.equal(changedTarget.terminalHandle, undefined);
+  assert.equal(changedTarget.sessionId, 'A');
+  assert.equal(changedTarget.agent, undefined);
+  const unchanged = resolveConfiguredOrcaWakeTargetPatch(rotated, { ...input, configuredSessionId: 'A' });
+  assert.equal(unchanged.sessionId, undefined);
+  assert.equal(unchanged.terminalHandle, 'term-fresh');
+  const newlyConfigured = resolveConfiguredOrcaWakeTargetPatch({ ...existing, configuredSessionId: undefined }, { ...input, configuredSessionId: 'A' });
+  assert.equal(newlyConfigured.terminalHandle, 'term-A');
+  assert.equal(newlyConfigured.paneKey, 'pane:A');
+  for (const caller of [{ sessionId: 'B' }, { workspacePath: '/other' }, { agent: 'codex' as const }]) {
+    const patch = resolveCallerOrcaWakeTargetPatch(existing, caller);
+    assert.ok(Object.hasOwn(patch, 'terminalHandle'));
+    assert.equal(patch.terminalHandle, undefined);
+    assert.equal(patch.paneKey, undefined);
+  }
+  const run = resolveConfiguredOrcaWakeTargetPatch(existing, { ...input, runId: 'run' });
+  assert.equal(run.mode, 'orca-run');
+  assert.equal(run.sessionId, undefined);
+  assert.equal(run.configuredSessionId, undefined);
+});
+
+test('custom continuation rejects ambiguous syntax, quoted placeholders and conflicting host modes', () => {
+  for (const interactiveCommand of [
+    "wrapper '{sessionId}'", 'wrapper "{sessionId}"', 'wrapper --session={sessionId}',
+    'wrapper \\{sessionId}', 'wrapper {sessionId}suffix', 'wrapper {sessionId} "unclosed',
+    'claude --resume old', 'claude --resume=old', 'claude -r old', 'claude --session-id old',
+    'claude --print', 'claude -p', 'other --flag', 'claude; echo bad', 'claude | cat',
+    'claude $(bad)', 'claude "$(bad)"', 'claude > /tmp/output', 'claude `bad`', 'claude "unterminated',
+  ]) {
+    assert.throws(() => buildOrcaAgentLaunchCommand({ agent: 'claude', sessionId: 'A', interactiveCommand }), OrcaTerminalLaunchRejectedError, interactiveCommand);
+  }
+  for (const [agent, interactiveCommand] of [
+    ['antigravity', 'agy run'], ['antigravity', 'agy --conversation=A'],
+    ['codex', 'codex exec'], ['codex', 'codex resume A'], ['codex', 'codex --'], ['codex', 'codex mcp'],
+  ] as const) assert.throws(() => buildOrcaAgentLaunchCommand({ agent, interactiveCommand, sessionId: 'A' }), OrcaTerminalLaunchRejectedError);
+  assert.throws(() => buildOrcaAgentLaunchCommand({ interactiveCommand: 'wrapper {sessionId}' }), /requires a sessionId/);
+  assert.equal(buildOrcaAgentLaunchCommand({ agent: 'claude', interactiveCommand: '"/opt/claude" --model "opus"', sessionId: 'A' }), '"/opt/claude" --model "opus" --resume \'A\'');
+  assert.equal(buildOrcaAgentLaunchCommand({ interactiveCommand: 'wrapper {sessionId} {sessionId}', sessionId: "a'b" }), "wrapper 'a'\\''b' 'a'\\''b'");
 });

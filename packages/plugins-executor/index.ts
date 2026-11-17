@@ -11,7 +11,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TopicBindingConfig } from '../cli/config.ts';
 import type { ExecutionContext, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup, launchFencedOrcaWorkspaceTerminal } from '../mailbox/index.ts';
+import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveEffectiveConversationMode, resolveOrcaWaveRotateAfterWaves, resolveConfiguredOrcaWakeTargetPatch, deliverPassiveWakeTarget, deliverSpawnedOrcaTerminalWakeup, launchFencedOrcaWorkspaceTerminal } from '../mailbox/index.ts';
 import type { WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import {
   setOrcaWorkspaceComment,
@@ -766,10 +766,12 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         const explicitAgent = binding?.agent ?? config.agent ?? options.agent ?? (hasReceiverTarget ? undefined : payload.agent);
         const explicitInteractiveCommand = binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand;
         return {
-          mode: runId ? 'orca-run' : 'orca-terminal',
-          ...(explicitAgent !== undefined ? { agent: orcaAgent(explicitAgent) } : {}),
-          ...(explicitInteractiveCommand !== undefined ? { interactiveCommand: explicitInteractiveCommand } : {}),
-          ...(binding?.sessionId ? { sessionId: binding.sessionId } : {}),
+          ...resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
+            runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
+            configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
+            configuredSessionId: binding?.sessionId, configuredInteractiveCommand: explicitInteractiveCommand,
+            hasTopicBinding: binding !== undefined, clearOmittedInteractiveCommand: false,
+          }),
           orcaCommand: command,
           coalesceMs,
           ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
@@ -778,7 +780,6 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
           ...(runId ? { runId } : {}),
           ...(cwd ? { workspacePath: cwd } : {}),
           ...(worktreeId ? { worktreeId } : {}),
-          ...(terminalHandle ? { terminalHandle } : {}),
           ...(effectiveMode === 'fixed'
             ? { rotateAfterWaves: undefined }
             : rotateAfterWaves !== undefined ? { rotateAfterWaves } : {}),

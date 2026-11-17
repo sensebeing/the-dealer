@@ -354,7 +354,10 @@ worktree or terminal automatically. Mutating caller operations also capture
 When that workspace sleeps, incoming thread mail reuses the restored pane or
 resumes the recorded conversation in a background tab with auto-permissions,
 without taking over a sibling tab. Session rotation starts a fresh conversation
-and clears the previous session/pane identity. `inbox list` and `inbox check
+and clears the previous session/pane identity; an unchanged configured session ID
+is not reapplied after rotation. Custom host commands retain their model flags
+when resuming; opaque wrappers must provide an unquoted standalone `{sessionId}`
+token, or continuation is rejected before launch. `inbox list` and `inbox check
 --peek` do not change these bindings. Omit `--mailbox` for two-way ask/reply/
 settle conversations; each side wakes the other's Orca terminal. `dealer ask`
 defaults to `collab.question.v1` when `--topic` is omitted, and

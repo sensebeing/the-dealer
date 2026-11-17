@@ -429,7 +429,7 @@ for (const agent of ['claude', 'codex'] as const) {
     const mailboxId = 'stream:fixed';
     const workspacePath = join(root, 'fixed');
     store.upsertWakeTarget(mailboxId, {
-      mode: 'orca-terminal', workspacePath, agent, sessionId: 'runtime-session', paneKey: 'runtime:pane', interactiveCommand: 'receiver-command',
+      mode: 'orca-terminal', workspacePath, agent, terminalHandle: 'runtime-tab', sessionId: 'runtime-session', paneKey: 'runtime:pane', interactiveCommand: 'receiver-command',
     });
     const binding = { executor: 'orca-wave', mode: 'fixed', mailboxId, workspacePath } as const;
     const plugin = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => binding });
@@ -443,12 +443,15 @@ for (const agent of ['claude', 'codex'] as const) {
       assert.equal(target.interactiveCommand, 'receiver-command');
     }
     const explicit = createOrcaWaveExecutorPlugin({ store, resolveTopicBinding: () => ({
-      ...binding, agent: 'antigravity', sessionId: 'configured-session', interactiveCommand: 'configured-command',
+      ...binding, agent: 'antigravity', sessionId: 'configured-session', interactiveCommand: 'configured-command {sessionId}',
     }) });
     await explicit.execute([envelope('override')], context, {});
     const target = store.getWakeTarget(mailboxId)!;
     assert.equal(target.agent, 'antigravity');
     assert.equal(target.sessionId, 'configured-session');
-    assert.equal(target.interactiveCommand, 'configured-command');
+    assert.equal(target.configuredSessionId, 'configured-session');
+    assert.equal(target.terminalHandle, undefined);
+    assert.equal(target.paneKey, undefined);
+    assert.equal(target.interactiveCommand, 'configured-command {sessionId}');
   });
 }
