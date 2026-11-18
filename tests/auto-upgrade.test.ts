@@ -967,6 +967,32 @@ function updateCheckoutFixture(t: { after: (fn: () => void) => void }, checkoutN
   return { root, stateDir, checkout, writer, beforeSha, update };
 }
 
+test('overlapping self-updates keep the same-process lock through daemon reconciliation', async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture(t);
+  const options = { stateDir, checkoutDir: checkout, homeDir: root };
+  const lock = join(stateDir, 'auto-update.lock');
+  let finishReconciliation!: (restarted: boolean) => void;
+  const pending = new Promise<boolean>(resolve => { finishReconciliation = resolve; });
+  let reconcileCalls = 0;
+  const reconcile = () => ++reconcileCalls === 1 ? pending : Promise.resolve(false);
+
+  const first = selfUpdate(options, reconcile);
+  try {
+    assert.equal(reconcileCalls, 1);
+    const owner = readFileSync(join(lock, 'owner.json'), 'utf8');
+    const second = await selfUpdate(options, reconcile);
+    assert.equal(second.status, 'skipped_locked');
+    assert.equal(second.sourceStatus, 'skipped_locked');
+    assert.equal(reconcileCalls, 1);
+    assert.equal(readFileSync(join(lock, 'owner.json'), 'utf8'), owner);
+  } finally {
+    finishReconciliation(true);
+    await first;
+  }
+  assert.equal((await first).restartedDaemon, true);
+  assert.equal(existsSync(lock), false);
+});
+
 for (const scenario of ['clean-restore', 'conflict', 'pull-failed'] as const) {
   test(`dirty self-update preserves tracked, staged and untracked files: ${scenario}`, t => {
     const { root, checkout, writer, beforeSha, update } = updateCheckoutFixture(t);

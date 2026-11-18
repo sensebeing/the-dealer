@@ -74,7 +74,7 @@ function deliverPeerCard(kernel: Kernel, card: NodeCard): void {
   });
 }
 
-test('peer routing prefers self and reachable teammates, and persists only current incarnations', async t => {
+test('peer routing prefers self and reachable teammates while retaining verified cards by node ID', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-routing-'));
   const peersPath = join(dir, 'peers.json');
   const local = generateNodeKeyPair();
@@ -102,7 +102,8 @@ test('peer routing prefers self and reachable teammates, and persists only curre
   const persistedIds = async () => new Set<string>(
     JSON.parse(await readFile(peersPath, 'utf8')).cards.map((entry: NodeCard) => entry.nodeId),
   );
-  assert.deepEqual(await persistedIds(), new Set([newGhost, newer, otherMachine, otherNetwork].map(entry => entry.nodeId)));
+  const verified = [oldGhost, newGhost, older, newer, oldest, otherMachine, otherNetwork];
+  assert.deepEqual(await persistedIds(), new Set(verified.map(entry => entry.nodeId)));
   const transport: P2PTransportService = kernel.ctx.services.transport;
   const node: PeerDirectoryService = kernel.ctx.services.node;
   await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
@@ -126,28 +127,30 @@ test('peer routing prefers self and reachable teammates, and persists only curre
   }
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
   assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [newGhost]);
-  assert.deepEqual(await persistedIds(), new Set([newGhost, claimant, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
+  const stored = new Set([...verified, claimant, replacement].map(entry => entry.nodeId));
+  assert.deepEqual(await persistedIds(), stored);
 
   reachable.add(claimant.nodeId);
   deliverPeerCard(kernel, claimant);
   assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [claimant]);
-  assert.deepEqual(await persistedIds(), new Set([claimant, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
+  assert.deepEqual(await persistedIds(), stored);
 });
 
-test('peer failover reconsiders an unchanged replacement while retaining replay floors after restart', async t => {
+test('peer failover restores a reachable fallback after restart and rejects stale or equivocated revisions', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-revisions-'));
   const peersPath = join(dir, 'peers.json');
   const local = generateNodeKeyPair();
   const retired = generateNodeKeyPair();
-  const excluded = generateNodeKeyPair();
+  const alternative = generateNodeKeyPair();
   const oldProfile = card('oliver', 'laptop', {}, retired);
-  const lastProfile = card('oliver', 'desktop', { revision: 10 }, retired);
+  const endpointAddr = '127.0.0.1:45678';
+  const lastProfile = card('oliver', 'desktop', { revision: 10, endpointAddr }, retired);
   const replacement = card('oliver', 'desktop', { updatedAt: '2026-01-02T00:00:00.000Z' });
-  const rejected = card('oliver', 'desktop', { revision: 12 }, excluded);
-  const excludedReplay = card('oliver', 'tablet', {}, excluded);
-  const equivocation = card('oliver', 'tablet', { revision: rejected.revision }, excluded);
+  const olderAlternative = card('oliver', 'desktop', { revision: 12 }, alternative);
+  const equivocation = card('oliver', 'tablet', { revision: olderAlternative.revision, endpointAddr }, alternative);
   await writeFile(peersPath, JSON.stringify({ schema: 'the-dealer-peer-directory/v1', cards: [oldProfile, lastProfile] }));
   const kernels: Kernel[] = [];
+  const reachable = new Set([lastProfile.nodeId]);
   t.after(async () => { await Promise.all(kernels.map(kernel => kernel.stop())); await rm(dir, { recursive: true, force: true }); });
   async function openDirectory() {
     const kernel = new Kernel([
@@ -156,61 +159,45 @@ test('peer failover reconsiders an unchanged replacement while retaining replay 
     ]);
     kernels.push(kernel);
     await kernel.start();
-    await kernel.ctx.services.transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
-    return { kernel, node: kernel.ctx.services.node as PeerDirectoryService };
+    const transport: P2PTransportService = kernel.ctx.services.transport;
+    await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
+    t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) => networkId === 'team' && reachable.has(nodeId));
+    const registerEndpoint = t.mock.method(transport, 'registerPeerEndpoint', () => {});
+    return { kernel, node: kernel.ctx.services.node as PeerDirectoryService, registerEndpoint };
   }
 
-  let { kernel, node } = await openDirectory();
-  const reachable = new Set([lastProfile.nodeId]);
-  t.mock.method(kernel.ctx.services.transport, 'isPeerReachable', (networkId: string, nodeId: string) => networkId === 'team' && reachable.has(nodeId));
-  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [lastProfile]);
-  deliverPeerCard(kernel, replacement);
-  deliverPeerCard(kernel, excludedReplay);
-  assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), [excludedReplay]);
-  deliverPeerCard(kernel, rejected);
-  deliverPeerCard(kernel, equivocation);
-  assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), []);
-  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [lastProfile]);
-  assert.deepEqual(node.listPeers({ networkId: 'team' }), [lastProfile]);
-  const waitingSnapshot = JSON.parse(await readFile(peersPath, 'utf8'));
-  assert.deepEqual(new Set(waitingSnapshot.cards), new Set([lastProfile, replacement]));
-
-  reachable.add(replacement.nodeId);
-  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
-  reachable.delete(replacement.nodeId);
-  reachable.delete(lastProfile.nodeId);
-  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
-  assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
-  assert.deepEqual(JSON.parse(await readFile(peersPath, 'utf8')), waitingSnapshot);
-
-  deliverPeerCard(kernel, replacement);
-  for (const replay of [oldProfile, excludedReplay]) deliverPeerCard(kernel, replay);
-  assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
+  const initial = await openDirectory();
+  for (const card of [replacement, olderAlternative]) deliverPeerCard(initial.kernel, card);
+  assert.deepEqual(initial.node.resolveTarget('oliver@desktop', 'team'), [lastProfile]);
   const snapshot = JSON.parse(await readFile(peersPath, 'utf8'));
-  assert.deepEqual(snapshot.cards, [replacement]);
-  assert.equal(snapshot.peerRevisions.team[retired.nodeId], lastProfile.revision);
-  assert.equal(snapshot.peerRevisions.team[excluded.nodeId], rejected.revision);
-  await kernel.stop();
+  assert.deepEqual(new Set(snapshot.cards), new Set([lastProfile, replacement, olderAlternative]));
+  await initial.kernel.stop();
 
-  // Restart from the state before the unchanged heartbeat pruned the incumbent.
-  await writeFile(peersPath, JSON.stringify(waitingSnapshot));
-  ({ kernel, node } = await openDirectory());
-  for (const replay of [oldProfile, excludedReplay, equivocation]) deliverPeerCard(kernel, replay);
-  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
-  assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
-  assert.deepEqual(JSON.parse(await readFile(peersPath, 'utf8')).cards, [replacement]);
-  await kernel.stop();
+  const { kernel, node, registerEndpoint } = await openDirectory();
+  const assertActivePeer = (active: NodeCard) => {
+    assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [active]);
+    assert.deepEqual(node.resolveTarget('member:oliver', 'team'), [active]);
+    assert.deepEqual(node.listPeers({ networkId: 'team' }), [active]);
+  };
+  assertActivePeer(lastProfile);
 
-  // A legacy snapshot may still contain both node IDs when startup compacts it.
-  await writeFile(peersPath, JSON.stringify({
-    schema: 'the-dealer-peer-directory/v1', cards: [oldProfile, lastProfile, replacement, rejected],
-  }));
-  ({ kernel, node } = await openDirectory());
-  for (const replay of [oldProfile, excludedReplay]) deliverPeerCard(kernel, replay);
-  assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
-  const compacted = JSON.parse(await readFile(peersPath, 'utf8'));
-  assert.deepEqual(compacted.cards, [replacement]);
-  assert.deepEqual(compacted.peerRevisions, snapshot.peerRevisions);
+  const updates: unknown[] = [];
+  kernel.ctx.on('node/peer-updated', (card, provenance) => { updates.push({ card, provenance }); });
+  const beforeHeartbeat = await readFile(peersPath, 'utf8');
+  const beforeStat = await stat(peersPath);
+  deliverPeerCard(kernel, lastProfile);
+  assert.deepEqual(registerEndpoint.mock.calls.map(call => call.arguments), [['team', lastProfile.nodeId, endpointAddr]]);
+  assert.deepEqual(updates, [{ card: lastProfile, provenance: { direct: true } }]);
+
+  reachable.delete(lastProfile.nodeId);
+  assertActivePeer(replacement);
+  for (const replay of [oldProfile, equivocation]) deliverPeerCard(kernel, replay);
+  assert.deepEqual(node.resolveTarget('oliver@laptop', 'team'), []);
+  assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), []);
+  assert.equal(registerEndpoint.mock.callCount(), 1);
+  assert.equal(updates.length, 1);
+  assert.equal(await readFile(peersPath, 'utf8'), beforeHeartbeat);
+  assert.equal((await stat(peersPath)).ino, beforeStat.ino);
 });
 
 test('selector and self card reads leave the peer store unchanged across a heartbeat', { timeout: 10_000 }, async t => {

@@ -5,7 +5,7 @@ import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../core-types/index.ts';
 import { appendFileDurably, writeFileAtomically } from '../fs-atomic/index.ts';
-import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
+import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 
 export type FingerprintRecord = {
   pid: number;
@@ -207,9 +207,26 @@ export function removeDaemonFingerprint(stateDir: string, instanceId: string): v
 }
 
 type UpdateLockResult =
-  | { lock: string; locked?: never; error?: never }
-  | { lock?: never; locked: true; error?: never }
-  | { lock?: never; locked?: never; error: string };
+  | { release: () => void; locked?: never; error?: never }
+  | { release?: never; locked: true; error?: never }
+  | { release?: never; locked?: never; error: string };
+
+function holdUpdateLock(lock: string): { release: () => void } {
+  holdOwnedDirectory(lock);
+  const owner = processOwnerRecord();
+  let released = false;
+  return {
+    release() {
+      if (released) return;
+      released = true;
+      const current = readProcessOwner(join(lock, 'owner.json'));
+      releaseOwnedDirectory(lock);
+      if (current?.pid === owner.pid && current.instanceId === owner.instanceId && current.host === owner.host) {
+        rmSync(lock, { recursive: true, force: true });
+      }
+    },
+  };
+}
 
 function claimStagedLock(stage: string, lock: string): boolean {
   try {
@@ -234,13 +251,17 @@ function claimReclaimGate(reclaim: string): boolean {
     if (existsSync(reclaim)) {
       return false;
     }
-    return claimStagedLock(stage, reclaim);
+    if (!claimStagedLock(stage, reclaim)) {
+      return false;
+    }
+    holdOwnedDirectory(reclaim);
+    return true;
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
 }
 
-function acquireReclaimGate(reclaim: string, stateDir: string): 'acquired' | 'busy' | 'corrupt' {
+function acquireReclaimGate(reclaim: string): 'acquired' | 'busy' | 'corrupt' {
   if (claimReclaimGate(reclaim)) {
     return 'acquired';
   }
@@ -252,7 +273,7 @@ function acquireReclaimGate(reclaim: string, stateDir: string): 'acquired' | 'bu
     // Never delete an ownerless gate: absence of proof is not proof of death.
     return 'corrupt';
   }
-  if (!isDeadProcessOwner(gateOwner, stateDir)) {
+  if (!isDeadProcessOwner(gateOwner, reclaim)) {
     return 'busy';
   }
   // Only a gate whose recorded owner is proven dead may be discarded.
@@ -283,7 +304,7 @@ function acquireUpdateLock(stateDir: string): UpdateLockResult {
   try {
     prepareStage();
     if (!existsSync(lock) && claimStagedLock(stage, lock)) {
-      return { lock };
+      return holdUpdateLock(lock);
     }
   } catch (error) {
     rmSync(stage, { recursive: true, force: true });
@@ -294,14 +315,14 @@ function acquireUpdateLock(stateDir: string): UpdateLockResult {
   if (!owner) {
     return { error: `Auto-update lock ${lock} has no readable owner record` };
   }
-  if (!isDeadProcessOwner(owner, stateDir)) {
+  if (!isDeadProcessOwner(owner, lock)) {
     return { locked: true };
   }
   const reclaim = `${lock}.reclaim`;
   const stale = `${lock}.stale.${process.pid}`;
   let gate: 'acquired' | 'busy' | 'corrupt';
   try {
-    gate = acquireReclaimGate(reclaim, stateDir);
+    gate = acquireReclaimGate(reclaim);
   } catch (error) {
     return { error: `Unable to claim auto-update reclaim gate: ${String(error)}` };
   }
@@ -315,7 +336,7 @@ function acquireUpdateLock(stateDir: string): UpdateLockResult {
     // Re-read the owner while holding the gate: a competitor may have claimed the
     // lock after this process failed to create it.
     const current = readProcessOwner(join(lock, 'owner.json'));
-    if (current && !isDeadProcessOwner(current, stateDir)) {
+    if (current && !isDeadProcessOwner(current, lock)) {
       return { locked: true };
     }
     // Move the stale lock out of the claim path before staging the replacement, so
@@ -323,13 +344,17 @@ function acquireUpdateLock(stateDir: string): UpdateLockResult {
     rmSync(stale, { recursive: true, force: true });
     renameSync(lock, stale);
     prepareStage();
-    return claimStagedLock(stage, lock) ? { lock } : { locked: true };
+    return claimStagedLock(stage, lock) ? holdUpdateLock(lock) : { locked: true };
   } catch (error) {
     return { error: `Unable to reclaim auto-update lock: ${String(error)}` };
   } finally {
-    rmSync(stale, { recursive: true, force: true });
-    rmSync(stage, { recursive: true, force: true });
-    rmSync(reclaim, { recursive: true, force: true });
+    try {
+      rmSync(stale, { recursive: true, force: true });
+      rmSync(stage, { recursive: true, force: true });
+    } finally {
+      releaseOwnedDirectory(reclaim);
+      rmSync(reclaim, { recursive: true, force: true });
+    }
   }
 }
 
@@ -454,7 +479,8 @@ export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon: Reconcil
 export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon?: ReconcileDaemon): SelfUpdateReport | Promise<SelfUpdateReport> {
   const checkedAt = new Date().toISOString();
   const acquired = acquireUpdateLock(options.stateDir);
-  if (!acquired.lock) {
+  const { release } = acquired;
+  if (!release) {
     const report: SelfUpdateReport = {
       status: acquired.error ? 'failed' : 'skipped_locked',
       sourceStatus: acquired.error ? 'corrupt_lock' : 'skipped_locked',
@@ -466,7 +492,6 @@ export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon?: Reconci
     };
     return reconcileDaemon ? Promise.resolve(report) : report;
   }
-  const release = () => rmSync(acquired.lock, { recursive: true, force: true });
   try {
     const { report, root, runtimeFingerprint, usableCheckout } = updateCheckout(options, checkedAt);
     persistUpdateReport(options.stateDir, report);
@@ -595,7 +620,7 @@ function reserveBackgroundUpdate(stateDir: string): boolean {
   if (acquired.error) {
     throw new Error(acquired.error);
   }
-  if (!acquired.lock) {
+  if (!acquired.release) {
     return false;
   }
   try {
@@ -611,7 +636,7 @@ function reserveBackgroundUpdate(stateDir: string): boolean {
     atomicJson(triggerPath, now);
     return true;
   } finally {
-    rmSync(acquired.lock, { recursive: true, force: true });
+    acquired.release();
   }
 }
 

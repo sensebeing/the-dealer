@@ -22,7 +22,7 @@
 
 - 运行 `dealer node up` 启动本机节点；无需 `dealer network mount`、`networkId`、`passphrase` 或任何外部 Peer。
 - 将消息发往 `member:<self>`、`skill:<local-skill>` 或本机 `ed25519:<nodeId>`。`transport` 在目标为本机且网络未挂载时，直接在进程内把帧交给同一 `transport/inbound` 处理器；已挂载时则复用本地 endpoint。
-- `node.resolveTarget` 优先返回已发现的远端节点，仅在无远端匹配时回退本机自身 `NodeCard`；`router` 将本机名片作为合法候选，`gate` 对本机签名身份放行 `approval_required`（`dnd` 仍入队，`closed` 仍拒收）。
+- `node.resolveTarget` 对身份选择器优先匹配本机，`skill:` 优先匹配远端。`router` 将本机名片作为合法候选，`gate` 对本机签名身份放行 `approval_required`（`dnd` 仍入队，`closed` 仍拒收）。
 - 项目清单中的 `defaultNetworkId` 只是其触发源在本机发送时使用的稳定作用域名称，不代表必须进行网络挂载。
 
 ### 第二步 — 跨机器 / 跨团队成员 P2P 协作（`networkId + passphrase`）
@@ -283,9 +283,9 @@ export interface NodeService {
 }
 ```
 
-- **已验证目录持久化**：配置 `peersPath` 后，每张通过 `verifyNodeCard` 的远端名片与本机每网络最后 revision 会原子写入 `peers.json`（临时文件 + `fsync` + `rename` + 父目录 `fsync`，`0600`），启动时重新逐张验签加载。这样即使队友离线，`member:` / `skill:` 选择器仍能解析出稳定目标，出站消息可进入持久化 outbox 等待重驱，而不是因为目录为空而路由失败。本机名片本身不落盘；下一张名片 revision 取 `max(持久化/已知 + 1, 当前毫秒时间)`，因此重启后的名片必然严格更新，不会被队友按旧 revision 丢弃。
-- **名片 Gossip**：`peer.card` 广播除自身名片外还携带 `knownCards`（最多 128 张已验证远端名片）。重启节点或只能经种子入网的新节点因此能在队友重新上线前拿到团队目录；接收端仍逐张验签、按 `revision` 单调更新并落盘，旧名片或伪造名片不会覆盖已有记录。临时卸载网络只清除本机名片，已验证远端目录保留。
-- **节点身份更新与目标解析**：每个网络内，同一 `(member, nodeName)` 保留最新名片和最新的可达候选。路由优先选择可达候选，同等可达性时按更新时间、revision、`nodeId` 依次比较。旧候选离线或更新候选变为可达时，查询立即调整选择，后续名片心跳或重启加载会压缩多余候选。目录拒绝与本机 `(member, nodeName)` 相同的其他 `nodeId`。每个 `(networkId, nodeId)` 的最高已验签 revision 在压缩后仍用于拦截旧版本。已排除的节点需提交更高 revision 才能重新成为候选，仍在目录中的候选可通过同版本心跳重新判定。身份选择器优先匹配本机，未挂载的项目范围使用只读本机名片，`skill:` 优先选择远端。`member:` 匹配多台远端机器时，只要有至少一台被 Transport 确认为可达，就只返回可达机器。全都离线时保留这些候选供 outbox 排队。选择器解析和本机名片读取均不写入目录，本机发布维护 `local` 与已挂载网络的名片。
+- **已验证目录持久化**：配置 `peersPath` 后，每个 `(networkId, nodeId)` 的最新已验签远端名片与本机每网络最后 revision 会原子写入 `peers.json`（临时文件 + `fsync` + `rename` + 父目录 `fsync`，`0600`）。启动时逐张验签，合并同一密钥的重复版本。每张存储的远端名片提供该密钥的 revision 下限，旧版本和同 revision 不同签名的名片会被拒绝。目录拒绝使用本机 `(member, nodeName)` 的其他密钥。本机只持久化 revision，下一张名片取 `max(持久化/已知 + 1, 当前毫秒时间)`。
+- **名片 Gossip**：`peer.card` 广播可随自身名片携带 `knownCards`（最多 128 张），按下述规则选取各身份的活跃远端名片。接收端逐张验签并按 revision 单调更新目录，启动时从持久化名片恢复同一目录。内容相同的直连心跳可刷新传输端点并通知 outbox 重驱，无需写入目录。卸载网络时保留已验签远端目录。
+- **节点身份更新与目标解析**：查询按网络为每个 `(member, nodeName)` 选取一张活跃远端名片。优先选可达名片，同等可达性时按更新时间、revision、`nodeId` 依次比较。可达性变化立即影响选择，所有密钥的最新已验签名片仍保留在目录中，供发现和重启后回退。身份选择器优先匹配本机，未挂载的项目范围使用只读本机名片，`skill:` 优先选择远端。`member:` 匹配多台远端机器时，若有可达机器则只返回可达机器，全部离线时仍返回候选供 outbox 排队。选择器解析和本机名片读取均不写入目录，本机发布维护 `local` 与已挂载网络的名片。
 
 ---
 
