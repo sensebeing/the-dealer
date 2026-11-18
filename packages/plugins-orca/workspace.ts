@@ -66,6 +66,7 @@ export interface OrcaWorkspaceIdleOptions {
   targetPaneKey?: string;
   /** Preferred target agent when the bound terminal is gone and a rebind picks a replacement. */
   agent?: SupportedOrcaAgent;
+  excludedHandles?: ReadonlySet<string>;
 }
 
 /** Reuse candidates in the same order terminal resolution falls back through them. */
@@ -152,11 +153,15 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
-    const targetTerm = row.path === cwd
-      ? handles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
-        ?? handles.find(t => matchesPane(t, options?.targetPaneKey))
+    const isRoot = row.path === cwd;
+    // Ownership limits the root tab selection; a relevant descendant still has to prove readiness.
+    const canUse = (terminal: OrcaTerminalRow) => !isRoot || !options?.excludedHandles?.has(String(terminal.handle));
+    const eligibleHandles = handles.filter(canUse);
+    const targetTerm = isRoot
+      ? eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
+        ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
       : undefined;
-    if (row.path === cwd && options?.targetPaneKey?.trim() && !targetTerm) return true;
+    if (isRoot && options?.targetPaneKey?.trim() && !targetTerm) return true;
     const targetPaneKeys = new Set<string>();
     if (typeof targetTerm?.tabId === 'string' && targetTerm.tabId && typeof targetTerm.leafId === 'string' && targetTerm.leafId)
       targetPaneKeys.add(`${targetTerm.tabId}:${targetTerm.leafId}`);
@@ -189,22 +194,23 @@ export async function checkOrcaWorkspaceIdle(
     // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
     // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
     // rebind could reuse when it was closed).
-    const rootTarget = row.path === cwd ? (targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle) : undefined;
+    const rootTarget = isRoot ? (targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle) : undefined;
+    const eligibleObservableHandles = observableHandles.filter(canUse);
     const targetPresent =
-      typeof rootTarget === 'string' && observableHandles.some((t) => String(t.handle) === rootTarget);
+      typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
     const reuseHandles =
       typeof rootTarget === 'string' && !targetPresent
-        ? new Set(reusableTerminalCandidates(observableHandles, options?.agent).map((t) => String(t.handle)))
+        ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
         : undefined;
     const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
-      if (row.path !== cwd) return true;
+      if (!isRoot) return true;
       if (rootTarget === null) return false;
       if (rootTarget === undefined) return true;
       if (String(terminal.handle) === rootTarget) return true;
       // The bound terminal was closed: only the terminals a rebind could reuse are inspected.
       return reuseHandles?.has(String(terminal.handle)) === true;
     };
-    for (const terminal of observableHandles) {
+    for (const terminal of eligibleObservableHandles) {
       if (!gatesWakeup(terminal)) {
         continue;
       }
@@ -225,18 +231,15 @@ export async function checkOrcaWorkspaceIdle(
     }
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
+      if (!child) return false;
       if (
-        targetPaneKeys.size > 0 &&
-        child?.agents?.length &&
-        child.agents.every(
-          (agent) =>
-            typeof agent.parentPaneKey === 'string' &&
-            agent.parentPaneKey.length > 0 &&
-            !targetPaneKeys.has(agent.parentPaneKey),
+        targetPaneKeys.size > 0 && child.agents?.length &&
+        (handles.length <= 1 || child.unverifiableTerminalCount === 0) &&
+        child.agents.every(agent =>
+          typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey),
         )
-      )
-        continue;
-      if (!child || !(await idleTree(child))) {
+      ) continue;
+      if (!(await idleTree(child))) {
         return false;
       }
     }
@@ -585,7 +588,7 @@ export async function planOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean; excludedHandles?: ReadonlySet<string> },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
   const targetAgent = options?.agent ?? 'antigravity';
   const listed = await checkedCommand(runner, {
@@ -598,7 +601,9 @@ export async function planOrcaWorkspaceTerminal(
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
-  const terminals = inventory.result.terminals as OrcaTerminalRow[];
+  const terminals = (inventory.result.terminals as OrcaTerminalRow[]).filter(
+    terminal => terminal && !options?.excludedHandles?.has(String(terminal.handle)),
+  );
   // A workspace already bound to a terminal reuses exactly that terminal: orphaned only means the
   // workspace registry lost track of it, not that its live TUI stopped accepting wakeups.
   const preferredHandle = options?.preferredHandle;

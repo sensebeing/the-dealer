@@ -313,10 +313,18 @@ export function isStreamConversationBinding(binding: Partial<MailboxTopicBinding
   return binding.stream === true || resolveEffectiveConversationMode({ binding, fallbackMode }) === 'wave';
 }
 
+export function baseStreamKeyOf(streamKey: string): string | undefined {
+  return /^(.+):([1-9]\d*)$/.exec(streamKey)?.[1];
+}
+
 export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding, fallbackMode?: AgentConversationMode): string {
   if (binding.mailboxId !== undefined) return normalizeMailboxId(binding.mailboxId);
-  return isStreamConversationBinding(binding, fallbackMode)
-    ? normalizeMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`) : 'default';
+  if (!isStreamConversationBinding(binding, fallbackMode)) return 'default';
+  const kindStreamKey = kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : undefined;
+  if (kindStreamKey !== undefined && binding.streamKey !== undefined && baseStreamKeyOf(kindStreamKey) === binding.streamKey) {
+    return normalizeMailboxId(`stream:${kindStreamKey}`);
+  }
+  return normalizeMailboxId(`stream:${binding.streamKey ?? kindStreamKey ?? kind}`);
 }
 
 export function resolveMailboxId(
@@ -1623,6 +1631,10 @@ export class MailboxStore {
     const id = normalizeMailboxId(mailboxId);
     const target = this.read().wakeTargets[id];
     return target ? structuredClone(target) : undefined;
+  }
+
+  listWakeTargets(): WakeTargetState[] {
+    return Object.values(this.read().wakeTargets).map(target => structuredClone(target));
   }
 
   /** Arrival notification for one mailbox; never emitted by read-only operations. */
