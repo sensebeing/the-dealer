@@ -33,6 +33,18 @@ export interface NodePluginConfig {
 const PEER_DIRECTORY_SCHEMA = 'the-dealer-peer-directory/v1';
 const MAX_GOSSIPED_PEER_CARDS = 128;
 
+function samePeerIdentity(a: NodeCard['identity'], b: NodeCard['identity']): boolean {
+  return a.member === b.member && a.nodeName === b.nodeName;
+}
+
+function isNewerPeerCard(a: NodeCard, b: NodeCard): boolean {
+  const aTime = Date.parse(a.updatedAt) || 0;
+  const bTime = Date.parse(b.updatedAt) || 0;
+  if (aTime !== bTime) return aTime > bTime;
+  if (a.revision !== b.revision) return a.revision > b.revision;
+  return a.nodeId > b.nodeId;
+}
+
 interface ObservableTransport extends TransportService {
   identityKeyPair?: ReturnType<typeof generateNodeKeyPair>;
   getNetworkConfig?(networkId: string): NetworkMountConfig | undefined;
@@ -135,10 +147,15 @@ export class PeerDirectoryService implements NodeService {
         this.revisions.set(networkId, revision as number);
       }
     }
-    for (const card of (parsed as { cards: unknown[] }).cards) {
+    const { cards } = parsed as { cards: unknown[] };
+    for (const card of cards) {
       // Persisted cards carry durable identity, not live reachability: the peer may be
       // offline, and its last endpoint is owned by transport discovery, not this store.
       this.acceptCard(card, undefined, false, false);
+    }
+    const retained = [...this.peers.values()].reduce((total, directory) => total + directory.size, 0);
+    if (retained < cards.length) {
+      this.persistPeers();
     }
   }
 
@@ -202,6 +219,8 @@ export class PeerDirectoryService implements NodeService {
       !card.identity ||
       typeof card.identity.member !== 'string' ||
       typeof card.identity.nodeName !== 'string' ||
+      samePeerIdentity(card.identity, this.config) ||
+      typeof card.updatedAt !== 'string' ||
       !Array.isArray(card.capabilities?.skills) ||
       !card.runtimeState
     ) {
@@ -213,6 +232,15 @@ export class PeerDirectoryService implements NodeService {
     const directory = this.peers.get(card.networkId) ?? new Map<string, NodeCard>();
     if ((directory.get(card.nodeId)?.revision ?? 0) >= card.revision) {
       return false;
+    }
+    const predecessor = [...directory.values()].find(existing =>
+      existing.nodeId !== card.nodeId && samePeerIdentity(existing.identity, card.identity),
+    );
+    if (predecessor) {
+      if (!isNewerPeerCard(card, predecessor)) {
+        return false;
+      }
+      directory.delete(predecessor.nodeId);
     }
     if (registerEndpoint && card.endpointAddr) {
       try {
@@ -440,11 +468,20 @@ export class PeerDirectoryService implements NodeService {
       networkId = selector.slice(0, slash);
       selector = selector.slice(slash + 1);
     }
+    const selfCard = this.getSelfCard(networkId ?? 'local');
+    if (!selector.startsWith('skill:') && this.matchSelector(selfCard, selector)) {
+      return [selfCard];
+    }
     const remote = this.listPeers({ networkId }).filter(card => this.matchSelector(card, selector));
+    if (selector.startsWith('member:') && remote.length > 1 && typeof this.transport.isPeerReachable === 'function') {
+      const reachable = remote.filter(card => this.transport.isPeerReachable?.(card.networkId, card.nodeId) === true);
+      if (reachable.length > 0) {
+        return reachable;
+      }
+    }
     if (remote.length > 0) {
       return remote;
     }
-    const selfCard = this.getSelfCard(networkId ?? 'local');
     return this.matchSelector(selfCard, selector) ? [selfCard] : [];
   }
 

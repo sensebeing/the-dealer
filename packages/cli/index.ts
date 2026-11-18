@@ -23,7 +23,7 @@ import {
   isTerminalDeliveryFailure,
 } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
-import { computeRuntimeFingerprint, readDaemonFingerprint, readAutoUpdateStatus, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
+import { computeRuntimeFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
@@ -313,11 +313,17 @@ export async function rpc(
 /** One startup budget for every path that waits on a daemon becoming usable. */
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
 
-async function launchDaemon(argv: string[], stateDir: string): Promise<unknown> {
+function daemonEntryPoint(checkoutDir?: string): string {
+  return checkoutDir === undefined
+    ? fileURLToPath(new URL('../../bin/dealerd.js', import.meta.url))
+    : join(checkoutDir, 'bin', 'dealerd.js');
+}
+
+async function launchDaemon(argv: string[], stateDir: string, checkoutDir?: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ['--no-warnings', '--experimental-strip-types', new URL('../../bin/dealerd.js', import.meta.url).pathname, ...argv],
+      ['--no-warnings', '--experimental-strip-types', daemonEntryPoint(checkoutDir), ...argv],
       {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -602,16 +608,16 @@ async function waitForOwnedDaemonReady(
   return final.state === 'ready' ? final.status : undefined;
 }
 
-export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
+export async function ensureDaemonRunning(stateDir: string, checkoutDir?: string): Promise<unknown> {
   // The fingerprint hashes the whole code tree; compute it once so the readiness wait never
   // re-reads it while a cold start is still loading plugins and mounting networks.
-  const expectedFingerprint = computeRuntimeFingerprint(stateDir);
+  const expectedFingerprint = computeRuntimeFingerprint(stateDir, checkoutDir);
   const ready = await waitForOwnedDaemonReady(stateDir, expectedFingerprint);
   if (ready) {
     return ready;
   }
   try {
-    return await launchDaemon([], stateDir);
+    return await launchDaemon([], stateDir, checkoutDir);
   } catch (error) {
     // A supervisor such as launchd may have claimed the lock between the readiness check and
     // the spawn; wait for that live owner to finish serving instead of failing on the
@@ -624,7 +630,10 @@ export async function ensureDaemonRunning(stateDir: string): Promise<unknown> {
   }
 }
 
-export async function restartDaemon(stateDir: string, options: { force?: boolean } = {}): Promise<unknown> {
+export async function restartDaemon(stateDir: string, options: { force?: boolean; checkoutDir?: string } = {}): Promise<unknown> {
+  if (options.checkoutDir !== undefined && !existsSync(daemonEntryPoint(options.checkoutDir))) {
+    throw new Error(`Cannot restart daemon: missing ${daemonEntryPoint(options.checkoutDir)}`);
+  }
   const stopped = await stopDaemonIfRunning(stateDir, options);
   if (!stopped.stopped && stopped.running) {
     // Only a drain the daemon itself deferred leaves it serving and is reported as deferred.
@@ -639,7 +648,7 @@ export async function restartDaemon(stateDir: string, options: { force?: boolean
   }
   // A supervisor that already started a replacement counts as a completed stop, so confirm
   // that live instance instead of reporting a false deferral for the incarnation that exited.
-  return ensureDaemonRunning(stateDir);
+  return ensureDaemonRunning(stateDir, options.checkoutDir);
 }
 
 function positiveInteger(value: unknown, flag: string): number | undefined {
@@ -1092,10 +1101,19 @@ async function runSessionCommand(
   };
 }
 
+function checkForBackgroundUpdate(stateDir: string, stderr: (line: string) => void): void {
+  try {
+    maybeTriggerBackgroundAutoUpdate({ stateDir });
+  } catch (error) {
+    stderr(JSON.stringify({ warning: `Unable to check for a background self-update: ${String(error)}` }));
+  }
+}
+
 export async function runDealerCli(argv: string[], options: DealerCliOptions = {}): Promise<number> {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
   let owned: DealerNodeRuntime | undefined;
+  let updateStateDir: string | undefined;
   // An ephemeral CLI runtime exits with this command; queued mail needs the daemon's
   // background redrive to survive that exit.
   let queuedForRedrive = false;
@@ -1117,6 +1135,10 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         },
       }, null, v.json ? undefined : 2));
       return 0;
+    }
+    const stateDir = resolve(options.stateDir ?? defaultStateDir());
+    if (!options.runtime && group !== 'self-update' && !(group === 'node' && action === 'down')) {
+      updateStateDir = stateDir;
     }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
     if (['ask', 'reply', 'settle', 'send', 'broadcast', 'inbox'].includes(group ?? '')) {
@@ -1187,16 +1209,13 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         }
       }
     }
-    const stateDir = resolve(options.stateDir ?? defaultStateDir());
     const localSetup = group === 'setup' && !['binding-preset', 'apply-preset'].includes(action);
     const localLifecycle = group === 'node' && ['down', 'restart', 'up'].includes(action ?? '') || group === 'self-update';
     if (!localSetup && !localLifecycle && !options.runtime && existsSync(join(stateDir, 'control.sock'))) {
-      // The daemon's idle-gated watcher is the sole automatic reload owner; ordinary
-      // commands always forward to the running daemon without a synchronous restart.
+      // Ordinary commands forward to the running daemon without a synchronous restart.
       const result = await rpc(join(stateDir, 'control.sock'), argv);
       result.stdout.forEach(line => stdout(line));
       result.stderr.forEach(line => stderr(line));
-      maybeTriggerBackgroundAutoUpdate({ stateDir });
       return result.code;
     }
     if (group === 'setup' && action !== 'apply-preset') {
@@ -1292,11 +1311,16 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     if (!options.runtime && group === 'self-update') {
-      const report = selfUpdate({ stateDir, checkoutDir: v['checkout-dir'], homeDir: v['home-dir'], geminiDir: v['gemini-dir'] });
-      if (existsSync(join(stateDir, 'control.sock')) && readDaemonFingerprint(stateDir)?.fingerprint !== computeRuntimeFingerprint(stateDir, v['checkout-dir'])) {
-        const restarted = await restartDaemon(stateDir);
-        report.restartedDaemon = !(restarted as { deferred?: boolean } | null)?.deferred;
-      }
+      const report = await selfUpdate(
+        { stateDir, checkoutDir: v['checkout-dir'], homeDir: v['home-dir'], geminiDir: v['gemini-dir'] },
+        async (runtimeFingerprint, checkoutDir) => {
+          if (!existsSync(join(stateDir, 'control.sock'))) return false;
+          const probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
+          if (probe.state === 'ready') return false;
+          const restarted = await restartDaemon(stateDir, { checkoutDir });
+          return !(restarted as { deferred?: boolean } | null)?.deferred;
+        },
+      );
       stdout(JSON.stringify(report, null, v.json ? undefined : 2));
       return 0;
     }
@@ -1621,7 +1645,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     return 1;
   } finally {
     if (owned) {
-      const stateDirForDaemon = resolve(options.stateDir ?? defaultStateDir());
+      const stateDirForDaemon = owned.stateDir;
       let pending = false;
       try {
         pending = Boolean(
@@ -1650,6 +1674,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           }));
         }
       }
+    }
+    if (updateStateDir !== undefined) {
+      checkForBackgroundUpdate(updateStateDir, stderr);
     }
   }
 }
@@ -1717,7 +1744,9 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   };
   runtime.onControlIdle = maybeSpawnSelfRestart;
   // Remote Git updates cannot emit local filesystem events, so check upstream every six hours.
-  const timer = setInterval(() => maybeTriggerBackgroundAutoUpdate({ stateDir: runtime.stateDir }), 6 * 3600_000);
+  const checkForUpdate = () => checkForBackgroundUpdate(runtime.stateDir, console.error);
+  checkForUpdate();
+  const timer = setInterval(checkForUpdate, 6 * 3600_000);
   timer.unref();
   return runtime;
 }

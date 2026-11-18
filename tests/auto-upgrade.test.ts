@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess, { execFileSync, spawn } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { computeRuntimeFingerprint, readDaemonFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from '../packages/cli/auto-update.ts';
-import { DealerNodeRuntime, ensureDaemonRunning, restartDaemon, stopDaemonIfRunning } from '../packages/cli/index.ts';
+import { DealerNodeRuntime, ensureDaemonRunning, restartDaemon, runDealerCli, runDealerDaemon, stopDaemonIfRunning } from '../packages/cli/index.ts';
 
 const dealerBin = fileURLToPath(new URL('../bin/dealer.js', import.meta.url));
 
@@ -40,9 +40,10 @@ async function runDealer(
   args: string[],
   stateDir: string,
   env: NodeJS.ProcessEnv = {},
+  bin = dealerBin,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', dealerBin, ...args], {
+    const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, ...args], {
       env: { ...process.env, DEALER_STATE_DIR: stateDir, ...env },
     });
     let stdout = '';
@@ -310,15 +311,12 @@ test('dealer self-update fast-forwards clean main, syncs skill symlinks, skips d
   const origin = join(root, 'origin.git');
   execFileSync('git', ['init', '--bare', '--initial-branch=main', origin], { stdio: ['ignore', 'pipe', 'pipe'] });
   const checkout = join(root, 'checkout');
-  mkdirSync(join(checkout, 'bin'), { recursive: true });
-  mkdirSync(join(checkout, 'packages'), { recursive: true });
+  copyDealerCode(checkout);
   for (const skill of ['the-dealer', 'the-dealer-setup', 'the-dealer-extend']) {
     mkdirSync(join(checkout, 'skills', skill), { recursive: true });
     writeFileSync(join(checkout, 'skills', skill, 'SKILL.md'), `# ${skill}\n`);
   }
-  writeFileSync(join(checkout, 'package.json'), `${JSON.stringify({ name: 'the-dealer', version: '0.1.0' }, null, 2)}\n`);
-  writeFileSync(join(checkout, 'bin', 'dealer.js'), '#!/usr/bin/env node\n');
-  writeFileSync(join(checkout, 'packages', 'index.ts'), 'export {};\n');
+  writeFileSync(join(checkout, 'package.json'), `${JSON.stringify({ name: 'the-dealer', type: 'module', version: '1.0.0-test' }, null, 2)}\n`);
   git(checkout, ['init', '--initial-branch=main']);
   git(checkout, ['config', 'user.email', 'dealer-test@example.com']);
   git(checkout, ['config', 'user.name', 'Dealer Test']);
@@ -402,6 +400,68 @@ test('dealer self-update fast-forwards clean main, syncs skill symlinks, skips d
   git(checkout, ['checkout', '-b', 'feat']);
   const offMain = selfUpdate(updateOptions);
   assert.equal(offMain.sourceStatus, 'skipped_non_main_branch');
+});
+
+function copyDealerCode(checkout: string): void {
+  for (const path of ['bin', 'packages', 'package.json']) {
+    cpSync(fileURLToPath(new URL(`../${path}`, import.meta.url)), join(checkout, path), { recursive: true });
+  }
+}
+
+test('up-to-date self-update from a linked worktree heals main links and restarts the live stale daemon', { timeout: 90_000 }, async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture({ after: cleanup => t.after(async () => {
+    try {
+      await stopDaemonIfRunning(stateDir, { force: true });
+    } finally {
+      cleanup();
+    }
+  }) }, 'the-dealer');
+  copyDealerCode(checkout);
+  writeFileSync(join(checkout, 'package.json'), JSON.stringify({ name: 'the-dealer', type: 'module', version: '1.0.0-test' }));
+  git(checkout, ['add', '-A']);
+  git(checkout, ['commit', '-m', 'add runnable dealer']);
+  git(checkout, ['push']);
+  const head = git(checkout, ['rev-parse', 'HEAD']);
+  const worktree = join(root, 'linked worktree');
+  git(checkout, ['worktree', 'add', '-b', 'topic', worktree]);
+  const localBin = join(root, '.local', 'bin');
+  mkdirSync(localBin, { recursive: true });
+  symlinkSync(join(worktree, 'bin', 'dealer.js'), join(localBin, 'dealer'));
+  symlinkSync(join(root, 'stale-daemon'), join(localBin, 'dealerd'));
+
+  await bootDaemon(stateDir, { DEALER_AUTO_RESTART: '0' });
+  const before = readDaemonFingerprint(stateDir)!;
+  const expected = computeRuntimeFingerprint(stateDir, checkout);
+  assert.notEqual(before.fingerprint, expected);
+  // The file claims the daemon is current, but its live status proves otherwise.
+  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({ ...before, fingerprint: expected }));
+  const result = await runDealer(['self-update', '--home-dir', root, '--json'], stateDir, {}, join(worktree, 'bin', 'dealer.js'));
+  assert.equal(result.code, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.sourceStatus, 'up_to_date');
+  assert.equal(report.headSha, head);
+  assert.equal(report.restartedDaemon, true);
+  assert.equal(report.runtimeFingerprint, expected);
+  assert.ok(Date.parse(report.lastUpdatedAt) >= Date.parse(report.lastCheckedAt));
+  assert.deepEqual(report.syncedBinaries, [join(localBin, 'dealer'), join(localBin, 'dealerd')]);
+  for (const bin of report.syncedBinaries) {
+    assert.equal(readlinkSync(bin), join(checkout, 'bin', `${bin.endsWith('dealerd') ? 'dealerd' : 'dealer'}.js`));
+  }
+  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'auto-update.json'), 'utf8')), report);
+  const log = readFileSync(join(stateDir, 'auto-update.log'), 'utf8').trim().split('\n');
+  assert.deepEqual(JSON.parse(log.at(-1)!), report);
+  assert.notEqual(readDaemonFingerprint(stateDir)?.instanceId, before.instanceId);
+  assert.equal((await dealer(['node', 'status'], stateDir)).runtimeFingerprint, expected);
+
+  rmSync(join(localBin, 'dealer'));
+  writeFileSync(join(localBin, 'dealer'), 'keep my wrapper');
+  rmSync(join(localBin, 'dealerd'));
+  const current = await runDealer(['self-update', '--home-dir', root, '--json'], stateDir, {}, join(worktree, 'bin', 'dealer.js'));
+  assert.equal(current.code, 0, current.stderr);
+  assert.equal(JSON.parse(current.stdout).restartedDaemon, false);
+  assert.deepEqual(JSON.parse(current.stdout).syncedBinaries, [join(localBin, 'dealerd')]);
+  assert.equal(readFileSync(join(localBin, 'dealer'), 'utf8'), 'keep my wrapper');
+  assert.equal(readlinkSync(join(localBin, 'dealerd')), join(checkout, 'bin', 'dealerd.js'));
 });
 
 test('dealer node restart tolerates concurrent ensureDaemonRunning and node down stops cleanly', { timeout: 90_000 }, async t => {
@@ -708,9 +768,7 @@ test('a completed drain waits out a slow stop hook without reporting a false def
   assert.equal(status.running, true);
 });
 
-test('background auto-update retries errors after fifteen minutes and successes after six hours', t => {
-  const { root, stateDir } = isolatedState();
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+function captureBackgroundUpdates(t: test.TestContext): string[] {
   const previous = { enabled: process.env.DEALER_AUTO_UPDATE, disabled: process.env.DEALER_DISABLE_AUTO_UPDATE };
   process.env.DEALER_AUTO_UPDATE = '1';
   delete process.env.DEALER_DISABLE_AUTO_UPDATE;
@@ -722,30 +780,99 @@ test('background auto-update retries errors after fifteen minutes and successes 
     mocked.mock.restore();
     syncBuiltinESMExports();
   });
-  const calls: unknown[][] = [];
-  const mocked = t.mock.method(childProcess, 'spawn', (...args: unknown[]) => {
-    calls.push(args);
-    return { unref() {} };
+  const calls: string[] = [];
+  const original = childProcess.spawn;
+  const mocked = t.mock.method(childProcess, 'spawn', (command: string, args: string[], options: childProcess.SpawnOptions) => {
+    if (args?.[3] === 'self-update') {
+      calls.push(options.env!.DEALER_STATE_DIR!);
+      return { on() {}, unref() {} };
+    }
+    return original(command, args, options);
   });
   syncBuiltinESMExports();
+  return calls;
+}
+
+test('background auto-update retries errors after fifteen minutes and successes after six hours', t => {
+  const calls = captureBackgroundUpdates(t);
   for (const [sourceStatus, minutes, expected] of [
     ['error', 14, 0], ['error', 16, 1], ['up_to_date', 16, 1],
     ['up_to_date', 359, 1], ['up_to_date', 361, 2],
   ] as const) {
+    const { root, stateDir } = isolatedState();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
     writeFileSync(join(stateDir, 'auto-update.json'), JSON.stringify({
       sourceStatus, lastCheckedAt: new Date(Date.now() - minutes * 60_000).toISOString(),
+      runtimeFingerprint: computeRuntimeFingerprint(stateDir, root),
     }));
-    maybeTriggerBackgroundAutoUpdate({ stateDir });
+    maybeTriggerBackgroundAutoUpdate({ stateDir, checkoutDir: root });
     assert.equal(calls.length, expected, sourceStatus + ':' + minutes);
   }
 });
 
-function updateCheckoutFixture(t: { after: (fn: () => void) => void }) {
+test('background auto-update bypasses cooldown for disk or live daemon drift with a thirty-second spawn guard', t => {
+  const { root, stateDir } = isolatedState();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const calls = captureBackgroundUpdates(t);
+  const checkoutDir = join(root, 'checkout');
+  mkdirSync(checkoutDir);
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const current = computeRuntimeFingerprint(stateDir, checkoutDir);
+  const writeStatus = (runtimeFingerprint: string, seconds: number) => writeFileSync(join(stateDir, 'auto-update.json'), JSON.stringify({
+    sourceStatus: 'up_to_date', lastCheckedAt: new Date(now - seconds * 1_000).toISOString(), runtimeFingerprint,
+  }));
+  const check = () => maybeTriggerBackgroundAutoUpdate({ stateDir, checkoutDir });
+  writeStatus('old-disk', 20);
+  check();
+  assert.deepEqual(calls, []);
+  writeStatus(current, 60);
+  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({ fingerprint: 'old-daemon' }));
+  check();
+  assert.deepEqual(calls, []);
+  writeFileSync(join(stateDir, 'control.sock'), '');
+  check();
+  check();
+  assert.deepEqual(calls, [stateDir]);
+  t.mock.method(Date, 'now', () => now + 30_000);
+  rmSync(join(stateDir, 'control.sock'));
+  writeStatus('old-disk', 60);
+  check();
+  assert.deepEqual(calls, [stateDir, stateDir]);
+});
+
+test('offline CLI commands and daemon startup trigger background auto-update', async t => {
+  const calls = captureBackgroundUpdates(t);
+  for (const args of [['inbox', 'check'], ['node', 'status'], ['setup', 'probe'], ['project', 'init']]) {
+    const { root, stateDir } = isolatedState();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const result = await runDealerCli([...args, '--root', join(root, 'project'), '--json'], {
+      stateDir, stdout: () => {}, stderr: message => assert.fail(message),
+    });
+    assert.equal(result, 0, args.join(' '));
+    assert.equal(calls.at(-1), stateDir, args.join(' '));
+  }
+  const { root, stateDir } = isolatedState();
+  const previous = process.env.DEALER_STATE_DIR;
+  process.env.DEALER_STATE_DIR = stateDir;
+  let runtime: DealerNodeRuntime | undefined;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.DEALER_STATE_DIR;
+    else process.env.DEALER_STATE_DIR = previous;
+    await runtime?.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  runtime = await runDealerDaemon(['--profile', 'headless-relay', '--member', 'test-node']);
+  assert.equal(calls.length, 5);
+  assert.equal(calls.at(-1), stateDir);
+});
+
+function updateCheckoutFixture(t: { after: (fn: () => void) => void }, checkoutName = 'checkout') {
   const { root, stateDir } = isolatedState();
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const origin = join(root, 'origin.git');
   git(root, ['init', '--bare', '--initial-branch=main', origin]);
-  const checkout = join(root, 'checkout');
+  const checkout = join(root, checkoutName);
   git(root, ['clone', origin, checkout]);
   for (const [key, value] of [['user.name', 'Test'], ['user.email', 'test@example.com']]) git(checkout, ['config', key, value]);
   writeFileSync(join(checkout, 'tracked.txt'), 'original\n');
@@ -757,7 +884,7 @@ function updateCheckoutFixture(t: { after: (fn: () => void) => void }) {
   git(root, ['clone', origin, writer]);
   for (const [key, value] of [['user.name', 'Test'], ['user.email', 'test@example.com']]) git(writer, ['config', key, value]);
   const update = () => selfUpdate({ stateDir, checkoutDir: checkout, homeDir: join(root, 'home'), geminiDir: join(root, 'gemini') });
-  return { root, checkout, writer, beforeSha, update };
+  return { root, stateDir, checkout, writer, beforeSha, update };
 }
 
 for (const scenario of ['clean-restore', 'conflict', 'pull-failed'] as const) {
