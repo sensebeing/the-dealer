@@ -278,10 +278,10 @@ export class PeerDirectoryService implements NodeService {
         // never discards verified member identity.
       }
     }
-    if (emit && (!unchanged || (registerEndpoint && card.endpointAddr))) {
+    if (emit && !unchanged) {
       // `direct` distinguishes live reachability from identity-only gossip so retry
       // schedulers never treat a third-party card as proof the member reconnected.
-      this.ctx.emit('node/peer-updated', structuredClone(existing && unchanged ? existing : card), {
+      this.ctx.emit('node/peer-updated', structuredClone(card), {
         direct: registerEndpoint,
       });
     }

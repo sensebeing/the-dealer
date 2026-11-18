@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess, { execFileSync, spawn } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { once } from 'node:events';
 import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { computeRuntimeFingerprint, readDaemonFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from '../packages/cli/auto-update.ts';
+import type { SelfUpdateReport } from '../packages/cli/auto-update.ts';
 import { DealerNodeRuntime, ensureDaemonRunning, restartDaemon, rpc, runDealerCli, runDealerDaemon, stopDaemonIfRunning } from '../packages/cli/index.ts';
 import { holdOwnedDirectory, processOwnerRecord, releaseOwnedDirectory } from '../packages/process-lock/index.ts';
 
@@ -992,6 +993,170 @@ test('overlapping self-updates keep the same-process lock through daemon reconci
   }
   assert.equal((await first).restartedDaemon, true);
   assert.equal(existsSync(lock), false);
+});
+
+function startUpdateWorker(
+  t: test.TestContext,
+  options: { stateDir: string; checkoutDir: string; homeDir: string },
+  setup = '',
+  reconcile = '',
+) {
+  const moduleUrl = new URL('../packages/cli/auto-update.ts', import.meta.url).href;
+  const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', '--input-type=module', '--eval', `
+    import fs from 'node:fs';
+    import cp from 'node:child_process';
+    import { join } from 'node:path';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { selfUpdate } from ${JSON.stringify(moduleUrl)};
+    const options = JSON.parse(process.argv[1]);
+    const mark = name => fs.writeFileSync(join(options.homeDir, name), '');
+    const pause = (ready, resume) => {
+      mark(ready);
+      const sleeper = new Int32Array(new SharedArrayBuffer(4));
+      const deadline = Date.now() + 15_000;
+      while (!fs.existsSync(join(options.homeDir, resume))) {
+        if (Date.now() >= deadline) throw new Error('Timed out at ' + ready);
+        Atomics.wait(sleeper, 0, 0, 10);
+      }
+    };
+    ${setup}
+    syncBuiltinESMExports();
+    const report = await selfUpdate(options, async () => { ${reconcile}; return false; });
+    console.log(JSON.stringify(report));
+  `, JSON.stringify(options)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const completed = new Promise<{ code: number | null; stdout: string; stderr: string }>(resolve => {
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', data => { stdout += data; });
+    child.stderr.on('data', data => { stderr += data; });
+    child.once('close', code => resolve({ code, stdout, stderr }));
+  });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await completed;
+  });
+  return {
+    pid: child.pid,
+    async report() {
+      const result = await completed;
+      assert.equal(result.code, 0, result.stderr);
+      return JSON.parse(result.stdout) as SelfUpdateReport;
+    },
+  };
+}
+
+test('a delayed reclaim contender cannot remove a replacement gate or take its lock', { timeout: 30_000 }, async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture(t);
+  const options = { stateDir, checkoutDir: checkout, homeDir: root };
+  const lock = join(stateDir, 'auto-update.lock');
+  const gate = `${lock}.reclaim`;
+  const deadGatePid = 999998;
+  mkdirSync(lock);
+  mkdirSync(gate);
+  writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 999999 }));
+  writeFileSync(join(gate, 'owner.json'), JSON.stringify({ pid: deadGatePid }));
+  const signal = (name: string) => writeFileSync(join(root, name), '');
+  const seen = (name: string) => existsSync(join(root, name));
+  const delayed = startUpdateWorker(t, options, `
+    const kill = process.kill;
+    process.kill = (pid, signal) => {
+      try {
+        return kill(pid, signal);
+      } catch (error) {
+        if (pid === ${deadGatePid}) pause('read-dead-gate', 'resume-delayed');
+        throw error;
+      }
+    };
+  `);
+  await until(() => seen('read-dead-gate'), 'contender to read the dead gate');
+  const winner = startUpdateWorker(t, options, `
+    const lock = join(options.stateDir, 'auto-update.lock');
+    const rename = fs.renameSync;
+    fs.renameSync = (source, destination) => {
+      if (destination === lock) pause('replacing-lock', 'publish-lock');
+      rename(source, destination);
+      if (destination === lock + '.reclaim') pause('claimed-gate', 'reclaim-lock');
+    };
+  `, "pause('reconciling', 'finish-reconciliation')");
+  await until(() => seen('claimed-gate'), 'winner to publish the replacement gate');
+  const files = readdirSync(gate);
+  assert.equal(files.length, 1);
+  const ownerPath = join(gate, files[0]);
+  assert.equal(JSON.parse(readFileSync(ownerPath, 'utf8')).pid, winner.pid);
+  signal('resume-delayed');
+  assert.equal((await delayed.report()).status, 'skipped_locked');
+  assert.equal(JSON.parse(readFileSync(ownerPath, 'utf8')).pid, winner.pid);
+
+  signal('reclaim-lock');
+  await until(() => seen('replacing-lock'), 'winner to stage the replacement lock');
+  assert.equal(existsSync(lock), false);
+  assert.equal(JSON.parse(readFileSync(ownerPath, 'utf8')).pid, winner.pid);
+  assert.equal((await startUpdateWorker(t, options).report()).status, 'skipped_locked');
+  signal('publish-lock');
+  await until(() => seen('reconciling'), 'winner to hold the update lock during reconciliation');
+  assert.equal(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).pid, winner.pid);
+  assert.equal((await startUpdateWorker(t, options).report()).status, 'skipped_locked');
+  signal('finish-reconciliation');
+  assert.equal((await winner.report()).status, 'complete');
+  assert.equal(existsSync(lock), false);
+  assert.equal(existsSync(gate), false);
+});
+
+test('self-updates from separate state directories serialize mutations of a shared checkout and home', { timeout: 30_000 }, async t => {
+  const { root, stateDir, checkout, writer } = updateCheckoutFixture(t, 'the-dealer');
+  const bin = join(root, '.local', 'bin');
+  mkdirSync(bin, { recursive: true });
+  const secondState = join(root, 'second-state');
+  const alias = join(root, 'checkout-alias');
+  symlinkSync(checkout, alias, 'dir');
+  writeFileSync(join(checkout, 'tracked.txt'), 'staged edit\n');
+  git(checkout, ['add', 'tracked.txt']);
+  writeFileSync(join(checkout, 'tracked.txt'), 'working edit\n');
+  writeFileSync(join(checkout, 'untracked.txt'), 'untracked edit\n');
+  const before = git(checkout, ['status', '--porcelain']);
+  writeFileSync(join(writer, 'upstream.txt'), 'upstream\n');
+  git(writer, ['add', 'upstream.txt']);
+  git(writer, ['commit', '-m', 'upstream']);
+  git(writer, ['push']);
+
+  const first = startUpdateWorker(t, { stateDir, checkoutDir: checkout, homeDir: root }, `
+    const exec = cp.execFileSync;
+    cp.execFileSync = (file, args, options) => {
+      if (file === 'git' && args[0] === 'pull') pause('first-stashed', 'allow-first-pull');
+      return exec(file, args, options);
+    };
+  `);
+  await until(() => existsSync(join(root, 'first-stashed')), 'first updater to stage its temporary stash');
+  assert.match(git(checkout, ['stash', 'list']), /dealer-self-update/);
+  const second = startUpdateWorker(t, { stateDir: secondState, checkoutDir: alias, homeDir: root }, `
+    const wait = Atomics.wait;
+    Atomics.wait = (...args) => {
+      mark('second-waiting');
+      return wait(...args);
+    };
+    const exec = cp.execFileSync;
+    cp.execFileSync = (file, args, options) => {
+      if (file === 'git' && args[0] === 'status') mark('second-entered-checkout');
+      return exec(file, args, options);
+    };
+  `);
+  const waiting = join(root, 'second-waiting');
+  const entered = join(root, 'second-entered-checkout');
+  await until(() => existsSync(waiting) || existsSync(entered), 'second updater to contend for the checkout');
+  assert.equal(existsSync(waiting), true);
+  assert.equal(existsSync(entered), false);
+  writeFileSync(join(root, 'allow-first-pull'), '');
+
+  assert.equal((await first.report()).sourceStatus, 'updated');
+  assert.equal((await second.report()).sourceStatus, 'up_to_date');
+  assert.equal(git(checkout, ['stash', 'list']), '');
+  assert.equal(git(checkout, ['status', '--porcelain']), before);
+  assert.equal(git(checkout, ['show', ':tracked.txt']), 'staged edit');
+  assert.equal(readFileSync(join(checkout, 'tracked.txt'), 'utf8'), 'working edit\n');
+  assert.equal(readFileSync(join(checkout, 'untracked.txt'), 'utf8'), 'untracked edit\n');
+  for (const name of ['dealer', 'dealerd']) {
+    assert.equal(readlinkSync(join(bin, name)), join(alias, 'bin', `${name}.js`));
+  }
 });
 
 test('self-update leaves binary links and daemon reconciliation alone when stash restoration fails', async t => {

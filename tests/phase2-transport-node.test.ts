@@ -190,7 +190,7 @@ test('peer failover restores a reachable fallback after restart and rejects stal
   const beforeStat = await stat(peersPath);
   deliverPeerCard(kernel, lastProfile);
   assert.deepEqual(registerEndpoint.mock.calls.map(call => call.arguments), [['team', lastProfile.nodeId, endpointAddr]]);
-  assert.deepEqual(updates, [{ card: lastProfile, provenance: { direct: true } }]);
+  assert.deepEqual(updates, []);
 
   reachable.delete(lastProfile.nodeId);
   assertActivePeer(replacement);
@@ -198,7 +198,7 @@ test('peer failover restores a reachable fallback after restart and rejects stal
   assert.deepEqual(node.resolveTarget('oliver@laptop', 'team'), []);
   assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), []);
   assert.equal(registerEndpoint.mock.callCount(), 1);
-  assert.equal(updates.length, 1);
+  assert.equal(updates.length, 0);
   assert.equal(await readFile(peersPath, 'utf8'), beforeHeartbeat);
   assert.equal((await stat(peersPath)).ino, beforeStat.ino);
 });

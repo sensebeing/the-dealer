@@ -1,10 +1,11 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../core-types/index.ts';
-import { appendFileDurably, tryAcquireOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
+import { appendFileDurably, tryAcquireOwnedLock, withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { isDeadProcessOwner, readProcessOwner } from '../process-lock/index.ts';
 
 export type FingerprintRecord = {
@@ -254,6 +255,22 @@ function updateCheckoutFor(options: SelfUpdateOptions): string {
     : root;
 }
 
+const UPDATE_SOURCE_LOCK_TIMEOUT_MS = 30_000;
+
+function withUpdateSourceLocks<T>(root: string, options: SelfUpdateOptions, update: () => T): T {
+  const gitCommonDir = realpathSync(resolve(root, checkoutGit(root, ['rev-parse', '--git-common-dir'])));
+  const checkoutLock = join(gitCommonDir, 'dealer-self-update.lock');
+  const home = resolve(options.homeDir ?? process.env.HOME ?? '');
+  return withOwnedLock(checkoutLock, 'Auto-update checkout', () => {
+    if (!existsSync(home)) {
+      return update();
+    }
+    // The home can itself be a worktree. Keep the installation lock outside it.
+    const homeLock = join(tmpdir(), `dealer-self-update-home-${sha256Hex(realpathSync(home))}.lock`);
+    return withOwnedLock(homeLock, 'Auto-update home', update, UPDATE_SOURCE_LOCK_TIMEOUT_MS);
+  }, UPDATE_SOURCE_LOCK_TIMEOUT_MS);
+}
+
 function syncLink(target: string, link: string, type: 'file' | 'dir'): boolean {
   const existing = lstatSync(link, { throwIfNoEntry: false });
   if (existing) {
@@ -391,80 +408,87 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
   let syncedBinaries: string[] = [];
   let stashedLocalChanges = false;
   let usableCheckout = false;
+  let runtimeFingerprint: string | undefined;
   try {
     root = updateCheckoutFor(options);
     if (existsSync(join(root, '.git'))) {
-      const git = (args: string[]) => checkoutGit(root, args);
-      const dirty = git(['status', '--porcelain']);
-      const branch = git(['branch', '--show-current']);
-      headSha = git(['rev-parse', 'HEAD']);
-      const hasConflicts = (porcelain: string) => /^(UU|AA|DD|AU|UA|DU|UD) /m.test(porcelain) ||
-        ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))));
-      if (hasConflicts(dirty)) {
-        status = 'failed';
-        sourceStatus = 'conflicted_checkout';
-        error = 'Checkout has unresolved merge or rebase state';
-      } else if (branch !== 'main') {
-        sourceStatus = 'skipped_non_main_branch';
-        usableCheckout = true;
-      } else {
-        const beforeSha = headSha;
-        const stashRef = () => {
-          try { return git(['rev-parse', '--verify', '--quiet', 'refs/stash']); }
-          catch { return ''; }
-        };
-        let savedStash: string | undefined;
-        const restore = () => {
-          if (!savedStash || stashRef() !== savedStash) throw new Error('Temporary update stash is no longer the newest stash');
-          git(['reset', '--hard', beforeSha]);
-          git(['clean', '-fd']);
-          git(['stash', 'pop', '--index']);
-        };
-        if (dirty) {
-          const stashBefore = stashRef();
-          git(['stash', 'push', '--include-untracked', '-m', 'dealer-self-update']);
-          savedStash = stashRef();
-          if (!savedStash || savedStash === stashBefore) throw new Error('Failed to preserve local changes in update stash');
-          stashedLocalChanges = true;
-        }
-        try { git(['pull', '--ff-only']); }
-        catch (pullError) {
-          if (savedStash) restore();
-          usableCheckout = !hasConflicts(git(['status', '--porcelain']));
-          throw pullError;
-        }
-        const pulledSha = git(['rev-parse', 'HEAD']);
-        let restored = true;
-        if (savedStash) {
-          try { git(['stash', 'pop', '--index']); }
-          catch {
-            restore();
-            usableCheckout = true;
-            restored = false;
+      withUpdateSourceLocks(root, options, () => {
+        try {
+          const git = (args: string[]) => checkoutGit(root, args);
+          const dirty = git(['status', '--porcelain']);
+          const branch = git(['branch', '--show-current']);
+          headSha = git(['rev-parse', 'HEAD']);
+          const hasConflicts = (porcelain: string) => /^(UU|AA|DD|AU|UA|DU|UD) /m.test(porcelain) ||
+            ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))));
+          if (hasConflicts(dirty)) {
             status = 'failed';
-            sourceStatus = 'stash_conflict_rolled_back';
-            headSha = beforeSha;
-            error = 'Local changes conflicted with upstream update; rolled back cleanly to previous HEAD';
+            sourceStatus = 'conflicted_checkout';
+            error = 'Checkout has unresolved merge or rebase state';
+          } else if (branch !== 'main') {
+            sourceStatus = 'skipped_non_main_branch';
+            usableCheckout = true;
+          } else {
+            const beforeSha = headSha;
+            const stashRef = () => {
+              try { return git(['rev-parse', '--verify', '--quiet', 'refs/stash']); }
+              catch { return ''; }
+            };
+            let savedStash: string | undefined;
+            const restore = () => {
+              if (!savedStash || stashRef() !== savedStash) throw new Error('Temporary update stash is no longer the newest stash');
+              git(['reset', '--hard', beforeSha]);
+              git(['clean', '-fd']);
+              git(['stash', 'pop', '--index']);
+            };
+            if (dirty) {
+              const stashBefore = stashRef();
+              git(['stash', 'push', '--include-untracked', '-m', 'dealer-self-update']);
+              savedStash = stashRef();
+              if (!savedStash || savedStash === stashBefore) throw new Error('Failed to preserve local changes in update stash');
+              stashedLocalChanges = true;
+            }
+            try { git(['pull', '--ff-only']); }
+            catch (pullError) {
+              if (savedStash) restore();
+              usableCheckout = !hasConflicts(git(['status', '--porcelain']));
+              throw pullError;
+            }
+            const pulledSha = git(['rev-parse', 'HEAD']);
+            let restored = true;
+            if (savedStash) {
+              try { git(['stash', 'pop', '--index']); }
+              catch {
+                restore();
+                usableCheckout = true;
+                restored = false;
+                status = 'failed';
+                sourceStatus = 'stash_conflict_rolled_back';
+                headSha = beforeSha;
+                error = 'Local changes conflicted with upstream update; rolled back cleanly to previous HEAD';
+              }
+            }
+            if (restored) {
+              usableCheckout = true;
+              sourceStatus = pulledSha === beforeSha ? 'up_to_date' : 'updated';
+              status = sourceStatus === 'updated' ? 'updated' : 'complete';
+              headSha = pulledSha;
+            }
           }
+          if (usableCheckout) {
+            syncedSkills = syncSkills(root, options);
+            syncedBinaries = syncBinaries(root, options);
+          }
+        } finally {
+          runtimeFingerprint = computeRuntimeFingerprint(options.stateDir, root);
         }
-        if (restored) {
-          usableCheckout = true;
-          sourceStatus = pulledSha === beforeSha ? 'up_to_date' : 'updated';
-          status = sourceStatus === 'updated' ? 'updated' : 'complete';
-          headSha = pulledSha;
-        }
-      }
-      if (usableCheckout) {
-        syncedSkills = syncSkills(root, options);
-        syncedBinaries = syncBinaries(root, options);
-      }
+      });
     }
   } catch (caught) {
     status = 'failed';
     sourceStatus = 'error';
     error = String(caught);
   }
-  const runtimeFingerprint = computeRuntimeFingerprint(options.stateDir, root);
+  runtimeFingerprint ??= computeRuntimeFingerprint(options.stateDir, root);
   const lastUpdatedAt = status === 'updated' ? new Date().toISOString() : previous?.lastUpdatedAt;
   const report: SelfUpdateReport = {
     status, sourceStatus, lastCheckedAt: checkedAt, runtimeFingerprint, syncedSkills, syncedBinaries,
