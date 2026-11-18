@@ -1459,7 +1459,7 @@ test('dealer send binds an Orca caller mailbox when the topic is locally bound',
   assert.equal(runtime.mailbox.getWakeTarget('worktree:prod-release'), undefined);
 });
 
-test('dealer send from a slotted Orca tab wakes that tab for the peer reply', async t => {
+test('slotted Orca replies wake the inferred tab and preserve explicit mailbox overrides', async t => {
   const root = directory(t);
   const workspacePath = join(root, 'alert-processor-prod');
   const worktreeMailbox = 'worktree:alert-processor-prod';
@@ -1485,8 +1485,9 @@ test('dealer send from a slotted Orca tab wakes that tab for the peer reply', as
     });
   }
 
-  const sent = await cli(alerts, 'send', '--network', 'team', '--to', 'member:prod',
-    '--topic', 'release.prod.v1', '--body', '{}', '--terminal-handle', 'term-2', '--workspace-path', workspacePath);
+  const callerArgs = ['--terminal-handle', 'term-2', '--workspace-path', workspacePath];
+  const peerArgs = ['--network', 'team', '--to', 'member:prod', '--topic', 'release.prod.v1', ...callerArgs];
+  const sent = await cli(alerts, 'send', ...peerArgs, '--body', '{}');
   assert.equal(sent.receipts[0].stage, 'dispatched');
   const inbound = prod.mailbox.listItemsAfterSequence(-1).find(item => item.id === sent.messageId);
   assert.equal(inbound?.envelope?.semantic?.replyMailbox, 'terminal:term-2');
@@ -1503,6 +1504,14 @@ test('dealer send from a slotted Orca tab wakes that tab for the peer reply', as
   assert.equal(alerts.mailbox.list({ mailboxId: 'terminal:term-2' }).items[0]?.id, replied.replyId);
   assert.equal(alerts.mailbox.getWakeTarget(worktreeMailbox)?.driverConfig?.terminalHandle, 'term-1');
   assert.equal(sendsTo(state.calls, 'term-1').length, 0);
+
+  for (const explicitMailbox of ['custom:coord', worktreeMailbox]) {
+    const explicitSend = await cli(alerts, 'send', ...peerArgs, '--body', '{}', '--reply-mailbox', explicitMailbox);
+    const explicitInbound = prod.mailbox.listItemsAfterSequence(-1).find(item => item.id === explicitSend.messageId);
+    assert.equal(explicitInbound?.envelope?.semantic?.replyMailbox, explicitMailbox);
+  }
+  const asked = await cli(alerts, 'ask', ...peerArgs, '--body', 'Release status?', '--mailbox', 'custom:ask');
+  assert.equal(asked.replyMailbox, 'custom:ask');
 });
 
 test('thread show fails loudly for an unknown thread', async t => {
