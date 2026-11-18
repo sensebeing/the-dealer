@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -12,11 +12,12 @@ import {
   readdirSync,
   renameSync,
   rmSync,
-  rmdirSync,
+  statSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import type { BigIntStats } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import {
   holdOwnedDirectory,
   isDeadProcessOwner,
@@ -24,6 +25,8 @@ import {
   readProcessOwner,
   releaseOwnedDirectory,
 } from '../process-lock/index.ts';
+
+import type { ProcessOwnerRecord } from '../process-lock/index.ts';
 
 const LOCK_RETRY_MS = 20;
 const LOCK_TIMEOUT_MS = 2_000;
@@ -128,18 +131,43 @@ export type NonBlockingLockResult =
   | { release?: never; locked: true; error?: never }
   | { release?: never; locked?: never; error: string };
 
-/** Stage the owner record before publishing the directory. */
-function stageOwnedDirectory(lockDir: string, ownerFile: string, owner: ReturnType<typeof processOwnerRecord>): string | undefined {
-  if (existsSync(lockDir)) {
+function lockHostKey(host: string): string {
+  return createHash('sha256').update(host).digest('base64url').slice(0, 16);
+}
+
+function makeLockArtifact(dir: string, kind: 'stage' | 'release' | 'stale', owner: ProcessOwnerRecord): string {
+  // Include provenance even while the temp directory is empty, before its owner file exists.
+  return mkdtempSync(`${dir}.${kind}.${owner.pid}.${owner.instanceId}.${lockHostKey(owner.host)}.`);
+}
+
+function moveOwnedDirectory(dir: string, kind: 'release' | 'stale'): string {
+  const artifact = makeLockArtifact(dir, kind, processOwnerRecord());
+  try {
+    renameSync(dir, artifact);
+  } catch (error) {
+    rmSync(artifact, { recursive: true, force: true });
+    throw error;
+  }
+  return artifact;
+}
+
+function sameProcessOwner(current: ProcessOwnerRecord | undefined, owner: ProcessOwnerRecord): boolean {
+  return current?.pid === owner.pid && current.instanceId === owner.instanceId && current.host === owner.host;
+}
+
+/** Stage the owner before publishing the directory. Release retires the entire directory. */
+function claimOwnedDirectory(dir: string): (() => void) | undefined {
+  if (existsSync(dir)) {
     return undefined;
   }
-  const stage = mkdtempSync(`${lockDir}.stage.`);
+  const owner = processOwnerRecord();
+  const stage = makeLockArtifact(dir, 'stage', owner);
   try {
-    writeFileAtomically(join(stage, ownerFile), JSON.stringify(owner));
-    if (existsSync(lockDir)) {
+    writeFileAtomically(join(stage, 'owner.json'), JSON.stringify(owner));
+    if (existsSync(dir)) {
       return undefined;
     }
-    renameSync(stage, lockDir);
+    renameSync(stage, dir);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'EEXIST' || code === 'ENOTEMPTY') {
@@ -149,90 +177,159 @@ function stageOwnedDirectory(lockDir: string, ownerFile: string, owner: ReturnTy
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
-  holdOwnedDirectory(lockDir);
-  return stage;
-}
-
-function claimOwnedDirectory(lockDir: string): (() => void) | undefined {
-  const owner = processOwnerRecord();
-  const stage = stageOwnedDirectory(lockDir, 'owner.json', owner);
-  if (!stage) {
-    return undefined;
-  }
+  holdOwnedDirectory(dir);
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    const current = readProcessOwner(join(lockDir, 'owner.json'));
-    releaseOwnedDirectory(lockDir);
-    if (current?.pid === owner.pid && current.instanceId === owner.instanceId && current.host === owner.host) {
-      // Remove the whole directory from the claim path before cleaning up its owner file.
-      renameSync(lockDir, stage);
-      rmSync(stage, { recursive: true, force: true });
+    const current = readProcessOwner(join(dir, 'owner.json'));
+    releaseOwnedDirectory(dir);
+    if (sameProcessOwner(current, owner)) {
+      rmSync(moveOwnedDirectory(dir, 'release'), { recursive: true, force: true });
     }
   };
 }
 
-function claimReclaimGate(gateDir: string): (() => void) | undefined {
-  const owner = processOwnerRecord();
-  const ownerFile = `owner.${owner.pid}.${owner.instanceId}.json`;
-  if (!stageOwnedDirectory(gateDir, ownerFile, owner)) {
-    return undefined;
-  }
-  return () => {
-    releaseOwnedDirectory(gateDir);
-    rmSync(join(gateDir, ownerFile), { force: true });
-    try {
-      rmdirSync(gateDir);
-    } catch {
-      // A concurrent reclaimer's owner file may now keep the directory in place.
+function ownedDirectoryStat(dir: string): BigIntStats | undefined {
+  try {
+    return statSync(dir, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return undefined;
     }
-  };
+    throw error;
+  }
+}
+
+function readOwnedDirectoryOwner(dir: string, gateDir: string): ProcessOwnerRecord | undefined {
+  const owner = readProcessOwner(join(dir, 'owner.json'));
+  if (owner || dir !== gateDir) {
+    return owner;
+  }
+  // Earlier releases used a single per-incarnation filename for reclaim gates.
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  }
+  const legacy = entries.length === 1 ? /^owner\.(\d+)\.([a-zA-Z0-9-]+)\.json$/.exec(entries[0]) : null;
+  if (legacy) {
+    const recorded = readProcessOwner(join(dir, entries[0]));
+    if (recorded?.pid === Number(legacy[1]) && recorded.instanceId === legacy[2]) {
+      return recorded;
+    }
+  }
+  return undefined;
+}
+
+/** Use an inode-scoped ticket so a stale observation cannot retire a replacement owner. */
+function replaceDeadOwnedDirectory(
+  dir: string,
+  stat: BigIntStats,
+  owner: ProcessOwnerRecord,
+  gateDir: string,
+  level = 0,
+): (() => void) | undefined {
+  const ticket = `${gateDir}.evict.${stat.ino}${level ? `.${level}` : ''}`;
+  let releaseTicket = claimOwnedDirectory(ticket);
+  if (!releaseTicket) {
+    const ticketStat = ownedDirectoryStat(ticket);
+    const ticketOwner = readOwnedDirectoryOwner(ticket, gateDir);
+    if (!ticketStat || !ticketOwner || !isDeadProcessOwner(ticketOwner, ticket)) {
+      return undefined;
+    }
+    // Recover a dead ticket under the same protocol. The level keeps ticket paths
+    // distinct even when the filesystem reuses an inode after an earlier eviction.
+    releaseTicket = replaceDeadOwnedDirectory(ticket, ticketStat, ticketOwner, gateDir, level + 1);
+    if (!releaseTicket) {
+      return undefined;
+    }
+  }
+  let reclaimed: (() => void) | undefined;
+  try {
+    try {
+      const current = readOwnedDirectoryOwner(dir, gateDir);
+      const currentStat = ownedDirectoryStat(dir);
+      if (currentStat?.ino !== stat.ino || currentStat.dev !== stat.dev ||
+          currentStat.birthtimeNs !== stat.birthtimeNs ||
+          !current || !sameProcessOwner(current, owner) || !isDeadProcessOwner(current, dir)) {
+        return undefined;
+      }
+      const stale = moveOwnedDirectory(dir, 'stale');
+      try {
+        reclaimed = claimOwnedDirectory(dir);
+      } finally {
+        rmSync(stale, { recursive: true, force: true });
+      }
+      return reclaimed;
+    } finally {
+      releaseTicket();
+    }
+  } catch (error) {
+    reclaimed?.();
+    throw error;
+  }
 }
 
 function tryAcquireReclaimGate(gateDir: string, label: string): NonBlockingLockResult {
-  const release = claimReclaimGate(gateDir);
+  const release = claimOwnedDirectory(gateDir);
   if (release) {
     return { release };
   }
-  let entries: string[];
-  try {
-    entries = readdirSync(gateDir);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { locked: true };
-    }
-    throw error;
+  const stat = ownedDirectoryStat(gateDir);
+  if (!stat) {
+    return { locked: true };
   }
-  const invalid = { error: `${label} reclaim gate ${gateDir} has no readable owner record` };
-  if (entries.length === 0) {
-    return invalid;
+  const owner = readOwnedDirectoryOwner(gateDir, gateDir);
+  if (!owner) {
+    return !existsSync(gateDir) || readOwnedDirectoryOwner(gateDir, gateDir)
+      ? { locked: true }
+      : { error: `${label} reclaim gate ${gateDir} has no readable owner record` };
   }
-  for (const entry of entries) {
-    const path = join(gateDir, entry);
-    const owner = readProcessOwner(path);
-    if (!owner) {
-      return existsSync(path) ? invalid : { locked: true };
-    }
-    if (!isDeadProcessOwner(owner, gateDir)) {
-      return { locked: true };
-    }
+  if (!isDeadProcessOwner(owner, gateDir)) {
+    return { locked: true };
   }
-  // Delete only the filenames inspected above. A replacement gate has its own filename.
-  for (const entry of entries) {
-    rmSync(join(gateDir, entry), { force: true });
-  }
-  try {
-    rmdirSync(gateDir);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTEMPTY' || code === 'EEXIST') {
-      return { locked: true };
-    }
-    throw error;
-  }
-  const reclaimed = claimReclaimGate(gateDir);
+  const reclaimed = replaceDeadOwnedDirectory(gateDir, stat, owner, gateDir);
   return reclaimed ? { release: reclaimed } : { locked: true };
+}
+
+function sweepLockArtifacts(lockDir: string, gateDir: string): void {
+  const parent = dirname(lockDir);
+  const prefix = basename(lockDir);
+  const { host } = processOwnerRecord();
+  const hostKey = lockHostKey(host);
+  for (const entry of readdirSync(parent, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) {
+      continue;
+    }
+    const suffix = entry.name.slice(prefix.length);
+    const artifact = /^(?:\.reclaim(?:\.evict\.\d+(?:\.\d+)?)?)?\.(?:stage|release|stale)\.(.*)$/.exec(suffix);
+    const path = join(parent, entry.name);
+    if (artifact) {
+      const provenance = /^([1-9]\d*)\.([a-zA-Z0-9-]+)\.([a-zA-Z0-9_-]{16})\./.exec(artifact[1]);
+      const owner = readProcessOwner(join(path, 'owner.json')) ?? (provenance ? {
+        pid: Number(provenance[1]),
+        instanceId: provenance[2],
+        host: provenance[3] === hostKey ? host : '',
+      } : undefined);
+      if (owner && isDeadProcessOwner(owner, path)) {
+        rmSync(path, { recursive: true, force: true });
+      }
+      continue;
+    }
+    const ticket = /^\.reclaim\.evict\.\d+(?:\.(\d+))?$/.exec(suffix);
+    if (ticket) {
+      const stat = ownedDirectoryStat(path);
+      const owner = readOwnedDirectoryOwner(path, gateDir);
+      if (stat && owner && isDeadProcessOwner(owner, path)) {
+        replaceDeadOwnedDirectory(path, stat, owner, gateDir, Number(ticket[1] ?? 0) + 1)?.();
+      }
+    }
+  }
 }
 
 /** Claim a directory without waiting, or recover it when its recorded owner is dead. */
@@ -269,12 +366,11 @@ export function tryAcquireOwnedLock(lockDir: string, label = 'Directory'): NonBl
         if (!isDeadProcessOwner(current, lockDir)) {
           return { locked: true };
         }
-        const stale = `${lockDir}.stale.${randomUUID()}`;
-        renameSync(lockDir, stale);
-        rmSync(stale, { recursive: true, force: true });
+        rmSync(moveOwnedDirectory(lockDir, 'stale'), { recursive: true, force: true });
       } else if (existsSync(lockDir)) {
         return readProcessOwner(ownerPath) ? { locked: true } : invalid;
       }
+      sweepLockArtifacts(lockDir, gateDir);
       reclaimed = claimOwnedDirectory(lockDir);
       return reclaimed ? { release: reclaimed } : { locked: true };
     } finally {

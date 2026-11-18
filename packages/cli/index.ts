@@ -150,6 +150,8 @@ function runtimeOptions(values: Record<string, any>, stateDir: string) {
 export interface DealerCliOptions {
   stateDir?: string;
   runtime?: DealerNodeRuntime;
+  /** Startup budget when self-update finds a live daemon without a ready listener. */
+  daemonStartupTimeoutMs?: number;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   /** Aborted when the calling control request disconnects, so long waits release listeners. */
@@ -1308,9 +1310,12 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           if (!existsSync(join(stateDir, 'control.sock')) && !liveDaemonOwner(stateDir)) return false;
           let probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
           if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
-            const ready = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint);
+            const ready = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint, options.daemonStartupTimeoutMs);
             if (ready) return false;
             probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
+            if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
+              throw new Error(`Timed out waiting for daemon in ${stateDir} to become ready`);
+            }
           }
           if (probe.state !== 'mismatch') return false;
           const restarted = await restartDaemon(stateDir, { checkoutDir });

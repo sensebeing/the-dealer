@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess, { execFileSync, spawn } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { computeRuntimeFingerprint, readDaemonFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from '../packages/cli/auto-update.ts';
 import type { SelfUpdateReport } from '../packages/cli/auto-update.ts';
 import { DealerNodeRuntime, ensureDaemonRunning, restartDaemon, rpc, runDealerCli, runDealerDaemon, stopDaemonIfRunning } from '../packages/cli/index.ts';
+import { withOwnedLock } from '../packages/fs-atomic/index.ts';
 import { holdOwnedDirectory, processOwnerRecord, releaseOwnedDirectory } from '../packages/process-lock/index.ts';
 
 const dealerBin = fileURLToPath(new URL('../bin/dealer.js', import.meta.url));
@@ -887,7 +888,8 @@ test('background auto-update bypasses cooldown for disk or live daemon drift wit
   const checkoutDir = join(root, 'checkout');
   mkdirSync(checkoutDir);
   const now = Date.now();
-  t.mock.method(Date, 'now', () => now);
+  let elapsed = 0;
+  t.mock.method(Date, 'now', () => now + elapsed);
   const current = computeRuntimeFingerprint(stateDir, checkoutDir);
   const writeStatus = (runtimeFingerprint: string, seconds: number) => writeFileSync(join(stateDir, 'auto-update.json'), JSON.stringify({
     sourceStatus: 'up_to_date', lastCheckedAt: new Date(now - seconds * 1_000).toISOString(), runtimeFingerprint,
@@ -916,7 +918,7 @@ test('background auto-update bypasses cooldown for disk or live daemon drift wit
   check();
   check();
   assert.deepEqual(calls, [stateDir]);
-  t.mock.method(Date, 'now', () => now + 30_000);
+  elapsed = 30_000;
   rmSync(join(stateDir, 'control.sock'));
   writeStatus('old-disk', 60);
   check();
@@ -1037,6 +1039,7 @@ function startUpdateWorker(
   });
   return {
     pid: child.pid,
+    completed,
     async report() {
       const result = await completed;
       assert.equal(result.code, 0, result.stderr);
@@ -1101,6 +1104,61 @@ test('a delayed reclaim contender cannot remove a replacement gate or take its l
   assert.equal(existsSync(lock), false);
   assert.equal(existsSync(gate), false);
 });
+
+for (const point of ['gate-release', 'stale-gate', 'stale-lock'] as const) {
+  test(`update locking recovers after interruption at ${point}`, async t => {
+    const { root, stateDir, checkout } = updateCheckoutFixture(t);
+    const lock = join(stateDir, 'auto-update.lock');
+    const gate = `${lock}.reclaim`;
+    const deadOwner = JSON.stringify({ pid: 999999, instanceId: 'dead-owner' });
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner.json'), deadOwner);
+    if (point === 'stale-gate') {
+      mkdirSync(gate);
+      writeFileSync(join(gate, 'owner.999999.dead-owner.json'), deadOwner);
+      const ticket = `${gate}.evict.${statSync(gate, { bigint: true }).ino}`;
+      mkdirSync(ticket);
+      writeFileSync(join(ticket, 'owner.json'), deadOwner);
+    }
+    // Use a child so the interrupted lock owner is actually dead during recovery.
+    const worker = startUpdateWorker(t, { stateDir, checkoutDir: checkout, homeDir: root }, `
+      const lock = join(options.stateDir, 'auto-update.lock');
+      const gate = lock + '.reclaim';
+      const point = ${JSON.stringify(point)};
+      const rename = fs.renameSync;
+      fs.renameSync = (source, destination) => {
+        rename(source, destination);
+        if ((point === 'gate-release' && source === gate && destination.startsWith(gate + '.release.')) ||
+            (point === 'stale-gate' && source === gate && destination.startsWith(gate + '.stale.')) ||
+            (point === 'stale-lock' && source === lock && destination.startsWith(lock + '.stale.'))) {
+          process.exit(73);
+        }
+      };
+      const rmdir = fs.rmdirSync;
+      fs.rmdirSync = path => {
+        if (path === gate && point !== 'stale-lock') process.exit(73);
+        rmdir(path);
+      };
+    `);
+    const result = await worker.completed;
+    assert.equal(result.code, 73, result.stderr || result.stdout);
+    assert.equal(existsSync(gate), point === 'stale-lock');
+    if (point === 'stale-lock') {
+      assert.equal(existsSync(lock), false);
+      assert.equal(JSON.parse(readFileSync(join(gate, 'owner.json'), 'utf8')).pid, worker.pid);
+    }
+    mkdirSync(`${gate}.stage.999999.dead-owner.abcdefghijklmnop.abc123`);
+    const liveStageName = 'auto-update.lock.stage.live';
+    const liveStage = join(stateDir, liveStageName);
+    mkdirSync(liveStage);
+    writeFileSync(join(liveStage, 'owner.json'), JSON.stringify({ pid: process.ppid }));
+    withOwnedLock(lock, 'Recovered update', () => {
+      assert.equal(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).pid, process.pid);
+    });
+    assert.deepEqual(readdirSync(stateDir).filter(name => name.startsWith('auto-update.lock')), [liveStageName]);
+    assert.equal(selfUpdate({ stateDir, checkoutDir: checkout, homeDir: root }).sourceStatus, 'up_to_date');
+  });
+}
 
 test('self-updates from separate state directories serialize mutations of a shared checkout and home', { timeout: 30_000 }, async t => {
   const { root, stateDir, checkout, writer } = updateCheckoutFixture(t, 'the-dealer');
@@ -1214,6 +1272,37 @@ test('self-update reports a daemon probe failure to the CLI and persists it', as
   const log = readFileSync(join(stateDir, 'auto-update.log'), 'utf8').trim().split('\n');
   assert.deepEqual(JSON.parse(log.at(-1)!), report);
   assert.equal(existsSync(lock), false);
+});
+
+test('self-update persists a readiness timeout for an unready live daemon owner', async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture(t);
+  const lock = join(stateDir, 'runtime.lock');
+  mkdirSync(lock);
+  writeFileSync(join(lock, 'owner.json'), JSON.stringify(processOwnerRecord()));
+  const ownedStateDir = realpathSync(stateDir);
+  holdOwnedDirectory(ownedStateDir);
+  t.after(() => releaseOwnedDirectory(ownedStateDir));
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const code = await runDealerCli(['self-update', '--checkout-dir', checkout, '--home-dir', root, '--json'], {
+    stateDir,
+    daemonStartupTimeoutMs: 40,
+    stdout: message => stdout.push(message),
+    stderr: message => stderr.push(message),
+  });
+  assert.equal(code, 1);
+  const error = `Timed out waiting for daemon in ${stateDir} to become ready`;
+  assert.deepEqual(stdout, []);
+  assert.deepEqual(stderr.map(message => JSON.parse(message)), [{ error }]);
+  const report = JSON.parse(readFileSync(join(stateDir, 'auto-update.json'), 'utf8'));
+  assert.equal(report.status, 'failed');
+  assert.equal(report.sourceStatus, 'up_to_date');
+  assert.equal(report.error, error);
+  assert.equal(report.restartedDaemon, false);
+  const log = readFileSync(join(stateDir, 'auto-update.log'), 'utf8').trim().split('\n');
+  assert.deepEqual(JSON.parse(log.at(-1)!), report);
+  assert.equal(readDaemonOwner(stateDir).pid, process.pid);
+  assert.equal(existsSync(join(stateDir, 'auto-update.lock')), false);
 });
 
 for (const scenario of ['clean-restore', 'conflict', 'pull-failed'] as const) {
