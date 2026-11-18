@@ -22,7 +22,7 @@
 
 - 运行 `dealer node up` 启动本机节点；无需 `dealer network mount`、`networkId`、`passphrase` 或任何外部 Peer。
 - 将消息发往 `member:<self>`、`skill:<local-skill>` 或本机 `ed25519:<nodeId>`。`transport` 在目标为本机且网络未挂载时，直接在进程内把帧交给同一 `transport/inbound` 处理器；已挂载时则复用本地 endpoint。
-- `node.resolveTarget` 优先返回已发现的远端节点，仅在无远端匹配时回退本机自身 `NodeCard`；`router` 将本机名片作为合法候选，`gate` 对本机签名身份放行 `approval_required`（`dnd` 仍入队，`closed` 仍拒收）。
+- `node.resolveTarget` 对身份选择器优先匹配本机，`skill:` 优先匹配远端。`router` 将本机名片作为合法候选，`gate` 对本机签名身份放行 `approval_required`（`dnd` 仍入队，`closed` 仍拒收）。
 - 项目清单中的 `defaultNetworkId` 只是其触发源在本机发送时使用的稳定作用域名称，不代表必须进行网络挂载。
 
 ### 第二步 — 跨机器 / 跨团队成员 P2P 协作（`networkId + passphrase`）
@@ -137,7 +137,7 @@ export interface Services {
 
 | 事件名称 | 派发模式 | 触发时机与插件职责 |
 | :--- | :--- | :--- |
-| `node/peer-updated` | `emit`（只读广播） | 发现新节点、节点名片（能力/负载/权限状态）变更或离线时触发 |
+| `node/peer-updated` | `emit`（只读广播） | 接受新节点名片或更高 revision 时触发 |
 | `emitter/prepare` | `waterfall`（洋葱中间件） | 消息发出前依次执行：注入发送方身份 → 打包本地文件为 Blob Ticket → 调用 `router` 解析目标节点列表 |
 | `gate/evaluate` | `bail`（短路裁决） | 收到入站消息时优先执行：按规则返回 `allow`、`queue_approval`（待确认）、`defer_dnd`（仅入队）或 `reject`；一旦非 `allow` 立即短路 |
 | `dispatcher/route` | `serial`（有序派发） | 通过 `gate` 的消息先经 `PolicyPlugin`（CAS 去重），就绪后交由匹配的 `ExecutorPlugin` 落地执行并回传 `DeliveryReceipt`；非 `rejected` / `failed` 的放行结果统一触发 `dispatcher/inbound`，驱动信箱反向路由与持久化唤醒 |
@@ -283,8 +283,9 @@ export interface NodeService {
 }
 ```
 
-- **已验证目录持久化**：配置 `peersPath` 后，每张通过 `verifyNodeCard` 的远端名片与本机每网络最后 revision 会原子写入 `peers.json`（临时文件 + `fsync` + `rename` + 父目录 `fsync`，`0600`），启动时重新逐张验签加载。这样即使队友离线，`member:` / `skill:` 选择器仍能解析出稳定目标，出站消息可进入持久化 outbox 等待重驱，而不是因为目录为空而路由失败。本机名片本身不落盘；下一张名片 revision 取 `max(持久化/已知 + 1, 当前毫秒时间)`，因此重启后的名片必然严格更新，不会被队友按旧 revision 丢弃。
-- **名片 Gossip**：`peer.card` 广播除自身名片外还携带 `knownCards`（最多 128 张已验证远端名片）。重启节点或只能经种子入网的新节点因此能在队友重新上线前拿到团队目录；接收端仍逐张验签、按 `revision` 单调更新并落盘，旧名片或伪造名片不会覆盖已有记录。临时卸载网络只清除本机名片，已验证远端目录保留。
+- **已验证目录持久化**：配置 `peersPath` 后，每个 `(networkId, nodeId)` 的最新已验签远端名片与本机每网络最后 revision 会原子写入 `peers.json`（临时文件 + `fsync` + `rename` + 父目录 `fsync`，`0600`）。启动时逐张验签，合并同一密钥的重复版本。每张存储的远端名片提供该密钥的 revision 下限，旧版本和同 revision 不同签名的名片会被拒绝。冒用本机 `(member, nodeName)` 的远端名片仍在目录中提供该密钥的 revision 下限，且不参与端点注册、路由或 Gossip。本机只持久化 revision，下一张名片取 `max(持久化/已知 + 1, 当前毫秒时间)`。
+- **名片 Gossip**：`peer.card` 广播可随自身名片携带 `knownCards`（最多 128 张），按下述规则选取各身份的活跃远端名片。接收端逐张验签并按 revision 单调更新目录，启动时从持久化名片恢复同一目录。内容相同的直连心跳只刷新传输端点。新 revision 触发 `node/peer-updated`，实际重连由 Transport 发出 `transport/peer-reachable`。卸载网络时保留已验签远端目录。
+- **节点身份更新与目标解析**：查询按网络为每个 `(member, nodeName)` 选取一张活跃远端名片。优先选可达名片，同等可达性时按更新时间、revision、`nodeId` 依次比较。可达性变化立即影响选择，所有密钥的最新已验签名片仍保留在目录中，供发现和重启后回退。身份选择器优先匹配本机，未挂载的项目范围使用只读本机名片。显式 `ed25519:` 选择器直接查询已挂载网络的密钥目录，支持按原密钥延续会话。`skill:` 优先选择远端。`member:` 匹配多台远端机器时，若有可达机器则只返回可达机器，全部离线时仍返回候选供 outbox 排队。选择器解析和本机名片读取均不写入目录，本机发布维护 `local` 与已挂载网络的名片。
 
 ---
 
@@ -578,7 +579,9 @@ executors whose registry descriptors set `interactiveAgent: true`; explicit `not
 
 ### Automatic upgrades and restart
 
-`dealer self-update` synchronizes a clean main checkout and skill links. `dealer node down` drains active work before shutdown and `dealer node restart` combines that drain with startup; a drain that cannot quiesce leaves the daemon serving and reports `stopped:false`, with `--force` as the explicit override. A shutdown targets the lock-owner incarnation and carries that identity in the control request, so a supervisor-started replacement (for example `launchd` `KeepAlive`) rejects the command and counts as the target having stopped instead of a pending drain. A daemon `runtimeFingerprint` is composed from the code, linked-project manifests/code and user plugins the process actually loaded (mutable config fields never participate), and the daemon's own watcher is the sole automatic reload owner: external changes trigger an idle-gated drain and restart only after active dispatches and control requests become idle. Ordinary CLI commands always forward to the running daemon and never restart it synchronously.
+`dealer self-update` synchronizes the main checkout and repairs skill and binary symlinks. By default an invocation from a topic worktree uses `~/the-dealer` when that checkout exists. A confirmed mismatch from the serving daemon triggers a graceful restart from a usable checkout, even when Git is already up to date. An unresolved merge, rebase, or failed restoration leaves existing links and any serving daemon in place. An owner still starting gets time to serve the control socket. If it remains live and unready after that budget, self-update records a readiness timeout and exits with an error. An offline node stays stopped. The update report records the checkout fingerprint, the links synchronized and whether a restart completed. A daemon probe or restart failure is recorded in both update files with the original source status before the update lock is released and the CLI exits with an error. The update holds an owner-backed lock for the state directory through daemon reconciliation. Separate locks for the Git common directory and installation home serialize source and symlink updates across state directories. Top-level CLI commands and daemon startup check for local drift and run `self-update` in the background. A daemon fingerprint contributes to that check when it belongs to the live lock owner. Daemon startup also schedules the six-hour upstream check. Local drift bypasses the upstream cooldown with a minimum thirty-second interval between background launches.
+
+`dealer node down` drains active work before shutdown, and `dealer node restart` combines that drain with startup. A drain that cannot quiesce leaves the daemon serving and reports `stopped:false`, with `--force` as the explicit override. A shutdown targets the lock-owner incarnation and carries that identity in the control request, so a supervisor-started replacement (for example `launchd` `KeepAlive`) rejects the command and counts as the target having stopped instead of a pending drain. The daemon's live `runtimeFingerprint` is composed from the code, linked-project manifests and code, and user plugins the process loaded. Mutable configuration values are excluded from the hash. The watcher detects external changes and triggers an idle-gated restart after active dispatches and control requests become idle.
 
 
 ### Stage 3: mailbox core and injected wakeup drivers

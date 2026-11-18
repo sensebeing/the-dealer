@@ -1,11 +1,12 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../core-types/index.ts';
-import { writeFileAtomically } from '../fs-atomic/index.ts';
-import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
+import { appendFileDurably, tryAcquireOwnedLock, withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
+import { isDeadProcessOwner, readProcessOwner } from '../process-lock/index.ts';
 
 export type FingerprintRecord = {
   pid: number;
@@ -190,137 +191,19 @@ export function readDaemonFingerprint(stateDir: string): FingerprintRecord | und
   }
 }
 
+export function liveDaemonOwner(stateDir: string) {
+  try {
+    const owner = readProcessOwner(join(stateDir, 'runtime.lock', 'owner.json'));
+    return owner && !isDeadProcessOwner(owner, stateDir) ? owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function removeDaemonFingerprint(stateDir: string, instanceId: string): void {
   const path = join(stateDir, 'runtime-fingerprint.json');
   if (readDaemonFingerprint(stateDir)?.instanceId === instanceId) {
     rmSync(path, { force: true });
-  }
-}
-
-type UpdateLockResult =
-  | { lock: string; locked?: never; error?: never }
-  | { lock?: never; locked: true; error?: never }
-  | { lock?: never; locked?: never; error: string };
-
-function claimStagedLock(stage: string, lock: string): boolean {
-  try {
-    renameSync(stage, lock);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST' || code === 'ENOTEMPTY') {
-      return false;
-    }
-    throw error;
-  }
-}
-
-/** Claim the reclaim gate with the staged-owner protocol, so it is never ownerless. */
-function claimReclaimGate(reclaim: string): boolean {
-  const stage = `${reclaim}.stage.${process.pid}`;
-  rmSync(stage, { recursive: true, force: true });
-  mkdirSync(stage, { mode: 0o700 });
-  try {
-    atomicJson(join(stage, 'owner.json'), processOwnerRecord());
-    if (existsSync(reclaim)) {
-      return false;
-    }
-    return claimStagedLock(stage, reclaim);
-  } finally {
-    rmSync(stage, { recursive: true, force: true });
-  }
-}
-
-function acquireReclaimGate(reclaim: string, stateDir: string): 'acquired' | 'busy' | 'corrupt' {
-  if (claimReclaimGate(reclaim)) {
-    return 'acquired';
-  }
-  if (!existsSync(reclaim)) {
-    return claimReclaimGate(reclaim) ? 'acquired' : 'busy';
-  }
-  const gateOwner = readProcessOwner(join(reclaim, 'owner.json'));
-  if (!gateOwner) {
-    // Never delete an ownerless gate: absence of proof is not proof of death.
-    return 'corrupt';
-  }
-  if (!isDeadProcessOwner(gateOwner, stateDir)) {
-    return 'busy';
-  }
-  // Only a gate whose recorded owner is proven dead may be discarded.
-  rmSync(join(reclaim, 'owner.json'), { force: true });
-  try {
-    rmdirSync(reclaim);
-  } catch {
-    return 'busy';
-  }
-  return claimReclaimGate(reclaim) ? 'acquired' : 'busy';
-}
-
-/**
- * Crash-recoverable claim: the owner record is staged before the rename, so a lock is
- * never observable without a provable owner. A lock whose owner is dead is reclaimed
- * through an owner-backed gate; a lock without any readable owner is surfaced as an
- * error instead of disabling updates silently.
- */
-function acquireUpdateLock(stateDir: string): UpdateLockResult {
-  const lock = join(stateDir, 'auto-update.lock');
-  const stage = `${lock}.stage.${process.pid}`;
-  const prepareStage = () => {
-    rmSync(stage, { recursive: true, force: true });
-    mkdirSync(stage, { mode: 0o700 });
-    atomicJson(join(stage, 'owner.json'), processOwnerRecord());
-  };
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  try {
-    prepareStage();
-    if (!existsSync(lock) && claimStagedLock(stage, lock)) {
-      return { lock };
-    }
-  } catch (error) {
-    rmSync(stage, { recursive: true, force: true });
-    return { error: `Unable to prepare auto-update lock: ${String(error)}` };
-  }
-  rmSync(stage, { recursive: true, force: true });
-  const owner = readProcessOwner(join(lock, 'owner.json'));
-  if (!owner) {
-    return { error: `Auto-update lock ${lock} has no readable owner record` };
-  }
-  if (!isDeadProcessOwner(owner, stateDir)) {
-    return { locked: true };
-  }
-  const reclaim = `${lock}.reclaim`;
-  const stale = `${lock}.stale.${process.pid}`;
-  let gate: 'acquired' | 'busy' | 'corrupt';
-  try {
-    gate = acquireReclaimGate(reclaim, stateDir);
-  } catch (error) {
-    return { error: `Unable to claim auto-update reclaim gate: ${String(error)}` };
-  }
-  if (gate === 'corrupt') {
-    return { error: `Auto-update reclaim gate ${reclaim} has no readable owner record` };
-  }
-  if (gate === 'busy') {
-    return { locked: true };
-  }
-  try {
-    // Re-read the owner while holding the gate: a competitor may have claimed the
-    // lock after this process failed to create it.
-    const current = readProcessOwner(join(lock, 'owner.json'));
-    if (current && !isDeadProcessOwner(current, stateDir)) {
-      return { locked: true };
-    }
-    // Move the stale lock out of the claim path before staging the replacement, so
-    // the path is never observably missing while this process holds the gate.
-    rmSync(stale, { recursive: true, force: true });
-    renameSync(lock, stale);
-    prepareStage();
-    return claimStagedLock(stage, lock) ? { lock } : { locked: true };
-  } catch (error) {
-    return { error: `Unable to reclaim auto-update lock: ${String(error)}` };
-  } finally {
-    rmSync(stale, { recursive: true, force: true });
-    rmSync(stage, { recursive: true, force: true });
-    rmSync(reclaim, { recursive: true, force: true });
   }
 }
 
@@ -331,12 +214,76 @@ export interface SelfUpdateOptions {
   geminiDir?: string;
 }
 
-export function readAutoUpdateStatus(stateDir: string): any {
+export interface SelfUpdateReport {
+  status: string;
+  sourceStatus: string;
+  lastCheckedAt: string;
+  lastUpdatedAt?: string;
+  headSha?: string;
+  runtimeFingerprint?: string;
+  syncedSkills: string[];
+  syncedBinaries: string[];
+  restartedDaemon: boolean;
+  stashedLocalChanges?: boolean;
+  error?: string;
+}
+
+export function readAutoUpdateStatus(stateDir: string): SelfUpdateReport | undefined {
   try {
     return JSON.parse(readFileSync(join(stateDir, 'auto-update.json'), 'utf8'));
   } catch {
     return undefined;
   }
+}
+
+function checkoutGit(root: string, args: string[]): string {
+  return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+function updateCheckoutFor(options: SelfUpdateOptions): string {
+  const root = dealerRootFor(options.checkoutDir);
+  if (options.checkoutDir !== undefined) {
+    return root;
+  }
+  const canonical = resolve(options.homeDir ?? process.env.HOME ?? '', 'the-dealer');
+  if (root === canonical) {
+    return root;
+  }
+  return existsSync(join(canonical, '.git')) &&
+    (!existsSync(join(root, '.git')) || checkoutGit(root, ['branch', '--show-current']) !== 'main')
+    ? canonical
+    : root;
+}
+
+const UPDATE_SOURCE_LOCK_TIMEOUT_MS = 30_000;
+
+function withUpdateSourceLocks<T>(root: string, options: SelfUpdateOptions, update: () => T): T {
+  const gitCommonDir = realpathSync(resolve(root, checkoutGit(root, ['rev-parse', '--git-common-dir'])));
+  const checkoutLock = join(gitCommonDir, 'dealer-self-update.lock');
+  const home = resolve(options.homeDir ?? process.env.HOME ?? '');
+  return withOwnedLock(checkoutLock, 'Auto-update checkout', () => {
+    if (!existsSync(home)) {
+      return update();
+    }
+    // The home can itself be a worktree. Keep the installation lock outside it.
+    const homeLock = join(tmpdir(), `dealer-self-update-home-${sha256Hex(realpathSync(home))}.lock`);
+    return withOwnedLock(homeLock, 'Auto-update home', update, UPDATE_SOURCE_LOCK_TIMEOUT_MS);
+  }, UPDATE_SOURCE_LOCK_TIMEOUT_MS);
+}
+
+function syncLink(target: string, link: string, type: 'file' | 'dir'): boolean {
+  const existing = lstatSync(link, { throwIfNoEntry: false });
+  if (existing) {
+    if (!existing.isSymbolicLink()) {
+      return false;
+    }
+    if (readlinkSync(link) === target) {
+      return true;
+    }
+    unlinkSync(link);
+  }
+  symlinkSync(target, link, type);
+  return true;
 }
 
 function syncSkills(root: string, options: SelfUpdateOptions): string[] {
@@ -359,22 +306,9 @@ function syncSkills(root: string, options: SelfUpdateOptions): string[] {
         continue;
       }
       try {
-        let existing;
-        try {
-          existing = lstatSync(link);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            throw error;
-          }
+        if (syncLink(target, link, 'dir')) {
+          synced.push(link);
         }
-        if (existing && !existing.isSymbolicLink()) {
-          continue;
-        }
-        if (existing) {
-          rmSync(link, { recursive: true, force: true });
-        }
-        symlinkSync(target, link, 'dir');
-        synced.push(link);
       } catch (error) {
         throw new Error(`Unable to sync skill link ${link}: ${String(error)}`);
       }
@@ -383,93 +317,219 @@ function syncSkills(root: string, options: SelfUpdateOptions): string[] {
   return synced;
 }
 
-export function selfUpdate(options: SelfUpdateOptions): any {
+function syncBinaries(root: string, options: SelfUpdateOptions): string[] {
+  const destination = join(options.homeDir ?? process.env.HOME ?? '', '.local', 'bin');
+  if (!existsSync(destination)) {
+    return [];
+  }
+  const synced: string[] = [];
+  for (const name of ['dealer', 'dealerd']) {
+    const link = join(destination, name);
+    if (syncLink(join(root, 'bin', `${name}.js`), link, 'file')) {
+      synced.push(link);
+    }
+  }
+  return synced;
+}
+
+function persistUpdateReport(stateDir: string, report: SelfUpdateReport): void {
+  atomicJson(join(stateDir, 'auto-update.json'), report);
+  appendFileDurably(join(stateDir, 'auto-update.log'), `${JSON.stringify(report)}\n`);
+}
+
+type ReconcileDaemon = (runtimeFingerprint: string, checkoutDir: string) => Promise<boolean>;
+
+async function reconcileUpdateReport(
+  stateDir: string,
+  report: SelfUpdateReport,
+  reconcile: () => Promise<boolean>,
+): Promise<SelfUpdateReport> {
+  let restarted: boolean;
+  try {
+    restarted = await reconcile();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    report.status = 'failed';
+    report.error = report.error ? `${report.error}; ${message}` : message;
+    persistUpdateReport(stateDir, report);
+    throw error;
+  }
+  if (restarted) {
+    report.restartedDaemon = true;
+    report.lastUpdatedAt = new Date().toISOString();
+    persistUpdateReport(stateDir, report);
+  }
+  return report;
+}
+
+export function selfUpdate(options: SelfUpdateOptions): SelfUpdateReport;
+export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon: ReconcileDaemon): Promise<SelfUpdateReport>;
+export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon?: ReconcileDaemon): SelfUpdateReport | Promise<SelfUpdateReport> {
   const checkedAt = new Date().toISOString();
-  const acquired = acquireUpdateLock(options.stateDir);
-  if (acquired.error) {
-    return { status: 'failed', sourceStatus: 'corrupt_lock', lastCheckedAt: checkedAt, syncedSkills: [], restartedDaemon: false, error: acquired.error };
+  const acquired = tryAcquireOwnedLock(join(options.stateDir, 'auto-update.lock'), 'Auto-update');
+  const { release } = acquired;
+  if (!release) {
+    const report: SelfUpdateReport = {
+      status: acquired.error ? 'failed' : 'skipped_locked',
+      sourceStatus: acquired.error ? 'corrupt_lock' : 'skipped_locked',
+      lastCheckedAt: checkedAt,
+      syncedSkills: [],
+      syncedBinaries: [],
+      restartedDaemon: false,
+      ...(acquired.error ? { error: acquired.error } : {}),
+    };
+    return reconcileDaemon ? Promise.resolve(report) : report;
   }
-  if (!acquired.lock) {
-    return { status: 'skipped_locked', sourceStatus: 'skipped_locked', lastCheckedAt: checkedAt, syncedSkills: [], restartedDaemon: false };
+  try {
+    const { report, root, runtimeFingerprint, usableCheckout } = updateCheckout(options, checkedAt);
+    persistUpdateReport(options.stateDir, report);
+    if (reconcileDaemon && usableCheckout) {
+      // Keep the update lock through the drain and report write so another updater cannot
+      // claim the same restart or replace its report while the restart is still in flight.
+      return reconcileUpdateReport(options.stateDir, report, () => reconcileDaemon(runtimeFingerprint, root))
+        .finally(release);
+    }
+    release();
+    return reconcileDaemon ? Promise.resolve(report) : report;
+  } catch (error) {
+    release();
+    throw error;
   }
-  const lock = acquired.lock;
-  const previous = readAutoUpdateStatus(options.stateDir) ?? {};
+}
+
+function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
+  const previous = readAutoUpdateStatus(options.stateDir);
+  let root = dealerRootFor(options.checkoutDir);
   let status = 'skipped';
   let sourceStatus = 'missing_checkout';
   let headSha: string | undefined;
   let error: string | undefined;
   let syncedSkills: string[] = [];
+  let syncedBinaries: string[] = [];
   let stashedLocalChanges = false;
+  let usableCheckout = false;
+  let runtimeFingerprint: string | undefined;
   try {
-    const root = options.checkoutDir ?? (existsSync(join(dealerRootFor(), '.git')) ? dealerRootFor() : join(options.homeDir ?? process.env.HOME ?? '', 'the-dealer'));
+    root = updateCheckoutFor(options);
     if (existsSync(join(root, '.git'))) {
-      const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-      const dirty = git(['status', '--porcelain']);
-      const branch = git(['branch', '--show-current']);
-      headSha = git(['rev-parse', 'HEAD']);
-      if (branch !== 'main') {
-        sourceStatus = 'skipped_non_main_branch';
-      } else if (/^(UU|AA|DD|AU|UA|DU|UD) /m.test(dirty) || ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))))) {
-        status = 'failed';
-        sourceStatus = 'conflicted_checkout';
-        error = 'Checkout has unresolved merge or rebase state';
-      } else {
-        const beforeSha = headSha;
-        const stashRef = () => {
-          try { return git(['rev-parse', '--verify', '--quiet', 'refs/stash']); }
-          catch { return ''; }
-        };
-        let savedStash: string | undefined;
-        const restore = () => {
-          if (!savedStash || stashRef() !== savedStash) throw new Error('Temporary update stash is no longer the newest stash');
-          git(['reset', '--hard', beforeSha]);
-          git(['clean', '-fd']);
-          git(['stash', 'pop', '--index']);
-        };
-        if (dirty) {
-          const stashBefore = stashRef();
-          git(['stash', 'push', '--include-untracked', '-m', 'dealer-self-update']);
-          savedStash = stashRef();
-          if (!savedStash || savedStash === stashBefore) throw new Error('Failed to preserve local changes in update stash');
-          stashedLocalChanges = true;
-        }
-        try { git(['pull', '--ff-only']); }
-        catch (pullError) {
-          if (savedStash) restore();
-          throw pullError;
-        }
-        const pulledSha = git(['rev-parse', 'HEAD']);
-        let restored = true;
-        if (savedStash) {
-          try { git(['stash', 'pop', '--index']); }
-          catch {
-            restore();
-            restored = false;
+      withUpdateSourceLocks(root, options, () => {
+        try {
+          const git = (args: string[]) => checkoutGit(root, args);
+          const dirty = git(['status', '--porcelain']);
+          const branch = git(['branch', '--show-current']);
+          headSha = git(['rev-parse', 'HEAD']);
+          const hasConflicts = (porcelain: string) => /^(UU|AA|DD|AU|UA|DU|UD) /m.test(porcelain) ||
+            ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))));
+          if (hasConflicts(dirty)) {
             status = 'failed';
-            sourceStatus = 'stash_conflict_rolled_back';
-            headSha = beforeSha;
-            error = 'Local changes conflicted with upstream update; rolled back cleanly to previous HEAD';
+            sourceStatus = 'conflicted_checkout';
+            error = 'Checkout has unresolved merge or rebase state';
+          } else if (branch !== 'main') {
+            sourceStatus = 'skipped_non_main_branch';
+            usableCheckout = true;
+          } else {
+            const beforeSha = headSha;
+            const stashRef = () => {
+              try { return git(['rev-parse', '--verify', '--quiet', 'refs/stash']); }
+              catch { return ''; }
+            };
+            let savedStash: string | undefined;
+            const restore = () => {
+              if (!savedStash || stashRef() !== savedStash) throw new Error('Temporary update stash is no longer the newest stash');
+              git(['reset', '--hard', beforeSha]);
+              git(['clean', '-fd']);
+              git(['stash', 'pop', '--index']);
+            };
+            if (dirty) {
+              const stashBefore = stashRef();
+              git(['stash', 'push', '--include-untracked', '-m', 'dealer-self-update']);
+              savedStash = stashRef();
+              if (!savedStash || savedStash === stashBefore) throw new Error('Failed to preserve local changes in update stash');
+              stashedLocalChanges = true;
+            }
+            try { git(['pull', '--ff-only']); }
+            catch (pullError) {
+              if (savedStash) restore();
+              usableCheckout = !hasConflicts(git(['status', '--porcelain']));
+              throw pullError;
+            }
+            const pulledSha = git(['rev-parse', 'HEAD']);
+            let restored = true;
+            if (savedStash) {
+              try { git(['stash', 'pop', '--index']); }
+              catch {
+                restore();
+                usableCheckout = true;
+                restored = false;
+                status = 'failed';
+                sourceStatus = 'stash_conflict_rolled_back';
+                headSha = beforeSha;
+                error = 'Local changes conflicted with upstream update; rolled back cleanly to previous HEAD';
+              }
+            }
+            if (restored) {
+              usableCheckout = true;
+              sourceStatus = pulledSha === beforeSha ? 'up_to_date' : 'updated';
+              status = sourceStatus === 'updated' ? 'updated' : 'complete';
+              headSha = pulledSha;
+            }
           }
+          if (usableCheckout) {
+            syncedSkills = syncSkills(root, options);
+            syncedBinaries = syncBinaries(root, options);
+          }
+        } finally {
+          runtimeFingerprint = computeRuntimeFingerprint(options.stateDir, root);
         }
-        if (restored) {
-          sourceStatus = pulledSha === beforeSha ? 'up_to_date' : 'updated';
-          status = sourceStatus === 'updated' ? 'updated' : 'complete';
-          headSha = pulledSha;
-        }
-      }
-      syncedSkills = syncSkills(root, options);
+      });
     }
   } catch (caught) {
     status = 'failed';
     sourceStatus = 'error';
     error = String(caught);
   }
-  const { error: _previousError, stashedLocalChanges: _previousStash, ...restPrevious } = previous;
-  const report = { ...restPrevious, lastCheckedAt: checkedAt, ...(status === 'updated' ? { lastUpdatedAt: new Date().toISOString() } : {}), status, sourceStatus, ...(stashedLocalChanges ? { stashedLocalChanges: true } : {}), ...(headSha ? { headSha } : {}), syncedSkills, restartedDaemon: false, ...(error ? { error } : {}) };
-  atomicJson(join(options.stateDir, 'auto-update.json'), report);
-  writeFileSync(join(options.stateDir, 'auto-update.log'), `${JSON.stringify(report)}\n`, { flag: 'a', mode: 0o600 });
-  rmSync(lock, { recursive: true, force: true });
-  return report;
+  runtimeFingerprint ??= computeRuntimeFingerprint(options.stateDir, root);
+  const lastUpdatedAt = status === 'updated' ? new Date().toISOString() : previous?.lastUpdatedAt;
+  const report: SelfUpdateReport = {
+    status, sourceStatus, lastCheckedAt: checkedAt, runtimeFingerprint, syncedSkills, syncedBinaries,
+    restartedDaemon: false,
+    ...(lastUpdatedAt ? { lastUpdatedAt } : {}),
+    ...(stashedLocalChanges ? { stashedLocalChanges: true } : {}),
+    ...(headSha ? { headSha } : {}),
+    ...(error ? { error } : {}),
+  };
+  return { report, root, runtimeFingerprint, usableCheckout };
+}
+
+const MIN_UPDATE_SPAWN_INTERVAL_MS = 30_000;
+
+function lastCheckedAt(report?: SelfUpdateReport): number {
+  return report?.lastCheckedAt ? Date.parse(report.lastCheckedAt) : 0;
+}
+
+function reserveBackgroundUpdate(stateDir: string): boolean {
+  const acquired = tryAcquireOwnedLock(join(stateDir, 'auto-update.lock'), 'Auto-update');
+  if (acquired.error) {
+    throw new Error(acquired.error);
+  }
+  if (!acquired.release) {
+    return false;
+  }
+  try {
+    const triggerPath = join(stateDir, 'auto-update-spawn.json');
+    const lastSpawn = existsSync(triggerPath) ? Number(readFileSync(triggerPath, 'utf8')) : 0;
+    const last = Math.max(lastCheckedAt(readAutoUpdateStatus(stateDir)) || 0, lastSpawn || 0);
+    const now = Date.now();
+    if (last && now - last < MIN_UPDATE_SPAWN_INTERVAL_MS) {
+      return false;
+    }
+    // Record the claim before spawning, since the child may not have written its report
+    // by the time another command or the daemon's startup makes the same check.
+    atomicJson(triggerPath, now);
+    return true;
+  } finally {
+    acquired.release();
+  }
 }
 
 export function maybeTriggerBackgroundAutoUpdate(options: SelfUpdateOptions): void {
@@ -480,15 +540,34 @@ export function maybeTriggerBackgroundAutoUpdate(options: SelfUpdateOptions): vo
     return;
   }
   const state = readAutoUpdateStatus(options.stateDir);
-  const last = state?.lastCheckedAt ? Date.parse(state.lastCheckedAt) : 0;
+  const last = lastCheckedAt(state);
   const now = Date.now();
-  const cooldownMs = state?.sourceStatus === 'error' ? 15 * 60_000 : 6 * 3600_000;
-  if (last && now - last < cooldownMs) {
+  if (last && now - last < MIN_UPDATE_SPAWN_INTERVAL_MS) {
     return;
   }
-  // Local file changes are restarted exclusively by runDealerDaemon's idle-gated fs.watch;
-  // this background check refreshes upstream code, retrying transient errors sooner.
+  const currentFingerprint = computeRuntimeFingerprint(options.stateDir, updateCheckoutFor(options));
+  const daemonOwner = existsSync(join(options.stateDir, 'control.sock')) ? liveDaemonOwner(options.stateDir) : undefined;
+  const daemonRecord = daemonOwner ? readDaemonFingerprint(options.stateDir) : undefined;
+  const daemonFingerprint = daemonOwner && daemonRecord?.pid === daemonOwner.pid && daemonRecord.instanceId === daemonOwner.instanceId
+    ? daemonRecord.fingerprint
+    : undefined;
+  const localSyncNeeded = state?.runtimeFingerprint !== currentFingerprint ||
+    (daemonFingerprint !== undefined && daemonFingerprint !== currentFingerprint);
+  const cooldownMs = state?.sourceStatus === 'error' ? 15 * 60_000 : 6 * 3600_000;
+  if (!localSyncNeeded && last && now - last < cooldownMs) {
+    return;
+  }
+  if (!reserveBackgroundUpdate(options.stateDir)) {
+    return;
+  }
   const bin = fileURLToPath(new URL('../../bin/dealer.js', import.meta.url));
-  const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, 'self-update', '--quiet', '--json'], { detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: options.stateDir } });
+  const args = ['--no-warnings', '--experimental-strip-types', bin, 'self-update', '--quiet', '--json'];
+  if (options.checkoutDir !== undefined) args.push('--checkout-dir', options.checkoutDir);
+  if (options.homeDir !== undefined) args.push('--home-dir', options.homeDir);
+  if (options.geminiDir !== undefined) args.push('--gemini-dir', options.geminiDir);
+  const child = spawn(process.execPath, args, {
+    detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: options.stateDir },
+  });
+  child.on('error', error => console.error(`Unable to start background self-update: ${error.message}`));
   child.unref();
 }

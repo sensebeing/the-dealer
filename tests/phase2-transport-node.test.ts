@@ -8,8 +8,8 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createConnection, createServer, Socket } from 'node:net';
 import { Kernel } from '../packages/kernel/index.ts';
-import { generateNodeKeyPair, deriveNetworkKeys, sealNetworkFrame, DeliveryTimeoutError, LocalDeliveryError } from '../packages/core-types/index.ts';
-import type { InboundFrameEvent } from '../packages/core-types/index.ts';
+import { generateNodeKeyPair, deriveNetworkKeys, sealNetworkFrame, signNodeCard, DeliveryTimeoutError, LocalDeliveryError } from '../packages/core-types/index.ts';
+import type { InboundFrameEvent, NodeCard } from '../packages/core-types/index.ts';
 import { createTransportPlugin, P2PTransportService, blake3 } from '../packages/transport/index.ts';
 import { createNodePlugin, PeerDirectoryService } from '../packages/node/index.ts';
 
@@ -51,6 +51,246 @@ test('real mesh discovers signed cards and resolves scoped targets', async t => 
   await until(() => ns[1].resolveTarget('ben.xu@mbp')[0]?.admissionMode === 'closed');
   await ts[0].broadcast('sensebeing', 'peer.card', encode({type:'peer.card',card:current}));
   assert.equal(ns[1].resolveTarget('ben.xu@mbp')[0].admissionMode, 'closed');
+});
+
+function card(member: string, nodeName: string, updates: Partial<NodeCard> = {}, keys = generateNodeKeyPair()): NodeCard {
+  return signNodeCard({
+    nodeId: keys.nodeId,
+    networkId: 'team',
+    identity: { member, nodeName },
+    revision: 1,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    capabilities: { summary: '', skills: [{ id: 'release', description: '' }] },
+    runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+    admissionMode: 'open',
+    ...updates,
+  }, keys.privateKeyPem);
+}
+
+function deliverPeerCard(kernel: Kernel, card: NodeCard): void {
+  kernel.ctx.emit('transport/inbound', {
+    networkId: card.networkId, senderNodeId: card.nodeId, mode: 'unicast',
+    payload: { type: 'peer.card', card },
+  });
+}
+
+test('peer routing prefers self and reachable teammates while retaining verified cards by node ID', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-routing-'));
+  const peersPath = join(dir, 'peers.json');
+  const local = generateNodeKeyPair();
+  const oldGhost = card('ben', 'ben', { updatedAt: '2025-01-01T00:00:00.000Z' });
+  const newGhost = card('ben', 'ben');
+  const duplicateSelf = card('ben', 'local');
+  const older = card('oliver', 'desktop', { revision: 10 });
+  const newer = card('oliver', 'desktop', { updatedAt: '2026-01-02T00:00:00.000Z' });
+  const oldest = card('oliver', 'desktop', { updatedAt: '2025-01-01T00:00:00.000Z' });
+  const otherMachine = card('oliver', 'laptop');
+  const otherNetwork = card('oliver', 'desktop', { networkId: 'other-team' });
+  await writeFile(peersPath, JSON.stringify({
+    schema: 'the-dealer-peer-directory/v1',
+    cards: [oldGhost, newGhost, duplicateSelf, older, newer, oldest, otherMachine, otherNetwork],
+  }));
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+    { plugin: createNodePlugin({
+      keyPair: local, member: 'ben', nodeName: 'local', peersPath,
+      capabilities: { summary: '', skills: [{ id: 'release', description: '' }] },
+    }) },
+  ]);
+  t.after(async () => { await kernel.stop(); await rm(dir, { recursive: true, force: true }); });
+  await kernel.start();
+  const persistedIds = async () => new Set<string>(
+    JSON.parse(await readFile(peersPath, 'utf8')).cards.map((entry: NodeCard) => entry.nodeId),
+  );
+  const verified = [oldGhost, newGhost, duplicateSelf, older, newer, oldest, otherMachine, otherNetwork];
+  assert.deepEqual(await persistedIds(), new Set(verified.map(entry => entry.nodeId)));
+  const transport: P2PTransportService = kernel.ctx.services.transport;
+  const node: PeerDirectoryService = kernel.ctx.services.node;
+  await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
+  const self = node.getSelfCard('team');
+  for (const selector of ['member:ben', 'team/member:ben', 'ben@local', local.nodeId]) {
+    assert.deepEqual(node.resolveTarget(selector, 'team'), [self], selector);
+  }
+  assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [newGhost]);
+  assert.ok(node.resolveTarget('skill:release', 'team').every(entry => entry.nodeId !== local.nodeId));
+  assert.deepEqual(node.resolveTarget('member:oliver', 'team'), [newer, otherMachine]);
+  const reachable = new Set([otherMachine.nodeId]);
+  t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) => networkId === 'team' && reachable.has(nodeId));
+  assert.deepEqual(node.resolveTarget('member:oliver', 'team'), [otherMachine]);
+  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [newer]);
+
+  const replacement = card('oliver', 'desktop', { updatedAt: newer.updatedAt, revision: newer.revision + 1 });
+  reachable.add(newGhost.nodeId);
+  const claimant = card('ben', 'ben', { updatedAt: '2026-01-03T00:00:00.000Z' });
+  for (const incoming of [replacement, newer, duplicateSelf, claimant]) {
+    deliverPeerCard(kernel, incoming);
+  }
+  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
+  assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [newGhost]);
+  const stored = new Set([...verified, claimant, replacement].map(entry => entry.nodeId));
+  assert.deepEqual(await persistedIds(), stored);
+
+  reachable.add(claimant.nodeId);
+  deliverPeerCard(kernel, claimant);
+  assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [claimant]);
+  assert.deepEqual(await persistedIds(), stored);
+});
+
+test('peer failover restores a reachable fallback after restart and rejects stale or equivocated revisions', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-revisions-'));
+  const peersPath = join(dir, 'peers.json');
+  const local = generateNodeKeyPair();
+  const retired = generateNodeKeyPair();
+  const alternative = generateNodeKeyPair();
+  const oldProfile = card('oliver', 'laptop', {}, retired);
+  const endpointAddr = '127.0.0.1:45678';
+  const lastProfile = card('oliver', 'desktop', { revision: 10, endpointAddr }, retired);
+  const replacement = card('oliver', 'desktop', { updatedAt: '2026-01-02T00:00:00.000Z' });
+  const olderAlternative = card('oliver', 'desktop', { revision: 12 }, alternative);
+  const equivocation = card('oliver', 'tablet', { revision: olderAlternative.revision, endpointAddr }, alternative);
+  await writeFile(peersPath, JSON.stringify({ schema: 'the-dealer-peer-directory/v1', cards: [oldProfile, lastProfile] }));
+  const kernels: Kernel[] = [];
+  const reachable = new Set([lastProfile.nodeId]);
+  t.after(async () => { await Promise.all(kernels.map(kernel => kernel.stop())); await rm(dir, { recursive: true, force: true }); });
+  async function openDirectory() {
+    const kernel = new Kernel([
+      { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+      { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local', peersPath }) },
+    ]);
+    kernels.push(kernel);
+    await kernel.start();
+    const transport: P2PTransportService = kernel.ctx.services.transport;
+    await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
+    t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) => networkId === 'team' && reachable.has(nodeId));
+    const registerEndpoint = t.mock.method(transport, 'registerPeerEndpoint', () => {});
+    return { kernel, node: kernel.ctx.services.node as PeerDirectoryService, registerEndpoint };
+  }
+
+  const initial = await openDirectory();
+  for (const card of [replacement, olderAlternative]) deliverPeerCard(initial.kernel, card);
+  assert.deepEqual(initial.node.resolveTarget('oliver@desktop', 'team'), [lastProfile]);
+  const snapshot = JSON.parse(await readFile(peersPath, 'utf8'));
+  assert.deepEqual(new Set(snapshot.cards), new Set([lastProfile, replacement, olderAlternative]));
+  await initial.kernel.stop();
+
+  const { kernel, node, registerEndpoint } = await openDirectory();
+  const assertActivePeer = (active: NodeCard) => {
+    assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [active]);
+    assert.deepEqual(node.resolveTarget('member:oliver', 'team'), [active]);
+    assert.deepEqual(node.listPeers({ networkId: 'team' }), [active]);
+    assert.deepEqual(node.resolveTarget(lastProfile.nodeId, 'team'), [lastProfile]);
+    assert.deepEqual(node.resolveTarget(replacement.nodeId, 'team'), [replacement]);
+    assert.deepEqual(node.resolveTarget(replacement.nodeId, 'another-team'), []);
+  };
+  assertActivePeer(lastProfile);
+
+  const updates: unknown[] = [];
+  kernel.ctx.on('node/peer-updated', (card, provenance) => { updates.push({ card, provenance }); });
+  const beforeHeartbeat = await readFile(peersPath, 'utf8');
+  const beforeStat = await stat(peersPath);
+  deliverPeerCard(kernel, lastProfile);
+  assert.deepEqual(registerEndpoint.mock.calls.map(call => call.arguments), [['team', lastProfile.nodeId, endpointAddr]]);
+  assert.deepEqual(updates, []);
+
+  reachable.delete(lastProfile.nodeId);
+  assertActivePeer(replacement);
+  for (const replay of [oldProfile, equivocation]) deliverPeerCard(kernel, replay);
+  assert.deepEqual(node.resolveTarget('oliver@laptop', 'team'), []);
+  assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), []);
+  assert.equal(registerEndpoint.mock.callCount(), 1);
+  assert.equal(updates.length, 0);
+  assert.equal(await readFile(peersPath, 'utf8'), beforeHeartbeat);
+  assert.equal((await stat(peersPath)).ino, beforeStat.ino);
+});
+
+test('a peer claiming the local identity retains its revision across restart', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-local-identity-'));
+  const peersPath = join(dir, 'peers.json');
+  const local = generateNodeKeyPair();
+  const remote = generateNodeKeyPair();
+  const earlier = card('oliver', 'desktop', { revision: 10 }, remote);
+  const localClaim = card('ben', 'local', { revision: 11, endpointAddr: '127.0.0.1:45678' }, remote);
+  const kernels: Kernel[] = [];
+  t.after(async () => {
+    await Promise.all(kernels.map(kernel => kernel.stop()));
+    await rm(dir, { recursive: true, force: true });
+  });
+  for (const restarting of [false, true]) {
+    const kernel = new Kernel([
+      { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+      { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local', peersPath }) },
+    ]);
+    kernels.push(kernel);
+    await kernel.start();
+    const transport: P2PTransportService = kernel.ctx.services.transport;
+    const node: PeerDirectoryService = kernel.ctx.services.node;
+    await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
+    if (!restarting) {
+      deliverPeerCard(kernel, earlier);
+      assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [earlier]);
+    }
+    const register = t.mock.method(transport, 'registerPeerEndpoint', () => {});
+    const updated = t.mock.fn();
+    kernel.ctx.on('node/peer-updated', updated);
+    if (!restarting) {
+      deliverPeerCard(kernel, localClaim);
+    }
+    assert.deepEqual(node.resolveTarget(remote.nodeId, 'team'), []);
+    deliverPeerCard(kernel, earlier);
+    assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), []);
+    assert.deepEqual(node.resolveTarget('skill:release', 'team'), []);
+    assert.deepEqual(node.resolveTarget(remote.nodeId, 'team'), []);
+    assert.deepEqual(node.listPeers({ networkId: 'team' }), []);
+    assert.equal(register.mock.callCount(), 0);
+    assert.equal(updated.mock.callCount(), 0);
+    assert.deepEqual(JSON.parse(await readFile(peersPath, 'utf8')).cards, [localClaim]);
+    await kernel.stop();
+  }
+});
+
+test('selector and self card reads leave the peer store unchanged across a heartbeat', { timeout: 10_000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-reads-'));
+  const peersPath = join(dir, 'peers.json');
+  const local = generateNodeKeyPair();
+  const remote = card('oliver', 'desktop');
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+    { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local', peersPath, exchangeIntervalMs: 30 }) },
+  ]);
+  t.after(async () => { await kernel.stop(); await rm(dir, { recursive: true, force: true }); });
+  await kernel.start();
+  const transport: P2PTransportService = kernel.ctx.services.transport;
+  const node: PeerDirectoryService = kernel.ctx.services.node;
+  await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
+  assert.deepEqual(transport.listMountedNetworks(), ['team']);
+  deliverPeerCard(kernel, remote);
+  const before = await readFile(peersPath, 'utf8');
+  const beforeStat = await stat(peersPath);
+  assert.deepEqual(node.resolveTarget(remote.nodeId), [remote]);
+
+  await new Promise<void>(resolve => {
+    const broadcast = transport.broadcast.bind(transport);
+    t.mock.method(transport, 'broadcast', async (...args: Parameters<typeof broadcast>) => {
+      const result = await broadcast(...args);
+      resolve();
+      return result;
+    });
+  });
+
+  assert.deepEqual(node.resolveTarget(remote.nodeId), [remote]);
+  assert.equal(node.resolveTarget('member:ben')[0]?.networkId, 'local');
+  const projected = node.getSelfCard('unmounted');
+  assert.equal(projected.networkId, 'unmounted');
+  assert.deepEqual(node.resolveTarget('unmounted/member:ben'), [projected]);
+  for (const selector of ['member:ben', 'ben@local', local.nodeId]) {
+    assert.deepEqual(node.resolveTarget(selector, 'unmounted'), [projected], selector);
+  }
+  const after = await readFile(peersPath, 'utf8');
+  const localRevision = JSON.parse(before).selfRevisions.local;
+  assert.equal(typeof localRevision, 'number');
+  assert.equal(JSON.parse(after).selfRevisions.local, localRevision);
+  assert.equal(after, before);
+  assert.equal((await stat(peersPath)).ino, beforeStat.ino);
 });
 
 test('wrong passphrase, forged cards, replay and other networks are isolated', async t => {

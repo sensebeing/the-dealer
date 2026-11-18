@@ -25,8 +25,9 @@ import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
 import { OutboxRedriveService, OutboxStore } from '../packages/mailbox/outbox.ts';
 import { MailboxStore } from '../packages/mailbox/store.ts';
+import { createNodePlugin } from '../packages/node/index.ts';
 import { createPollWatermarkSourcePlugin } from '../packages/plugins-source/index.ts';
-import { P2PTransportService, blake3 } from '../packages/transport/index.ts';
+import { P2PTransportService, blake3, createTransportPlugin } from '../packages/transport/index.ts';
 import type { TransportPluginOptions } from '../packages/transport/index.ts';
 import type { RuntimeConfig } from '../packages/cli/config.ts';
 import {
@@ -2172,6 +2173,68 @@ test('peer pulse redrive is scoped to the direct target and gossip cannot reset 
   await new Promise(resolve => setTimeout(resolve, 150));
   assert.deepEqual(calls, [itemA.id], 'identity gossip never advances a retry clock');
   assert.equal(outbox.get(itemB.id)?.status, 'queued');
+});
+
+test('an unchanged direct peer card refreshes the endpoint while preserving outbox backoff', async t => {
+  const dir = directory(t);
+  const local = generateNodeKeyPair();
+  const peer = generateNodeKeyPair();
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir, multicast: false }) },
+    { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local' }) },
+  ]);
+  t.after(() => kernel.stop());
+  await kernel.start();
+  const transport: P2PTransportService = kernel.ctx.services.transport;
+  await transport.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const endpointAddr = '127.0.0.1:45678';
+  const card = {
+    nodeId: peer.nodeId, networkId: NETWORK, identity: { member: 'oliver', nodeName: 'laptop' },
+    capabilities: { summary: '', skills: [] },
+    runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+    admissionMode: 'open', endpointAddr, updatedAt: new Date().toISOString(),
+  } as const;
+  const first = signNodeCard({ ...card, revision: 1 }, peer.privateKeyPem);
+  const deliverCard = (card: NodeCard) => kernel.ctx.emit('transport/inbound', {
+    networkId: NETWORK, senderNodeId: peer.nodeId, mode: 'unicast', payload: { type: 'peer.card', card },
+  });
+  deliverCard(first);
+
+  const outbox = new OutboxStore(join(dir, 'outbox.json'), join(dir, 'outbox-blobs'));
+  const item = outbox.enqueue({
+    envelope: envelopeFor(local, NETWORK, peer.nodeId),
+    explicitTargets: [peer.nodeId],
+    pendingNodeIds: [peer.nodeId],
+  });
+  const nextAttemptAt = new Date(Date.now() + 60_000).toISOString();
+  outbox.recordAttempt(item.id, { nextAttemptAt });
+  const service = new OutboxRedriveService({
+    outbox,
+    intervalMs: 60_000,
+    events: { on: (event, listener) => kernel.ctx.on(event, listener) },
+    deliver: async candidate => ({
+      deliveredReceipts: {
+        [peer.nodeId]: {
+          messageId: candidate.envelope.id, networkId: NETWORK, fromNodeId: peer.nodeId,
+          stage: 'dispatched', updatedAt: new Date().toISOString(), signature: 'test-signature',
+        },
+      },
+      pendingNodeIds: [],
+    }),
+  });
+  service.start();
+  t.after(() => service.stop());
+
+  transport.registerPeerEndpoint(NETWORK, peer.nodeId, '127.0.0.1:45679');
+  deliverCard(first);
+  assert.equal(transport.listPeerEndpoints(NETWORK).get(peer.nodeId), endpointAddr);
+  await service.flush(); // The regular flush follows any event-driven flush in the same queue.
+  assert.equal(outbox.get(item.id)?.status, 'queued');
+  assert.equal(outbox.get(item.id)?.nextAttemptAt, nextAttemptAt);
+
+  deliverCard(signNodeCard({ ...card, revision: 2 }, peer.privateKeyPem));
+  await service.flush();
+  assert.equal(outbox.get(item.id)?.status, 'delivered');
 });
 
 test('self card revisions advance across a restart and peers accept them', async t => {

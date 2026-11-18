@@ -43,7 +43,6 @@ import {
   userPluginFingerprintEntries,
   writeDaemonFingerprint,
   removeDaemonFingerprint,
-  readDaemonFingerprint,
   readAutoUpdateStatus,
 } from './auto-update.ts';
 import type { FingerprintEntries } from './auto-update.ts';
@@ -1384,7 +1383,7 @@ export class DealerNodeRuntime {
       gateMode: this.gate.getMode(),
       lastError: this.lastError,
       outbox: { queuedCount: this.outbox ? this.outbox.list({ status: 'queued' }).length : 0 },
-      runtimeFingerprint: readDaemonFingerprint(this.stateDir)?.fingerprint,
+      runtimeFingerprint: this.currentDaemonFingerprint(),
       autoUpdate: readAutoUpdateStatus(this.stateDir),
     };
   }
