@@ -237,7 +237,7 @@ export class PeerDirectoryService implements NodeService {
       existing.nodeId !== card.nodeId && samePeerIdentity(existing.identity, card.identity),
     );
     if (predecessor) {
-      if (!isNewerPeerCard(card, predecessor)) {
+      if (this.transport.isPeerReachable?.(card.networkId, predecessor.nodeId) === true || !isNewerPeerCard(card, predecessor)) {
         return false;
       }
       directory.delete(predecessor.nodeId);

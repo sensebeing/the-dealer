@@ -71,7 +71,8 @@ test('peer routing prefers self and reachable teammates, and persists only curre
       ...updates,
     }, keys.privateKeyPem);
   }
-  const otherSelf = card('ben', 'old-laptop');
+  const oldGhost = card('ben', 'ben', { updatedAt: '2025-01-01T00:00:00.000Z' });
+  const newGhost = card('ben', 'ben');
   const duplicateSelf = card('ben', 'local');
   const older = card('oliver', 'desktop', { revision: 10 });
   const newer = card('oliver', 'desktop', { updatedAt: '2026-01-02T00:00:00.000Z' });
@@ -80,7 +81,7 @@ test('peer routing prefers self and reachable teammates, and persists only curre
   const otherNetwork = card('oliver', 'desktop', { networkId: 'other-team' });
   await writeFile(peersPath, JSON.stringify({
     schema: 'the-dealer-peer-directory/v1',
-    cards: [otherSelf, duplicateSelf, older, newer, oldest, otherMachine, otherNetwork],
+    cards: [oldGhost, newGhost, duplicateSelf, older, newer, oldest, otherMachine, otherNetwork],
   }));
   const kernel = new Kernel([
     { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
@@ -94,7 +95,7 @@ test('peer routing prefers self and reachable teammates, and persists only curre
   const persistedIds = async () => new Set<string>(
     JSON.parse(await readFile(peersPath, 'utf8')).cards.map((entry: NodeCard) => entry.nodeId),
   );
-  assert.deepEqual(await persistedIds(), new Set([otherSelf, newer, otherMachine, otherNetwork].map(entry => entry.nodeId)));
+  assert.deepEqual(await persistedIds(), new Set([newGhost, newer, otherMachine, otherNetwork].map(entry => entry.nodeId)));
   const transport: P2PTransportService = kernel.ctx.services.transport;
   const node: PeerDirectoryService = kernel.ctx.services.node;
   await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
@@ -102,22 +103,26 @@ test('peer routing prefers self and reachable teammates, and persists only curre
   for (const selector of ['member:ben', 'team/member:ben', 'ben@local', local.nodeId]) {
     assert.deepEqual(node.resolveTarget(selector, 'team'), [self], selector);
   }
-  assert.deepEqual(node.resolveTarget('ben@old-laptop', 'team'), [otherSelf]);
+  assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [newGhost]);
   assert.ok(node.resolveTarget('skill:release', 'team').every(entry => entry.nodeId !== local.nodeId));
   assert.deepEqual(node.resolveTarget('member:oliver', 'team'), [newer, otherMachine]);
-  t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) => networkId === 'team' && nodeId === otherMachine.nodeId);
+  const reachable = new Set([otherMachine.nodeId]);
+  t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) => networkId === 'team' && reachable.has(nodeId));
   assert.deepEqual(node.resolveTarget('member:oliver', 'team'), [otherMachine]);
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [newer]);
 
   const replacement = card('oliver', 'desktop', { updatedAt: newer.updatedAt, revision: newer.revision + 1 });
-  for (const incoming of [replacement, newer, duplicateSelf]) {
+  reachable.add(newGhost.nodeId);
+  const claimant = card('ben', 'ben', { updatedAt: '2026-01-03T00:00:00.000Z' });
+  for (const incoming of [replacement, newer, duplicateSelf, claimant]) {
     kernel.ctx.emit('transport/inbound', {
       networkId: 'team', senderNodeId: incoming.nodeId, mode: 'unicast',
       payload: { type: 'peer.card', card: incoming },
     });
   }
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
-  assert.deepEqual(await persistedIds(), new Set([otherSelf, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
+  assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [newGhost]);
+  assert.deepEqual(await persistedIds(), new Set([newGhost, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
 });
 
 test('wrong passphrase, forged cards, replay and other networks are isolated', async t => {
