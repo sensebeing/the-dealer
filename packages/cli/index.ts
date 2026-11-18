@@ -876,6 +876,12 @@ async function runSessionCommand(
   const store = runtime.mailbox;
   const callerMailboxFlag =
     typeof v.mailbox === 'string' && v.mailbox ? String(v.mailbox) : undefined;
+  const pinReplyMailbox = (localMailbox = 'default'): string => pinOrcaTerminalSessionMailbox(
+    store,
+    callerMailboxFlag ?? (localMailbox !== 'default' ? localMailbox : caller?.mailboxId ?? 'default'),
+    caller?.terminalHandle,
+    { inferredCallerMailboxId: callerMailboxFlag === undefined ? caller?.mailboxId : undefined },
+  );
   const ackId = typeof v.ack === 'string' && v.ack ? String(v.ack) : undefined;
   // The caller's inbound lease is burned only after the outbound send actually committed
   // (a live handoff or a durable outbox obligation). A preflight rejects an unknown lease
@@ -917,7 +923,7 @@ async function runSessionCommand(
         replyTo,
         typeof v.network === 'string' && v.network ? String(v.network) : undefined,
       );
-      const replyMailbox = pinOrcaTerminalSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
+      const replyMailbox = pinReplyMailbox(route.localMailbox);
       bindCallerWakeTarget(store, replyMailbox, caller);
       assertAckLease();
       const body = required(v.body, '--body');
@@ -966,7 +972,7 @@ async function runSessionCommand(
       throw new Error('Choose exactly one of --to or --auto-route');
     }
     assertAckLease();
-    const replyMailbox = pinOrcaTerminalSessionMailbox(store, callerMailboxFlag ?? caller?.mailboxId ?? 'default', caller?.terminalHandle);
+    const replyMailbox = pinReplyMailbox();
     bindCallerWakeTarget(store, replyMailbox, caller);
     const targetMailbox =
       typeof v['target-mailbox'] === 'string' && v['target-mailbox']
@@ -1014,7 +1020,7 @@ async function runSessionCommand(
 
   const messageId = required(positional, 'message-id');
   const route = replyTargetOrThrow(store, messageId);
-  const replyMailbox = pinOrcaTerminalSessionMailbox(store, callerMailboxFlag ?? (route.localMailbox !== 'default' ? route.localMailbox : caller?.mailboxId ?? 'default'), caller?.terminalHandle);
+  const replyMailbox = pinReplyMailbox(route.localMailbox);
   bindCallerWakeTarget(store, replyMailbox, caller);
   assertAckLease();
 
@@ -1515,18 +1521,23 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
             callerBinding.terminalHandle === resolvedTopic.binding.terminalHandle)
         ),
       );
-      let replyMailbox =
+      const explicitReplyMailbox =
         typeof v['reply-mailbox'] === 'string' && v['reply-mailbox']
           ? String(v['reply-mailbox'])
-          : (callerBinding?.mailboxId && !callerMatchesBoundTopic
-            ? callerBinding.mailboxId
-            : (threadRoute?.localMailbox !== undefined && threadRoute.localMailbox !== 'default'
-              ? threadRoute.localMailbox
-              : (callerMatchesBoundTopic && resolvedTopic?.binding.rotateAfterWaves !== undefined
-                ? boundTopicMailbox
-                : undefined)));
-      if (callerBinding && replyMailbox) replyMailbox = pinOrcaTerminalSessionMailbox(runtime.mailbox, replyMailbox, callerBinding.terminalHandle);
-      if (callerBinding && replyMailbox) bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
+          : undefined;
+      let replyMailbox = explicitReplyMailbox ?? (callerBinding?.mailboxId && !callerMatchesBoundTopic
+        ? callerBinding.mailboxId
+        : (threadRoute?.localMailbox !== undefined && threadRoute.localMailbox !== 'default'
+          ? threadRoute.localMailbox
+          : (callerMatchesBoundTopic && resolvedTopic?.binding.rotateAfterWaves !== undefined
+            ? boundTopicMailbox
+            : undefined)));
+      if (callerBinding && replyMailbox) {
+        replyMailbox = pinOrcaTerminalSessionMailbox(runtime.mailbox, replyMailbox, callerBinding.terminalHandle, {
+          inferredCallerMailboxId: explicitReplyMailbox === undefined ? callerBinding.mailboxId : undefined,
+        });
+        bindCallerWakeTarget(runtime.mailbox, replyMailbox, callerBinding);
+      }
       result = await runtime.emitter.emit({
         networkId,
         kind: topic,

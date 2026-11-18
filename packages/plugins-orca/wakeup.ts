@@ -487,14 +487,22 @@ export function pinOrcaTerminalSessionMailbox(
   store: MailboxStore,
   mailboxId: string,
   terminalHandle?: string,
+  options: { inferredCallerMailboxId?: string } = {},
 ): string {
   const id = normalizeMailboxId(mailboxId);
-  const target = store.getWakeTarget(id);
   const handle = terminalHandle?.trim();
-  if (!handle || target?.driver !== 'orca-terminal' || target.rotateAfterWaves === undefined) return id;
-  return store.pinSessionMailbox(id, `terminal:${handle}`, {
+  if (!handle) return id;
+  const target = store.getWakeTarget(id);
+  let rotatingOwner = target?.driver === 'orca-terminal' && target.rotateAfterWaves !== undefined ? target : undefined;
+  if (!rotatingOwner && id === options.inferredCallerMailboxId && id.startsWith('worktree:')) {
+    rotatingOwner = store.listWakeTargets().find(item => item.driver === 'orca-terminal' && item.rotateAfterWaves !== undefined
+      && readOrcaDriverConfig(item).terminalHandle === handle);
+  }
+  if (!rotatingOwner) return id;
+  const sessionMailboxId = `terminal:${handle}`;
+  return store.pinSessionMailbox(rotatingOwner.mailboxId, sessionMailboxId, {
     driver: 'orca-terminal',
-    driverConfig: buildPinnedOrcaSessionDriverConfig(readOrcaWakeTarget(target), store.getWakeTarget(`terminal:${handle}`), handle),
+    driverConfig: buildPinnedOrcaSessionDriverConfig(readOrcaWakeTarget(rotatingOwner), store.getWakeTarget(sessionMailboxId), handle),
   });
 }
 
