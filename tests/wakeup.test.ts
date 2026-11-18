@@ -1459,6 +1459,52 @@ test('dealer send binds an Orca caller mailbox when the topic is locally bound',
   assert.equal(runtime.mailbox.getWakeTarget('worktree:prod-release'), undefined);
 });
 
+test('dealer send from a slotted Orca tab wakes that tab for the peer reply', async t => {
+  const root = directory(t);
+  const workspacePath = join(root, 'alert-processor-prod');
+  const worktreeMailbox = 'worktree:alert-processor-prod';
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, ['term-1', 'term-2'].map(handle => ({
+    handle, connected: true, writable: true, agentIdentity: 'codex', preview: '',
+  })));
+  const alerts = await makeNode(t, root, 'alerts', { commandRunner: runner });
+  const prod = await makeNode(t, root, 'prod', { patch: { gateMode: 'open' } });
+  await alerts.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
+  await prod.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
+  await until(() => alerts.node.listPeers().length === 1 && prod.node.listPeers().length === 1, 'peer discovery');
+
+  alerts.mailbox.upsertWakeTarget(worktreeMailbox, {
+    driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'term-1' },
+  });
+  for (const [mailboxId, terminalHandle] of [
+    ['stream:alert-processor-prod', 'term-1'],
+    ['stream:alert-processor-prod:2', 'term-2'],
+  ]) {
+    alerts.mailbox.upsertWakeTarget(mailboxId, {
+      driver: 'orca-terminal', rotateAfterWaves: 1, coalesceMs: 0,
+      driverConfig: { workspacePath, terminalHandle, worktreeId: 'fake-worktree', agent: 'codex' },
+    });
+  }
+
+  const sent = await cli(alerts, 'send', '--network', 'team', '--to', 'member:prod',
+    '--topic', 'release.prod.v1', '--body', '{}', '--terminal-handle', 'term-2', '--workspace-path', workspacePath);
+  assert.equal(sent.receipts[0].stage, 'dispatched');
+  const inbound = prod.mailbox.listItemsAfterSequence(-1).find(item => item.id === sent.messageId);
+  assert.equal(inbound?.envelope?.semantic?.replyMailbox, 'terminal:term-2');
+  const pinned = alerts.mailbox.getWakeTarget('terminal:term-2');
+  assert.equal(pinned?.driverConfig?.workspacePath, workspacePath);
+  assert.equal(pinned?.driverConfig?.worktreeId, 'fake-worktree');
+  assert.equal(pinned?.driverConfig?.agent, 'codex');
+  assert.equal(pinned?.rotateAfterWaves, undefined);
+
+  const replied = await cli(prod, 'reply', sent.messageId, '--body', 'Released');
+  assert.equal(replied.targetMailbox, 'terminal:term-2');
+  assert.equal(replied.receipts[0].stage, 'dispatched');
+  await until(() => sendsTo(state.calls, 'term-2').some(call => textOf(call).includes('--mailbox terminal:term-2 --json')), 'second tab reply wake');
+  assert.equal(alerts.mailbox.list({ mailboxId: 'terminal:term-2' }).items[0]?.id, replied.replyId);
+  assert.equal(alerts.mailbox.getWakeTarget(worktreeMailbox)?.driverConfig?.terminalHandle, 'term-1');
+  assert.equal(sendsTo(state.calls, 'term-1').length, 0);
+});
+
 test('thread show fails loudly for an unknown thread', async t => {
   const root = directory(t);
   const runtime = await makeNode(t, root, 'solo');
