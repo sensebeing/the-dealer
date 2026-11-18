@@ -153,13 +153,15 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
-    const canUse = (terminal: OrcaTerminalRow) => !options?.excludedHandles?.has(String(terminal.handle));
+    const isRoot = row.path === cwd;
+    // Ownership limits the root tab selection; a relevant descendant still has to prove readiness.
+    const canUse = (terminal: OrcaTerminalRow) => !isRoot || !options?.excludedHandles?.has(String(terminal.handle));
     const eligibleHandles = handles.filter(canUse);
-    const targetTerm = row.path === cwd
+    const targetTerm = isRoot
       ? eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
         ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
       : undefined;
-    if (row.path === cwd && options?.targetPaneKey?.trim() && !targetTerm) return true;
+    if (isRoot && options?.targetPaneKey?.trim() && !targetTerm) return true;
     const targetPaneKeys = new Set<string>();
     if (typeof targetTerm?.tabId === 'string' && targetTerm.tabId && typeof targetTerm.leafId === 'string' && targetTerm.leafId)
       targetPaneKeys.add(`${targetTerm.tabId}:${targetTerm.leafId}`);
@@ -192,7 +194,7 @@ export async function checkOrcaWorkspaceIdle(
     // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
     // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
     // rebind could reuse when it was closed).
-    const rootTarget = row.path === cwd ? (targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle) : undefined;
+    const rootTarget = isRoot ? (targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle) : undefined;
     const eligibleObservableHandles = observableHandles.filter(canUse);
     const targetPresent =
       typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
@@ -201,7 +203,7 @@ export async function checkOrcaWorkspaceIdle(
         ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
         : undefined;
     const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
-      if (row.path !== cwd) return true;
+      if (!isRoot) return true;
       if (rootTarget === null) return false;
       if (rootTarget === undefined) return true;
       if (String(terminal.handle) === rootTarget) return true;
@@ -229,17 +231,15 @@ export async function checkOrcaWorkspaceIdle(
     }
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
-      if (targetPaneKeys.size > 0) {
-        const childAgents = child?.agents;
-        if (handles.length > 1) {
-          if (!childAgents?.some(agent => typeof agent.parentPaneKey === 'string' && targetPaneKeys.has(agent.parentPaneKey))) continue;
-        } else if (childAgents?.length && childAgents.every(agent =>
+      if (!child) return false;
+      if (
+        targetPaneKeys.size > 0 && child.agents?.length &&
+        (handles.length <= 1 || child.unverifiableTerminalCount === 0) &&
+        child.agents.every(agent =>
           typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey),
-        )) {
-          continue;
-        }
-      }
-      if (!child || !(await idleTree(child))) {
+        )
+      ) continue;
+      if (!(await idleTree(child))) {
         return false;
       }
     }

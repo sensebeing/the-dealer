@@ -185,12 +185,21 @@ function sameCallerWorkspace(a?: string, b?: string): boolean {
   try { return realpathSync(a) === realpathSync(b); } catch { return false; }
 }
 
-function claimedOrcaTerminalHandles(store: MailboxStore, excludeMailboxId: string): Set<string> {
+function claimedOrcaTerminalHandles(
+  store: MailboxStore, mailboxId: string, bound: OrcaTerminalDriverConfig,
+): Set<string> {
   const handles = new Set<string>();
   for (const item of store.listWakeTargets()) {
-    if (item.mailboxId === excludeMailboxId || item.mailboxId.startsWith('terminal:') || item.driver !== 'orca-terminal') continue;
-    const { terminalHandle } = readOrcaDriverConfig(item);
-    if (terminalHandle) handles.add(terminalHandle);
+    if (item.mailboxId === mailboxId || item.mailboxId.startsWith('terminal:') || item.driver !== 'orca-terminal') continue;
+    const { terminalHandle, workspacePath } = readOrcaDriverConfig(item);
+    if (!terminalHandle) continue;
+    // Explicit terminal mailboxes and caller worktree mailboxes can address an already-bound tab.
+    if (terminalHandle === bound.terminalHandle && (
+      mailboxId === `terminal:${terminalHandle}` ||
+      ((mailboxId.startsWith('worktree:') || item.mailboxId.startsWith('worktree:')) &&
+        sameCallerWorkspace(bound.workspacePath, workspacePath))
+    )) continue;
+    handles.add(terminalHandle);
   }
   return handles;
 }
@@ -202,10 +211,10 @@ function callerOwnsExplicitOrcaWakeTarget(
   if (caller.terminalHandle && id === `terminal:${caller.terminalHandle}`) {
     return !existing || existing.driver === 'passive' || sameCallerWorkspace(readOrcaDriverConfig(existing).workspacePath, caller.workspacePath);
   }
-  if (caller.terminalHandle && store && claimedOrcaTerminalHandles(store, id).has(caller.terminalHandle)) return false;
   if (existing?.driver !== 'orca-terminal') return false;
   const bound = readOrcaDriverConfig(existing);
   if (!sameCallerWorkspace(bound.workspacePath, caller.workspacePath)) return false;
+  if (caller.terminalHandle && store && claimedOrcaTerminalHandles(store, id, bound).has(caller.terminalHandle)) return false;
   return Boolean((caller.terminalHandle && bound.terminalHandle === caller.terminalHandle)
     || (caller.paneKey && bound.paneKey === caller.paneKey));
 }
@@ -530,7 +539,7 @@ class OrcaWakeDelivery {
         }
       }
       activeRevision = target.bindingRevision ?? 0;
-      const excludedHandles = target.driver === 'orca-terminal' ? this.excludedHandles(mailboxId, target) : new Set<string>();
+      const excludedHandles = target.driver === 'orca-terminal' ? claimedOrcaTerminalHandles(this.store, mailboxId, target) : new Set<string>();
       if (target.terminalHandle && excludedHandles.has(target.terminalHandle)) {
         target = { ...target, terminalHandle: undefined, paneKey: undefined };
       }
@@ -561,13 +570,6 @@ class OrcaWakeDelivery {
       }
       return { kind: 'defer', reason: String(error), expectedRevision: activeRevision };
     }
-  }
-
-  private excludedHandles(mailboxId: string, target: OrcaWakeTarget): Set<string> {
-    const handles = claimedOrcaTerminalHandles(this.store, mailboxId);
-    // A pinned session mailbox intentionally shares its own handle with the active stream.
-    if (target.terminalHandle && mailboxId === `terminal:${target.terminalHandle}`) handles.delete(target.terminalHandle);
-    return handles;
   }
 
   private needsDedicatedTab(mailboxId: string, target: OrcaWakeTarget): boolean {
@@ -769,7 +771,7 @@ class OrcaWakeDelivery {
       });
       // Another mailbox may have claimed a tab while Orca was listing the workspace.
       if (plan.kind !== 'create' && (
-        this.excludedHandles(mailboxId, target).has(plan.handle) ||
+        claimedOrcaTerminalHandles(this.store, mailboxId, target).has(plan.handle) ||
         (!options.dedicatedTab && plan.handle !== target.terminalHandle && this.needsDedicatedTab(mailboxId, target))
       )) {
         return this.defer(mailboxId, target, 'Orca terminal ownership changed during selection');
@@ -812,7 +814,7 @@ class OrcaWakeDelivery {
     if (target.driver === 'orca-run' && !target.runId) throw new Error('orca-run wake target requires runId');
     if (target.driver === 'orca-terminal' && !terminalHandle)
       throw new Error('orca-terminal wake target requires terminalHandle or workspacePath');
-    if (target.driver === 'orca-terminal' && terminalHandle && this.excludedHandles(mailboxId, target).has(terminalHandle)) {
+    if (target.driver === 'orca-terminal' && terminalHandle && claimedOrcaTerminalHandles(this.store, mailboxId, target).has(terminalHandle)) {
       return this.defer(mailboxId, target, 'Orca terminal ownership changed before delivery');
     }
     if (rebound) {

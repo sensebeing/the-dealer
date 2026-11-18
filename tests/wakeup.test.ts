@@ -102,7 +102,7 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
     waitOk: true,
     created: 0,
     agents: undefined as FakeOrcaAgent[] | undefined,
-    children: [] as { path: string; worktreeId: string; unverifiableTerminalCount: number; agents: FakeOrcaAgent[] }[],
+    children: [] as { path: string; worktreeId: string; unverifiableTerminalCount: number; agents?: FakeOrcaAgent[]; terminals?: FakeTerminalRow[] }[],
   };
   const runner: CommandRunner = async request => {
     state.calls.push(request);
@@ -124,7 +124,8 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
       };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'list') {
-      return { stdout: JSON.stringify({ ok: true, result: { terminals: state.terminals } }) };
+      const child = state.children.find(item => request.args.includes(`path:${item.path}`));
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: child ? child.terminals ?? [] : state.terminals } }) };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'create') {
       state.created += 1;
@@ -545,7 +546,7 @@ test('alert slot idle checks follow the selected tab and its attributed children
     { handle: 'term-2', tabId: 'slot-2', leafId: 'root', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
   ]);
   state.agents = [{ state: 'working', paneKey: 'slot-1:root' }, { state: 'done', paneKey: 'slot-2:root' }];
-  const child = { worktreeId: 'child', path: join(workspacePath, 'child'), unverifiableTerminalCount: 1, agents: [] as FakeOrcaAgent[] };
+  const child: (typeof state.children)[number] = { worktreeId: 'child', path: join(workspacePath, 'child'), unverifiableTerminalCount: 0 };
   state.children = [child];
   store.upsertWakeTarget('stream:tools-alert', { driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'term-1' } });
   const mailboxId = 'stream:tools-alert:2';
@@ -553,18 +554,60 @@ test('alert slot idle checks follow the selected tab and its attributed children
   const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
   t.after(() => service.stop());
 
-  for (const [index, agents] of [
-    [],
-    [{ state: 'working', parentPaneKey: 'slot-1:root' }],
-    [{ state: 'working', parentPaneKey: 'slot-2:root' }],
+  for (const [index, scenario] of [
+    { agents: [], idle: true },
+    { agents: [], unverifiableTerminalCount: 1, idle: false },
+    { agents: [{ state: 'working', parentPaneKey: 'slot-1:root' }], idle: true },
+    { agents: [{ state: 'working', parentPaneKey: 'slot-2:root' }], idle: false },
+    { agents: [{ state: 'working' }], idle: false },
+    { agents: undefined, idle: false },
   ].entries()) {
-    child.agents = agents;
+    child.agents = scenario.agents;
+    child.unverifiableTerminalCount = scenario.unverifiableTerminalCount ?? 0;
     store.enqueue([alert(`child-${index}`)], { mailboxId });
     const result = await service.flushMailbox(mailboxId, { force: true });
-    assert.equal(result.woke, index < 2, result.reason);
+    assert.equal(result.woke, scenario.idle, result.reason);
   }
   assert.equal(sendsTo(state.calls, 'term-2').length, 2);
   assert.equal(sendsTo(state.calls, 'term-1').length, 0);
+});
+
+test('a target tab requires complete inventory and checks claimed terminals in its child worktree', async t => {
+  const workspacePath = directory(t);
+  const store = new MailboxStore(join(workspacePath, 'mailbox.json'));
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-1', tabId: 'slot-1', leafId: 'root', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-2', tabId: 'slot-2', leafId: 'root', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const terminal = { handle: 'term-child', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> unsent draft' };
+  const childPath = join(workspacePath, 'child');
+  state.children = [{
+    worktreeId: 'child', path: childPath, unverifiableTerminalCount: 0, terminals: [terminal],
+    agents: [{ state: 'done', parentPaneKey: 'slot-2:root' }],
+  }];
+  store.upsertWakeTarget('task:child', {
+    driver: 'orca-terminal', driverConfig: { workspacePath: childPath, terminalHandle: terminal.handle },
+  });
+  let childMissing = true;
+  const commandRunner: CommandRunner = async request => {
+    const output = await runner(request);
+    if (!childMissing || request.args[0] !== 'worktree' || request.args[1] !== 'ps') return output;
+    const inventory = JSON.parse(output.stdout);
+    inventory.result.worktrees.length = 1;
+    return { stdout: JSON.stringify(inventory) };
+  };
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner }) });
+  t.after(() => service.stop());
+  const mailboxId = 'stream:tools-alert:2';
+  store.enqueue([alert('child-ready')], {
+    mailboxId, wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'term-2' } },
+  });
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false, 'missing child inventory blocks');
+  childMissing = false;
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false, 'the claimed child composer still gates its parent');
+  assert.equal(sendsTo(state.calls, 'term-2').length, 0);
+  terminal.preview = '';
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
 });
 
 test('a stale alert slot binding never writes into a sibling slot tab', async t => {
@@ -1262,6 +1305,10 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   await until(() => alice.node.listPeers().length === 1 && bob.node.listPeers().length === 1, 'peer discovery');
   const aliceEnv = { ORCA_TERMINAL_HANDLE: 'term-alice', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` };
   const bobEnv = { ORCA_TERMINAL_HANDLE: 'term-bob', ORCA_WORKTREE_ID: `repo::${bobWtPath}` };
+  const taskMailbox = 'task:alice-agent';
+  alice.mailbox.upsertWakeTarget(taskMailbox, {
+    driver: 'orca-terminal', driverConfig: { workspacePath: aliceWtPath, terminalHandle: 'term-alice' },
+  });
   const askOut: string[] = [];
   await runDealerCli(['ask', '--network', 'team', '--to', 'member:bob', '--target-mailbox', 'worktree:bob-wt', '--body', 'Please review'], { runtime: alice, env: aliceEnv, stdout: line => askOut.push(line) });
   const asked = JSON.parse(askOut.join('\n'));
@@ -1303,6 +1350,17 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   const settleOut: string[] = [];
   await runDealerCli(['settle', asked.questionId, '--outcome', 'succeeded', '--summary', 'Done', '--ack', bobCheck.deliveryId], { runtime: bob, env: bobEnv, stdout: line => settleOut.push(line) });
   await until(() => calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'send' && call.args.includes('term-alice')).length >= 2, 'Alice terminal settle wake');
+
+  alice.mailbox.enqueue([alert('task-follow-up')], { mailboxId: taskMailbox });
+  await until(() => sendsTo(calls, 'term-alice').some(call => textOf(call).includes(`--mailbox ${taskMailbox} --json`)), 'Alice task wake');
+  const taskCheckOut: string[] = [];
+  await runDealerCli(['inbox', 'check', '--mailbox', taskMailbox, '--json'], {
+    runtime: alice,
+    env: { ...aliceEnv, ORCA_PANE_KEY: 'alice:root' },
+    stdout: line => taskCheckOut.push(line),
+  });
+  assert.equal(JSON.parse(taskCheckOut.join('\n')).items.length, 1);
+  assert.equal(alice.mailbox.getWakeTarget(taskMailbox)?.driverConfig?.paneKey, 'alice:root');
 
   alice.mailbox.enqueue([alert('rpc-mail')], { mailboxId: 'worktree:alice-wt' });
   await alice.serveControl(async (argv, context) => {
