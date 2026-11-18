@@ -468,9 +468,9 @@ export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon?: Reconci
   }
   const release = () => rmSync(acquired.lock, { recursive: true, force: true });
   try {
-    const { report, root, runtimeFingerprint } = updateCheckout(options, checkedAt);
+    const { report, root, runtimeFingerprint, usableCheckout } = updateCheckout(options, checkedAt);
     persistUpdateReport(options.stateDir, report);
-    if (reconcileDaemon) {
+    if (reconcileDaemon && usableCheckout) {
       // Keep the update lock through the drain and report write so another updater cannot
       // claim the same restart or replace its report while the restart is still in flight.
       return reconcileDaemon(runtimeFingerprint, root).then(restarted => {
@@ -483,7 +483,7 @@ export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon?: Reconci
       }).finally(release);
     }
     release();
-    return report;
+    return reconcileDaemon ? Promise.resolve(report) : report;
   } catch (error) {
     release();
     throw error;
@@ -500,6 +500,7 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
   let syncedSkills: string[] = [];
   let syncedBinaries: string[] = [];
   let stashedLocalChanges = false;
+  let usableCheckout = false;
   try {
     root = updateCheckoutFor(options);
     if (existsSync(join(root, '.git'))) {
@@ -507,12 +508,15 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
       const dirty = git(['status', '--porcelain']);
       const branch = git(['branch', '--show-current']);
       headSha = git(['rev-parse', 'HEAD']);
-      if (branch !== 'main') {
-        sourceStatus = 'skipped_non_main_branch';
-      } else if (/^(UU|AA|DD|AU|UA|DU|UD) /m.test(dirty) || ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))))) {
+      const conflicted = /^(UU|AA|DD|AU|UA|DU|UD) /m.test(dirty) ||
+        ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))));
+      usableCheckout = !conflicted;
+      if (conflicted) {
         status = 'failed';
         sourceStatus = 'conflicted_checkout';
         error = 'Checkout has unresolved merge or rebase state';
+      } else if (branch !== 'main') {
+        sourceStatus = 'skipped_non_main_branch';
       } else {
         const beforeSha = headSha;
         const stashRef = () => {
@@ -557,8 +561,10 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
           headSha = pulledSha;
         }
       }
-      syncedSkills = syncSkills(root, options);
-      syncedBinaries = syncBinaries(root, options);
+      if (usableCheckout) {
+        syncedSkills = syncSkills(root, options);
+        syncedBinaries = syncBinaries(root, options);
+      }
     }
   } catch (caught) {
     status = 'failed';
@@ -575,7 +581,7 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
     ...(headSha ? { headSha } : {}),
     ...(error ? { error } : {}),
   };
-  return { report, root, runtimeFingerprint };
+  return { report, root, runtimeFingerprint, usableCheckout };
 }
 
 const MIN_UPDATE_SPAWN_INTERVAL_MS = 30_000;

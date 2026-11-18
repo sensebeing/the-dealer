@@ -35,6 +35,7 @@ const MAX_GOSSIPED_PEER_CARDS = 128;
 
 type PeerRevisions = Map<string, Map<string, number>>;
 type CardAcceptance = 'ignored' | 'revision' | 'candidate';
+type PeerCandidates = { newest: NodeCard; reachable?: NodeCard; offline?: NodeCard[] };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype;
@@ -64,8 +65,8 @@ function parsePeerRevisions(value: unknown): PeerRevisions {
   return revisions;
 }
 
-function samePeerIdentity(a: NodeCard['identity'], b: NodeCard['identity']): boolean {
-  return a.member === b.member && a.nodeName === b.nodeName;
+function peerIdentityKey(identity: NodeCard['identity']): string {
+  return JSON.stringify([identity.member, identity.nodeName]);
 }
 
 function isNewerPeerCard(a: NodeCard, b: NodeCard): boolean {
@@ -221,6 +222,37 @@ export class PeerDirectoryService implements NodeService {
     );
   }
 
+  /** Project one active card per identity. Ingress may also compact offline alternatives. */
+  private activeNetworkCards(networkId: string, directory: Map<string, NodeCard>, compactIdentity?: string): NodeCard[] {
+    const groups = new Map<string, PeerCandidates>();
+    for (const card of directory.values()) {
+      const key = peerIdentityKey(card.identity);
+      if (compactIdentity !== undefined && key !== compactIdentity) {
+        continue;
+      }
+      const group: PeerCandidates = groups.get(key) ?? { newest: card, offline: compactIdentity === undefined ? undefined : [] };
+      if (isNewerPeerCard(card, group.newest)) {
+        group.newest = card;
+      }
+      if (this.transport.isPeerReachable?.(networkId, card.nodeId) === true) {
+        if (!group.reachable || isNewerPeerCard(card, group.reachable)) {
+          group.reachable = card;
+        }
+      } else {
+        group.offline?.push(card);
+      }
+      groups.set(key, group);
+    }
+    return Array.from(groups.values(), ({ newest, reachable, offline }) => {
+      for (const card of offline ?? []) {
+        if (card.nodeId !== newest.nodeId) {
+          directory.delete(card.nodeId);
+        }
+      }
+      return reachable ?? newest;
+    });
+  }
+
   /**
    * Record the newest verified revision and admit it as a routing candidate when eligible.
    * Only a card carried directly by its signing node may contribute an endpoint:
@@ -272,43 +304,54 @@ export class PeerDirectoryService implements NodeService {
     }
     const directory = this.peers.get(card.networkId) ?? new Map<string, NodeCard>();
     const revisionFloors = this.peerRevisions.get(card.networkId) ?? new Map<string, number>();
-    const previousFloor = Math.max(directory.get(card.nodeId)?.revision ?? 0, revisionFloors.get(card.nodeId) ?? 0);
-    // A persisted candidate may equal its stored floor. Revisions already observed in this
-    // load still use the same strict ordering as live arrivals.
-    if (previousFloor >= card.revision || (storedFloors?.get(card.networkId)?.get(card.nodeId) ?? 0) > card.revision) {
+    const existing = directory.get(card.nodeId);
+    const previousFloor = Math.max(
+      existing?.revision ?? 0,
+      revisionFloors.get(card.nodeId) ?? 0,
+      storedFloors?.get(card.networkId)?.get(card.nodeId) ?? 0,
+    );
+    if (card.revision < previousFloor) {
       return 'ignored';
     }
-    revisionFloors.set(card.nodeId, card.revision);
-    this.peerRevisions.set(card.networkId, revisionFloors);
-    const predecessor = [...directory.values()].find(existing =>
-      existing.nodeId !== card.nodeId && samePeerIdentity(existing.identity, card.identity),
-    );
-    const keepPredecessor = predecessor && (
-      this.transport.isPeerReachable?.(card.networkId, predecessor.nodeId) === true || !isNewerPeerCard(card, predecessor)
-    );
-    if (keepPredecessor || samePeerIdentity(card.identity, this.config)) {
-      // The newer verified profile invalidates any earlier labels for this signing key.
-      directory.delete(card.nodeId);
-      return 'revision';
+    const revisionAdvanced = card.revision > previousFloor;
+    if (revisionAdvanced) {
+      revisionFloors.set(card.nodeId, card.revision);
+      this.peerRevisions.set(card.networkId, revisionFloors);
     }
-    if (predecessor) {
-      // Candidate admission already recorded this predecessor's revision in revisionFloors.
-      directory.delete(predecessor.nodeId);
+    // An unchanged heartbeat reconsiders reachability with the payload already verified
+    // for that revision. Newer verified profiles replace any earlier labels for that key.
+    const candidate = existing?.revision === card.revision ? existing : card;
+    const identity = peerIdentityKey(candidate.identity);
+    if (identity === peerIdentityKey(this.config)) {
+      const removed = directory.delete(card.nodeId);
+      return revisionAdvanced || removed ? 'revision' : 'ignored';
     }
-    if (registerEndpoint && card.endpointAddr) {
+    const previousSize = directory.size;
+    if (candidate !== existing) {
+      directory.set(card.nodeId, structuredClone(candidate));
+    }
+    this.activeNetworkCards(card.networkId, directory, identity);
+    const retained = directory.get(card.nodeId);
+    const candidatesChanged = retained !== existing || directory.size !== previousSize;
+    if (!retained) {
+      return revisionAdvanced || candidatesChanged ? 'revision' : 'ignored';
+    }
+    this.peers.set(card.networkId, directory);
+    if (registerEndpoint && retained.endpointAddr) {
       try {
-        this.transport.registerPeerEndpoint?.(card.networkId, card.nodeId, card.endpointAddr);
+        this.transport.registerPeerEndpoint?.(card.networkId, card.nodeId, retained.endpointAddr);
       } catch {
         // Endpoint registration is transport-owned reachability; a failed registration
         // never discards verified member identity.
       }
     }
-    directory.set(card.nodeId, structuredClone(card));
-    this.peers.set(card.networkId, directory);
+    if (!candidatesChanged) {
+      return revisionAdvanced ? 'revision' : 'ignored';
+    }
     if (emit) {
       // `direct` distinguishes live reachability from identity-only gossip so retry
       // schedulers never treat a third-party card as proof the member reconnected.
-      this.ctx.emit('node/peer-updated', structuredClone(card), {
+      this.ctx.emit('node/peer-updated', structuredClone(retained), {
         direct: registerEndpoint,
       });
     }
@@ -350,7 +393,7 @@ export class PeerDirectoryService implements NodeService {
     }
   }
 
-  private signSelfCard(networkId: string, revision: number): NodeCard {
+  private signSelfCard(networkId: string, revision: number, updatedAt = new Date().toISOString()): NodeCard {
     const mount =
       this.transport.getNetworkConfig?.(networkId) ??
       this.config.networks?.find(n => n.networkId === networkId);
@@ -378,7 +421,7 @@ export class PeerDirectoryService implements NodeService {
           availableAgents: [],
         },
         endpointAddr: this.transport.endpointAddr,
-        updatedAt: new Date().toISOString(),
+        updatedAt,
       },
       this.keyPair.privateKeyPem,
     );
@@ -425,10 +468,9 @@ export class PeerDirectoryService implements NodeService {
         // directory, and a newly accepted direct peer receives it once on the next beacon.
         // Steady-state 250ms presence heartbeats carry only the self card.
         const includeKnownCards = refresh || this.gossipRequested.delete(networkId);
-        const knownCards = includeKnownCards
-          ? [...(this.peers.get(networkId)?.values() ?? [])]
-              .filter(card => card.nodeId !== selfCard.nodeId)
-              .slice(0, MAX_GOSSIPED_PEER_CARDS)
+        const directory = this.peers.get(networkId);
+        const knownCards = includeKnownCards && directory
+          ? this.activeNetworkCards(networkId, directory).slice(0, MAX_GOSSIPED_PEER_CARDS)
           : [];
         await this.transport.broadcast(
           networkId,
@@ -448,7 +490,12 @@ export class PeerDirectoryService implements NodeService {
   }
 
   getSelfCard(networkId: string): NodeCard {
-    const card = this.self.get(networkId) ?? this.signSelfCard(networkId, Math.max(this.revisions.get(networkId) ?? 1, 1));
+    // The last local publication time keeps an unmounted projection stable across reads.
+    const card = this.self.get(networkId) ?? this.signSelfCard(
+      networkId,
+      Math.max(this.revisions.get(networkId) ?? 1, 1),
+      this.self.get('local')?.updatedAt,
+    );
     return structuredClone(card);
   }
 
@@ -487,12 +534,11 @@ export class PeerDirectoryService implements NodeService {
     } = {},
   ): readonly NodeCard[] {
     const mounted = this.transport.listMountedNetworks();
-    return [...this.peers.values()]
-      .flatMap(d => [...d.values()])
+    return [...this.peers.entries()]
+      .filter(([networkId]) => mounted.includes(networkId) && (!filter.networkId || networkId === filter.networkId))
+      .flatMap(([networkId, directory]) => this.activeNetworkCards(networkId, directory))
       .filter(
         card =>
-          mounted.includes(card.networkId) &&
-          (!filter.networkId || card.networkId === filter.networkId) &&
           (!filter.member || card.identity.member === filter.member) &&
           (!filter.skillTag ||
             card.capabilities.skills.some(
@@ -525,9 +571,9 @@ export class PeerDirectoryService implements NodeService {
       networkId = selector.slice(0, slash);
       selector = selector.slice(slash + 1);
     }
-    const selfCard = this.self.get(networkId ?? 'local');
-    if (selfCard && !selector.startsWith('skill:') && this.matchSelector(selfCard, selector)) {
-      return [structuredClone(selfCard)];
+    const selfCard = this.getSelfCard(networkId ?? 'local');
+    if (!selector.startsWith('skill:') && this.matchSelector(selfCard, selector)) {
+      return [selfCard];
     }
     const remote = this.listPeers({ networkId }).filter(card => this.matchSelector(card, selector));
     if (selector.startsWith('member:') && remote.length > 1 && typeof this.transport.isPeerReachable === 'function') {
@@ -539,7 +585,7 @@ export class PeerDirectoryService implements NodeService {
     if (remote.length > 0) {
       return remote;
     }
-    return selfCard && this.matchSelector(selfCard, selector) ? [structuredClone(selfCard)] : [];
+    return this.matchSelector(selfCard, selector) ? [selfCard] : [];
   }
 
   async dispose(): Promise<void> {

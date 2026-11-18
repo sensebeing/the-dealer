@@ -126,10 +126,10 @@ test('peer routing prefers self and reachable teammates, and persists only curre
   }
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
   assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [newGhost]);
-  assert.deepEqual(await persistedIds(), new Set([newGhost, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
+  assert.deepEqual(await persistedIds(), new Set([newGhost, claimant, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
 });
 
-test('peer revision floors fence replays under former labels after replacement and restart', async t => {
+test('peer failover reconsiders an unchanged replacement while retaining replay floors after restart', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-revisions-'));
   const peersPath = join(dir, 'peers.json');
   const local = generateNodeKeyPair();
@@ -155,11 +155,27 @@ test('peer revision floors fence replays under former labels after replacement a
   }
 
   let { kernel, node } = await openDirectory();
+  const reachable = new Set([lastProfile.nodeId]);
+  t.mock.method(kernel.ctx.services.transport, 'isPeerReachable', (networkId: string, nodeId: string) => networkId === 'team' && reachable.has(nodeId));
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [lastProfile]);
   deliverPeerCard(kernel, replacement);
   deliverPeerCard(kernel, excludedReplay);
   assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), [excludedReplay]);
   deliverPeerCard(kernel, rejected);
+  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [lastProfile]);
+  assert.deepEqual(node.listPeers({ networkId: 'team' }), [lastProfile]);
+  const waitingSnapshot = JSON.parse(await readFile(peersPath, 'utf8'));
+  assert.deepEqual(new Set(waitingSnapshot.cards), new Set([lastProfile, replacement]));
+
+  reachable.add(replacement.nodeId);
+  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
+  reachable.delete(replacement.nodeId);
+  reachable.delete(lastProfile.nodeId);
+  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
+  assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
+  assert.deepEqual(JSON.parse(await readFile(peersPath, 'utf8')), waitingSnapshot);
+
+  deliverPeerCard(kernel, replacement);
   for (const replay of [oldProfile, excludedReplay]) deliverPeerCard(kernel, replay);
   assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
   const snapshot = JSON.parse(await readFile(peersPath, 'utf8'));
@@ -168,9 +184,13 @@ test('peer revision floors fence replays under former labels after replacement a
   assert.equal(snapshot.peerRevisions.team[excluded.nodeId], rejected.revision);
   await kernel.stop();
 
+  // Restart from the state before the unchanged heartbeat pruned the incumbent.
+  await writeFile(peersPath, JSON.stringify(waitingSnapshot));
   ({ kernel, node } = await openDirectory());
   for (const replay of [oldProfile, excludedReplay]) deliverPeerCard(kernel, replay);
+  assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
   assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
+  assert.deepEqual(JSON.parse(await readFile(peersPath, 'utf8')).cards, [replacement]);
   await kernel.stop();
 
   // A legacy snapshot may still contain both node IDs when startup compacts it.
@@ -216,8 +236,12 @@ test('selector and self card reads leave the peer store unchanged across a heart
 
   assert.deepEqual(node.resolveTarget(remote.nodeId), [remote]);
   assert.equal(node.resolveTarget('member:ben')[0]?.networkId, 'local');
-  assert.equal(node.getSelfCard('unmounted').networkId, 'unmounted');
-  assert.deepEqual(node.resolveTarget('unmounted/member:ben'), []);
+  const projected = node.getSelfCard('unmounted');
+  assert.equal(projected.networkId, 'unmounted');
+  assert.deepEqual(node.resolveTarget('unmounted/member:ben'), [projected]);
+  for (const selector of ['member:ben', 'ben@local', local.nodeId]) {
+    assert.deepEqual(node.resolveTarget(selector, 'unmounted'), [projected], selector);
+  }
   const after = await readFile(peersPath, 'utf8');
   const localRevision = JSON.parse(before).selfRevisions.local;
   assert.equal(typeof localRevision, 'number');

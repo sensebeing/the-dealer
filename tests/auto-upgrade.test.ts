@@ -410,7 +410,7 @@ function copyDealerCode(checkout: string): void {
   }
 }
 
-test('up-to-date self-update from a linked worktree heals main links and restarts the live stale daemon', { timeout: 90_000 }, async t => {
+function runnableLinkedCheckout(t: test.TestContext) {
   const { root, stateDir, checkout } = updateCheckoutFixture({ after: cleanup => t.after(async () => {
     try {
       await stopDaemonIfRunning(stateDir, { force: true });
@@ -426,6 +426,11 @@ test('up-to-date self-update from a linked worktree heals main links and restart
   const head = git(checkout, ['rev-parse', 'HEAD']);
   const worktree = join(root, 'linked worktree');
   git(checkout, ['worktree', 'add', '-b', 'topic', worktree]);
+  return { root, stateDir, checkout, head, worktree };
+}
+
+test('up-to-date self-update from a linked worktree heals main links and restarts the live stale daemon', { timeout: 90_000 }, async t => {
+  const { root, stateDir, checkout, head, worktree } = runnableLinkedCheckout(t);
   const localBin = join(root, '.local', 'bin');
   mkdirSync(localBin, { recursive: true });
   symlinkSync(join(worktree, 'bin', 'dealer.js'), join(localBin, 'dealer'));
@@ -464,6 +469,36 @@ test('up-to-date self-update from a linked worktree heals main links and restart
   assert.deepEqual(JSON.parse(current.stdout).syncedBinaries, [join(localBin, 'dealerd')]);
   assert.equal(readFileSync(join(localBin, 'dealer'), 'utf8'), 'keep my wrapper');
   assert.equal(readlinkSync(join(localBin, 'dealerd')), join(checkout, 'bin', 'dealerd.js'));
+});
+
+test('self-update preserves links and the serving daemon when the canonical checkout is conflicted', { timeout: 90_000 }, async t => {
+  const { root, stateDir, checkout, head, worktree } = runnableLinkedCheckout(t);
+  const localBin = join(root, '.local', 'bin');
+  mkdirSync(localBin, { recursive: true });
+  const worktreeDealer = join(worktree, 'bin', 'dealer.js');
+  const worktreeDaemon = join(worktree, 'bin', 'dealerd.js');
+  symlinkSync(worktreeDealer, join(localBin, 'dealer'));
+  symlinkSync(worktreeDaemon, join(localBin, 'dealerd'));
+  mkdirSync(join(root, '.agents'));
+  mkdirSync(join(checkout, 'skills', 'the-dealer'), { recursive: true });
+  writeFileSync(join(checkout, '.git', 'MERGE_HEAD'), `${head}\n`);
+
+  await bootDaemon(stateDir, { DEALER_AUTO_RESTART: '0' });
+  const before = readDaemonFingerprint(stateDir)!;
+  assert.notEqual(before.fingerprint, computeRuntimeFingerprint(stateDir, checkout));
+
+  const result = await runDealer(['self-update', '--home-dir', root, '--json'], stateDir, {}, worktreeDealer);
+  assert.equal(result.code, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.status, 'failed');
+  assert.equal(report.sourceStatus, 'conflicted_checkout');
+  assert.deepEqual(report.syncedBinaries, []);
+  assert.deepEqual(report.syncedSkills, []);
+  assert.equal(report.restartedDaemon, false);
+  assert.equal(readlinkSync(join(localBin, 'dealer')), worktreeDealer);
+  assert.equal(readlinkSync(join(localBin, 'dealerd')), worktreeDaemon);
+  assert.equal((await dealer(['node', 'status'], stateDir)).runtimeFingerprint, before.fingerprint);
+  assert.equal(readDaemonFingerprint(stateDir)?.instanceId, before.instanceId);
 });
 
 test('self-update leaves an offline node stopped when its control socket is stale', { timeout: 30_000 }, async t => {
