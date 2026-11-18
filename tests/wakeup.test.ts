@@ -1283,6 +1283,7 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   const aliceWtPath = join(root, 'alice-wt');
   const bobWtPath = join(root, 'bob-wt');
   const calls: CommandRequest[] = [];
+  let aliceHandle = 'term-alice';
   const runner: CommandRunner = async request => {
     calls.push(request);
     if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
@@ -1293,8 +1294,10 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'list') {
       const path = request.args[request.args.indexOf('--worktree') + 1]?.replace(/^path:/, '');
-      const handle = path === bobWtPath ? 'term-bob' : 'term-alice';
-      return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle, connected: true, writable: true, preview: '' }] } }) };
+      const terminal = path === bobWtPath
+        ? { handle: 'term-bob' }
+        : { handle: aliceHandle, tabId: 'alice', leafId: 'root' };
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ ...terminal, connected: true, writable: true, preview: '' }] } }) };
     }
     return { stdout: JSON.stringify({ ok: true }) };
   };
@@ -1303,7 +1306,7 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   await alice.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
   await bob.mountNetwork({ networkId: 'team', passphrase: 'team-secret' });
   await until(() => alice.node.listPeers().length === 1 && bob.node.listPeers().length === 1, 'peer discovery');
-  const aliceEnv = { ORCA_TERMINAL_HANDLE: 'term-alice', ORCA_WORKTREE_ID: `repo::${aliceWtPath}` };
+  const aliceEnv = { ORCA_TERMINAL_HANDLE: 'term-alice', ORCA_WORKTREE_ID: `repo::${aliceWtPath}`, ORCA_PANE_KEY: 'alice:root' };
   const bobEnv = { ORCA_TERMINAL_HANDLE: 'term-bob', ORCA_WORKTREE_ID: `repo::${bobWtPath}` };
   const taskMailbox = 'task:alice-agent';
   alice.mailbox.upsertWakeTarget(taskMailbox, {
@@ -1356,13 +1359,20 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
   const taskCheckOut: string[] = [];
   await runDealerCli(['inbox', 'check', '--mailbox', taskMailbox, '--json'], {
     runtime: alice,
-    env: { ...aliceEnv, ORCA_PANE_KEY: 'alice:root' },
+    env: aliceEnv,
     stdout: line => taskCheckOut.push(line),
   });
   assert.equal(JSON.parse(taskCheckOut.join('\n')).items.length, 1);
   assert.equal(alice.mailbox.getWakeTarget(taskMailbox)?.driverConfig?.paneKey, 'alice:root');
 
+  aliceHandle = 'term-alice-restored';
+  alice.mailbox.enqueue([alert('restored-task-mail')], { mailboxId: taskMailbox });
+  await until(() => sendsTo(calls, aliceHandle).some(call => textOf(call).includes(`--mailbox ${taskMailbox} --json`)), 'task wakes on the restored pane');
+  assert.equal(alice.mailbox.getWakeTarget(taskMailbox)?.driverConfig?.terminalHandle, aliceHandle);
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.driverConfig?.terminalHandle, 'term-alice');
   alice.mailbox.enqueue([alert('rpc-mail')], { mailboxId: 'worktree:alice-wt' });
+  await until(() => sendsTo(calls, aliceHandle).some(call => textOf(call).includes('--mailbox worktree:alice-wt --json')), 'worktree alias wakes on the restored pane');
+  assert.equal(alice.mailbox.getWakeTarget('worktree:alice-wt')?.driverConfig?.terminalHandle, aliceHandle);
   await alice.serveControl(async (argv, context) => {
     const stdout: string[] = [];
     const stderr: string[] = [];

@@ -191,14 +191,13 @@ function claimedOrcaTerminalHandles(
   const handles = new Set<string>();
   for (const item of store.listWakeTargets()) {
     if (item.mailboxId === mailboxId || item.mailboxId.startsWith('terminal:') || item.driver !== 'orca-terminal') continue;
-    const { terminalHandle, workspacePath } = readOrcaDriverConfig(item);
+    const { terminalHandle, workspacePath, paneKey } = readOrcaDriverConfig(item);
     if (!terminalHandle) continue;
-    // Explicit terminal mailboxes and caller worktree mailboxes can address an already-bound tab.
-    if (terminalHandle === bound.terminalHandle && (
-      mailboxId === `terminal:${terminalHandle}` ||
-      ((mailboxId.startsWith('worktree:') || item.mailboxId.startsWith('worktree:')) &&
-        sameCallerWorkspace(bound.workspacePath, workspacePath))
-    )) continue;
+    const isSessionAlias = mailboxId.startsWith('terminal:') ||
+      mailboxId.startsWith('worktree:') || item.mailboxId.startsWith('worktree:');
+    // A recorded pane retains its session identity when Orca replaces the terminal handle.
+    const sameTab = terminalHandle === bound.terminalHandle || Boolean(paneKey && paneKey === bound.paneKey);
+    if (isSessionAlias && sameTab && sameCallerWorkspace(bound.workspacePath, workspacePath)) continue;
     handles.add(terminalHandle);
   }
   return handles;
