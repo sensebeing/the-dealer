@@ -182,6 +182,9 @@ export class PeerDirectoryService implements NodeService {
   private activeNetworkCards(networkId: string, directory: Map<string, NodeCard>): NodeCard[] {
     const groups = new Map<string, PeerCandidates>();
     for (const card of directory.values()) {
+      if (this.claimsLocalIdentity(card)) {
+        continue;
+      }
       const key = peerIdentityKey(card.identity);
       const group: PeerCandidates = groups.get(key) ?? { newest: card };
       if (isNewerPeerCard(card, group.newest)) {
@@ -195,6 +198,10 @@ export class PeerDirectoryService implements NodeService {
       groups.set(key, group);
     }
     return Array.from(groups.values(), ({ newest, reachable }) => reachable ?? newest);
+  }
+
+  private claimsLocalIdentity(card: NodeCard): boolean {
+    return card.identity.member === this.config.member && card.identity.nodeName === this.config.nodeName;
   }
 
   /**
@@ -251,16 +258,17 @@ export class PeerDirectoryService implements NodeService {
     if (existing && (existing.revision > card.revision || (unchanged && existing.signature !== card.signature))) {
       return false;
     }
-    if (peerIdentityKey(card.identity) === peerIdentityKey(this.config)) {
-      return directory.delete(card.nodeId);
-    }
     if (!unchanged) {
       directory.set(card.nodeId, structuredClone(card));
       this.peers.set(card.networkId, directory);
-      if (emit && registerEndpoint) {
-        // Share known cards once when a peer announces a new revision directly.
-        this.gossipRequested.add(card.networkId);
-      }
+    }
+    if (this.claimsLocalIdentity(card)) {
+      // Keep the signed revision as the floor for this key, while excluding it from routing.
+      return !unchanged;
+    }
+    if (!unchanged && emit && registerEndpoint) {
+      // Share known cards once when a peer announces a new revision directly.
+      this.gossipRequested.add(card.networkId);
     }
     if (registerEndpoint && card.endpointAddr) {
       try {
@@ -441,6 +449,11 @@ export class PeerDirectoryService implements NodeService {
     await this.publish();
   }
 
+  private mountedPeerDirectories(networkId?: string): [string, Map<string, NodeCard>][] {
+    const mounted = this.transport.listMountedNetworks();
+    return [...this.peers].filter(([id]) => mounted.includes(id) && (!networkId || id === networkId));
+  }
+
   listPeers(
     filter: {
       networkId?: string;
@@ -449,9 +462,7 @@ export class PeerDirectoryService implements NodeService {
       onlyAvailable?: boolean;
     } = {},
   ): readonly NodeCard[] {
-    const mounted = this.transport.listMountedNetworks();
-    return [...this.peers.entries()]
-      .filter(([networkId]) => mounted.includes(networkId) && (!filter.networkId || networkId === filter.networkId))
+    return this.mountedPeerDirectories(filter.networkId)
       .flatMap(([networkId, directory]) => this.activeNetworkCards(networkId, directory))
       .filter(
         card =>
@@ -490,6 +501,12 @@ export class PeerDirectoryService implements NodeService {
     const selfCard = this.getSelfCard(networkId ?? 'local');
     if (!selector.startsWith('skill:') && this.matchSelector(selfCard, selector)) {
       return [selfCard];
+    }
+    if (selector.startsWith('ed25519:')) {
+      return this.mountedPeerDirectories(networkId)
+        .map(([, directory]) => directory.get(selector))
+        .filter((card): card is NodeCard => card !== undefined && !this.claimsLocalIdentity(card))
+        .map(card => structuredClone(card));
     }
     const remote = this.listPeers({ networkId }).filter(card => this.matchSelector(card, selector));
     if (selector.startsWith('member:') && remote.length > 1 && typeof this.transport.isPeerReachable === 'function') {

@@ -6,10 +6,12 @@ import {
   existsSync,
   fsyncSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   renameSync,
   rmSync,
+  rmdirSync,
   statSync,
   writeFileSync,
   writeSync,
@@ -92,9 +94,7 @@ export function copyFileAtomically(sourcePath: string, destPath: string, mode = 
 }
 
 /**
- * Sole crash-recoverable directory-lock owner shared by every durable store. It claims the
- * directory, records the process incarnation and held-directory truth from process-lock,
- * reclaims only provably dead owners, and always releases the claim on unwind.
+ * Wait briefly for a store's directory lock and release it when the operation unwinds.
  */
 export function withOwnedLock<T>(
   lockDir: string,
@@ -128,6 +128,123 @@ export function withOwnedLock<T>(
   } finally {
     rmSync(lockDir, { recursive: true, force: true });
     releaseOwnedDirectory(lockDir);
+  }
+}
+
+export type NonBlockingLockResult =
+  | { release: () => void; locked?: never; error?: never }
+  | { release?: never; locked: true; error?: never }
+  | { release?: never; locked?: never; error: string };
+
+/** Stage the owner record before publishing the directory. */
+function claimOwnedDirectory(lockDir: string): (() => void) | undefined {
+  if (existsSync(lockDir)) {
+    return undefined;
+  }
+  const stage = mkdtempSync(`${lockDir}.stage.`);
+  const owner = processOwnerRecord();
+  try {
+    writeFileAtomically(join(stage, 'owner.json'), JSON.stringify(owner));
+    if (existsSync(lockDir)) {
+      return undefined;
+    }
+    renameSync(stage, lockDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+      return undefined;
+    }
+    throw error;
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+  holdOwnedDirectory(lockDir);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const current = readProcessOwner(join(lockDir, 'owner.json'));
+    releaseOwnedDirectory(lockDir);
+    if (current?.pid === owner.pid && current.instanceId === owner.instanceId && current.host === owner.host) {
+      rmSync(lockDir, { recursive: true, force: true });
+    }
+  };
+}
+
+function tryAcquireReclaimGate(gateDir: string, label: string): NonBlockingLockResult {
+  const release = claimOwnedDirectory(gateDir);
+  if (release) {
+    return { release };
+  }
+  const ownerPath = join(gateDir, 'owner.json');
+  const owner = readProcessOwner(ownerPath);
+  if (!owner) {
+    return existsSync(gateDir)
+      ? { error: `${label} reclaim gate ${gateDir} has no readable owner record` }
+      : { locked: true };
+  }
+  if (!isDeadProcessOwner(owner, gateDir)) {
+    return { locked: true };
+  }
+  rmSync(ownerPath, { force: true });
+  try {
+    rmdirSync(gateDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTEMPTY' || code === 'EEXIST') {
+      return { locked: true };
+    }
+    throw error;
+  }
+  const reclaimed = claimOwnedDirectory(gateDir);
+  return reclaimed ? { release: reclaimed } : { locked: true };
+}
+
+/** Claim a directory without waiting, or recover it when its recorded owner is dead. */
+export function tryAcquireOwnedLock(lockDir: string, label = 'Directory'): NonBlockingLockResult {
+  try {
+    mkdirSync(dirname(lockDir), { recursive: true, mode: 0o700 });
+    const release = claimOwnedDirectory(lockDir);
+    if (release) {
+      return { release };
+    }
+    const ownerPath = join(lockDir, 'owner.json');
+    const owner = readProcessOwner(ownerPath);
+    if (!owner) {
+      return existsSync(lockDir)
+        ? { error: `${label} lock ${lockDir} has no readable owner record` }
+        : { locked: true };
+    }
+    if (!isDeadProcessOwner(owner, lockDir)) {
+      return { locked: true };
+    }
+    const gate = tryAcquireReclaimGate(`${lockDir}.reclaim`, label);
+    if (!gate.release) {
+      return gate;
+    }
+    const stale = `${lockDir}.stale.${randomUUID()}`;
+    try {
+      // Another process may have recovered the lock before we claimed the gate.
+      const current = readProcessOwner(ownerPath);
+      if (current) {
+        if (!isDeadProcessOwner(current, lockDir)) {
+          return { locked: true };
+        }
+        renameSync(lockDir, stale);
+      } else if (existsSync(lockDir)) {
+        return { error: `${label} lock ${lockDir} has no readable owner record` };
+      }
+    } finally {
+      try {
+        rmSync(stale, { recursive: true, force: true });
+      } finally {
+        gate.release();
+      }
+    }
+    const reclaimed = claimOwnedDirectory(lockDir);
+    return reclaimed ? { release: reclaimed } : { locked: true };
+  } catch (error) {
+    return { error: `Unable to acquire ${label} lock: ${String(error)}` };
   }
 }
 

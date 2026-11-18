@@ -1,11 +1,11 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, rmdirSync, symlinkSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalJson } from '../core-types/index.ts';
-import { appendFileDurably, writeFileAtomically } from '../fs-atomic/index.ts';
-import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
+import { appendFileDurably, tryAcquireOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
+import { isDeadProcessOwner, readProcessOwner } from '../process-lock/index.ts';
 
 export type FingerprintRecord = {
   pid: number;
@@ -206,158 +206,6 @@ export function removeDaemonFingerprint(stateDir: string, instanceId: string): v
   }
 }
 
-type UpdateLockResult =
-  | { release: () => void; locked?: never; error?: never }
-  | { release?: never; locked: true; error?: never }
-  | { release?: never; locked?: never; error: string };
-
-function holdUpdateLock(lock: string): { release: () => void } {
-  holdOwnedDirectory(lock);
-  const owner = processOwnerRecord();
-  let released = false;
-  return {
-    release() {
-      if (released) return;
-      released = true;
-      const current = readProcessOwner(join(lock, 'owner.json'));
-      releaseOwnedDirectory(lock);
-      if (current?.pid === owner.pid && current.instanceId === owner.instanceId && current.host === owner.host) {
-        rmSync(lock, { recursive: true, force: true });
-      }
-    },
-  };
-}
-
-function claimStagedLock(stage: string, lock: string): boolean {
-  try {
-    renameSync(stage, lock);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST' || code === 'ENOTEMPTY') {
-      return false;
-    }
-    throw error;
-  }
-}
-
-/** Claim the reclaim gate with the staged-owner protocol, so it is never ownerless. */
-function claimReclaimGate(reclaim: string): boolean {
-  const stage = `${reclaim}.stage.${process.pid}`;
-  rmSync(stage, { recursive: true, force: true });
-  mkdirSync(stage, { mode: 0o700 });
-  try {
-    atomicJson(join(stage, 'owner.json'), processOwnerRecord());
-    if (existsSync(reclaim)) {
-      return false;
-    }
-    if (!claimStagedLock(stage, reclaim)) {
-      return false;
-    }
-    holdOwnedDirectory(reclaim);
-    return true;
-  } finally {
-    rmSync(stage, { recursive: true, force: true });
-  }
-}
-
-function acquireReclaimGate(reclaim: string): 'acquired' | 'busy' | 'corrupt' {
-  if (claimReclaimGate(reclaim)) {
-    return 'acquired';
-  }
-  if (!existsSync(reclaim)) {
-    return claimReclaimGate(reclaim) ? 'acquired' : 'busy';
-  }
-  const gateOwner = readProcessOwner(join(reclaim, 'owner.json'));
-  if (!gateOwner) {
-    // Never delete an ownerless gate: absence of proof is not proof of death.
-    return 'corrupt';
-  }
-  if (!isDeadProcessOwner(gateOwner, reclaim)) {
-    return 'busy';
-  }
-  // Only a gate whose recorded owner is proven dead may be discarded.
-  rmSync(join(reclaim, 'owner.json'), { force: true });
-  try {
-    rmdirSync(reclaim);
-  } catch {
-    return 'busy';
-  }
-  return claimReclaimGate(reclaim) ? 'acquired' : 'busy';
-}
-
-/**
- * Crash-recoverable claim: the owner record is staged before the rename, so a lock is
- * never observable without a provable owner. A lock whose owner is dead is reclaimed
- * through an owner-backed gate; a lock without any readable owner is surfaced as an
- * error instead of disabling updates silently.
- */
-function acquireUpdateLock(stateDir: string): UpdateLockResult {
-  const lock = join(stateDir, 'auto-update.lock');
-  const stage = `${lock}.stage.${process.pid}`;
-  const prepareStage = () => {
-    rmSync(stage, { recursive: true, force: true });
-    mkdirSync(stage, { mode: 0o700 });
-    atomicJson(join(stage, 'owner.json'), processOwnerRecord());
-  };
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  try {
-    prepareStage();
-    if (!existsSync(lock) && claimStagedLock(stage, lock)) {
-      return holdUpdateLock(lock);
-    }
-  } catch (error) {
-    rmSync(stage, { recursive: true, force: true });
-    return { error: `Unable to prepare auto-update lock: ${String(error)}` };
-  }
-  rmSync(stage, { recursive: true, force: true });
-  const owner = readProcessOwner(join(lock, 'owner.json'));
-  if (!owner) {
-    return { error: `Auto-update lock ${lock} has no readable owner record` };
-  }
-  if (!isDeadProcessOwner(owner, lock)) {
-    return { locked: true };
-  }
-  const reclaim = `${lock}.reclaim`;
-  const stale = `${lock}.stale.${process.pid}`;
-  let gate: 'acquired' | 'busy' | 'corrupt';
-  try {
-    gate = acquireReclaimGate(reclaim);
-  } catch (error) {
-    return { error: `Unable to claim auto-update reclaim gate: ${String(error)}` };
-  }
-  if (gate === 'corrupt') {
-    return { error: `Auto-update reclaim gate ${reclaim} has no readable owner record` };
-  }
-  if (gate === 'busy') {
-    return { locked: true };
-  }
-  try {
-    // Re-read the owner while holding the gate: a competitor may have claimed the
-    // lock after this process failed to create it.
-    const current = readProcessOwner(join(lock, 'owner.json'));
-    if (current && !isDeadProcessOwner(current, lock)) {
-      return { locked: true };
-    }
-    // Move the stale lock out of the claim path before staging the replacement, so
-    // the path is never observably missing while this process holds the gate.
-    rmSync(stale, { recursive: true, force: true });
-    renameSync(lock, stale);
-    prepareStage();
-    return claimStagedLock(stage, lock) ? holdUpdateLock(lock) : { locked: true };
-  } catch (error) {
-    return { error: `Unable to reclaim auto-update lock: ${String(error)}` };
-  } finally {
-    try {
-      rmSync(stale, { recursive: true, force: true });
-      rmSync(stage, { recursive: true, force: true });
-    } finally {
-      releaseOwnedDirectory(reclaim);
-      rmSync(reclaim, { recursive: true, force: true });
-    }
-  }
-}
-
 export interface SelfUpdateOptions {
   stateDir: string;
   checkoutDir?: string;
@@ -474,11 +322,34 @@ function persistUpdateReport(stateDir: string, report: SelfUpdateReport): void {
 
 type ReconcileDaemon = (runtimeFingerprint: string, checkoutDir: string) => Promise<boolean>;
 
+async function reconcileUpdateReport(
+  stateDir: string,
+  report: SelfUpdateReport,
+  reconcile: () => Promise<boolean>,
+): Promise<SelfUpdateReport> {
+  let restarted: boolean;
+  try {
+    restarted = await reconcile();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    report.status = 'failed';
+    report.error = report.error ? `${report.error}; ${message}` : message;
+    persistUpdateReport(stateDir, report);
+    throw error;
+  }
+  if (restarted) {
+    report.restartedDaemon = true;
+    report.lastUpdatedAt = new Date().toISOString();
+    persistUpdateReport(stateDir, report);
+  }
+  return report;
+}
+
 export function selfUpdate(options: SelfUpdateOptions): SelfUpdateReport;
 export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon: ReconcileDaemon): Promise<SelfUpdateReport>;
 export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon?: ReconcileDaemon): SelfUpdateReport | Promise<SelfUpdateReport> {
   const checkedAt = new Date().toISOString();
-  const acquired = acquireUpdateLock(options.stateDir);
+  const acquired = tryAcquireOwnedLock(join(options.stateDir, 'auto-update.lock'), 'Auto-update');
   const { release } = acquired;
   if (!release) {
     const report: SelfUpdateReport = {
@@ -498,14 +369,8 @@ export function selfUpdate(options: SelfUpdateOptions, reconcileDaemon?: Reconci
     if (reconcileDaemon && usableCheckout) {
       // Keep the update lock through the drain and report write so another updater cannot
       // claim the same restart or replace its report while the restart is still in flight.
-      return reconcileDaemon(runtimeFingerprint, root).then(restarted => {
-        if (restarted) {
-          report.restartedDaemon = true;
-          report.lastUpdatedAt = new Date().toISOString();
-          persistUpdateReport(options.stateDir, report);
-        }
-        return report;
-      }).finally(release);
+      return reconcileUpdateReport(options.stateDir, report, () => reconcileDaemon(runtimeFingerprint, root))
+        .finally(release);
     }
     release();
     return reconcileDaemon ? Promise.resolve(report) : report;
@@ -533,15 +398,15 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
       const dirty = git(['status', '--porcelain']);
       const branch = git(['branch', '--show-current']);
       headSha = git(['rev-parse', 'HEAD']);
-      const conflicted = /^(UU|AA|DD|AU|UA|DU|UD) /m.test(dirty) ||
+      const hasConflicts = (porcelain: string) => /^(UU|AA|DD|AU|UA|DU|UD) /m.test(porcelain) ||
         ['MERGE_HEAD', 'rebase-merge', 'rebase-apply'].some(name => existsSync(resolve(root, git(['rev-parse', '--git-path', name]))));
-      usableCheckout = !conflicted;
-      if (conflicted) {
+      if (hasConflicts(dirty)) {
         status = 'failed';
         sourceStatus = 'conflicted_checkout';
         error = 'Checkout has unresolved merge or rebase state';
       } else if (branch !== 'main') {
         sourceStatus = 'skipped_non_main_branch';
+        usableCheckout = true;
       } else {
         const beforeSha = headSha;
         const stashRef = () => {
@@ -565,6 +430,7 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
         try { git(['pull', '--ff-only']); }
         catch (pullError) {
           if (savedStash) restore();
+          usableCheckout = !hasConflicts(git(['status', '--porcelain']));
           throw pullError;
         }
         const pulledSha = git(['rev-parse', 'HEAD']);
@@ -573,6 +439,7 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
           try { git(['stash', 'pop', '--index']); }
           catch {
             restore();
+            usableCheckout = true;
             restored = false;
             status = 'failed';
             sourceStatus = 'stash_conflict_rolled_back';
@@ -581,6 +448,7 @@ function updateCheckout(options: SelfUpdateOptions, checkedAt: string) {
           }
         }
         if (restored) {
+          usableCheckout = true;
           sourceStatus = pulledSha === beforeSha ? 'up_to_date' : 'updated';
           status = sourceStatus === 'updated' ? 'updated' : 'complete';
           headSha = pulledSha;
@@ -616,7 +484,7 @@ function lastCheckedAt(report?: SelfUpdateReport): number {
 }
 
 function reserveBackgroundUpdate(stateDir: string): boolean {
-  const acquired = acquireUpdateLock(stateDir);
+  const acquired = tryAcquireOwnedLock(join(stateDir, 'auto-update.lock'), 'Auto-update');
   if (acquired.error) {
     throw new Error(acquired.error);
   }

@@ -102,7 +102,7 @@ test('peer routing prefers self and reachable teammates while retaining verified
   const persistedIds = async () => new Set<string>(
     JSON.parse(await readFile(peersPath, 'utf8')).cards.map((entry: NodeCard) => entry.nodeId),
   );
-  const verified = [oldGhost, newGhost, older, newer, oldest, otherMachine, otherNetwork];
+  const verified = [oldGhost, newGhost, duplicateSelf, older, newer, oldest, otherMachine, otherNetwork];
   assert.deepEqual(await persistedIds(), new Set(verified.map(entry => entry.nodeId)));
   const transport: P2PTransportService = kernel.ctx.services.transport;
   const node: PeerDirectoryService = kernel.ctx.services.node;
@@ -178,6 +178,9 @@ test('peer failover restores a reachable fallback after restart and rejects stal
     assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [active]);
     assert.deepEqual(node.resolveTarget('member:oliver', 'team'), [active]);
     assert.deepEqual(node.listPeers({ networkId: 'team' }), [active]);
+    assert.deepEqual(node.resolveTarget(lastProfile.nodeId, 'team'), [lastProfile]);
+    assert.deepEqual(node.resolveTarget(replacement.nodeId, 'team'), [replacement]);
+    assert.deepEqual(node.resolveTarget(replacement.nodeId, 'another-team'), []);
   };
   assertActivePeer(lastProfile);
 
@@ -198,6 +201,51 @@ test('peer failover restores a reachable fallback after restart and rejects stal
   assert.equal(updates.length, 1);
   assert.equal(await readFile(peersPath, 'utf8'), beforeHeartbeat);
   assert.equal((await stat(peersPath)).ino, beforeStat.ino);
+});
+
+test('a peer claiming the local identity retains its revision across restart', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-peer-local-identity-'));
+  const peersPath = join(dir, 'peers.json');
+  const local = generateNodeKeyPair();
+  const remote = generateNodeKeyPair();
+  const earlier = card('oliver', 'desktop', { revision: 10 }, remote);
+  const localClaim = card('ben', 'local', { revision: 11, endpointAddr: '127.0.0.1:45678' }, remote);
+  const kernels: Kernel[] = [];
+  t.after(async () => {
+    await Promise.all(kernels.map(kernel => kernel.stop()));
+    await rm(dir, { recursive: true, force: true });
+  });
+  for (const restarting of [false, true]) {
+    const kernel = new Kernel([
+      { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+      { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local', peersPath }) },
+    ]);
+    kernels.push(kernel);
+    await kernel.start();
+    const transport: P2PTransportService = kernel.ctx.services.transport;
+    const node: PeerDirectoryService = kernel.ctx.services.node;
+    await transport.mountNetwork({ networkId: 'team', passphrase: 'test-secret' });
+    if (!restarting) {
+      deliverPeerCard(kernel, earlier);
+      assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [earlier]);
+    }
+    const register = t.mock.method(transport, 'registerPeerEndpoint', () => {});
+    const updated = t.mock.fn();
+    kernel.ctx.on('node/peer-updated', updated);
+    if (!restarting) {
+      deliverPeerCard(kernel, localClaim);
+    }
+    assert.deepEqual(node.resolveTarget(remote.nodeId, 'team'), []);
+    deliverPeerCard(kernel, earlier);
+    assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), []);
+    assert.deepEqual(node.resolveTarget('skill:release', 'team'), []);
+    assert.deepEqual(node.resolveTarget(remote.nodeId, 'team'), []);
+    assert.deepEqual(node.listPeers({ networkId: 'team' }), []);
+    assert.equal(register.mock.callCount(), 0);
+    assert.equal(updated.mock.callCount(), 0);
+    assert.deepEqual(JSON.parse(await readFile(peersPath, 'utf8')).cards, [localClaim]);
+    await kernel.stop();
+  }
 });
 
 test('selector and self card reads leave the peer store unchanged across a heartbeat', { timeout: 10_000 }, async t => {

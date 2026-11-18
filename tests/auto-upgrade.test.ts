@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess, { execFileSync, spawn } from 'node:child_process';
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -990,6 +991,63 @@ test('overlapping self-updates keep the same-process lock through daemon reconci
     await first;
   }
   assert.equal((await first).restartedDaemon, true);
+  assert.equal(existsSync(lock), false);
+});
+
+test('self-update leaves binary links and daemon reconciliation alone when stash restoration fails', async t => {
+  const { root, stateDir, checkout, writer } = updateCheckoutFixture(t);
+  const bin = join(root, '.local', 'bin');
+  mkdirSync(bin, { recursive: true });
+  const link = join(bin, 'dealerd');
+  const original = join(root, 'serving', 'bin', 'dealerd.js');
+  symlinkSync(original, link);
+
+  writeFileSync(join(checkout, 'tracked.txt'), 'local edits\n');
+  writeFileSync(join(writer, 'upstream.txt'), 'upstream\n');
+  git(writer, ['add', 'upstream.txt']);
+  git(writer, ['commit', '-m', 'upstream']);
+  git(writer, ['push']);
+  const hooks = join(root, 'hooks');
+  mkdirSync(hooks);
+  git(checkout, ['config', 'core.hooksPath', hooks]);
+  writeFileSync(join(hooks, 'post-merge'), '#!/bin/sh\ngit stash drop\n', { mode: 0o755 });
+
+  const reconcile = t.mock.fn(async () => false);
+  const report = await selfUpdate({ stateDir, checkoutDir: checkout, homeDir: root }, reconcile);
+  assert.equal(report.status, 'failed');
+  assert.equal(report.sourceStatus, 'error');
+  assert.match(report.error ?? '', /Temporary update stash is no longer the newest stash/);
+  assert.deepEqual(report.syncedBinaries, []);
+  assert.equal(readlinkSync(link), original);
+  assert.equal(existsSync(join(bin, 'dealer')), false);
+  assert.equal(reconcile.mock.callCount(), 0);
+});
+
+test('self-update reports a daemon probe failure to the CLI and persists it', async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture(t);
+  const lock = join(stateDir, 'auto-update.lock');
+  const error = 'Daemon status probe failed';
+  let lockHeldDuringProbe = false;
+  const server = createServer((request, response) => {
+    request.resume();
+    lockHeldDuringProbe = existsSync(join(lock, 'owner.json'));
+    response.writeHead(500).end(error);
+  });
+  server.listen(join(stateDir, 'control.sock'));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  await once(server, 'listening');
+
+  const result = await runDealer(['self-update', '--checkout-dir', checkout, '--home-dir', root, '--json'], stateDir);
+  assert.equal(result.code, 1);
+  assert.deepEqual(JSON.parse(result.stderr), { error });
+  assert.equal(lockHeldDuringProbe, true);
+  const report = JSON.parse(readFileSync(join(stateDir, 'auto-update.json'), 'utf8'));
+  assert.equal(report.status, 'failed');
+  assert.equal(report.sourceStatus, 'up_to_date');
+  assert.equal(report.error, error);
+  assert.equal(report.restartedDaemon, false);
+  const log = readFileSync(join(stateDir, 'auto-update.log'), 'utf8').trim().split('\n');
+  assert.deepEqual(JSON.parse(log.at(-1)!), report);
   assert.equal(existsSync(lock), false);
 });
 
