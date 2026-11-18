@@ -66,6 +66,7 @@ export interface OrcaWorkspaceIdleOptions {
   targetPaneKey?: string;
   /** Preferred target agent when the bound terminal is gone and a rebind picks a replacement. */
   agent?: SupportedOrcaAgent;
+  excludedHandles?: ReadonlySet<string>;
 }
 
 /** Reuse candidates in the same order terminal resolution falls back through them. */
@@ -152,9 +153,11 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
+    const canUse = (terminal: OrcaTerminalRow) => !options?.excludedHandles?.has(String(terminal.handle));
+    const eligibleHandles = handles.filter(canUse);
     const targetTerm = row.path === cwd
-      ? handles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
-        ?? handles.find(t => matchesPane(t, options?.targetPaneKey))
+      ? eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
+        ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
       : undefined;
     if (row.path === cwd && options?.targetPaneKey?.trim() && !targetTerm) return true;
     const targetPaneKeys = new Set<string>();
@@ -190,11 +193,12 @@ export async function checkOrcaWorkspaceIdle(
     // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
     // rebind could reuse when it was closed).
     const rootTarget = row.path === cwd ? (targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle) : undefined;
+    const eligibleObservableHandles = observableHandles.filter(canUse);
     const targetPresent =
-      typeof rootTarget === 'string' && observableHandles.some((t) => String(t.handle) === rootTarget);
+      typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
     const reuseHandles =
       typeof rootTarget === 'string' && !targetPresent
-        ? new Set(reusableTerminalCandidates(observableHandles, options?.agent).map((t) => String(t.handle)))
+        ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
         : undefined;
     const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
       if (row.path !== cwd) return true;
@@ -204,7 +208,7 @@ export async function checkOrcaWorkspaceIdle(
       // The bound terminal was closed: only the terminals a rebind could reuse are inspected.
       return reuseHandles?.has(String(terminal.handle)) === true;
     };
-    for (const terminal of observableHandles) {
+    for (const terminal of eligibleObservableHandles) {
       if (!gatesWakeup(terminal)) {
         continue;
       }
@@ -225,17 +229,16 @@ export async function checkOrcaWorkspaceIdle(
     }
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
-      if (
-        targetPaneKeys.size > 0 &&
-        child?.agents?.length &&
-        child.agents.every(
-          (agent) =>
-            typeof agent.parentPaneKey === 'string' &&
-            agent.parentPaneKey.length > 0 &&
-            !targetPaneKeys.has(agent.parentPaneKey),
-        )
-      )
-        continue;
+      if (targetPaneKeys.size > 0) {
+        const childAgents = child?.agents;
+        if (handles.length > 1) {
+          if (!childAgents?.some(agent => typeof agent.parentPaneKey === 'string' && targetPaneKeys.has(agent.parentPaneKey))) continue;
+        } else if (childAgents?.length && childAgents.every(agent =>
+          typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey),
+        )) {
+          continue;
+        }
+      }
       if (!child || !(await idleTree(child))) {
         return false;
       }
@@ -585,7 +588,7 @@ export async function planOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean; excludedHandles?: ReadonlySet<string> },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
   const targetAgent = options?.agent ?? 'antigravity';
   const listed = await checkedCommand(runner, {
@@ -598,7 +601,9 @@ export async function planOrcaWorkspaceTerminal(
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
-  const terminals = inventory.result.terminals as OrcaTerminalRow[];
+  const terminals = (inventory.result.terminals as OrcaTerminalRow[]).filter(
+    terminal => terminal && !options?.excludedHandles?.has(String(terminal.handle)),
+  );
   // A workspace already bound to a terminal reuses exactly that terminal: orphaned only means the
   // workspace registry lost track of it, not that its live TUI stopped accepting wakeups.
   const preferredHandle = options?.preferredHandle;
