@@ -35,7 +35,7 @@ const MAX_GOSSIPED_PEER_CARDS = 128;
 
 type PeerRevisions = Map<string, Map<string, number>>;
 type CardAcceptance = 'ignored' | 'revision' | 'candidate';
-type PeerCandidates = { newest: NodeCard; reachable?: NodeCard; offline?: NodeCard[] };
+type PeerCandidates = { newest: NodeCard; reachable?: NodeCard; cards?: NodeCard[] };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype;
@@ -222,7 +222,7 @@ export class PeerDirectoryService implements NodeService {
     );
   }
 
-  /** Project one active card per identity. Ingress may also compact offline alternatives. */
+  /** Project one active card per identity. Ingress retains only the newest and newest reachable cards. */
   private activeNetworkCards(networkId: string, directory: Map<string, NodeCard>, compactIdentity?: string): NodeCard[] {
     const groups = new Map<string, PeerCandidates>();
     for (const card of directory.values()) {
@@ -230,7 +230,8 @@ export class PeerDirectoryService implements NodeService {
       if (compactIdentity !== undefined && key !== compactIdentity) {
         continue;
       }
-      const group: PeerCandidates = groups.get(key) ?? { newest: card, offline: compactIdentity === undefined ? undefined : [] };
+      const group: PeerCandidates = groups.get(key) ?? { newest: card, cards: compactIdentity === undefined ? undefined : [] };
+      group.cards?.push(card);
       if (isNewerPeerCard(card, group.newest)) {
         group.newest = card;
       }
@@ -238,14 +239,12 @@ export class PeerDirectoryService implements NodeService {
         if (!group.reachable || isNewerPeerCard(card, group.reachable)) {
           group.reachable = card;
         }
-      } else {
-        group.offline?.push(card);
       }
       groups.set(key, group);
     }
-    return Array.from(groups.values(), ({ newest, reachable, offline }) => {
-      for (const card of offline ?? []) {
-        if (card.nodeId !== newest.nodeId) {
+    return Array.from(groups.values(), ({ newest, reachable, cards }) => {
+      for (const card of cards ?? []) {
+        if (card.nodeId !== newest.nodeId && card.nodeId !== reachable?.nodeId) {
           directory.delete(card.nodeId);
         }
       }
@@ -305,16 +304,19 @@ export class PeerDirectoryService implements NodeService {
     const directory = this.peers.get(card.networkId) ?? new Map<string, NodeCard>();
     const revisionFloors = this.peerRevisions.get(card.networkId) ?? new Map<string, number>();
     const existing = directory.get(card.nodeId);
+    const observedFloor = revisionFloors.get(card.nodeId) ?? 0;
     const previousFloor = Math.max(
       existing?.revision ?? 0,
-      revisionFloors.get(card.nodeId) ?? 0,
+      observedFloor,
       storedFloors?.get(card.networkId)?.get(card.nodeId) ?? 0,
     );
-    if (card.revision < previousFloor) {
+    // A stored floor can hydrate its candidate once on startup. An observed revision
+    // whose candidate was excluded can only be followed by a newer revision.
+    if (card.revision < previousFloor || (!existing && observedFloor >= card.revision)) {
       return 'ignored';
     }
     const revisionAdvanced = card.revision > previousFloor;
-    if (revisionAdvanced) {
+    if (card.revision > observedFloor) {
       revisionFloors.set(card.nodeId, card.revision);
       this.peerRevisions.set(card.networkId, revisionFloors);
     }

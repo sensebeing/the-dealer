@@ -127,6 +127,11 @@ test('peer routing prefers self and reachable teammates, and persists only curre
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
   assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [newGhost]);
   assert.deepEqual(await persistedIds(), new Set([newGhost, claimant, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
+
+  reachable.add(claimant.nodeId);
+  deliverPeerCard(kernel, claimant);
+  assert.deepEqual(node.resolveTarget('ben@ben', 'team'), [claimant]);
+  assert.deepEqual(await persistedIds(), new Set([claimant, replacement, otherMachine, otherNetwork].map(entry => entry.nodeId)));
 });
 
 test('peer failover reconsiders an unchanged replacement while retaining replay floors after restart', async t => {
@@ -140,6 +145,7 @@ test('peer failover reconsiders an unchanged replacement while retaining replay 
   const replacement = card('oliver', 'desktop', { updatedAt: '2026-01-02T00:00:00.000Z' });
   const rejected = card('oliver', 'desktop', { revision: 12 }, excluded);
   const excludedReplay = card('oliver', 'tablet', {}, excluded);
+  const equivocation = card('oliver', 'tablet', { revision: rejected.revision }, excluded);
   await writeFile(peersPath, JSON.stringify({ schema: 'the-dealer-peer-directory/v1', cards: [oldProfile, lastProfile] }));
   const kernels: Kernel[] = [];
   t.after(async () => { await Promise.all(kernels.map(kernel => kernel.stop())); await rm(dir, { recursive: true, force: true }); });
@@ -162,6 +168,8 @@ test('peer failover reconsiders an unchanged replacement while retaining replay 
   deliverPeerCard(kernel, excludedReplay);
   assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), [excludedReplay]);
   deliverPeerCard(kernel, rejected);
+  deliverPeerCard(kernel, equivocation);
+  assert.deepEqual(node.resolveTarget('oliver@tablet', 'team'), []);
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [lastProfile]);
   assert.deepEqual(node.listPeers({ networkId: 'team' }), [lastProfile]);
   const waitingSnapshot = JSON.parse(await readFile(peersPath, 'utf8'));
@@ -187,7 +195,7 @@ test('peer failover reconsiders an unchanged replacement while retaining replay 
   // Restart from the state before the unchanged heartbeat pruned the incumbent.
   await writeFile(peersPath, JSON.stringify(waitingSnapshot));
   ({ kernel, node } = await openDirectory());
-  for (const replay of [oldProfile, excludedReplay]) deliverPeerCard(kernel, replay);
+  for (const replay of [oldProfile, excludedReplay, equivocation]) deliverPeerCard(kernel, replay);
   assert.deepEqual(node.resolveTarget('oliver@desktop', 'team'), [replacement]);
   assert.deepEqual(node.listPeers({ networkId: 'team' }), [replacement]);
   assert.deepEqual(JSON.parse(await readFile(peersPath, 'utf8')).cards, [replacement]);
