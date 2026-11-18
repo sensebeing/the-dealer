@@ -452,6 +452,22 @@ test('slotted alerts inherit a base topic binding and route to independent mailb
     assert.equal(target?.driverConfig?.workspacePath, workspacePath);
     assert.equal(target?.rotateAfterWaves, 4);
   }
+
+  const updatedWorkspace = join(root, 'updated-alerts');
+  const explicitWorkspace = join(root, 'explicit-slot');
+  runtime.config.topicBindings = {
+    [`${topic}:tools-alert:3`]: { ...binding, streamKey: 'tools-alert:3', workspacePath: explicitWorkspace, rotateAfterWaves: 9 },
+    [`${topic}:tools-alert`]: { ...binding, workspacePath: updatedWorkspace, rotateAfterWaves: 6 },
+  };
+  await runtime.applyAgentPreset({ host: 'codex', mode: 'inbox-only', topic: 'reconfiguration.trigger' });
+
+  const inherited = runtime.mailbox.getWakeTarget('stream:tools-alert:2');
+  assert.equal(inherited?.driverConfig?.workspacePath, updatedWorkspace);
+  assert.equal(inherited?.rotateAfterWaves, 6);
+  assert.equal(runtime.mailbox.list({ mailboxId: 'stream:tools-alert:2' }).queuedCount, 1);
+  const explicitSlot = runtime.mailbox.getWakeTarget('stream:tools-alert:3');
+  assert.equal(explicitSlot?.driverConfig?.workspacePath, explicitWorkspace);
+  assert.equal(explicitSlot?.rotateAfterWaves, 9);
 });
 
 test('concurrent alert slot wakeups open independent tabs in one workspace', async t => {

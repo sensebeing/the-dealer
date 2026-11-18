@@ -1054,18 +1054,38 @@ export class DealerNodeRuntime {
     for (const project of this.loadedProjects.values()) {
       for (const kind of Object.keys(project.userPatch?.topicBindings ?? {})) kinds.add(kind);
     }
+    const wakeTargets = this.mailbox.listWakeTargets();
     const mailboxes: string[] = [];
-    for (const kind of kinds) {
-      const { binding, projectRoot } = this.resolveTopicBinding(kind)!;
-      const mailboxId = resolveBoundMailboxId(kind, this.registry.toMailboxBinding(binding, this.config.executorConfig));
-      const notifyLark = typeof binding.notifyLark === 'boolean' ? binding.notifyLark
-        : !kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
-          this.registry.executor(manifest.topics?.[kind]?.defaultExecutor ?? '')?.interactiveAgent === true);
+    const syncBinding = (
+      kind: string,
+      { binding, projectRoot }: { binding: TopicBindingConfig; projectRoot?: string },
+      inherited?: { mailboxId: string; notifyLark: boolean },
+    ) => {
+      const addressing = this.registry.toMailboxBinding(binding, this.config.executorConfig);
+      const mailboxId = resolveBoundMailboxId(kind, addressing);
+      if (inherited && mailboxId !== inherited.mailboxId) return;
+      const notifyLark = binding.notifyLark ?? inherited?.notifyLark ??
+        (!kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
+          this.registry.executor(manifest.topics?.[kind]?.defaultExecutor ?? '')?.interactiveAgent === true));
       if (notifyLark) mailboxes.push(mailboxId);
       this.registry.executor(binding.executor)?.syncTopicWakeTarget?.({
-        kind, mailboxId, binding, projectRoot, store: this.mailbox, wave: this.config.wave,
-        addressing: this.registry.toMailboxBinding(binding, this.config.executorConfig),
+        kind, mailboxId, binding, projectRoot, store: this.mailbox, wave: this.config.wave, addressing,
       });
+      return { mailboxId, notifyLark };
+    };
+    for (const kind of kinds) {
+      const resolved = this.resolveTopicBinding(kind)!;
+      const base = syncBinding(kind, resolved);
+      if (resolved.binding.mailboxId !== undefined || !base?.mailboxId.startsWith('stream:')) continue;
+      const topic = kind.split(':', 1)[0];
+      for (const target of wakeTargets) {
+        if (baseStreamKeyOf(target.mailboxId) !== base.mailboxId) continue;
+        const slotStreamKey = target.mailboxId.slice('stream:'.length);
+        const slotKind = `${topic}:${slotStreamKey}`;
+        if (kinds.has(slotKind)) continue;
+        const slot = this.resolveTopicBinding(topic, slotStreamKey);
+        if (slot) syncBinding(slotKind, slot, { mailboxId: target.mailboxId, notifyLark: base.notifyLark });
+      }
     }
     this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);
     return mailboxes;
