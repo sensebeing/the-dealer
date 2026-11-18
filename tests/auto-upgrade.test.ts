@@ -4,10 +4,12 @@ import childProcess, { execFileSync, spawn } from 'node:child_process';
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { once } from 'node:events';
 import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { computeRuntimeFingerprint, readDaemonFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from '../packages/cli/auto-update.ts';
-import { DealerNodeRuntime, ensureDaemonRunning, restartDaemon, runDealerCli, runDealerDaemon, stopDaemonIfRunning } from '../packages/cli/index.ts';
+import { DealerNodeRuntime, ensureDaemonRunning, restartDaemon, rpc, runDealerCli, runDealerDaemon, stopDaemonIfRunning } from '../packages/cli/index.ts';
+import { holdOwnedDirectory, processOwnerRecord, releaseOwnedDirectory } from '../packages/process-lock/index.ts';
 
 const dealerBin = fileURLToPath(new URL('../bin/dealer.js', import.meta.url));
 
@@ -464,6 +466,37 @@ test('up-to-date self-update from a linked worktree heals main links and restart
   assert.equal(readlinkSync(join(localBin, 'dealerd')), join(checkout, 'bin', 'dealerd.js'));
 });
 
+test('self-update leaves an offline node stopped when its control socket is stale', { timeout: 30_000 }, async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture({ after: cleanup => t.after(async () => {
+    try {
+      await stopDaemonIfRunning(stateDir, { force: true });
+    } finally {
+      cleanup();
+    }
+  }) });
+  copyDealerCode(checkout);
+  git(checkout, ['add', '-A']);
+  git(checkout, ['commit', '-m', 'add runnable dealer']);
+  git(checkout, ['push']);
+  const socket = join(stateDir, 'control.sock');
+  const listener = spawn(process.execPath, ['-e', "require('node:net').createServer().listen(process.argv[1], () => console.log('ready'))", socket], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const exited = once(listener, 'exit');
+  await Promise.race([once(listener.stdout, 'data'), exited.then(() => assert.fail('listener exited before binding'))]);
+  listener.kill('SIGKILL');
+  await exited;
+  assert.ok(existsSync(socket));
+  assert.ok(!existsSync(join(stateDir, 'runtime.lock')));
+  await assert.rejects(rpc(socket, ['node', 'status', '--json']), { code: 'ECONNREFUSED' });
+
+  const report = await dealer(['self-update', '--checkout-dir', checkout, '--home-dir', root], stateDir);
+  assert.equal(report.sourceStatus, 'up_to_date');
+  assert.equal(report.restartedDaemon, false);
+  assert.equal(readDaemonFingerprint(stateDir), undefined);
+  assert.ok(!existsSync(join(stateDir, 'runtime.lock')));
+});
+
 test('dealer node restart tolerates concurrent ensureDaemonRunning and node down stops cleanly', { timeout: 90_000 }, async t => {
   const { root, stateDir } = isolatedState();
   t.after(async () => {
@@ -827,10 +860,22 @@ test('background auto-update bypasses cooldown for disk or live daemon drift wit
   check();
   assert.deepEqual(calls, []);
   writeStatus(current, 60);
-  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({ fingerprint: 'old-daemon' }));
+  const owner = processOwnerRecord();
+  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({ ...owner, fingerprint: 'old-daemon' }));
   check();
   assert.deepEqual(calls, []);
   writeFileSync(join(stateDir, 'control.sock'), '');
+  const lockDir = join(stateDir, 'runtime.lock');
+  mkdirSync(lockDir);
+  writeFileSync(join(lockDir, 'owner.json'), JSON.stringify(owner));
+  check();
+  assert.deepEqual(calls, []);
+  holdOwnedDirectory(stateDir);
+  t.after(() => releaseOwnedDirectory(stateDir));
+  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({ ...owner, instanceId: 'previous', fingerprint: 'old-daemon' }));
+  check();
+  assert.deepEqual(calls, []);
+  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({ ...owner, fingerprint: 'old-daemon' }));
   check();
   check();
   assert.deepEqual(calls, [stateDir]);

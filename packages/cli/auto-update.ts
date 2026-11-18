@@ -190,6 +190,15 @@ export function readDaemonFingerprint(stateDir: string): FingerprintRecord | und
   }
 }
 
+export function liveDaemonOwner(stateDir: string) {
+  try {
+    const owner = readProcessOwner(join(stateDir, 'runtime.lock', 'owner.json'));
+    return owner && !isDeadProcessOwner(owner, stateDir) ? owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function removeDaemonFingerprint(stateDir: string, instanceId: string): void {
   const path = join(stateDir, 'runtime-fingerprint.json');
   if (readDaemonFingerprint(stateDir)?.instanceId === instanceId) {
@@ -614,8 +623,10 @@ export function maybeTriggerBackgroundAutoUpdate(options: SelfUpdateOptions): vo
     return;
   }
   const currentFingerprint = computeRuntimeFingerprint(options.stateDir, updateCheckoutFor(options));
-  const daemonFingerprint = existsSync(join(options.stateDir, 'control.sock'))
-    ? readDaemonFingerprint(options.stateDir)?.fingerprint
+  const daemonOwner = existsSync(join(options.stateDir, 'control.sock')) ? liveDaemonOwner(options.stateDir) : undefined;
+  const daemonRecord = daemonOwner ? readDaemonFingerprint(options.stateDir) : undefined;
+  const daemonFingerprint = daemonOwner && daemonRecord?.pid === daemonOwner.pid && daemonRecord.instanceId === daemonOwner.instanceId
+    ? daemonRecord.fingerprint
     : undefined;
   const localSyncNeeded = state?.runtimeFingerprint !== currentFingerprint ||
     (daemonFingerprint !== undefined && daemonFingerprint !== currentFingerprint);

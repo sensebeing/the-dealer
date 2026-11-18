@@ -23,10 +23,10 @@ import {
   isTerminalDeliveryFailure,
 } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
-import { computeRuntimeFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
+import { computeRuntimeFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
-import { isDeadProcessOwner, processOwnerRecord, readProcessOwner } from '../process-lock/index.ts';
+import { processOwnerRecord } from '../process-lock/index.ts';
 
 export * from './runtime.ts';
 export * from './config.ts';
@@ -368,15 +368,6 @@ async function launchDaemon(argv: string[], stateDir: string, checkoutDir?: stri
       }
     });
   });
-}
-
-function liveDaemonOwner(stateDir: string) {
-  try {
-    const owner = readProcessOwner(join(stateDir, 'runtime.lock', 'owner.json'));
-    return owner && !isDeadProcessOwner(owner, stateDir) ? owner : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 type DaemonProbe = 'live' | 'absent' | 'stale_recovered';
@@ -1314,9 +1305,14 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const report = await selfUpdate(
         { stateDir, checkoutDir: v['checkout-dir'], homeDir: v['home-dir'], geminiDir: v['gemini-dir'] },
         async (runtimeFingerprint, checkoutDir) => {
-          if (!existsSync(join(stateDir, 'control.sock'))) return false;
-          const probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
-          if (probe.state === 'ready') return false;
+          if (!existsSync(join(stateDir, 'control.sock')) && !liveDaemonOwner(stateDir)) return false;
+          let probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
+          if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
+            const ready = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint);
+            if (ready) return false;
+            probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
+          }
+          if (probe.state !== 'mismatch') return false;
           const restarted = await restartDaemon(stateDir, { checkoutDir });
           return !(restarted as { deferred?: boolean } | null)?.deferred;
         },
