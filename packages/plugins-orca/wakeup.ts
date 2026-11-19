@@ -506,6 +506,7 @@ function buildPinnedOrcaSessionDriverConfig(
     configuredSessionId: undefined,
     configuredTerminalHandle: undefined,
     retiredSessionId: undefined,
+    retiredTerminalHandle: undefined,
   };
 }
 
@@ -787,6 +788,8 @@ class OrcaWakeDelivery {
     };
     let retirementAttempted = false;
     const attemptRetirement = async (): Promise<void> => {
+      // A pinned session mailbox never rotates, so it must never act on an inherited retirement.
+      if (target.rotateAfterWaves === undefined) return;
       retirementAttempted = true;
       const retirement = await this.retireReplacedTerminal(mailboxId, target, terminalHandle, command, activeRevision);
       if (retirement.warning !== undefined) appendWarning(retirement.warning);
@@ -815,6 +818,21 @@ class OrcaWakeDelivery {
         throw new Error(`Orca session rotation requires a workspacePath: ${mailboxId}`);
       }
       const workspacePath = target.workspacePath;
+      // A previous rotation's close may still be unconfirmed. Retry it before this launch, because
+      // the launch patch would overwrite the persisted retired handle; until it closes, the next
+      // rotation is deferred so a slot never loses track of a live retired terminal.
+      if (needsRotation && target.retiredTerminalHandle && target.rotateAfterWaves !== undefined) {
+        const prior = await this.retireReplacedTerminal(mailboxId, target, terminalHandle, command, activeRevision);
+        const refreshed = this.store.getWakeTarget(mailboxId);
+        if (refreshed) {
+          target = readOrcaWakeTarget(refreshed);
+          activeRevision = target.bindingRevision ?? 0;
+          setActiveRevision(activeRevision);
+        }
+        if (target.retiredTerminalHandle) {
+          return this.defer(mailboxId, target, prior.warning ?? 'Retired terminal close pending before next rotation');
+        }
+      }
       const spawned = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
         command,
         workspacePath,

@@ -662,6 +662,81 @@ test('a retired terminal claimed by another mailbox before the close boundary is
   assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
 });
 
+test('an unconfirmed retiring-terminal close defers the next rotation instead of overwriting it', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'retry-before-rotate');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-1', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  let closeOk = false;
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'close' && !closeOk) {
+      state.calls.push(request);
+      return { stdout: '{"ok":false}' };
+    }
+    return runner(request);
+  };
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner }),
+  });
+  t.after(() => service.stop());
+  const mailboxId = 'stream:retry-before-rotate';
+  const ack = () => {
+    const lease = store.check({ mailboxId });
+    store.ack(lease.deliveryId!);
+  };
+
+  store.enqueue([alert('wave-one')], {
+    mailboxId,
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-1' },
+    },
+  });
+  const first = await service.flushMailbox(mailboxId);
+  assert.equal(first.woke, true, first.reason);
+  assert.equal(first.rotated, true);
+  assert.equal(state.created, 1);
+  assert.match(String(first.warning), /Retired terminal close failed \(term-1\)/);
+  assert.equal(store.getWakeTarget(mailboxId)!.driverConfig?.retiredTerminalHandle, 'term-1');
+
+  ack();
+  store.enqueue([alert('wave-two')], { mailboxId });
+  const deferred = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(deferred.woke, false);
+  assert.match(String(deferred.reason), /Retired terminal close failed \(term-1\)/);
+  assert.equal(deferred.rotated, undefined);
+  assert.equal(state.created, 1, 'the next rotation waits for the earlier retired tab to close');
+  assert.equal(
+    store.getWakeTarget(mailboxId)!.driverConfig?.retiredTerminalHandle,
+    'term-1',
+    'a pending retirement is never overwritten by the next rotation',
+  );
+  assert.equal(store.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, 'term-new-1');
+
+  closeOk = true;
+  const rotated = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 2, 'the deferred rotation finally opens its replacement');
+  const closeCalls = state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'close');
+  assert.deepEqual(
+    closeCalls.map(call => call.args[call.args.indexOf('--terminal') + 1]),
+    ['term-1', 'term-1', 'term-1', 'term-new-1'],
+    'the retry fails twice, then closes term-1 before the launch and term-new-1 after it',
+  );
+  assert.equal(store.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, 'term-new-2');
+  assert.equal(store.getWakeTarget(mailboxId)!.driverConfig?.retiredTerminalHandle, undefined);
+  assert.deepEqual(state.terminals.map(terminal => terminal.handle), ['term-new-2']);
+  assert.equal(sendsTo(state.calls, 'term-new-2').length, 1);
+});
+
 for (const retainedComposer of [
   '> unsent draft',
   '• ,1（主推）：继续检查剩余任务\n> 继续检查剩余任务',
@@ -3349,7 +3424,7 @@ test('rotating mailbox pins the active conversation identity durably', t => {
   const file = join(directory(t), 'mailbox.json');
   const store = new MailboxStore(file);
   store.upsertWakeTarget('stream:wave', {
-    driver: 'orca-terminal', rotateAfterWaves: 1, driverConfig: { workspacePath: '/workspace', terminalHandle: 'term-original',...{ retiredSessionId: 'prior-session', configuredSessionId: 'original-session', configuredTerminalHandle: 'term-original', paneKey: 'tab:leaf' }, agent: 'codex', sessionId: 'original-session'}});
+    driver: 'orca-terminal', rotateAfterWaves: 1, driverConfig: { workspacePath: '/workspace', terminalHandle: 'term-original',...{ retiredSessionId: 'prior-session', configuredSessionId: 'original-session', configuredTerminalHandle: 'term-original', retiredTerminalHandle: 'term-retired', paneKey: 'tab:leaf' }, agent: 'codex', sessionId: 'original-session'}});
   assert.equal(pinOrcaTerminalSessionMailbox(store, 'stream:wave', 'term-original'), 'terminal:term-original');
   const pinned = new MailboxStore(file).getWakeTarget('terminal:term-original')!;
   assert.equal(pinned.driverConfig?.agent, 'codex');
@@ -3359,6 +3434,7 @@ test('rotating mailbox pins the active conversation identity durably', t => {
   assert.equal(sessionBinding(pinned).configuredSessionId, undefined);
   assert.equal(sessionBinding(pinned).configuredTerminalHandle, undefined);
   assert.equal(sessionBinding(pinned).retiredSessionId, undefined);
+  assert.equal(sessionBinding(pinned).retiredTerminalHandle, undefined);
 });
 
 for (const busyOwner of ['restored', 'child'] as const) {
@@ -4038,19 +4114,21 @@ test('rotating wave pinning preserves session-owned identity and clears parent p
   store.enqueue([alert('pinned-first')], { mailboxId, wakeTarget: {
     driver: 'orca-terminal', rotateAfterWaves: 2, coalesceMs: 0,
     driverConfig: { workspacePath: root, terminalHandle: 'term-1', agent: 'claude',
-      sessionId: 'parent-session', paneKey: 'parent:pane', configuredSessionId: 'parent-session' },
+      sessionId: 'parent-session', paneKey: 'parent:pane', configuredSessionId: 'parent-session',
+      retiredTerminalHandle: 'term-retired' },
   } });
   assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
   store.upsertWakeTarget(sessionMailbox, {
     driverConfig: { sessionId: 'conv-1', paneKey: 'pane-1', interactiveCommand: 'claude --model opus',
-      configuredSessionId: 'obsolete', configuredTerminalHandle: 'obsolete-handle', retiredSessionId: 'obsolete' },
+      configuredSessionId: 'obsolete', configuredTerminalHandle: 'obsolete-handle', retiredSessionId: 'obsolete',
+      retiredTerminalHandle: 'obsolete-retirement' },
   });
   const assertPinnedIdentity = () => {
     const config = store.getWakeTarget(sessionMailbox)!.driverConfig!;
     assert.equal(config.sessionId, 'conv-1');
     assert.equal(config.paneKey, 'pane-1');
     assert.equal(config.interactiveCommand, 'claude --model opus');
-    for (const key of ['configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId']) {
+    for (const key of ['configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId', 'retiredTerminalHandle']) {
       assert.equal(Object.hasOwn(config, key), false, key);
     }
   };
