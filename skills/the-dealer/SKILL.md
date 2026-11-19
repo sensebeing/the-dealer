@@ -313,7 +313,10 @@ terminal is never typed into: retries use 1s → 2s → 5s → 10s backoff, and 
 daemon restart re-arms every pending target from disk. Acknowledge the batch
 after handling it, then end your turn; when the mailbox reaches
 `rotateAfterWaves`, the next wave opens a new agent session tab in the same
-Orca workspace and leaves the previous tab untouched (no `/new` reset). Fixed
+Orca workspace once the retiring slot's own agent and its child worktrees are
+done, then closes the retired tab after the replacement launch commits (an
+unsent draft in the retired tab does not block rotation; the tab is never reset
+with `/new`). Fixed
 Orca workspaces default to `rotateAfterWaves: 1`, so each wave gets its own tab
 and the first wakeup never takes over a conversation tab you already have open.
 Pending leases, wake targets, and thread routes are not lost on restart.
