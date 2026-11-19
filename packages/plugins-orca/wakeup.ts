@@ -1,6 +1,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
+  OrcaTerminalCloseRejectedError,
   OrcaTerminalLaunchRejectedError,
   readOrcaTerminal,
   checkOrcaWorkspaceIdle,
@@ -738,7 +739,8 @@ class OrcaWakeDelivery {
   /**
    * Retire one replaced terminal, retrying a close that failed on an earlier wakeup. The retired
    * handle is durable only while the close is unconfirmed: a tab another mailbox actively claimed
-   * since the launch is cleared without touching it, and a failed close reports and stays retryable.
+   * since the launch is cleared without touching it, a transient failure reports and stays
+   * retryable, and a deterministic Orca refusal parks the target for an operator.
    */
   private async retireReplacedTerminal(
     mailboxId: string,
@@ -746,7 +748,12 @@ class OrcaWakeDelivery {
     terminalHandle: string | undefined,
     command: string,
     revision: number,
-  ): Promise<{ warning?: string; revision: number; target?: OrcaWakeTarget }> {
+  ): Promise<{
+    warning?: string;
+    revision: number;
+    target?: OrcaWakeTarget;
+    parked?: OrcaTerminalCloseRejectedError;
+  }> {
     const retiredHandle = target.retiredTerminalHandle?.trim();
     if (!retiredHandle) return { revision };
     const clearRetirement = (): { revision: number; target?: OrcaWakeTarget } => {
@@ -763,6 +770,11 @@ class OrcaWakeDelivery {
       await closeOrcaWorkspaceTerminal(this.runner, command, target.workspacePath ?? '', retiredHandle);
       return clearRetirement();
     } catch (error) {
+      if (error instanceof OrcaTerminalCloseRejectedError) {
+        // Retrying a deterministic refusal would loop forever on the 10s backoff.
+        this.store.parkWakeDelivery(mailboxId, error);
+        return { parked: error, revision };
+      }
       this.report(error);
       return {
         warning: `Retired terminal close failed (${retiredHandle}): ${error instanceof Error ? error.message : String(error)}`,
@@ -787,9 +799,7 @@ class OrcaWakeDelivery {
       warning = warning === undefined ? message : `${warning}; ${message}`;
     };
     let retirementAttempted = false;
-    const attemptRetirement = async (): Promise<void> => {
-      // A pinned session mailbox never rotates, so it must never act on an inherited retirement.
-      if (target.rotateAfterWaves === undefined) return;
+    const attemptRetirement = async (): Promise<{ parked?: OrcaTerminalCloseRejectedError }> => {
       retirementAttempted = true;
       const retirement = await this.retireReplacedTerminal(mailboxId, target, terminalHandle, command, activeRevision);
       if (retirement.warning !== undefined) appendWarning(retirement.warning);
@@ -797,6 +807,7 @@ class OrcaWakeDelivery {
       if (retirement.target) target = retirement.target;
       activeRevision = retirement.revision;
       setActiveRevision(activeRevision);
+      return { parked: retirement.parked };
     };
     const needsRotation = needsSessionRotation(target, preview);
     const spawnFreshSession = !needsRotation && options.freshSession;
@@ -821,8 +832,9 @@ class OrcaWakeDelivery {
       // A previous rotation's close may still be unconfirmed. Retry it before this launch, because
       // the launch patch would overwrite the persisted retired handle; until it closes, the next
       // rotation is deferred so a slot never loses track of a live retired terminal.
-      if (needsRotation && target.retiredTerminalHandle && target.rotateAfterWaves !== undefined) {
+      if (needsRotation && target.retiredTerminalHandle) {
         const prior = await this.retireReplacedTerminal(mailboxId, target, terminalHandle, command, activeRevision);
+        if (prior.parked) return { kind: 'noop', reason: prior.parked.message };
         const refreshed = this.store.getWakeTarget(mailboxId);
         if (refreshed) {
           target = readOrcaWakeTarget(refreshed);
@@ -848,8 +860,9 @@ class OrcaWakeDelivery {
       setActiveRevision(activeRevision);
       rotated = needsRotation;
       // One slot keeps at most one live terminal: the replacement is committed, so the retired
-      // tab is closed before the pointer is written.
-      await attemptRetirement();
+      // tab is closed before the pointer is written. A deterministic refusal parks the target.
+      const retirement = await attemptRetirement();
+      if (retirement.parked) return { kind: 'noop', reason: retirement.parked.message };
       const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles);
       if (!idle.idle) {
         const deferred = this.defer(
@@ -901,7 +914,9 @@ class OrcaWakeDelivery {
         activeRevision = target.bindingRevision ?? 0;
         setActiveRevision(activeRevision);
         // A close from an earlier rotation may still be pending; retry it before the pointer.
-        await attemptRetirement();
+        // A deterministic refusal parks the target instead of writing a pointer.
+        const pending = await attemptRetirement();
+        if (pending.parked) return { kind: 'noop', reason: pending.parked.message };
         if (plan.kind === 'shell') {
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
         }
@@ -914,7 +929,10 @@ class OrcaWakeDelivery {
     }
     // A retired terminal whose close failed earlier is retried on every wakeup, even when this
     // flush reuses a live binding instead of launching a replacement.
-    if (!retirementAttempted) await attemptRetirement();
+    if (!retirementAttempted) {
+      const pending = await attemptRetirement();
+      if (pending.parked) return { kind: 'noop', reason: pending.parked.message };
+    }
 
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) {

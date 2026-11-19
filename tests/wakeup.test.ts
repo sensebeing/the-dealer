@@ -487,7 +487,8 @@ test('a failed retiring-terminal close stays durable, surfaces a warning, and re
   const commandRunner: CommandRunner = async request => {
     if (request.args[0] === 'terminal' && request.args[1] === 'close' && !closeOk) {
       state.calls.push(request);
-      return { stdout: '{"ok":false}' };
+      // A transient CLI failure (not a deterministic refusal): the tab is still listed.
+      return { stdout: '', exitCode: 1 };
     }
     return runner(request);
   };
@@ -673,7 +674,8 @@ test('an unconfirmed retiring-terminal close defers the next rotation instead of
   const commandRunner: CommandRunner = async request => {
     if (request.args[0] === 'terminal' && request.args[1] === 'close' && !closeOk) {
       state.calls.push(request);
-      return { stdout: '{"ok":false}' };
+      // A transient CLI failure (not a deterministic refusal): the tab is still listed.
+      return { stdout: '', exitCode: 1 };
     }
     return runner(request);
   };
@@ -735,6 +737,198 @@ test('an unconfirmed retiring-terminal close defers the next rotation instead of
   assert.equal(store.getWakeTarget(mailboxId)!.driverConfig?.retiredTerminalHandle, undefined);
   assert.deepEqual(state.terminals.map(terminal => terminal.handle), ['term-new-2']);
   assert.equal(sendsTo(state.calls, 'term-new-2').length, 1);
+});
+
+test('a missing retiring terminal still waits for its busy child worktree before rotating', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'slot-gone');
+  // The retiring tab is already absent and has no recorded pane, so no pane owns its children.
+  const { runner, state } = fakeOrcaWorkspace(workspacePath);
+  const child = {
+    worktreeId: 'child-gone',
+    path: join(workspacePath, 'child'),
+    unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: 'slot-gone:root' }] as FakeOrcaAgent[],
+    terminals: [{ handle: 'term-child', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' }],
+  };
+  state.children = [child];
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('missing-retiring')], {
+    mailboxId: 'stream:missing-retiring',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-gone' },
+    },
+  });
+
+  const deferred = await service.flushMailbox('stream:missing-retiring');
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(state.created, 0, 'an unattributed child worktree fails closed instead of being guessed idle');
+
+  child.agents = [{ state: 'done', parentPaneKey: 'slot-gone:root' }];
+  const rotated = await service.flushMailbox('stream:missing-retiring', { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 1);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+});
+
+test('a pending retirement is still closed after the slot is reconfigured to a fixed tab', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'retire-fixed');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-1', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  let closeOk = false;
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'close' && !closeOk) {
+      state.calls.push(request);
+      return { stdout: '', exitCode: 1 };
+    }
+    return runner(request);
+  };
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner }),
+  });
+  t.after(() => service.stop());
+  const mailboxId = 'stream:retire-fixed';
+  const ack = () => {
+    const lease = store.check({ mailboxId });
+    store.ack(lease.deliveryId!);
+  };
+
+  store.enqueue([alert('wave-one')], {
+    mailboxId,
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-1' },
+    },
+  });
+  const first = await service.flushMailbox(mailboxId);
+  assert.equal(first.woke, true, first.reason);
+  assert.equal(first.rotated, true);
+  assert.match(String(first.warning), /Retired terminal close failed \(term-1\)/);
+  assert.equal(store.getWakeTarget(mailboxId)!.driverConfig?.retiredTerminalHandle, 'term-1');
+
+  // The slot is reconfigured as a fixed tab: rotation is off, but the durable retirement remains
+  // its own obligation and must not be replaced by the fixed binding.
+  store.upsertWakeTarget(mailboxId, { rotateAfterWaves: undefined });
+  assert.equal(store.getWakeTarget(mailboxId)!.rotateAfterWaves, undefined);
+  ack();
+  closeOk = true;
+  store.enqueue([alert('wave-two')], { mailboxId });
+  const reconciled = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(reconciled.woke, true, reconciled.reason);
+  assert.equal(reconciled.warning, undefined);
+  assert.equal(state.created, 1, 'a fixed slot opens no replacement tab');
+  assert.equal(
+    state.terminals.some(terminal => terminal.handle === 'term-1'),
+    false,
+    'the pending retirement is reconciled even without rotateAfterWaves',
+  );
+  assert.equal(store.getWakeTarget(mailboxId)!.driverConfig?.retiredTerminalHandle, undefined);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 2);
+});
+
+test('a retired terminal already absent from the inventory settles without a warning or defer', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'retire-absent');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'close') {
+      state.calls.push(request);
+      // Orca cannot close a tab that is already gone; the inventory below confirms it.
+      return { stdout: '{"ok":false,"error":{"code":"terminal_not_found"}}', exitCode: 1 };
+    }
+    return runner(request);
+  };
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('absent')], {
+    mailboxId: 'stream:absent',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      driverConfig: { workspacePath, terminalHandle: 'term-live', retiredTerminalHandle: 'term-gone' },
+    },
+  });
+
+  const delivered = await service.flushMailbox('stream:absent');
+  assert.equal(delivered.woke, true, delivered.reason);
+  assert.equal(delivered.warning, undefined, 'an already-absent tab settles the retirement silently');
+  assert.equal(
+    store.getWakeTarget('stream:absent')!.driverConfig?.retiredTerminalHandle,
+    undefined,
+    'the retirement is satisfied by the absence proof',
+  );
+  assert.equal(sendsTo(state.calls, 'term-live').length, 1);
+});
+
+test('a deterministic close refusal parks the wake target instead of retrying forever', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'retire-pinned');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-old', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'close') {
+      state.calls.push(request);
+      return {
+        stdout: '{"ok":false,"error":{"code":"terminal_tab_pinned","message":"Tab is pinned"}}',
+        exitCode: 1,
+      };
+    }
+    return runner(request);
+  };
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('pinned')], {
+    mailboxId: 'stream:pinned',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      driverConfig: { workspacePath, terminalHandle: 'term-live', retiredTerminalHandle: 'term-old' },
+    },
+  });
+
+  const result = await service.flushMailbox('stream:pinned');
+  assert.equal(result.woke, false);
+  assert.match(String(result.reason), /Orca refused to close terminal term-old \(terminal_tab_pinned\)/);
+  const parked = store.getWakeTarget('stream:pinned')!;
+  assert.equal(parked.deliveryInDoubt, true, 'an unresolvable refusal is parked, never retried forever');
+  assert.equal(parked.pendingWake, false);
+  assert.match(String(parked.lastWakeError), /terminal_tab_pinned/);
+  assert.equal(sendsTo(state.calls, 'term-live').length, 0, 'a parked target never writes a pointer');
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-old'), true);
 });
 
 for (const retainedComposer of [

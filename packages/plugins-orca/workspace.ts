@@ -187,8 +187,6 @@ export async function checkOrcaWorkspaceIdle(
       targetPaneKeys.add(`${targetTerm.tabId}:${targetTerm.leafId}`);
     if (typeof targetTerm?.recordedPaneKey === 'string' && targetTerm.recordedPaneKey) targetPaneKeys.add(targetTerm.recordedPaneKey);
     if (rotating && options?.retiringPaneKey?.trim()) targetPaneKeys.add(options.retiringPaneKey.trim());
-    // The retiring terminal is already gone and carries no pane key to attribute children with.
-    if (rotating && !targetTerm && targetPaneKeys.size === 0) return true;
     const ownedAgentsBusy = (): boolean =>
       !row.agents ||
       row.agents
@@ -200,7 +198,7 @@ export async function checkOrcaWorkspaceIdle(
     } else if (rotating) {
       // A rotation waits only for the retiring slot's own agent; retained and unverifiable tabs
       // never block opening a new session tab. A retiring terminal that cannot be pane-attributed
-      // fails closed instead of guessing, so a busy workspace never gains a second live tab.
+      // fails closed instead of guessing; its child worktrees are still inspected below.
       if (targetTerm && allAgentsBusy()) return false;
     } else if (row.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
       return false;
@@ -743,10 +741,13 @@ export async function sendOrcaTerminalText(
   }
 }
 
+/** A deterministic Orca refusal (for example a pinned tab), which retrying cannot resolve. */
+export class OrcaTerminalCloseRejectedError extends Error {}
+
 /**
- * Close a terminal whose replacement has already been committed. Failures propagate so the caller
- * keeps the retired handle persisted, reports the error and retries the close on the next wakeup;
- * a silently swallowed failure would leak a live terminal into the slot.
+ * Close a terminal whose replacement has already been committed. An already-absent terminal
+ * settles the retirement; a deterministic refusal is typed so the caller can park instead of
+ * retrying forever; an unverifiable failure propagates so the caller keeps the handle durable.
  */
 export async function closeOrcaWorkspaceTerminal(
   runner: CommandRunner,
@@ -757,13 +758,65 @@ export async function closeOrcaWorkspaceTerminal(
 ): Promise<void> {
   const handle = terminalHandle.trim();
   if (!handle) return;
-  const output = await checkedCommand(runner, {
-    command,
-    args: ['terminal', 'close', '--terminal', handle, '--json'],
-    cwd,
-    signal,
-  });
-  if (JSON.parse(output.stdout)?.ok === false) throw new Error('Orca terminal close failed');
+  let result: { stdout: string; stderr?: string; exitCode?: number } | undefined;
+  let failure: unknown;
+  try {
+    result = await runner({
+      command,
+      args: ['terminal', 'close', '--terminal', handle, '--json'],
+      cwd,
+      signal,
+    });
+  } catch (error) {
+    failure = error;
+  }
+  let parsed: unknown;
+  try {
+    parsed = result?.stdout ? JSON.parse(result.stdout) : undefined;
+  } catch {
+    parsed = undefined;
+  }
+  const refused = Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed) &&
+    (parsed as { ok?: unknown }).ok === false;
+  if (
+    failure === undefined &&
+    result !== undefined &&
+    (result.exitCode === undefined || result.exitCode === 0) &&
+    !refused
+  ) {
+    return;
+  }
+  const closeError = failure ?? new Error(`Orca terminal close failed: ${handle}`);
+  // The close did not confirm. A terminal already absent from the workspace inventory satisfies
+  // the one-live-terminal invariant, so only a still-present terminal keeps the retirement open.
+  let inventory: unknown;
+  try {
+    const listed = await checkedCommand(runner, {
+      command,
+      args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
+      cwd,
+      signal,
+    });
+    inventory = JSON.parse(listed.stdout);
+  } catch {
+    throw closeError;
+  }
+  if (!inventory || typeof inventory !== 'object' || Array.isArray(inventory)) throw closeError;
+  const parsedInventory = inventory as { ok?: unknown; result?: { terminals?: unknown } };
+  if (parsedInventory.ok !== true || !Array.isArray(parsedInventory.result?.terminals)) throw closeError;
+  const stillPresent = (parsedInventory.result.terminals as unknown[]).some(
+    (row) => row !== null && typeof row === 'object' && String((row as { handle?: unknown }).handle) === handle,
+  );
+  if (!stillPresent) return;
+  if (refused) {
+    const detail = (parsed as { error?: unknown }).error;
+    const code = detail && typeof detail === 'object' && !Array.isArray(detail)
+      ? (detail as { code?: unknown }).code : undefined;
+    throw new OrcaTerminalCloseRejectedError(
+      `Orca refused to close terminal ${handle}${typeof code === 'string' && code ? ` (${code})` : ''}`,
+    );
+  }
+  throw closeError;
 }
 
 /** Set the visible worktree card comment; `current` is used when no workspace path is known. */
