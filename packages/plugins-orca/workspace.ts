@@ -190,7 +190,12 @@ export async function checkOrcaWorkspaceIdle(
     const ownedAgentsBusy = (): boolean =>
       !row.agents ||
       row.agents
-        .filter((agent) => (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) || (!agent.paneKey && handles.length <= 1))
+        .filter((agent) =>
+          (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) ||
+          // During rotation an agent without a paneKey cannot be proven to belong to a sibling,
+          // so it is counted against the retiring slot instead of being silently ignored.
+          (!agent.paneKey && (rotating || handles.length <= 1)),
+        )
         .some((agent) => agent.state !== 'done');
     const allAgentsBusy = (): boolean => !row.agents || row.agents.some((agent) => agent.state !== 'done');
     if (targetPaneKeys.size > 0) {
@@ -772,7 +777,13 @@ export async function closeOrcaWorkspaceTerminal(
   }
   let parsed: unknown;
   try {
-    parsed = result?.stdout ? JSON.parse(result.stdout) : undefined;
+    // `runCommand` rejects on a non-zero exit and attaches the captured output, so a refusal has
+    // to be read from the thrown error exactly like a returned result.
+    const rejected = failure as { stdout?: unknown; exitCode?: unknown } | null;
+    const stdout = typeof rejected?.stdout === 'string' && rejected.exitCode !== null
+      ? rejected.stdout.trim()
+      : result?.stdout;
+    parsed = stdout ? JSON.parse(stdout) : undefined;
   } catch {
     parsed = undefined;
   }
@@ -802,8 +813,9 @@ export async function closeOrcaWorkspaceTerminal(
     throw closeError;
   }
   if (!inventory || typeof inventory !== 'object' || Array.isArray(inventory)) throw closeError;
-  const parsedInventory = inventory as { ok?: unknown; result?: { terminals?: unknown } };
-  if (parsedInventory.ok !== true || !Array.isArray(parsedInventory.result?.terminals)) throw closeError;
+  const parsedInventory = inventory as { ok?: unknown; result?: { truncated?: unknown; terminals?: unknown } };
+  // A truncated inventory cannot prove absence: the missing handle may simply be cut off.
+  if (parsedInventory.ok !== true || parsedInventory.result?.truncated || !Array.isArray(parsedInventory.result?.terminals)) throw closeError;
   const stillPresent = (parsedInventory.result.terminals as unknown[]).some(
     (row) => row !== null && typeof row === 'object' && String((row as { handle?: unknown }).handle) === handle,
   );

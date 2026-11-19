@@ -822,9 +822,9 @@ class OrcaWakeDelivery {
           !(await isOrcaWorkspaceTerminalLive(this.runner, command, target.workspacePath!, terminalHandle, undefined, target.paneKey))));
 
     if (needsRotation || spawnFreshSession || replaceTaskTab) {
-      // Rotation never resets an existing TUI: it opens a new session tab and leaves every old
-      // tab untouched. A missing workspace makes that impossible and must fail loudly; a
-      // fresh-tab plan has already proven its workspace in `spawnsFreshSession`.
+      // Rotation never resets an existing TUI: it opens a new session tab and retires the
+      // replaced tab once the launch commits. A missing workspace makes that impossible and must
+      // fail loudly; a fresh-tab plan has already proven its workspace in `spawnsFreshSession`.
       if (!target.workspacePath) {
         throw new Error(`Orca session rotation requires a workspacePath: ${mailboxId}`);
       }

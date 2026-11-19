@@ -898,10 +898,12 @@ test('a deterministic close refusal parks the wake target instead of retrying fo
   const commandRunner: CommandRunner = async request => {
     if (request.args[0] === 'terminal' && request.args[1] === 'close') {
       state.calls.push(request);
-      return {
-        stdout: '{"ok":false,"error":{"code":"terminal_tab_pinned","message":"Tab is pinned"}}',
+      // `runCommand` rejects on a non-zero exit and attaches the captured JSON output.
+      throw Object.assign(new Error('exit 1'), {
         exitCode: 1,
-      };
+        stdout: '{"ok":false,"error":{"code":"terminal_tab_pinned","message":"Tab is pinned"}}',
+        stderr: '',
+      });
     }
     return runner(request);
   };
@@ -929,6 +931,98 @@ test('a deterministic close refusal parks the wake target instead of retrying fo
   assert.match(String(parked.lastWakeError), /terminal_tab_pinned/);
   assert.equal(sendsTo(state.calls, 'term-live').length, 0, 'a parked target never writes a pointer');
   assert.equal(state.terminals.some(terminal => terminal.handle === 'term-old'), true);
+});
+
+test('a truncated terminal inventory never proves the retired tab absent', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'retire-truncated');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-live', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-old', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  let closeAttempted = false;
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'close') {
+      state.calls.push(request);
+      closeAttempted = true;
+      // A transient failure, so absence has to be verified from the inventory.
+      return { stdout: '', exitCode: 1 };
+    }
+    if (closeAttempted && request.args[0] === 'terminal' && request.args[1] === 'list') {
+      state.calls.push(request);
+      // A truncated page cannot show whether the retired handle still exists.
+      return { stdout: JSON.stringify({ ok: true, result: { truncated: true, terminals: [] } }) };
+    }
+    return runner(request);
+  };
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('truncated')], {
+    mailboxId: 'stream:truncated',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      driverConfig: { workspacePath, terminalHandle: 'term-live', retiredTerminalHandle: 'term-old' },
+    },
+  });
+
+  const delivered = await service.flushMailbox('stream:truncated');
+  assert.equal(delivered.woke, true, delivered.reason);
+  assert.match(String(delivered.warning), /Retired terminal close failed \(term-old\)/);
+  assert.equal(
+    store.getWakeTarget('stream:truncated')!.driverConfig?.retiredTerminalHandle,
+    'term-old',
+    'a truncated inventory never clears the durable retirement',
+  );
+  assert.equal(sendsTo(state.calls, 'term-live').length, 1);
+});
+
+test('rotation fails closed on a working agent that has no pane key', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'slot-unattributed-agent');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-slot', tabId: 'slot-1', leafId: 'root', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-other', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  // Two live terminals and a persisted retiring pane: an agent without a paneKey still cannot be
+  // proven to belong to a sibling, so it must keep the rotation deferred while it works.
+  state.agents = [{ state: 'working' }];
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('unattributed-agent')], {
+    mailboxId: 'stream:unattributed-agent',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-slot', paneKey: 'slot-1:root' },
+    },
+  });
+
+  const deferred = await service.flushMailbox('stream:unattributed-agent');
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(state.created, 0, 'an unattributable working agent keeps the slot on one terminal');
+  assert.equal(state.calls.some(call => call.args[1] === 'close'), false);
+
+  state.agents = [{ state: 'done', paneKey: 'slot-1:root' }];
+  const rotated = await service.flushMailbox('stream:unattributed-agent', { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 1);
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-slot'), false);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
 });
 
 for (const retainedComposer of [
