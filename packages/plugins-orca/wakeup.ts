@@ -41,6 +41,8 @@ export interface OrcaTerminalDriverConfig {
   configuredSessionId?: string;
   configuredTerminalHandle?: string;
   retiredSessionId?: string;
+  /** Terminal replaced by the current binding; persisted until its close is confirmed. */
+  retiredTerminalHandle?: string;
   worktreeId?: string;
   workspacePath?: string;
   terminalHandle?: string;
@@ -59,6 +61,7 @@ export function readOrcaDriverConfig(target: Pick<WakeTargetState, 'driverConfig
   for (const field of [
     'orcaCommand',
     'interactiveCommand', 'sessionId', 'paneKey', 'resumeCommand', 'configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId',
+    'retiredTerminalHandle',
     'worktreeId',
     'workspacePath',
     'terminalHandle',
@@ -167,6 +170,11 @@ export function buildLaunchedOrcaWakeTargetPatch(
     ...(options.resetCompletedWaves ? {
       completedWaves: 0, sessionId: undefined,
       retiredSessionId: binding.sessionId ?? binding.configuredSessionId ?? binding.retiredSessionId,
+      // Rotation commits the replacement and the tab it replaces together, so a failed close can be
+      // retried from durable state instead of leaking a second live terminal into the slot.
+      retiredTerminalHandle: binding.terminalHandle && binding.terminalHandle !== options.handle
+        ? binding.terminalHandle
+        : binding.retiredTerminalHandle,
     } : {}),
   });
 }
@@ -186,13 +194,23 @@ function sameCallerWorkspace(a?: string, b?: string): boolean {
   try { return realpathSync(a) === realpathSync(b); } catch { return false; }
 }
 
+/**
+ * Handles no other mailbox may select. A retired terminal stays reserved until its owner confirms
+ * the close, so a sibling flush cannot bind a tab that is about to disappear; the close boundary
+ * re-reads the same ledger without retirements to decide whether the tab is still ours to close.
+ */
 function claimedOrcaTerminalHandles(
-  store: MailboxStore, mailboxId: string, bound: OrcaTerminalDriverConfig,
+  store: MailboxStore,
+  mailboxId: string,
+  bound: OrcaTerminalDriverConfig,
+  options: { includeRetired?: boolean } = {},
 ): Set<string> {
+  const includeRetired = options.includeRetired !== false;
   const handles = new Set<string>();
   for (const item of store.listWakeTargets()) {
     if (item.mailboxId === mailboxId || item.mailboxId.startsWith('terminal:') || item.driver !== 'orca-terminal') continue;
-    const { terminalHandle, workspacePath, paneKey } = readOrcaDriverConfig(item);
+    const { terminalHandle, retiredTerminalHandle, workspacePath, paneKey } = readOrcaDriverConfig(item);
+    if (includeRetired && retiredTerminalHandle) handles.add(retiredTerminalHandle);
     if (!terminalHandle) continue;
     const isSessionAlias = mailboxId.startsWith('terminal:') ||
       mailboxId.startsWith('worktree:') || item.mailboxId.startsWith('worktree:');
@@ -259,6 +277,7 @@ export function resolveCallerOrcaWakeTargetPatch(
     ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
     ...(switchedIdentity ? {
       completedWaves: 0, terminalHandle: caller.terminalHandle, paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent,
+      retiredTerminalHandle: undefined,
     } : {
       ...(caller.terminalHandle ? { terminalHandle: caller.terminalHandle } : {}),
       ...(caller.paneKey ? { paneKey: caller.paneKey } : {}),
@@ -286,6 +305,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
   if (input.runId) return orcaWakeTargetPatch({
     driver: 'orca-run', completedWaves: 0, retiredSessionId: undefined, terminalHandle: nextConfiguredHandle, paneKey: undefined,
     sessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined,
+    retiredTerminalHandle: undefined,
     ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
     ...commandPatch, ...resumeCommandPatch,
   });
@@ -305,6 +325,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
     terminalHandle: handleUnchangedSinceConfig ? existing?.terminalHandle : (nextConfiguredHandle ?? existing?.terminalHandle),
     paneKey: existing?.paneKey, sessionId: existing?.sessionId,
     agent: input.configuredAgent ?? existing?.agent,
+    retiredTerminalHandle: existing?.retiredTerminalHandle,
   };
   let identity: Partial<OrcaWakeTarget>;
   if (addedOrChanged) {
@@ -314,6 +335,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
       completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: handleBelongsToPrevious ? undefined : nextConfiguredHandle, paneKey: undefined, sessionId: nextConfiguredSession,
       agent: input.configuredAgent ?? (sameWorkspace && sameAgent ? existing?.agent : undefined),
+      retiredTerminalHandle: undefined,
     };
     identity = { ...identity, configuredSessionId: nextConfiguredSession };
   } else if (removed) {
@@ -321,6 +343,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
       completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
       agent: input.configuredAgent ?? (compatible ? existing?.agent : undefined),
+      retiredTerminalHandle: undefined,
     } : preserved;
     identity = { ...identity, configuredSessionId: undefined, retiredSessionId: undefined };
   } else if (unchangedConfigured) {
@@ -328,6 +351,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
       completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: nextConfiguredHandle, paneKey: undefined,
       sessionId: nextConfiguredSession, agent: input.configuredAgent,
+      retiredTerminalHandle: undefined,
     };
     identity = { ...identity, configuredSessionId: nextConfiguredSession };
   } else {
@@ -335,6 +359,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
       completedWaves: 0, retiredSessionId: undefined,
       terminalHandle: nextConfiguredHandle, paneKey: undefined, sessionId: undefined,
       configuredSessionId: undefined, agent: input.configuredAgent,
+      retiredTerminalHandle: undefined,
     };
   }
   const clearLaunchConfig = !input.authoritativeConfig && input.configuredInteractiveCommand === undefined && input.configuredResumeCommand === undefined &&
@@ -709,6 +734,42 @@ class OrcaWakeDelivery {
     return probeOrcaTerminalIdle(this.runner, command, terminalHandle);
   }
 
+  /**
+   * Retire one replaced terminal, retrying a close that failed on an earlier wakeup. The retired
+   * handle is durable only while the close is unconfirmed: a tab another mailbox actively claimed
+   * since the launch is cleared without touching it, and a failed close reports and stays retryable.
+   */
+  private async retireReplacedTerminal(
+    mailboxId: string,
+    target: OrcaWakeTarget,
+    terminalHandle: string | undefined,
+    command: string,
+    revision: number,
+  ): Promise<{ warning?: string; revision: number; target?: OrcaWakeTarget }> {
+    const retiredHandle = target.retiredTerminalHandle?.trim();
+    if (!retiredHandle) return { revision };
+    const clearRetirement = (): { revision: number; target?: OrcaWakeTarget } => {
+      const updated = this.store.updateWakeDriverConfigIfCurrent(mailboxId, revision, { retiredTerminalHandle: undefined });
+      if (updated.superseded) return { revision };
+      const next = readOrcaWakeTarget(updated.target);
+      return { revision: next.bindingRevision ?? revision, target: next };
+    };
+    // Ownership is re-read at the destructive boundary: the launch was authorized from an earlier
+    // snapshot, but a sibling may have bound this tab since. Only active claims block the close.
+    const claims = claimedOrcaTerminalHandles(this.store, mailboxId, target, { includeRetired: false });
+    if (retiredHandle === terminalHandle?.trim() || claims.has(retiredHandle)) return clearRetirement();
+    try {
+      await closeOrcaWorkspaceTerminal(this.runner, command, target.workspacePath ?? '', retiredHandle);
+      return clearRetirement();
+    } catch (error) {
+      this.report(error);
+      return {
+        warning: `Retired terminal close failed (${retiredHandle}): ${error instanceof Error ? error.message : String(error)}`,
+        revision,
+      };
+    }
+  }
+
   private async deliver(
     mailboxId: string,
     target: OrcaWakeTarget,
@@ -720,8 +781,20 @@ class OrcaWakeDelivery {
     let activeRevision = target.bindingRevision ?? 0;
     let rebound = false;
     let terminalHandle = target.terminalHandle;
-    // Captured before the launch replaces the binding, so a rotation can retire its own tab only.
-    const previousHandle = target.terminalHandle?.trim();
+    let warning: string | undefined;
+    const appendWarning = (message: string): void => {
+      warning = warning === undefined ? message : `${warning}; ${message}`;
+    };
+    let retirementAttempted = false;
+    const attemptRetirement = async (): Promise<void> => {
+      retirementAttempted = true;
+      const retirement = await this.retireReplacedTerminal(mailboxId, target, terminalHandle, command, activeRevision);
+      if (retirement.warning !== undefined) appendWarning(retirement.warning);
+      // Clearing the durable retirement bumps the binding revision; later CAS steps must see it.
+      if (retirement.target) target = retirement.target;
+      activeRevision = retirement.revision;
+      setActiveRevision(activeRevision);
+    };
     const needsRotation = needsSessionRotation(target, preview);
     const spawnFreshSession = !needsRotation && options.freshSession;
     let rotated = false;
@@ -757,15 +830,8 @@ class OrcaWakeDelivery {
       setActiveRevision(activeRevision);
       rotated = needsRotation;
       // One slot keeps at most one live terminal: the replacement is committed, so the retired
-      // tab is closed before the pointer is written. A handle another mailbox claimed is not ours.
-      if (
-        needsRotation &&
-        previousHandle &&
-        previousHandle !== terminalHandle &&
-        !options.excludedHandles.has(previousHandle)
-      ) {
-        await closeOrcaWorkspaceTerminal(this.runner, command, workspacePath, previousHandle);
-      }
+      // tab is closed before the pointer is written.
+      await attemptRetirement();
       const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles);
       if (!idle.idle) {
         const deferred = this.defer(
@@ -816,6 +882,8 @@ class OrcaWakeDelivery {
         target = launched.target;
         activeRevision = target.bindingRevision ?? 0;
         setActiveRevision(activeRevision);
+        // A close from an earlier rotation may still be pending; retry it before the pointer.
+        await attemptRetirement();
         if (plan.kind === 'shell') {
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
         }
@@ -826,6 +894,9 @@ class OrcaWakeDelivery {
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
       }
     }
+    // A retired terminal whose close failed earlier is retried on every wakeup, even when this
+    // flush reuses a live binding instead of launching a replacement.
+    if (!retirementAttempted) await attemptRetirement();
 
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) {
@@ -878,7 +949,6 @@ class OrcaWakeDelivery {
       });
     }
 
-    let warning: string | undefined;
     const comment =
       target.workspaceComment ??
       (mailboxId.startsWith('stream:') ? `Dealer: ${mailboxId} pending` : undefined);
@@ -887,7 +957,7 @@ class OrcaWakeDelivery {
         await setOrcaWorkspaceComment(this.runner, command, target.workspacePath, comment);
       } catch (error) {
         // The pointer is already delivered; retrying it would duplicate a wakeup.
-        warning = String(error);
+        appendWarning(String(error));
         this.report(error);
       }
     }

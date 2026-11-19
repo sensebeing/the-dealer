@@ -475,6 +475,193 @@ test('rotation waits for a child worktree owned by the retiring slot pane', asyn
   assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
 });
 
+test('a failed retiring-terminal close stays durable, surfaces a warning, and retries on the next wakeup', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'close-fail');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-old', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  let closeOk = false;
+  const errors: unknown[] = [];
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'close' && !closeOk) {
+      state.calls.push(request);
+      return { stdout: '{"ok":false}' };
+    }
+    return runner(request);
+  };
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    onError: error => errors.push(error),
+    drivers: createTestWakeupDrivers({ commandRunner }),
+  });
+  t.after(() => service.stop());
+  const enqueue = (id: string) =>
+    store.enqueue([alert(id)], {
+      mailboxId: 'stream:close-fail',
+      wakeTarget: {
+        driver: 'orca-terminal',
+        coalesceMs: 0,
+        rotateAfterWaves: 1,
+        completedWaves: 1,
+        driverConfig: { workspacePath, terminalHandle: 'term-old' },
+      },
+    });
+
+  enqueue('close-fails');
+  const rotated = await service.flushMailbox('stream:close-fail');
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.match(String(rotated.warning), /Retired terminal close failed \(term-old\): Orca terminal close failed/);
+  assert.equal(errors.length, 1, 'the failed close is reported, never swallowed');
+  assert.equal(
+    store.getWakeTarget('stream:close-fail')!.driverConfig?.retiredTerminalHandle,
+    'term-old',
+    'an unconfirmed close stays durable for retry',
+  );
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-old'), true);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+
+  closeOk = true;
+  enqueue('close-retries');
+  const retried = await service.flushMailbox('stream:close-fail', { force: true });
+  assert.equal(retried.woke, true, retried.reason);
+  assert.equal(retried.warning, undefined);
+  assert.equal(store.getWakeTarget('stream:close-fail')!.driverConfig?.retiredTerminalHandle, undefined);
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-old'), false, 'the retry closes the retired tab');
+  assert.equal(errors.length, 1, 'a successful retry reports nothing new');
+});
+
+test('rotation fails closed when the retiring terminal cannot be attributed to one pane', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'unattributed');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-slot', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-other', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  state.agents = [{ state: 'working' }, { state: 'done' }];
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('unattributed')], {
+    mailboxId: 'stream:unattributed',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-slot' },
+    },
+  });
+
+  const deferred = await service.flushMailbox('stream:unattributed');
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(state.created, 0, 'a busy unattributed slot never gains a second live terminal');
+  assert.equal(state.calls.some(call => call.args[1] === 'close'), false);
+
+  state.agents = [{ state: 'done' }, { state: 'done' }];
+  const rotated = await service.flushMailbox('stream:unattributed', { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 1);
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-slot'), false);
+});
+
+test('a terminal awaiting retirement close is excluded from sibling selection', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'reserve');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-retiring', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  // A previous rotation's close failed, so the tab is still reserved while its owner retries.
+  store.upsertWakeTarget('stream:retiring-owner', {
+    driver: 'orca-terminal',
+    rotateAfterWaves: 1,
+    driverConfig: { workspacePath, terminalHandle: 'term-current', retiredTerminalHandle: 'term-retiring' },
+  });
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('sibling')], {
+    mailboxId: 'stream:sibling',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-retiring' },
+    },
+  });
+
+  const sibling = await service.flushMailbox('stream:sibling', { force: true });
+  assert.equal(sibling.woke, true, sibling.reason);
+  assert.equal(state.created, 1, 'the sibling opens its own tab instead of the retiring one');
+  assert.equal(store.getWakeTarget('stream:sibling')!.driverConfig?.terminalHandle, 'term-new-1');
+  assert.equal(sendsTo(state.calls, 'term-retiring').length, 0, 'an awaiting-retirement tab is never selected');
+  assert.equal(
+    store.getWakeTarget('stream:retiring-owner')!.driverConfig?.retiredTerminalHandle,
+    'term-retiring',
+    'the reservation belongs to its owner until the close is confirmed',
+  );
+});
+
+test('a retired terminal claimed by another mailbox before the close boundary is left alone', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'claim-race');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-old', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      // A sibling binds the retiring tab after the idle proof but before the close boundary.
+      store.upsertWakeTarget('stream:sibling-claim', {
+        driver: 'orca-terminal',
+        driverConfig: { workspacePath, terminalHandle: 'term-old' },
+      });
+    }
+    return runner(request);
+  };
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('claim-race')], {
+    mailboxId: 'stream:claim-race',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-old' },
+    },
+  });
+
+  const rotated = await service.flushMailbox('stream:claim-race');
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(
+    state.calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'close'),
+    false,
+    'a tab another mailbox now actively owns is never closed',
+  );
+  assert.equal(store.getWakeTarget('stream:claim-race')!.driverConfig?.retiredTerminalHandle, undefined);
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-old'), true, 'the claimed tab stays live');
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+});
+
 for (const retainedComposer of [
   '> unsent draft',
   '• ,1（主推）：继续检查剩余任务\n> 继续检查剩余任务',

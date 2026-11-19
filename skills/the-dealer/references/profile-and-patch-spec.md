@@ -58,8 +58,10 @@ delay before a pointer (a message's `payload.minAgeMs` overrides it), and
 injects text into a busy, timed-out, or unverifiable terminal. Before the next
 pointer, rotation opens a new agent session tab in the configured workspace only
 after the previous lease is acknowledged and
-`completedWaves >= rotateAfterWaves`; it never rotates an unacknowledged batch.
-The previous tab is left untouched — the wakeup service never sends `/new` or
+`completedWaves >= rotateAfterWaves`; it never rotates an unacknowledged batch,
+and it waits until the retiring slot's own agent and child worktrees are done.
+The retired tab is closed after the replacement launch commits; an unsent draft
+there does not block rotation, and the wakeup service never sends `/new` or
 resets an existing TUI. A managed fixed workspace defaults to
 `rotateAfterWaves: 1`, so every wave owns an independent tab and the first
 wakeup never hijacks a conversation tab a human already opened; a terminal

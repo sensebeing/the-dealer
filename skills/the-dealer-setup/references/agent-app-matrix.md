@@ -36,5 +36,7 @@ supports `agy run`; it does not guarantee a resumed fixed TUI, so use the manage
 Orca preset for fixed conversations. Only Orca wakeups currently use the persisted
 idle-gated redrive service; passive agent-pty mail remains readable after failure.
 Managed Orca/antigravity fixed presets default to `rotateAfterWaves: 1`: each wave
-opens its own agent session tab in the workspace, and the previous tab stays
-untouched (no `/new` reset).
+opens its own agent session tab in the workspace once the retiring slot's own
+agent and child worktrees are done, and the retired tab is closed after the
+replacement launch commits (an unsent draft there does not block rotation; no
+`/new` reset).

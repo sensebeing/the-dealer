@@ -199,8 +199,9 @@ export async function checkOrcaWorkspaceIdle(
       if (ownedAgentsBusy()) return false;
     } else if (rotating) {
       // A rotation waits only for the retiring slot's own agent; retained and unverifiable tabs
-      // never block opening a new session tab.
-      if (targetTerm && handles.length <= 1 && allAgentsBusy()) return false;
+      // never block opening a new session tab. A retiring terminal that cannot be pane-attributed
+      // fails closed instead of guessing, so a busy workspace never gains a second live tab.
+      if (targetTerm && allAgentsBusy()) return false;
     } else if (row.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
       return false;
     }
@@ -743,8 +744,9 @@ export async function sendOrcaTerminalText(
 }
 
 /**
- * Best-effort retirement of a replaced terminal. Rotation commits the replacement handle first, so
- * a failed close only leaves an extra tab behind and must never fail the wakeup.
+ * Close a terminal whose replacement has already been committed. Failures propagate so the caller
+ * keeps the retired handle persisted, reports the error and retries the close on the next wakeup;
+ * a silently swallowed failure would leak a live terminal into the slot.
  */
 export async function closeOrcaWorkspaceTerminal(
   runner: CommandRunner,
@@ -755,16 +757,13 @@ export async function closeOrcaWorkspaceTerminal(
 ): Promise<void> {
   const handle = terminalHandle.trim();
   if (!handle) return;
-  try {
-    await runner({
-      command,
-      args: ['terminal', 'close', '--terminal', handle, '--json'],
-      cwd,
-      signal,
-    });
-  } catch {
-    // Best-effort cleanup of a retired terminal after the replacement launch has already committed.
-  }
+  const output = await checkedCommand(runner, {
+    command,
+    args: ['terminal', 'close', '--terminal', handle, '--json'],
+    cwd,
+    signal,
+  });
+  if (JSON.parse(output.stdout)?.ok === false) throw new Error('Orca terminal close failed');
 }
 
 /** Set the visible worktree card comment; `current` is used when no workspace path is known. */
