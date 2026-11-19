@@ -134,6 +134,12 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
       state.terminals.push({ handle, connected: true, writable: true, agentIdentity: 'antigravity', preview: '', tabId: handle, leafId: 'root' });
       return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle } } }) };
     }
+    if (request.args[0] === 'terminal' && request.args[1] === 'close') {
+      const index = request.args.indexOf('--terminal');
+      const handle = index >= 0 ? request.args[index + 1] : undefined;
+      if (handle) state.terminals = state.terminals.filter(terminal => terminal.handle !== handle);
+      return { stdout: '{"ok":true}' };
+    }
     if (request.args[0] === 'terminal' && request.args[1] === 'wait') {
       return { stdout: JSON.stringify({ ok: state.waitOk }) };
     }
@@ -367,6 +373,106 @@ test('rotation persists the new session tab before tui-idle and the next tick re
   assert.equal(store.getWakeTarget('stream:rotate')!.pendingWake, false);
   assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
   assert.equal(terminalSends(state.calls).some(call => textOf(call) === '/new'), false);
+  // One slot keeps at most one live terminal: the retired tab is closed after the launch commits.
+  const close = state.calls.find(call => call.args[0] === 'terminal' && call.args[1] === 'close')!;
+  assert.deepEqual(close.args, ['terminal', 'close', '--terminal', 'term-rotate', '--json']);
+  assert.equal(close.args.includes('--tab'), false, 'the whole retired tab is closed, not reused');
+  assert.deepEqual(state.terminals.map(terminal => terminal.handle), ['term-new-1']);
+});
+
+test('rotation waits for the retiring slot agent before it opens the replacement tab', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'slot-busy');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-slot', tabId: 'slot-1', leafId: 'root', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+    { handle: 'term-other', tabId: 'slot-2', leafId: 'root', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> human draft' },
+  ]);
+  state.agents = [{ state: 'working', paneKey: 'slot-1:root' }, { state: 'done', paneKey: 'slot-2:root' }];
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('busy-slot')], {
+    mailboxId: 'stream:slot-busy',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-slot', paneKey: 'slot-1:root' },
+    },
+  });
+
+  const deferred = await service.flushMailbox('stream:slot-busy');
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(state.created, 0, 'a busy slot never opens a second live terminal');
+  assert.equal(state.calls.some(call => call.args[1] === 'close'), false, 'the busy tab is not retired');
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  state.agents = [{ state: 'done', paneKey: 'slot-1:root' }, { state: 'done', paneKey: 'slot-2:root' }];
+  const rotated = await service.flushMailbox('stream:slot-busy', { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 1);
+  const close = state.calls.find(call => call.args[0] === 'terminal' && call.args[1] === 'close')!;
+  assert.deepEqual(close.args, ['terminal', 'close', '--terminal', 'term-slot', '--json']);
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-slot'), false);
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-other'), true, 'other slots keep their tabs');
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+  assert.equal(sendsTo(state.calls, 'term-other').length, 0, 'a human tab is never hijacked');
+});
+
+test('rotation waits for a child worktree owned by the retiring slot pane', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const workspacePath = join(root, 'slot-child');
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'term-slot', tabId: 'slot-1', leafId: 'root', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const child = {
+    worktreeId: 'child-slot',
+    path: join(workspacePath, 'child'),
+    unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: 'slot-1:root' }] as FakeOrcaAgent[],
+    terminals: [{ handle: 'term-child', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' }],
+  };
+  state.children = [child];
+  const service = new WakeupRedriveService({
+    store,
+    flushIntervalMs: 100_000,
+    drivers: createTestWakeupDrivers({ commandRunner: runner }),
+  });
+  t.after(() => service.stop());
+  store.enqueue([alert('child-busy')], {
+    mailboxId: 'stream:slot-child',
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath, terminalHandle: 'term-slot', paneKey: 'slot-1:root' },
+    },
+  });
+
+  const deferred = await service.flushMailbox('stream:slot-child');
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(state.created, 0, 'a working child worktree keeps the slot on its one terminal');
+  assert.equal(state.calls.some(call => call.args[1] === 'close'), false, 'the busy slot is not retired');
+
+  child.agents = [{ state: 'done', parentPaneKey: 'slot-1:root' }];
+  const rotated = await service.flushMailbox('stream:slot-child', { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 1);
+  const close = state.calls.find(call => call.args[0] === 'terminal' && call.args[1] === 'close')!;
+  assert.deepEqual(close.args, ['terminal', 'close', '--terminal', 'term-slot', '--json']);
+  assert.equal(state.terminals.some(terminal => terminal.handle === 'term-slot'), false);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
 });
 
 for (const retainedComposer of [

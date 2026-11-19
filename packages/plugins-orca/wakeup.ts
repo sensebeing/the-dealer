@@ -4,6 +4,7 @@ import {
   OrcaTerminalLaunchRejectedError,
   readOrcaTerminal,
   checkOrcaWorkspaceIdle,
+  closeOrcaWorkspaceTerminal,
   ensureOrcaWorkspace,
   isOrcaWorkspaceTerminalLive,
   planOrcaWorkspaceTerminal,
@@ -642,11 +643,14 @@ class OrcaWakeDelivery {
     }
     if (target.workspacePath) {
       // A fresh tab is created empty, so its retained siblings must not block the wakeup; a bound
-      // tab is the only composer that can receive the pointer.
+      // tab is the only composer that can receive the pointer. A rotation additionally waits for
+      // the slot it replaces to finish, because that tab is closed after the launch commits.
       return withPlan(
         await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
           targetTerminalHandle: spawnFreshSession ? null : target.terminalHandle,
           targetPaneKey: spawnFreshSession ? undefined : target.paneKey,
+          retiringTerminalHandle: spawnFreshSession ? target.terminalHandle : undefined,
+          retiringPaneKey: spawnFreshSession ? target.paneKey : undefined,
           agent: target.agent,
           excludedHandles,
         }),
@@ -716,6 +720,8 @@ class OrcaWakeDelivery {
     let activeRevision = target.bindingRevision ?? 0;
     let rebound = false;
     let terminalHandle = target.terminalHandle;
+    // Captured before the launch replaces the binding, so a rotation can retire its own tab only.
+    const previousHandle = target.terminalHandle?.trim();
     const needsRotation = needsSessionRotation(target, preview);
     const spawnFreshSession = !needsRotation && options.freshSession;
     let rotated = false;
@@ -750,6 +756,16 @@ class OrcaWakeDelivery {
       activeRevision = target.bindingRevision ?? 0;
       setActiveRevision(activeRevision);
       rotated = needsRotation;
+      // One slot keeps at most one live terminal: the replacement is committed, so the retired
+      // tab is closed before the pointer is written. A handle another mailbox claimed is not ours.
+      if (
+        needsRotation &&
+        previousHandle &&
+        previousHandle !== terminalHandle &&
+        !options.excludedHandles.has(previousHandle)
+      ) {
+        await closeOrcaWorkspaceTerminal(this.runner, command, workspacePath, previousHandle);
+      }
       const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles);
       if (!idle.idle) {
         const deferred = this.defer(

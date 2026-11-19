@@ -64,6 +64,12 @@ export interface OrcaWorkspaceIdleOptions {
    */
   targetTerminalHandle?: string | null;
   targetPaneKey?: string;
+  /**
+   * With a `null` target handle: the terminal this wakeup replaces. A rotation may only open the
+   * replacement tab once the retiring slot's own agent and its child worktrees are done.
+   */
+  retiringTerminalHandle?: string;
+  retiringPaneKey?: string;
   /** Preferred target agent when the bound terminal is gone and a rebind picks a replacement. */
   agent?: SupportedOrcaAgent;
   excludedHandles?: ReadonlySet<string>;
@@ -97,7 +103,8 @@ function reusableTerminalCandidates(
  * unverifiable terminals, every agent must be done with at least as many connected terminals as
  * agents, and every terminal the wakeup could write into must be connected, writable and free of
  * an unsent composer draft. When a fresh session tab will receive the pointer, retained tabs in
- * the root workspace neither block the wakeup nor mark the composer prefilled. Synthetic
+ * the root workspace neither block the wakeup nor mark the composer prefilled; only a rotation's
+ * retiring terminal gates the replacement, through its own agent and child worktrees. Synthetic
  * inventories are confirmed with `terminal wait`. A `> ` composer line is treated as an empty
  * Antigravity composer only when it matches the exact mode-placeholder vocabulary and Orca's
  * readiness probe also reports idle; every other `> ` line stays busy as an unsent human draft.
@@ -135,7 +142,13 @@ export async function checkOrcaWorkspaceIdle(
   if (!root) {
     return { idle: false, reason: 'Workspace not found' };
   }
-  if (options?.targetTerminalHandle === null) return { idle: true, reason: undefined };
+  // A fresh session tab has its own empty composer, so nothing retained can block it. Replacing a
+  // bound terminal is the exception: the retiring slot must be quiescent before its tab is closed.
+  if (options?.targetTerminalHandle === null) {
+    if (!options.retiringTerminalHandle?.trim() && !options.retiringPaneKey?.trim()) {
+      return { idle: true, reason: undefined };
+    }
+  }
   const visited = new Set<string>();
   const idleTree = async (row: Workspace): Promise<boolean> => {
     if (visited.has(row.worktreeId)) {
@@ -157,34 +170,44 @@ export async function checkOrcaWorkspaceIdle(
     // Ownership limits the root tab selection; a relevant descendant still has to prove readiness.
     const canUse = (terminal: OrcaTerminalRow) => !isRoot || !options?.excludedHandles?.has(String(terminal.handle));
     const eligibleHandles = handles.filter(canUse);
+    // A rotation opens a brand-new tab, so only the slot it retires can gate it.
+    const rotating = isRoot && options?.targetTerminalHandle === null;
+    const retiringHandle = options?.retiringTerminalHandle?.trim();
     const targetTerm = isRoot
-      ? eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
-        ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
+      ? rotating
+        ? (retiringHandle
+            ? eligibleHandles.find(t => String(t.handle) === retiringHandle)
+            : undefined) ?? eligibleHandles.find(t => matchesPane(t, options?.retiringPaneKey))
+        : eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
+          ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
       : undefined;
-    if (isRoot && options?.targetPaneKey?.trim() && !targetTerm) return true;
+    if (isRoot && !rotating && options?.targetPaneKey?.trim() && !targetTerm) return true;
     const targetPaneKeys = new Set<string>();
     if (typeof targetTerm?.tabId === 'string' && targetTerm.tabId && typeof targetTerm.leafId === 'string' && targetTerm.leafId)
       targetPaneKeys.add(`${targetTerm.tabId}:${targetTerm.leafId}`);
     if (typeof targetTerm?.recordedPaneKey === 'string' && targetTerm.recordedPaneKey) targetPaneKeys.add(targetTerm.recordedPaneKey);
-    if (targetPaneKeys.size === 0) {
-      if (
-        row.unverifiableTerminalCount !== 0 ||
-        !row.agents ||
-        row.agents.some((agent) => agent.state !== 'done')
-      )
-        return false;
-    } else {
-      if (
-        !row.agents ||
-        row.agents
-          .filter((agent) => (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) || (!agent.paneKey && handles.length <= 1))
-          .some((agent) => agent.state !== 'done')
-      )
-        return false;
+    if (rotating && options?.retiringPaneKey?.trim()) targetPaneKeys.add(options.retiringPaneKey.trim());
+    // The retiring terminal is already gone and carries no pane key to attribute children with.
+    if (rotating && !targetTerm && targetPaneKeys.size === 0) return true;
+    const ownedAgentsBusy = (): boolean =>
+      !row.agents ||
+      row.agents
+        .filter((agent) => (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) || (!agent.paneKey && handles.length <= 1))
+        .some((agent) => agent.state !== 'done');
+    const allAgentsBusy = (): boolean => !row.agents || row.agents.some((agent) => agent.state !== 'done');
+    if (targetPaneKeys.size > 0) {
+      if (ownedAgentsBusy()) return false;
+    } else if (rotating) {
+      // A rotation waits only for the retiring slot's own agent; retained and unverifiable tabs
+      // never block opening a new session tab.
+      if (targetTerm && handles.length <= 1 && allAgentsBusy()) return false;
+    } else if (row.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
+      return false;
     }
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
     const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
     if (
+      !rotating &&
       targetPaneKeys.size === 0 &&
       observableHandles.filter((t) => Boolean(t.connected)).length < (row.agents?.length ?? 0)
     ) {
@@ -193,8 +216,15 @@ export async function checkOrcaWorkspaceIdle(
     // Liveness and composer state only matter for terminals this wakeup may actually write into:
     // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
     // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
-    // rebind could reuse when it was closed).
-    const rootTarget = isRoot ? (targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle) : undefined;
+    // rebind could reuse when it was closed). A rotation never inspects the retiring composer:
+    // an unsent human draft there must not keep the replacement tab from opening.
+    const rootTarget = isRoot
+      ? rotating
+        ? null
+        : targetTerm
+          ? String(targetTerm.handle)
+          : options?.targetTerminalHandle
+      : undefined;
     const eligibleObservableHandles = observableHandles.filter(canUse);
     const targetPresent =
       typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
@@ -709,6 +739,31 @@ export async function sendOrcaTerminalText(
   }
   if (JSON.parse(output.stdout).ok === false) {
     throw new Error('Orca terminal send failed');
+  }
+}
+
+/**
+ * Best-effort retirement of a replaced terminal. Rotation commits the replacement handle first, so
+ * a failed close only leaves an extra tab behind and must never fail the wakeup.
+ */
+export async function closeOrcaWorkspaceTerminal(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  terminalHandle: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const handle = terminalHandle.trim();
+  if (!handle) return;
+  try {
+    await runner({
+      command,
+      args: ['terminal', 'close', '--terminal', handle, '--json'],
+      cwd,
+      signal,
+    });
+  } catch {
+    // Best-effort cleanup of a retired terminal after the replacement launch has already committed.
   }
 }
 
