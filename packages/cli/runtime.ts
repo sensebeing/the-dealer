@@ -1197,10 +1197,12 @@ export class DealerNodeRuntime {
           try {
             const binding = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding;
             const execution = receipt.stage === 'dispatched' && receipt.executionReceipt;
-            const authoritativeMailbox = execution && typeof execution === 'object' &&
-              typeof execution.mailboxId === 'string' &&
-              (!Array.isArray(execution.mailboxIds) || execution.mailboxIds.length === 1)
-              ? normalizeMailboxId(execution.mailboxId) : undefined;
+            const envelopeMailboxes = execution && execution.envelopeMailboxes;
+            const authoritativeMailbox = envelopeMailboxes && Object.hasOwn(envelopeMailboxes, envelope.id)
+              ? normalizeMailboxId(envelopeMailboxes[envelope.id])
+              : execution && typeof execution.mailboxId === 'string' &&
+                (!Array.isArray(execution.mailboxIds) || execution.mailboxIds.length === 1)
+                ? normalizeMailboxId(execution.mailboxId) : undefined;
             const mailboxId = authoritativeMailbox ?? resolveMailboxId(
               // Mode hints are normalized by the payload-aware binding adapter below, including
               // queued messages whose executor has not yet validated their payload.

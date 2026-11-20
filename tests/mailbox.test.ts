@@ -225,11 +225,12 @@ test('enqueue deduplicates per mailbox and sanitizes one-line wakeup hints', t =
   const { path } = workspace(t);
   const store = new MailboxStore(path);
   const first = store.enqueue([envelope('a')], { wakeupHint: '  line one\n\n  two   three  ' });
-  assert.deepEqual(first, { inserted: ['a'], duplicateIds: [], mailboxIds: ['default'] });
+  assert.deepEqual(first, { inserted: ['a'], duplicateIds: [], mailboxIds: ['default'], envelopeMailboxes: { a: 'default' } });
   assert.deepEqual(store.enqueue([envelope('a')]), {
     inserted: [],
     duplicateIds: ['a'],
     mailboxIds: ['default'],
+    envelopeMailboxes: { a: 'default' },
   });
   assert.deepEqual(store.enqueue([envelope('a')], { mailboxId: 'task:a' }).inserted, ['a']);
   assert.equal(

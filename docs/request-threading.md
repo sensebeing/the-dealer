@@ -55,7 +55,9 @@ wake target.
 
 In `spawn` mode, a new request without a concrete semantic target or local
 thread mailbox starts a dedicated session at `task:<rootMessageId>`. A sender's
-payload mailbox hint does not establish session ownership. Structured updates
+payload mailbox hint does not establish session ownership. When a new request
+and its follow-ups arrive in the same execution batch, they share the request's
+session unless a follow-up explicitly selects an executor. Structured updates
 and comments sent with `dealer send --thread` return to the existing session.
 Outbound messages without an explicit reply mailbox advertise the sender's
 local bound mailbox before final signing.

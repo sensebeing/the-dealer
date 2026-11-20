@@ -689,6 +689,8 @@ export interface ExecutionReceipt extends Record<string, unknown> {
   executor: string;
   executionId: string;
   detail?: string;
+  /** Destinations committed by mailbox-backed execution, keyed by envelope ID. */
+  envelopeMailboxes?: Readonly<Record<string, string>>;
 }
 
 export interface DispatchReceipt {

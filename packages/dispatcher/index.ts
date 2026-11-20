@@ -140,18 +140,21 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         for (const e of batch) {
           ledger.set(key(e), { stage: 'dispatching' });
         }
+        let result: DispatchReceipt;
         try {
-          const result = await executor.execute(batch);
+          result = await executor.execute(batch);
           for (const e of batch) {
             ledger.set(key(e), result);
           }
-          return result;
         } catch (error) {
           for (const e of batch) {
             ledger.set(key(e), { stage: 'failed', detail: String(error) });
           }
           throw error;
         }
+        // A policy can dispatch messages queued by earlier calls. Publish each committed delivery.
+        for (const envelope of batch) ctx.emit('dispatcher/inbound', { envelope, receipt: result });
+        return result;
       };
       ctx.provide('dispatcher', {
         hasExecutor(name) { return executors.has(name); },
@@ -257,12 +260,13 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             })
             .then(result => {
               // A queued policy owns its pending buffer; do not overwrite a later wave's completed state.
-              if (!ledger.get(id)) {
+              const recorded = ledger.get(id);
+              if (!recorded) {
                 ledger.set(id, result);
               }
               // Record the authenticated inbound route only after the gate allowed this delivery.
               // Pending approval/DND knocks never reach here; gate.approve()/drainDnd() do.
-              if (result.stage !== 'rejected' && result.stage !== 'failed') {
+              if (recorded?.stage !== 'dispatched' && result.stage !== 'rejected' && result.stage !== 'failed') {
                 ctx.emit('dispatcher/inbound', { envelope, receipt: result });
               }
               return result;

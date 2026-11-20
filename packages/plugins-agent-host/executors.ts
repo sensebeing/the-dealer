@@ -11,7 +11,7 @@ import {
   defaultAgentCommandArgs,
 } from './hosts.ts';
 import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from './hosts.ts';
-import { normalizeMailboxId, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress } from '../mailbox/index.ts';
+import { groupSpawnBatch, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveSpawnMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
 import type { MailboxStore, MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
@@ -103,6 +103,7 @@ export function createNamedHostExecutorPlugin(
 
 type HostDelivery = {
   type: 'host';
+  mode: ActiveConversationMode;
   mailboxId: string;
   request: CommandRequest;
   driverConfig: Record<string, unknown>;
@@ -156,7 +157,7 @@ function prepareAgentDelivery(
     }
   }
   const mailboxId = conversationMode === 'spawn'
-    ? normalizeMailboxId(`task:${envelope.id}`)
+    ? resolveSpawnMailboxId(envelope.id)
     : resolveMailboxId(envelope, addressing, threadLocalMailbox, 'inbox-only');
   const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
   const command = config.command ?? options.command;
@@ -178,6 +179,7 @@ function prepareAgentDelivery(
   const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
   return {
     type: 'host',
+    mode: conversationMode,
     mailboxId,
     request: { ...invocation, cwd },
     driverConfig: serializeAgentHostDriverConfig({
@@ -241,6 +243,7 @@ function createAgentExecutorPlugin(
 
       const inboxGroups = new Map<string, MessageEnvelope[]>();
       const hostGroups = new Map<string, { delivery: HostDelivery; envelopes: MessageEnvelope[] }>();
+      const spawnDeliveries = new Map<MessageEnvelope, HostDelivery>();
       const rawBatch: MessageEnvelope[] = [];
       for (const { envelope, delivery } of deliveries) {
         switch (delivery.type) {
@@ -254,6 +257,10 @@ function createAgentExecutorPlugin(
             break;
           }
           case 'host': {
+            if (delivery.mode === 'spawn') {
+              spawnDeliveries.set(envelope, delivery);
+              break;
+            }
             const group = hostGroups.get(delivery.mailboxId) ?? { delivery, envelopes: [] };
             group.envelopes.push(envelope);
             hostGroups.set(delivery.mailboxId, group);
@@ -261,12 +268,18 @@ function createAgentExecutorPlugin(
           }
         }
       }
+      for (const { mailboxId, envelopes } of prepareExternalEffect(() => groupSpawnBatch([...spawnDeliveries.keys()]))) {
+        const delivery = spawnDeliveries.get(envelopes[0])!;
+        const bound = hostGroups.get(mailboxId);
+        hostGroups.set(mailboxId, { delivery, envelopes: bound ? [...envelopes, ...bound.envelopes] : envelopes });
+      }
       const deliverInbox = await prepareInboxDeliveries(store, wakeup, inboxGroups);
       // Validate every route and resolve session wake targets before any handoff.
       const rawReceipt = rawBatch.length ? await rawExecutor.execute(rawBatch, context, runtimeConfig) : undefined;
       if (rawReceipt && !inboxGroups.size && !hostGroups.size) return rawReceipt;
       const mailboxIds = new Set<string>();
       const inserted: string[] = [];
+      const envelopeMailboxes: [string, string][] = [];
       let output: ReturnType<typeof commandOutput> | undefined;
       let woke: boolean | undefined;
       let reason: string | undefined;
@@ -282,6 +295,7 @@ function createAgentExecutorPlugin(
           });
           mailboxIds.add(mailboxId);
           inserted.push(...result.inserted);
+          envelopeMailboxes.push(...Object.entries(result.envelopeMailboxes));
           try {
             const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
             delivered = true;
@@ -299,11 +313,12 @@ function createAgentExecutorPlugin(
       const inbox = deliverInbox(context);
       for (const mailboxId of inbox.mailboxIds) mailboxIds.add(mailboxId);
       inserted.push(...inbox.inserted);
+      envelopeMailboxes.push(...Object.entries(inbox.envelopeMailboxes));
       const destinations = [...mailboxIds];
       return {
         ...rawReceipt, ...output, executor: name, executionId: randomUUID(),
         ...(destinations.length === 1 ? { mailboxId: destinations[0] } : {}),
-        mailboxIds: destinations, inserted,
+        mailboxIds: destinations, inserted, envelopeMailboxes: Object.fromEntries(envelopeMailboxes),
         ...(woke !== undefined ? { woke } : {}),
         ...(reason !== undefined ? { reason } : {}),
       };

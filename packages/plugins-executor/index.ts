@@ -136,14 +136,16 @@ export async function prepareInboxDeliveries(
   }
   return (context: ExecutionContext) => {
     const inserted: string[] = [];
+    const envelopeMailboxes: [string, string][] = [];
     for (const { mailboxId, envelopes, wakeTarget } of prepared) {
       const result = store.enqueue(envelopes, {
         signedEnvelopes: context?.signedEnvelopes, mailboxId, ...(wakeTarget ? { wakeTarget } : {}),
       });
       inserted.push(...result.inserted);
+      envelopeMailboxes.push(...Object.entries(result.envelopeMailboxes));
       if (result.inserted.length > 0) wakeup?.notifyMailbox(mailboxId);
     }
-    return { mailboxIds: prepared.map(item => item.mailboxId), inserted };
+    return { mailboxIds: prepared.map(item => item.mailboxId), inserted, envelopeMailboxes: Object.fromEntries(envelopeMailboxes) };
   };
 }
 
@@ -176,14 +178,13 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
         groups.set(mailboxId, group);
       }
       const deliver = await prepareInboxDeliveries(store, wakeup, groups);
-      const { mailboxIds, inserted } = deliver(context);
+      const delivered = deliver(context);
       return {
         executor: 'inbox',
         executionId: randomUUID(),
-        ...(mailboxIds.length === 1 ? { mailboxId: mailboxIds[0] } : {}),
-        mailboxIds,
+        ...(delivered.mailboxIds.length === 1 ? { mailboxId: delivered.mailboxIds[0] } : {}),
+        ...delivered,
         count: batch.length,
-        inserted,
       };
     },
   };

@@ -172,6 +172,7 @@ export interface MailboxEnqueueResult {
   inserted: string[];
   duplicateIds: string[];
   mailboxIds: string[];
+  envelopeMailboxes: Record<string, string>;
 }
 
 export interface MailboxCheckOptions {
@@ -354,6 +355,34 @@ export function resolveSessionOrThreadMailbox(
   return undefined;
 }
 
+export function resolveSpawnMailboxId(messageId: string): string {
+  return normalizeMailboxId(`task:${messageId}`, 'task mailbox');
+}
+
+/** Partition messages already selected for spawning, with each thread's root first. */
+export function groupSpawnBatch(batch: readonly MessageEnvelope[]) {
+  const threadKey = (envelope: MessageEnvelope) =>
+    JSON.stringify([envelope.networkId, envelope.semantic?.threadId ?? envelope.id]);
+  const hasExplicitExecutor = ({ payload }: MessageEnvelope) =>
+    typeof payload?.executor === 'string' && payload.executor.trim().length > 0;
+  const roots = new Map<string, MessageEnvelope>();
+  for (const envelope of batch) {
+    const key = threadKey(envelope);
+    if (envelope.id === envelope.semantic?.threadId ||
+      (!roots.has(key) && !hasExplicitExecutor(envelope))) {
+      roots.set(key, envelope);
+    }
+  }
+  const groups = new Map<MessageEnvelope, MessageEnvelope[]>();
+  for (const envelope of batch) {
+    const root = hasExplicitExecutor(envelope) ? envelope : roots.get(threadKey(envelope))!;
+    const group = groups.get(root) ?? [root];
+    if (envelope !== root) group.push(envelope);
+    groups.set(root, group);
+  }
+  return [...groups].map(([root, envelopes]) => ({ mailboxId: resolveSpawnMailboxId(root.id), envelopes }));
+}
+
 export function resolveMailboxId(
   envelope: MessageEnvelope,
   binding?: MailboxTopicBinding,
@@ -400,7 +429,7 @@ export function resolveMailboxId(
     return normalizeMailboxId(`stream:${streamKey ?? binding?.streamKey ?? envelope.kind}`, 'stream mailbox');
   }
   if (mode === 'spawn') {
-    return normalizeMailboxId(`task:${envelope.id}`, 'task mailbox');
+    return resolveSpawnMailboxId(envelope.id);
   }
   return 'default';
 }
@@ -1028,6 +1057,7 @@ export class MailboxStore {
       const inserted: string[] = [];
       const duplicateIds: string[] = [];
       const mailboxIds = new Set<string>();
+      const envelopeMailboxes = new Map<string, string>();
       for (const envelope of batch) {
         if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
           throw new Error('Invalid envelope: missing id');
@@ -1042,6 +1072,7 @@ export class MailboxStore {
           ),
         );
         mailboxIds.add(mailboxId);
+        envelopeMailboxes.set(envelope.id, mailboxId);
         if (state.items.some(item => item.mailboxId === mailboxId && item.id === envelope.id)) {
           duplicateIds.push(envelope.id);
           continue;
@@ -1101,7 +1132,7 @@ export class MailboxStore {
           }
         }
       }
-      return { inserted, duplicateIds, mailboxIds: [...mailboxIds] };
+      return { inserted, duplicateIds, mailboxIds: [...mailboxIds], envelopeMailboxes: Object.fromEntries(envelopeMailboxes) };
     });
     for (const [mailboxId, count] of insertedByMailbox) {
       if (count > 0) {
