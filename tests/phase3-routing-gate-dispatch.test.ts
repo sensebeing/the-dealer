@@ -52,6 +52,28 @@ async function setup(t: TestContext, options: { mode?: 'open' | 'dnd' | 'closed'
   return { kernel, calls, executor, gate: kernel.ctx.services.gate as NetworkGateService, dispatcher: kernel.ctx.services.dispatcher };
 }
 
+test('standalone dispatcher reports a post-delivery policy failure and keeps the committed receipt', async t => {
+  const { kernel, dispatcher, calls } = await setup(t);
+  const failure = new Error('policy could not settle');
+  const reported: unknown[] = [];
+  const subscription = kernel.ctx.on('dispatcher/error', event => { reported.push(event); });
+  t.after(() => subscription.dispose());
+  dispatcher.registerPolicy({ name: 'settlement-failure', async process(message, next) {
+    await next([message]);
+    throw failure;
+  } });
+  const input = envelope();
+  const receipt = await dispatcher.dispatch(input);
+  const expected = { stage: 'post_delivery_policy', networkId: input.networkId,
+    fromNodeId: input.from.nodeId, messageId: input.id, receipt, error: failure };
+  assert.equal(receipt.stage, 'dispatched');
+  assert.deepEqual(reported, [expected]);
+  assert.deepEqual(dispatcher.getLastError(), expected);
+  assert.deepEqual(await dispatcher.dispatch(input), receipt);
+  assert.equal(calls.length, 1);
+  assert.equal(reported.length, 1);
+});
+
 test('router explicit selectors, broadcast, capability tags/types and idle preference', async t => {
   const busy = card(generateNodeKeyPair(), { runtimeState: { load: 'busy', activeTasks: 1, availableAgents: [] } });
   const kernel = new Kernel(); kernel.ctx.provide('node', node(receiver, [card(), busy])); await kernel.use(createRouterPlugin()); t.after(() => kernel.stop());

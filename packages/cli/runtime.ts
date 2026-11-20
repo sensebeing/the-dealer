@@ -558,9 +558,11 @@ export class DealerNodeRuntime {
           requiredPolicies: () => this.config.policies,
           ledgerPath: join(this.stateDir, 'deliveries.json'),
           wrapExecutor: executor => this.wrapExecutorWithAttachments(executor),
+          withExecutionScope: (batch, context, execute) =>
+            serializeThreadDeliveries(this.mailbox, batch, context, (_commit, reservedContext) => execute(reservedContext)),
           resolveExecutor: envelope => this.resolveExecutorName(envelope),
-          onError: (error, { phase, networkId, fromNodeId, messageId }) => {
-            this.lastError = `${phase} failure for ${networkId}/${fromNodeId}/${messageId}: ${String(error)}`;
+          onError: (error, { stage, networkId, fromNodeId, messageId }) => {
+            this.lastError = `${stage} failure for ${networkId}/${fromNodeId}/${messageId}: ${String(error)}`;
           },
         }),
       );
@@ -1165,7 +1167,7 @@ export class DealerNodeRuntime {
 
   /** Every registered executor receives the same attachment and receiver-config boundary. */
   private wrapExecutorWithAttachments(executor: ExecutorPlugin<any>): ExecutorPlugin<any> {
-    return { ...executor, execute: (batch, context, config) => serializeThreadDeliveries(this.mailbox, batch, context, async (_commit, reservedContext) => {
+    return { ...executor, execute: async (batch, context, config) => {
       const local = [];
       const signedEnvelopes: Record<string, MessageEnvelope> = { ...(context.signedEnvelopes ?? {}) };
       for (const envelope of batch) {
@@ -1181,8 +1183,8 @@ export class DealerNodeRuntime {
         const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload) ? envelope.payload : {};
         local.push({ ...envelope, payload: { ...payload, localAttachments: files } });
       }
-      return executor.execute(local, { ...reservedContext, signedEnvelopes }, { ...config, ...this.config.executorConfig[executor.name] });
-    }) };
+      return executor.execute(local, { ...context, signedEnvelopes }, { ...config, ...this.config.executorConfig[executor.name] });
+    } };
   }
 
   private describeInboundMailbox(envelope: MessageEnvelope): string {

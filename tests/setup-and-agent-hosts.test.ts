@@ -2328,6 +2328,47 @@ test('runtime reserves a spawn thread before fetching the root’s attachment', 
   assert.deepEqual(runtime.mailbox.list({ mailboxId }).items.map(item => item.id).sort(), [followup.id, rootEnvelope.id]);
 });
 
+test('runtime selects inbox after waiting for an explicitly selected Orca root', { timeout: 8000 }, async t => {
+  const root = directory(t);
+  const createStarted = Promise.withResolvers<void>();
+  const releaseCreate = Promise.withResolvers<void>();
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'), member: 'solo', transport: { discoveryDir: join(root, 'discovery') },
+    patch: { defaultExecutor: 'notify' },
+    commandRunner: async request => {
+      calls.push(request);
+      if (request.args.slice(0, 2).join(' ') === 'worktree create') {
+        createStarted.resolve();
+        await releaseCreate.promise;
+        return { stdout: JSON.stringify({ ok: true, result: { path: root } }) };
+      }
+      return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-root-owner"}}}' };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  const initial: MessageEnvelope = { ...message('explicit-root', { executor: 'orca', mode: 'spawn' }), networkId: 'local', kind: 'review' };
+  const followup: MessageEnvelope = {
+    ...initial, id: 'unforced-followup', payload: {}, semantic: { type: 'message', threadId: initial.id },
+  };
+  const dispatcher = runtime.kernel.getService('dispatcher');
+  const rootDelivery = dispatcher.dispatch(initial);
+  await createStarted.promise;
+  assert.equal(runtime.resolveExecutorName(followup), 'notify');
+  const followupDelivery = dispatcher.dispatch(followup);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+  } finally {
+    releaseCreate.resolve();
+  }
+  const [first, second] = await Promise.all([rootDelivery, followupDelivery]);
+  assert.equal(first.executionReceipt?.executor, 'orca');
+  assert.equal(second.executionReceipt?.executor, 'inbox');
+  assert.equal(second.executionReceipt?.mailboxId, 'task:explicit-root');
+  assert.deepEqual(runtime.mailbox.list({ mailboxId: 'task:explicit-root' }).items.map(item => item.id), [followup.id, initial.id]);
+  assert.ok(calls.every(call => call.command !== 'osascript'));
+});
+
 test('runtime reports a dedup watermark write failure without replaying a confirmed delivery', async t => {
   const root = directory(t);
   const stateDir = join(root, 'state');

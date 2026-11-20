@@ -211,6 +211,35 @@ test('dealer send --thread leaves a root’s payload mailbox hint out of the sig
 });
 
 for (const [name, create] of [['orca', createOrcaExecutorPlugin], ['orca-spawn', createOrcaSpawnExecutorPlugin]] as const) {
+  test(`standalone ${name} initializes and reuses its configured spawn mailbox`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const mailboxId = 'requests';
+    const calls: CommandRequest[] = [];
+    const commandRunner: CommandRunner = async request => {
+      calls.push(request);
+      const action = request.args.slice(0, 2).join(' ');
+      if (action === 'worktree create') return { stdout: JSON.stringify({ ok: true, result: { path: root } }) };
+      if (action === 'terminal create') return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-bound"}}}' };
+      return { stdout: '{"ok":true}' };
+    };
+    const wakeup = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner, idleCheck: async () => ({ idle: true }) }) });
+    t.after(() => wakeup.stop());
+    const plugin = create({ store, wakeup, commandRunner, resolveTopicBinding: () => ({ mailboxId, mode: 'spawn' }) });
+    const first = envelope('first', { semantic: { type: 'message', threadId: 'first', targetMailbox: mailboxId } });
+    const second = envelope('second');
+    const third = envelope('third', { semantic: { type: 'message', threadId: 'third', targetMailbox: mailboxId } });
+    const receipts = await Promise.all([first, second].map(message => plugin.execute([message], context, {})));
+    receipts.push(await plugin.execute([third], context, {}));
+    for (const receipt of receipts) {
+      assert.equal(receipt.executor, name);
+      assert.equal(receipt.mailboxId, mailboxId);
+    }
+    assert.deepEqual(store.list({ mailboxId }).items.map(item => item.id).sort(), ['first', 'second', 'third']);
+    assert.equal(store.getWakeTarget(mailboxId)?.driver, 'orca-terminal');
+    assert.equal(calls.filter(call => call.args.slice(0, 2).join(' ') === 'worktree create').length, 1);
+  });
+
   test(`standalone ${name} spawn delivers a batch to its owning thread and session mailboxes`, async t => {
     const store = new MailboxStore(join(directory(t), 'mailbox.json'));
     const calls: CommandRequest[] = [];

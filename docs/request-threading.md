@@ -54,8 +54,9 @@ another mailbox is enqueued there and wakes its owning session when it has a
 wake target.
 
 In `spawn` mode, a new request without a concrete semantic target or local
-thread mailbox starts a session at `task:<rootMessageId>`. A standalone agent
-host uses the receiver's configured `mailboxId` when present. A sender's
+thread mailbox starts a session at `task:<rootMessageId>` by default. A
+receiver-configured spawn mailbox takes precedence and Orca reuses its
+initialized session for later arrivals. A sender's
 payload mailbox hint does not establish session ownership. The executor associates
 follow-ups with their thread before choosing a delivery mode. With no existing owner,
 a follow-up in the same batch shares the root's session unless it names a concrete

@@ -57,10 +57,42 @@ type ReservedExecutionContext = ExecutionContext & {
     reused: boolean;
   };
 };
-const pendingThreadDeliveries = new Map<string, Promise<void>>();
+const pendingDeliveries = new Map<string, Promise<void>>();
 
 const threadDeliveryKey = (store: MailboxStore, envelope: MessageEnvelope) =>
   JSON.stringify([store.path, envelope.networkId, envelopeThreadId(envelope)]);
+
+async function serializeDeliveryKeys<T>(
+  keys: Iterable<string>, deliver: (release: (key: string) => void) => Promise<T>,
+): Promise<T> {
+  const releases = new Map<string, () => void>();
+  const previous: Promise<void>[] = [];
+  for (const key of keys) {
+    const prior = pendingDeliveries.get(key);
+    if (prior) previous.push(prior);
+    const { promise, resolve } = Promise.withResolvers<void>();
+    pendingDeliveries.set(key, promise);
+    releases.set(key, () => {
+      releases.delete(key);
+      resolve();
+      if (pendingDeliveries.get(key) === promise) pendingDeliveries.delete(key);
+    });
+  }
+  try {
+    if (previous.length) await Promise.all(previous);
+    return await deliver(key => releases.get(key)?.());
+  } finally {
+    for (const release of releases.values()) release();
+  }
+}
+
+/** A receiver-configured mailbox may be shared by several threads. */
+export function serializeMailboxInitialization<T>(
+  store: MailboxStore, mailboxId: string, deliver: (commit: () => void) => Promise<T>,
+): Promise<T> {
+  const key = JSON.stringify([store.path, mailboxId]);
+  return serializeDeliveryKeys([key], release => deliver(() => release(key)));
+}
 
 /** Queue before yielding and release each thread when its final member takes custody. */
 export async function serializeThreadDeliveries<T>(
@@ -84,36 +116,20 @@ export async function serializeThreadDeliveries<T>(
     const key = threadDeliveryKey(store, envelope);
     remaining.set(key, (remaining.get(key) ?? 0) + 1);
   }
-  const releases = new Map<string, () => void>();
-  const previous: Promise<void>[] = [];
-  for (const key of remaining.keys()) {
-    const prior = pendingThreadDeliveries.get(key);
-    if (prior) previous.push(prior);
-    const { promise, resolve } = Promise.withResolvers<void>();
-    pendingThreadDeliveries.set(key, promise);
-    releases.set(key, () => {
-      releases.delete(key);
-      resolve();
-      if (pendingThreadDeliveries.get(key) === promise) pendingThreadDeliveries.delete(key);
-    });
-  }
-  try {
-    if (previous.length) await Promise.all(previous);
+  return serializeDeliveryKeys(remaining.keys(), release => {
     const commit: ThreadCustody = envelopes => {
       for (const envelope of envelopes) {
         const key = threadDeliveryKey(store, envelope);
         const count = (remaining.get(key) ?? 0) - 1;
-        if (count === 0) releases.get(key)?.();
+        if (count === 0) release(key);
         remaining.set(key, count);
       }
     };
     const reservedContext: ReservedExecutionContext = {
       ...context, [threadReservation]: { storePath: store.path, batch, commit, reused: false },
     };
-    return await deliver(commit, reservedContext);
-  } finally {
-    for (const release of releases.values()) release();
-  }
+    return deliver(commit, reservedContext);
+  });
 }
 
 function mergeDeliveryReceipts(

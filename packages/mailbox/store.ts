@@ -828,9 +828,9 @@ function loadState(raw: string): MailboxFileState {
       }
       const delivered = deliveredMailboxes.get(networkMessageKey(record.networkId, record.messageId));
       const deliveryTarget = delivered === undefined ? undefined : validatedWakeTargets[delivered];
-      const pinnedTarget = record.localMailbox.startsWith('terminal:') && Object.hasOwn(wakeTargets, record.localMailbox)
+      const pinnedTarget = Object.hasOwn(wakeTargets, record.localMailbox)
         ? validatedWakeTargets[record.localMailbox] : undefined;
-      // Legacy terminal pinning kept the delivered item in the rotating mailbox.
+      // Legacy session pinning kept the delivered item in the rotating mailbox.
       const preservesLegacyPin = record.localMailbox !== delivered && deliveryTarget?.rotateAfterWaves !== undefined &&
         pinnedTarget !== undefined && pinnedTarget.rotateAfterWaves === undefined &&
         pinnedTarget.driver !== 'passive' && pinnedTarget.driver === deliveryTarget.driver;

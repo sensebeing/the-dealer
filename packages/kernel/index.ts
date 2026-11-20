@@ -11,6 +11,7 @@ import type {
   GateVerdict,
   PendingApprovalItem,
   DispatchReceipt,
+  DispatchErrorEvent,
   DeliveryReceipt,
   InboundFrameEvent,
   PeerReachableEvent,
@@ -50,6 +51,7 @@ export interface Events {
     envelope: MessageEnvelope,
   ) => DispatchReceipt | undefined | Promise<DispatchReceipt | undefined>;
   'dispatcher/inbound': (event: { envelope: MessageEnvelope; receipt: DispatchReceipt }) => void;
+  'dispatcher/error': (event: DispatchErrorEvent) => void;
   'emitter/sent': (event: {
     envelope: MessageEnvelope;
     targetNodeIds: readonly string[];

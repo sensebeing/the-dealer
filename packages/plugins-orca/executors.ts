@@ -40,6 +40,7 @@ import {
   rethrowBeforeCommandStart,
   executeDeliveryGroups,
   prepareInboxDeliveries,
+  serializeMailboxInitialization,
   serializeThreadDeliveries,
 } from '../plugins-executor/index.ts';
 import type { PreparedDelivery } from '../plugins-executor/index.ts';
@@ -170,7 +171,8 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
   const issuedNames = new Set<string>();
   return (
     batch: readonly MessageEnvelope[], route: OrcaRoute, mailboxId: string,
-    context: ExecutionContext, config: OrcaSpawnOptions, proposedSpawn = false,
+    context: ExecutionContext, config: OrcaSpawnOptions,
+    custody?: { proposedSpawn: boolean; boundMailbox: boolean },
   ) => {
     const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
     const { binding, explicitMode } = route;
@@ -180,6 +182,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
       payload.interactive === true ||
       explicitMode === 'spawn' ||
       binding?.executor === 'orca' ||
+      custody?.boundMailbox === true ||
       config.interactive === true ||
       options.interactive === true;
     const store = options.store ?? config.store;
@@ -319,7 +322,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
           // Once committed, the mailbox owns recovery even if Orca cannot launch the agent.
           enqueued = store.enqueue(batch, {
             ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}),
-            mailboxId, proposedSpawn,
+            mailboxId, proposedSpawn: custody?.proposedSpawn,
             wakeTarget: {
               driver: 'orca-terminal',
               coalesceMs: 0,
@@ -440,6 +443,14 @@ async function prepareOrcaSpawnBatch(
   const wakeup = options.wakeup ?? config.wakeup;
   const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
   const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
+  const prepareSession = async (store: MailboxStore, mailboxId: string, envelopes: MessageEnvelope[]) => {
+    const wakeTarget = await resolveOrcaSessionWakeTarget(store, wakeup, runner, command, mailboxId);
+    return prepareOrcaMailboxDelivery(store, wakeup, context, mailboxId, envelopes, wakeTarget);
+  };
+  const ownsBoundMailbox = (store: MailboxStore, mailboxId: string) => {
+    const target = store.getWakeTarget(mailboxId);
+    return (target !== undefined && target.driver !== 'passive') || store.list({ mailboxId, limit: 1 }).totalCount > 0;
+  };
   const { existing, launches } = prepareExternalEffect(() => {
     if (!store) {
       const route = routes[0];
@@ -457,22 +468,34 @@ async function prepareOrcaSpawnBatch(
       const sessionMailbox = hasExplicitExecutor(envelope)
         ? undefined : resolveSessionOrThreadMailbox(envelope, threadLocal);
       const boundMailboxId = resolveBoundMailboxId(bindingKind, { ...binding, mode, conversationMode: undefined }, mode);
-      if (sessionMailbox === undefined || sessionMailbox === boundMailboxId) {
-        const proposedSpawn = canInheritThreadMailbox(envelope);
-        const mailboxId = resolveSpawnMailboxId(envelope.id);
-        launches.push({ envelopes, deliver: prepareSpawn(envelopes, route, mailboxId, context, config, proposedSpawn) });
-      } else {
-        const group = existing.get(sessionMailbox) ?? [];
+      const destination = sessionMailbox ?? boundMailboxId;
+      const boundMailbox = destination === boundMailboxId && boundMailboxId !== 'default';
+      if ((sessionMailbox !== undefined && (!boundMailbox || threadLocal === destination)) ||
+          (boundMailbox && ownsBoundMailbox(store, destination))) {
+        const group = existing.get(destination) ?? [];
         group.push(...envelopes);
-        existing.set(sessionMailbox, group);
+        existing.set(destination, group);
+        continue;
       }
+      const mailboxId = boundMailbox ? destination : resolveSpawnMailboxId(envelope.id);
+      const launch = prepareSpawn(envelopes, route, mailboxId, context, config, {
+        boundMailbox, proposedSpawn: canInheritThreadMailbox(envelope),
+      });
+      launches.push({ envelopes, deliver: boundMailbox ? commit =>
+        serializeMailboxInitialization(store, mailboxId, async release => {
+          const committed = () => { release(); commit(); };
+          if (prepareExternalEffect(() => ownsBoundMailbox(store, mailboxId))) {
+            const session = await prepareSession(store, mailboxId, envelopes);
+            return session.deliver(committed);
+          }
+          return launch(committed);
+        }) : launch });
     }
     return { existing, launches };
   });
   if (store) {
     for (const [mailboxId, envelopes] of existing) {
-      const wakeTarget = await resolveOrcaSessionWakeTarget(store, wakeup, runner, command, mailboxId);
-      sessions.push(prepareOrcaMailboxDelivery(store, wakeup, context, mailboxId, envelopes, wakeTarget));
+      sessions.push(await prepareSession(store, mailboxId, envelopes));
     }
   }
   return { sessions, launches };

@@ -783,26 +783,26 @@ test('legacy v2 inbound routes follow the stored delivery despite an unrelated w
   assert.equal(reloaded.getThread(history.id)?.mailboxCommitted, false);
 });
 
-test('an upgraded legacy rotating thread retains its terminal through subsequent rotation', t => {
+for (const early of ['terminal:early', 'session:one']) test(`an upgraded legacy rotating thread retains ${early} through subsequent rotation`, t => {
   const { path } = workspace(t);
   const store = new MailboxStore(path);
   const stream = 'stream:requests';
   const first = envelope('first');
   store.enqueue([first], { mailboxId: stream, wakeTarget: { driver: 'orca-terminal', rotateAfterWaves: 1 } });
   const firstDelivery = store.check({ mailboxId: stream });
-  store.completeWakeDelivery(stream, firstDelivery.items[0].sequence, {}, { sessionMailboxId: 'terminal:early' });
+  store.completeWakeDelivery(stream, firstDelivery.items[0].sequence, {}, { sessionMailboxId: early });
   store.ack(firstDelivery.deliveryId!, stream);
   const snapshot = JSON.parse(readFileSync(path, 'utf8'));
   delete snapshot.threads['inbound:first'].mailboxCommitted;
   writeFileSync(path, JSON.stringify(snapshot));
 
   const upgraded = new MailboxStore(path);
-  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), 'terminal:early');
+  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), early);
   const next = envelope('next');
   upgraded.enqueue([next], { mailboxId: stream });
   const nextDelivery = upgraded.check({ mailboxId: stream });
   upgraded.completeWakeDelivery(stream, nextDelivery.items[0].sequence, {}, { sessionMailboxId: 'terminal:later' });
-  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), 'terminal:early');
+  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), early);
   assert.equal(upgraded.resolveThreadLocalMailbox(next.id, next.networkId), 'terminal:later');
 });
 

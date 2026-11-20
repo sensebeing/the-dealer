@@ -1557,9 +1557,14 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
         subject: promptCase.subject,
         payload: { interactive: true, terminalPrompt: promptCase.terminalPrompt },
       });
-      await executor.execute([message], {} as ExecutionContext);
+      const claim = direct ? undefined : service.claim(`task:${message.id}`);
+      try {
+        await executor.execute([message], {} as ExecutionContext);
+        if (!direct) assert.equal(terminalSends(calls).length, 0);
+      } finally {
+        claim?.dispose();
+      }
       if (!direct) {
-        assert.equal(terminalSends(calls).length, 0);
         await service.flushMailbox(`task:${message.id}`);
       }
       const sends = terminalSends(calls);
@@ -3844,10 +3849,15 @@ for (const source of ['refresh', 'wave'] as const) {
     };
     let service = new WakeupRedriveService({ store: runtime.mailbox, drivers: createTestWakeupDrivers({ commandRunner: runner })});
     t.after(() => service.stop());
-    await ingest('wave-one');
-    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, undefined);
-    assert.equal(sessionBinding(runtime.mailbox.getWakeTarget(mailboxId)).paneKey, undefined);
-    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.completedWaves, 0);
+    const initialClaim = service.claim(mailboxId);
+    try {
+      await ingest('wave-one');
+      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, undefined);
+      assert.equal(sessionBinding(runtime.mailbox.getWakeTarget(mailboxId)).paneKey, undefined);
+      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.completedWaves, 0);
+    } finally {
+      initialClaim.dispose();
+    }
     assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
     assert.equal(sendsTo(state.calls, 'term-A').length, 0);
     const firstCreate = state.calls.find(call => call.args[1] === 'create')!;
@@ -4089,9 +4099,14 @@ for (const source of ['refresh', 'wave'] as const) {
           await plugin.execute([alert(id)], { networkId: 'team', nodeId: 'receiver', traceId: id }, {});
         }
       };
-      await ingest('first');
-      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, baseline ? 'term-rotated' : undefined);
-      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.sessionId, baseline ? undefined : 'B');
+      const initialClaim = service.claim(mailboxId);
+      try {
+        await ingest('first');
+        assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, baseline ? 'term-rotated' : undefined);
+        assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.sessionId, baseline ? undefined : 'B');
+      } finally {
+        initialClaim.dispose();
+      }
       assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
       assert.equal(state.created, baseline ? 0 : 1);
       if (baseline) {

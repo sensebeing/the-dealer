@@ -733,10 +733,20 @@ export interface ExecutorPlugin<C = unknown> {
   ): Promise<ExecutionReceipt>;
 }
 
+export interface DispatchErrorEvent {
+  readonly stage: 'post_delivery_policy';
+  readonly networkId: string;
+  readonly fromNodeId: string;
+  readonly messageId: string;
+  readonly receipt: DispatchReceipt;
+  readonly error: unknown;
+}
+
 export interface DispatcherService {
   hasExecutor(name: string): boolean;
   hasPolicy(name: string): boolean;
   dispatch(envelope: MessageEnvelope): Promise<DispatchReceipt>;
+  getLastError(): DispatchErrorEvent | undefined;
   registerPolicy(policy: DispatchPolicyPlugin): Disposable;
   registerExecutor<C>(executor: ExecutorPlugin<C>, config: C): Disposable;
   /** In-flight dispatch count; zero means the dispatcher is idle. */

@@ -3,31 +3,29 @@ import { PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt 
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type {
   DispatchPolicyPlugin,
+  DispatchErrorEvent,
   DispatchReceipt,
+  ExecutionContext,
   ExecutorPlugin,
   MessageEnvelope,
 } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 
-export interface DispatchErrorContext {
-  phase: 'post-delivery-policy';
-  networkId: string;
-  fromNodeId: string;
-  messageId: string;
-  receipt: DispatchReceipt;
-}
-
 export interface DispatcherConfig {
   requiredPolicies?: () => readonly string[];
   /** Composition-root decoration, uniformly applied at the registration boundary. */
   wrapExecutor?: (executor: ExecutorPlugin<any>) => ExecutorPlugin<any>;
+  withExecutionScope?: (
+    batch: readonly MessageEnvelope[], context: ExecutionContext,
+    execute: (scopedContext: ExecutionContext) => Promise<DispatchReceipt>,
+  ) => Promise<DispatchReceipt>;
   privateKeyPem?: string;
   ledgerPath?: string;
   defaultExecutor?: string;
   resolveExecutor?: (envelope: MessageEnvelope) => string | undefined;
   resolveKindExecutor?: (kind: string, streamKey?: string) => string | undefined;
   kindExecutors?: Record<string, string>;
-  onError?: (error: unknown, context: DispatchErrorContext) => void;
+  onError?: (error: unknown, context: Omit<DispatchErrorEvent, 'error'>) => void;
 }
 
 /**
@@ -98,12 +96,13 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       const policies = new Set<DispatchPolicyPlugin>();
       const executors = new Map<
         string,
-        { execute: (batch: readonly MessageEnvelope[]) => Promise<DispatchReceipt> }
+        { execute: (batch: readonly MessageEnvelope[], context: ExecutionContext) => Promise<DispatchReceipt> }
       >();
       const ledger = new DeliveryLedger(config.ledgerPath);
       const active = new Map<string, Promise<DispatchReceipt>>();
       const idleListeners = new Set<() => void>();
       const controller = new AbortController();
+      let lastError: DispatchErrorEvent | undefined;
       ctx.effect(() => async () => {
         controller.abort();
         await Promise.allSettled(active.values());
@@ -139,12 +138,14 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           }
         }
       };
-      const core = async (batch: readonly MessageEnvelope[], callerKey: string): Promise<DispatchReceipt> => {
-        if (!batch.length) {
-          throw Object.assign(new Error('Empty execution batch'), { beforeExternalEffect: true });
+      const executeBatch = async (
+        batch: readonly MessageEnvelope[], callerKey: string, context: ExecutionContext,
+      ): Promise<DispatchReceipt> => {
+        if (context.signal?.aborted) {
+          throw Object.assign(new Error('Dispatcher stopped'), { beforeExternalEffect: true });
         }
         const name = select(batch[0]);
-        if (batch.some(e => select(e) !== name || e.networkId !== batch[0].networkId)) {
+        if (batch.slice(1).some(e => e.networkId !== context.networkId || select(e) !== name)) {
           throw Object.assign(new Error('Batch crosses executor or network boundary'), { beforeExternalEffect: true });
         }
         const executor = name && executors.get(name);
@@ -161,7 +162,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         ledger.update(members.map(({ id }) => [id, { stage: 'dispatching' }]));
         let result: DispatchReceipt;
         try {
-          result = await executor.execute(batch);
+          result = await executor.execute(batch, context);
         } catch (error) {
           const partial = error instanceof PartialBatchExecutionError ? error : undefined;
           const beforeEffect = (error as { beforeExternalEffect?: boolean } | null)?.beforeExternalEffect === true;
@@ -191,10 +192,22 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         for (const envelope of batch) ctx.emit('dispatcher/inbound', { envelope, receipt: result });
         return result;
       };
+      const core = async (batch: readonly MessageEnvelope[], callerKey: string): Promise<DispatchReceipt> => {
+        const first = batch[0];
+        if (!first) throw Object.assign(new Error('Empty execution batch'), { beforeExternalEffect: true });
+        const context = {
+          networkId: first.networkId, nodeId: ctx.services.node.getSelfCard(first.networkId).nodeId,
+          traceId: first.traceId, signal: controller.signal,
+        };
+        return config.withExecutionScope
+          ? config.withExecutionScope(batch, context, scopedContext => executeBatch(batch, callerKey, scopedContext))
+          : executeBatch(batch, callerKey, context);
+      };
       ctx.provide('dispatcher', {
         hasExecutor(name) { return executors.has(name); },
         hasPolicy(name) { return [...policies].some(policy => policy.name === name); },
         activeCount() { return active.size; },
+        getLastError() { return lastError; },
         onIdle(listener: () => void) {
           idleListeners.add(listener);
           return { dispose() { idleListeners.delete(listener); } };
@@ -221,21 +234,10 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           }
           const wrapped = config.wrapExecutor?.(executor) ?? executor;
           const entry = {
-            async execute(batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> {
-              const first = batch[0];
-              const nodeId = ctx.services.node.getSelfCard(first.networkId).nodeId;
+            async execute(batch: readonly MessageEnvelope[], context: ExecutionContext): Promise<DispatchReceipt> {
               return {
                 stage: 'dispatched',
-                executionReceipt: await wrapped.execute(
-                  batch,
-                  {
-                    networkId: first.networkId,
-                    nodeId,
-                    traceId: first.traceId,
-                    signal: controller.signal,
-                  },
-                  executorConfig,
-                ),
+                executionReceipt: await wrapped.execute(batch, context, executorConfig),
               };
             },
           };
@@ -309,10 +311,18 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             }, error => {
               const recorded = ledger.get(id);
               if (recorded?.stage === 'dispatched' || recorded?.stage === 'settled') {
-                config.onError?.(error, {
-                  phase: 'post-delivery-policy', networkId: envelope.networkId,
-                  fromNodeId: envelope.from.nodeId, messageId: envelope.id, receipt: recorded,
-                });
+                const context = {
+                  stage: 'post_delivery_policy' as const, networkId: envelope.networkId,
+                  fromNodeId: envelope.from.nodeId, messageId: envelope.id, receipt: structuredClone(recorded),
+                };
+                const event = { ...context, error };
+                lastError = event;
+                for (const report of [() => ctx.emit('dispatcher/error', event), () => config.onError?.(error, context)]) {
+                  try { report(); }
+                  catch (reportError) {
+                    lastError = { ...event, error: new AggregateError([lastError.error, reportError], 'Dispatcher diagnostic observer failed') };
+                  }
+                }
                 return recorded;
               }
               throw error;

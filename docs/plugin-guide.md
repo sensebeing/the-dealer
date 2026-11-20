@@ -261,8 +261,9 @@ Prepare every delivery group before taking custody or launching a host. The shar
 `executeDeliveryGroups` reports partial outcomes through `PartialBatchExecutionError`.
 The dispatcher publishes `dispatcher/inbound` for each settled member, preserves its committed
 receipt, records failures for attempted members, and removes the ledger entries for
-unattempted members so they can be retried safely. A policy error after confirmed delivery
-reaches runtime diagnostics while the dispatcher returns the persisted receipt.
+unattempted members so they can be retried safely. After confirmed delivery, policy errors
+are available through `dispatcher/error` and `DispatcherService.getLastError()` while the
+dispatcher returns the persisted receipt.
 
 Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
 pinning; these decisions stay with the host plugin rather than the core mailbox.
