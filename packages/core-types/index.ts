@@ -693,6 +693,22 @@ export interface ExecutionReceipt extends Record<string, unknown> {
   envelopeMailboxes?: Readonly<Record<string, string>>;
 }
 
+/** A failed execution group leaves earlier handoffs settled and later members unattempted. */
+export class PartialBatchExecutionError extends Error {
+  readonly settledReceipts: Readonly<Record<string, ExecutionReceipt>>;
+  readonly unattemptedIds: ReadonlySet<string>;
+
+  constructor(
+    cause: unknown,
+    settledReceipts: Readonly<Record<string, ExecutionReceipt>>,
+    unattemptedIds: ReadonlySet<string>,
+  ) {
+    super(String(cause), { cause });
+    this.settledReceipts = settledReceipts;
+    this.unattemptedIds = unattemptedIds;
+  }
+}
+
 export interface DispatchReceipt {
   stage: DeliveryStage;
   executionReceipt?: ExecutionReceipt;

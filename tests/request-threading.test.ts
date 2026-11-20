@@ -42,12 +42,11 @@ test('thread envelopes survive settlement and reload; summaries and sequence sca
   const first = envelope('root');
   const reply = envelope('reply', { semantic: { type: 'reply', threadId: 'root' } });
   const settled = envelope('settled', { semantic: { type: 'settle', threadId: 'root', outcome: 'succeeded' } });
-  store.recordInboundEnvelope(first, 'default');
   store.recordOutboundEnvelope(reply, [key.nodeId]);
-  store.recordInboundEnvelope(settled, 'default');
   store.enqueue([first, reply, settled]);
   const reloaded = new MailboxStore(store.path);
   const records = reloaded.listThreadRecords('root');
+  assert.deepEqual(records.filter(record => record.messageId === reply.id).map(record => record.direction).sort(), ['inbound', 'outbound']);
   for (const record of records) {
     assert.ok(verifyEnvelope(record.envelope!));
     assert.equal(record.envelope!.id, record.messageId);
@@ -55,7 +54,7 @@ test('thread envelopes survive settlement and reload; summaries and sequence sca
   }
   const summary = reloaded.listThreads({ kind: 'request', state: 'settled', limit: 1 })[0];
   assert.equal(summary.rootMessageId, 'root');
-  assert.equal(summary.hopCount, 3);
+  assert.equal(summary.hopCount, 4);
   summary.rootEnvelope!.body = 'mutated';
   assert.equal(reloaded.listThreads()[0].rootEnvelope!.body, 'Details');
   const items = reloaded.listItemsAfterSequence(0);

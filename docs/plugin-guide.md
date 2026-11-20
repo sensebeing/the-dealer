@@ -244,10 +244,18 @@ Dispose each registration with `ctx.effect` when unloading the plugin.
 
 `MailboxStore.enqueue` returns `envelopeMailboxes`, the committed destination for each
 envelope ID. Mailbox-backed executors propagate this map as `ExecutionReceipt.envelopeMailboxes`,
-combining the committed results if an execution writes to several mailboxes. After recording
-the delivery result, the dispatcher publishes `dispatcher/inbound` for each completed batch
-member, including messages a policy queued earlier. The runtime uses the envelope's receipt
-entry first, then a legacy single-destination `mailboxId`, then its normal mailbox resolution.
+combining results when execution writes to several mailboxes. Include a top-level `mailboxId`
+only when every member of the batch shares that destination. The store records inbound thread
+ownership atomically with enqueue, using the original signed envelope when available. The
+runtime records queued and non-mailbox history without granting it thread ownership. For that
+history, an omitted entry in a present mailbox map describes the default mailbox. Runtime can
+read a legacy single-destination `mailboxId` when the map is absent.
+
+Prepare every delivery group before taking custody or launching a host. The shared
+`executeDeliveryGroups` reports partial outcomes through `PartialBatchExecutionError`.
+The dispatcher publishes `dispatcher/inbound` for each settled member, preserves its committed
+receipt, records failures for attempted members, and restores the previous ledger state for
+unattempted members so they can be retried safely.
 
 Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
 pinning; these decisions stay with the host plugin rather than the core mailbox.

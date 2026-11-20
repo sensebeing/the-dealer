@@ -17,6 +17,7 @@ import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import {
   prepareInboxDeliveries,
+  executeDeliveryGroups,
   createRawCommandExecutorPlugin,
   renderWave,
   beforeExternalEffect,
@@ -238,7 +239,7 @@ function createAgentExecutorPlugin(
         if (delivery.type !== 'host') throw beforeExternalEffect(new Error('Inbox delivery requires a mailbox store'));
         trustWorkspace(delivery);
         const output = await checkedCommand(runner, { ...delivery.request, signal: context.signal }).catch(rethrowBeforeCommandStart);
-        return { executor: name, executionId: randomUUID(), mailboxId: delivery.mailboxId, ...commandOutput(output) };
+        return { executor: name, executionId: randomUUID(), ...commandOutput(output) };
       }
 
       const inboxGroups = new Map<string, MessageEnvelope[]>();
@@ -273,55 +274,34 @@ function createAgentExecutorPlugin(
         const bound = hostGroups.get(mailboxId);
         hostGroups.set(mailboxId, { delivery, envelopes: bound ? [...envelopes, ...bound.envelopes] : envelopes });
       }
-      const deliverInbox = await prepareInboxDeliveries(store, wakeup, inboxGroups);
-      // Validate every route and resolve session wake targets before any handoff.
-      const rawReceipt = rawBatch.length ? await rawExecutor.execute(rawBatch, context, runtimeConfig) : undefined;
-      if (rawReceipt && !inboxGroups.size && !hostGroups.size) return rawReceipt;
-      const mailboxIds = new Set<string>();
-      const inserted: string[] = [];
-      const envelopeMailboxes: [string, string][] = [];
-      let output: ReturnType<typeof commandOutput> | undefined;
-      let woke: boolean | undefined;
-      let reason: string | undefined;
+      const groups = await prepareInboxDeliveries(store, wakeup, inboxGroups, context);
       for (const { delivery, envelopes } of hostGroups.values()) {
-        trustWorkspace(delivery);
-        const { mailboxId } = delivery;
-        const claim = wakeup?.claim(mailboxId);
-        let delivered = false;
-        try {
-          const result = store.enqueue(envelopes, {
-            signedEnvelopes: context?.signedEnvelopes, mailboxId,
-            wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
-          });
-          mailboxIds.add(mailboxId);
-          inserted.push(...result.inserted);
-          envelopeMailboxes.push(...Object.entries(result.envelopeMailboxes));
+        groups.push({ envelopes, async deliver() {
+          trustWorkspace(delivery);
+          const { mailboxId } = delivery;
+          const claim = wakeup?.claim(mailboxId);
+          let woke = false;
           try {
-            const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
-            delivered = true;
-            woke = true;
-            output ??= commandOutput(response);
-          } catch (error) {
-            woke ??= false;
-            reason ??= String(error);
+            const result = store.enqueue(envelopes, {
+              signedEnvelopes: context?.signedEnvelopes, mailboxId,
+              wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
+            });
+            const receipt = { ...result, executor: name, executionId: randomUUID(), mailboxId };
+            try {
+              const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
+              woke = true;
+              return { ...receipt, woke, ...commandOutput(response) };
+            } catch (error) {
+              return { ...receipt, woke, reason: String(error) };
+            }
+          } finally {
+            claim?.dispose();
+            if (woke) wakeup?.notifyMailbox(mailboxId);
           }
-        } finally {
-          claim?.dispose();
-          if (delivered) wakeup?.notifyMailbox(mailboxId);
-        }
+        } });
       }
-      const inbox = deliverInbox(context);
-      for (const mailboxId of inbox.mailboxIds) mailboxIds.add(mailboxId);
-      inserted.push(...inbox.inserted);
-      envelopeMailboxes.push(...Object.entries(inbox.envelopeMailboxes));
-      const destinations = [...mailboxIds];
-      return {
-        ...rawReceipt, ...output, executor: name, executionId: randomUUID(),
-        ...(destinations.length === 1 ? { mailboxId: destinations[0] } : {}),
-        mailboxIds: destinations, inserted, envelopeMailboxes: Object.fromEntries(envelopeMailboxes),
-        ...(woke !== undefined ? { woke } : {}),
-        ...(reason !== undefined ? { reason } : {}),
-      };
+      if (rawBatch.length) groups.push({ envelopes: rawBatch, deliver: () => rawExecutor.execute(rawBatch, context, runtimeConfig) });
+      return executeDeliveryGroups(name, batch, groups);
     },
   };
 }

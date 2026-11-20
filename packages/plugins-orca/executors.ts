@@ -7,16 +7,14 @@ import { randomUUID } from 'node:crypto';
 import type { ExecutionContext, ExecutionReceipt, ExecutorPlugin, MessageEnvelope, AgentConversationMode } from '../core-types/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import {
-  MailboxStore,
   groupSpawnBatch,
   resolveBoundMailboxId,
   resolveMailboxId,
   resolveSessionOrThreadMailbox,
   resolveSpawnMailboxId,
   resolveTopicAddress,
-  resolveEffectiveConversationMode,
 } from '../mailbox/index.ts';
-import type { MailboxEnqueueResult, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
+import type { MailboxStore, MailboxEnqueueResult, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import { setOrcaWorkspaceComment, orcaAgent, pickSeaCreatureName } from './workspace.ts';
 import type { SupportedOrcaAgent } from './workspace.ts';
 import {
@@ -38,8 +36,10 @@ import {
   prepareExternalEffect,
   prepareExternalEffectAsync,
   rethrowBeforeCommandStart,
-  createInboxExecutorPlugin,
+  executeDeliveryGroups,
+  prepareInboxBatch,
 } from '../plugins-executor/index.ts';
+import type { PreparedDelivery } from '../plugins-executor/index.ts';
 
 export interface OrcaTopicBinding extends MailboxTopicBinding {
   /** Addressing fallback; never an explicitly requested interactive conversation mode. */
@@ -133,22 +133,44 @@ function assertParentInProject(projectId: string, boundRoot: string, parentWorkt
   }
 }
 
-export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): ExecutorPlugin {
+type OrcaExecutorOptions = OrcaSpawnOptions & OrcaWaveOptions;
+
+type OrcaRoute = {
+  envelope: MessageEnvelope;
+  binding?: OrcaTopicBinding;
+  bindingKind: string;
+  explicitMode?: AgentConversationMode;
+  mode: AgentConversationMode;
+};
+
+function resolveOrcaRoutes(
+  batch: readonly MessageEnvelope[], options: OrcaExecutorOptions, config: OrcaExecutorOptions,
+  fallbackMode: AgentConversationMode,
+): OrcaRoute[] {
+  const resolveBinding = options.resolveTopicBinding ?? config.resolveTopicBinding;
+  return prepareExternalEffect(() => batch.map(envelope => {
+    const { payload, kind } = envelope;
+    const streamKey = typeof payload?.streamKey === 'string' ? payload.streamKey : undefined;
+    const binding = resolveBinding?.(kind, streamKey);
+    const explicitMode = normalizeConversationModeInput(payload) ?? normalizeConversationModeInput(binding) ??
+      normalizeConversationModeInput(config) ?? normalizeConversationModeInput(options);
+    return {
+      envelope, binding, bindingKind: resolveTopicAddress(kind, streamKey).kind,
+      explicitMode, mode: explicitMode ?? binding?.defaultMode ?? fallbackMode,
+    };
+  }));
+}
+
+function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
   const issuedNames = new Set<string>();
-  const prepareSpawn = (batch: readonly MessageEnvelope[], context: ExecutionContext, runtimeConfig: unknown) => {
-    const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
+  return (
+    batch: readonly MessageEnvelope[], route: OrcaRoute, mailboxId: string,
+    context: ExecutionContext, config: OrcaSpawnOptions,
+  ) => {
     const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
-    if (!batch[0]) throw beforeExternalEffect(new Error('Empty spawn batch'));
-    const payload = (batch[0]?.payload ?? {}) as Record<string, unknown>;
+    const { binding, explicitMode } = route;
+    const payload = route.envelope.payload ?? {};
     const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
-    const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(
-      batch[0]?.kind,
-      typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined,
-    );
-    const explicitMode = prepareExternalEffect(
-      () => normalizeConversationModeInput(payload) ?? normalizeConversationModeInput(binding) ??
-        normalizeConversationModeInput(config) ?? normalizeConversationModeInput(options),
-    );
     const interactive =
       payload.interactive === true ||
       explicitMode === 'spawn' ||
@@ -218,7 +240,6 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
           ? config.seaCreatureNaming
           : options.seaCreatureNaming === true;
     const namePrefix = config.namePrefix?.trim() || options.namePrefix?.trim() || 'dealer';
-    const mailboxId = resolveSpawnMailboxId(batch[0].id);
     return async (): Promise<ExecutionReceipt> => {
       const name = explicitName
         ? explicitName
@@ -397,80 +418,68 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       };
     };
   };
+}
+
+async function prepareOrcaSpawnBatch(
+  routes: readonly OrcaRoute[], context: ExecutionContext, options: OrcaSpawnOptions, config: OrcaSpawnOptions,
+  prepareSpawn: ReturnType<typeof createOrcaSpawnPreparation>,
+): Promise<{ sessions: PreparedDelivery[]; launches: PreparedDelivery[] }> {
+  const sessions: PreparedDelivery[] = [];
+  if (!routes.length) return { sessions, launches: [] };
+  const store = options.store ?? config.store;
+  const wakeup = options.wakeup ?? config.wakeup;
+  const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
+  const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
+  const { existing, launches } = prepareExternalEffect(() => {
+    if (!store) {
+      const route = routes[0];
+      const envelopes = routes.map(item => item.envelope);
+      return { existing: new Map<string, MessageEnvelope[]>(), launches: [{
+        envelopes,
+        deliver: prepareSpawn(envelopes, route, resolveSpawnMailboxId(route.envelope.id), context, config),
+      }] };
+    }
+    const fresh = new Map<MessageEnvelope, OrcaRoute>();
+    const existing = new Map<string, MessageEnvelope[]>();
+    for (const route of routes) {
+      const { envelope, binding, bindingKind } = route;
+      const threadLocal = resolveOrcaThreadMailbox(store, envelope);
+      const sessionMailbox = optionalString(envelope.payload?.executor)?.trim()
+        ? undefined : resolveSessionOrThreadMailbox(envelope, threadLocal);
+      const boundMailboxId = binding ? resolveBoundMailboxId(bindingKind, binding, binding.defaultMode ?? 'spawn') : 'default';
+      if (sessionMailbox === undefined || sessionMailbox === boundMailboxId) {
+        fresh.set(envelope, route);
+      } else {
+        const group = existing.get(sessionMailbox) ?? [];
+        group.push(envelope);
+        existing.set(sessionMailbox, group);
+      }
+    }
+    const launches = groupSpawnBatch([...fresh.keys()]).map(({ mailboxId, envelopes }) => ({
+      envelopes,
+      deliver: prepareSpawn(envelopes, fresh.get(envelopes[0])!, mailboxId, context, config),
+    }));
+    return { existing, launches };
+  });
+  if (store) {
+    for (const [mailboxId, envelopes] of existing) {
+      const wakeTarget = await resolveOrcaSessionWakeTarget(store, wakeup, runner, command, mailboxId);
+      sessions.push(prepareOrcaMailboxDelivery(store, wakeup, context, mailboxId, envelopes, wakeTarget));
+    }
+  }
+  return { sessions, launches };
+}
+
+export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): ExecutorPlugin {
+  const prepareSpawn = createOrcaSpawnPreparation(options);
   return {
     name: 'orca-spawn',
     async execute(batch, context, runtimeConfig) {
       if (!batch.length) throw beforeExternalEffect(new Error('Empty spawn batch'));
-      const config = (runtimeConfig ?? {}) as Partial<OrcaSpawnOptions>;
-      const store = options.store ?? config.store;
-      if (!store) return prepareExternalEffect(() => prepareSpawn(batch, context, runtimeConfig))();
-
-      const spawnBatch: MessageEnvelope[] = [];
-      const sessions = new Map<string, MessageEnvelope[]>();
-      const resolveTopicBinding = options.resolveTopicBinding ?? config.resolveTopicBinding;
-      for (const envelope of batch) {
-        const payload = envelope.payload;
-        const mailboxId = prepareExternalEffect(() => {
-          if (optionalString(payload?.executor)?.trim()) return undefined;
-          const sessionMailbox = resolveSessionOrThreadMailbox(envelope, store.resolveThreadLocalMailbox(
-            envelope.semantic?.threadId, envelope.networkId, { excludeInboundMessageId: envelope.id },
-          ));
-          if (sessionMailbox === undefined) return undefined;
-          const streamKey = typeof payload?.streamKey === 'string' ? payload.streamKey : undefined;
-          const binding = resolveTopicBinding?.(envelope.kind, streamKey);
-          const boundMailboxId = binding
-            ? resolveBoundMailboxId(resolveTopicAddress(envelope.kind, streamKey).kind, binding, binding.defaultMode ?? 'spawn')
-            : 'default';
-          return sessionMailbox === boundMailboxId ? undefined : sessionMailbox;
-        });
-        if (mailboxId === undefined) {
-          spawnBatch.push(envelope);
-        } else {
-          const group = sessions.get(mailboxId) ?? [];
-          group.push(envelope);
-          sessions.set(mailboxId, group);
-        }
-      }
-      const launches = prepareExternalEffect(() =>
-        groupSpawnBatch(spawnBatch).map(({ envelopes }) => prepareSpawn(envelopes, context, runtimeConfig)),
-      );
-
-      const wakeup = options.wakeup ?? config.wakeup;
-      const command = config.orcaCommand?.trim() || options.orcaCommand || 'orca';
-      const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
-      const prepared = [];
-      for (const [mailboxId, envelopes] of sessions) {
-        const wakeTarget = await resolveOrcaSessionWakeTarget(store, wakeup, runner, command, mailboxId);
-        prepared.push({ mailboxId, envelopes, wakeTarget });
-      }
-      // Prepare every launch and wake target before committing any mailbox or launching Orca.
-      const spawned: ExecutionReceipt[] = [];
-      for (const launch of launches) {
-        try {
-          spawned.push(await launch());
-        } catch (error) {
-          if (!spawned.length) throw error;
-          throw new Error(`Orca spawn batch failed after an earlier launch: ${String(error)}`, { cause: error });
-        }
-      }
-      if (spawned.length === 1 && prepared.length === 0) return spawned[0];
-      const delivered = await deliverOrcaMailboxes(store, wakeup, context, prepared);
-      const envelopeMailboxes = Object.fromEntries([
-        ...spawned.flatMap(receipt => Object.entries(receipt.envelopeMailboxes ?? {})),
-        ...Object.entries(delivered.envelopeMailboxes),
-      ]);
-      const reason = spawned.find(receipt => receipt.reason !== undefined)?.reason ?? delivered.reason;
-      return {
-        ...delivered,
-        ...spawned[0],
-        executor: 'orca-spawn',
-        executionId: spawned[0]?.executionId ?? randomUUID(),
-        mailboxIds: [...new Set(Object.values(envelopeMailboxes))],
-        envelopeMailboxes,
-        inserted: [...spawned.flatMap(receipt => Array.isArray(receipt.inserted) ? receipt.inserted : []), ...delivered.inserted],
-        woke: delivered.woke || spawned.some(receipt => receipt.woke === true),
-        ...(reason !== undefined ? { reason } : {}),
-      };
+      const config = (runtimeConfig ?? {}) as OrcaSpawnOptions;
+      const routes = resolveOrcaRoutes(batch, options, config, 'spawn');
+      const { sessions, launches } = await prepareOrcaSpawnBatch(routes, context, options, config, prepareSpawn);
+      return executeDeliveryGroups('orca-spawn', batch, [...sessions, ...launches]);
     },
   };
 }
@@ -515,260 +524,190 @@ function resolveOrcaSessionWakeTarget(
   });
 }
 
-async function deliverOrcaMailboxes(
-  store: MailboxStore, wakeup: WakeupRedriveService | undefined, context: ExecutionContext,
-  groups: { mailboxId: string; envelopes: MessageEnvelope[]; wakeTarget?: Partial<WakeTargetState> }[],
-) {
-  const inserted: string[] = [];
-  const envelopeMailboxes: [string, string][] = [];
-  let woke = false;
-  let reason: string | undefined;
-  for (const { mailboxId, envelopes, wakeTarget } of groups) {
-    const enqueued = store.enqueue(envelopes, {
-      ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}),
-      mailboxId,
-      ...(wakeTarget ? { wakeTarget } : {}),
-    });
-    inserted.push(...enqueued.inserted);
-    envelopeMailboxes.push(...Object.entries(enqueued.envelopeMailboxes));
-    if (wakeup) {
-      try {
-        const result = await wakeup.flushMailbox(mailboxId);
-        woke ||= result.woke;
-        reason ??= result.reason;
-      } catch (error) {
-        // Durable ingestion already succeeded; the redrive timer owns retry.
-        reason ??= String(error);
-      }
-    }
-  }
-  return {
-    ...(groups.length ? { mailboxId: groups[0].mailboxId } : {}),
-    mailboxIds: groups.map(group => group.mailboxId),
-    inserted,
-    envelopeMailboxes: Object.fromEntries(envelopeMailboxes),
-    woke,
-    ...(reason !== undefined ? { reason } : {}),
-  };
+function resolveOrcaThreadMailbox(store: MailboxStore, envelope: MessageEnvelope): string | undefined {
+  return store.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
+    excludeInboundMessageId: envelope.id,
+  });
 }
 
-/**
- * Durable wave ingestion. Each envelope is committed to its resolved logical mailbox before any
- * pointer is attempted; a busy workspace or a daemon restart resumes from `pendingWake`, so an
- * executor never rejects a wave merely because the workspace is busy.
- */
+function prepareOrcaMailboxDelivery(
+  store: MailboxStore, wakeup: WakeupRedriveService | undefined, context: ExecutionContext,
+  mailboxId: string, envelopes: MessageEnvelope[], wakeTarget?: Partial<WakeTargetState>,
+): PreparedDelivery {
+  return { envelopes, async deliver() {
+    const enqueued = store.enqueue(envelopes, {
+      signedEnvelopes: context?.signedEnvelopes, mailboxId, ...(wakeTarget ? { wakeTarget } : {}),
+    });
+    const receipt = { ...enqueued, executor: 'orca-wave', executionId: randomUUID(), mailboxId };
+    if (!wakeup) return { ...receipt, woke: false };
+    try {
+      const { woke, reason } = await wakeup.flushMailbox(mailboxId);
+      return { ...receipt, woke, ...(reason !== undefined ? { reason } : {}) };
+    } catch (error) {
+      // The durable mailbox already owns retry, even if synchronous wakeup fails.
+      return { ...receipt, woke: false, reason: String(error) };
+    }
+  } };
+}
+
+async function prepareOrcaWaveBatch(
+  routes: readonly OrcaRoute[], context: ExecutionContext, options: OrcaWaveOptions, config: OrcaExecutorOptions,
+): Promise<PreparedDelivery[]> {
+  if (!routes.length) return [];
+  const store = options.store ?? config.store;
+  if (!store) throw beforeExternalEffect(new Error('orca-wave requires a durable mailbox store'));
+  const wakeup = options.wakeup ?? config.wakeup;
+  const command = options.orcaCommand ?? 'orca';
+  const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
+  const waveConfig = config.wave ?? options.wave;
+
+  /**
+   * Receiver-owned workspace, terminal and scheduling configuration for the topic's own bound
+   * mailbox. Inbound payload values are only a fallback when the deployment has no local
+   * binding or executor config, so a sender can never rebind runtime-managed workspace state.
+   */
+  const topicWakeTarget = (
+    envelopes: readonly MessageEnvelope[],
+    route: OrcaRoute,
+    mailboxId: string,
+  ): Partial<WakeTargetState> => {
+    const { mode, binding, envelope } = route;
+    const payload = envelope.payload ?? {};
+    const receiverCwd = binding?.workspacePath ?? config.cwd ?? options.cwd;
+    const receiverRunId = binding?.runId ?? config.runId ?? options.runId;
+    const receiverTerminalHandle =
+      binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle;
+    const hasReceiverTarget = Boolean(receiverCwd || receiverRunId || receiverTerminalHandle);
+    const cwd =
+      receiverCwd ??
+      (hasReceiverTarget
+        ? undefined
+        : (optionalString(payload.workspacePath) ?? optionalString(payload.cwd)));
+    const runId = receiverRunId ?? (hasReceiverTarget ? undefined : optionalString(payload.runId));
+    const terminalHandle =
+      receiverTerminalHandle ?? (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
+    const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
+    const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
+      mode: mode === 'fixed' ? 'fixed' : 'wave',
+      bindingRotateAfterWaves: binding?.rotateAfterWaves,
+      waveRotateAfterWaves: optionalPositiveInteger(waveConfig?.rotateAfterWaves),
+      fallbackRotateAfterWaves: hasReceiverTarget
+        ? undefined
+        : optionalPositiveInteger(payload.rotateAfterWaves),
+      managesWorkspace: Boolean(cwd),
+      runId,
+      pinnedTerminalHandle: receiverTerminalHandle,
+    });
+    const worktreeId =
+      binding?.worktreeId ??
+      config.worktreeId ??
+      options.worktreeId ??
+      (hasReceiverTarget ? undefined : optionalString(payload.worktreeId));
+    const workspaceComment = String(
+      envelopes.at(-1)?.payload?.workspaceComment ||
+        binding?.workspaceComment ||
+        `Dealer: ${mailboxId} pending`,
+    );
+    const explicitAgent = binding?.agent ?? config.agent ?? options.agent ?? (hasReceiverTarget ? undefined : payload.agent);
+    const identityPatch = resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
+      mailboxId, runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
+      configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
+      configuredSessionId: binding?.sessionId,
+      configuredInteractiveCommand: binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
+      configuredResumeCommand: binding?.resumeCommand ?? config.resumeCommand ?? options.resumeCommand,
+      hasTopicBinding: binding !== undefined, authoritativeConfig: false,
+    });
+    return {
+      ...identityPatch,
+      coalesceMs,
+      ...(binding?.wakeupPrefix ? { wakeupPrefix: binding.wakeupPrefix } : {}),
+      ...(mode === 'fixed'
+        ? { rotateAfterWaves: undefined }
+        : rotateAfterWaves !== undefined
+          ? { rotateAfterWaves }
+          : {}),
+      driverConfig: {
+        ...identityPatch.driverConfig,
+        orcaCommand: command,
+        ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
+        ...(binding?.autoCreateWorkspace !== undefined
+          ? { autoCreateWorkspace: binding.autoCreateWorkspace }
+          : {}),
+        ...(runId ? { runId } : {}),
+        ...(cwd ? { workspacePath: cwd } : {}),
+        ...(worktreeId ? { worktreeId } : {}),
+        workspaceComment,
+      },
+    };
+  };
+
+  const groups = prepareExternalEffect(() => {
+    const byTarget = new Map<string, {
+      mailboxId: string; envelopes: MessageEnvelope[]; topic?: OrcaRoute;
+    }>();
+    for (const route of routes) {
+      const { envelope, binding, bindingKind, mode } = route;
+      const mailboxId = resolveMailboxId(envelope, binding, resolveOrcaThreadMailbox(store, envelope), 'wave');
+      const boundMailboxId = binding ? resolveBoundMailboxId(bindingKind, binding, 'wave') : undefined;
+      // A session or thread retains its wake target instead of inheriting topic configuration.
+      const isSession = mailboxId.startsWith('worktree:') || mailboxId.startsWith('terminal:') || mailboxId.startsWith('task:');
+      const topic = (binding ? mailboxId === boundMailboxId : !isSession) ? route : undefined;
+      const key = JSON.stringify([mailboxId, topic ? bindingKind : null, topic ? mode : null]);
+      const group = byTarget.get(key) ?? { mailboxId, envelopes: [], topic };
+      group.envelopes.push(envelope);
+      byTarget.set(key, group);
+    }
+    return byTarget.values();
+  });
+  const prepared: PreparedDelivery[] = [];
+  for (const { mailboxId, envelopes, topic } of groups) {
+    const wakeTarget = topic
+      ? prepareExternalEffect(() => topicWakeTarget(envelopes, topic, mailboxId))
+      : await resolveOrcaSessionWakeTarget(store, wakeup, runner, command, mailboxId);
+    prepared.push(prepareOrcaMailboxDelivery(store, wakeup, context, mailboxId, envelopes, wakeTarget));
+  }
+  return prepared;
+}
+
+/** Durable wave ingestion precedes wakeup, so a busy workspace can resume from pendingWake. */
 export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): ExecutorPlugin {
   return {
     name: 'orca-wave',
     async execute(batch, context, runtimeConfig) {
-      const config = (runtimeConfig ?? {}) as Partial<OrcaWaveOptions>;
-      const store = options.store ?? config.store;
-      if (!store) {
-        throw beforeExternalEffect(new Error('orca-wave requires a durable mailbox store'));
-      }
-      const wakeup = options.wakeup ?? config.wakeup;
-      if (!batch[0]) {
-        throw beforeExternalEffect(new Error('Empty wave batch'));
-      }
-      const command = options.orcaCommand ?? 'orca';
-      const runner = options.commandRunner ?? config.commandRunner ?? runCommand;
-      const resolveTopicBinding = options.resolveTopicBinding ?? config.resolveTopicBinding;
-      const waveConfig = config.wave ?? options.wave;
-
-      /**
-       * Receiver-owned workspace, terminal and scheduling configuration for the topic's own bound
-       * mailbox. Inbound payload values are only a fallback when the deployment has no local
-       * binding or executor config, so a sender can never rebind runtime-managed workspace state.
-       */
-      const topicWakeTarget = (
-        envelopes: readonly MessageEnvelope[],
-        binding: OrcaTopicBinding | undefined,
-        mailboxId: string,
-      ): Partial<WakeTargetState> => {
-        const payload = (envelopes[0].payload ?? {}) as Record<string, unknown>;
-        const receiverCwd = binding?.workspacePath ?? config.cwd ?? options.cwd;
-        const receiverRunId = binding?.runId ?? config.runId ?? options.runId;
-        const receiverTerminalHandle =
-          binding?.terminalHandle ?? config.terminalHandle ?? options.terminalHandle;
-        const hasReceiverTarget = Boolean(receiverCwd || receiverRunId || receiverTerminalHandle);
-        const cwd =
-          receiverCwd ??
-          (hasReceiverTarget
-            ? undefined
-            : (optionalString(payload.workspacePath) ?? optionalString(payload.cwd)));
-        const runId = receiverRunId ?? (hasReceiverTarget ? undefined : optionalString(payload.runId));
-        const terminalHandle =
-          receiverTerminalHandle ?? (hasReceiverTarget ? undefined : optionalString(payload.terminalHandle));
-        const coalesceMs = Math.max(0, binding?.coalesceMs ?? waveConfig?.minAgeMs ?? 0);
-        const effectiveMode = prepareExternalEffect(() =>
-          resolveEffectiveConversationMode({
-            fallbackMode: 'wave',
-            binding,
-            payload,
-            sources: [
-              payload,
-              binding,
-              config as { mode?: unknown; conversationMode?: unknown },
-              options as { mode?: unknown; conversationMode?: unknown },
-              { mode: 'wave' },
-            ],
-          }),
-        );
-        const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
-          mode:
-            (payload.mode ?? binding?.mode ?? (config as { mode?: unknown }).mode) === 'fixed'
-              ? 'fixed'
-              : effectiveMode === 'fixed'
-                ? 'fixed'
-                : 'wave',
-          bindingRotateAfterWaves: binding?.rotateAfterWaves,
-          waveRotateAfterWaves: optionalPositiveInteger(waveConfig?.rotateAfterWaves),
-          fallbackRotateAfterWaves: hasReceiverTarget
-            ? undefined
-            : optionalPositiveInteger(payload.rotateAfterWaves),
-          managesWorkspace: Boolean(cwd),
-          runId,
-          pinnedTerminalHandle: receiverTerminalHandle,
-        });
-        const worktreeId =
-          binding?.worktreeId ??
-          config.worktreeId ??
-          options.worktreeId ??
-          (hasReceiverTarget ? undefined : optionalString(payload.worktreeId));
-        const workspaceComment = String(
-          envelopes.at(-1)?.payload?.workspaceComment ||
-            binding?.workspaceComment ||
-            `Dealer: ${mailboxId} pending`,
-        );
-        const explicitAgent = binding?.agent ?? config.agent ?? options.agent ?? (hasReceiverTarget ? undefined : payload.agent);
-        const identityPatch = resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
-          mailboxId, runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
-          configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
-          configuredSessionId: binding?.sessionId,
-          configuredInteractiveCommand: binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
-          configuredResumeCommand: binding?.resumeCommand ?? config.resumeCommand ?? options.resumeCommand,
-          hasTopicBinding: binding !== undefined, authoritativeConfig: false,
-        });
-        return {
-          ...identityPatch,
-          coalesceMs,
-          ...(binding?.wakeupPrefix ? { wakeupPrefix: binding.wakeupPrefix } : {}),
-          ...(effectiveMode === 'fixed'
-            ? { rotateAfterWaves: undefined }
-            : rotateAfterWaves !== undefined
-              ? { rotateAfterWaves }
-              : {}),
-          driverConfig: {
-            ...identityPatch.driverConfig,
-            orcaCommand: command,
-            ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
-            ...(binding?.autoCreateWorkspace !== undefined
-              ? { autoCreateWorkspace: binding.autoCreateWorkspace }
-              : {}),
-            ...(runId ? { runId } : {}),
-            ...(cwd ? { workspacePath: cwd } : {}),
-            ...(worktreeId ? { worktreeId } : {}),
-            workspaceComment,
-          },
-        };
-      };
-
-      // Each envelope resolves through its own topic binding and thread-affinity route, so a mixed
-      // batch is never conflated into one mailbox.
-      const groups = new Map<
-        string,
-        {
-          envelopes: MessageEnvelope[];
-          bindingKind: string;
-          binding?: OrcaTopicBinding;
-        }
-      >();
-      for (const envelope of batch) {
-        const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
-        const binding = resolveTopicBinding?.(envelope.kind, streamKey);
-        const { kind: bindingKind } = resolveTopicAddress(envelope.kind, streamKey);
-        const mailboxId = prepareExternalEffect(() =>
-          resolveMailboxId(
-            envelope,
-            binding,
-            store.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
-              excludeInboundMessageId: envelope.id,
-            }),
-            'wave',
-          ),
-        );
-        const group = groups.get(mailboxId);
-        if (group) {
-          group.envelopes.push(envelope);
-        } else {
-          groups.set(mailboxId, { envelopes: [envelope], bindingKind, binding });
-        }
-      }
-
-      const prepared = [];
-      for (const [mailboxId, group] of groups) {
-        const boundMailboxId = group.binding
-          ? prepareExternalEffect(() => resolveBoundMailboxId(group.bindingKind, group.binding, 'wave'))
-          : undefined;
-        // Only the topic's own bound mailbox may use the receiver binding. A thread- or
-        // session-scoped mailbox keeps the wake target its originating session already bound, so
-        // a reply wakes that terminal instead of rotating it into the generic topic workspace.
-        const isSessionScopedMailbox = mailboxId.startsWith('worktree:') || mailboxId.startsWith('terminal:') || mailboxId.startsWith('task:');
-        const usesTopicBinding = group.binding !== undefined ? mailboxId === boundMailboxId : !isSessionScopedMailbox;
-        const wakeTarget = usesTopicBinding
-          ? prepareExternalEffect(() => topicWakeTarget(group.envelopes, group.binding, mailboxId))
-          : await resolveOrcaSessionWakeTarget(store, wakeup, runner, command, mailboxId);
-        prepared.push({ mailboxId, envelopes: group.envelopes, wakeTarget });
-      }
-      return {
-        executor: 'orca-wave',
-        executionId: randomUUID(),
-        ...await deliverOrcaMailboxes(store, wakeup, context, prepared),
-      };
+      if (!batch.length) throw beforeExternalEffect(new Error('Empty wave batch'));
+      const config = (runtimeConfig ?? {}) as OrcaExecutorOptions;
+      const routes = resolveOrcaRoutes(batch, options, config, 'wave');
+      const groups = await prepareOrcaWaveBatch(routes, context, options, config);
+      return executeDeliveryGroups('orca-wave', batch, groups);
     },
   };
 }
 
-/** Unified Orca executor selecting task or stream semantics from the orthogonal mode. */
-export function createOrcaExecutorPlugin(options: OrcaSpawnOptions & OrcaWaveOptions = {}): ExecutorPlugin {
-  const spawnPlugin = createOrcaSpawnExecutorPlugin(options);
-  const wavePlugin = createOrcaWaveExecutorPlugin(options);
+/** The unified executor prepares each mode before any group takes custody. */
+export function createOrcaExecutorPlugin(options: OrcaExecutorOptions = {}): ExecutorPlugin {
+  const prepareSpawn = createOrcaSpawnPreparation(options);
   return {
     name: 'orca',
     async execute(batch, context, runtimeConfig) {
-      const config = (runtimeConfig ?? {}) as Record<string, unknown>;
-      const binding = (
-        options.resolveTopicBinding ?? (config.resolveTopicBinding as OrcaSpawnOptions['resolveTopicBinding'])
-      )?.(
-        batch[0]?.kind,
-        typeof batch[0]?.payload?.streamKey === 'string' ? batch[0].payload.streamKey : undefined,
-      );
-      const payload = batch[0]?.payload;
-      const effectiveMode = prepareExternalEffect(() =>
-        resolveEffectiveConversationMode({
-          fallbackMode: 'spawn',
-          binding,
-          payload,
-          sources: [
-            payload,
-            binding,
-            config as { mode?: unknown; conversationMode?: unknown },
-            options as { mode?: unknown; conversationMode?: unknown },
-            { mode: binding?.defaultMode ?? 'spawn' },
-          ],
-        }),
-      );
-      const receipt =
-        effectiveMode === 'inbox-only'
-          ? await prepareExternalEffect(() =>
-              createInboxExecutorPlugin({
-                store: options.store ?? (config.store as MailboxStore | undefined),
-              }),
-            ).execute(batch, context, runtimeConfig)
-          : effectiveMode === 'spawn'
-            ? await spawnPlugin.execute(batch, context, runtimeConfig)
-            : await wavePlugin.execute(batch, context, { ...runtimeConfig, mode: effectiveMode });
-      return { ...receipt, executor: 'orca' };
+      if (!batch.length) throw beforeExternalEffect(new Error('Empty Orca batch'));
+      const config = (runtimeConfig ?? {}) as OrcaExecutorOptions;
+      const routes = resolveOrcaRoutes(batch, options, config, 'spawn');
+      const inboxRoutes = routes.filter(route => route.mode === 'inbox-only');
+      const spawnRoutes = routes.filter(route => route.mode === 'spawn');
+      const waveRoutes = routes.filter(route => route.mode === 'wave' || route.mode === 'fixed');
+      const inbox = [];
+      if (inboxRoutes.length) {
+        const store = options.store ?? config.store;
+        if (!store) throw beforeExternalEffect(new Error('Inbox executor requires store or inboxPath'));
+        const bindings = new Map(inboxRoutes.map(route => [route.bindingKind, route.binding]));
+        inbox.push(...await prepareInboxBatch(inboxRoutes.map(route => route.envelope), context, store, {
+          wakeup: options.wakeup ?? config.wakeup,
+          resolveTopicBinding: (kind, streamKey) => bindings.get(resolveTopicAddress(kind, streamKey).kind),
+        }));
+      }
+      const waves = await prepareOrcaWaveBatch(waveRoutes, context, options, config);
+      const { sessions, launches } = await prepareOrcaSpawnBatch(spawnRoutes, context, options, config, prepareSpawn);
+      return executeDeliveryGroups('orca', batch, [...inbox, ...waves, ...sessions, ...launches]);
     },
   };
 }

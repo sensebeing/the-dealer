@@ -1955,6 +1955,8 @@ for (const [name, create] of [
       await wakeup.flushMailbox('task:existing', { force: true });
       assert.deepEqual(store.list({ mailboxId: 'task:fresh' }).items.map(item => item.signedEnvelope), [fresh]);
       assert.deepEqual(store.list({ mailboxId: 'task:existing' }).items.map(item => item.signedEnvelope), [followup]);
+      assert.deepEqual(store.getThread(fresh.id)?.envelope, fresh);
+      assert.deepEqual(store.getThread(followup.id)?.envelope, followup);
       assert.equal(receipt.executor, name);
       assert.ok(Array.isArray(receipt.mailboxIds));
       assert.deepEqual(receipt.mailboxIds.toSorted(), ['task:existing', 'task:fresh']);
@@ -2059,6 +2061,171 @@ test('runtime records authoritative task mailboxes for every dispatched batch me
   }
   assert.equal(calls.filter(call => call.args.slice(0, 2).join(' ') === '--bg --name').length, 2);
 });
+
+test('a policy-queued spawn root gains thread ownership at enqueue, before its host launch finishes', { timeout: 10000 }, async t => {
+  const root = directory(t);
+  const launchStarted = Promise.withResolvers<void>();
+  const releaseLaunch = Promise.withResolvers<void>();
+  let launches = 0;
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'), member: 'solo', transport: { discoveryDir: join(root, 'discovery') },
+    patch: { topicBindings: { review: { executor: 'agent-pty', agent: 'claude-code', mode: 'spawn' } } },
+    commandRunner: async request => {
+      if (request.args[0] === '--bg' && request.args[1] === '--name' && ++launches === 1) {
+        launchStarted.resolve();
+        await releaseLaunch.promise;
+      }
+      return { stdout: '{}' };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  const dispatcher = runtime.kernel.getService('dispatcher');
+  let pending: MessageEnvelope | undefined;
+  dispatcher.registerPolicy({ name: 'hold-root', async process(envelope, next) {
+    if (envelope.id === 'queued-root') {
+      pending = envelope;
+      return { stage: 'queued' };
+    }
+    const batch = pending ? [pending, envelope] : [envelope];
+    pending = undefined;
+    return next(batch);
+  } });
+  const newRoot = { ...message('queued-root', { mailbox: 'sender-hint' }), kind: 'review', networkId: 'local' };
+  const followup = { ...newRoot, id: 'batch-followup', semantic: { type: 'message', threadId: newRoot.id } as const };
+  const mailboxId = 'task:queued-root';
+  try {
+    assert.equal((await dispatcher.dispatch(newRoot)).stage, 'queued');
+    assert.equal(runtime.mailbox.getThread(newRoot.id)?.localMailbox, 'sender-hint');
+    assert.equal(runtime.mailbox.resolveThreadLocalMailbox(newRoot.id, 'local'), undefined);
+    assert.equal(runtime.mailbox.resolveReplyTarget(newRoot.id, 'local')?.localMailbox, 'default');
+    const batch = dispatcher.dispatch(followup);
+    await Promise.race([launchStarted.promise, batch.then(() => assert.fail('batch returned before its host launch'))]);
+    const reloaded = new MailboxStore(runtime.mailbox.path);
+    assert.equal(reloaded.resolveThreadLocalMailbox(newRoot.id, 'local'), mailboxId);
+    assert.equal(reloaded.getThread(newRoot.id)?.mailboxCommitted, true);
+    assert.equal((await dispatcher.dispatch({ ...followup, id: 'concurrent-followup' })).executionReceipt?.executor, 'inbox');
+    releaseLaunch.resolve();
+    assert.equal((await batch).stage, 'dispatched');
+    assert.equal(launches, 1);
+    assert.equal(runtime.mailbox.list({ mailboxId: 'sender-hint' }).totalCount, 0);
+    assert.deepEqual(runtime.mailbox.list({ mailboxId }).items.map(item => item.id).sort(), ['batch-followup', 'concurrent-followup', 'queued-root']);
+  } finally {
+    releaseLaunch.resolve();
+  }
+});
+
+test('a later Orca batch failure preserves committed receipts and leaves unattempted members retryable', async t => {
+  const root = directory(t);
+  const launched: string[] = [];
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'), member: 'solo', transport: { discoveryDir: join(root, 'discovery') },
+    patch: { topicBindings: { review: { executor: 'orca', mode: 'spawn' } } },
+    commandRunner: async request => {
+      if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+        const name = request.args[request.args.indexOf('--name') + 1];
+        launched.push(name);
+        if (name === 'failing') throw new Error('worktree creation failed');
+        return { stdout: JSON.stringify({ ok: true, result: { path: root } }) };
+      }
+      if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+        return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-batch"}}}' };
+      }
+      return { stdout: '{"ok":true}' };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  const dispatcher = runtime.kernel.getService('dispatcher');
+  const make = (id: string): MessageEnvelope => ({ ...message(id, { worktreeName: id }), kind: 'review', networkId: 'local' });
+  const first = make('completed');
+  const failed = make('failing');
+  const last = make('unattempted');
+  const queued: MessageEnvelope[] = [];
+  const published: string[] = [];
+  runtime.kernel.ctx.on('dispatcher/inbound', event => {
+    if (event.receipt.stage === 'dispatched') published.push(event.envelope.id);
+  });
+  dispatcher.registerPolicy({ name: 'fail-middle-batch', async process(envelope, next) {
+    if (envelope.id !== last.id) {
+      queued.push(envelope);
+      return { stage: 'queued' };
+    }
+    return next([...queued.splice(0), envelope]);
+  } });
+  await dispatcher.dispatch(first);
+  await dispatcher.dispatch(failed);
+  await assert.rejects(dispatcher.dispatch(last), (error: any) => error.beforeExternalEffect === true);
+  assert.deepEqual(launched, [first.id, failed.id]);
+  assert.deepEqual(published, [first.id]);
+  assert.equal((await dispatcher.dispatch(first)).executionReceipt?.envelopeMailboxes?.[first.id], 'task:completed');
+  assert.equal((await dispatcher.dispatch(failed)).stage, 'failed');
+  assert.equal(runtime.mailbox.list({ mailboxId: 'task:completed' }).totalCount, 1);
+  assert.equal((await dispatcher.dispatch(last)).executionReceipt?.envelopeMailboxes?.[last.id], 'task:unattempted');
+  assert.deepEqual(launched, [first.id, failed.id, last.id]);
+});
+
+test('a mixed raw and host receipt keeps the raw thread unbound', async t => {
+  const root = directory(t);
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'), member: 'solo', transport: { discoveryDir: join(root, 'discovery') },
+    patch: { topicBindings: { review: { executor: 'agent-pty' } } },
+    commandRunner: async () => ({ stdout: '{}' }),
+  }).start();
+  t.after(() => runtime.stop());
+  const dispatcher = runtime.kernel.getService('dispatcher');
+  const raw = { ...message('raw-thread', { mailbox: 'hint' }), networkId: 'local', kind: 'review' };
+  const hosted = { ...message('host-thread', { agent: 'claude-code' }), networkId: 'local', kind: 'review' };
+  dispatcher.registerPolicy({ name: 'mix-host-and-raw', async process(envelope, next) {
+    return envelope.id === hosted.id ? next([raw, envelope]) : { stage: 'queued' };
+  } });
+  await dispatcher.dispatch(raw);
+  const { executionReceipt: receipt } = await dispatcher.dispatch(hosted);
+  assert.deepEqual(receipt?.envelopeMailboxes, { 'host-thread': 'task:host-thread' });
+  assert.equal(receipt?.mailboxId, undefined);
+  assert.equal(runtime.mailbox.getThread(raw.id)?.localMailbox, 'default');
+  assert.equal(runtime.mailbox.resolveThreadLocalMailbox(raw.id, 'local'), undefined);
+  assert.equal(runtime.mailbox.resolveThreadLocalMailbox(hosted.id, 'local'), 'task:host-thread');
+});
+
+test('mixed interactive and noninteractive Orca spawns report only the committed mailbox', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const plugin = createOrcaSpawnExecutorPlugin({ store, cwd: root, commandRunner: async ({ args }) => ({
+    stdout: JSON.stringify({ ok: true, result: args[0] === 'worktree' ? { path: root } : { terminal: { handle: 'term-mixed' } } }),
+  }) });
+  const receipt = await plugin.execute([message('persistent', { interactive: true }), message('one-off')], context, {});
+  assert.deepEqual(receipt.envelopeMailboxes, { persistent: 'task:persistent' });
+  assert.equal(receipt.mailboxId, undefined);
+  assert.equal(store.resolveThreadLocalMailbox('one-off', 'test'), undefined);
+});
+
+for (const reverse of [false, true]) {
+  test(`unified Orca routes spawn, wave, fixed and inbox-only in ${reverse ? 'reverse' : 'forward'} batch order`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const bindings = {
+      spawn: { mode: 'spawn', workspacePath: root },
+      wave: { mode: 'wave', workspacePath: root, rotateAfterWaves: 2 },
+      fixed: { mode: 'fixed', mailboxId: 'stream:fixed', terminalHandle: 'term-fixed' },
+      inbox: { mode: 'inbox-only', mailboxId: 'review-inbox' },
+    } as const;
+    let creates = 0;
+    const plugin = createOrcaExecutorPlugin({ store, resolveTopicBinding: kind => bindings[kind as keyof typeof bindings],
+      commandRunner: async ({ args }) => {
+        if (args[0] === 'worktree' && args[1] === 'create') creates += 1;
+        return { stdout: JSON.stringify({ ok: true, result: args[0] === 'worktree' ? { path: root } : { terminal: { handle: 'term-spawn' } } }) };
+      },
+    });
+    const batch = Object.keys(bindings).map(kind => ({ ...message(kind), kind }));
+    const receipt = await plugin.execute(reverse ? batch.reverse() : batch, context, {});
+    assert.deepEqual(receipt.envelopeMailboxes, { spawn: 'task:spawn', wave: 'stream:wave', fixed: 'stream:fixed', inbox: 'review-inbox' });
+    assert.equal(receipt.mailboxId, undefined);
+    assert.equal(creates, 1);
+    assert.equal(store.getWakeTarget('stream:wave')?.rotateAfterWaves, 2);
+    assert.equal(store.getWakeTarget('stream:fixed')?.driverConfig?.terminalHandle, 'term-fixed');
+    assert.equal(store.getWakeTarget('stream:fixed')?.rotateAfterWaves, undefined);
+    assert.equal(store.list({ mailboxId: 'review-inbox' }).totalCount, 1);
+  });
+}
 
 test('mailbox addressing fallback accepts valid payload hints and ignores malformed hints', () => {
   const binding = { executor: 'agent-pty' };

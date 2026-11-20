@@ -103,6 +103,8 @@ export interface ThreadRouteRecord {
   readonly networkId: string;
   readonly peerReplyMailbox: string;
   readonly localMailbox: string;
+  /** False for inbound history recorded before or without durable mailbox delivery. */
+  readonly mailboxCommitted?: boolean;
   readonly traceId: string;
   readonly kind: string;
   readonly subject: string;
@@ -567,6 +569,7 @@ function validateThreadRecord(value: unknown): ThreadRouteRecord {
     typeof record.networkId !== 'string' ||
     !isValidMailboxId(record.peerReplyMailbox) ||
     !isValidMailboxId(record.localMailbox) ||
+    (record.mailboxCommitted !== undefined && typeof record.mailboxCommitted !== 'boolean') ||
     typeof record.traceId !== 'string' ||
     typeof record.kind !== 'string' ||
     typeof record.subject !== 'string' ||
@@ -1070,11 +1073,17 @@ export class MailboxStore {
             state,
             envelope.semantic?.threadId,
             envelope.networkId,
+            envelope.id,
           ),
         );
         mailboxIds.add(mailboxId);
         envelopeMailboxes.set(envelope.id, mailboxId);
-        if (state.items.some(item => item.mailboxId === mailboxId && item.id === envelope.id)) {
+        const duplicate = state.items.find(item => item.mailboxId === mailboxId && item.id === envelope.id);
+        if (duplicate) {
+          const inbound = state.threads[threadKey({ direction: 'inbound', messageId: envelope.id })];
+          if (!inbound || inbound.mailboxCommitted === false) {
+            this.upsertInboundThread(state, duplicate.signedEnvelope ?? duplicate.envelope, mailboxId, now, true);
+          }
           duplicateIds.push(envelope.id);
           continue;
         }
@@ -1107,6 +1116,7 @@ export class MailboxStore {
               threadRecordsFor(state, envelope.semantic.threadId)
                 .some(record => record.networkId === envelope.networkId))),
         );
+        this.upsertInboundThread(state, signedEnvelope ?? cloned, mailboxId, now, true);
         inserted.push(cloned.id);
         insertedByMailbox.set(mailboxId, (insertedByMailbox.get(mailboxId) ?? 0) + 1);
       }
@@ -1715,84 +1725,86 @@ export class MailboxStore {
       .map(target => structuredClone(target));
   }
 
-  private writeThreadRecord(
+  private upsertThreadRecord(
+    state: MailboxFileState,
     record: ThreadRouteRecord,
-    settlement: ThreadRouteRecord['settlement'] | undefined,
   ): ThreadRouteRecord {
-    return this.mutate(state => {
-      const key = threadKey(record);
-      const existing = state.threads[key];
-      const now = record.updatedAt;
-      let threadState = mergeThreadState(existing?.state ?? 'open', record.state);
-      let threadSettlement = settlement ?? existing?.settlement;
-      for (const [currentKey, current] of Object.entries(state.threads)) {
-        if (current.threadId !== record.threadId) {
-          continue;
-        }
-        const nextSettlement = settlement ?? current.settlement;
-        const nextState = mergeThreadState(current.state, record.state);
-        state.threads[currentKey] = {
-          ...current,
-          state: nextState,
-          ...(nextSettlement !== undefined ? { settlement: nextSettlement } : {}),
-          updatedAt: now,
-        };
-        threadState = mergeThreadState(threadState, nextState);
-        if (nextSettlement !== undefined) {
-          threadSettlement = nextSettlement;
-        }
-      }
-      const stored: ThreadRouteRecord = {
-        ...record,
-        state: threadState,
-        ...(threadSettlement !== undefined ? { settlement: threadSettlement } : {}),
-        createdAt: existing?.createdAt ?? record.createdAt,
+    const key = threadKey(record);
+    const existing = state.threads[key];
+    if (record.mailboxCommitted === false && existing && existing.networkId === record.networkId &&
+      existing.mailboxCommitted !== false) return existing;
+    const now = record.updatedAt;
+    let threadState = mergeThreadState(existing?.state ?? 'open', record.state);
+    let threadSettlement = record.settlement ?? existing?.settlement;
+    for (const [currentKey, current] of Object.entries(state.threads)) {
+      if (current.threadId !== record.threadId || current.networkId !== record.networkId) continue;
+      const nextSettlement = record.settlement ?? current.settlement;
+      const nextState = mergeThreadState(current.state, record.state);
+      state.threads[currentKey] = {
+        ...current,
+        state: nextState,
+        ...(nextSettlement !== undefined ? { settlement: nextSettlement } : {}),
         updatedAt: now,
       };
-      state.threads[key] = stored;
-      return structuredClone(stored);
+      threadState = mergeThreadState(threadState, nextState);
+      if (nextSettlement !== undefined) {
+        threadSettlement = nextSettlement;
+      }
+    }
+    const stored: ThreadRouteRecord = {
+      ...record,
+      state: threadState,
+      ...(threadSettlement !== undefined ? { settlement: threadSettlement } : {}),
+      createdAt: existing?.createdAt ?? record.createdAt,
+    };
+    state.threads[key] = stored;
+    return stored;
+  }
+
+  private upsertInboundThread(
+    state: MailboxFileState,
+    envelope: MessageEnvelope,
+    localMailbox: string,
+    now: string,
+    committed: boolean,
+  ): ThreadRouteRecord {
+    validateStoredEnvelope(envelope);
+    const peerReplyMailbox = normalizeMailboxId(
+      envelope.semantic?.replyMailbox ?? 'default',
+      'peer reply mailbox',
+    );
+    const settlement = settlementOf(envelope, now);
+    return this.upsertThreadRecord(state, {
+      threadId: envelope.semantic?.threadId ?? envelope.id,
+      messageId: envelope.id,
+      envelope: structuredClone(envelope),
+      direction: 'inbound',
+      peerNodeId: envelope.from.nodeId,
+      peerNodeIds: [envelope.from.nodeId],
+      networkId: envelope.networkId,
+      peerReplyMailbox,
+      localMailbox,
+      mailboxCommitted: committed,
+      traceId: envelope.traceId,
+      kind: envelope.kind,
+      subject: envelope.subject,
+      state: stateForSemantic(envelope),
+      ...(settlement ? { settlement } : {}),
+      createdAt: now,
+      updatedAt: now,
     });
   }
 
   recordInboundEnvelope(
     envelope: MessageEnvelope,
     localMailbox: string,
+    options: { committed?: boolean } = {},
   ): ThreadRouteRecord {
-    const local = normalizeMailboxId(localMailbox, 'local mailbox');
-    if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
-      throw new Error('Invalid envelope: missing id');
-    }
-    if (envelope.semantic !== undefined) {
-      validateSemanticHeader(envelope.semantic);
-    }
+    const mailboxId = normalizeMailboxId(localMailbox, 'local mailbox');
     const now = new Date().toISOString();
-    const threadId = envelope.semantic?.threadId ?? envelope.id;
-    const peerReplyMailbox = normalizeMailboxId(
-      envelope.semantic?.replyMailbox ?? 'default',
-      'peer reply mailbox',
-    );
-    const settlement = settlementOf(envelope, now);
-    return this.writeThreadRecord(
-      {
-        threadId,
-        messageId: envelope.id,
-        envelope: structuredClone(envelope),
-        direction: 'inbound',
-        peerNodeId: envelope.from.nodeId,
-        peerNodeIds: [envelope.from.nodeId],
-        networkId: envelope.networkId,
-        peerReplyMailbox,
-        localMailbox: local,
-        traceId: envelope.traceId,
-        kind: envelope.kind,
-        subject: envelope.subject,
-        state: stateForSemantic(envelope),
-        ...(settlement ? { settlement } : {}),
-        createdAt: now,
-        updatedAt: now,
-      },
-      settlement,
-    );
+    return this.mutate(state => structuredClone(
+      this.upsertInboundThread(state, envelope, mailboxId, now, options.committed ?? true),
+    ));
   }
 
   recordOutboundEnvelope(
@@ -1814,31 +1826,28 @@ export class MailboxStore {
     const now = new Date().toISOString();
     const threadId = envelope.semantic?.threadId ?? envelope.id;
     const settlement = settlementOf(envelope, now);
-    return this.writeThreadRecord(
-      {
-        threadId,
-        messageId: envelope.id,
-        envelope: structuredClone(envelope),
-        direction: 'outbound',
-        peerNodeId: peers[0] ?? '',
-        peerNodeIds: peers,
-        networkId: envelope.networkId,
-        // The outbound target, including an explicit payload mailbox, is where replies land.
-        peerReplyMailbox: normalizeMailboxId(
-          envelope.semantic?.targetMailbox ?? resolveMailboxId(envelope),
-          'peer reply mailbox',
-        ),
-        localMailbox: local,
-        traceId: envelope.traceId,
-        kind: envelope.kind,
-        subject: envelope.subject,
-        state: stateForSemantic(envelope),
-        ...(settlement ? { settlement } : {}),
-        createdAt: now,
-        updatedAt: now,
-      },
-      settlement,
-    );
+    return this.mutate(state => structuredClone(this.upsertThreadRecord(state, {
+      threadId,
+      messageId: envelope.id,
+      envelope: structuredClone(envelope),
+      direction: 'outbound',
+      peerNodeId: peers[0] ?? '',
+      peerNodeIds: peers,
+      networkId: envelope.networkId,
+      // The outbound target, including an explicit payload mailbox, is where replies land.
+      peerReplyMailbox: normalizeMailboxId(
+        envelope.semantic?.targetMailbox ?? resolveMailboxId(envelope),
+        'peer reply mailbox',
+      ),
+      localMailbox: local,
+      traceId: envelope.traceId,
+      kind: envelope.kind,
+      subject: envelope.subject,
+      state: stateForSemantic(envelope),
+      ...(settlement ? { settlement } : {}),
+      createdAt: now,
+      updatedAt: now,
+    })));
   }
 
   /**
@@ -1945,6 +1954,11 @@ export class MailboxStore {
     return found ? structuredClone(found) : undefined;
   }
 
+  getInboundThreadRecord(messageId: string, networkId: string): ThreadRouteRecord | undefined {
+    const record = this.read().threads[threadKey({ direction: 'inbound', messageId })];
+    return record?.networkId === networkId ? structuredClone(record) : undefined;
+  }
+
   /** All directional records of a thread, oldest first; accepts a message id or thread id. */
   listThreadRecords(messageOrThreadId: string): ThreadRouteRecord[] {
     if (!isNonEmptyString(messageOrThreadId)) {
@@ -1984,8 +1998,8 @@ export class MailboxStore {
     const records = threadRecordsFor(state, threadId)
       .filter(record => networkId === undefined || record.networkId === networkId);
     for (let index = records.length - 1; index >= 0; index -= 1) {
-      const { direction, messageId, localMailbox } = records[index];
-      if (direction === 'inbound' && messageId === excludeInboundMessageId) continue;
+      const { direction, messageId, localMailbox, mailboxCommitted } = records[index];
+      if (direction === 'inbound' && (messageId === excludeInboundMessageId || mailboxCommitted === false)) continue;
       if (localMailbox !== 'default') {
         return normalizeMailboxId(localMailbox, 'thread local mailbox');
       }
@@ -2031,10 +2045,9 @@ export class MailboxStore {
         ) ??
         records.findLast(candidate => candidate.peerReplyMailbox !== 'default') ??
         record).peerReplyMailbox;
-    const localMailbox = exactLeg !== undefined && exactLeg.localMailbox !== 'default'
+    const localMailbox = exactLeg !== undefined && exactLeg.mailboxCommitted !== false && exactLeg.localMailbox !== 'default'
       ? exactLeg.localMailbox
-      : this.threadLocalMailboxFromState(state, record.threadId, record.networkId) ??
-        record.localMailbox;
+      : this.threadLocalMailboxFromState(state, record.threadId, record.networkId) ?? 'default';
     return {
       threadId: record.threadId,
       messageId: record.messageId,

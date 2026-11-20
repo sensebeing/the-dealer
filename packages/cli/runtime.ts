@@ -1182,42 +1182,49 @@ export class DealerNodeRuntime {
     } };
   }
 
+  private describeInboundMailbox(envelope: MessageEnvelope): string {
+    const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
+    const binding = this.resolveTopicBinding(envelope.kind, streamKey)?.binding;
+    // The registry handles queued mode hints without validating execution prematurely.
+    return resolveMailboxId(
+      { ...envelope, payload: { ...envelope.payload, mode: undefined, conversationMode: undefined } },
+      binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
+      this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
+        excludeInboundMessageId: envelope.id,
+      }),
+      this.registry.toMailboxBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
+    );
+  }
+
   private integrationPlugin(): Plugin {
     return {
       name: 'runtime-plugins',
       inject: ['dispatcher', 'transport', 'emitter', 'router'],
       apply: ctx => {
-        // Thread reverse routes are populated from the authenticated dispatcher/emitter boundary,
-        // not from raw transport frames, so forged senders and gate-rejected messages never
-        // create routes.
+        // The mailbox owns admitted delivery routes. The dispatcher also reports queued and
+        // non-mailbox executions so their authenticated history is available for inspection.
         ctx.on('dispatcher/inbound', ({ envelope, receipt }) => {
           if (receipt.stage === 'rejected') {
             return;
           }
           try {
-            const binding = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding;
+            const committed = this.mailbox.getInboundThreadRecord(envelope.id, envelope.networkId);
+            if (committed && committed.mailboxCommitted !== false) {
+              if (receipt.stage === 'dispatched') {
+                const target = this.mailbox.getWakeTarget(committed.localMailbox);
+                if (target) this.registry.pinDeliveredInboundMailbox(this.mailbox, committed.localMailbox, target);
+              }
+              return;
+            }
             const execution = receipt.stage === 'dispatched' && receipt.executionReceipt;
-            const envelopeMailboxes = execution && execution.envelopeMailboxes;
-            const authoritativeMailbox = envelopeMailboxes && Object.hasOwn(envelopeMailboxes, envelope.id)
-              ? normalizeMailboxId(envelopeMailboxes[envelope.id])
+            const envelopeMailboxes = execution ? execution.envelopeMailboxes : undefined;
+            const reportedMailbox = envelopeMailboxes !== undefined
+              ? Object.hasOwn(envelopeMailboxes, envelope.id) ? normalizeMailboxId(envelopeMailboxes[envelope.id]) : 'default'
               : execution && typeof execution.mailboxId === 'string' &&
                 (!Array.isArray(execution.mailboxIds) || execution.mailboxIds.length === 1)
                 ? normalizeMailboxId(execution.mailboxId) : undefined;
-            const mailboxId = authoritativeMailbox ?? resolveMailboxId(
-              // Mode hints are normalized by the payload-aware binding adapter below, including
-              // queued messages whose executor has not yet validated their payload.
-              { ...envelope, payload: { ...envelope.payload, mode: undefined, conversationMode: undefined } },
-              binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
-              this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
-                excludeInboundMessageId: envelope.id,
-              }),
-              this.registry.toMailboxBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
-            );
-            // Inbound receipts can arrive after a synchronous pointer delivery; preserve its session.
-            const target = this.mailbox.getWakeTarget(mailboxId);
-            const localMailbox = target
-              ? this.registry.pinDeliveredInboundMailbox(this.mailbox, mailboxId, target) : mailboxId;
-            this.mailbox.recordInboundEnvelope(envelope, localMailbox);
+            const mailboxId = reportedMailbox ?? this.describeInboundMailbox(envelope);
+            this.mailbox.recordInboundEnvelope(envelope, mailboxId, { committed: false });
           } catch (error) {
             this.lastError = String(error);
           }

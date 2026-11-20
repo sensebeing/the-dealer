@@ -100,7 +100,9 @@ flowchart TB
 
 外部 project/user 插件通过 `ctx.services.dispatcher.registerExecutor/registerPolicy` 注册，和内置执行器共用同一活跃注册表与附件包装；可在 `executors`、`defaultExecutor`、`executorConfig`、`policies`、`topicBindings` 中引用。配置含外部来源或 executor overrides 时只预校验标识符，全部插件加载后逐一核对实际注册，未注册即拒绝启动。没有外部来源的独立配置仍拒绝未知名字。
 
-`MailboxStore.enqueue` 返回 `envelopeMailboxes`，以消息 ID 记录每封信实际入库的信箱。支持信箱投递的执行器将此映射传入 `ExecutionReceipt.envelopeMailboxes`。Dispatcher 写入 DeliveryLedger 后，对已交付批次中的每封信发布 `dispatcher/inbound`，包括此前由策略排队的消息。Runtime 首先采用回执中该消息的信箱，其次采用兼容的单目标 `mailboxId`，最后通过 payload-aware registry 和 mailbox 地址解析恢复。已交付 session 归属由插件 hook 与 `MailboxStore.pinSessionMailbox` 原子维护。
+`MailboxStore.enqueue` 在同一次写入中持久化信箱条目和该消息的入站线程归属，并返回以消息 ID 为键的 `envelopeMailboxes`。Runtime 保留已入库的归属，为策略排队和无信箱执行记录可查询的历史。未入库的入站记录带有 `mailboxCommitted: false`，寻址时会跳过这些记录。已交付 session 的归属由插件 hook 与 MailboxStore 的原子会话绑定维护。
+
+信箱执行器通过 `ExecutionReceipt.envelopeMailboxes` 返回实际入库地址，所有消息共用一个信箱时才返回单目标 `mailboxId`。Dispatcher 持久化结果后为每封已交付的信发布 `dispatcher/inbound`，包括此前由策略排队的消息。部分失败时保留已完成投递的回执，只把尝试后失败的消息记为失败，并恢复尚未尝试成员的原状态。
 
 `TopicBindingConfig.metadata` 是唯一开放的非空字符串注解映射。顶层仅接受已声明字段及显式兼容的 `assignee`，未知字段被拒绝，注解不赋予核心 runtime 业务语义。
 

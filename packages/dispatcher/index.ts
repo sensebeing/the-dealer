@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { signReceipt, verifyEnvelope, verifyReceipt } from '../core-types/index.ts';
+import { PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt } from '../core-types/index.ts';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type {
   DispatchPolicyPlugin,
@@ -62,7 +62,15 @@ export class DeliveryLedger {
   }
 
   set(key: string, value: DispatchReceipt): void {
-    const next = { ...this.#entries, [key]: value };
+    this.update([[key, value]]);
+  }
+
+  update(changes: readonly (readonly [string, DispatchReceipt | undefined])[]): void {
+    const next = { ...this.#entries };
+    for (const [key, receipt] of changes) {
+      if (receipt) next[key] = receipt;
+      else delete next[key];
+    }
     if (this.#path) {
       writeFileAtomically(this.#path, JSON.stringify(next));
     }
@@ -118,7 +126,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           }
         }
       };
-      const core = async (batch: readonly MessageEnvelope[]): Promise<DispatchReceipt> => {
+      const core = async (batch: readonly MessageEnvelope[], callerKey: string): Promise<DispatchReceipt> => {
         if (!batch.length) {
           throw Object.assign(new Error('Empty execution batch'), { beforeExternalEffect: true });
         }
@@ -130,28 +138,40 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         if (!executor) {
           throw Object.assign(new Error(`Executor unavailable: ${name}`), { beforeExternalEffect: true });
         }
-        for (const e of batch) {
-          const prior = ledger.get(key(e));
+        const members = batch.map(envelope => ({ envelope, id: key(envelope), prior: ledger.get(key(envelope)) }));
+        for (const { envelope, prior } of members) {
           if (prior && prior.stage !== 'queued') {
-            throw new Error(`Execution already attempted: ${e.id} (${prior.stage})`);
+            throw new Error(`Execution already attempted: ${envelope.id} (${prior.stage})`);
           }
         }
         assertRequiredPolicies();
-        for (const e of batch) {
-          ledger.set(key(e), { stage: 'dispatching' });
-        }
+        ledger.update(members.map(({ id }) => [id, { stage: 'dispatching' }]));
         let result: DispatchReceipt;
         try {
           result = await executor.execute(batch);
-          for (const e of batch) {
-            ledger.set(key(e), result);
-          }
         } catch (error) {
-          for (const e of batch) {
-            ledger.set(key(e), { stage: 'failed', detail: String(error) });
+          const partial = error instanceof PartialBatchExecutionError ? error : undefined;
+          const beforeEffect = (error as { beforeExternalEffect?: boolean } | null)?.beforeExternalEffect === true;
+          const outcomes = members.map(({ envelope, id, prior }) => {
+            const settled = partial?.settledReceipts;
+            const unattempted = beforeEffect || partial?.unattemptedIds.has(envelope.id) === true;
+            const receipt: DispatchReceipt | undefined = settled && Object.hasOwn(settled, envelope.id)
+              ? { stage: 'dispatched', executionReceipt: settled[envelope.id] }
+              : unattempted ? prior : { stage: 'failed', detail: String(error) };
+            return { envelope, id, receipt, unattempted };
+          });
+          ledger.update(outcomes.map(({ id, receipt }) => [id, receipt]));
+          for (const { envelope, receipt } of outcomes) {
+            if (receipt?.stage === 'dispatched') ctx.emit('dispatcher/inbound', { envelope, receipt });
+          }
+          const caller = outcomes.find(({ id }) => id === callerKey);
+          if (caller?.receipt?.stage === 'dispatched') return caller.receipt;
+          if (caller?.unattempted && !beforeEffect) {
+            throw Object.assign(new Error(String(error), { cause: error }), { beforeExternalEffect: true });
           }
           throw error;
         }
+        ledger.update(members.map(({ id }) => [id, result]));
         // A policy can dispatch messages queued by earlier calls. Publish each committed delivery.
         for (const envelope of batch) ctx.emit('dispatcher/inbound', { envelope, receipt: result });
         return result;
@@ -238,9 +258,10 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               const run = async (
                 index: number,
                 batch: readonly MessageEnvelope[],
+                callerKey: string,
               ): Promise<DispatchReceipt> => {
                 if (index === chain.length) {
-                  return core(batch);
+                  return core(batch, callerKey);
                 }
                 // Policies consume individual envelopes; batching policies should be registered last.
                 let result: DispatchReceipt = { stage: 'queued' };
@@ -251,12 +272,12 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                       throw new Error('Policy next may only be called once');
                     }
                     called = true;
-                    return run(index + 1, nextBatch);
+                    return run(index + 1, nextBatch, key(e));
                   });
                 }
                 return result;
               };
-              return run(0, [structuredClone(envelope)]);
+              return run(0, [structuredClone(envelope)], id);
             })
             .then(result => {
               // A queued policy owns its pending buffer; do not overwrite a later wave's completed state.
@@ -269,7 +290,11 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               if (recorded?.stage !== 'dispatched' && result.stage !== 'rejected' && result.stage !== 'failed') {
                 ctx.emit('dispatcher/inbound', { envelope, receipt: result });
               }
-              return result;
+              return recorded?.stage === 'dispatched' ? recorded : result;
+            }, error => {
+              const recorded = ledger.get(id);
+              if (recorded?.stage === 'dispatched') return recorded;
+              throw error;
             })
             .finally(() => {
               active.delete(id);
