@@ -226,7 +226,10 @@ for (const [name, create] of [['orca', createOrcaExecutorPlugin], ['orca-spawn',
     const wakeup = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner, idleCheck: async () => ({ idle: true }) }) });
     t.after(() => wakeup.stop());
     const plugin = create({ store, wakeup, commandRunner, resolveTopicBinding: () => ({ mailboxId, mode: 'spawn' }) });
-    const first = envelope('first', { semantic: { type: 'message', threadId: 'first', targetMailbox: mailboxId } });
+    store.enqueue([envelope('acknowledged')], { mailboxId, wakeTarget: { driver: 'passive' } });
+    store.ack(store.check({ mailboxId }).deliveryId!);
+    store.enqueue([envelope('queued')], { mailboxId });
+    const first = envelope('first', { semantic: { type: 'message', threadId: 'queued' } });
     const second = envelope('second');
     const third = envelope('third', { semantic: { type: 'message', threadId: 'third', targetMailbox: mailboxId } });
     const receipts = await Promise.all([first, second].map(message => plugin.execute([message], context, {})));
@@ -235,9 +238,28 @@ for (const [name, create] of [['orca', createOrcaExecutorPlugin], ['orca-spawn',
       assert.equal(receipt.executor, name);
       assert.equal(receipt.mailboxId, mailboxId);
     }
-    assert.deepEqual(store.list({ mailboxId }).items.map(item => item.id).sort(), ['first', 'second', 'third']);
+    assert.deepEqual(store.list({ mailboxId }).items.map(item => item.id).sort(), ['first', 'queued', 'second', 'third']);
+    assert.deepEqual(store.list({ mailboxId, includeAcked: true }).items.filter(item => item.status === 'acked').map(item => item.id), ['acknowledged']);
     assert.equal(store.getWakeTarget(mailboxId)?.driver, 'orca-terminal');
+    assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.dedicatedSpawn, true);
     assert.equal(calls.filter(call => call.args.slice(0, 2).join(' ') === 'worktree create').length, 1);
+  });
+
+  test(`standalone ${name} preserves a fenced bound mailbox even with a passive driver`, async t => {
+    const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+    const mailboxId = 'terminal:reconcile-first';
+    store.upsertWakeTarget(mailboxId, { driver: 'passive', deliveryInDoubt: true, lastWakeError: 'Unknown delivery outcome' });
+    const commandRunner: CommandRunner = async request => {
+      assert.fail(`Unexpected Orca command: ${request.args.join(' ')}`);
+    };
+    const plugin = create({ store, commandRunner, resolveTopicBinding: () => ({ mailboxId, mode: 'spawn' }) });
+    const receipt = await plugin.execute([envelope('fenced')], context, {});
+    assert.equal(receipt.mailboxId, mailboxId);
+    assert.deepEqual(store.list({ mailboxId }).items.map(item => item.id), ['fenced']);
+    const target = store.getWakeTarget(mailboxId);
+    assert.equal(target?.driver, 'passive');
+    assert.equal(target?.deliveryInDoubt, true);
+    assert.equal(target?.lastWakeError, 'Unknown delivery outcome');
   });
 
   test(`standalone ${name} spawn delivers a batch to its owning thread and session mailboxes`, async t => {

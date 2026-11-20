@@ -331,6 +331,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
                 interactiveCommand, resumeCommand,
                 orcaCommand: command,
                 workspacePath: path,
+                dedicatedSpawn: true,
                 ...(workspaceComment ? { workspaceComment } : {}),
               },
             },
@@ -447,10 +448,6 @@ async function prepareOrcaSpawnBatch(
     const wakeTarget = await resolveOrcaSessionWakeTarget(store, wakeup, runner, command, mailboxId);
     return prepareOrcaMailboxDelivery(store, wakeup, context, mailboxId, envelopes, wakeTarget);
   };
-  const ownsBoundMailbox = (store: MailboxStore, mailboxId: string) => {
-    const target = store.getWakeTarget(mailboxId);
-    return (target !== undefined && target.driver !== 'passive') || store.list({ mailboxId, limit: 1 }).totalCount > 0;
-  };
   const { existing, launches } = prepareExternalEffect(() => {
     if (!store) {
       const route = routes[0];
@@ -470,8 +467,8 @@ async function prepareOrcaSpawnBatch(
       const boundMailboxId = resolveBoundMailboxId(bindingKind, { ...binding, mode, conversationMode: undefined }, mode);
       const destination = sessionMailbox ?? boundMailboxId;
       const boundMailbox = destination === boundMailboxId && boundMailboxId !== 'default';
-      if ((sessionMailbox !== undefined && (!boundMailbox || threadLocal === destination)) ||
-          (boundMailbox && ownsBoundMailbox(store, destination))) {
+      if ((sessionMailbox !== undefined && !boundMailbox) ||
+          (boundMailbox && shouldPreserveWakeTarget(store.getWakeTarget(destination)))) {
         const group = existing.get(destination) ?? [];
         group.push(...envelopes);
         existing.set(destination, group);
@@ -479,12 +476,13 @@ async function prepareOrcaSpawnBatch(
       }
       const mailboxId = boundMailbox ? destination : resolveSpawnMailboxId(envelope.id);
       const launch = prepareSpawn(envelopes, route, mailboxId, context, config, {
-        boundMailbox, proposedSpawn: canInheritThreadMailbox(envelope),
+        boundMailbox,
+        proposedSpawn: canInheritThreadMailbox(envelope) && !(boundMailbox && threadLocal === destination),
       });
       launches.push({ envelopes, deliver: boundMailbox ? commit =>
         serializeMailboxInitialization(store, mailboxId, async release => {
           const committed = () => { release(); commit(); };
-          if (prepareExternalEffect(() => ownsBoundMailbox(store, mailboxId))) {
+          if (prepareExternalEffect(() => shouldPreserveWakeTarget(store.getWakeTarget(mailboxId)))) {
             const session = await prepareSession(store, mailboxId, envelopes);
             return session.deliver(committed);
           }
@@ -544,17 +542,18 @@ function optionalPositiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+function shouldPreserveWakeTarget(target: WakeTargetState | undefined): boolean {
+  return target !== undefined && (target.driver !== 'passive' || target.deliveryInDoubt === true);
+}
+
 function resolveOrcaSessionWakeTarget(
   store: MailboxStore, wakeup: WakeupRedriveService | undefined, runner: CommandRunner, command: string, mailboxId: string,
 ) {
   return prepareExternalEffectAsync(async () => {
+    if (shouldPreserveWakeTarget(store.getWakeTarget(mailboxId))) return undefined;
     if (wakeup) return wakeup.resolveSessionWakeTarget(mailboxId);
-    const current = store.getWakeTarget(mailboxId);
-    if (!current || current.driver === 'passive') {
-      return createOrcaTerminalWakeupDriver({ commandRunner: runner, orcaCommand: command })
-        .resolveSessionTarget?.(mailboxId, store);
-    }
-    return undefined;
+    return createOrcaTerminalWakeupDriver({ commandRunner: runner, orcaCommand: command })
+      .resolveSessionTarget?.(mailboxId, store);
   });
 }
 

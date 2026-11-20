@@ -55,9 +55,11 @@ wake target.
 
 In `spawn` mode, a new request without a concrete semantic target or local
 thread mailbox starts a session at `task:<rootMessageId>` by default. A
-receiver-configured spawn mailbox takes precedence and Orca reuses its
-initialized session for later arrivals. A sender's
-payload mailbox hint does not establish session ownership. The executor associates
+receiver-configured spawn mailbox takes precedence. Orca initializes that
+mailbox even when it already contains inbox mail, reuses an active wake binding,
+and preserves any delivery awaiting reconciliation. If its spawned terminal
+exits, Orca recovers the session in a dedicated tab. A sender's payload mailbox
+hint does not establish session ownership. The executor associates
 follow-ups with their thread before choosing a delivery mode. With no existing owner,
 a follow-up in the same batch shares the root's session unless it names a concrete
 semantic target or explicitly selects an executor. Structured updates

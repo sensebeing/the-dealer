@@ -3353,6 +3353,46 @@ test('durable spawn survives the account gate and redrives into one dedicated ag
   assert.ok(state.calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'set').length >= 2);
 });
 
+test('a named Orca spawn mailbox recovers its own terminal after restart', async t => {
+  const root = directory(t);
+  const workspacePath = join(root, 'child');
+  const mailboxId = 'named-spawn';
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const { runner: inventory, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'shell', connected: true, writable: true, preview: 'user@host %' },
+    { handle: 'sibling-agent', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const runner: CommandRunner = async request => {
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      state.calls.push(request);
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: workspacePath } } }) };
+    }
+    return inventory(request);
+  };
+  const plugin = createOrcaSpawnExecutorPlugin({
+    store, commandRunner: runner, cwd: root, noParent: true,
+    resolveTopicBinding: () => ({ mailboxId, mode: 'spawn' }),
+  });
+  state.waitOk = false;
+  const receipt = await plugin.execute([alert('named-spawn')], { networkId: 'team', nodeId: 'receiver', traceId: 'spawn' }, {});
+  assert.equal(receipt.mailboxId, mailboxId);
+  assert.equal(receipt.woke, false);
+  assert.equal(state.created, 1);
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-new-1');
+  state.waitOk = true;
+  const recovered = new MailboxStore(store.path);
+  const wakeup = new WakeupRedriveService({ store: recovered, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => wakeup.stop());
+  assert.equal((await wakeup.flushMailbox(mailboxId, { force: true })).woke, true);
+  assert.equal(state.calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'create').length, 1);
+  assert.equal(state.created, 2);
+  assert.equal(terminalSends(state.calls).length, 1);
+  assert.match(textOf(sendsTo(state.calls, 'term-new-2')[0]), /dealer inbox check --mailbox named-spawn --json/);
+  assert.equal(recovered.getWakeTarget(mailboxId)?.driverConfig?.dedicatedSpawn, true);
+});
+
 test('spawn keeps durable custody through launch, comment and pointer failures', async t => {
   // Preparation failures remain retryable; an attempted pointer remains fenced. Neither
   // may turn the already-committed task into a failed dispatcher/CAS handoff.
