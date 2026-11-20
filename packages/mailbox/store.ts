@@ -339,12 +339,29 @@ export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding
   return normalizeMailboxId(`stream:${binding.streamKey ?? kindStreamKey ?? kind}`);
 }
 
+/** A concrete semantic target wins over thread affinity. The default mailbox confers neither. */
+export function resolveSessionOrThreadMailbox(
+  envelope: { semantic?: { targetMailbox?: string } },
+  threadLocalMailbox?: string,
+): string | undefined {
+  const target = envelope.semantic?.targetMailbox;
+  if (target !== undefined && target !== 'default') {
+    return normalizeMailboxId(target, 'semantic targetMailbox');
+  }
+  if (threadLocalMailbox !== undefined && threadLocalMailbox !== 'default') {
+    return normalizeMailboxId(threadLocalMailbox, 'thread local mailbox');
+  }
+  return undefined;
+}
+
 export function resolveMailboxId(
   envelope: MessageEnvelope,
   binding?: MailboxTopicBinding,
   threadLocalMailbox?: string,
   fallbackMode?: AgentConversationMode,
 ): string {
+  const sessionMailbox = resolveSessionOrThreadMailbox(envelope, threadLocalMailbox);
+  if (sessionMailbox !== undefined) return sessionMailbox;
   const semantic = envelope.semantic;
   const payload = isRecord(envelope.payload)
     ? (envelope.payload as Record<string, unknown>)
@@ -354,16 +371,6 @@ export function resolveMailboxId(
     typeof payload?.streamKey === 'string' ? payload.streamKey : undefined,
   );
   const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
-  // An explicit session mailbox always owns its message, including control frames: a generic
-  // topic binding must never rewrite a session-specific destination. `default` means unspecified.
-  if (semantic?.targetMailbox !== undefined && semantic.targetMailbox !== 'default') {
-    return normalizeMailboxId(semantic.targetMailbox, 'semantic targetMailbox');
-  }
-  // An established thread stays with the mailbox already handling it, so replies wake the
-  // originating worktree/terminal session instead of opening work in the topic's generic binding.
-  if (threadLocalMailbox !== undefined && threadLocalMailbox !== 'default') {
-    return normalizeMailboxId(threadLocalMailbox, 'thread local mailbox');
-  }
   // Control frames follow the topic binding only when the sender named no destination.
   if (binding && control && (semantic?.targetMailbox === undefined || semantic.targetMailbox === 'default')) {
     const bound = resolveBoundMailboxId(bindingKind, binding, fallbackMode);
@@ -1929,6 +1936,7 @@ export class MailboxStore {
     networkId?: string,
     options?: { excludeInboundMessageId?: string },
   ): string | undefined {
+    if (!threadId) return undefined;
     return this.threadLocalMailboxFromState(this.read(), threadId, networkId, options?.excludeInboundMessageId);
   }
 

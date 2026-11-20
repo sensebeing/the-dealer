@@ -16,6 +16,7 @@ export interface DispatcherConfig {
   privateKeyPem?: string;
   ledgerPath?: string;
   defaultExecutor?: string;
+  resolveExecutor?: (envelope: MessageEnvelope) => string | undefined;
   resolveKindExecutor?: (kind: string, streamKey?: string) => string | undefined;
   kindExecutors?: Record<string, string>;
 }
@@ -88,6 +89,8 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       });
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
       const select = (e: MessageEnvelope) => {
+        const resolved = config.resolveExecutor?.(e);
+        if (resolved !== undefined) return resolved;
         // Session control always lands in a mailbox; it must never spawn new worktrees.
         const semanticType = e.semantic?.type;
         if (

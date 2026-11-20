@@ -11,7 +11,7 @@ import {
   defaultAgentCommandArgs,
 } from './hosts.ts';
 import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from './hosts.ts';
-import { MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
+import { MailboxStore, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress } from '../mailbox/index.ts';
 import type { MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
@@ -114,12 +114,8 @@ function createAgentExecutorPlugin(
       const first = batch[0];
       if (!first) throw beforeExternalEffect(new Error('Empty agent batch'));
       const payload = first?.payload ?? {};
-      const binding = first
-        ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(
-            first.kind,
-            typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined,
-          )
-        : undefined;
+      const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
+      const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(first.kind, streamKey);
       const agentInput = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
       const agent =
         agentInput === undefined ? undefined : prepareExternalEffect(() => parseAgentHost(agentInput));
@@ -160,15 +156,32 @@ function createAgentExecutorPlugin(
           if (rawMode !== undefined && rawMode !== 'spawn' && rawMode !== 'wave' && rawMode !== 'fixed')
             throw beforeExternalEffect(new Error('Invalid agent conversationMode'));
           const conversationMode = (rawMode ?? 'spawn') as ActiveConversationMode;
+          const addressing = {
+            mailboxId: binding?.mailboxId,
+            streamKey: binding?.streamKey,
+            stream: binding?.stream,
+            mode: conversationMode,
+          };
+          const threadLocalMailbox = store?.resolveThreadLocalMailbox(first.semantic?.threadId, first.networkId, {
+            excludeInboundMessageId: first.id,
+          });
+          if (store && !(typeof payload.executor === 'string' && payload.executor.trim())) {
+            const sessionMailbox = prepareExternalEffect(() => resolveSessionOrThreadMailbox(first, threadLocalMailbox));
+            if (sessionMailbox !== undefined) {
+              const boundMailboxId = conversationMode === 'spawn' ? 'default' : prepareExternalEffect(() =>
+                resolveBoundMailboxId(resolveTopicAddress(first.kind, streamKey).kind, addressing),
+              );
+              if (sessionMailbox !== boundMailboxId) {
+                const receipt = await createInboxExecutorPlugin({ store, wakeup: options.wakeup ?? config.wakeup })
+                  .execute(batch, context, runtimeConfig);
+                return { ...receipt, executor: name };
+              }
+            }
+          }
           mailboxId =
             conversationMode === 'spawn'
               ? `task:${first.id}`
-              : prepareExternalEffect(() => resolveMailboxId(first, {
-                  mailboxId: binding?.mailboxId,
-                  streamKey: binding?.streamKey,
-                  stream: binding?.stream,
-                  mode: conversationMode,
-                }, undefined, 'inbox-only'));
+              : prepareExternalEffect(() => resolveMailboxId(first, addressing, threadLocalMailbox, 'inbox-only'));
           const terminalPrompt =
             typeof payload.terminalPrompt === 'string'
               ? payload.terminalPrompt.trim() || undefined

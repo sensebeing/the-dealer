@@ -3,14 +3,17 @@ import { createOrcaWakeupDrivers } from '../packages/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DealerNodeRuntime,
   MailboxStore,
   WakeupRedriveService,
+  createOrcaExecutorPlugin,
+  createOrcaSpawnExecutorPlugin,
   createOrcaWaveExecutorPlugin,
+  initProjectScaffold,
   runDealerCli,
 } from '../packages/index.ts';
 import type {
@@ -70,6 +73,185 @@ function terminalSends(calls: readonly CommandRequest[]): CommandRequest[] {
 function terminalOf(call: CommandRequest): string {
   return String(call.args[call.args.indexOf('--terminal') + 1]);
 }
+
+async function spawnPeers(t: TestContext) {
+  const root = directory(t);
+  const originWorkspace = join(root, 'tool-registry发布部署方式');
+  const childWorkspace = join(root, 'spawned-child');
+  for (const workspace of [originWorkspace, childWorkspace]) mkdirSync(workspace);
+  const project = join(root, 'alter-service');
+  initProjectScaffold(project, { projectId: 'alter-service', defaultNetworkId: 'team' });
+  const calls: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    if (request.command === 'lark-cli') return { stdout: '{"message_id":"notified"}' };
+    calls.push(request);
+    const reply = (result: unknown) => ({ stdout: JSON.stringify({ ok: true, result }) });
+    switch (request.args.slice(0, 2).join(' ')) {
+      case 'worktree create': return reply({ path: childWorkspace });
+      case 'worktree ps': return reply({
+        truncated: false,
+        worktrees: [originWorkspace, childWorkspace].map((path, index) => ({
+          path, worktreeId: `wt-${index}`, unverifiableTerminalCount: 0, agents: [{ state: 'done' }],
+        })),
+      });
+      case 'terminal create': return reply({ terminal: { handle: 'term_child' } });
+      case 'terminal list': return reply({
+        terminals: [{
+          handle: request.args.includes(`path:${childWorkspace}`) ? 'term_child' : 'term_origin',
+          connected: true, writable: true, preview: '>',
+        }],
+      });
+      default: return { stdout: '{"ok":true}' };
+    }
+  };
+  const make = async (member: string) => {
+    const runtime = await new DealerNodeRuntime({
+      stateDir: join(root, member),
+      member, name: member, profile: 'personal-dev',
+      transport: { discoveryDir: join(root, 'mesh') },
+      patch: {
+        gateMode: 'open', defaultExecutor: 'inbox', larkNotify: { enabled: false, target: { userId: 'test-user' } },
+        ...(member === 'alice' ? { projects: [{ projectId: 'alter-service', rootPath: project }] } : {}),
+      },
+      wakeupIdleCheck: async () => ({ idle: true }),
+      commandRunner,
+    }).start();
+    t.after(() => runtime.stop());
+    await runtime.mountNetwork({ networkId: 'team', passphrase: 'affinity-test' });
+    return runtime;
+  };
+  const alice = await make('alice');
+  const bob = await make('bob');
+  const deadline = Date.now() + 5000;
+  while (!alice.node.listPeers({ networkId: 'team', member: 'bob' }).length ||
+         !bob.node.listPeers({ networkId: 'team', member: 'alice' }).length) {
+    assert.ok(Date.now() < deadline, 'peer discovery');
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  const preset = await alice.applyAgentPreset({
+    host: 'orca', mode: 'spawn', projectId: 'alter-service', agent: 'antigravity', notifyLark: true,
+  });
+  assert.equal(preset.binding.executor, 'orca');
+  assert.equal(preset.binding.mode, 'spawn');
+  const send = async (runtime: DealerNodeRuntime, member: string, ...args: string[]) => {
+    const out: string[] = [], err: string[] = [];
+    const code = await runDealerCli([
+      'send', '--network', 'team', '--to', `member:${member}`, '--topic', 'collab.request.v4', ...args, '--json',
+    ], { runtime, env: {}, stdout: line => out.push(line), stderr: line => err.push(line) });
+    assert.equal(code, 0, err.join('\n'));
+    const result = JSON.parse(out.join('\n'));
+    assert.equal(result.receipts[0]?.stage, 'dispatched', JSON.stringify(result.receipts));
+    return result;
+  };
+  return { alice, bob, calls, originWorkspace, send };
+}
+
+test('spawn preset delivers structured status updates to the originating Orca worktree', async t => {
+  const { alice, bob, calls, originWorkspace, send } = await spawnPeers(t);
+  const mailboxId = 'worktree:tool-registry发布部署方式';
+  const request = await send(alice, 'bob', '--body', 'Publish the tool registry',
+    '--workspace-path', originWorkspace, '--terminal-handle', 'term_origin');
+  const ids = [];
+  for (const status of ['accepted', 'in_progress', 'done']) {
+    const update = await send(bob, 'alice', '--thread', request.messageId, '--body', JSON.stringify({ status }));
+    ids.push(update.messageId);
+  }
+  const followup = await bob.emitter.emit({
+    networkId: 'team', routing: { mode: 'unicast', targets: ['member:alice'] },
+    kind: 'collab.request.v4', subject: 'Follow-up', body: 'Additional detail', payload: {},
+    semantic: { type: 'message', threadId: request.messageId },
+  });
+  assert.equal(followup.receipts[0].stage, 'dispatched', JSON.stringify(followup.receipts));
+  await alice.wakeups.flushMailbox(mailboxId, { force: true });
+  assert.equal(calls.filter(call => call.args.slice(0, 2).join(' ') === 'worktree create').length, 0);
+  const items = alice.mailbox.list({ mailboxId }).items.toReversed();
+  assert.deepEqual(items.map(item => item.envelope.id), [...ids, followup.messageId]);
+  assert.deepEqual(items.slice(0, 3).map(item => item.envelope.payload.status), ['accepted', 'in_progress', 'done']);
+  assert.deepEqual(items.map(item => item.envelope.semantic?.targetMailbox), [mailboxId, mailboxId, mailboxId, undefined]);
+  assert.ok(items.every(item => item.envelope.semantic?.type === 'message'));
+  assert.ok(terminalSends(calls).length > 0);
+  assert.ok(terminalSends(calls).every(call => terminalOf(call) === 'term_origin'));
+  assert.equal(alice.mailbox.getWakeTarget(mailboxId)?.pendingWake, false);
+});
+
+test('spawn preset reuses the task mailbox for follow-ups to an inbound root', async t => {
+  const { alice, bob, calls, send } = await spawnPeers(t);
+  const request = await send(bob, 'alice', '--body', 'New task');
+  const mailboxId = `task:${request.messageId}`;
+  const lease = alice.mailbox.check({ mailboxId });
+  assert.equal(lease.items[0]?.envelope.id, request.messageId);
+  alice.mailbox.ack(lease.deliveryId!, mailboxId);
+  const before = terminalSends(calls).length;
+  const followup = await bob.emitter.emit({
+    networkId: 'team', routing: { mode: 'unicast', targets: ['member:alice'] },
+    kind: 'collab.request.v4', subject: 'Follow-up', body: 'Additional detail', payload: {},
+    semantic: { type: 'message', threadId: request.messageId, targetMailbox: 'default' },
+  });
+  assert.equal(followup.receipts[0].stage, 'dispatched', JSON.stringify(followup.receipts));
+  await alice.wakeups.flushMailbox(mailboxId, { force: true });
+  assert.equal(calls.filter(call => call.args.slice(0, 2).join(' ') === 'worktree create').length, 1);
+  assert.deepEqual(alice.mailbox.list({ mailboxId }).items.map(item => item.envelope.id), [followup.messageId]);
+  assert.deepEqual(terminalSends(calls).slice(before).map(terminalOf), ['term_child']);
+});
+
+for (const [name, create] of [['orca', createOrcaExecutorPlugin], ['orca-spawn', createOrcaSpawnExecutorPlugin]] as const) {
+  test(`standalone ${name} spawn delivers a batch to its owning thread and session mailboxes`, async t => {
+    const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+    const calls: CommandRequest[] = [];
+    const commandRunner: CommandRunner = async request => {
+      calls.push(request);
+      assert.notDeepEqual(request.args.slice(0, 2), ['worktree', 'create']);
+      return { stdout: '{"ok":true}' };
+    };
+    const wakeup = new WakeupRedriveService({
+      store, drivers: createTestWakeupDrivers({ commandRunner, idleCheck: async () => ({ idle: true }) }),
+    });
+    t.after(() => wakeup.stop());
+    const root = envelope('root', { semantic: { type: 'message', threadId: 'root' } });
+    store.recordInboundEnvelope(root, 'task:root');
+    store.upsertWakeTarget('task:root', { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term_child' } });
+    store.upsertWakeTarget('worktree:origin', { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term_origin' } });
+    const plugin = create({ store, wakeup, commandRunner, mode: 'spawn' });
+    const receipt = await plugin.execute([
+      envelope('followup', { semantic: { type: 'message', threadId: root.id } }),
+      envelope('reply', { semantic: { type: 'message', threadId: 'reply', targetMailbox: 'worktree:origin' } }),
+    ], context, {});
+    assert.equal(receipt.executor, name);
+    assert.deepEqual(receipt.mailboxIds, ['task:root', 'worktree:origin']);
+    assert.deepEqual(store.list({ mailboxId: 'task:root' }).items.map(item => item.envelope.id), ['followup']);
+    assert.deepEqual(store.list({ mailboxId: 'worktree:origin' }).items.map(item => item.envelope.id), ['reply']);
+    assert.deepEqual(terminalSends(calls).map(terminalOf), ['term_child', 'term_origin']);
+  });
+}
+
+test('standalone orca-spawn separates a new task from an existing thread in the same batch', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const commandRunner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      return { stdout: JSON.stringify({ ok: true, result: { path: root } }) };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term_new"}}}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const first = envelope('existing', { semantic: { type: 'message', threadId: 'existing' } });
+  store.recordInboundEnvelope(first, 'task:existing');
+  store.upsertWakeTarget('task:existing', { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term_existing' } });
+  const plugin = createOrcaSpawnExecutorPlugin({ store, commandRunner, cwd: root, mode: 'spawn' });
+  const receipt = await plugin.execute([
+    envelope('fresh', { payload: { mailbox: 'sender-hint' } }),
+    envelope('followup', { semantic: { type: 'message', threadId: first.id } }),
+  ], context, {});
+  assert.deepEqual(receipt.mailboxIds, ['task:fresh', 'task:existing']);
+  assert.deepEqual(store.list({ mailboxId: 'task:fresh' }).items.map(item => item.envelope.id), ['fresh']);
+  assert.deepEqual(store.list({ mailboxId: 'task:existing' }).items.map(item => item.envelope.id), ['followup']);
+  assert.equal(store.list({ mailboxId: 'sender-hint' }).totalCount, 0);
+  assert.equal(calls.filter(call => call.args.slice(0, 2).join(' ') === 'worktree create').length, 1);
+});
 
 test('thread replies wake the originating worktree session instead of the topic inbox', async t => {
   const root = directory(t);

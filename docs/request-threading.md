@@ -45,12 +45,20 @@ otherwise use `stream:<streamKey>` (or `stream:<kind>`). Local `projectId` resol
 through linked projects; a project user patch can also use its own linked root.
 Bindings do not rewrite signed inbound messages.
 
-Ordinary messages with an explicit executor keep that executor. Session control
-messages (`question`, `reply`, `settle`) always use inbox delivery; when their
-semantic target is absent or `default`, they follow the local topic binding.
-Explicit non-default targets remain explicit. Outbound messages without an
-explicit reply mailbox advertise the sender's local bound mailbox before final
-signing.
+Session control messages (`question`, `reply`, `settle`) always use inbox
+delivery. Ordinary messages with an explicit executor keep that executor.
+Otherwise, an explicit non-default semantic target or the thread's recorded
+local mailbox on the same network takes precedence over the topic. A message
+for the topic's own bound mailbox still uses the topic executor. A message for
+another mailbox is enqueued there and wakes its owning session when it has a
+wake target.
+
+In `spawn` mode, a new request without a concrete semantic target or local
+thread mailbox starts a dedicated session at `task:<rootMessageId>`. A sender's
+payload mailbox hint does not establish session ownership. Structured updates
+and comments sent with `dealer send --thread` return to the existing session.
+Outbound messages without an explicit reply mailbox advertise the sender's
+local bound mailbox before final signing.
 
 Wave wake targets are registered before the first batch. Auto-creation requires
 a receiver-local repository root and creates a fixed top-level Orca workspace.

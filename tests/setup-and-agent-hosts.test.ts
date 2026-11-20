@@ -1856,6 +1856,62 @@ test('payload-selected host owns inbound task addressing and thread replies resu
 
 });
 
+for (const [name, create] of [
+  ['codex', createCodexExecutorPlugin],
+  ['claude-code', createClaudeCodeExecutorPlugin],
+  ['antigravity', createAntigravityExecutorPlugin],
+  ['agent-pty', createAgentPtyExecutorPlugin],
+] as const) {
+  test(`standalone ${name} spawn preserves existing thread and explicit session mailboxes`, async t => {
+    const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+    const calls: CommandRequest[] = [];
+    const commandRunner: CommandRunner = async request => {
+      calls.push(request);
+      return { stdout: name === 'codex' ? '{"threadId":"task-session"}' : '{"ok":true}' };
+    };
+    const wakeup = new WakeupRedriveService({
+      store, drivers: createTestWakeupDrivers({ commandRunner, idleCheck: async () => ({ idle: true }) }),
+    });
+    t.after(() => wakeup.stop());
+    const plugin = create({ store, wakeup, commandRunner, mode: 'spawn', sessionId: 'task-session',
+      ...(name === 'agent-pty' ? { agent: 'claude-code' } : {}) });
+    const root = {
+      ...message('new-task', { mailbox: 'sender-hint' }),
+      semantic: { type: 'message', threadId: 'new-task', targetMailbox: 'default' } as const,
+    };
+    const taskMailbox = 'task:new-task';
+    assert.equal((await plugin.execute([root], context, {})).mailboxId, taskMailbox);
+    assert.equal(store.list({ mailboxId: 'sender-hint' }).totalCount, 0);
+    store.recordInboundEnvelope(root, taskMailbox);
+    store.ack(store.check({ mailboxId: taskMailbox }).deliveryId!, taskMailbox);
+    const taskTarget = store.getWakeTarget(taskMailbox)!;
+    const worktreeMailbox = 'worktree:origin';
+    const followup = { ...message('followup'), semantic: { type: 'message' as const, threadId: root.id } };
+    assert.equal((await plugin.execute([followup], context, {})).mailboxId, taskMailbox);
+    await wakeup.flushMailbox(taskMailbox, { force: true });
+    assert.deepEqual(store.list({ mailboxId: taskMailbox }).items.map(item => item.envelope.id), ['followup']);
+    assert.equal(store.getWakeTarget('task:followup'), undefined);
+    if (name === 'antigravity') {
+      // The standalone CLI has no continuation and leaves the task mailbox passive.
+      assert.equal(taskTarget.driver, 'passive');
+      assert.equal(calls.length, 1);
+    } else {
+      assert.equal(calls.length, 2);
+      assert.ok(calls[1].args.includes('--resume'));
+      assert.ok(calls[1].args.includes('task-session'));
+    }
+    store.upsertWakeTarget(worktreeMailbox, { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term_origin' } });
+    const reply = { ...message('reply'), semantic: { type: 'message' as const, threadId: root.id, targetMailbox: worktreeMailbox } };
+    assert.equal((await plugin.execute([reply], context, {})).mailboxId, worktreeMailbox);
+    await wakeup.flushMailbox(worktreeMailbox, { force: true });
+    assert.deepEqual(store.list({ mailboxId: worktreeMailbox }).items.map(item => item.envelope.id), ['reply']);
+    assert.equal(store.getWakeTarget('task:reply'), undefined);
+    const last = calls.at(-1)!;
+    assert.deepEqual(last.args.slice(0, 2), ['terminal', 'send']);
+    assert.equal(last.args[last.args.indexOf('--terminal') + 1], 'term_origin');
+  });
+}
+
 test('mailbox addressing fallback accepts valid payload hints and ignores malformed hints', () => {
   const binding = { executor: 'agent-pty' };
   assert.equal(toMailboxTopicBinding(binding, {}, { agent: 'claude-code' }).mode, 'spawn');

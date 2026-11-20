@@ -76,7 +76,8 @@ test('topic binding routes signed messages and control frames consistently with 
   }).start();
   t.after(() => runtime.stop());
   assert.equal(runtime.mailbox.getWakeTarget('stream:requests')?.driverConfig?.workspacePath, '/fixed');
-  await cli(runtime, 'send', '--network', 'local', '--to', `member:alice`, '--topic', 'request', '--body', 'first', '--thread', 'thread-main');
+  assert.equal(runtime.resolveExecutorName({ kind: 'request', semantic: { targetMailbox: 'stream:requests' } }), 'orca-wave');
+  await cli(runtime, 'send', '--network', 'local', '--to', `member:alice`, '--topic', 'request', '--body', 'first', '--thread', 'thread-main', '--target-mailbox', 'stream:requests');
   for (const type of ['question', 'reply', 'settle'] as const) {
     await runtime.emitter.emit({ networkId: 'local', routing: { mode: 'unicast', targets: ['member:alice'] }, kind: 'request', subject: type, body: type, payload: {},
       semantic: { type, threadId: 'thread-main', targetMailbox: 'default', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } });

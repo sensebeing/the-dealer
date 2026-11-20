@@ -140,7 +140,9 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
               envelope.kind,
               typeof envelope?.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined,
             ),
-            store.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
+            store.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
+              excludeInboundMessageId: envelope.id,
+            }),
           ),
         );
         const group = groups.get(mailboxId) ?? [];

@@ -25,6 +25,7 @@ import {
   isConfirmedHandoffReceipt,
   isDedupCasDuplicateReceipt,
   isDurableQueuedReceipt,
+  isValidMailboxId,
 } from '../core-types/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
 import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityCliExecutorPlugin, createAntigravityAppExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin, createAgentPtyExecutorPlugin } from '../plugins-agent-host/index.ts';
@@ -32,7 +33,7 @@ import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
 import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
+import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -557,7 +558,7 @@ export class DealerNodeRuntime {
           requiredPolicies: () => this.config.policies,
           ledgerPath: join(this.stateDir, 'deliveries.json'),
           wrapExecutor: executor => this.wrapExecutorWithAttachments(executor),
-          resolveKindExecutor: (kind, streamKey) => this.resolveTopicDefaultExecutor(kind, streamKey) ?? this.config.defaultExecutor,
+          resolveExecutor: envelope => this.resolveExecutorName(envelope),
         }),
       );
       await this.kernel.use(
@@ -1125,9 +1126,11 @@ export class DealerNodeRuntime {
   }
 
   resolveExecutorName(envelope: {
+    id?: string;
+    networkId?: string;
     kind: string;
     payload?: Record<string, any>;
-    semantic?: { type?: string };
+    semantic?: { type?: string; threadId?: string; targetMailbox?: string };
   }): string {
     // Session control must land in the target mailbox, never in a new worktree.
     const type = envelope.semantic?.type;
@@ -1138,7 +1141,23 @@ export class DealerNodeRuntime {
     if (typeof explicit === 'string' && explicit.trim().length > 0) {
       return explicit;
     }
-    return this.resolveTopicDefaultExecutor(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined) ?? this.config.defaultExecutor;
+    const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
+    const targetMailbox = envelope.semantic?.targetMailbox;
+    // The signed-header boundary rejects invalid targets. Keep direct selection side-effect-free too.
+    if (targetMailbox !== undefined && !isValidMailboxId(targetMailbox)) return 'inbox';
+    const sessionMailbox = resolveSessionOrThreadMailbox(envelope, this.mailbox?.resolveThreadLocalMailbox(
+      envelope.semantic?.threadId, envelope.networkId, { excludeInboundMessageId: envelope.id },
+    ));
+    if (sessionMailbox !== undefined) {
+      const resolved = this.resolveTopicBinding(envelope.kind, streamKey);
+      const boundMailboxId = resolved ? resolveBoundMailboxId(
+        resolveTopicAddress(envelope.kind, streamKey).kind,
+        this.registry.toMailboxBinding(resolved.binding, this.config.executorConfig, envelope.payload),
+      ) : 'default';
+      if (sessionMailbox !== boundMailboxId) return 'inbox';
+      if (resolved) return resolved.binding.executor;
+    }
+    return this.resolveTopicDefaultExecutor(envelope.kind, streamKey) ?? this.config.defaultExecutor;
   }
 
   /** Every registered executor receives the same attachment and receiver-config boundary. */
@@ -1187,7 +1206,9 @@ export class DealerNodeRuntime {
               // queued messages whose executor has not yet validated their payload.
               { ...envelope, payload: { ...envelope.payload, mode: undefined, conversationMode: undefined } },
               binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
-              this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
+              this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
+                excludeInboundMessageId: envelope.id,
+              }),
               this.registry.toMailboxBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
             );
             // Inbound receipts can arrive after a synchronous pointer delivery; preserve its session.
