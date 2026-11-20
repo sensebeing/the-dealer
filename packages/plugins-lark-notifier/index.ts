@@ -32,6 +32,7 @@ export interface LarkMailboxNotifierOptions {
   localNodeId: string;
   localMember: string;
   defaultBoundMailboxes?: string[];
+  acceptsDynamicMailbox?: (item: MailboxItem) => boolean;
   commandRunner?: CommandRunner;
   onError?: (error: unknown) => void;
 }
@@ -213,8 +214,10 @@ export class LarkMailboxNotifier {
   }
   private accepts(item: MailboxItem): boolean {
     const config = this.options.config;
-    const allowed = new Set(config.mailboxes ?? ['default', ...this.boundMailboxes]);
-    return allowed.has(item.mailboxId) && !config.excludeMailboxes?.includes(item.mailboxId) && this.acceptsEnvelope(item.envelope) &&
+    const allowed = config.mailboxes !== undefined
+      ? new Set(config.mailboxes).has(item.mailboxId)
+      : item.mailboxId === 'default' || this.boundMailboxes.includes(item.mailboxId) || Boolean(this.options.acceptsDynamicMailbox?.(item));
+    return allowed && !config.excludeMailboxes?.includes(item.mailboxId) && this.acceptsEnvelope(item.envelope) &&
       !(config.skipSelfMessages && item.envelope.from.nodeId === this.options.localNodeId);
   }
   private attachments(envelope: MessageEnvelope): string {

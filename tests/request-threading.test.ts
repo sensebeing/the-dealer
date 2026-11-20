@@ -635,14 +635,121 @@ test('smart Lark defaults omit compound and project background bindings but perm
   writeFileSync(patch, JSON.stringify({ topicBindings: bindings }));
   await runtime.linkProject(project, patch);
   for (const kind of Object.keys(bindings)) runtime.mailbox.enqueue([envelope(`default-${kind}`, { kind })], { mailboxId: bindings[kind].mailboxId });
+  runtime.mailbox.enqueue([envelope('dynamic-background', { kind: 'wave' })], { mailboxId: 'worktree:background' });
   await runtime.larkNotifier!.flush();
   assert.equal(calls.length, 2, 'only inbox and top-level request defaults notify');
   writeFileSync(patch, JSON.stringify({ topicBindings: Object.fromEntries(Object.entries(bindings).map(([kind, binding]) =>
     [kind, { ...binding, notifyLark: kind !== 'request' }])) }));
   await runtime.linkProject(project, patch);
   for (const kind of Object.keys(bindings)) runtime.mailbox.enqueue([envelope(`explicit-${kind}`, { kind })], { mailboxId: bindings[kind].mailboxId });
+  runtime.mailbox.enqueue([envelope('dynamic-opted-in', { kind: 'wave' })], { mailboxId: 'worktree:background' });
   await runtime.larkNotifier!.flush();
-  assert.equal(calls.length, 7, 'explicit true opts background mailboxes in; false opts request out');
+  assert.equal(calls.length, 8, 'explicit true opts static and dynamic background mailboxes in; false opts request out');
+});
+
+test('Lark mirrors enabled bound topics and outbound thread replies in dynamic mailboxes', async t => {
+  const calls: CommandRequest[] = [];
+  const worktree = 'worktree:requests';
+  const terminal = 'terminal:term_00000000-0000-4000-8000-000000000001';
+  const runtime = await new DealerNodeRuntime({ stateDir: directory(t), member: 'bob', profile: 'personal-dev',
+    patch: {
+      gateMode: 'open',
+      defaultExecutor: 'inbox',
+      topicBindings: {
+        'collab.request.v4': { executor: 'inbox', mailboxId: 'collaboration', notifyLark: true },
+        'review:enabled': { executor: 'inbox', notifyLark: true },
+        'quiet': { executor: 'inbox', mailboxId: 'quiet', notifyLark: false },
+        'wave:alerts': { executor: 'inbox', mailboxId: 'alerts' },
+      },
+      larkNotify: { enabled: true, target: { chatId: 'copilot' }, excludeMailboxes: ['default', 'worktree:excluded'] },
+    },
+    commandRunner: async call => {
+      if (call.command === 'orca') return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
+      calls.push(call);
+      return { stdout: JSON.stringify({ message_id: `lark-${calls.length}` }) };
+    },
+    wakeupIdleCheck: async () => ({ idle: false }),
+  }).start();
+  t.after(() => runtime.stop());
+  const dispatcher = runtime.kernel.ctx.services.dispatcher;
+  const subjects: string[] = [];
+  for (const [name, mailboxId] of [['worktree', worktree], ['terminal', terminal]]) {
+    const threadId = `outbound-${name}`;
+    await cli(runtime, 'send', '--network', 'local', '--to', 'member:bob', '--topic', 'request', '--body', 'first', '--thread', threadId, '--reply-mailbox', mailboxId);
+    assert.equal(runtime.mailbox.resolveThreadLocalMailbox(threadId, 'local'), mailboxId);
+    const reply = envelope(`unbound-${name}`, { semantic: { type: 'reply', threadId } });
+    assert.equal((await dispatcher.dispatch(reply)).stage, 'dispatched');
+    subjects.push(`**[request] ${reply.subject}**`);
+    for (const [kind, mirror] of [['collab.request.v4', true], ['quiet', false], ['wave:alerts', false]] as const) {
+      const id = `${kind}-${name}`;
+      const message = envelope(id, { kind, semantic: { type: 'reply', threadId: id, targetMailbox: mailboxId } });
+      assert.equal((await dispatcher.dispatch(message)).stage, 'dispatched');
+      if (mirror) subjects.push(`**[${kind}] ${message.subject}**`);
+    }
+    const items = runtime.mailbox.listItemsAfterSequence(-1).filter(item => item.mailboxId === mailboxId);
+    assert.deepEqual(items.map(item => item.id), [reply.id, `collab.request.v4-${name}`, `quiet-${name}`, `wave:alerts-${name}`]);
+  }
+  for (const [id, patch, mailboxId] of [
+    ['normalized-stream', { kind: 'review:ignored', payload: { streamKey: ' enabled ' } }, 'chosen-reply'],
+    ['excluded', { kind: 'collab.request.v4' }, 'worktree:excluded'],
+    ['different-network', { networkId: 'other', semantic: { type: 'reply', threadId: 'outbound-worktree' } }, worktree],
+  ] as const) {
+    runtime.mailbox.enqueue([envelope(id, patch)], { mailboxId });
+  }
+  await runtime.larkNotifier!.flush();
+  subjects.push('**[review:ignored] normalized-stream**');
+  assert.deepEqual(calls.map(call => argument(call, '--markdown').split('\n')[0]), subjects);
+});
+
+test('an unthreaded arrival in a private mailbox stays silent during Lark catch-up', async t => {
+  const sending = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const calls: CommandRequest[] = [];
+  const runtime = await new DealerNodeRuntime({ stateDir: directory(t), member: 'bob', profile: 'personal-dev',
+    patch: { gateMode: 'open', defaultExecutor: 'inbox', larkNotify: { enabled: true, target: { chatId: 'copilot' } } },
+    commandRunner: async call => {
+      calls.push(call);
+      sending.resolve();
+      await release.promise;
+      return { stdout: '{"message_id":"root"}' };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  try {
+    runtime.mailbox.enqueue([envelope('public')]);
+    await sending.promise;
+    const message = envelope('private', { payload: { mailbox: 'private' } });
+    const receipt = await runtime.kernel.ctx.services.dispatcher.dispatch(message);
+    assert.equal(receipt.stage, 'dispatched');
+    assert.equal(runtime.mailbox.listItemsAfterSequence(-1).at(-1)?.mailboxId, 'private');
+  } finally {
+    release.resolve();
+  }
+  await runtime.larkNotifier!.flush();
+  assert.deepEqual(calls.map(call => argument(call, '--markdown').split('\n')[0]), ['**[request] public**']);
+});
+
+test('explicit Lark mailbox lists bypass the dynamic predicate and honor exclusions', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  store.enqueue([envelope('default')]);
+  store.enqueue([envelope('included')], { mailboxId: 'worktree:included' });
+  store.enqueue([envelope('excluded')], { mailboxId: 'terminal:term_excluded' });
+  for (const mailboxes of [[], ['worktree:included', 'terminal:term_excluded']]) {
+    const calls: CommandRequest[] = [];
+    let dynamicChecks = 0;
+    const notifier = new LarkMailboxNotifier({
+      store, stateDir: join(root, String(mailboxes.length)), localNodeId: 'local', localMember: 'bob',
+      config: { enabled: true, target: { chatId: 'copilot' }, mailboxes, excludeMailboxes: ['terminal:term_excluded'] },
+      acceptsDynamicMailbox: () => { dynamicChecks += 1; return true; },
+      commandRunner: async call => { calls.push(call); return { stdout: '{"message_id":"root"}' }; },
+    });
+    notifier.start();
+    await notifier.flush();
+    await notifier.stop();
+    assert.equal(dynamicChecks, 0);
+    assert.deepEqual(calls.map(call => argument(call, '--markdown').split('\n')[0]), mailboxes.length ? ['**[request] included**'] : []);
+  }
 });
 
 test('lark-mirror seeds existing approvals and retries failed persistence with the same idempotency key', async t => {

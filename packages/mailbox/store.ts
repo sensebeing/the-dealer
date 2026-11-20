@@ -1908,15 +1908,21 @@ export class MailboxStore {
    * leg. This is the durable thread-affinity record that keeps replies with the worktree/terminal
    * session that owns the thread instead of the topic's generic binding. Records are scoped to the
    * envelope's network so a colliding thread id on another network never inherits this route.
+   * An arrival can exclude its own inbound leg when checking for existing thread affinity.
    */
-  resolveThreadLocalMailbox(threadId?: string, networkId?: string): string | undefined {
-    return this.threadLocalMailboxFromState(this.read(), threadId, networkId);
+  resolveThreadLocalMailbox(
+    threadId?: string,
+    networkId?: string,
+    options?: { excludeInboundMessageId?: string },
+  ): string | undefined {
+    return this.threadLocalMailboxFromState(this.read(), threadId, networkId, options?.excludeInboundMessageId);
   }
 
   private threadLocalMailboxFromState(
     state: MailboxFileState,
     threadId?: string,
     networkId?: string,
+    excludeInboundMessageId?: string,
   ): string | undefined {
     if (typeof threadId !== 'string' || threadId.length === 0) {
       return undefined;
@@ -1924,7 +1930,8 @@ export class MailboxStore {
     const records = threadRecordsFor(state, threadId)
       .filter(record => networkId === undefined || record.networkId === networkId);
     for (let index = records.length - 1; index >= 0; index -= 1) {
-      const localMailbox = records[index].localMailbox;
+      const { direction, messageId, localMailbox } = records[index];
+      if (direction === 'inbound' && messageId === excludeInboundMessageId) continue;
       if (localMailbox !== 'default') {
         return normalizeMailboxId(localMailbox, 'thread local mailbox');
       }

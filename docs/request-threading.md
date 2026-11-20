@@ -79,7 +79,10 @@ The CLI is invoked as an argument array without a shell.
 
 The first-class Kernel plugin `lark-mirror` owns the notifier lifecycle and
 observes gate, mailbox, and emitter events without changing admission or routing.
-By default, mailbox notification covers `default` plus top-level bound mailboxes.
+By default, mailbox notification covers `default`, eligible bound mailboxes,
+and dynamic reply or session mailboxes such as `worktree:*` and `terminal:*`.
+Dynamic mailboxes qualify when the topic's `notifyLark` policy allows it and
+the topic is bound or the mailbox already owns the local thread.
 Compound `<topic>:<stream>` bindings and linked-project topics whose manifest
 `defaultExecutor` is an active agent or workspace executor (`orca`, `claude-app`, `chatgpt-app`, `antigravity-app`, `claude-code`, `codex-cli`, `antigravity-cli`, `codex`, `antigravity`, `orca-wave`, `orca-spawn`, or `agent-pty`) are excluded by default.
 An explicit `notifyLark: true` opts those bindings in; `false` opts any binding out. Explicit `mailboxes` replaces that default set (an

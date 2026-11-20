@@ -29,6 +29,7 @@ import {
 import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
 import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityCliExecutorPlugin, createAntigravityAppExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin, createAgentPtyExecutorPlugin } from '../plugins-agent-host/index.ts';
 import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
+import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
@@ -1003,6 +1004,18 @@ export class DealerNodeRuntime {
     return binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig) : undefined;
   };
 
+  private resolveTopicLarkNotify(kind: string, streamKey?: string, inheritedNotifyLark?: boolean): { bound: boolean; notifyLark: boolean } {
+    const normalizedStream = streamKey?.trim() || undefined;
+    const separator = kind.indexOf(':');
+    const baseTopic = kind.split(':', 1)[0];
+    const effectiveKind = normalizedStream && separator < 0 ? `${kind}:${normalizedStream}` : kind;
+    const resolved = this.resolveTopicBinding(baseTopic, normalizedStream ?? (separator >= 0 ? kind.slice(separator + 1) : undefined));
+    const notifyLark = resolved?.binding.notifyLark ?? inheritedNotifyLark ??
+      (!effectiveKind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
+        this.registry.executor(manifest.topics?.[baseTopic]?.defaultExecutor ?? '')?.interactiveAgent === true));
+    return { bound: Boolean(resolved), notifyLark };
+  }
+
   private async activateLarkNotifier(): Promise<void> {
     if (!this.config.larkNotify?.enabled) {
       if (this.larkNotifier) {
@@ -1010,10 +1023,18 @@ export class DealerNodeRuntime {
       }
       return;
     }
-    const options = {
+    const options: LarkMailboxNotifierOptions = {
       store: this.mailbox, config: this.config.larkNotify, stateDir: this.stateDir,
       localNodeId: this.transport.localNodeId, localMember: this.config.member,
       defaultBoundMailboxes: this.refreshTopicBindings(),
+      acceptsDynamicMailbox: ({ envelope, mailboxId }) => {
+        const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
+        const { bound, notifyLark } = this.resolveTopicLarkNotify(envelope.kind, streamKey);
+        if (!notifyLark) return false;
+        return bound || this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId ?? envelope.id, envelope.networkId, {
+          excludeInboundMessageId: envelope.id,
+        }) === mailboxId;
+      },
       commandRunner: this.options.commandRunner ?? runCommand,
       onError: (error: unknown) => { this.lastError = String(error); },
     };
@@ -1064,9 +1085,7 @@ export class DealerNodeRuntime {
       const addressing = this.registry.toMailboxBinding(binding, this.config.executorConfig);
       const mailboxId = resolveBoundMailboxId(kind, addressing);
       if (inherited && mailboxId !== inherited.mailboxId) return;
-      const notifyLark = binding.notifyLark ?? inherited?.notifyLark ??
-        (!kind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
-          this.registry.executor(manifest.topics?.[kind]?.defaultExecutor ?? '')?.interactiveAgent === true));
+      const { notifyLark } = this.resolveTopicLarkNotify(kind, undefined, inherited?.notifyLark);
       if (notifyLark) mailboxes.push(mailboxId);
       this.registry.executor(binding.executor)?.syncTopicWakeTarget?.({
         kind, mailboxId, binding, projectRoot, store: this.mailbox, wave: this.config.wave, addressing,
