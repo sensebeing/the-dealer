@@ -361,14 +361,15 @@ export function resolveSpawnMailboxId(messageId: string): string {
 
 /** Partition messages already selected for spawning, with each thread's root first. */
 export function groupSpawnBatch(batch: readonly MessageEnvelope[]) {
+  const threadId = (envelope: MessageEnvelope) => envelope.semantic?.threadId ?? envelope.id;
   const threadKey = (envelope: MessageEnvelope) =>
-    JSON.stringify([envelope.networkId, envelope.semantic?.threadId ?? envelope.id]);
+    JSON.stringify([envelope.networkId, threadId(envelope)]);
   const hasExplicitExecutor = ({ payload }: MessageEnvelope) =>
     typeof payload?.executor === 'string' && payload.executor.trim().length > 0;
   const roots = new Map<string, MessageEnvelope>();
   for (const envelope of batch) {
     const key = threadKey(envelope);
-    if (envelope.id === envelope.semantic?.threadId ||
+    if (envelope.id === threadId(envelope) ||
       (!roots.has(key) && !hasExplicitExecutor(envelope))) {
       roots.set(key, envelope);
     }

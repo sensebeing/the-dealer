@@ -242,6 +242,13 @@ original `signedEnvelope` separately. Recovery authenticates `signedEnvelope` wh
 otherwise the legacy `envelope`, without removing or interpreting projected payload fields.
 Dispose each registration with `ctx.effect` when unloading the plugin.
 
+`MailboxStore.enqueue` returns `envelopeMailboxes`, the committed destination for each
+envelope ID. Mailbox-backed executors propagate this map as `ExecutionReceipt.envelopeMailboxes`,
+combining the committed results if an execution writes to several mailboxes. After recording
+the delivery result, the dispatcher publishes `dispatcher/inbound` for each completed batch
+member, including messages a policy queued earlier. The runtime uses the envelope's receipt
+entry first, then a legacy single-destination `mailboxId`, then its normal mailbox resolution.
+
 Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
 pinning; these decisions stay with the host plugin rather than the core mailbox.
 

@@ -100,7 +100,9 @@ flowchart TB
 
 外部 project/user 插件通过 `ctx.services.dispatcher.registerExecutor/registerPolicy` 注册，和内置执行器共用同一活跃注册表与附件包装；可在 `executors`、`defaultExecutor`、`executorConfig`、`policies`、`topicBindings` 中引用。配置含外部来源或 executor overrides 时只预校验标识符，全部插件加载后逐一核对实际注册，未注册即拒绝启动。没有外部来源的独立配置仍拒绝未知名字。
 
-`dispatcher/inbound` 首先使用单目标执行回执的 authoritative `mailboxId`，缺省时通过 payload-aware registry 适配和 mailbox 的地址解析恢复；已交付 session 归属由插件 hook 与 `MailboxStore.pinSessionMailbox` 原子维护。`TopicBindingConfig.metadata` 是唯一开放的非空字符串注解映射；顶层仅接受已声明字段及显式兼容的 `assignee`，未知字段被拒绝，注解不赋予核心 runtime 业务语义。
+`MailboxStore.enqueue` 返回 `envelopeMailboxes`，以消息 ID 记录每封信实际入库的信箱。支持信箱投递的执行器将此映射传入 `ExecutionReceipt.envelopeMailboxes`。Dispatcher 写入 DeliveryLedger 后，对已交付批次中的每封信发布 `dispatcher/inbound`，包括此前由策略排队的消息。Runtime 首先采用回执中该消息的信箱，其次采用兼容的单目标 `mailboxId`，最后通过 payload-aware registry 和 mailbox 地址解析恢复。已交付 session 归属由插件 hook 与 `MailboxStore.pinSessionMailbox` 原子维护。
+
+`TopicBindingConfig.metadata` 是唯一开放的非空字符串注解映射。顶层仅接受已声明字段及显式兼容的 `assignee`，未知字段被拒绝，注解不赋予核心 runtime 业务语义。
 
 执行组合根在生成接收端附件路径前，通过 `ExecutionContext.signedEnvelopes` 保留原始签名信封；执行器入库时将映射传给 `MailboxStore.enqueue`，账本独立保存执行投影 `envelope` 与可选原始 `signedEnvelope`。恢复确认直接认证 `signedEnvelope ?? envelope`，mailbox 不清理或重建执行投影以猜测签名内容，旧记录仍可直接验签。
 

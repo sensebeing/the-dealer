@@ -1987,37 +1987,42 @@ for (const [name, create] of [
   ['agent-pty', createAgentPtyExecutorPlugin],
   ['orca-spawn', createOrcaSpawnExecutorPlugin],
 ] as const) {
-  test(`standalone ${name} spawns once per new thread in a mixed batch`, async t => {
-    const root = directory(t);
-    const store = new MailboxStore(join(root, 'mailbox.json'));
-    const calls: CommandRequest[] = [];
-    const commandRunner: CommandRunner = async request => {
-      calls.push(request);
-      if (request.args[0] === 'worktree' && request.args[1] === 'create') {
-        return { stdout: JSON.stringify({ ok: true, result: { path: root } }) };
-      }
-      if (request.args[0] === 'terminal' && request.args[1] === 'create') {
-        return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-new"}}}' };
-      }
-      return { stdout: '{"ok":true}' };
-    };
-    const plugin = create({ store, commandRunner, mode: 'spawn', cwd: root, agent: 'claude-code' });
-    const newRoot = { ...message('new-root'), semantic: { type: 'message', threadId: 'new-root' } as const };
-    const followup = { ...message('followup', { executor: ' ' }), semantic: { type: 'message', threadId: newRoot.id } as const };
-    const forced = { ...followup, id: 'forced', payload: { executor: name } };
-    const unrelated = message('unrelated', { mailbox: 'sender-hint' });
-    const receipt = await plugin.execute([followup, unrelated, newRoot, forced], context, {});
-    assert.deepEqual(store.list({ mailboxId: 'task:new-root' }).items.map(item => item.envelope.id).sort(), ['followup', 'new-root']);
-    assert.deepEqual(store.list({ mailboxId: 'task:unrelated' }).items.map(item => item.envelope.id), ['unrelated']);
-    assert.deepEqual(store.list({ mailboxId: 'task:forced' }).items.map(item => item.envelope.id), ['forced']);
-    assert.equal(store.list({ mailboxId: 'sender-hint' }).totalCount, 0);
-    assert.equal(calls.filter(call => name === 'orca-spawn'
-      ? call.args.slice(0, 2).join(' ') === 'worktree create'
-      : call.args.slice(0, 2).join(' ') === '--bg --name').length, 3);
-    assert.deepEqual(receipt.envelopeMailboxes, {
-      'new-root': 'task:new-root', followup: 'task:new-root', unrelated: 'task:unrelated', forced: 'task:forced',
+  for (const rootHasSemantic of [true, false]) {
+    const rootType = rootHasSemantic ? 'with an explicit thread' : 'without a semantic header';
+    test(`standalone ${name} spawns once per new thread in a mixed batch ${rootType}`, async t => {
+      const root = directory(t);
+      const store = new MailboxStore(join(root, 'mailbox.json'));
+      const calls: CommandRequest[] = [];
+      const commandRunner: CommandRunner = async request => {
+        calls.push(request);
+        if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+          return { stdout: JSON.stringify({ ok: true, result: { path: root } }) };
+        }
+        if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+          return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-new"}}}' };
+        }
+        return { stdout: '{"ok":true}' };
+      };
+      const plugin = create({ store, commandRunner, mode: 'spawn', cwd: root, agent: 'claude-code' });
+      const newRoot = message('new-root');
+      if (rootHasSemantic) newRoot.semantic = { type: 'message', threadId: newRoot.id };
+      const followup = { ...message('followup', { executor: ' ' }), semantic: { type: 'message', threadId: newRoot.id } as const };
+      const forced = { ...followup, id: 'forced', payload: { executor: name } };
+      const unrelated = message('unrelated', { mailbox: 'sender-hint' });
+      const receipt = await plugin.execute([followup, unrelated, newRoot, forced], context, {});
+      const sharedTask = store.list({ mailboxId: 'task:new-root' }).items;
+      assert.deepEqual(sharedTask.sort((a, b) => a.sequence - b.sequence).map(item => item.envelope.id), ['new-root', 'followup']);
+      assert.deepEqual(store.list({ mailboxId: 'task:unrelated' }).items.map(item => item.envelope.id), ['unrelated']);
+      assert.deepEqual(store.list({ mailboxId: 'task:forced' }).items.map(item => item.envelope.id), ['forced']);
+      assert.equal(store.list({ mailboxId: 'sender-hint' }).totalCount, 0);
+      assert.equal(calls.filter(call => name === 'orca-spawn'
+        ? call.args.slice(0, 2).join(' ') === 'worktree create'
+        : call.args.slice(0, 2).join(' ') === '--bg --name').length, 3);
+      assert.deepEqual(receipt.envelopeMailboxes, {
+        'new-root': 'task:new-root', followup: 'task:new-root', unrelated: 'task:unrelated', forced: 'task:forced',
+      });
     });
-  });
+  }
 }
 
 test('runtime records authoritative task mailboxes for every dispatched batch member', async t => {
