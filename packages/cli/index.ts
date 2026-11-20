@@ -13,7 +13,7 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { MailboxStore, OutboxStore, resolveBoundMailboxId, normalizeMailboxId } from '../mailbox/index.ts';
+import { MailboxStore, OutboxStore, resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
 import type { OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
@@ -1508,7 +1508,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
       const resolvedTopic = group === 'send' ? runtime.resolveTopicBinding(topic, streamKey) : undefined;
       const boundTopicMailbox = resolvedTopic
-        ? resolveBoundMailboxId(streamKey ? `${topic}:${streamKey}` : topic, toMailboxTopicBinding(resolvedTopic.binding, runtime.config.executorConfig))
+        ? resolveBoundMailboxId(resolveTopicAddress(topic, streamKey).kind, toMailboxTopicBinding(resolvedTopic.binding, runtime.config.executorConfig))
         : undefined;
       const callerMatchesBoundTopic = Boolean(
         callerBinding && resolvedTopic && (

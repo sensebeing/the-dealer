@@ -317,10 +317,22 @@ export function baseStreamKeyOf(streamKey: string): string | undefined {
   return /^(.+):([1-9]\d*)$/.exec(streamKey)?.[1];
 }
 
+/** An explicit compound kind owns its stream. A payload stream qualifies a top-level kind. */
+export function resolveTopicAddress(kind: string, payloadStreamKey?: string) {
+  const separator = kind.indexOf(':');
+  const topic = separator < 0 ? kind : kind.slice(0, separator);
+  const streamKey = separator < 0 ? payloadStreamKey?.trim() || undefined : kind.slice(separator + 1);
+  return {
+    topic,
+    kind: separator < 0 && streamKey !== undefined ? `${topic}:${streamKey}` : kind,
+    streamKey,
+  };
+}
+
 export function resolveBoundMailboxId(kind: string, binding: MailboxTopicBinding, fallbackMode?: AgentConversationMode): string {
   if (binding.mailboxId !== undefined) return normalizeMailboxId(binding.mailboxId);
   if (!isStreamConversationBinding(binding, fallbackMode)) return 'default';
-  const kindStreamKey = kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : undefined;
+  const { streamKey: kindStreamKey } = resolveTopicAddress(kind);
   if (kindStreamKey !== undefined && binding.streamKey !== undefined && baseStreamKeyOf(kindStreamKey) === binding.streamKey) {
     return normalizeMailboxId(`stream:${kindStreamKey}`);
   }
@@ -337,8 +349,10 @@ export function resolveMailboxId(
   const payload = isRecord(envelope.payload)
     ? (envelope.payload as Record<string, unknown>)
     : undefined;
-  const bindingKind = typeof payload?.streamKey === 'string'
-    ? `${envelope.kind}:${payload.streamKey}` : envelope.kind;
+  const { kind: bindingKind, topic, streamKey } = resolveTopicAddress(
+    envelope.kind,
+    typeof payload?.streamKey === 'string' ? payload.streamKey : undefined,
+  );
   const control = ['question', 'reply', 'settle'].includes(semantic?.type ?? '');
   // An explicit session mailbox always owns its message, including control frames: a generic
   // topic binding must never rewrite a session-specific destination. `default` means unspecified.
@@ -368,15 +382,15 @@ export function resolveMailboxId(
   }
   const mode = resolveEffectiveConversationMode({ binding, payload, fallbackMode });
   if (binding && !control && !isNonEmptyString(payload?.executor)) {
-    if (isStreamConversationBinding(binding, fallbackMode) && isNonEmptyString(payload?.streamKey) && binding.mailboxId === undefined) {
-      return normalizeMailboxId(`stream:${payload.streamKey}`);
+    if (isStreamConversationBinding(binding, fallbackMode) && topic === envelope.kind && streamKey !== undefined && binding.mailboxId === undefined) {
+      return normalizeMailboxId(`stream:${streamKey}`);
     }
     if (binding.mailboxId !== undefined || isStreamConversationBinding(binding, fallbackMode) || mode !== 'spawn') {
       return resolveBoundMailboxId(bindingKind, binding, fallbackMode);
     }
   }
   if (mode === 'wave' || binding?.stream === true) {
-    return normalizeMailboxId(`stream:${String(payload?.streamKey ?? binding?.streamKey ?? envelope.kind)}`, 'stream mailbox');
+    return normalizeMailboxId(`stream:${streamKey ?? binding?.streamKey ?? envelope.kind}`, 'stream mailbox');
   }
   if (mode === 'spawn') {
     return normalizeMailboxId(`task:${envelope.id}`, 'task mailbox');
@@ -1908,15 +1922,21 @@ export class MailboxStore {
    * leg. This is the durable thread-affinity record that keeps replies with the worktree/terminal
    * session that owns the thread instead of the topic's generic binding. Records are scoped to the
    * envelope's network so a colliding thread id on another network never inherits this route.
+   * An arrival can exclude its own inbound leg when checking for existing thread affinity.
    */
-  resolveThreadLocalMailbox(threadId?: string, networkId?: string): string | undefined {
-    return this.threadLocalMailboxFromState(this.read(), threadId, networkId);
+  resolveThreadLocalMailbox(
+    threadId?: string,
+    networkId?: string,
+    options?: { excludeInboundMessageId?: string },
+  ): string | undefined {
+    return this.threadLocalMailboxFromState(this.read(), threadId, networkId, options?.excludeInboundMessageId);
   }
 
   private threadLocalMailboxFromState(
     state: MailboxFileState,
     threadId?: string,
     networkId?: string,
+    excludeInboundMessageId?: string,
   ): string | undefined {
     if (typeof threadId !== 'string' || threadId.length === 0) {
       return undefined;
@@ -1924,7 +1944,8 @@ export class MailboxStore {
     const records = threadRecordsFor(state, threadId)
       .filter(record => networkId === undefined || record.networkId === networkId);
     for (let index = records.length - 1; index >= 0; index -= 1) {
-      const localMailbox = records[index].localMailbox;
+      const { direction, messageId, localMailbox } = records[index];
+      if (direction === 'inbound' && messageId === excludeInboundMessageId) continue;
       if (localMailbox !== 'default') {
         return normalizeMailboxId(localMailbox, 'thread local mailbox');
       }

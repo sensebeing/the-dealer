@@ -10,6 +10,7 @@ import {
   MailboxStore,
   resolveBoundMailboxId,
   resolveMailboxId,
+  resolveTopicAddress,
   resolveEffectiveConversationMode,
 } from '../mailbox/index.ts';
 import type { MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
@@ -563,14 +564,9 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
         }
       >();
       for (const envelope of batch) {
-        const binding = resolveTopicBinding?.(
-          envelope.kind,
-          typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined,
-        );
-        const bindingKind =
-          typeof envelope.payload?.streamKey === 'string'
-            ? `${envelope.kind}:${envelope.payload.streamKey}`
-            : envelope.kind;
+        const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
+        const binding = resolveTopicBinding?.(envelope.kind, streamKey);
+        const { kind: bindingKind } = resolveTopicAddress(envelope.kind, streamKey);
         const mailboxId = prepareExternalEffect(() =>
           resolveMailboxId(
             envelope,
