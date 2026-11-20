@@ -32,7 +32,7 @@ import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
 import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, WakeupRedriveService } from '../mailbox/index.ts';
+import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -963,33 +963,41 @@ export class DealerNodeRuntime {
 
   resolveTopicBinding(kind: string, streamKey?: string): { binding: TopicBindingConfig; projectRoot?: string } | undefined {
     if (typeof kind !== 'string') return undefined;
-    const separator = kind.indexOf(':');
-    const effectiveStreamKey = streamKey ?? (separator >= 0 ? kind.slice(separator + 1) : undefined);
-    const baseStream = effectiveStreamKey === undefined ? undefined : baseStreamKeyOf(effectiveStreamKey);
-    const topic = streamKey === undefined && separator >= 0 ? kind.slice(0, separator) : kind;
-    const keys = streamKey === undefined ? [kind] : [`${kind}:${streamKey}`];
+    const { address, baseStream, match } = this.resolveTopicBindingMatch(kind, streamKey);
+    if (!match) return undefined;
+    const { binding, projectRoot } = match;
+    return {
+      binding: binding.mailboxId === undefined && binding.streamKey !== undefined && baseStream === binding.streamKey
+        ? { ...binding, streamKey: address.streamKey }
+        : binding,
+      projectRoot,
+    };
+  }
+
+  private resolveTopicBindingMatch(kind: string, streamKey?: string) {
+    const address = resolveTopicAddress(kind, streamKey);
+    const { topic } = address;
+    const baseStream = address.streamKey === undefined ? undefined : baseStreamKeyOf(address.streamKey);
+    const keys = [address.kind];
     if (baseStream !== undefined) keys.push(`${topic}:${baseStream}`);
     if (keys[0] !== topic) keys.push(topic);
 
-    const withEffectiveStream = (binding: TopicBindingConfig, projectRoot?: string) => ({
-      binding: binding.mailboxId === undefined && binding.streamKey !== undefined && baseStream === binding.streamKey
-        ? { ...binding, streamKey: effectiveStreamKey }
-        : binding,
-      projectRoot,
+    const result = (key: string, binding: TopicBindingConfig, projectRoot?: string) => ({
+      address, baseStream, match: { key, binding, projectRoot },
     });
     for (const key of keys) {
       for (const project of this.loadedProjects.values()) {
         const bindings = project.userPatch?.topicBindings;
         const binding = bindings && Object.hasOwn(bindings, key) ? bindings[key] : undefined;
-        if (binding) return withEffectiveStream(
-          binding,
+        if (binding) return result(
+          key, binding,
           binding.projectId ? this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath : project.rootPath,
         );
       }
       const binding = this.config.topicBindings && Object.hasOwn(this.config.topicBindings, key) ? this.config.topicBindings[key] : undefined;
-      if (binding) return withEffectiveStream(binding, this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath);
+      if (binding) return result(key, binding, this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath);
     }
-    return undefined;
+    return { address, baseStream, match: undefined };
   }
 
   private executorTopicBinding = (kind: string, streamKey?: string) => {
@@ -1004,16 +1012,17 @@ export class DealerNodeRuntime {
     return binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig) : undefined;
   };
 
-  private resolveTopicLarkNotify(kind: string, streamKey?: string, inheritedNotifyLark?: boolean): { bound: boolean; notifyLark: boolean } {
-    const normalizedStream = streamKey?.trim() || undefined;
-    const separator = kind.indexOf(':');
-    const baseTopic = kind.split(':', 1)[0];
-    const effectiveKind = normalizedStream && separator < 0 ? `${kind}:${normalizedStream}` : kind;
-    const resolved = this.resolveTopicBinding(baseTopic, normalizedStream ?? (separator >= 0 ? kind.slice(separator + 1) : undefined));
-    const notifyLark = resolved?.binding.notifyLark ?? inheritedNotifyLark ??
-      (!effectiveKind.includes(':') && ![...this.loadedProjects.values()].some(({ manifest }) =>
-        this.registry.executor(manifest.topics?.[baseTopic]?.defaultExecutor ?? '')?.interactiveAgent === true));
-    return { bound: Boolean(resolved), notifyLark };
+  private resolveTopicLarkNotify(kind: string, streamKey?: string): { bound: boolean; notifyLark: boolean } {
+    const { address, baseStream, match } = this.resolveTopicBindingMatch(kind, streamKey);
+    const { topic } = address;
+    const explicit = match?.binding.notifyLark;
+    if (explicit !== undefined) return { bound: true, notifyLark: explicit };
+    // An implicit numbered slot inherits a top-level binding's default only for its own stream.
+    const inheritsBaseDefault = match?.key === topic && baseStream !== undefined && match.binding.mailboxId === undefined &&
+      resolveBoundMailboxId(topic, this.registry.toMailboxBinding(match.binding, this.config.executorConfig)) === `stream:${baseStream}`;
+    const notifyLark = (address.kind === topic || inheritsBaseDefault) && ![...this.loadedProjects.values()].some(({ manifest }) =>
+      this.registry.executor(manifest.topics?.[topic]?.defaultExecutor ?? '')?.interactiveAgent === true);
+    return { bound: Boolean(match), notifyLark };
   }
 
   private async activateLarkNotifier(): Promise<void> {
@@ -1026,12 +1035,11 @@ export class DealerNodeRuntime {
     const options: LarkMailboxNotifierOptions = {
       store: this.mailbox, config: this.config.larkNotify, stateDir: this.stateDir,
       localNodeId: this.transport.localNodeId, localMember: this.config.member,
-      defaultBoundMailboxes: this.refreshTopicBindings(),
-      acceptsDynamicMailbox: ({ envelope, mailboxId }) => {
+      acceptsDefaultItem: ({ envelope, mailboxId }) => {
         const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
         const { bound, notifyLark } = this.resolveTopicLarkNotify(envelope.kind, streamKey);
         if (!notifyLark) return false;
-        return bound || this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId ?? envelope.id, envelope.networkId, {
+        return mailboxId === 'default' || bound || this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId ?? envelope.id, envelope.networkId, {
           excludeInboundMessageId: envelope.id,
         }) === mailboxId;
       },
@@ -1039,7 +1047,6 @@ export class DealerNodeRuntime {
       onError: (error: unknown) => { this.lastError = String(error); },
     };
     await this.kernel.use(createLarkMirrorPlugin(options));
-    this.refreshTopicBindings();
   }
 
   previewAgentPreset(options: Parameters<typeof buildAgentBindingPreset>[0] & { cwd?: string }) {
@@ -1070,44 +1077,39 @@ export class DealerNodeRuntime {
     return { applied: preset.topic, host, mode, defaultExecutor, binding: preset.binding, executorConfig: preset.executorConfig, ...(preset.larkNotify ? { larkNotify: preset.larkNotify } : {}) };
   }
 
-  private refreshTopicBindings(): string[] {
+  private refreshTopicBindings(): void {
     const kinds = new Set(Object.keys(this.config.topicBindings ?? {}));
     for (const project of this.loadedProjects.values()) {
       for (const kind of Object.keys(project.userPatch?.topicBindings ?? {})) kinds.add(kind);
     }
     const wakeTargets = this.mailbox.listWakeTargets();
-    const mailboxes: string[] = [];
     const syncBinding = (
       kind: string,
       { binding, projectRoot }: { binding: TopicBindingConfig; projectRoot?: string },
-      inherited?: { mailboxId: string; notifyLark: boolean },
+      expectedMailboxId?: string,
     ) => {
       const addressing = this.registry.toMailboxBinding(binding, this.config.executorConfig);
       const mailboxId = resolveBoundMailboxId(kind, addressing);
-      if (inherited && mailboxId !== inherited.mailboxId) return;
-      const { notifyLark } = this.resolveTopicLarkNotify(kind, undefined, inherited?.notifyLark);
-      if (notifyLark) mailboxes.push(mailboxId);
+      if (expectedMailboxId !== undefined && mailboxId !== expectedMailboxId) return;
       this.registry.executor(binding.executor)?.syncTopicWakeTarget?.({
         kind, mailboxId, binding, projectRoot, store: this.mailbox, wave: this.config.wave, addressing,
       });
-      return { mailboxId, notifyLark };
+      return mailboxId;
     };
     for (const kind of kinds) {
       const resolved = this.resolveTopicBinding(kind)!;
-      const base = syncBinding(kind, resolved);
-      if (resolved.binding.mailboxId !== undefined || !base?.mailboxId.startsWith('stream:')) continue;
-      const topic = kind.split(':', 1)[0];
+      const baseMailboxId = syncBinding(kind, resolved);
+      if (resolved.binding.mailboxId !== undefined || !baseMailboxId?.startsWith('stream:')) continue;
+      const { topic } = resolveTopicAddress(kind);
       for (const target of wakeTargets) {
-        if (baseStreamKeyOf(target.mailboxId) !== base.mailboxId) continue;
+        if (baseStreamKeyOf(target.mailboxId) !== baseMailboxId) continue;
         const slotStreamKey = target.mailboxId.slice('stream:'.length);
         const slotKind = `${topic}:${slotStreamKey}`;
         if (kinds.has(slotKind)) continue;
         const slot = this.resolveTopicBinding(topic, slotStreamKey);
-        if (slot) syncBinding(slotKind, slot, { mailboxId: target.mailboxId, notifyLark: base.notifyLark });
+        if (slot) syncBinding(slotKind, slot, target.mailboxId);
       }
     }
-    this.larkNotifier?.setDefaultBoundMailboxes(mailboxes);
-    return mailboxes;
   }
 
   resolveTopicDefaultExecutor(kind: string, streamKey?: string): string | undefined {
@@ -1199,10 +1201,10 @@ export class DealerNodeRuntime {
         });
         ctx.on('emitter/prepare', (envelope, next) => {
           if (envelope.semantic?.replyMailbox !== undefined) return next(envelope);
-          const resolved = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined);
+          const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
+          const resolved = this.resolveTopicBinding(envelope.kind, streamKey);
           if (!resolved) return next(envelope);
-          const bindingKind = typeof envelope.payload?.streamKey === 'string'
-            ? `${envelope.kind}:${envelope.payload.streamKey}` : envelope.kind;
+          const { kind: bindingKind } = resolveTopicAddress(envelope.kind, streamKey);
           const replyMailbox = resolveBoundMailboxId(bindingKind, this.registry.toMailboxBinding(resolved.binding, this.config.executorConfig));
           return next(replyMailbox === 'default' ? envelope : {
             ...envelope, semantic: { ...(envelope.semantic ?? { type: 'message' as const, threadId: envelope.id }), replyMailbox },

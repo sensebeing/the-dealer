@@ -104,7 +104,7 @@ flowchart TB
 
 执行组合根在生成接收端附件路径前，通过 `ExecutionContext.signedEnvelopes` 保留原始签名信封；执行器入库时将映射传给 `MailboxStore.enqueue`，账本独立保存执行投影 `envelope` 与可选原始 `signedEnvelope`。恢复确认直接认证 `signedEnvelope ?? envelope`，mailbox 不清理或重建执行投影以猜测签名内容，旧记录仍可直接验签。
 
-`lark-mirror` 在插件内部创建 `LarkMailboxNotifier`，用 `ctx.provide('larkNotifier', ...)` 发布服务并用 `ctx.effect` 启停。Kernel unload/replacement 自动清理订阅与重试；runtime 通过只读 service getter 更新默认 mailbox 集。
+`lark-mirror` 在插件内部创建 `LarkMailboxNotifier`，用 `ctx.provide('larkNotifier', ...)` 发布服务并用 `ctx.effect` 启停。Kernel unload/replacement 自动清理订阅与重试。Runtime 注入默认投递通知策略，按当前主题绑定和 MailboxStore 的线程归属判断每条到达消息。
 
 ## 二、 微内核与插件协议设计 (`@the-dealer/kernel`)
 
@@ -573,9 +573,11 @@ deleted roots use a distinct fallback key. Pending event queues are in-memory,
 not a durable outbound replay log. The local `notify` executor only owns OS
 notification or file sinks, with no Lark webhook transport.
 
-`notifyGateApprovals` and `mirrorOutboundThreads` default to true. Default watched
-mailboxes omit compound topic/stream bindings and project topics with background
-executors whose registry descriptors set `interactiveAgent: true`; explicit `notifyLark` overrides that choice. Inbox topics and top-level request bindings remain included. See
+`notifyGateApprovals` and `mirrorOutboundThreads` default to true. Default-mode
+mailbox filtering applies the resolved topic's `notifyLark` policy to each
+arrival. Compound topics and project topics with executors whose descriptors
+set `interactiveAgent: true` default to silent. An eligible bound topic or
+existing local thread can notify from a dynamically addressed mailbox. See
 [request threading](request-threading.md) for filters and configuration.
 
 ### Automatic upgrades and restart
