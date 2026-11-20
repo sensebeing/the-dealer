@@ -121,6 +121,32 @@ export interface InboxExecutorOptions {
   commandRunner?: CommandRunner;
 }
 
+/** Prepare wake targets for callers that have already resolved each envelope's mailbox. */
+export async function prepareInboxDeliveries(
+  store: MailboxStore,
+  wakeup: WakeupRedriveService | undefined,
+  groups: ReadonlyMap<string, readonly MessageEnvelope[]>,
+) {
+  const prepared = [];
+  for (const [mailboxId, envelopes] of groups) {
+    const wakeTarget = await prepareExternalEffectAsync(() =>
+      Promise.resolve(wakeup?.resolveSessionWakeTarget(mailboxId)),
+    );
+    prepared.push({ mailboxId, envelopes, wakeTarget });
+  }
+  return (context: ExecutionContext) => {
+    const inserted: string[] = [];
+    for (const { mailboxId, envelopes, wakeTarget } of prepared) {
+      const result = store.enqueue(envelopes, {
+        signedEnvelopes: context?.signedEnvelopes, mailboxId, ...(wakeTarget ? { wakeTarget } : {}),
+      });
+      inserted.push(...result.inserted);
+      if (result.inserted.length > 0) wakeup?.notifyMailbox(mailboxId);
+    }
+    return { mailboxIds: prepared.map(item => item.mailboxId), inserted };
+  };
+}
+
 export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): ExecutorPlugin {
   if (!options.store && !options.inboxPath) {
     throw new Error('Inbox executor requires store or inboxPath');
@@ -149,26 +175,13 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
         group.push(envelope);
         groups.set(mailboxId, group);
       }
-      const prepared = [];
-      for (const [mailboxId, envelopes] of groups) {
-        const wakeTarget = await prepareExternalEffectAsync(() =>
-          Promise.resolve(wakeup?.resolveSessionWakeTarget(mailboxId)),
-        );
-        prepared.push({ mailboxId, envelopes, wakeTarget });
-      }
-      const inserted: string[] = [];
-      for (const { mailboxId, envelopes, wakeTarget } of prepared) {
-        const result = store.enqueue(envelopes, { ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}), mailboxId, ...(wakeTarget ? { wakeTarget } : {}) });
-        inserted.push(...result.inserted);
-        if (result.inserted.length > 0) {
-          wakeup?.notifyMailbox(mailboxId);
-        }
-      }
+      const deliver = await prepareInboxDeliveries(store, wakeup, groups);
+      const { mailboxIds, inserted } = deliver(context);
       return {
         executor: 'inbox',
         executionId: randomUUID(),
-        ...(prepared.length === 1 ? { mailboxId: prepared[0].mailboxId } : {}),
-        mailboxIds: prepared.map(item => item.mailboxId),
+        ...(mailboxIds.length === 1 ? { mailboxId: mailboxIds[0] } : {}),
+        mailboxIds,
         count: batch.length,
         inserted,
       };

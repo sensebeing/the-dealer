@@ -29,7 +29,7 @@ import {
   BUILTIN_EXECUTORS, getBuiltInProfile, readProjectManifest, buildOnboardingPrompts, resolveAgentBindingPreset,
   defaultAgentLaunchCommand, resolveOrSpawnOrcaWorkspaceTerminal, validateTopicBindings,
   Kernel, createTransportPlugin, createNodePlugin, generateNodeKeyPair, deriveNetworkKeys,
-  sealNetworkFrame, unsealNetworkFrame, signNodeCard,
+  sealNetworkFrame, unsealNetworkFrame, signEnvelope, signNodeCard,
 } from '../packages/index.ts';
 import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
 
@@ -1909,6 +1909,76 @@ for (const [name, create] of [
     const last = calls.at(-1)!;
     assert.deepEqual(last.args.slice(0, 2), ['terminal', 'send']);
     assert.equal(last.args[last.args.indexOf('--terminal') + 1], 'term_origin');
+  });
+}
+
+for (const [name, create] of [
+  ['claude-code', createClaudeCodeExecutorPlugin],
+  ['agent-pty', createAgentPtyExecutorPlugin],
+] as const) {
+  for (const freshFirst of [true, false]) {
+    test(`standalone ${name} routes a mixed batch with ${freshFirst ? 'the fresh task' : 'the follow-up'} first`, async t => {
+      const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+      const calls: CommandRequest[] = [];
+      const commandRunner: CommandRunner = async request => {
+        calls.push(request);
+        return { stdout: '{}' };
+      };
+      const wakeup = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner }) });
+      t.after(() => wakeup.stop());
+      store.recordInboundEnvelope(message('existing'), 'task:existing');
+      store.upsertWakeTarget('task:existing', {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'claude-code', conversationMode: 'fixed', sessionId: 'existing-session' },
+      });
+      const plugin = create({
+        store, wakeup, commandRunner, agent: 'claude-code',
+        resolveTopicBinding: (_kind, streamKey) => streamKey === 'new'
+          ? { mode: 'spawn', sessionId: 'new-session' }
+          : { mode: 'fixed', mailboxId: 'stream:topic', sessionId: 'topic-session' },
+      });
+      const key = generateNodeKeyPair();
+      const freshMessage = message('fresh', { streamKey: 'new', mailbox: 'sender-hint' });
+      const fresh = signEnvelope({
+        ...freshMessage,
+        from: { ...freshMessage.from, nodeId: key.nodeId },
+      }, key.privateKeyPem);
+      const followup = signEnvelope({
+        ...message('followup'),
+        from: fresh.from,
+        semantic: { type: 'message', threadId: 'existing' },
+      }, key.privateKeyPem);
+      const batch = freshFirst ? [fresh, followup] : [followup, fresh];
+      const receipt = await plugin.execute(batch.map(envelope => ({
+        ...envelope, payload: { ...envelope.payload, localAttachments: [] },
+      })), { ...context, signedEnvelopes: { fresh, followup } }, {});
+      await wakeup.flushMailbox('task:existing', { force: true });
+      assert.deepEqual(store.list({ mailboxId: 'task:fresh' }).items.map(item => item.signedEnvelope), [fresh]);
+      assert.deepEqual(store.list({ mailboxId: 'task:existing' }).items.map(item => item.signedEnvelope), [followup]);
+      assert.equal(receipt.executor, name);
+      assert.ok(Array.isArray(receipt.mailboxIds));
+      assert.deepEqual(receipt.mailboxIds.toSorted(), ['task:existing', 'task:fresh']);
+      assert.ok(Array.isArray(receipt.inserted));
+      assert.deepEqual(receipt.inserted.toSorted(), ['followup', 'fresh']);
+      assert.equal(store.list({ mailboxId: 'sender-hint' }).totalCount, 0);
+      assert.equal(store.list({ mailboxId: 'stream:topic' }).totalCount, 0);
+      assert.deepEqual(calls.map(call => call.args.slice(0, 3).join(' ')).sort(), [
+        '--bg --name new-session', '--bg --resume existing-session',
+      ]);
+    });
+  }
+
+  test(`standalone ${name} validates the entire batch before handing off messages`, async t => {
+    const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+    const plugin = create({
+      store, agent: 'claude-code', mode: 'spawn',
+      commandRunner: async () => assert.fail('An invalid batch must never invoke the host'),
+    });
+    await assert.rejects(
+      plugin.execute([message('fresh'), message('invalid', { mode: 'broken' })], context, {}),
+      { message: 'Invalid agent conversationMode', beforeExternalEffect: true },
+    );
+    assert.equal(store.list().totalCount, 0);
   });
 }
 
