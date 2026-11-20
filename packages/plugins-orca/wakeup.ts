@@ -528,6 +528,7 @@ export function pinOrcaTerminalSessionMailbox(
   }
   if (!rotatingOwner) return id;
   const sessionMailboxId = `terminal:${handle}`;
+  // The live target can be advertised as a reply address. Wake completion pins committed routes.
   return store.pinSessionMailbox(rotatingOwner.mailboxId, sessionMailboxId, {
     driver: 'orca-terminal',
     driverConfig: buildPinnedOrcaSessionDriverConfig(readOrcaWakeTarget(rotatingOwner), store.getWakeTarget(sessionMailboxId), handle),

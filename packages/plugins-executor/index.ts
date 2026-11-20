@@ -3,7 +3,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { PartialBatchExecutionError } from '../core-types/index.ts';
 import type { ExecutionContext, ExecutionReceipt, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { canInheritThreadMailbox, envelopeThreadId, MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
+import { envelopeThreadId, MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
 import type { MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, CommandNotStartedError, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
@@ -44,39 +44,50 @@ export function rethrowBeforeCommandStart(error: unknown): never {
 
 export interface PreparedDelivery {
   envelopes: readonly MessageEnvelope[];
-  deliver(): ExecutionReceipt | Promise<ExecutionReceipt>;
+  deliver(commit: () => void): ExecutionReceipt | Promise<ExecutionReceipt>;
 }
 
-const inFlightSpawnThreads = new Map<string, Promise<void>>();
+type ThreadCustody = (envelopes: readonly MessageEnvelope[]) => void;
+const pendingThreadDeliveries = new Map<string, Promise<void>>();
 
-const spawnThreadKey = (store: MailboxStore, envelope: MessageEnvelope) =>
+const threadDeliveryKey = (store: MailboxStore, envelope: MessageEnvelope) =>
   JSON.stringify([store.path, envelope.networkId, envelopeThreadId(envelope)]);
 
-/** Wait for an in-flight claim before choosing a route for an unbound follow-up. */
-export async function waitForSpawnClaims(store: MailboxStore, batch: readonly MessageEnvelope[]): Promise<void> {
-  const pending = prepareExternalEffect(() => batch.flatMap(envelope => {
-    if (!canInheritThreadMailbox(envelope)) return [];
-    const claim = inFlightSpawnThreads.get(spawnThreadKey(store, envelope));
-    const owner = claim && store.resolveThreadLocalMailbox(envelopeThreadId(envelope), envelope.networkId, {
-      excludeInboundMessageId: envelope.id,
+/** Queue before yielding and release each thread when its final member takes custody. */
+export async function serializeThreadDeliveries<T>(
+  store: MailboxStore | undefined, batch: readonly MessageEnvelope[], deliver: (commit: ThreadCustody) => Promise<T>,
+): Promise<T> {
+  if (!store) return deliver(() => {});
+  const remaining = new Map<string, number>();
+  for (const envelope of batch) {
+    const key = threadDeliveryKey(store, envelope);
+    remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  }
+  const releases = new Map<string, () => void>();
+  const previous: Promise<void>[] = [];
+  for (const key of remaining.keys()) {
+    const prior = pendingThreadDeliveries.get(key);
+    if (prior) previous.push(prior);
+    const { promise, resolve } = Promise.withResolvers<void>();
+    pendingThreadDeliveries.set(key, promise);
+    releases.set(key, () => {
+      releases.delete(key);
+      resolve();
+      if (pendingThreadDeliveries.get(key) === promise) pendingThreadDeliveries.delete(key);
     });
-    return claim && owner === undefined ? [claim] : [];
-  }));
-  await Promise.all(pending);
-}
-
-/** Serialize preparation and claim while a host creates a session for this thread. */
-export async function withSpawnThreadLock<T>(store: MailboxStore, root: MessageEnvelope, run: () => T | Promise<T>): Promise<T> {
-  const key = spawnThreadKey(store, root);
-  const previous = inFlightSpawnThreads.get(key);
-  const { promise, resolve } = Promise.withResolvers<void>();
-  inFlightSpawnThreads.set(key, promise);
+  }
   try {
-    await previous;
-    return await run();
+    if (previous.length) await Promise.all(previous);
+    return await deliver(envelopes => {
+      for (const envelope of envelopes) {
+        const key = threadDeliveryKey(store, envelope);
+        const count = (remaining.get(key) ?? 0) - 1;
+        if (count === 0) releases.get(key)?.();
+        remaining.set(key, count);
+      }
+    });
   } finally {
-    resolve();
-    if (inFlightSpawnThreads.get(key) === promise) inFlightSpawnThreads.delete(key);
+    for (const release of releases.values()) release();
   }
 }
 
@@ -111,14 +122,20 @@ function mergeDeliveryReceipts(
 
 /** Run validated delivery groups with independent outcomes across external-effect boundaries. */
 export async function executeDeliveryGroups(
-  executor: string, batch: readonly MessageEnvelope[], groups: readonly PreparedDelivery[],
+  executor: string, batch: readonly MessageEnvelope[], groups: readonly PreparedDelivery[], commit: ThreadCustody,
 ): Promise<ExecutionReceipt> {
   const settled = new Map<string, ExecutionReceipt>();
   const unattempted = new Set(batch.map(envelope => envelope.id));
   for (const { envelopes, deliver } of groups) {
     let receipt: ExecutionReceipt;
+    let committed = false;
+    const commitGroup = () => {
+      if (!committed) commit(envelopes);
+      committed = true;
+    };
     try {
-      receipt = { ...await deliver(), executor };
+      receipt = { ...await deliver(commitGroup), executor };
+      commitGroup();
     } catch (error) {
       const beforeEffect = (error as { beforeExternalEffect?: boolean } | null)?.beforeExternalEffect === true;
       if (!settled.size && (beforeEffect || groups.length === 1)) throw error;
@@ -225,12 +242,15 @@ export async function prepareInboxDeliveries(
     const wakeTarget = await prepareExternalEffectAsync(() =>
       Promise.resolve(wakeup?.resolveSessionWakeTarget(mailboxId)),
     );
-    prepared.push({ envelopes, deliver() {
+    prepared.push({ envelopes, deliver(commit) {
       const result = store.enqueue(envelopes, {
         signedEnvelopes: context?.signedEnvelopes, mailboxId, ...(wakeTarget ? { wakeTarget } : {}),
       });
-      if (result.inserted.length > 0) wakeup?.notifyMailbox(mailboxId);
-      return { executor: 'inbox', executionId: randomUUID(), mailboxId, ...result };
+      commit();
+      if (result.inserted.length > 0) {
+        for (const actualMailbox of result.mailboxIds) wakeup?.notifyMailbox(actualMailbox);
+      }
+      return { executor: 'inbox', executionId: randomUUID(), ...result };
     } });
   }
   return prepared;
@@ -267,13 +287,15 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
   const store = options.store ?? new MailboxStore(options.inboxPath!);
   return {
     name: 'inbox',
-    async execute(batch, context, runtimeConfig) {
+    execute(batch, context, runtimeConfig) {
       const config = (runtimeConfig ?? {}) as InboxExecutorOptions;
-      const groups = await prepareInboxBatch(batch, context, store, {
-        wakeup: options.wakeup ?? config.wakeup,
-        resolveTopicBinding: options.resolveTopicBinding ?? config.resolveTopicBinding,
+      return serializeThreadDeliveries(store, batch, async commit => {
+        const groups = await prepareInboxBatch(batch, context, store, {
+          wakeup: options.wakeup ?? config.wakeup,
+          resolveTopicBinding: options.resolveTopicBinding ?? config.resolveTopicBinding,
+        });
+        return { ...await executeDeliveryGroups('inbox', batch, groups, commit), count: batch.length };
       });
-      return { ...await executeDeliveryGroups('inbox', batch, groups), count: batch.length };
     },
   };
 }

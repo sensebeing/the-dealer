@@ -2639,21 +2639,21 @@ test('only newly inserted conversational frames bypass coalescing and never rese
   t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   for (const type of ['question', 'reply', 'settle'] as const) {
-    store.enqueue([alert(type, { semantic: { type, threadId: 'thread', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } })], {
+    store.enqueue([alert(type, { semantic: { type, threadId: type, ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } })], {
       mailboxId: type,
       wakeTarget: { driver: 'orca-run', coalesceMs: 5000, driverConfig: { runId: 'run' } },
     });
     assert.equal(store.getWakeTarget(type)?.earliestWakeAt, 10_000);
   }
-  store.enqueue([alert('normal'), alert('control', { semantic: { type: 'reply', threadId: 'thread' } })], {
+  store.enqueue([alert('normal'), alert('control', { semantic: { type: 'reply', threadId: 'mixed' } })], {
     mailboxId: 'mixed',
     wakeTarget: { driver: 'orca-run', coalesceMs: 5000, driverConfig: { runId: 'run' } },
   });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 15_000);
-  store.enqueue([alert('normal'), alert('new-control', { semantic: { type: 'question', threadId: 'thread' } })], { mailboxId: 'mixed' });
+  store.enqueue([alert('normal'), alert('new-control', { semantic: { type: 'question', threadId: 'mixed' } })], { mailboxId: 'mixed' });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 10_000, 'duplicates do not affect classification');
   store.upsertWakeTarget('mixed', { attemptCount: 2, earliestWakeAt: 30_000 });
-  store.enqueue([alert('retry', { semantic: { type: 'settle', threadId: 'thread', outcome: 'succeeded' } })], { mailboxId: 'mixed' });
+  store.enqueue([alert('retry', { semantic: { type: 'settle', threadId: 'mixed', outcome: 'succeeded' } })], { mailboxId: 'mixed' });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 30_000);
   const calls: CommandRequest[] = [];
   const wakeup = new WakeupRedriveService({

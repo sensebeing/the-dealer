@@ -251,15 +251,18 @@ runtime records queued and non-mailbox history without granting it thread owners
 history, an omitted entry in a present mailbox map describes the default mailbox. Runtime can
 read a legacy single-destination `mailboxId` when the map is absent.
 
-Associate thread follow-ups before selecting delivery modes. When proposing a spawn,
-`enqueue` rechecks committed ownership under its write lock and reports whether the
-proposal acquired ownership. Use the committed destination to wake an existing owner.
+Queue thread deliveries before asynchronous preparation and release each thread when its
+messages reach durable custody. Associate follow-ups before choosing a delivery mode.
+`enqueue` rechecks committed ownership under its write lock for messages eligible to
+inherit it. A spawn proposal also reports whether it acquired ownership. Use the committed
+destinations to wake the owning sessions.
 
 Prepare every delivery group before taking custody or launching a host. The shared
 `executeDeliveryGroups` reports partial outcomes through `PartialBatchExecutionError`.
 The dispatcher publishes `dispatcher/inbound` for each settled member, preserves its committed
 receipt, records failures for attempted members, and removes the ledger entries for
-unattempted members so they can be retried safely.
+unattempted members so they can be retried safely. A policy error after confirmed delivery
+reaches runtime diagnostics while the dispatcher returns the persisted receipt.
 
 Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
 pinning; these decisions stay with the host plugin rather than the core mailbox.

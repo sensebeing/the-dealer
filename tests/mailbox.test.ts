@@ -713,6 +713,7 @@ test('generic session pinning atomically binds delivered threads and preserves e
   const store = new MailboxStore(path);
   const first = envelope('first', { semantic: { type: 'message', threadId: 'first' } });
   const newer = envelope('newer', { semantic: { type: 'message', threadId: 'newer' } });
+  const queued = envelope('queued', { semantic: { type: 'message', threadId: first.id } });
   store.enqueue([first], { mailboxId: 'stream:test', wakeTarget: { driver: 'mock', rotateAfterWaves: 2, wakeupPrefix: 'check --mailbox stream:test', driverConfig: { destination: 'next' } } });
   store.recordInboundEnvelope(first, 'stream:test');
   store.upsertWakeTarget('session:one', { driver: 'mock', completedWaves: 7, pendingWake: true, deliveryInDoubt: true, lastWakeError: 'unknown prior send' });
@@ -720,10 +721,14 @@ test('generic session pinning atomically binds delivered threads and preserves e
   store.beginWakeDelivery('stream:test');
   store.enqueue([newer], { mailboxId: 'stream:test' });
   store.recordInboundEnvelope(newer, 'stream:test');
+  store.recordInboundEnvelope(queued, 'stream:test', { committed: false });
   store.completeWakeDelivery('stream:test', observed, {}, { sessionMailboxId: 'session:one', driverConfig: { destination: 'one' } });
   assert.equal(store.getWakeTarget('stream:test')?.pendingWake, true);
   assert.equal(store.resolveThreadLocalMailbox('first'), 'session:one');
   assert.equal(store.resolveThreadLocalMailbox('newer'), 'stream:test');
+  assert.equal(store.getInboundThreadRecord(first.id, first.networkId)?.mailboxCommitted, true);
+  assert.equal(store.getInboundThreadRecord(queued.id, queued.networkId)?.localMailbox, 'stream:test');
+  assert.equal(store.getInboundThreadRecord(queued.id, queued.networkId)?.mailboxCommitted, false);
   const pinned = new MailboxStore(path).getWakeTarget('session:one')!;
   assert.equal(pinned.rotateAfterWaves, undefined);
   assert.equal(pinned.completedWaves, 7);
@@ -749,27 +754,30 @@ test('a proposed spawn reuses a committed thread without changing its wake targe
   assert.deepEqual(concurrent.envelopeMailboxes, { followup: 'task:root' });
   assert.equal(store.getWakeTarget('task:root')?.driver, 'owner');
   assert.equal(store.getWakeTarget('task:followup'), undefined);
+  const wave = envelope('wave', { semantic: { type: 'message', threadId: root.id, targetMailbox: 'default' } });
+  assert.deepEqual(store.enqueue([wave], {
+    mailboxId: 'stream:requests', wakeTarget: { driver: 'wave' },
+  }).envelopeMailboxes, { wave: 'task:root' });
+  assert.equal(store.getWakeTarget('stream:requests'), undefined);
+  assert.equal(store.getWakeTarget('task:root')?.driver, 'owner');
 });
 
-test('legacy v2 inbound routes require an item and preserve a durable session pin', t => {
+test('legacy v2 inbound routes follow the stored delivery despite an unrelated wake target', t => {
   const { path } = workspace(t);
   const store = new MailboxStore(path);
-  const pinned = envelope('pinned');
-  const inferred = envelope('inferred');
+  const stale = envelope('stale');
   const history = envelope('history');
-  store.enqueue([pinned, inferred], { mailboxId: 'stream:actual' });
-  store.ack(store.check({ mailboxId: 'stream:actual' }).deliveryId!, 'stream:actual');
-  store.upsertWakeTarget('terminal:pinned', { driver: 'local' });
-  store.recordInboundEnvelope(pinned, 'terminal:pinned');
-  store.recordInboundEnvelope(inferred, 'wrong-hint');
+  store.enqueue([stale], { mailboxId: 'task:root' });
+  store.ack(store.check({ mailboxId: 'task:root' }).deliveryId!, 'task:root');
+  store.upsertWakeTarget('stream:requests', { driver: 'local' });
+  store.recordInboundEnvelope(stale, 'stream:requests');
   store.recordInboundEnvelope(history, 'history-hint');
   const snapshot = JSON.parse(readFileSync(path, 'utf8'));
   for (const record of Object.values(snapshot.threads) as Array<{ mailboxCommitted?: boolean }>) delete record.mailboxCommitted;
   writeFileSync(path, JSON.stringify(snapshot));
 
   const reloaded = new MailboxStore(path);
-  assert.equal(reloaded.resolveThreadLocalMailbox(pinned.id, pinned.networkId), 'terminal:pinned');
-  assert.equal(reloaded.resolveThreadLocalMailbox(inferred.id, inferred.networkId), 'stream:actual');
+  assert.equal(reloaded.resolveThreadLocalMailbox(stale.id, stale.networkId), 'task:root');
   assert.equal(reloaded.resolveThreadLocalMailbox(history.id, history.networkId), undefined);
   assert.equal(reloaded.getThread(history.id)?.localMailbox, 'history-hint');
   assert.equal(reloaded.getThread(history.id)?.mailboxCommitted, false);

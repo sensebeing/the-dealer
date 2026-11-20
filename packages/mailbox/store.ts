@@ -820,8 +820,7 @@ function loadState(raw: string): MailboxFileState {
       normalizedThreads[expected] = {
         ...record,
         mailboxCommitted: delivered !== undefined,
-        localMailbox: delivered === undefined || Object.hasOwn(wakeTargets, record.localMailbox)
-          ? record.localMailbox : delivered,
+        localMailbox: delivered ?? record.localMailbox,
       };
     } else {
       normalizedThreads[expected] = record;
@@ -1102,23 +1101,17 @@ export class MailboxStore {
         if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
           throw new Error('Invalid envelope: missing id');
         }
-        const owner = options.proposedSpawn && canInheritThreadMailbox(envelope)
+        const owner = canInheritThreadMailbox(envelope)
           ? this.threadLocalMailboxFromState(state, envelopeThreadId(envelope), envelope.networkId, envelope.id)
           : undefined;
-        const mailboxId = owner ?? explicitMailbox ?? resolveMailboxId(
-          envelope,
-          undefined,
-          this.threadLocalMailboxFromState(
-            state,
-            envelope.semantic?.threadId,
-            envelope.networkId,
-            envelope.id,
-          ),
-        );
+        const mailboxId = owner ?? explicitMailbox ?? resolveMailboxId(envelope);
         mailboxIds.add(mailboxId);
         envelopeMailboxes.set(envelope.id, mailboxId);
         const duplicate = state.items.find(item => item.mailboxId === mailboxId && item.id === envelope.id);
-        if (owner === undefined && (!options.proposedSpawn || !duplicate)) configureWakeTargets.add(mailboxId);
+        const mayConfigureWakeTarget = options.proposedSpawn
+          ? owner === undefined && !duplicate
+          : owner === undefined || owner === explicitMailbox;
+        if (mayConfigureWakeTarget) configureWakeTargets.add(mailboxId);
         if (duplicate) {
           const inbound = state.threads[threadKey({ direction: 'inbound', messageId: envelope.id })];
           if (!inbound || inbound.mailboxCommitted === false) {
@@ -1710,8 +1703,12 @@ export class MailboxStore {
         const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
         const updatedAt = new Date().toISOString();
         for (const [key, record] of Object.entries(state.threads)) {
-          if (record.localMailbox === id && (keys.has(key) || keys.has(record.threadId) || keys.has(record.messageId))) {
-            state.threads[key] = { ...record, localMailbox: termMailbox, updatedAt };
+          if (record.mailboxCommitted !== false && record.localMailbox === id &&
+              (keys.has(key) || keys.has(record.threadId) || keys.has(record.messageId))) {
+            state.threads[key] = {
+              ...record, localMailbox: termMailbox, updatedAt,
+              ...(record.direction === 'inbound' ? { mailboxCommitted: true } : {}),
+            };
           }
         }
       }

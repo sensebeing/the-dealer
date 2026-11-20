@@ -11,7 +11,7 @@ import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir, homedir, networkInterfaces } from 'node:os';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { createSocket } from 'node:dgram';
@@ -2239,7 +2239,7 @@ for (const [name, create, rootPayload, followupPayload] of [
   });
 }
 
-test('concurrent Orca spawns wait for in-flight worktree creation on the same thread', { timeout: 8000 }, async t => {
+test('simultaneous spawn, wave and inbox deliveries keep the first root’s worktree', { timeout: 8000 }, async t => {
   const cwd = directory(t);
   const store = new MailboxStore(join(cwd, 'mailbox.json'));
   const beganCreate = Promise.withResolvers<void>();
@@ -2257,23 +2257,56 @@ test('concurrent Orca spawns wait for in-flight worktree creation on the same th
   } });
   const root = message('root');
   const followup = { ...message('followup'), semantic: { type: 'message', threadId: root.id } as const };
-  const wave = { ...message('wave-followup', { mode: 'wave' }), semantic: followup.semantic };
+  const wave = { ...message('wave-followup'), semantic: followup.semantic };
+  const inbox = { ...message('inbox-followup'), semantic: followup.semantic };
   const initial = plugin.execute([root], context, {});
-  await beganCreate.promise;
   const concurrent = plugin.execute([followup], context, {});
-  const concurrentWave = plugin.execute([wave], context, {});
+  const concurrentWave = createOrcaWaveExecutorPlugin({ store }).execute([wave], context, {});
+  const concurrentInbox = createInboxExecutorPlugin({ store }).execute([inbox], context, {});
   try {
+    await beganCreate.promise;
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(creates, 1);
     assert.equal(store.resolveThreadLocalMailbox(root.id, root.networkId), undefined);
   } finally {
     finishCreate.resolve();
-    await Promise.all([initial, concurrent, concurrentWave]);
+    await Promise.all([initial, concurrent, concurrentWave, concurrentInbox]);
   }
   assert.equal((await concurrent).mailboxId, 'task:root');
   assert.equal((await concurrentWave).mailboxId, 'task:root');
+  assert.equal((await concurrentInbox).mailboxId, 'task:root');
   assert.equal(creates, 1);
-  assert.equal(store.list({ mailboxId: 'task:root' }).totalCount, 3);
+  assert.equal(store.list({ mailboxId: 'task:root' }).totalCount, 4);
+});
+
+test('runtime reports a dedup watermark write failure without replaying a confirmed delivery', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const watermarksPath = join(stateDir, 'dedup-watermarks.json');
+  const pendingWatermarksPath = join(stateDir, 'pending-watermarks.json');
+  let calls = 0;
+  const runtime = await new DealerNodeRuntime({
+    stateDir, member: 'solo', transport: { discoveryDir: join(root, 'discovery') },
+    patch: { topicBindings: { review: { executor: 'agent-pty' } } },
+    commandRunner: async () => {
+      calls++;
+      renameSync(watermarksPath, pendingWatermarksPath);
+      mkdirSync(watermarksPath);
+      return { stdout: '{}' };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  const envelope = { ...message('watermark-failure', { revision: 1 }), kind: 'review', networkId: 'local', idempotencyKey: 'review-1' };
+  const dispatcher = runtime.kernel.getService('dispatcher');
+  const receipt = await dispatcher.dispatch(envelope);
+  assert.equal(receipt.stage, 'dispatched');
+  assert.deepEqual(await dispatcher.dispatch(envelope), receipt);
+  assert.equal(calls, 1);
+  assert.ok(runtime.lastError?.includes(envelope.networkId));
+  assert.ok(runtime.lastError?.includes(envelope.from.nodeId));
+  assert.ok(runtime.lastError?.includes(envelope.id));
+  assert.match(runtime.lastError ?? '', /EISDIR|ENOTDIR/);
+  assert.match(readFileSync(pendingWatermarksPath, 'utf8'), /"status":"unknown"/);
 });
 
 test('concurrent host preparations commit to one task before launching', async t => {

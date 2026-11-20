@@ -9,6 +9,14 @@ import type {
 } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 
+export interface DispatchErrorContext {
+  phase: 'post-delivery-policy';
+  networkId: string;
+  fromNodeId: string;
+  messageId: string;
+  receipt: DispatchReceipt;
+}
+
 export interface DispatcherConfig {
   requiredPolicies?: () => readonly string[];
   /** Composition-root decoration, uniformly applied at the registration boundary. */
@@ -19,6 +27,7 @@ export interface DispatcherConfig {
   resolveExecutor?: (envelope: MessageEnvelope) => string | undefined;
   resolveKindExecutor?: (kind: string, streamKey?: string) => string | undefined;
   kindExecutors?: Record<string, string>;
+  onError?: (error: unknown, context: DispatchErrorContext) => void;
 }
 
 /**
@@ -299,7 +308,13 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               return recorded?.stage === 'dispatched' ? recorded : result;
             }, error => {
               const recorded = ledger.get(id);
-              if (recorded?.stage === 'dispatched') return recorded;
+              if (recorded?.stage === 'dispatched' || recorded?.stage === 'settled') {
+                config.onError?.(error, {
+                  phase: 'post-delivery-policy', networkId: envelope.networkId,
+                  fromNodeId: envelope.from.nodeId, messageId: envelope.id, receipt: recorded,
+                });
+                return recorded;
+              }
               throw error;
             })
             .finally(() => {

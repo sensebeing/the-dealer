@@ -559,6 +559,9 @@ export class DealerNodeRuntime {
           ledgerPath: join(this.stateDir, 'deliveries.json'),
           wrapExecutor: executor => this.wrapExecutorWithAttachments(executor),
           resolveExecutor: envelope => this.resolveExecutorName(envelope),
+          onError: (error, { phase, networkId, fromNodeId, messageId }) => {
+            this.lastError = `${phase} failure for ${networkId}/${fromNodeId}/${messageId}: ${String(error)}`;
+          },
         }),
       );
       await this.kernel.use(

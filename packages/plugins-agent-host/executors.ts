@@ -18,8 +18,7 @@ import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import {
   prepareInboxDeliveries,
   executeDeliveryGroups,
-  waitForSpawnClaims,
-  withSpawnThreadLock,
+  serializeThreadDeliveries,
   createRawCommandExecutorPlugin,
   renderWave,
   beforeExternalEffect,
@@ -228,86 +227,86 @@ function createAgentExecutorPlugin(
       const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
       const store = options.store ?? config.store;
       const wakeup = options.wakeup ?? config.wakeup;
-      if (store) await waitForSpawnClaims(store, batch);
-      const threadGroups = store ? prepareExternalEffect(() => groupThreadBatch(batch, store)) : batch.map(envelope => [envelope]);
-      const deliveries = threadGroups.map((envelopes, index) => ({
-        envelopes,
-        delivery: prepareExternalEffect(() =>
-          prepareAgentDelivery(envelopes[0], !store && index === 0 ? batch : envelopes, options, config, store, host),
-        ),
-      }));
-      if (!store) {
-        const { delivery } = deliveries[0];
-        if (delivery.type === 'raw') return rawExecutor.execute(batch, context, runtimeConfig);
-        if (delivery.type !== 'host') throw beforeExternalEffect(new Error('Inbox delivery requires a mailbox store'));
-        trustWorkspace(delivery);
-        const output = await checkedCommand(runner, { ...delivery.request, signal: context.signal }).catch(rethrowBeforeCommandStart);
-        return { executor: name, executionId: randomUUID(), ...commandOutput(output) };
-      }
+      return serializeThreadDeliveries(store, batch, async commit => {
+        const threadGroups = store ? prepareExternalEffect(() => groupThreadBatch(batch, store)) : batch.map(envelope => [envelope]);
+        const deliveries = threadGroups.map((envelopes, index) => ({
+          envelopes,
+          delivery: prepareExternalEffect(() =>
+            prepareAgentDelivery(envelopes[0], !store && index === 0 ? batch : envelopes, options, config, store, host),
+          ),
+        }));
+        if (!store) {
+          const { delivery } = deliveries[0];
+          if (delivery.type === 'raw') return rawExecutor.execute(batch, context, runtimeConfig);
+          if (delivery.type !== 'host') throw beforeExternalEffect(new Error('Inbox delivery requires a mailbox store'));
+          trustWorkspace(delivery);
+          const output = await checkedCommand(runner, { ...delivery.request, signal: context.signal }).catch(rethrowBeforeCommandStart);
+          return { executor: name, executionId: randomUUID(), ...commandOutput(output) };
+        }
 
-      const inboxGroups = new Map<string, MessageEnvelope[]>();
-      const hostGroups = new Map<string, { delivery: HostDelivery; envelopes: MessageEnvelope[] }>();
-      const spawnGroups: { delivery: HostDelivery; envelopes: MessageEnvelope[] }[] = [];
-      const rawBatch: MessageEnvelope[] = [];
-      for (const { envelopes, delivery } of deliveries) {
-        switch (delivery.type) {
-          case 'raw':
-            rawBatch.push(...envelopes);
-            break;
-          case 'inbox': {
-            const group = inboxGroups.get(delivery.mailboxId) ?? [];
-            group.push(...envelopes);
-            inboxGroups.set(delivery.mailboxId, group);
-            break;
-          }
-          case 'host': {
-            if (delivery.mode === 'spawn') {
-              spawnGroups.push({ delivery, envelopes });
+        const inboxGroups = new Map<string, MessageEnvelope[]>();
+        const hostGroups = new Map<string, { delivery: HostDelivery; envelopes: MessageEnvelope[] }>();
+        const spawnGroups: { delivery: HostDelivery; envelopes: MessageEnvelope[] }[] = [];
+        const rawBatch: MessageEnvelope[] = [];
+        for (const { envelopes, delivery } of deliveries) {
+          switch (delivery.type) {
+            case 'raw':
+              rawBatch.push(...envelopes);
+              break;
+            case 'inbox': {
+              const group = inboxGroups.get(delivery.mailboxId) ?? [];
+              group.push(...envelopes);
+              inboxGroups.set(delivery.mailboxId, group);
               break;
             }
-            const group = hostGroups.get(delivery.mailboxId) ?? { delivery, envelopes: [] };
-            group.envelopes.push(...envelopes);
-            hostGroups.set(delivery.mailboxId, group);
-            break;
+            case 'host': {
+              if (delivery.mode === 'spawn') {
+                spawnGroups.push({ delivery, envelopes });
+                break;
+              }
+              const group = hostGroups.get(delivery.mailboxId) ?? { delivery, envelopes: [] };
+              group.envelopes.push(...envelopes);
+              hostGroups.set(delivery.mailboxId, group);
+              break;
+            }
           }
         }
-      }
-      const groups = await prepareInboxDeliveries(store, wakeup, inboxGroups, context);
-      for (const { delivery, envelopes } of [...hostGroups.values(), ...spawnGroups]) {
-        const spawning = delivery.mode === 'spawn';
-        const proposedSpawn = spawning && canInheritThreadMailbox(envelopes[0]);
-        groups.push({ envelopes, async deliver() {
-          const { mailboxId } = delivery;
-          const claim = wakeup?.claim(mailboxId);
-          let woke = false;
-          try {
-            const enqueue = () => store.enqueue(envelopes, {
-              signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
-              wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
-            });
-            const result = spawning ? await withSpawnThreadLock(store, envelopes[0], enqueue) : enqueue();
-            const receipt = { ...result, executor: name, executionId: randomUUID(),
-              ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
-            if (result.claimedSpawn === false) {
-              for (const actualMailbox of result.mailboxIds) wakeup?.notifyMailbox(actualMailbox);
-              return receipt;
-            }
+        const groups = await prepareInboxDeliveries(store, wakeup, inboxGroups, context);
+        for (const { delivery, envelopes } of [...hostGroups.values(), ...spawnGroups]) {
+          const proposedSpawn = delivery.mode === 'spawn' && canInheritThreadMailbox(envelopes[0]);
+          groups.push({ envelopes, async deliver(committed) {
+            const { mailboxId } = delivery;
+            const claim = wakeup?.claim(mailboxId);
+            let woke = false;
             try {
-              trustWorkspace(delivery);
-              const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
-              woke = true;
-              return { ...receipt, woke, ...commandOutput(response) };
-            } catch (error) {
-              return { ...receipt, woke, reason: String(error) };
+              const result = store.enqueue(envelopes, {
+                signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
+                wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
+              });
+              committed();
+              const receipt = { ...result, executor: name, executionId: randomUUID(),
+                ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
+              for (const actualMailbox of result.mailboxIds) {
+                if (actualMailbox !== mailboxId || result.claimedSpawn === false) wakeup?.notifyMailbox(actualMailbox);
+              }
+              if (result.claimedSpawn === false || !result.mailboxIds.includes(mailboxId)) return receipt;
+              try {
+                trustWorkspace(delivery);
+                const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
+                woke = true;
+                return { ...receipt, woke, ...commandOutput(response) };
+              } catch (error) {
+                return { ...receipt, woke, reason: String(error) };
+              }
+            } finally {
+              claim?.dispose();
+              if (woke) wakeup?.notifyMailbox(mailboxId);
             }
-          } finally {
-            claim?.dispose();
-            if (woke) wakeup?.notifyMailbox(mailboxId);
-          }
-        } });
-      }
-      if (rawBatch.length) groups.push({ envelopes: rawBatch, deliver: () => rawExecutor.execute(rawBatch, context, runtimeConfig) });
-      return executeDeliveryGroups(name, batch, groups);
+          } });
+        }
+        if (rawBatch.length) groups.push({ envelopes: rawBatch, deliver: () => rawExecutor.execute(rawBatch, context, runtimeConfig) });
+        return executeDeliveryGroups(name, batch, groups, commit);
+      });
     },
   };
 }
