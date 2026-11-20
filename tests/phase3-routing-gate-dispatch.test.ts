@@ -645,7 +645,7 @@ test('orca-spawn ignores inbound command and settings authority and prefers rece
   assert.equal(existsSync(senderSettings), false);
 
   requests.length = 0;
-  await executor.execute([input], context, {});
+  await executor.execute([envelope({ payload: input.payload })], context, {});
   assert.equal(requests[0].cwd, '/receiver/options');
   assert.ok(requests[0].args.includes('--no-parent'));
   assert.equal(requests[0].args.includes('--parent-worktree'), false);

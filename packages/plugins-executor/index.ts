@@ -3,7 +3,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { PartialBatchExecutionError } from '../core-types/index.ts';
 import type { ExecutionContext, ExecutionReceipt, ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
-import { MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
+import { canInheritThreadMailbox, envelopeThreadId, MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
 import type { MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, CommandNotStartedError, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
@@ -45,6 +45,39 @@ export function rethrowBeforeCommandStart(error: unknown): never {
 export interface PreparedDelivery {
   envelopes: readonly MessageEnvelope[];
   deliver(): ExecutionReceipt | Promise<ExecutionReceipt>;
+}
+
+const inFlightSpawnThreads = new Map<string, Promise<void>>();
+
+const spawnThreadKey = (store: MailboxStore, envelope: MessageEnvelope) =>
+  JSON.stringify([store.path, envelope.networkId, envelopeThreadId(envelope)]);
+
+/** Wait for an in-flight claim before choosing a route for an unbound follow-up. */
+export async function waitForSpawnClaims(store: MailboxStore, batch: readonly MessageEnvelope[]): Promise<void> {
+  const pending = prepareExternalEffect(() => batch.flatMap(envelope => {
+    if (!canInheritThreadMailbox(envelope)) return [];
+    const claim = inFlightSpawnThreads.get(spawnThreadKey(store, envelope));
+    const owner = claim && store.resolveThreadLocalMailbox(envelopeThreadId(envelope), envelope.networkId, {
+      excludeInboundMessageId: envelope.id,
+    });
+    return claim && owner === undefined ? [claim] : [];
+  }));
+  await Promise.all(pending);
+}
+
+/** Serialize preparation and claim while a host creates a session for this thread. */
+export async function withSpawnThreadLock<T>(store: MailboxStore, root: MessageEnvelope, run: () => T | Promise<T>): Promise<T> {
+  const key = spawnThreadKey(store, root);
+  const previous = inFlightSpawnThreads.get(key);
+  const { promise, resolve } = Promise.withResolvers<void>();
+  inFlightSpawnThreads.set(key, promise);
+  try {
+    await previous;
+    return await run();
+  } finally {
+    resolve();
+    if (inFlightSpawnThreads.get(key) === promise) inFlightSpawnThreads.delete(key);
+  }
 }
 
 function mergeDeliveryReceipts(

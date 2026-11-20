@@ -54,10 +54,12 @@ another mailbox is enqueued there and wakes its owning session when it has a
 wake target.
 
 In `spawn` mode, a new request without a concrete semantic target or local
-thread mailbox starts a dedicated session at `task:<rootMessageId>`. A sender's
-payload mailbox hint does not establish session ownership. When a new request
-and its follow-ups arrive in the same execution batch, they share the request's
-session unless a follow-up explicitly selects an executor. Structured updates
+thread mailbox starts a session at `task:<rootMessageId>`. A standalone agent
+host uses the receiver's configured `mailboxId` when present. A sender's
+payload mailbox hint does not establish session ownership. The executor associates
+follow-ups with their thread before choosing a delivery mode. With no existing owner,
+a follow-up in the same batch shares the root's session unless it names a concrete
+semantic target or explicitly selects an executor. Structured updates
 and comments sent with `dealer send --thread` return to the existing session.
 Outbound messages without an explicit reply mailbox advertise the sender's
 local bound mailbox before final signing.

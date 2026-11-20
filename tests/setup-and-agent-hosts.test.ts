@@ -575,7 +575,7 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
         return { stdout: agent === 'codex' ? '{"threadId":"session"}' : '{"accepted":true}' };
       };
       const plugin = createAgentPtyExecutorPlugin({ store, commandRunner, resolveTopicBinding: () => ({ executor: 'agent-pty', agent, conversationMode,
-        mailboxId: 'stream:collab.request.v4', agentProfile: 'review', targetBot: 'bot', sessionId: 'session', workspacePath: root }) });
+        ...(conversationMode === 'fixed' ? { mailboxId } : {}), agentProfile: 'review', targetBot: 'bot', sessionId: 'session', workspacePath: root }) });
       await plugin.execute([message()], context, {});
       const call = calls[0];
       const args = call.args;
@@ -1180,7 +1180,7 @@ for (const [name, factory, command] of [
       const mailboxId = mode === 'spawn' ? 'task:test' : 'stream:review';
       const options = {
         store, conversationMode: mode,
-        resolveTopicBinding: () => ({ executor: name, mailboxId: 'stream:review', workspacePath: root, sessionId: 'session' }),
+        resolveTopicBinding: () => ({ executor: name, ...(mode === 'fixed' ? { mailboxId } : {}), workspacePath: root, sessionId: 'session' }),
         commandRunner: async (request: CommandRequest) => {
           assert.equal(store.getWakeTarget(mailboxId)?.driver, 'agent-host');
           calls.push(request);
@@ -2139,20 +2139,24 @@ test('a later Orca batch failure preserves committed receipts and leaves unattem
   const first = make('completed');
   const failed = make('failing');
   const last = make('unattempted');
+  const queuedLast = make('previously-queued');
   const queued: MessageEnvelope[] = [];
+  let drained = false;
   const published: string[] = [];
   runtime.kernel.ctx.on('dispatcher/inbound', event => {
     if (event.receipt.stage === 'dispatched') published.push(event.envelope.id);
   });
   dispatcher.registerPolicy({ name: 'fail-middle-batch', async process(envelope, next) {
-    if (envelope.id !== last.id) {
+    if (envelope.id !== last.id && !drained) {
       queued.push(envelope);
       return { stage: 'queued' };
     }
+    drained = true;
     return next([...queued.splice(0), envelope]);
   } });
   await dispatcher.dispatch(first);
   await dispatcher.dispatch(failed);
+  await dispatcher.dispatch(queuedLast);
   await assert.rejects(dispatcher.dispatch(last), (error: any) => error.beforeExternalEffect === true);
   assert.deepEqual(launched, [first.id, failed.id]);
   assert.deepEqual(published, [first.id]);
@@ -2160,7 +2164,8 @@ test('a later Orca batch failure preserves committed receipts and leaves unattem
   assert.equal((await dispatcher.dispatch(failed)).stage, 'failed');
   assert.equal(runtime.mailbox.list({ mailboxId: 'task:completed' }).totalCount, 1);
   assert.equal((await dispatcher.dispatch(last)).executionReceipt?.envelopeMailboxes?.[last.id], 'task:unattempted');
-  assert.deepEqual(launched, [first.id, failed.id, last.id]);
+  assert.equal((await dispatcher.dispatch(queuedLast)).executionReceipt?.envelopeMailboxes?.[queuedLast.id], 'task:previously-queued');
+  assert.deepEqual(launched, [first.id, failed.id, last.id, queuedLast.id]);
 });
 
 test('a mixed raw and host receipt keeps the raw thread unbound', async t => {
@@ -2196,6 +2201,94 @@ test('mixed interactive and noninteractive Orca spawns report only the committed
   assert.deepEqual(receipt.envelopeMailboxes, { persistent: 'task:persistent' });
   assert.equal(receipt.mailboxId, undefined);
   assert.equal(store.resolveThreadLocalMailbox('one-off', 'test'), undefined);
+});
+
+for (const targetMailbox of [undefined, 'requests']) {
+  test(`agent host launches in the configured spawn mailbox when the semantic target is ${targetMailbox ?? 'omitted'}`, async t => {
+    const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+    const calls: CommandRequest[] = [];
+    const plugin = createClaudeCodeExecutorPlugin({ store, resolveTopicBinding: () => ({ mode: 'spawn', mailboxId: 'requests' }),
+      commandRunner: async request => { calls.push(request); return { stdout: '{}' }; },
+    });
+    const root = { ...message('root'), semantic: { type: 'message', threadId: 'root', ...(targetMailbox ? { targetMailbox } : {}) } as const };
+    const receipt = await plugin.execute([root], context, {});
+    assert.equal(receipt.mailboxId, 'requests');
+    assert.equal(store.getWakeTarget('requests')?.driver, 'agent-host');
+    assert.equal(calls.length, 1);
+  });
+}
+
+for (const [name, create, rootPayload, followupPayload] of [
+  ['orca', createOrcaExecutorPlugin, { mode: 'spawn' }, { mode: 'wave' }],
+  ['agent-pty', createAgentPtyExecutorPlugin, { agent: 'claude-code' }, {}],
+] as const) {
+  test(`${name} batches root and follow-up before selecting delivery mode`, async t => {
+    const cwd = directory(t);
+    const store = new MailboxStore(join(cwd, 'mailbox.json'));
+    const calls: CommandRequest[] = [];
+    const plugin = create({ store, cwd, commandRunner: async request => {
+      calls.push(request);
+      return { stdout: JSON.stringify({ ok: true, result: request.args[0] === 'worktree' ? { path: cwd } : { terminal: { handle: 'term-group' } } }) };
+    } });
+    const root = message('root', rootPayload);
+    const followup = { ...message('followup', followupPayload), semantic: { type: 'message', threadId: root.id } as const };
+    const receipt = await plugin.execute([followup, root], context, {});
+    assert.deepEqual(receipt.envelopeMailboxes, { root: 'task:root', followup: 'task:root' });
+    assert.deepEqual(store.list({ mailboxId: 'task:root' }).items.map(item => item.id), ['followup', 'root']);
+    assert.equal(calls.filter(call => name === 'orca' ? call.args.slice(0, 2).join(' ') === 'worktree create' : call.args[0] === '--bg').length, 1);
+  });
+}
+
+test('concurrent Orca spawns wait for in-flight worktree creation on the same thread', { timeout: 8000 }, async t => {
+  const cwd = directory(t);
+  const store = new MailboxStore(join(cwd, 'mailbox.json'));
+  const beganCreate = Promise.withResolvers<void>();
+  const finishCreate = Promise.withResolvers<void>();
+  let creates = 0;
+  const plugin = createOrcaExecutorPlugin({ store, cwd, mode: 'spawn', commandRunner: async ({ args }) => {
+    if (args[0] === 'worktree' && args[1] === 'create') {
+      if (++creates === 1) {
+        beganCreate.resolve();
+        await finishCreate.promise;
+      }
+      return { stdout: JSON.stringify({ ok: true, result: { path: cwd } }) };
+    }
+    return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-concurrent"}}}' };
+  } });
+  const root = message('root');
+  const followup = { ...message('followup'), semantic: { type: 'message', threadId: root.id } as const };
+  const wave = { ...message('wave-followup', { mode: 'wave' }), semantic: followup.semantic };
+  const initial = plugin.execute([root], context, {});
+  await beganCreate.promise;
+  const concurrent = plugin.execute([followup], context, {});
+  const concurrentWave = plugin.execute([wave], context, {});
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(creates, 1);
+    assert.equal(store.resolveThreadLocalMailbox(root.id, root.networkId), undefined);
+  } finally {
+    finishCreate.resolve();
+    await Promise.all([initial, concurrent, concurrentWave]);
+  }
+  assert.equal((await concurrent).mailboxId, 'task:root');
+  assert.equal((await concurrentWave).mailboxId, 'task:root');
+  assert.equal(creates, 1);
+  assert.equal(store.list({ mailboxId: 'task:root' }).totalCount, 3);
+});
+
+test('concurrent host preparations commit to one task before launching', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const plugin = createClaudeCodeExecutorPlugin({ store, commandRunner: async request => {
+    calls.push(request);
+    return { stdout: '{}' };
+  } });
+  const root = message('root');
+  const followup = { ...message('followup'), semantic: { type: 'message', threadId: root.id } as const };
+  const receipts = await Promise.all([plugin.execute([root], context, {}), plugin.execute([followup], context, {})]);
+  assert.deepEqual(receipts.map(receipt => receipt.mailboxId), ['task:root', 'task:root']);
+  assert.equal(calls.length, 1);
+  assert.equal(store.list({ mailboxId: 'task:root' }).totalCount, 2);
 });
 
 for (const reverse of [false, true]) {

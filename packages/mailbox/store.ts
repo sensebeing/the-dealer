@@ -166,6 +166,7 @@ export interface MailboxStoreOptions {
 export interface MailboxEnqueueOptions {
   signedEnvelopes?: Readonly<Record<string, MessageEnvelope>>;
   mailboxId?: string;
+  proposedSpawn?: boolean;
   wakeupHint?: string;
   wakeTarget?: Partial<WakeTargetState>;
 }
@@ -175,6 +176,7 @@ export interface MailboxEnqueueResult {
   duplicateIds: string[];
   mailboxIds: string[];
   envelopeMailboxes: Record<string, string>;
+  claimedSpawn?: boolean;
 }
 
 export interface MailboxCheckOptions {
@@ -361,29 +363,42 @@ export function resolveSpawnMailboxId(messageId: string): string {
   return normalizeMailboxId(`task:${messageId}`, 'task mailbox');
 }
 
-/** Partition messages already selected for spawning, with each thread's root first. */
-export function groupSpawnBatch(batch: readonly MessageEnvelope[]) {
-  const threadId = (envelope: MessageEnvelope) => envelope.semantic?.threadId ?? envelope.id;
-  const threadKey = (envelope: MessageEnvelope) =>
-    JSON.stringify([envelope.networkId, threadId(envelope)]);
-  const hasExplicitExecutor = ({ payload }: MessageEnvelope) =>
-    typeof payload?.executor === 'string' && payload.executor.trim().length > 0;
+export function envelopeThreadId(envelope: MessageEnvelope): string {
+  return envelope.semantic?.threadId ?? envelope.id;
+}
+
+export function hasExplicitExecutor({ payload }: MessageEnvelope): boolean {
+  return typeof payload?.executor === 'string' && payload.executor.trim().length > 0;
+}
+
+export function canInheritThreadMailbox(envelope: MessageEnvelope): boolean {
+  const target = envelope.semantic?.targetMailbox;
+  return !hasExplicitExecutor(envelope) && (target === undefined || target === 'default');
+}
+
+const networkMessageKey = (networkId: string, messageId: string) => JSON.stringify([networkId, messageId]);
+
+/** Associate unforced, untargeted follow-ups before selecting a delivery mechanism. */
+export function groupThreadBatch(batch: readonly MessageEnvelope[], store?: MailboxStore): MessageEnvelope[][] {
+  const keyOf = (envelope: MessageEnvelope) => networkMessageKey(envelope.networkId, envelopeThreadId(envelope));
   const roots = new Map<string, MessageEnvelope>();
   for (const envelope of batch) {
-    const key = threadKey(envelope);
-    if (envelope.id === threadId(envelope) ||
-      (!roots.has(key) && !hasExplicitExecutor(envelope))) {
+    const key = keyOf(envelope);
+    if (envelope.id === envelopeThreadId(envelope) || (!roots.has(key) && canInheritThreadMailbox(envelope))) {
       roots.set(key, envelope);
     }
   }
   const groups = new Map<MessageEnvelope, MessageEnvelope[]>();
   for (const envelope of batch) {
-    const root = hasExplicitExecutor(envelope) ? envelope : roots.get(threadKey(envelope))!;
+    let root = canInheritThreadMailbox(envelope) ? roots.get(keyOf(envelope))! : envelope;
+    if (root !== envelope && !canInheritThreadMailbox(root) && store?.resolveThreadLocalMailbox(
+      envelopeThreadId(envelope), envelope.networkId, { excludeInboundMessageId: envelope.id },
+    )) root = envelope;
     const group = groups.get(root) ?? [root];
     if (envelope !== root) group.push(envelope);
     groups.set(root, group);
   }
-  return [...groups].map(([root, envelopes]) => ({ mailboxId: resolveSpawnMailboxId(root.id), envelopes }));
+  return [...groups.values()];
 }
 
 export function resolveMailboxId(
@@ -785,6 +800,7 @@ function loadState(raw: string): MailboxFileState {
     }
   }
   const normalizedThreads: Record<string, ThreadRouteRecord> = {};
+  let deliveredMailboxes: Map<string, string> | undefined;
   for (const [key, value] of Object.entries(threads)) {
     const record = validateThreadRecord(value);
     const expected = threadKey(record);
@@ -792,7 +808,24 @@ function loadState(raw: string): MailboxFileState {
     if (key !== expected) {
       throw invalidStore();
     }
-    normalizedThreads[expected] = record;
+    if (record.direction === 'inbound' && record.mailboxCommitted === undefined) {
+      if (!deliveredMailboxes) {
+        deliveredMailboxes = new Map();
+        for (const item of items) {
+          const itemKey = networkMessageKey(item.envelope.networkId, item.id);
+          if (!deliveredMailboxes.has(itemKey)) deliveredMailboxes.set(itemKey, item.mailboxId);
+        }
+      }
+      const delivered = deliveredMailboxes.get(networkMessageKey(record.networkId, record.messageId));
+      normalizedThreads[expected] = {
+        ...record,
+        mailboxCommitted: delivered !== undefined,
+        localMailbox: delivered === undefined || Object.hasOwn(wakeTargets, record.localMailbox)
+          ? record.localMailbox : delivered,
+      };
+    } else {
+      normalizedThreads[expected] = record;
+    }
   }
   const sequence = Math.max(
     parsed.sequence,
@@ -1053,6 +1086,7 @@ export class MailboxStore {
     }
     const explicitMailbox =
       options.mailboxId === undefined ? undefined : normalizeMailboxId(options.mailboxId);
+    if (options.proposedSpawn && explicitMailbox === undefined) throw new Error('A proposed spawn requires a mailbox id');
     const now = new Date().toISOString();
     const nowMs = Date.now();
     const insertedByMailbox = new Map<string, number>();
@@ -1061,12 +1095,17 @@ export class MailboxStore {
       const inserted: string[] = [];
       const duplicateIds: string[] = [];
       const mailboxIds = new Set<string>();
+      const configureWakeTargets = new Set<string>();
       const envelopeMailboxes = new Map<string, string>();
+      let claimedSpawn = false;
       for (const envelope of batch) {
         if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
           throw new Error('Invalid envelope: missing id');
         }
-        const mailboxId = explicitMailbox ?? resolveMailboxId(
+        const owner = options.proposedSpawn && canInheritThreadMailbox(envelope)
+          ? this.threadLocalMailboxFromState(state, envelopeThreadId(envelope), envelope.networkId, envelope.id)
+          : undefined;
+        const mailboxId = owner ?? explicitMailbox ?? resolveMailboxId(
           envelope,
           undefined,
           this.threadLocalMailboxFromState(
@@ -1079,6 +1118,7 @@ export class MailboxStore {
         mailboxIds.add(mailboxId);
         envelopeMailboxes.set(envelope.id, mailboxId);
         const duplicate = state.items.find(item => item.mailboxId === mailboxId && item.id === envelope.id);
+        if (owner === undefined && (!options.proposedSpawn || !duplicate)) configureWakeTargets.add(mailboxId);
         if (duplicate) {
           const inbound = state.threads[threadKey({ direction: 'inbound', messageId: envelope.id })];
           if (!inbound || inbound.mailboxCommitted === false) {
@@ -1117,13 +1157,14 @@ export class MailboxStore {
                 .some(record => record.networkId === envelope.networkId))),
         );
         this.upsertInboundThread(state, signedEnvelope ?? cloned, mailboxId, now, true);
+        claimedSpawn ||= options.proposedSpawn === true && owner === undefined;
         inserted.push(cloned.id);
         insertedByMailbox.set(mailboxId, (insertedByMailbox.get(mailboxId) ?? 0) + 1);
       }
       for (const mailboxId of mailboxIds) {
         const previous = state.wakeTargets[mailboxId];
         const current = previous ?? defaultWakeTarget(mailboxId);
-        if (options.wakeTarget) {
+        if (options.wakeTarget && configureWakeTargets.has(mailboxId)) {
           state.wakeTargets[mailboxId] = validateWakeTarget(
             mergeWakeTarget(current, options.wakeTarget),
           );
@@ -1143,7 +1184,10 @@ export class MailboxStore {
           }
         }
       }
-      return { inserted, duplicateIds, mailboxIds: [...mailboxIds], envelopeMailboxes: Object.fromEntries(envelopeMailboxes) };
+      return {
+        inserted, duplicateIds, mailboxIds: [...mailboxIds], envelopeMailboxes: Object.fromEntries(envelopeMailboxes),
+        ...(options.proposedSpawn ? { claimedSpawn } : {}),
+      };
     });
     for (const [mailboxId, count] of insertedByMailbox) {
       if (count > 0) {

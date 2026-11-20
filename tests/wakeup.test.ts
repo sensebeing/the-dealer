@@ -1515,6 +1515,7 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
   assert.equal(store.list({ mailboxId: 'task:task-timeout' }).queuedCount, 1);
 
   await until(() => store.getWakeTarget('task:task-timeout')!.attemptCount > 0, 'claim release probes busy target');
+  await service.flushMailbox('task:task-timeout');
   idle = true;
   await service.flushMailbox('task:task-timeout', { force: true });
   const preambleSends = terminalSends(calls);

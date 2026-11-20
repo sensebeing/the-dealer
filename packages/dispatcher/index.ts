@@ -65,6 +65,10 @@ export class DeliveryLedger {
     this.update([[key, value]]);
   }
 
+  delete(key: string): void {
+    this.update([[key, undefined]]);
+  }
+
   update(changes: readonly (readonly [string, DispatchReceipt | undefined])[]): void {
     const next = { ...this.#entries };
     for (const [key, receipt] of changes) {
@@ -152,15 +156,17 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         } catch (error) {
           const partial = error instanceof PartialBatchExecutionError ? error : undefined;
           const beforeEffect = (error as { beforeExternalEffect?: boolean } | null)?.beforeExternalEffect === true;
-          const outcomes = members.map(({ envelope, id, prior }) => {
+          const outcomes = members.map(({ envelope, id }) => {
             const settled = partial?.settledReceipts;
             const unattempted = beforeEffect || partial?.unattemptedIds.has(envelope.id) === true;
             const receipt: DispatchReceipt | undefined = settled && Object.hasOwn(settled, envelope.id)
               ? { stage: 'dispatched', executionReceipt: settled[envelope.id] }
-              : unattempted ? prior : { stage: 'failed', detail: String(error) };
+              : unattempted ? undefined : { stage: 'failed', detail: String(error) };
             return { envelope, id, receipt, unattempted };
           });
-          ledger.update(outcomes.map(({ id, receipt }) => [id, receipt]));
+          // Policies handed these members to the executor. Release unattempted claims for retry.
+          if (outcomes.length === 1 && outcomes[0].receipt === undefined) ledger.delete(outcomes[0].id);
+          else ledger.update(outcomes.map(({ id, receipt }) => [id, receipt]));
           for (const { envelope, receipt } of outcomes) {
             if (receipt?.stage === 'dispatched') ctx.emit('dispatcher/inbound', { envelope, receipt });
           }

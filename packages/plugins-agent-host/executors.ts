@@ -11,13 +11,15 @@ import {
   defaultAgentCommandArgs,
 } from './hosts.ts';
 import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from './hosts.ts';
-import { groupSpawnBatch, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveSpawnMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
+import { canInheritThreadMailbox, groupThreadBatch, hasExplicitExecutor, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveSpawnMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
 import type { MailboxStore, MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import {
   prepareInboxDeliveries,
   executeDeliveryGroups,
+  waitForSpawnClaims,
+  withSpawnThreadLock,
   createRawCommandExecutorPlugin,
   renderWave,
   beforeExternalEffect,
@@ -131,11 +133,24 @@ function prepareAgentDelivery(
   } catch {
     throw new Error('Invalid agent conversationMode');
   }
-  if (!usesAgentHostInvocation(agent, rawMode, Boolean(host))) return { type: 'raw' };
-
+  const usesHost = usesAgentHostInvocation(agent, rawMode, Boolean(host));
   const threadLocalMailbox = store?.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
     excludeInboundMessageId: envelope.id,
   });
+  const addressing: MailboxTopicBinding = {
+    mailboxId: binding?.mailboxId,
+    streamKey: binding?.streamKey,
+    stream: binding?.stream,
+    mode: rawMode ?? 'spawn',
+  };
+  const boundMailboxId = resolveBoundMailboxId(resolveTopicAddress(envelope.kind, streamKey).kind, addressing, rawMode);
+  if (store && !hasExplicitExecutor(envelope)) {
+    const sessionMailbox = resolveSessionOrThreadMailbox(envelope, threadLocalMailbox);
+    if (sessionMailbox !== undefined && (sessionMailbox !== boundMailboxId || !usesHost)) {
+      return { type: 'inbox', mailboxId: sessionMailbox };
+    }
+  }
+  if (!usesHost) return { type: 'raw' };
   if (rawMode === 'inbox-only') {
     if (store && binding?.mode === 'inbox-only') {
       return { type: 'inbox', mailboxId: resolveMailboxId(envelope, binding, threadLocalMailbox) };
@@ -143,22 +158,8 @@ function prepareAgentDelivery(
     throw new Error('Invalid agent conversationMode');
   }
   const conversationMode: ActiveConversationMode = rawMode ?? 'spawn';
-  const addressing: MailboxTopicBinding = {
-    mailboxId: binding?.mailboxId,
-    streamKey: binding?.streamKey,
-    stream: binding?.stream,
-    mode: conversationMode,
-  };
-  if (store && !(typeof payload.executor === 'string' && payload.executor.trim())) {
-    const sessionMailbox = resolveSessionOrThreadMailbox(envelope, threadLocalMailbox);
-    if (sessionMailbox !== undefined) {
-      const boundMailboxId = conversationMode === 'spawn' ? 'default' :
-        resolveBoundMailboxId(resolveTopicAddress(envelope.kind, streamKey).kind, addressing);
-      if (sessionMailbox !== boundMailboxId) return { type: 'inbox', mailboxId: sessionMailbox };
-    }
-  }
   const mailboxId = conversationMode === 'spawn'
-    ? resolveSpawnMailboxId(envelope.id)
+    ? addressing.mailboxId !== undefined ? boundMailboxId : resolveSpawnMailboxId(envelope.id)
     : resolveMailboxId(envelope, addressing, threadLocalMailbox, 'inbox-only');
   const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
   const command = config.command ?? options.command;
@@ -227,10 +228,12 @@ function createAgentExecutorPlugin(
       const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
       const store = options.store ?? config.store;
       const wakeup = options.wakeup ?? config.wakeup;
-      const deliveries = batch.map((envelope, index) => ({
-        envelope,
+      if (store) await waitForSpawnClaims(store, batch);
+      const threadGroups = store ? prepareExternalEffect(() => groupThreadBatch(batch, store)) : batch.map(envelope => [envelope]);
+      const deliveries = threadGroups.map((envelopes, index) => ({
+        envelopes,
         delivery: prepareExternalEffect(() =>
-          prepareAgentDelivery(envelope, !store && index === 0 ? batch : [envelope], options, config, store, host),
+          prepareAgentDelivery(envelopes[0], !store && index === 0 ? batch : envelopes, options, config, store, host),
         ),
       }));
       if (!store) {
@@ -244,50 +247,53 @@ function createAgentExecutorPlugin(
 
       const inboxGroups = new Map<string, MessageEnvelope[]>();
       const hostGroups = new Map<string, { delivery: HostDelivery; envelopes: MessageEnvelope[] }>();
-      const spawnDeliveries = new Map<MessageEnvelope, HostDelivery>();
+      const spawnGroups: { delivery: HostDelivery; envelopes: MessageEnvelope[] }[] = [];
       const rawBatch: MessageEnvelope[] = [];
-      for (const { envelope, delivery } of deliveries) {
+      for (const { envelopes, delivery } of deliveries) {
         switch (delivery.type) {
           case 'raw':
-            rawBatch.push(envelope);
+            rawBatch.push(...envelopes);
             break;
           case 'inbox': {
             const group = inboxGroups.get(delivery.mailboxId) ?? [];
-            group.push(envelope);
+            group.push(...envelopes);
             inboxGroups.set(delivery.mailboxId, group);
             break;
           }
           case 'host': {
             if (delivery.mode === 'spawn') {
-              spawnDeliveries.set(envelope, delivery);
+              spawnGroups.push({ delivery, envelopes });
               break;
             }
             const group = hostGroups.get(delivery.mailboxId) ?? { delivery, envelopes: [] };
-            group.envelopes.push(envelope);
+            group.envelopes.push(...envelopes);
             hostGroups.set(delivery.mailboxId, group);
             break;
           }
         }
       }
-      for (const { mailboxId, envelopes } of prepareExternalEffect(() => groupSpawnBatch([...spawnDeliveries.keys()]))) {
-        const delivery = spawnDeliveries.get(envelopes[0])!;
-        const bound = hostGroups.get(mailboxId);
-        hostGroups.set(mailboxId, { delivery, envelopes: bound ? [...envelopes, ...bound.envelopes] : envelopes });
-      }
       const groups = await prepareInboxDeliveries(store, wakeup, inboxGroups, context);
-      for (const { delivery, envelopes } of hostGroups.values()) {
+      for (const { delivery, envelopes } of [...hostGroups.values(), ...spawnGroups]) {
+        const spawning = delivery.mode === 'spawn';
+        const proposedSpawn = spawning && canInheritThreadMailbox(envelopes[0]);
         groups.push({ envelopes, async deliver() {
-          trustWorkspace(delivery);
           const { mailboxId } = delivery;
           const claim = wakeup?.claim(mailboxId);
           let woke = false;
           try {
-            const result = store.enqueue(envelopes, {
-              signedEnvelopes: context?.signedEnvelopes, mailboxId,
+            const enqueue = () => store.enqueue(envelopes, {
+              signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
               wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
             });
-            const receipt = { ...result, executor: name, executionId: randomUUID(), mailboxId };
+            const result = spawning ? await withSpawnThreadLock(store, envelopes[0], enqueue) : enqueue();
+            const receipt = { ...result, executor: name, executionId: randomUUID(),
+              ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
+            if (result.claimedSpawn === false) {
+              for (const actualMailbox of result.mailboxIds) wakeup?.notifyMailbox(actualMailbox);
+              return receipt;
+            }
             try {
+              trustWorkspace(delivery);
               const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
               woke = true;
               return { ...receipt, woke, ...commandOutput(response) };
