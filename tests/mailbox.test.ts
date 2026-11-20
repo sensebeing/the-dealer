@@ -782,3 +782,42 @@ test('legacy v2 inbound routes follow the stored delivery despite an unrelated w
   assert.equal(reloaded.getThread(history.id)?.localMailbox, 'history-hint');
   assert.equal(reloaded.getThread(history.id)?.mailboxCommitted, false);
 });
+
+test('an upgraded legacy rotating thread retains its terminal through subsequent rotation', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const stream = 'stream:requests';
+  const first = envelope('first');
+  store.enqueue([first], { mailboxId: stream, wakeTarget: { driver: 'orca-terminal', rotateAfterWaves: 1 } });
+  const firstDelivery = store.check({ mailboxId: stream });
+  store.completeWakeDelivery(stream, firstDelivery.items[0].sequence, {}, { sessionMailboxId: 'terminal:early' });
+  store.ack(firstDelivery.deliveryId!, stream);
+  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
+  delete snapshot.threads['inbound:first'].mailboxCommitted;
+  writeFileSync(path, JSON.stringify(snapshot));
+
+  const upgraded = new MailboxStore(path);
+  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), 'terminal:early');
+  const next = envelope('next');
+  upgraded.enqueue([next], { mailboxId: stream });
+  const nextDelivery = upgraded.check({ mailboxId: stream });
+  upgraded.completeWakeDelivery(stream, nextDelivery.items[0].sequence, {}, { sessionMailboxId: 'terminal:later' });
+  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), 'terminal:early');
+  assert.equal(upgraded.resolveThreadLocalMailbox(next.id, next.networkId), 'terminal:later');
+});
+
+test('reply lookup trusts a stored outbound semantic address over a legacy mailbox hint', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const explicit = envelope('explicit', { semantic: { type: 'message', threadId: 'explicit', targetMailbox: 'task:peer' } });
+  const hint = envelope('hint', { payload: { mailbox: 'wrong-hint' } });
+  store.recordOutboundEnvelope(explicit, [explicit.from.nodeId]);
+  store.recordOutboundEnvelope(hint, [hint.from.nodeId]);
+  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
+  snapshot.threads['outbound:explicit'].peerReplyMailbox = 'wrong-hint';
+  snapshot.threads['outbound:hint'].peerReplyMailbox = 'wrong-hint';
+  writeFileSync(path, JSON.stringify(snapshot));
+
+  assert.equal(store.resolveReplyTarget(explicit.id, explicit.networkId)?.targetMailbox, 'task:peer');
+  assert.equal(store.resolveReplyTarget(hint.id, hint.networkId)?.targetMailbox, 'default');
+});

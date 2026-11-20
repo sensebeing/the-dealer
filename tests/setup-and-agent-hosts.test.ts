@@ -2279,6 +2279,55 @@ test('simultaneous spawn, wave and inbox deliveries keep the first root’s work
   assert.equal(store.list({ mailboxId: 'task:root' }).totalCount, 4);
 });
 
+test('runtime reserves a spawn thread before fetching the root’s attachment', { timeout: 8000 }, async t => {
+  const root = directory(t);
+  const attachmentStarted = Promise.withResolvers<void>();
+  const releaseAttachment = Promise.withResolvers<void>();
+  let creates = 0;
+  const runtime = await new DealerNodeRuntime({
+    stateDir: join(root, 'state'), member: 'solo', transport: { discoveryDir: join(root, 'discovery') },
+    patch: { topicBindings: { review: { executor: 'orca', mode: 'spawn' } } },
+    commandRunner: async ({ args }) => {
+      if (args.slice(0, 2).join(' ') === 'worktree create') {
+        creates++;
+        return { stdout: JSON.stringify({ ok: true, result: { path: root } }) };
+      }
+      return { stdout: '{"ok":true,"result":{"terminal":{"handle":"term-attachment"}}}' };
+    },
+  }).start();
+  t.after(() => runtime.stop());
+  runtime.transport.fetchBlobToPath = async (_ticket, path) => {
+    attachmentStarted.resolve();
+    await releaseAttachment.promise;
+    writeFileSync(path, 'content');
+  };
+  const rootEnvelope: MessageEnvelope = {
+    ...message('attachment-root'), networkId: 'local', kind: 'review',
+    attachments: [{ name: 'context.txt', mimeType: 'text/plain', sizeBytes: 7, blake3Hash: 'a'.repeat(64), ticket: 'test-ticket' }],
+  };
+  const followup: MessageEnvelope = {
+    ...rootEnvelope, id: 'attachment-followup', attachments: [],
+    semantic: { type: 'message', threadId: rootEnvelope.id },
+  };
+  const dispatcher = runtime.kernel.getService('dispatcher');
+  const initial = dispatcher.dispatch(rootEnvelope);
+  await attachmentStarted.promise;
+  const concurrent = dispatcher.dispatch(followup);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(creates, 0);
+    assert.equal(runtime.mailbox.resolveThreadLocalMailbox(rootEnvelope.id, rootEnvelope.networkId), undefined);
+  } finally {
+    releaseAttachment.resolve();
+    await Promise.all([initial, concurrent]);
+  }
+  const mailboxId = 'task:attachment-root';
+  assert.equal(creates, 1);
+  assert.equal((await initial).executionReceipt?.mailboxId, mailboxId);
+  assert.equal((await concurrent).executionReceipt?.mailboxId, mailboxId);
+  assert.deepEqual(runtime.mailbox.list({ mailboxId }).items.map(item => item.id).sort(), [followup.id, rootEnvelope.id]);
+});
+
 test('runtime reports a dedup watermark write failure without replaying a confirmed delivery', async t => {
   const root = directory(t);
   const stateDir = join(root, 'state');

@@ -227,7 +227,7 @@ function createAgentExecutorPlugin(
       const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
       const store = options.store ?? config.store;
       const wakeup = options.wakeup ?? config.wakeup;
-      return serializeThreadDeliveries(store, batch, async commit => {
+      return serializeThreadDeliveries(store, batch, context, async commit => {
         const threadGroups = store ? prepareExternalEffect(() => groupThreadBatch(batch, store)) : batch.map(envelope => [envelope]);
         const deliveries = threadGroups.map((envelopes, index) => ({
           envelopes,

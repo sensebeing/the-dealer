@@ -616,6 +616,15 @@ function threadKey(record: Pick<ThreadRouteRecord, 'direction' | 'messageId'>): 
   return `${record.direction}:${record.messageId}`;
 }
 
+function outboundPeerMailbox(envelope: MessageEnvelope): string {
+  return normalizeMailboxId(envelope.semantic?.targetMailbox ?? 'default', 'peer reply mailbox');
+}
+
+function recordedPeerMailbox(record: ThreadRouteRecord): string {
+  return record.direction === 'outbound' && record.envelope
+    ? outboundPeerMailbox(record.envelope) : record.peerReplyMailbox;
+}
+
 const THREAD_STATE_RANK: Readonly<Record<ThreadRouteRecord['state'], number>> = {
   open: 0,
   replied: 1,
@@ -799,6 +808,7 @@ function loadState(raw: string): MailboxFileState {
       throw invalidStore();
     }
   }
+  const validatedWakeTargets = wakeTargets as Record<string, WakeTargetState>;
   const normalizedThreads: Record<string, ThreadRouteRecord> = {};
   let deliveredMailboxes: Map<string, string> | undefined;
   for (const [key, value] of Object.entries(threads)) {
@@ -817,10 +827,17 @@ function loadState(raw: string): MailboxFileState {
         }
       }
       const delivered = deliveredMailboxes.get(networkMessageKey(record.networkId, record.messageId));
+      const deliveryTarget = delivered === undefined ? undefined : validatedWakeTargets[delivered];
+      const pinnedTarget = record.localMailbox.startsWith('terminal:') && Object.hasOwn(wakeTargets, record.localMailbox)
+        ? validatedWakeTargets[record.localMailbox] : undefined;
+      // Legacy terminal pinning kept the delivered item in the rotating mailbox.
+      const preservesLegacyPin = record.localMailbox !== delivered && deliveryTarget?.rotateAfterWaves !== undefined &&
+        pinnedTarget !== undefined && pinnedTarget.rotateAfterWaves === undefined &&
+        pinnedTarget.driver !== 'passive' && pinnedTarget.driver === deliveryTarget.driver;
       normalizedThreads[expected] = {
         ...record,
         mailboxCommitted: delivered !== undefined,
-        localMailbox: delivered ?? record.localMailbox,
+        localMailbox: preservesLegacyPin ? record.localMailbox : delivered ?? record.localMailbox,
       };
     } else {
       normalizedThreads[expected] = record;
@@ -835,7 +852,7 @@ function loadState(raw: string): MailboxFileState {
     sequence,
     items,
     mailboxes: mailboxes as Record<string, MailboxStateRecord>,
-    wakeTargets: wakeTargets as Record<string, WakeTargetState>,
+    wakeTargets: validatedWakeTargets,
     threads: normalizedThreads,
   };
 }
@@ -1875,11 +1892,7 @@ export class MailboxStore {
       peerNodeId: peers[0] ?? '',
       peerNodeIds: peers,
       networkId: envelope.networkId,
-      // The outbound target, including an explicit payload mailbox, is where replies land.
-      peerReplyMailbox: normalizeMailboxId(
-        envelope.semantic?.targetMailbox ?? resolveMailboxId(envelope),
-        'peer reply mailbox',
-      ),
+      peerReplyMailbox: outboundPeerMailbox(envelope),
       localMailbox: local,
       traceId: envelope.traceId,
       kind: envelope.kind,
@@ -2079,13 +2092,13 @@ export class MailboxStore {
       : undefined;
     const records = threadRecordsFor(state, exact?.threadId ?? messageOrThreadId)
       .filter(candidate => candidate.networkId === record.networkId);
-    const targetMailbox = exactLeg !== undefined && exactLeg.peerReplyMailbox !== 'default'
-      ? exactLeg.peerReplyMailbox
+    const targetRecord = exactLeg !== undefined && recordedPeerMailbox(exactLeg) !== 'default'
+      ? exactLeg
       : (records.findLast(candidate =>
-          candidate.direction === 'inbound' && candidate.peerReplyMailbox !== 'default',
+          candidate.direction === 'inbound' && recordedPeerMailbox(candidate) !== 'default',
         ) ??
-        records.findLast(candidate => candidate.peerReplyMailbox !== 'default') ??
-        record).peerReplyMailbox;
+        records.findLast(candidate => recordedPeerMailbox(candidate) !== 'default') ??
+        record);
     const localMailbox = exactLeg !== undefined && exactLeg.mailboxCommitted !== false && exactLeg.localMailbox !== 'default'
       ? exactLeg.localMailbox
       : this.threadLocalMailboxFromState(state, record.threadId, record.networkId) ?? 'default';
@@ -2094,7 +2107,7 @@ export class MailboxStore {
       messageId: record.messageId,
       peerNodeId: record.peerNodeId,
       networkId: record.networkId,
-      targetMailbox,
+      targetMailbox: recordedPeerMailbox(targetRecord),
       localMailbox,
       traceId: record.traceId,
       kind: record.kind,

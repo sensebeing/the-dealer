@@ -486,7 +486,7 @@ export function createOrcaSpawnExecutorPlugin(options: OrcaSpawnOptions = {}): E
       if (!batch.length) throw beforeExternalEffect(new Error('Empty spawn batch'));
       const config = (runtimeConfig ?? {}) as OrcaSpawnOptions;
       const store = options.store ?? config.store;
-      return serializeThreadDeliveries(store, batch, async commit => {
+      return serializeThreadDeliveries(store, batch, context, async commit => {
         const routes = resolveOrcaRoutes(batch, options, config, 'spawn');
         const { sessions, launches } = await prepareOrcaSpawnBatch(routes, context, options, config, prepareSpawn);
         return executeDeliveryGroups('orca-spawn', batch, [...sessions, ...launches], commit);
@@ -692,7 +692,7 @@ export function createOrcaWaveExecutorPlugin(options: OrcaWaveOptions = {}): Exe
       if (!batch.length) throw beforeExternalEffect(new Error('Empty wave batch'));
       const config = (runtimeConfig ?? {}) as OrcaExecutorOptions;
       const store = options.store ?? config.store;
-      return serializeThreadDeliveries(store, batch, async commit => {
+      return serializeThreadDeliveries(store, batch, context, async commit => {
         const routes = resolveOrcaRoutes(batch, options, config, 'wave');
         const groups = await prepareOrcaWaveBatch(routes, context, options, config);
         return executeDeliveryGroups('orca-wave', batch, groups, commit);
@@ -710,7 +710,7 @@ export function createOrcaExecutorPlugin(options: OrcaExecutorOptions = {}): Exe
       if (!batch.length) throw beforeExternalEffect(new Error('Empty Orca batch'));
       const config = (runtimeConfig ?? {}) as OrcaExecutorOptions;
       const store = options.store ?? config.store;
-      return serializeThreadDeliveries(store, batch, async commit => {
+      return serializeThreadDeliveries(store, batch, context, async commit => {
         const routes = resolveOrcaRoutes(batch, options, config, 'spawn');
         const inboxRoutes = routes.filter(route => route.mode === 'inbox-only');
         const spawnRoutes = routes.filter(route => route.mode === 'spawn');

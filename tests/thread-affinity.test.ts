@@ -194,6 +194,22 @@ test('spawn preset reuses the task mailbox for follow-ups to an inbound root', a
   assert.deepEqual(terminalSends(calls).slice(before).map(terminalOf), ['term_child']);
 });
 
+test('dealer send --thread leaves a root’s payload mailbox hint out of the signed target', async t => {
+  const { alice, bob, calls, send } = await spawnPeers(t);
+  const hint = 'worktree:sender-hint';
+  const request = await send(bob, 'alice', '--body', JSON.stringify({ mailbox: hint }));
+  const mailboxId = `task:${request.messageId}`;
+  assert.equal(alice.mailbox.list({ mailboxId }).items[0]?.envelope.payload.mailbox, hint);
+  assert.equal(bob.mailbox.resolveReplyTarget(request.messageId, 'team')?.targetMailbox, 'default');
+
+  const followup = await send(bob, 'alice', '--thread', request.messageId, '--body', 'Additional context');
+  const items = alice.mailbox.list({ mailboxId }).items;
+  assert.equal(items.find(item => item.id === followup.messageId)?.envelope.semantic?.targetMailbox, undefined);
+  assert.deepEqual(items.map(item => item.id).sort(), [request.messageId, followup.messageId].sort());
+  assert.equal(alice.mailbox.list({ mailboxId: hint }).totalCount, 0);
+  assert.equal(calls.filter(call => call.args.slice(0, 2).join(' ') === 'worktree create').length, 1);
+});
+
 for (const [name, create] of [['orca', createOrcaExecutorPlugin], ['orca-spawn', createOrcaSpawnExecutorPlugin]] as const) {
   test(`standalone ${name} spawn delivers a batch to its owning thread and session mailboxes`, async t => {
     const store = new MailboxStore(join(directory(t), 'mailbox.json'));

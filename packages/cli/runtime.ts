@@ -1,4 +1,4 @@
-import { createNotifyExecutorPlugin, createInboxExecutorPlugin } from '../plugins-executor/index.ts';
+import { createNotifyExecutorPlugin, createInboxExecutorPlugin, serializeThreadDeliveries } from '../plugins-executor/index.ts';
 import { createOrcaWakeupDrivers } from '../plugins-orca/index.ts';
 import { createAgentHostWakeupDriver } from '../plugins-agent-host/index.ts';
 import { createDefaultHostPluginRegistry } from './registry.ts';
@@ -1165,7 +1165,7 @@ export class DealerNodeRuntime {
 
   /** Every registered executor receives the same attachment and receiver-config boundary. */
   private wrapExecutorWithAttachments(executor: ExecutorPlugin<any>): ExecutorPlugin<any> {
-    return { ...executor, execute: async (batch, context, config) => {
+    return { ...executor, execute: (batch, context, config) => serializeThreadDeliveries(this.mailbox, batch, context, async (_commit, reservedContext) => {
       const local = [];
       const signedEnvelopes: Record<string, MessageEnvelope> = { ...(context.signedEnvelopes ?? {}) };
       for (const envelope of batch) {
@@ -1181,8 +1181,8 @@ export class DealerNodeRuntime {
         const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload) ? envelope.payload : {};
         local.push({ ...envelope, payload: { ...payload, localAttachments: files } });
       }
-      return executor.execute(local, { ...context, signedEnvelopes }, { ...config, ...this.config.executorConfig[executor.name] });
-    } };
+      return executor.execute(local, { ...reservedContext, signedEnvelopes }, { ...config, ...this.config.executorConfig[executor.name] });
+    }) };
   }
 
   private describeInboundMailbox(envelope: MessageEnvelope): string {

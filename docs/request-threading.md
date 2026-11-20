@@ -61,8 +61,10 @@ follow-ups with their thread before choosing a delivery mode. With no existing o
 a follow-up in the same batch shares the root's session unless it names a concrete
 semantic target or explicitly selects an executor. Structured updates
 and comments sent with `dealer send --thread` return to the existing session.
-Outbound messages without an explicit reply mailbox advertise the sender's
-local bound mailbox before final signing.
+The sender uses a signed semantic destination or the peer's advertised reply
+mailbox when available. Otherwise it leaves the destination open for the
+receiver to resolve. Outbound messages without an explicit reply mailbox
+advertise the sender's local bound mailbox before final signing.
 
 Wave wake targets are registered before the first batch. Auto-creation requires
 a receiver-local repository root and creates a fixed top-level Orca workspace.

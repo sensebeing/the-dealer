@@ -48,6 +48,15 @@ export interface PreparedDelivery {
 }
 
 type ThreadCustody = (envelopes: readonly MessageEnvelope[]) => void;
+const threadReservation = Symbol('thread reservation');
+type ReservedExecutionContext = ExecutionContext & {
+  [threadReservation]?: {
+    storePath: string;
+    batch: readonly MessageEnvelope[];
+    commit: ThreadCustody;
+    reused: boolean;
+  };
+};
 const pendingThreadDeliveries = new Map<string, Promise<void>>();
 
 const threadDeliveryKey = (store: MailboxStore, envelope: MessageEnvelope) =>
@@ -55,9 +64,21 @@ const threadDeliveryKey = (store: MailboxStore, envelope: MessageEnvelope) =>
 
 /** Queue before yielding and release each thread when its final member takes custody. */
 export async function serializeThreadDeliveries<T>(
-  store: MailboxStore | undefined, batch: readonly MessageEnvelope[], deliver: (commit: ThreadCustody) => Promise<T>,
+  store: MailboxStore | undefined, batch: readonly MessageEnvelope[], context: ExecutionContext,
+  deliver: (commit: ThreadCustody, context: ExecutionContext) => Promise<T>,
 ): Promise<T> {
-  if (!store) return deliver(() => {});
+  if (!store) return deliver(() => {}, context);
+  const active = (context as ReservedExecutionContext)?.[threadReservation];
+  // The runtime prepares attachments before the mailbox-backed executor takes custody.
+  if (active?.storePath === store.path && !active.reused && active.batch.length === batch.length &&
+      batch.every((envelope, index) => {
+        const original = active.batch[index];
+        return envelope.id === original.id && envelope.networkId === original.networkId &&
+          envelopeThreadId(envelope) === envelopeThreadId(original);
+      })) {
+    active.reused = true;
+    return deliver(active.commit, context);
+  }
   const remaining = new Map<string, number>();
   for (const envelope of batch) {
     const key = threadDeliveryKey(store, envelope);
@@ -78,14 +99,18 @@ export async function serializeThreadDeliveries<T>(
   }
   try {
     if (previous.length) await Promise.all(previous);
-    return await deliver(envelopes => {
+    const commit: ThreadCustody = envelopes => {
       for (const envelope of envelopes) {
         const key = threadDeliveryKey(store, envelope);
         const count = (remaining.get(key) ?? 0) - 1;
         if (count === 0) releases.get(key)?.();
         remaining.set(key, count);
       }
-    });
+    };
+    const reservedContext: ReservedExecutionContext = {
+      ...context, [threadReservation]: { storePath: store.path, batch, commit, reused: false },
+    };
+    return await deliver(commit, reservedContext);
   } finally {
     for (const release of releases.values()) release();
   }
@@ -289,7 +314,7 @@ export function createInboxExecutorPlugin(options: InboxExecutorOptions = {}): E
     name: 'inbox',
     execute(batch, context, runtimeConfig) {
       const config = (runtimeConfig ?? {}) as InboxExecutorOptions;
-      return serializeThreadDeliveries(store, batch, async commit => {
+      return serializeThreadDeliveries(store, batch, context, async commit => {
         const groups = await prepareInboxBatch(batch, context, store, {
           wakeup: options.wakeup ?? config.wakeup,
           resolveTopicBinding: options.resolveTopicBinding ?? config.resolveTopicBinding,
