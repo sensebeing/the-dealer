@@ -53,6 +53,7 @@ export interface OrcaTerminalDriverConfig {
 }
 export interface OrcaRunDriverConfig extends OrcaTerminalDriverConfig {
   runId?: string;
+  dedicatedSpawn?: boolean;
 }
 
 type OrcaWakeTarget = WakeTargetState & OrcaRunDriverConfig;
@@ -77,6 +78,8 @@ export function readOrcaDriverConfig(target: Pick<WakeTargetState, 'driverConfig
     throw new Error('Invalid Orca driver agent');
   if (config.autoCreateWorkspace !== undefined && typeof config.autoCreateWorkspace !== 'boolean')
     throw new Error('Invalid Orca workspace creation policy');
+  if (config.dedicatedSpawn !== undefined && typeof config.dedicatedSpawn !== 'boolean')
+    throw new Error('Invalid Orca dedicated spawn policy');
   return config as OrcaRunDriverConfig;
 }
 
@@ -88,6 +91,10 @@ export function serializeOrcaDriverConfig(config: OrcaRunDriverConfig): Record<s
 
 function readOrcaWakeTarget(target: WakeTargetState): OrcaWakeTarget {
   return { ...readOrcaDriverConfig(target), ...target };
+}
+
+function isDedicatedSpawn(target: OrcaWakeTarget): boolean {
+  return target.dedicatedSpawn === true || target.mailboxId.startsWith('task:');
 }
 
 export interface OrcaWakeupDriverOptions {
@@ -528,6 +535,7 @@ export function pinOrcaTerminalSessionMailbox(
   }
   if (!rotatingOwner) return id;
   const sessionMailboxId = `terminal:${handle}`;
+  // The live target can be advertised as a reply address. Wake completion pins committed routes.
   return store.pinSessionMailbox(rotatingOwner.mailboxId, sessionMailboxId, {
     driver: 'orca-terminal',
     driverConfig: buildPinnedOrcaSessionDriverConfig(readOrcaWakeTarget(rotatingOwner), store.getWakeTarget(sessionMailboxId), handle),
@@ -608,7 +616,7 @@ class OrcaWakeDelivery {
   }
 
   private needsDedicatedTab(mailboxId: string, target: OrcaWakeTarget): boolean {
-    if (mailboxId.startsWith('task:') || target.rotateAfterWaves !== undefined) return true;
+    if (isDedicatedSpawn(target) || target.rotateAfterWaves !== undefined) return true;
     if (!mailboxId.startsWith('stream:')) return false;
     return baseStreamKeyOf(mailboxId.slice('stream:'.length)) !== undefined ||
       this.store.listWakeTargets().some(item => baseStreamKeyOf(item.mailboxId) === mailboxId);
@@ -635,7 +643,7 @@ class OrcaWakeDelivery {
       return false;
     }
     if (needsSessionRotation(target, preview)) return true;
-    if (target.mailboxId.startsWith('task:') || target.sessionId?.trim() || target.paneKey?.trim()) {
+    if (isDedicatedSpawn(target) || target.sessionId?.trim() || target.paneKey?.trim()) {
       if (!target.terminalHandle && !target.paneKey) return true;
       return !this.idleCheck && !(await isOrcaWorkspaceTerminalLive(
         this.runner, command, workspacePath, target.terminalHandle, undefined, target.paneKey,
@@ -812,16 +820,16 @@ class OrcaWakeDelivery {
     const needsRotation = needsSessionRotation(target, preview);
     const spawnFreshSession = !needsRotation && options.freshSession;
     let rotated = false;
-    const dedicatedTaskTab =
-      mailboxId.startsWith('task:') && target.driver === 'orca-terminal' && Boolean(target.workspacePath);
-    const replaceTaskTab =
-      dedicatedTaskTab &&
+    const dedicatedSpawnTab =
+      isDedicatedSpawn(target) && target.driver === 'orca-terminal' && Boolean(target.workspacePath);
+    const replaceSpawnTab =
+      dedicatedSpawnTab &&
       !(needsRotation || spawnFreshSession) &&
       ((!terminalHandle && !target.paneKey) ||
         (!this.idleCheck &&
           !(await isOrcaWorkspaceTerminalLive(this.runner, command, target.workspacePath!, terminalHandle, undefined, target.paneKey))));
 
-    if (needsRotation || spawnFreshSession || replaceTaskTab) {
+    if (needsRotation || spawnFreshSession || replaceSpawnTab) {
       // Rotation never resets an existing TUI: it opens a new session tab and retires the
       // replaced tab once the launch commits. A missing workspace makes that impossible and must
       // fail loudly; a fresh-tab plan has already proven its workspace in `spawnsFreshSession`.

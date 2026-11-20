@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ExecutorPlugin } from '../core-types/index.ts';
+import type { ExecutorPlugin, MessageEnvelope } from '../core-types/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import {
   buildAgentHostInvocation,
@@ -11,12 +11,14 @@ import {
   defaultAgentCommandArgs,
 } from './hosts.ts';
 import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from './hosts.ts';
-import { MailboxStore, resolveMailboxId } from '../mailbox/index.ts';
-import type { MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
+import { canInheritThreadMailbox, groupThreadBatch, hasExplicitExecutor, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveSpawnMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
+import type { MailboxStore, MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
-import type { CommandRunner } from '../subprocess/index.ts';
+import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import {
-  createInboxExecutorPlugin,
+  prepareInboxDeliveries,
+  executeDeliveryGroups,
+  serializeThreadDeliveries,
   createRawCommandExecutorPlugin,
   renderWave,
   beforeExternalEffect,
@@ -101,186 +103,210 @@ export function createNamedHostExecutorPlugin(
   );
 }
 
+type HostDelivery = {
+  type: 'host';
+  mode: ActiveConversationMode;
+  mailboxId: string;
+  request: CommandRequest;
+  driverConfig: Record<string, unknown>;
+  trustWorkspace?: string;
+};
+
+function prepareAgentDelivery(
+  envelope: MessageEnvelope,
+  promptBatch: readonly MessageEnvelope[],
+  options: AgentOptions,
+  config: Partial<AgentOptions>,
+  store: MailboxStore | undefined,
+  host: SupportedAgentHost | undefined,
+): HostDelivery | { type: 'inbox'; mailboxId: string } | { type: 'raw' } {
+  const payload = envelope.payload ?? {};
+  const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
+  const binding = (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(envelope.kind, streamKey);
+  const agentInput = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
+  const agent = agentInput === undefined ? undefined : parseAgentHost(agentInput);
+  let rawMode: AgentConversationMode | undefined;
+  try {
+    rawMode = normalizeConversationModeInput(payload) ?? normalizeConversationModeInput(binding) ??
+      normalizeConversationModeInput(config) ?? normalizeConversationModeInput(options) ?? (host ? 'spawn' : undefined);
+  } catch {
+    throw new Error('Invalid agent conversationMode');
+  }
+  const usesHost = usesAgentHostInvocation(agent, rawMode, Boolean(host));
+  const threadLocalMailbox = store?.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
+    excludeInboundMessageId: envelope.id,
+  });
+  const addressing: MailboxTopicBinding = {
+    mailboxId: binding?.mailboxId,
+    streamKey: binding?.streamKey,
+    stream: binding?.stream,
+    mode: rawMode ?? 'spawn',
+  };
+  const boundMailboxId = resolveBoundMailboxId(resolveTopicAddress(envelope.kind, streamKey).kind, addressing, rawMode);
+  if (store && !hasExplicitExecutor(envelope)) {
+    const sessionMailbox = resolveSessionOrThreadMailbox(envelope, threadLocalMailbox);
+    if (sessionMailbox !== undefined && (sessionMailbox !== boundMailboxId || !usesHost)) {
+      return { type: 'inbox', mailboxId: sessionMailbox };
+    }
+  }
+  if (!usesHost) return { type: 'raw' };
+  if (rawMode === 'inbox-only') {
+    if (store && binding?.mode === 'inbox-only') {
+      return { type: 'inbox', mailboxId: resolveMailboxId(envelope, binding, threadLocalMailbox) };
+    }
+    throw new Error('Invalid agent conversationMode');
+  }
+  const conversationMode: ActiveConversationMode = rawMode ?? 'spawn';
+  const mailboxId = conversationMode === 'spawn'
+    ? addressing.mailboxId !== undefined ? boundMailboxId : resolveSpawnMailboxId(envelope.id)
+    : resolveMailboxId(envelope, addressing, threadLocalMailbox, 'inbox-only');
+  const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
+  const command = config.command ?? options.command;
+  const agentProfile = optionalHostString(
+    payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile, 'agentProfile',
+  );
+  const targetBot = optionalHostString(
+    payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot, 'targetBot',
+  );
+  const sessionId = resolveAgentSessionId(mailboxId, optionalHostString(
+    payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId, 'sessionId',
+  ), agent ?? 'codex');
+  const terminalPrompt = typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined;
+  const invocation = buildAgentHostInvocation({
+    agent: agent ?? 'codex', conversationMode, mailboxId,
+    promptText: singleLine(terminalPrompt || renderWave(promptBatch)),
+    cwd, command, agentProfile, targetBot, sessionId,
+  });
+  const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
+  return {
+    type: 'host',
+    mode: conversationMode,
+    mailboxId,
+    request: { ...invocation, cwd },
+    driverConfig: serializeAgentHostDriverConfig({
+      hostAgent: agent ?? 'codex', conversationMode, sessionId,
+      ...(cwd ? { workspacePath: cwd } : {}),
+      ...(command ? { interactiveCommand: command } : {}),
+      ...(agentProfile ? { agentProfile } : {}),
+      ...(targetBot ? { targetBot } : {}),
+    }),
+    ...(canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app' ? { trustWorkspace: cwd } : {}),
+  };
+}
+
+function commandOutput(output: { stdout: string; stderr?: string }) {
+  let result: unknown;
+  try {
+    result = JSON.parse(output.stdout);
+  } catch {
+    result = output.stdout;
+  }
+  return { output: result, stderr: output.stderr ?? '' };
+}
+
 function createAgentExecutorPlugin(
   name: string,
   options: AgentOptions,
   host?: SupportedAgentHost,
   agySettingsPath?: string,
 ): ExecutorPlugin {
+  const runner = options.commandRunner ?? runCommand;
+  const mayTrustWorkspace = agySettingsPath !== undefined || runner === runCommand;
+  const rawCommand = options.command ?? 'codex';
+  const rawExecutor = createRawCommandExecutorPlugin({
+    ...options, command: rawCommand, args: options.args ?? defaultAgentCommandArgs(rawCommand),
+  });
+  const trustWorkspace = (delivery: HostDelivery) => {
+    if (mayTrustWorkspace && delivery.trustWorkspace) trustAntigravityWorkspace(delivery.trustWorkspace, agySettingsPath);
+  };
   return {
     name,
     async execute(batch, context, runtimeConfig) {
-      const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
       const first = batch[0];
       if (!first) throw beforeExternalEffect(new Error('Empty agent batch'));
-      const payload = first?.payload ?? {};
-      const binding = first
-        ? (options.resolveTopicBinding ?? config.resolveTopicBinding)?.(
-            first.kind,
-            typeof first?.payload?.streamKey === 'string' ? first.payload.streamKey : undefined,
-          )
-        : undefined;
-      const agentInput = host ?? payload.agent ?? binding?.agent ?? config.agent ?? options.agent;
-      const agent =
-        agentInput === undefined ? undefined : prepareExternalEffect(() => parseAgentHost(agentInput));
-      let rawMode: AgentConversationMode | undefined;
-      try {
-        rawMode =
-          [payload, binding, config, options].reduce<AgentConversationMode | undefined>(
-            (acc, layer) => acc ?? normalizeConversationModeInput(layer),
-            undefined,
-          ) ?? (host ? 'spawn' : undefined);
-      } catch {
-        throw beforeExternalEffect(new Error('Invalid agent conversationMode'));
-      }
-      const canonicalHost = agent ? prepareExternalEffect(() => normalizeAgentHost(agent)) : undefined;
-      const hostMode = prepareExternalEffect(() => usesAgentHostInvocation(agent, rawMode, Boolean(host)));
-      if (!hostMode) {
-        const command = options.command ?? 'codex';
-        return createRawCommandExecutorPlugin({
-          ...options,
-          command,
-          args: options.args ?? defaultAgentCommandArgs(command),
-        }).execute(batch, context, runtimeConfig);
-      }
-      let request;
-      let mailboxId: string | undefined;
-      let effectiveSessionId: string | undefined;
-      let wakeDelivered = false;
+      const config = (runtimeConfig ?? {}) as Partial<AgentOptions>;
       const store = options.store ?? config.store;
-      const runner = options.commandRunner ?? runCommand;
-      let claim: ReturnType<WakeupRedriveService['claim']> | undefined;
-      try {
-        {
-          if (rawMode === 'inbox-only') {
-            if (store && binding?.mode === 'inbox-only')
-              return createInboxExecutorPlugin({ store }).execute(batch, context, runtimeConfig);
-            throw beforeExternalEffect(new Error('Invalid agent conversationMode'));
-          }
-          if (rawMode !== undefined && rawMode !== 'spawn' && rawMode !== 'wave' && rawMode !== 'fixed')
-            throw beforeExternalEffect(new Error('Invalid agent conversationMode'));
-          const conversationMode = (rawMode ?? 'spawn') as ActiveConversationMode;
-          mailboxId =
-            conversationMode === 'spawn'
-              ? `task:${first.id}`
-              : prepareExternalEffect(() => resolveMailboxId(first, {
-                  mailboxId: binding?.mailboxId,
-                  streamKey: binding?.streamKey,
-                  stream: binding?.stream,
-                  mode: conversationMode,
-                }, undefined, 'inbox-only'));
-          const terminalPrompt =
-            typeof payload.terminalPrompt === 'string'
-              ? payload.terminalPrompt.trim() || undefined
-              : undefined;
-          const cwd = binding?.workspacePath ?? binding?.repoRoot ?? config.cwd ?? options.cwd;
-          const command = config.command ?? options.command;
-          const agentProfile = prepareExternalEffect(() =>
-            optionalHostString(
-              payload.agentProfile ?? binding?.agentProfile ?? config.agentProfile ?? options.agentProfile,
-              'agentProfile',
-            ),
-          );
-          const targetBot = prepareExternalEffect(() =>
-            optionalHostString(
-              payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot,
-              'targetBot',
-            ),
-          );
-          const sessionId = prepareExternalEffect(() =>
-            optionalHostString(
-              payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId,
-              'sessionId',
-            ),
-          );
-          effectiveSessionId = prepareExternalEffect(() =>
-            resolveAgentSessionId(mailboxId, sessionId, agent ?? 'codex'),
-          );
-          const invocation = prepareExternalEffect(() =>
-            buildAgentHostInvocation({
-              agent: agent ?? 'codex',
-              conversationMode,
-              mailboxId,
-              promptText: singleLine(terminalPrompt ?? renderWave(batch)),
-              cwd,
-              command,
-              agentProfile,
-              targetBot,
-              sessionId: effectiveSessionId,
-            }),
-          );
-          if (
-            (canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app') &&
-            cwd &&
-            (agySettingsPath !== undefined ||
-              options.commandRunner === undefined ||
-              options.commandRunner === runCommand)
-          ) {
-            trustAntigravityWorkspace(cwd, agySettingsPath);
-          }
-          claim = (options.wakeup ?? config.wakeup)?.claim(mailboxId);
-          if (store) {
-            store.enqueue(batch, {
-              ...(context?.signedEnvelopes ? { signedEnvelopes: context.signedEnvelopes } : {}),
-              mailboxId,
-              wakeTarget: {
-                driver: 'agent-host',
-                driverConfig: serializeAgentHostDriverConfig({
-                  hostAgent: agent ?? 'codex',
-                  conversationMode,
-                  ...(cwd ? { workspacePath: cwd } : {}),
-                  ...(command ? { interactiveCommand: command } : {}),
-                  ...(agentProfile ? { agentProfile } : {}),
-                  ...(targetBot ? { targetBot } : {}),
-                  sessionId: effectiveSessionId,
-                }),
-              },
-            });
-          } else {
-            request = { ...invocation, cwd };
+      const wakeup = options.wakeup ?? config.wakeup;
+      return serializeThreadDeliveries(store, batch, context, async commit => {
+        const threadGroups = store ? prepareExternalEffect(() => groupThreadBatch(batch, store)) : batch.map(envelope => [envelope]);
+        const deliveries = threadGroups.map((envelopes, index) => ({
+          envelopes,
+          delivery: prepareExternalEffect(() =>
+            prepareAgentDelivery(envelopes[0], !store && index === 0 ? batch : envelopes, options, config, store, host),
+          ),
+        }));
+        if (!store) {
+          const { delivery } = deliveries[0];
+          if (delivery.type === 'raw') return rawExecutor.execute(batch, context, runtimeConfig);
+          if (delivery.type !== 'host') throw beforeExternalEffect(new Error('Inbox delivery requires a mailbox store'));
+          trustWorkspace(delivery);
+          const output = await checkedCommand(runner, { ...delivery.request, signal: context.signal }).catch(rethrowBeforeCommandStart);
+          return { executor: name, executionId: randomUUID(), ...commandOutput(output) };
+        }
+
+        const inboxGroups = new Map<string, MessageEnvelope[]>();
+        const hostGroups = new Map<string, { delivery: HostDelivery; envelopes: MessageEnvelope[] }>();
+        const spawnGroups: { delivery: HostDelivery; envelopes: MessageEnvelope[] }[] = [];
+        const rawBatch: MessageEnvelope[] = [];
+        for (const { envelopes, delivery } of deliveries) {
+          switch (delivery.type) {
+            case 'raw':
+              rawBatch.push(...envelopes);
+              break;
+            case 'inbox': {
+              const group = inboxGroups.get(delivery.mailboxId) ?? [];
+              group.push(...envelopes);
+              inboxGroups.set(delivery.mailboxId, group);
+              break;
+            }
+            case 'host': {
+              if (delivery.mode === 'spawn') {
+                spawnGroups.push({ delivery, envelopes });
+                break;
+              }
+              const group = hostGroups.get(delivery.mailboxId) ?? { delivery, envelopes: [] };
+              group.envelopes.push(...envelopes);
+              hostGroups.set(delivery.mailboxId, group);
+              break;
+            }
           }
         }
-        let output;
-        if (store && mailboxId) {
-          // The mailbox owner builds the pointer and settles the lease for both initial and redrive paths.
-          try {
-            const delivered = await deliverAgentHostWakeTarget(store, runner, mailboxId, {
-              signal: context.signal,
-            });
-            output = { stdout: delivered.stdout, stderr: delivered.stderr };
-            wakeDelivered = true;
-          } catch (error) {
-            return {
-              executor: name,
-              executionId: randomUUID(),
-              mailboxId,
-              woke: false,
-              reason: String(error),
-            };
-          }
-        } else {
-          output = await checkedCommand(runner, { ...request, signal: context.signal }).catch(
-            rethrowBeforeCommandStart,
-          );
+        const groups = await prepareInboxDeliveries(store, wakeup, inboxGroups, context);
+        for (const { delivery, envelopes } of [...hostGroups.values(), ...spawnGroups]) {
+          const proposedSpawn = delivery.mode === 'spawn' && canInheritThreadMailbox(envelopes[0]);
+          groups.push({ envelopes, async deliver(committed) {
+            const { mailboxId } = delivery;
+            const claim = wakeup?.claim(mailboxId);
+            let woke = false;
+            try {
+              const result = store.enqueue(envelopes, {
+                signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
+                wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
+              });
+              committed();
+              const receipt = { ...result, executor: name, executionId: randomUUID(),
+                ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
+              for (const actualMailbox of result.mailboxIds) {
+                if (actualMailbox !== mailboxId || result.claimedSpawn === false) wakeup?.notifyMailbox(actualMailbox);
+              }
+              if (result.claimedSpawn === false || !result.mailboxIds.includes(mailboxId)) return receipt;
+              try {
+                trustWorkspace(delivery);
+                const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
+                woke = true;
+                return { ...receipt, woke, ...commandOutput(response) };
+              } catch (error) {
+                return { ...receipt, woke, reason: String(error) };
+              }
+            } finally {
+              claim?.dispose();
+              if (woke) wakeup?.notifyMailbox(mailboxId);
+            }
+          } });
         }
-        let structuredOutput: unknown;
-        try {
-          structuredOutput = JSON.parse(output.stdout);
-        } catch {
-          structuredOutput = output.stdout;
-        }
-        return {
-          executor: name,
-          executionId: randomUUID(),
-          output: structuredOutput,
-          stderr: output.stderr ?? '',
-          ...(mailboxId ? { mailboxId } : {}),
-          ...(wakeDelivered ? { woke: true } : {}),
-        };
-      } finally {
-        claim?.dispose();
-        if (wakeDelivered && mailboxId) (options.wakeup ?? config.wakeup)?.notifyMailbox(mailboxId);
-      }
+        if (rawBatch.length) groups.push({ envelopes: rawBatch, deliver: () => rawExecutor.execute(rawBatch, context, runtimeConfig) });
+        return executeDeliveryGroups(name, batch, groups, commit);
+      });
     },
   };
 }

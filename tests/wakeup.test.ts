@@ -1515,6 +1515,7 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
   assert.equal(store.list({ mailboxId: 'task:task-timeout' }).queuedCount, 1);
 
   await until(() => store.getWakeTarget('task:task-timeout')!.attemptCount > 0, 'claim release probes busy target');
+  await service.flushMailbox('task:task-timeout');
   idle = true;
   await service.flushMailbox('task:task-timeout', { force: true });
   const preambleSends = terminalSends(calls);
@@ -1556,9 +1557,14 @@ test('orca-spawn never injects after a failed idle wait and redrive sends the ta
         subject: promptCase.subject,
         payload: { interactive: true, terminalPrompt: promptCase.terminalPrompt },
       });
-      await executor.execute([message], {} as ExecutionContext);
+      const claim = direct ? undefined : service.claim(`task:${message.id}`);
+      try {
+        await executor.execute([message], {} as ExecutionContext);
+        if (!direct) assert.equal(terminalSends(calls).length, 0);
+      } finally {
+        claim?.dispose();
+      }
       if (!direct) {
-        assert.equal(terminalSends(calls).length, 0);
         await service.flushMailbox(`task:${message.id}`);
       }
       const sends = terminalSends(calls);
@@ -2638,21 +2644,21 @@ test('only newly inserted conversational frames bypass coalescing and never rese
   t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   for (const type of ['question', 'reply', 'settle'] as const) {
-    store.enqueue([alert(type, { semantic: { type, threadId: 'thread', ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } })], {
+    store.enqueue([alert(type, { semantic: { type, threadId: type, ...(type === 'settle' ? { outcome: 'succeeded' as const } : {}) } })], {
       mailboxId: type,
       wakeTarget: { driver: 'orca-run', coalesceMs: 5000, driverConfig: { runId: 'run' } },
     });
     assert.equal(store.getWakeTarget(type)?.earliestWakeAt, 10_000);
   }
-  store.enqueue([alert('normal'), alert('control', { semantic: { type: 'reply', threadId: 'thread' } })], {
+  store.enqueue([alert('normal'), alert('control', { semantic: { type: 'reply', threadId: 'mixed' } })], {
     mailboxId: 'mixed',
     wakeTarget: { driver: 'orca-run', coalesceMs: 5000, driverConfig: { runId: 'run' } },
   });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 15_000);
-  store.enqueue([alert('normal'), alert('new-control', { semantic: { type: 'question', threadId: 'thread' } })], { mailboxId: 'mixed' });
+  store.enqueue([alert('normal'), alert('new-control', { semantic: { type: 'question', threadId: 'mixed' } })], { mailboxId: 'mixed' });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 10_000, 'duplicates do not affect classification');
   store.upsertWakeTarget('mixed', { attemptCount: 2, earliestWakeAt: 30_000 });
-  store.enqueue([alert('retry', { semantic: { type: 'settle', threadId: 'thread', outcome: 'succeeded' } })], { mailboxId: 'mixed' });
+  store.enqueue([alert('retry', { semantic: { type: 'settle', threadId: 'mixed', outcome: 'succeeded' } })], { mailboxId: 'mixed' });
   assert.equal(store.getWakeTarget('mixed')?.earliestWakeAt, 30_000);
   const calls: CommandRequest[] = [];
   const wakeup = new WakeupRedriveService({
@@ -3347,6 +3353,46 @@ test('durable spawn survives the account gate and redrives into one dedicated ag
   assert.ok(state.calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'set').length >= 2);
 });
 
+test('a named Orca spawn mailbox recovers its own terminal after restart', async t => {
+  const root = directory(t);
+  const workspacePath = join(root, 'child');
+  const mailboxId = 'named-spawn';
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const { runner: inventory, state } = fakeOrcaWorkspace(workspacePath, [
+    { handle: 'shell', connected: true, writable: true, preview: 'user@host %' },
+    { handle: 'sibling-agent', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
+  ]);
+  const runner: CommandRunner = async request => {
+    if (request.args[0] === 'worktree' && request.args[1] === 'create') {
+      state.calls.push(request);
+      return { stdout: JSON.stringify({ ok: true, result: { worktree: { path: workspacePath } } }) };
+    }
+    return inventory(request);
+  };
+  const plugin = createOrcaSpawnExecutorPlugin({
+    store, commandRunner: runner, cwd: root, noParent: true,
+    resolveTopicBinding: () => ({ mailboxId, mode: 'spawn' }),
+  });
+  state.waitOk = false;
+  const receipt = await plugin.execute([alert('named-spawn')], { networkId: 'team', nodeId: 'receiver', traceId: 'spawn' }, {});
+  assert.equal(receipt.mailboxId, mailboxId);
+  assert.equal(receipt.woke, false);
+  assert.equal(state.created, 1);
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-new-1');
+  state.waitOk = true;
+  const recovered = new MailboxStore(store.path);
+  const wakeup = new WakeupRedriveService({ store: recovered, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => wakeup.stop());
+  assert.equal((await wakeup.flushMailbox(mailboxId, { force: true })).woke, true);
+  assert.equal(state.calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'create').length, 1);
+  assert.equal(state.created, 2);
+  assert.equal(terminalSends(state.calls).length, 1);
+  assert.match(textOf(sendsTo(state.calls, 'term-new-2')[0]), /dealer inbox check --mailbox named-spawn --json/);
+  assert.equal(recovered.getWakeTarget(mailboxId)?.driverConfig?.dedicatedSpawn, true);
+});
+
 test('spawn keeps durable custody through launch, comment and pointer failures', async t => {
   // Preparation failures remain retryable; an attempted pointer remains fenced. Neither
   // may turn the already-committed task into a failed dispatcher/CAS handoff.
@@ -3843,10 +3889,15 @@ for (const source of ['refresh', 'wave'] as const) {
     };
     let service = new WakeupRedriveService({ store: runtime.mailbox, drivers: createTestWakeupDrivers({ commandRunner: runner })});
     t.after(() => service.stop());
-    await ingest('wave-one');
-    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, undefined);
-    assert.equal(sessionBinding(runtime.mailbox.getWakeTarget(mailboxId)).paneKey, undefined);
-    assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.completedWaves, 0);
+    const initialClaim = service.claim(mailboxId);
+    try {
+      await ingest('wave-one');
+      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, undefined);
+      assert.equal(sessionBinding(runtime.mailbox.getWakeTarget(mailboxId)).paneKey, undefined);
+      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.completedWaves, 0);
+    } finally {
+      initialClaim.dispose();
+    }
     assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
     assert.equal(sendsTo(state.calls, 'term-A').length, 0);
     const firstCreate = state.calls.find(call => call.args[1] === 'create')!;
@@ -4088,9 +4139,14 @@ for (const source of ['refresh', 'wave'] as const) {
           await plugin.execute([alert(id)], { networkId: 'team', nodeId: 'receiver', traceId: id }, {});
         }
       };
-      await ingest('first');
-      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, baseline ? 'term-rotated' : undefined);
-      assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.sessionId, baseline ? undefined : 'B');
+      const initialClaim = service.claim(mailboxId);
+      try {
+        await ingest('first');
+        assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.terminalHandle, baseline ? 'term-rotated' : undefined);
+        assert.equal(runtime.mailbox.getWakeTarget(mailboxId)!.driverConfig?.sessionId, baseline ? undefined : 'B');
+      } finally {
+        initialClaim.dispose();
+      }
       assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
       assert.equal(state.created, baseline ? 0 : 1);
       if (baseline) {

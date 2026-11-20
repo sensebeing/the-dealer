@@ -1,4 +1,4 @@
-import { createNotifyExecutorPlugin, createInboxExecutorPlugin } from '../plugins-executor/index.ts';
+import { createNotifyExecutorPlugin, createInboxExecutorPlugin, serializeThreadDeliveries } from '../plugins-executor/index.ts';
 import { createOrcaWakeupDrivers } from '../plugins-orca/index.ts';
 import { createAgentHostWakeupDriver } from '../plugins-agent-host/index.ts';
 import { createDefaultHostPluginRegistry } from './registry.ts';
@@ -25,6 +25,7 @@ import {
   isConfirmedHandoffReceipt,
   isDedupCasDuplicateReceipt,
   isDurableQueuedReceipt,
+  isValidMailboxId,
 } from '../core-types/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
 import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAppExecutorPlugin, createChatgptAppExecutorPlugin, createAntigravityCliExecutorPlugin, createAntigravityAppExecutorPlugin, createClaudeCodeExecutorPlugin, createAntigravityExecutorPlugin, createAgentPtyExecutorPlugin } from '../plugins-agent-host/index.ts';
@@ -32,7 +33,7 @@ import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
 import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
+import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -557,7 +558,12 @@ export class DealerNodeRuntime {
           requiredPolicies: () => this.config.policies,
           ledgerPath: join(this.stateDir, 'deliveries.json'),
           wrapExecutor: executor => this.wrapExecutorWithAttachments(executor),
-          resolveKindExecutor: (kind, streamKey) => this.resolveTopicDefaultExecutor(kind, streamKey) ?? this.config.defaultExecutor,
+          withExecutionScope: (batch, context, execute) =>
+            serializeThreadDeliveries(this.mailbox, batch, context, (_commit, reservedContext) => execute(reservedContext)),
+          resolveExecutor: envelope => this.resolveExecutorName(envelope),
+          onError: (error, { stage, networkId, fromNodeId, messageId }) => {
+            this.lastError = `${stage} failure for ${networkId}/${fromNodeId}/${messageId}: ${String(error)}`;
+          },
         }),
       );
       await this.kernel.use(
@@ -1125,9 +1131,11 @@ export class DealerNodeRuntime {
   }
 
   resolveExecutorName(envelope: {
+    id?: string;
+    networkId?: string;
     kind: string;
     payload?: Record<string, any>;
-    semantic?: { type?: string };
+    semantic?: { type?: string; threadId?: string; targetMailbox?: string };
   }): string {
     // Session control must land in the target mailbox, never in a new worktree.
     const type = envelope.semantic?.type;
@@ -1138,7 +1146,23 @@ export class DealerNodeRuntime {
     if (typeof explicit === 'string' && explicit.trim().length > 0) {
       return explicit;
     }
-    return this.resolveTopicDefaultExecutor(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined) ?? this.config.defaultExecutor;
+    const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
+    const targetMailbox = envelope.semantic?.targetMailbox;
+    // The signed-header boundary rejects invalid targets. Keep direct selection side-effect-free too.
+    if (targetMailbox !== undefined && !isValidMailboxId(targetMailbox)) return 'inbox';
+    const sessionMailbox = resolveSessionOrThreadMailbox(envelope, this.mailbox?.resolveThreadLocalMailbox(
+      envelope.semantic?.threadId, envelope.networkId, { excludeInboundMessageId: envelope.id },
+    ));
+    if (sessionMailbox !== undefined) {
+      const resolved = this.resolveTopicBinding(envelope.kind, streamKey);
+      const boundMailboxId = resolved ? resolveBoundMailboxId(
+        resolveTopicAddress(envelope.kind, streamKey).kind,
+        this.registry.toMailboxBinding(resolved.binding, this.config.executorConfig, envelope.payload),
+      ) : 'default';
+      if (sessionMailbox !== boundMailboxId) return 'inbox';
+      if (resolved) return resolved.binding.executor;
+    }
+    return this.resolveTopicDefaultExecutor(envelope.kind, streamKey) ?? this.config.defaultExecutor;
   }
 
   /** Every registered executor receives the same attachment and receiver-config boundary. */
@@ -1163,38 +1187,49 @@ export class DealerNodeRuntime {
     } };
   }
 
+  private describeInboundMailbox(envelope: MessageEnvelope): string {
+    const streamKey = typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined;
+    const binding = this.resolveTopicBinding(envelope.kind, streamKey)?.binding;
+    // The registry handles queued mode hints without validating execution prematurely.
+    return resolveMailboxId(
+      { ...envelope, payload: { ...envelope.payload, mode: undefined, conversationMode: undefined } },
+      binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
+      this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId, {
+        excludeInboundMessageId: envelope.id,
+      }),
+      this.registry.toMailboxBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
+    );
+  }
+
   private integrationPlugin(): Plugin {
     return {
       name: 'runtime-plugins',
       inject: ['dispatcher', 'transport', 'emitter', 'router'],
       apply: ctx => {
-        // Thread reverse routes are populated from the authenticated dispatcher/emitter boundary,
-        // not from raw transport frames, so forged senders and gate-rejected messages never
-        // create routes.
+        // The mailbox owns admitted delivery routes. The dispatcher also reports queued and
+        // non-mailbox executions so their authenticated history is available for inspection.
         ctx.on('dispatcher/inbound', ({ envelope, receipt }) => {
           if (receipt.stage === 'rejected') {
             return;
           }
           try {
-            const binding = this.resolveTopicBinding(envelope.kind, typeof envelope.payload?.streamKey === 'string' ? envelope.payload.streamKey : undefined)?.binding;
+            const committed = this.mailbox.getInboundThreadRecord(envelope.id, envelope.networkId);
+            if (committed && committed.mailboxCommitted !== false) {
+              if (receipt.stage === 'dispatched') {
+                const target = this.mailbox.getWakeTarget(committed.localMailbox);
+                if (target) this.registry.pinDeliveredInboundMailbox(this.mailbox, committed.localMailbox, target);
+              }
+              return;
+            }
             const execution = receipt.stage === 'dispatched' && receipt.executionReceipt;
-            const authoritativeMailbox = execution && typeof execution === 'object' &&
-              typeof execution.mailboxId === 'string' &&
-              (!Array.isArray(execution.mailboxIds) || execution.mailboxIds.length === 1)
-              ? normalizeMailboxId(execution.mailboxId) : undefined;
-            const mailboxId = authoritativeMailbox ?? resolveMailboxId(
-              // Mode hints are normalized by the payload-aware binding adapter below, including
-              // queued messages whose executor has not yet validated their payload.
-              { ...envelope, payload: { ...envelope.payload, mode: undefined, conversationMode: undefined } },
-              binding ? this.registry.toMailboxBinding(binding, this.config.executorConfig, envelope.payload) : undefined,
-              this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId, envelope.networkId),
-              this.registry.toMailboxBinding({ executor: this.resolveExecutorName(envelope) }, this.config.executorConfig, envelope.payload).mode,
-            );
-            // Inbound receipts can arrive after a synchronous pointer delivery; preserve its session.
-            const target = this.mailbox.getWakeTarget(mailboxId);
-            const localMailbox = target
-              ? this.registry.pinDeliveredInboundMailbox(this.mailbox, mailboxId, target) : mailboxId;
-            this.mailbox.recordInboundEnvelope(envelope, localMailbox);
+            const envelopeMailboxes = execution ? execution.envelopeMailboxes : undefined;
+            const reportedMailbox = envelopeMailboxes !== undefined
+              ? Object.hasOwn(envelopeMailboxes, envelope.id) ? normalizeMailboxId(envelopeMailboxes[envelope.id]) : 'default'
+              : execution && typeof execution.mailboxId === 'string' &&
+                (!Array.isArray(execution.mailboxIds) || execution.mailboxIds.length === 1)
+                ? normalizeMailboxId(execution.mailboxId) : undefined;
+            const mailboxId = reportedMailbox ?? this.describeInboundMailbox(envelope);
+            this.mailbox.recordInboundEnvelope(envelope, mailboxId, { committed: false });
           } catch (error) {
             this.lastError = String(error);
           }

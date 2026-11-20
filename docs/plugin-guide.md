@@ -242,6 +242,29 @@ original `signedEnvelope` separately. Recovery authenticates `signedEnvelope` wh
 otherwise the legacy `envelope`, without removing or interpreting projected payload fields.
 Dispose each registration with `ctx.effect` when unloading the plugin.
 
+`MailboxStore.enqueue` returns `envelopeMailboxes`, the committed destination for each
+envelope ID. Mailbox-backed executors propagate this map as `ExecutionReceipt.envelopeMailboxes`,
+combining results when execution writes to several mailboxes. Include a top-level `mailboxId`
+only when every member of the batch shares that destination. The store records inbound thread
+ownership atomically with enqueue, using the original signed envelope when available. The
+runtime records queued and non-mailbox history without granting it thread ownership. For that
+history, an omitted entry in a present mailbox map describes the default mailbox. Runtime can
+read a legacy single-destination `mailboxId` when the map is absent.
+
+Queue thread deliveries before asynchronous preparation and release each thread when its
+messages reach durable custody. Associate follow-ups before choosing a delivery mode.
+`enqueue` rechecks committed ownership under its write lock for messages eligible to
+inherit it. A spawn proposal also reports whether it acquired ownership. Use the committed
+destinations to wake the owning sessions.
+
+Prepare every delivery group before taking custody or launching a host. The shared
+`executeDeliveryGroups` reports partial outcomes through `PartialBatchExecutionError`.
+The dispatcher publishes `dispatcher/inbound` for each settled member, preserves its committed
+receipt, records failures for attempted members, and removes the ledger entries for
+unattempted members so they can be retried safely. After confirmed delivery, policy errors
+are available through `dispatcher/error` and `DispatcherService.getLastError()` while the
+dispatcher returns the persisted receipt.
+
 Use `metadata` as the sole open map of identifier keys to non-empty string annotations; top-level fields are strictly allowlisted, with only the explicit legacy `assignee` string preserved verbatim without runtime interpretation, and unknown fields or empty annotation values are rejected. Descriptor hooks cover validation, addressing, wake-target synchronization and delivered-session
 pinning; these decisions stay with the host plugin rather than the core mailbox.
 

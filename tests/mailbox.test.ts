@@ -225,11 +225,12 @@ test('enqueue deduplicates per mailbox and sanitizes one-line wakeup hints', t =
   const { path } = workspace(t);
   const store = new MailboxStore(path);
   const first = store.enqueue([envelope('a')], { wakeupHint: '  line one\n\n  two   three  ' });
-  assert.deepEqual(first, { inserted: ['a'], duplicateIds: [], mailboxIds: ['default'] });
+  assert.deepEqual(first, { inserted: ['a'], duplicateIds: [], mailboxIds: ['default'], envelopeMailboxes: { a: 'default' } });
   assert.deepEqual(store.enqueue([envelope('a')]), {
     inserted: [],
     duplicateIds: ['a'],
     mailboxIds: ['default'],
+    envelopeMailboxes: { a: 'default' },
   });
   assert.deepEqual(store.enqueue([envelope('a')], { mailboxId: 'task:a' }).inserted, ['a']);
   assert.equal(
@@ -712,6 +713,7 @@ test('generic session pinning atomically binds delivered threads and preserves e
   const store = new MailboxStore(path);
   const first = envelope('first', { semantic: { type: 'message', threadId: 'first' } });
   const newer = envelope('newer', { semantic: { type: 'message', threadId: 'newer' } });
+  const queued = envelope('queued', { semantic: { type: 'message', threadId: first.id } });
   store.enqueue([first], { mailboxId: 'stream:test', wakeTarget: { driver: 'mock', rotateAfterWaves: 2, wakeupPrefix: 'check --mailbox stream:test', driverConfig: { destination: 'next' } } });
   store.recordInboundEnvelope(first, 'stream:test');
   store.upsertWakeTarget('session:one', { driver: 'mock', completedWaves: 7, pendingWake: true, deliveryInDoubt: true, lastWakeError: 'unknown prior send' });
@@ -719,10 +721,14 @@ test('generic session pinning atomically binds delivered threads and preserves e
   store.beginWakeDelivery('stream:test');
   store.enqueue([newer], { mailboxId: 'stream:test' });
   store.recordInboundEnvelope(newer, 'stream:test');
+  store.recordInboundEnvelope(queued, 'stream:test', { committed: false });
   store.completeWakeDelivery('stream:test', observed, {}, { sessionMailboxId: 'session:one', driverConfig: { destination: 'one' } });
   assert.equal(store.getWakeTarget('stream:test')?.pendingWake, true);
   assert.equal(store.resolveThreadLocalMailbox('first'), 'session:one');
   assert.equal(store.resolveThreadLocalMailbox('newer'), 'stream:test');
+  assert.equal(store.getInboundThreadRecord(first.id, first.networkId)?.mailboxCommitted, true);
+  assert.equal(store.getInboundThreadRecord(queued.id, queued.networkId)?.localMailbox, 'stream:test');
+  assert.equal(store.getInboundThreadRecord(queued.id, queued.networkId)?.mailboxCommitted, false);
   const pinned = new MailboxStore(path).getWakeTarget('session:one')!;
   assert.equal(pinned.rotateAfterWaves, undefined);
   assert.equal(pinned.completedWaves, 7);
@@ -732,4 +738,86 @@ test('generic session pinning atomically binds delivered threads and preserves e
   assert.equal(pinned.wakeupPrefix, 'check --mailbox session:one');
   assert.equal(store.pinSessionMailbox('default', 'session:ignored'), 'default');
   assert.equal(store.getWakeTarget('session:ignored'), undefined);
+});
+
+test('a proposed spawn reuses a committed thread without changing its wake target', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const root = envelope('root');
+  const followup = envelope('followup', { semantic: { type: 'message', threadId: root.id } });
+  const original = store.enqueue([root], { mailboxId: 'task:root', proposedSpawn: true, wakeTarget: { driver: 'owner' } });
+  const concurrent = new MailboxStore(path).enqueue([followup], {
+    mailboxId: 'task:followup', proposedSpawn: true, wakeTarget: { driver: 'redundant' },
+  });
+  assert.equal(original.claimedSpawn, true);
+  assert.equal(concurrent.claimedSpawn, false);
+  assert.deepEqual(concurrent.envelopeMailboxes, { followup: 'task:root' });
+  assert.equal(store.getWakeTarget('task:root')?.driver, 'owner');
+  assert.equal(store.getWakeTarget('task:followup'), undefined);
+  const wave = envelope('wave', { semantic: { type: 'message', threadId: root.id, targetMailbox: 'default' } });
+  assert.deepEqual(store.enqueue([wave], {
+    mailboxId: 'stream:requests', wakeTarget: { driver: 'wave' },
+  }).envelopeMailboxes, { wave: 'task:root' });
+  assert.equal(store.getWakeTarget('stream:requests'), undefined);
+  assert.equal(store.getWakeTarget('task:root')?.driver, 'owner');
+});
+
+test('legacy v2 inbound routes follow the stored delivery despite an unrelated wake target', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const stale = envelope('stale');
+  const history = envelope('history');
+  store.enqueue([stale], { mailboxId: 'task:root' });
+  store.ack(store.check({ mailboxId: 'task:root' }).deliveryId!, 'task:root');
+  store.upsertWakeTarget('stream:requests', { driver: 'local' });
+  store.recordInboundEnvelope(stale, 'stream:requests');
+  store.recordInboundEnvelope(history, 'history-hint');
+  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
+  for (const record of Object.values(snapshot.threads) as Array<{ mailboxCommitted?: boolean }>) delete record.mailboxCommitted;
+  writeFileSync(path, JSON.stringify(snapshot));
+
+  const reloaded = new MailboxStore(path);
+  assert.equal(reloaded.resolveThreadLocalMailbox(stale.id, stale.networkId), 'task:root');
+  assert.equal(reloaded.resolveThreadLocalMailbox(history.id, history.networkId), undefined);
+  assert.equal(reloaded.getThread(history.id)?.localMailbox, 'history-hint');
+  assert.equal(reloaded.getThread(history.id)?.mailboxCommitted, false);
+});
+
+for (const early of ['terminal:early', 'session:one']) test(`an upgraded legacy rotating thread retains ${early} through subsequent rotation`, t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const stream = 'stream:requests';
+  const first = envelope('first');
+  store.enqueue([first], { mailboxId: stream, wakeTarget: { driver: 'orca-terminal', rotateAfterWaves: 1 } });
+  const firstDelivery = store.check({ mailboxId: stream });
+  store.completeWakeDelivery(stream, firstDelivery.items[0].sequence, {}, { sessionMailboxId: early });
+  store.ack(firstDelivery.deliveryId!, stream);
+  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
+  delete snapshot.threads['inbound:first'].mailboxCommitted;
+  writeFileSync(path, JSON.stringify(snapshot));
+
+  const upgraded = new MailboxStore(path);
+  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), early);
+  const next = envelope('next');
+  upgraded.enqueue([next], { mailboxId: stream });
+  const nextDelivery = upgraded.check({ mailboxId: stream });
+  upgraded.completeWakeDelivery(stream, nextDelivery.items[0].sequence, {}, { sessionMailboxId: 'terminal:later' });
+  assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), early);
+  assert.equal(upgraded.resolveThreadLocalMailbox(next.id, next.networkId), 'terminal:later');
+});
+
+test('reply lookup trusts a stored outbound semantic address over a legacy mailbox hint', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  const explicit = envelope('explicit', { semantic: { type: 'message', threadId: 'explicit', targetMailbox: 'task:peer' } });
+  const hint = envelope('hint', { payload: { mailbox: 'wrong-hint' } });
+  store.recordOutboundEnvelope(explicit, [explicit.from.nodeId]);
+  store.recordOutboundEnvelope(hint, [hint.from.nodeId]);
+  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
+  snapshot.threads['outbound:explicit'].peerReplyMailbox = 'wrong-hint';
+  snapshot.threads['outbound:hint'].peerReplyMailbox = 'wrong-hint';
+  writeFileSync(path, JSON.stringify(snapshot));
+
+  assert.equal(store.resolveReplyTarget(explicit.id, explicit.networkId)?.targetMailbox, 'task:peer');
+  assert.equal(store.resolveReplyTarget(hint.id, hint.networkId)?.targetMailbox, 'default');
 });
