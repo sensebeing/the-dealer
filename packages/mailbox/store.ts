@@ -1829,18 +1829,25 @@ export class MailboxStore {
     const remoteMessageKeys: string[] = [];
     for (const record of records) {
       if (record.direction !== 'outbound') continue;
-      const semantic = record.envelope?.semantic;
-      if (semantic?.type === 'reply' || semantic?.type === 'settle') continue;
       const messageKey = netKey(record.networkId, record.messageId);
-      const threadKey = netKey(record.networkId, record.threadId);
-      if (selfInboundMessages.has(messageKey) || settledThreads.has(threadKey)) continue;
+      if (selfInboundMessages.has(messageKey)) continue;
+      const semantic = record.envelope?.semantic;
       const replyMailbox = semantic?.replyMailbox ?? record.localMailbox;
-      const isOwnedQuestion = semantic?.type === 'question' && postAckMailboxes.has(replyMailbox);
-      const isActiveWaveOutbound = activeSince !== undefined && record.createdAt >= activeSince && ownedMailboxes.has(replyMailbox);
-      if (!isOwnedQuestion && !isActiveWaveOutbound) continue;
-      if (localUnackedMessages.has(messageKey)) {
+      const threadKey = netKey(record.networkId, record.threadId);
+      const isReplyOrSettlement = semantic?.type === 'reply' || semantic?.type === 'settle';
+      const ownsReplyMailbox = ownedMailboxes.has(replyMailbox);
+      // Local custody lasts until acknowledgement, even after the wave or thread ends.
+      if (
+        ownsReplyMailbox &&
+        (localUnackedMessages.has(messageKey) || (!isReplyOrSettlement && localUnackedThreads.has(threadKey)))
+      ) {
         return { hasPendingWave, immediateBusyReason: 'local_outbound_pending' };
       }
+
+      if (isReplyOrSettlement || settledThreads.has(threadKey)) continue;
+      const isOwnedQuestion = semantic?.type === 'question' && postAckMailboxes.has(replyMailbox);
+      const isActiveWaveOutbound = activeSince !== undefined && record.createdAt >= activeSince && ownsReplyMailbox;
+      if (!isOwnedQuestion && !isActiveWaveOutbound) continue;
 
       const answered = inboundByThread.get(threadKey)?.some(inbound => {
         // The candidate's reply mailbox already belongs to this slot or its session.
@@ -1855,10 +1862,6 @@ export class MailboxStore {
           inbound.createdAt >= record.createdAt;
       });
       if (answered) continue;
-
-      if (localUnackedThreads.has(threadKey)) {
-        return { hasPendingWave, immediateBusyReason: 'local_outbound_pending' };
-      }
       remoteMessageKeys.push(messageKey);
     }
     if (remoteMessageKeys.length > 0) {

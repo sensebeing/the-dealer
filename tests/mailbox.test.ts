@@ -90,6 +90,67 @@ test('slot obligations follow local downstream mail through acknowledgement', t 
   assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
 });
 
+test('acknowledging the originating wave preserves queued and leased downstream custody', async t => {
+  for (const replyMailbox of [slotSession, waveSlot]) {
+    await t.test(replyMailbox, t => {
+      const store = new MailboxStore(workspace(t).path);
+      store.upsertWakeTarget(waveSlot, { rotateAfterWaves: 1 });
+      store.enqueue([envelope('wave')], { mailboxId: waveSlot });
+      const waveLease = store.check({ mailboxId: waveSlot });
+      const downstream = 'stream:prod-release';
+      const release = envelope('release', {
+        kind: 'release.prod.v1',
+        semantic: { type: 'message', threadId: 'release', replyMailbox, targetMailbox: downstream },
+      });
+      store.recordOutboundEnvelope(release, [release.from.nodeId], replyMailbox);
+      store.enqueue([release], { mailboxId: downstream });
+      store.ack(waveLease.deliveryId!, waveSlot);
+
+      const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession });
+      const pending = { hasPendingWave: false, immediateBusyReason: 'local_outbound_pending' };
+      assert.deepEqual(inspect(), pending);
+      const downstreamLease = store.check({ mailboxId: downstream });
+      assert.deepEqual(inspect(), pending);
+      store.ack(downstreamLease.deliveryId!, downstream);
+      assert.deepEqual(inspect(), { hasPendingWave: false });
+    });
+  }
+});
+
+test('settling a thread preserves custody of its downstream message and other local mail on the thread', t => {
+  const store = new MailboxStore(workspace(t).path);
+  store.enqueue([envelope('wave')], { mailboxId: waveSlot });
+  store.recordOutboundEnvelope(envelope('remote-question', {
+    semantic: { type: 'question', threadId: 'remote-question', replyMailbox: slotSession },
+  }), ['remote'], slotSession);
+  const downstream = 'stream:prod-release';
+  const followUpMailbox = 'stream:release-follow-up';
+  const release = envelope('release', {
+    kind: 'release.prod.v1',
+    semantic: { type: 'message', threadId: 'release', replyMailbox: slotSession, targetMailbox: downstream },
+  });
+  store.recordOutboundEnvelope(release, [release.from.nodeId], slotSession);
+  store.enqueue([release], { mailboxId: downstream });
+  store.enqueue([envelope('follow-up', {
+    semantic: { type: 'message', threadId: release.id, targetMailbox: followUpMailbox },
+  })], { mailboxId: followUpMailbox });
+  store.recordInboundEnvelope(envelope('settlement', {
+    semantic: { type: 'settle', threadId: release.id, outcome: 'succeeded' },
+  }), slotSession, { committed: false });
+
+  const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession });
+  const pending = { hasPendingWave: true, immediateBusyReason: 'local_outbound_pending' };
+  assert.deepEqual(inspect(), pending);
+  const downstreamLease = store.check({ mailboxId: downstream });
+  assert.deepEqual(inspect(), pending);
+  store.ack(downstreamLease.deliveryId!, downstream);
+  assert.deepEqual(inspect(), pending);
+  const followUpLease = store.check({ mailboxId: followUpMailbox });
+  assert.deepEqual(inspect(), pending);
+  store.ack(followUpLease.deliveryId!, followUpMailbox);
+  assert.deepEqual(inspect(), { hasPendingWave: true, immediateBusyReason: 'outbound_thread_open' });
+});
+
 test('slot obligations exclude replied, settled and failed outbound messages', t => {
   const { path, root } = workspace(t);
   const store = new MailboxStore(path);
@@ -139,9 +200,14 @@ test('slot obligations exclude the local wave after both thread legs are pinned 
     { direction: 'inbound', localMailbox: slotSession, state: 'open' },
     { direction: 'outbound', localMailbox: slotSession, state: 'open' },
   ]);
+  const otherMailbox = 'stream:other';
+  store.enqueue([envelope('wave-thread-other-mail', {
+    semantic: { type: 'message', threadId: wave.id, targetMailbox: otherMailbox },
+  })], { mailboxId: otherMailbox });
   assert.deepEqual(store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession }), {
     hasPendingWave: true,
   });
+  store.ack(store.check({ mailboxId: otherMailbox }).deliveryId!, otherMailbox);
 
   store.recordOutboundEnvelope(envelope('wave-follow-up', {
     replyToId: wave.id,

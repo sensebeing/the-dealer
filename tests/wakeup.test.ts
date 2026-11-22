@@ -519,6 +519,55 @@ test('slot probe answers from the ledger without invoking Orca when there is no 
   assert.deepEqual(state.calls, []);
 });
 
+test('slot probe is busy after wave acknowledgement until queued and leased downstream mail is acknowledged', async t => {
+  for (const replyMailbox of [`terminal:${probeTerminal.handle}`, probeMailbox]) {
+    await t.test(replyMailbox, async t => {
+      const { store, service, state } = slotProbeFixture(t, { wave: true });
+      const targetMailbox = 'stream:prod-release';
+      const release = alert('release', {
+        kind: 'release.prod.v1', semantic: { type: 'message', threadId: 'release', replyMailbox, targetMailbox },
+      });
+      store.recordOutboundEnvelope(release, [release.from.nodeId], replyMailbox);
+      store.enqueue([release], { mailboxId: targetMailbox });
+      store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
+
+      const busy = { busy: true, ready: false, reason: 'local_outbound_pending' };
+      assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+      const downstreamLease = store.check({ mailboxId: targetMailbox });
+      assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+      assert.deepEqual(state.calls, []);
+      store.ack(downstreamLease.deliveryId!, targetMailbox);
+      assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+    });
+  }
+});
+
+test('slot probe stays busy on a settled thread while another downstream message is queued or leased', async t => {
+  const { store, service, state } = slotProbeFixture(t, { wave: true });
+  const replyMailbox = `terminal:${probeTerminal.handle}`;
+  const targetMailbox = 'stream:prod-release';
+  const release = alert('release', {
+    kind: 'release.prod.v1', semantic: { type: 'message', threadId: 'release', replyMailbox, targetMailbox },
+  });
+  store.recordOutboundEnvelope(release, [release.from.nodeId], replyMailbox);
+  store.enqueue([alert('follow-up', {
+    semantic: { type: 'message', threadId: release.id, targetMailbox },
+  })], { mailboxId: targetMailbox });
+  store.recordInboundEnvelope(alert('settlement', {
+    semantic: { type: 'settle', threadId: release.id, outcome: 'succeeded' },
+  }), replyMailbox, { committed: false });
+
+  const busy = { busy: true, ready: false, reason: 'local_outbound_pending' };
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+  const downstreamLease = store.check({ mailboxId: targetMailbox });
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+  store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+  assert.deepEqual(state.calls, []);
+  store.ack(downstreamLease.deliveryId!, targetMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+});
+
 test('slot probe reports failed Orca reads and fails closed', async t => {
   const workspacePath = directory(t);
   const store = new MailboxStore(join(workspacePath, 'mailbox.json'));
