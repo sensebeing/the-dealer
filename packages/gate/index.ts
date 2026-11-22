@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 import {
-  APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, isConfirmedHandoffReceipt, verifyEnvelope,
+  APPROVAL_CANCELLED, APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED,
+  isConfirmedHandoffReceipt, verifyEnvelope,
 } from '../core-types/index.ts';
 import type {
   AdmissionMode,
@@ -175,30 +176,42 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         const drainingCurrent = drainEntry !== undefined && existingDnd === drainEntry &&
           service.getNetworkMode(envelope.networkId) === 'open';
         const durable = Boolean(config.dndQueuePath);
+        const existingApproval = [...pending.values()].find(item => key(item.envelope) === key(envelope));
+        const approvalInProgress = existingApproval && approving.has(existingApproval.id);
+        if (existingApproval && (approvalInProgress || existingApproval.envelope.signature !== envelope.signature)) {
+          return {
+            status: 'reject', code: APPROVAL_CUSTODY_RETAINED, durable: false,
+            reason: approvalInProgress ? 'Approval already in progress' : existingApproval.reason,
+          };
+        }
         if (retained && existingDnd.status === 'parked' && (!drainingCurrent || verdict.status === 'reject')) {
           return {
             status: 'reject', code: DND_HANDOFF_PARKED, durable,
             reason: existingDnd.lastError ?? 'Previous DND handoff outcome unknown; newer revision required',
           };
         }
-        if (retained && existingDnd.status === 'queued' && verdict.status === 'reject' && !drainingCurrent) {
-          return { ...verdict, code: DND_CUSTODY_RETAINED, durable };
-        }
         const cancellation = cancelledApprovals.get(cancellationKey(envelope));
-        if (cancellation !== undefined) {
-          return { status: 'reject', code: 'approval_rejected', reason: cancellation };
+        if (retained && existingDnd.status === 'queued' && !drainingCurrent) {
+          if (verdict.status === 'reject' || cancellation !== undefined ||
+              (verdict.status === 'allow' && existingDnd.envelope.signature !== envelope.signature)) {
+            return { status: 'reject', code: DND_CUSTODY_RETAINED, durable,
+              reason: verdict.status === 'reject' ? verdict.reason : 'Queued DND copy retained' };
+          }
+          if (verdict.status === 'allow') {
+            if (durable) return { status: 'queued_dnd', reason: 'Message queued in DND store', durable };
+            updateDnd(id);
+          }
         }
-        if (verdict.status === 'reject' && [...pending.values()].some(item =>
-          key(item.envelope) === key(envelope),
-        )) {
+        if (cancellation !== undefined) {
+          return { status: 'reject', code: APPROVAL_CANCELLED, reason: cancellation, durable };
+        }
+        if (verdict.status === 'reject' && existingApproval) {
           return { ...verdict, code: APPROVAL_CUSTODY_RETAINED, durable: false };
         }
+        if (verdict.status === 'allow' && existingApproval) pending.delete(existingApproval.id);
         if (verdict.status === 'pending_approval') {
-          const existing = [...pending.values()].find(
-            item => key(item.envelope) === key(envelope),
-          );
-          if (existing) {
-            return { ...verdict, approvalId: existing.id };
+          if (existingApproval) {
+            return { ...verdict, approvalId: existingApproval.id };
           }
           if (pending.has(verdict.approvalId)) {
             throw new Error('Approval ID collision');
@@ -213,6 +226,9 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
           ctx.emit('gate/pending-approval', structuredClone(item));
         } else if (verdict.status === 'queued_dnd') {
           if (!existingDnd && dnd.size >= maxDndItems) {
+            if (existingApproval) {
+              return { status: 'reject', code: APPROVAL_CUSTODY_RETAINED, durable: false, reason: existingApproval.reason };
+            }
             return { status: 'reject', code: 'dnd_queue_full', reason: 'DND queue capacity exceeded' };
           }
           if (!retained) {

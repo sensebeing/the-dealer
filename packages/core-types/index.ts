@@ -215,6 +215,25 @@ export function isRetryablePreEffectReceipt(receipt: HandoffReceipt | null | und
   return false;
 }
 
+/** Signed evidence of interrupted or potentially irreversible execution. */
+export function isUnknownEffectReceipt(receipt: HandoffReceipt | null | undefined): boolean {
+  if (!receipt || isConfirmedHandoffReceipt(receipt, { allowQueued: true }) || isRetainedApprovalReceipt(receipt)) {
+    return false;
+  }
+  if (receipt.stage === 'dispatching') return true;
+  if (receipt.stage === 'failed') return receipt.executionReceipt?.handoff !== 'unattempted';
+  if (receipt.stage === 'rejected') {
+    return receipt.detail === DEDUP_CAS_AMBIGUOUS_DETAIL || receipt.executionReceipt?.handoff === 'unknown';
+  }
+  return false;
+}
+
+/** Only the receipt for this exact envelope can release its provisional custody. */
+export function isRelinquishedCustodyReceipt(receipt: HandoffReceipt | null | undefined, signature: unknown): boolean {
+  return isRetryablePreEffectReceipt(receipt) && receipt?.executionReceipt?.custodyRelinquished === true &&
+    typeof signature === 'string' && signature.length > 0 && receipt.executionReceipt.envelopeSignature === signature;
+}
+
 /** A bound receipt applies only to its envelope. Older receipts may omit the binding. */
 export function receiptMatchesEnvelopeSignature(receipt: HandoffReceipt | undefined, signature: unknown): boolean {
   const bound = receipt?.executionReceipt?.envelopeSignature;
@@ -572,7 +591,7 @@ export interface OutboxItem {
   updatedAt: string;
   nextAttemptAt: string;
   lastError?: string;
-  activeAttempt?: { token: string; expiresAt: string };
+  activeAttempt?: { token: string; expiresAt: string; fencedNodeIds?: string[] };
   /** The replacement owns the key; this row still provides terminal evidence for its envelope. */
   supersededById?: string;
 }
@@ -612,6 +631,8 @@ export interface OutboxAttemptOptions {
 
 export interface OutboxEnqueueInput {
   attemptToken?: string;
+  /** Targets whose current attempt recorded a non-ambiguous outcome. */
+  clearFenceNodeIds?: readonly string[];
   /** Replace outcomes only for these original targets; confirmed execution is immutable. */
   reconcileNodeIds?: readonly string[];
   envelope: MessageEnvelope;
@@ -632,6 +653,7 @@ export interface OutboxEnqueueInput {
 export interface OutboxClaimInput {
   envelope: MessageEnvelope;
   explicitTargets: string[];
+  plannedTargetNodeIds?: readonly string[];
   filePaths?: Record<string, string>;
   /** How long the attempt owns the obligation before another worker may resume it. */
   leaseMs?: number;
@@ -685,6 +707,7 @@ export interface OutboxDeliveryOutcome {
   /** Targets still retryable after this attempt. */
   pendingNodeIds?: readonly string[];
   approvalPendingNodeIds?: readonly string[];
+  clearFenceNodeIds?: readonly string[];
   /** Targets whose send timed out after a possible external effect; retry only on pulse/force. */
   inDoubtNodeIds?: readonly string[];
   relaySpooledNodeIds?: readonly string[];
@@ -701,6 +724,7 @@ export interface OutboxStoreLike {
   /** Reserve a same-version replacement or retry of the exact unattempted obligation observed. */
   replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined;
   beginAttempt(id: string, options?: OutboxAttemptOptions): { item: OutboxItem; attemptToken: string } | undefined;
+  prepareSend?(id: string, attemptToken: string, targetNodeIds: readonly string[]): OutboxItem | undefined;
   releaseAttempt(id: string, attemptToken: string): void;
   /** Read the highest matching version without reserving or changing an obligation. */
   findKeyedObligation?(networkId: string, key: string, minVersion: number): OutboxItem | undefined;
@@ -721,8 +745,14 @@ export interface EmitterService {
   /** Emitter-owned outbound preparation, routing, send and receipt validation for redrive. */
   redriveOutboxItem?(
     item: OutboxItem,
-    options?: { targetNodeIds?: readonly string[]; timeoutMs?: number },
+    options?: OutboxRedriveDeliveryOptions,
   ): Promise<OutboxDeliveryOutcome>;
+}
+
+export interface OutboxRedriveDeliveryOptions {
+  targetNodeIds?: readonly string[];
+  timeoutMs?: number;
+  attemptToken?: string;
 }
 
 export interface RouteDecision {
@@ -749,6 +779,7 @@ export interface RouterService {
 export const DND_HANDOFF_PARKED = 'dnd_handoff_parked';
 export const DND_CUSTODY_RETAINED = 'dnd_custody_retained';
 export const APPROVAL_CUSTODY_RETAINED = 'approval_custody_retained';
+export const APPROVAL_CANCELLED = 'approval_cancelled';
 
 export type GateVerdict =
   | { status: 'allow' }
@@ -792,6 +823,7 @@ export interface ExecutionReceipt extends Record<string, unknown> {
   executor: string;
   executionId: string;
   detail?: string;
+  custodyRelinquished?: boolean;
   /** Destinations committed by mailbox-backed execution, keyed by envelope ID. */
   envelopeMailboxes?: Readonly<Record<string, string>>;
 }

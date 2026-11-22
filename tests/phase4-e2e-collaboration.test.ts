@@ -1150,8 +1150,12 @@ test('Phase 4: approval custody stays open until approved or cancelled', async t
       try {
         await entered.promise;
         assert.deepEqual(await bob.gate.evaluate(approval.envelope), {
-          status: 'reject', code: 'approval_custody_retained', durable: false, reason: 'Node admission gate is closed',
+          status: 'reject', code: 'approval_custody_retained', durable: false, reason: 'Approval already in progress',
         });
+        await bob.gate.setNetworkMode(request.networkId, 'open');
+        const inProgress = await alice.emitter.emit(request);
+        assert.equal(inProgress.receipts.find(receipt => receipt.stage === 'rejected')?.executionReceipt?.handoff, 'approval_pending');
+        await bob.gate.setNetworkMode(request.networkId, 'closed');
         await assert.rejects(bob.gate.reject(approval.id), /Approval already in progress/);
       } finally {
         release.resolve();
@@ -1193,6 +1197,84 @@ test('Phase 4: retryable policy rejections re-evaluate the original outbox envel
   assert.equal(retry.receipts[0].stage, 'dispatched');
   assert.deepEqual(bob.mailbox.list().items.map(item => item.id), [first.messageId]);
   assert.deepEqual(await alice.emitter.emit(request), retry);
+});
+
+test('Phase 4: reopened admission retires the old approval before certifying a pre-effect outcome', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob');
+  await connect(alice, bob);
+  const dispatcher = bob.kernel.ctx.services.dispatcher;
+  const executor = dispatcher.registerExecutor({
+    name: 'pre-effect-failure',
+    async execute() {
+      throw Object.assign(new Error('Executor could not start'), { beforeExternalEffect: true });
+    },
+  });
+  const policy = dispatcher.registerPolicy({
+    name: 'reject-reopened',
+    async process(envelope, next) {
+      return envelope.subject === 'policy' ? { stage: 'rejected', detail: 'Policy denied' } : next([envelope]);
+    },
+  });
+  t.after(() => { executor.dispose(); policy.dispose(); });
+  for (const path of ['policy', 'executor']) {
+    const request = { ...input('bob', { executor: 'pre-effect-failure' }), subject: path, idempotencyKey: path };
+    await bob.gate.setNetworkMode(request.networkId, 'approval_required');
+    const first = await alice.emitter.emit(request);
+    const [approval] = bob.gate.listPendingApprovals();
+    await bob.gate.setNetworkMode(request.networkId, 'open');
+    const retried = await alice.emitter.emit(request);
+    assert.equal(retried.messageId, first.messageId);
+    assert.equal(retried.receipts[0].stage, path === 'policy' ? 'rejected' : 'failed');
+    assert.equal(isRetryablePreEffectReceipt(retried.receipts[0]), true);
+    assert.deepEqual(bob.gate.listPendingApprovals(), []);
+    await assert.rejects(bob.gate.approve(approval.id), /Unknown approval/);
+  }
+});
+
+test('Phase 4: explicit approval cancellation relinquishes intervening durable DND custody', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'approval_required' } });
+  const carol = await node(t, root, 'carol');
+  await connect(alice, bob, carol);
+  const replyMailbox = 'terminal:cancel-dnd';
+  const request: EmitMessageInput = {
+    ...input('bob'), idempotencyKey: 'cancel-dnd', semantic: { type: 'question', replyMailbox },
+  };
+  const inspect = () => alice.mailbox.inspectSlotObligations('stream:approvals', {
+    sessionMailboxId: replyMailbox, outbox: alice.outbox,
+  });
+  const first = await alice.emitter.emit(request);
+  const [approval] = bob.gate.listPendingApprovals();
+  const target = first.receipts.find(receipt => receipt.stage === 'pending_approval')!.fromNodeId;
+  await bob.gate.setNetworkMode(request.networkId, 'dnd');
+  const queued = await alice.emitter.emit(request);
+  assert.equal(queued.receipts[0].stage, 'queued');
+  assert.equal(queued.receipts[0].executionReceipt?.executor, 'gate-dnd');
+  assert.equal(alice.outbox.get(first.messageId)?.status, 'delivered');
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  await bob.gate.reject(approval.id, 'Operator cancelled both copies');
+  assert.deepEqual(bob.gate.listDndQueue(), []);
+
+  const changed = { ...request, routing: { mode: 'unicast' as const, targets: ['member:carol'] } };
+  const reconciled = await alice.emitter.emit(changed);
+  assert.equal(reconciled.messageId, first.messageId);
+  const failed = alice.outbox.get(first.messageId)!;
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.deliveredReceipts[target], undefined);
+  assert.equal(failed.failedReceipts[target].executionReceipt?.custodyRelinquished, true);
+  assert.equal(failed.failedReceipts[target].executionReceipt?.envelopeSignature, approval.envelope.signature);
+  assert.equal(isUnattemptedOutboxItem(failed), true);
+  assert.equal(inspect().immediateBusyReason, undefined);
+  assert.equal(inspect().hasPendingWave, false);
+
+  const replaced = await alice.emitter.emit(changed);
+  assert.notEqual(replaced.messageId, first.messageId);
+  assert.deepEqual(carol.mailbox.list().items.map(item => item.id), [replaced.messageId]);
+  await bob.gate.setNetworkMode(request.networkId, 'open');
+  assert.equal(bob.mailbox.list().totalCount, 0);
 });
 
 test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND obligation after restart', async t => {

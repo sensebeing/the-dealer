@@ -18,6 +18,7 @@ export {
   isDurableQueuedReceipt,
   isConfirmedHandoffReceipt,
   isRetryablePreEffectReceipt,
+  isUnknownEffectReceipt,
   isUnattemptedOutboxItem,
 } from '../core-types/index.ts';
 

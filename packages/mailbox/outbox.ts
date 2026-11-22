@@ -2,8 +2,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import {
-  envelopeClaimVersion, isConfirmedHandoffReceipt, isRetainedApprovalReceipt, isRetryablePreEffectReceipt,
-  isUnattemptedOutboxItem, outboxReconciliationTargets, outstandingRelaySpooledTargets, sameEnvelopeIntent,
+  envelopeClaimVersion, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
+  isRetryablePreEffectReceipt, isUnattemptedOutboxItem, isUnknownEffectReceipt, outboxReconciliationTargets,
+  outstandingRelaySpooledTargets, sameEnvelopeIntent,
 } from '../core-types/index.ts';
 import {
   copyFileAtomically,
@@ -25,6 +26,7 @@ import type {
   OutboxItem,
   OutboxItemStatus,
   OutboxListFilter,
+  OutboxRedriveDeliveryOptions,
   PeerReachableEvent,
 } from '../core-types/index.ts';
 import { netKey } from './network-key.ts';
@@ -83,6 +85,7 @@ export interface OutboxAttemptUpdate {
   failures?: OutboxDeliveryOutcome['failures'];
   pendingNodeIds?: string[];
   approvalPendingNodeIds?: readonly string[];
+  clearFenceNodeIds?: readonly string[];
   inDoubtNodeIds?: string[];
   relaySpooledNodeIds?: string[];
   lastError?: string;
@@ -107,6 +110,28 @@ function acceptsSettlement(item: OutboxItem | undefined, attemptToken: string | 
   return item.supersededById === undefined && (attemptToken === undefined
     ? !hasActiveAttempt(item)
     : item.activeAttempt?.token === attemptToken);
+}
+
+function fenceAttempt(item: OutboxItem, attempt: NonNullable<OutboxItem['activeAttempt']>, targets: readonly string[]): void {
+  item.pendingNodeIds = [...new Set([...item.pendingNodeIds, ...targets])]
+    .filter(nodeId => !item.deliveredReceipts[nodeId] && !item.failedNodeIds.includes(nodeId));
+  const newlyFenced = [...new Set(targets)].filter(nodeId => !item.inDoubtNodeIds.includes(nodeId));
+  if (newlyFenced.length === 0) return;
+  item.inDoubtNodeIds.push(...newlyFenced);
+  attempt.fencedNodeIds = [...(attempt.fencedNodeIds ?? []), ...newlyFenced];
+}
+
+function remainingInDoubt(
+  item: OutboxItem | undefined, attemptToken: string | undefined, clearFenceNodeIds: readonly string[] | undefined,
+): string[] {
+  const prior = item?.inDoubtNodeIds ?? [];
+  const attempt = item?.activeAttempt;
+  if (!attempt || attempt.token !== attemptToken || !attempt.fencedNodeIds?.length || !clearFenceNodeIds?.length) {
+    return prior;
+  }
+  const cleared = new Set(clearFenceNodeIds);
+  const fenced = new Set(attempt.fencedNodeIds);
+  return prior.filter(nodeId => !cleared.has(nodeId) || !fenced.has(nodeId));
 }
 
 function clone<T>(value: T): T {
@@ -181,7 +206,9 @@ function validItem(value: unknown): value is OutboxItem {
     (value.activeAttempt === undefined || (
       isRecord(value.activeAttempt) &&
       typeof value.activeAttempt.token === 'string' && value.activeAttempt.token.length > 0 &&
-      typeof value.activeAttempt.expiresAt === 'string' && Number.isFinite(Date.parse(value.activeAttempt.expiresAt))
+      typeof value.activeAttempt.expiresAt === 'string' && Number.isFinite(Date.parse(value.activeAttempt.expiresAt)) &&
+      (value.activeAttempt.fencedNodeIds === undefined ||
+        (Array.isArray(value.activeAttempt.fencedNodeIds) && value.activeAttempt.fencedNodeIds.every(id => typeof id === 'string')))
     ))
   );
 }
@@ -191,7 +218,8 @@ function normalizeTargets(item: OutboxItem): OutboxItem {
     nodeId => !item.deliveredReceipts[nodeId] && !item.failedNodeIds.includes(nodeId),
   );
   // A later rejection cannot disprove an earlier delivery whose reply timed out.
-  item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(nodeId => !item.deliveredReceipts[nodeId]);
+  item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)]
+    .filter(nodeId => !isConfirmedHandoffReceipt(item.deliveredReceipts[nodeId], { allowQueued: false }));
   item.relaySpooledNodeIds = outstandingRelaySpooledTargets(item.relaySpooledNodeIds, item.deliveredReceipts);
   if (item.approvalPendingNodeIds !== undefined) {
     item.approvalPendingNodeIds = [...new Set(item.approvalPendingNodeIds)].filter(nodeId => item.pendingNodeIds.includes(nodeId));
@@ -351,7 +379,7 @@ export class OutboxStore {
       const approvalPendingNodeIds = input.approvalPendingNodeIds !== undefined || existing?.approvalPendingNodeIds !== undefined
         ? [...(existing?.approvalPendingNodeIds ?? []), ...(input.approvalPendingNodeIds ?? [])]
         : undefined;
-      const inDoubtNodeIds = [...(existing?.inDoubtNodeIds ?? []), ...(input.inDoubtNodeIds ?? [])];
+      const inDoubtNodeIds = [...remainingInDoubt(existing, input.attemptToken, input.clearFenceNodeIds), ...(input.inDoubtNodeIds ?? [])];
       const relaySpooledNodeIds = [
         ...new Set([
           ...(existing?.relaySpooledNodeIds ?? []),
@@ -408,9 +436,10 @@ export class OutboxStore {
   readDefinitivelyFailedKeys(): ReadonlySet<string> {
     const keys = new Set<string>();
     for (const item of this.read().items) {
-      if (item.status === 'failed' && item.pendingNodeIds.length === 0 &&
+      if (item.status === 'failed' && !hasActiveAttempt(item) && item.pendingNodeIds.length === 0 &&
         item.inDoubtNodeIds.length === 0 && item.relaySpooledNodeIds.length === 0 &&
-        Object.keys(item.deliveredReceipts).length === 0 && !Object.values(item.failedReceipts).some(isRetainedApprovalReceipt)) {
+        (item.approvalPendingNodeIds?.length ?? 0) === 0 && Object.keys(item.deliveredReceipts).length === 0 &&
+        !Object.values(item.failedReceipts).some(receipt => isUnknownEffectReceipt(receipt) || isRetainedApprovalReceipt(receipt))) {
         keys.add(netKey(item.networkId, item.id));
       }
     }
@@ -452,7 +481,7 @@ export class OutboxStore {
     const { envelope } = input;
     const now = Date.now();
     const createdAt = new Date(now).toISOString();
-    return {
+    const item: OutboxItem = {
       id: envelope.id,
       networkId: envelope.networkId,
       envelope: clone(envelope),
@@ -471,6 +500,8 @@ export class OutboxStore {
       nextAttemptAt: activeAttempt.expiresAt,
       activeAttempt,
     };
+    fenceAttempt(item, activeAttempt, input.plannedTargetNodeIds ?? []);
+    return item;
   }
 
   /** Same-id retries lease the original targets, so they cannot race a retargeted send. */
@@ -501,6 +532,7 @@ export class OutboxStore {
           nextAttemptAt: activeAttempt.expiresAt,
           activeAttempt,
         };
+        if (input.plannedTargetNodeIds !== undefined) fenceAttempt(item, activeAttempt, item.pendingNodeIds);
         state.items[state.items.indexOf(existing)] = item;
       } else {
         if (sameEnvelopeIntent(existing.envelope, input.envelope)) return { claimed: false, item: clone(existing) };
@@ -540,6 +572,13 @@ export class OutboxStore {
   releaseAttempt(id: string, attemptToken: string): void {
     this.mutateAttempt(id, attemptToken, item => {
       delete item.activeAttempt;
+    });
+  }
+
+  prepareSend(id: string, attemptToken: string, targetNodeIds: readonly string[]): OutboxItem | undefined {
+    return this.mutateAttempt(id, attemptToken, item => {
+      fenceAttempt(item, item.activeAttempt!, targetNodeIds);
+      return clone(item);
     });
   }
 
@@ -652,9 +691,16 @@ export class OutboxStore {
   }
 
   private applyNodeFailure(item: OutboxItem, nodeId: string, receipt?: DeliveryReceipt): void {
-    if (isConfirmedHandoffReceipt(item.deliveredReceipts[nodeId], { allowQueued: true })) return;
+    const priorDelivery = item.deliveredReceipts[nodeId];
+    if (isConfirmedHandoffReceipt(priorDelivery, { allowQueued: true })) {
+      if (isConfirmedHandoffReceipt(priorDelivery, { allowQueued: false }) ||
+          !isRelinquishedCustodyReceipt(receipt, item.envelope.signature)) return;
+      delete item.deliveredReceipts[nodeId];
+      item.approvalPendingNodeIds = item.approvalPendingNodeIds?.filter(id => id !== nodeId);
+    }
     item.failedNodeIds = [...new Set([...item.failedNodeIds, nodeId])];
     const prior = item.failedReceipts[nodeId];
+    if (isUnknownEffectReceipt(prior) && !isUnknownEffectReceipt(receipt)) return;
     if (receipt && (!prior || isRetryablePreEffectReceipt(prior) || !isRetryablePreEffectReceipt(receipt))) {
       item.failedReceipts[nodeId] = structuredClone(receipt);
     }
@@ -725,9 +771,7 @@ export class OutboxStore {
       if (update.approvalPendingNodeIds?.length) {
         item.approvalPendingNodeIds = [...(item.approvalPendingNodeIds ?? []), ...update.approvalPendingNodeIds];
       }
-      if (update.inDoubtNodeIds !== undefined) {
-        item.inDoubtNodeIds.push(...update.inDoubtNodeIds);
-      }
+      item.inDoubtNodeIds = [...remainingInDoubt(item, attemptToken, update.clearFenceNodeIds), ...(update.inDoubtNodeIds ?? [])];
       if (update.relaySpooledNodeIds?.length) {
         item.relaySpooledNodeIds = [
           ...new Set([...item.relaySpooledNodeIds, ...update.relaySpooledNodeIds]),
@@ -774,7 +818,7 @@ export interface OutboxRedriveOptions {
   /** Emitter-owned delivery: routing, envelope framing, transport send and receipt checks. */
   deliver: (
     item: OutboxItem,
-    options?: { targetNodeIds?: readonly string[]; timeoutMs?: number },
+    options?: OutboxRedriveDeliveryOptions,
   ) => Promise<OutboxDeliveryOutcome>;
   events?: OutboxRedriveEvents;
   /** Transport-owned level check: may an in-doubt target be reconciled on its normal schedule? */
@@ -1016,6 +1060,7 @@ export class OutboxRedriveService {
           outcome = await this.deliver(item, {
             ...(requestTargets.length > 0 ? { targetNodeIds: requestTargets } : {}),
             timeoutMs: this.attemptTimeoutMs,
+            attemptToken,
           });
         } catch (error) {
           outcome = { lastError: String(error) };
@@ -1025,11 +1070,13 @@ export class OutboxRedriveService {
         const untouchedPendingNodeIds = requestTargets.length > 0
           ? eligibleTargets.filter(nodeId => !requested.has(nodeId))
           : [];
+        const pending = outcome.pendingNodeIds ?? resolved;
         const updated = this.outbox.recordAttempt(item.id, {
           deliveredReceipts: outcome.deliveredReceipts,
           failures: outcome.failures,
-          pendingNodeIds: [...(outcome.pendingNodeIds ?? resolved ?? eligibleTargets), ...untouchedPendingNodeIds],
+          pendingNodeIds: pending === undefined ? undefined : [...pending, ...untouchedPendingNodeIds],
           approvalPendingNodeIds: outcome.approvalPendingNodeIds,
+          clearFenceNodeIds: outcome.clearFenceNodeIds,
           inDoubtNodeIds: outcome.inDoubtNodeIds?.slice(),
           relaySpooledNodeIds: outcome.relaySpooledNodeIds?.slice(),
           lastError: outcome.lastError,

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import {
-  APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, isRetryablePreEffectReceipt,
+  APPROVAL_CANCELLED, APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, isRetryablePreEffectReceipt,
   PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt,
 } from '../core-types/index.ts';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
@@ -433,11 +433,15 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             let handoff = 'unattempted';
             if (approvalCustody) handoff = 'approval_pending';
             else if (dndCustody || latest || active.has(id)) handoff = 'unknown';
+            const custodyRelinquished = verdict.code === APPROVAL_CANCELLED && handoff === 'unattempted';
             receipt = {
               stage: 'rejected', detail: verdict.reason,
               executionReceipt: {
                 executor, executionId: `${executor}:${envelope.id}`, handoff,
-                durable: dndCustody ? Boolean(verdict.durable) : !approvalCustody && Boolean(config.ledgerPath),
+                durable: dndCustody || custodyRelinquished
+                  ? Boolean(verdict.durable)
+                  : !approvalCustody && Boolean(config.ledgerPath),
+                ...(custodyRelinquished ? { custodyRelinquished: true } : {}),
               },
             };
           } else {

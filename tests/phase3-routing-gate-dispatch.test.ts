@@ -1325,6 +1325,23 @@ test('DND persists signed queued receipts, restores capacity and rechecks admiss
   assert.equal(second.calls.length, 1);
 });
 
+test('an allow rule preserves durable DND custody and retires only the exact volatile copy', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-allow-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const durable of [true, false]) {
+    const { gate } = await setup(t, { mode: 'dnd', ...(durable ? { dndQueuePath: join(dir, 'queue.json') } : {}) });
+    const original = envelope();
+    assert.equal((await gate.evaluate(original)).status, 'queued_dnd');
+    gate.registerRule({ name: 'allow-retry', priority: 1, async evaluate() { return { status: 'allow' }; } });
+    const changed = signEnvelope({ ...original, body: 'different signature' }, sender.privateKeyPem);
+    assert.deepEqual(await gate.evaluate(changed), {
+      status: 'reject', code: 'dnd_custody_retained', durable, reason: 'Queued DND copy retained',
+    });
+    assert.equal((await gate.evaluate(original)).status, durable ? 'queued_dnd' : 'allow');
+    assert.deepEqual(gate.listDndQueue().map(item => item.envelope.signature), durable ? [original.signature] : []);
+  }
+});
+
 test('DND keeps failures durable, drains later items, and rejects corrupt or oversized stores', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-errors-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
