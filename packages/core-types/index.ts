@@ -178,13 +178,18 @@ export function isDedupCasDuplicateReceipt(
   return handoff === 'settled' || (Boolean(options?.allowQueued) && handoff === 'queued');
 }
 
+export function isRetainedApprovalReceipt(receipt: HandoffReceipt | null | undefined): boolean {
+  return receipt?.stage === 'rejected' && receipt.executionReceipt?.handoff === 'approval_pending';
+}
+
 /** A signed decision that must stop retries for this target and preserve its evidence. */
 export function isTerminalDeliveryFailure(
   receipt: HandoffReceipt | null | undefined,
 ): boolean {
   // Live dispatches await their in-process promise; a returned dispatching receipt
   // is persisted interrupted execution, never an offline obligation to requeue.
-  return receipt?.stage === 'rejected' || receipt?.stage === 'failed' || receipt?.stage === 'dispatching';
+  return (receipt?.stage === 'rejected' && !isRetainedApprovalReceipt(receipt)) ||
+    receipt?.stage === 'failed' || receipt?.stage === 'dispatching';
 }
 
 export function isConfirmedHandoffReceipt(
@@ -223,12 +228,15 @@ export function isUnattemptedOutboxItem(item: {
   supersededById?: unknown;
   pendingNodeIds?: readonly string[];
   inDoubtNodeIds?: readonly string[];
+  relaySpooledNodeIds?: readonly string[];
+  approvalPendingNodeIds?: readonly string[];
   deliveredReceipts?: Readonly<Record<string, HandoffReceipt>>;
   failedNodeIds?: readonly string[];
   failedReceipts?: Readonly<Record<string, HandoffReceipt>>;
 } | null | undefined): boolean {
   if (!item || item.status !== 'failed' || item.supersededById !== undefined) return false;
   if ((item.pendingNodeIds?.length ?? 0) > 0 || (item.inDoubtNodeIds?.length ?? 0) > 0) return false;
+  if ((item.relaySpooledNodeIds?.length ?? 0) > 0 || (item.approvalPendingNodeIds?.length ?? 0) > 0) return false;
   if (Object.keys(item.deliveredReceipts ?? {}).length > 0) return false;
   const failedReceipts = item.failedReceipts ?? {};
   const failedIds = new Set([...(item.failedNodeIds ?? []), ...Object.keys(failedReceipts)]);
@@ -545,6 +553,7 @@ export interface OutboxItem {
   envelope: MessageEnvelope;
   explicitTargets: string[];
   pendingNodeIds: string[];
+  approvalPendingNodeIds?: string[];
   deliveredReceipts: Record<string, DeliveryReceipt>;
   /** Signed terminal decisions, kept as operator evidence and never reported as delivered. */
   failedReceipts: Record<string, DeliveryReceipt>;
@@ -570,16 +579,28 @@ export interface OutboxItem {
 
 /** Original targets whose prior outcome permits explicit reconciliation. */
 export function outboxReconciliationTargets(item: OutboxItem): string[] {
+  const approvals = new Set([
+    ...(item.approvalPendingNodeIds ?? []),
+    ...Object.entries(item.failedReceipts).filter(([, receipt]) => isRetainedApprovalReceipt(receipt)).map(([target]) => target),
+  ]);
+  if (item.status === 'queued') return [...approvals];
   const provisional = Object.entries(item.deliveredReceipts)
     .filter(([, receipt]) => isConfirmedHandoffReceipt(receipt, { allowQueued: true }) &&
       !isConfirmedHandoffReceipt(receipt, { allowQueued: false }))
     .map(([target]) => target);
   if (item.status === 'delivered') return provisional;
-  return [...new Set([...provisional, ...item.failedNodeIds, ...Object.keys(item.failedReceipts)])].filter(target => {
+  return [...new Set([...approvals, ...provisional, ...item.failedNodeIds, ...Object.keys(item.failedReceipts)])].filter(target => {
     const failure = item.failedReceipts[target];
-    return (!failure || isRetryablePreEffectReceipt(failure)) &&
+    return (!failure || isRetainedApprovalReceipt(failure) || isRetryablePreEffectReceipt(failure)) &&
       !isConfirmedHandoffReceipt(item.deliveredReceipts[target], { allowQueued: false });
   });
+}
+
+/** A relay copy remains in custody until the target confirms final execution. */
+export function outstandingRelaySpooledTargets(
+  nodeIds: readonly string[], deliveredReceipts: Readonly<Record<string, HandoffReceipt>>,
+): string[] {
+  return [...new Set(nodeIds)].filter(nodeId => !isConfirmedHandoffReceipt(deliveredReceipts[nodeId], { allowQueued: false }));
 }
 
 export interface OutboxAttemptOptions {
@@ -596,6 +617,7 @@ export interface OutboxEnqueueInput {
   envelope: MessageEnvelope;
   explicitTargets: string[];
   pendingNodeIds: string[];
+  approvalPendingNodeIds?: readonly string[];
   deliveredReceipts?: Record<string, DeliveryReceipt>;
   failedReceipts?: Record<string, DeliveryReceipt>;
   failedNodeIds?: string[];
@@ -662,6 +684,7 @@ export interface OutboxDeliveryOutcome {
   deliveredReceipts?: Readonly<Record<string, DeliveryReceipt>>;
   /** Targets still retryable after this attempt. */
   pendingNodeIds?: readonly string[];
+  approvalPendingNodeIds?: readonly string[];
   /** Targets whose send timed out after a possible external effect; retry only on pulse/force. */
   inDoubtNodeIds?: readonly string[];
   relaySpooledNodeIds?: readonly string[];

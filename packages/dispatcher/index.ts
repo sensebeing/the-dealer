@@ -403,8 +403,14 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             detail: 'Invalid envelope signature or authenticated sender/network mismatch',
           };
         } else {
-          const verdict = await ctx.services.gate.evaluate(envelope);
-          if (verdict.status === 'allow') {
+          const id = key(envelope);
+          const prior = readDeliveryFence(id);
+          const alreadyExecuted = prior?.stage === 'dispatched' || prior?.stage === 'settled';
+          const verdict = alreadyExecuted ? { status: 'allow' as const } : await ctx.services.gate.evaluate(envelope);
+          const latest = alreadyExecuted ? prior : readDeliveryFence(id);
+          if (latest?.stage === 'dispatched' || latest?.stage === 'settled') {
+            receipt = latest;
+          } else if (verdict.status === 'allow') {
             try {
               receipt = await ctx.services.dispatcher.dispatch(envelope);
             } catch (error) {
@@ -421,15 +427,12 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               };
             }
           } else if (verdict.status === 'reject') {
-            const id = key(envelope);
-            const prior = readDeliveryFence(id);
             const dndCustody = verdict.code === DND_HANDOFF_PARKED || verdict.code === DND_CUSTODY_RETAINED;
             const approvalCustody = verdict.code === APPROVAL_CUSTODY_RETAINED;
             const executor = dndCustody ? 'gate-dnd' : 'gate';
             let handoff = 'unattempted';
-            if (dndCustody || approvalCustody) handoff = 'unknown';
-            else if (prior?.stage === 'dispatched' || prior?.stage === 'settled') handoff = 'settled';
-            else if (prior || active.has(id)) handoff = 'unknown';
+            if (approvalCustody) handoff = 'approval_pending';
+            else if (dndCustody || latest || active.has(id)) handoff = 'unknown';
             receipt = {
               stage: 'rejected', detail: verdict.reason,
               executionReceipt: {

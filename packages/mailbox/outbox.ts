@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import {
-  envelopeClaimVersion, isConfirmedHandoffReceipt, isRetryablePreEffectReceipt, isUnattemptedOutboxItem,
-  outboxReconciliationTargets, sameEnvelopeIntent,
+  envelopeClaimVersion, isConfirmedHandoffReceipt, isRetainedApprovalReceipt, isRetryablePreEffectReceipt,
+  isUnattemptedOutboxItem, outboxReconciliationTargets, outstandingRelaySpooledTargets, sameEnvelopeIntent,
 } from '../core-types/index.ts';
 import {
   copyFileAtomically,
@@ -82,6 +82,7 @@ export interface OutboxAttemptUpdate {
   deliveredReceipts?: OutboxDeliveryOutcome['deliveredReceipts'];
   failures?: OutboxDeliveryOutcome['failures'];
   pendingNodeIds?: string[];
+  approvalPendingNodeIds?: readonly string[];
   inDoubtNodeIds?: string[];
   relaySpooledNodeIds?: string[];
   lastError?: string;
@@ -152,6 +153,8 @@ function validItem(value: unknown): value is OutboxItem {
     value.explicitTargets.every(target => typeof target === 'string') &&
     Array.isArray(value.pendingNodeIds) &&
     value.pendingNodeIds.every(nodeId => typeof nodeId === 'string') &&
+    (value.approvalPendingNodeIds === undefined ||
+      (Array.isArray(value.approvalPendingNodeIds) && value.approvalPendingNodeIds.every(nodeId => typeof nodeId === 'string'))) &&
     isRecord(value.deliveredReceipts) &&
     Object.values(value.deliveredReceipts).every(validReceipt) &&
     isRecord(value.failedReceipts) &&
@@ -189,6 +192,10 @@ function normalizeTargets(item: OutboxItem): OutboxItem {
   );
   // A later rejection cannot disprove an earlier delivery whose reply timed out.
   item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(nodeId => !item.deliveredReceipts[nodeId]);
+  item.relaySpooledNodeIds = outstandingRelaySpooledTargets(item.relaySpooledNodeIds, item.deliveredReceipts);
+  if (item.approvalPendingNodeIds !== undefined) {
+    item.approvalPendingNodeIds = [...new Set(item.approvalPendingNodeIds)].filter(nodeId => item.pendingNodeIds.includes(nodeId));
+  }
   return item;
 }
 
@@ -334,14 +341,16 @@ export class OutboxStore {
       for (const nodeId of input.reconcileNodeIds ?? []) {
         if (!existing) continue;
         const failure = existing.failedReceipts[nodeId];
-        if (!failure || isRetryablePreEffectReceipt(failure)) {
+        if (!failure || isRetainedApprovalReceipt(failure) || isRetryablePreEffectReceipt(failure)) {
           delete existing.failedReceipts[nodeId];
           existing.failedNodeIds = existing.failedNodeIds.filter(id => id !== nodeId);
         }
         existing.pendingNodeIds = existing.pendingNodeIds.filter(id => id !== nodeId);
-        existing.relaySpooledNodeIds = existing.relaySpooledNodeIds.filter(id => id !== nodeId);
       }
       const pendingNodeIds = [...(input.pendingNodeIds ?? []), ...(existing?.pendingNodeIds ?? [])];
+      const approvalPendingNodeIds = input.approvalPendingNodeIds !== undefined || existing?.approvalPendingNodeIds !== undefined
+        ? [...(existing?.approvalPendingNodeIds ?? []), ...(input.approvalPendingNodeIds ?? [])]
+        : undefined;
       const inDoubtNodeIds = [...(existing?.inDoubtNodeIds ?? []), ...(input.inDoubtNodeIds ?? [])];
       const relaySpooledNodeIds = [
         ...new Set([
@@ -356,6 +365,7 @@ export class OutboxStore {
         envelope: structuredClone(input.envelope),
         explicitTargets: [...new Set(input.explicitTargets ?? [])],
         pendingNodeIds,
+        ...(approvalPendingNodeIds !== undefined ? { approvalPendingNodeIds } : {}),
         deliveredReceipts: existing?.deliveredReceipts ?? {},
         failedReceipts: existing?.failedReceipts ?? {},
         failedNodeIds: existing?.failedNodeIds ?? [],
@@ -399,7 +409,8 @@ export class OutboxStore {
     const keys = new Set<string>();
     for (const item of this.read().items) {
       if (item.status === 'failed' && item.pendingNodeIds.length === 0 &&
-        item.inDoubtNodeIds.length === 0 && Object.keys(item.deliveredReceipts).length === 0) {
+        item.inDoubtNodeIds.length === 0 && item.relaySpooledNodeIds.length === 0 &&
+        Object.keys(item.deliveredReceipts).length === 0 && !Object.values(item.failedReceipts).some(isRetainedApprovalReceipt)) {
         keys.add(netKey(item.networkId, item.id));
       }
     }
@@ -711,6 +722,9 @@ export class OutboxStore {
       if (update.pendingNodeIds !== undefined) {
         item.pendingNodeIds = [...new Set(update.pendingNodeIds)];
       }
+      if (update.approvalPendingNodeIds?.length) {
+        item.approvalPendingNodeIds = [...(item.approvalPendingNodeIds ?? []), ...update.approvalPendingNodeIds];
+      }
       if (update.inDoubtNodeIds !== undefined) {
         item.inDoubtNodeIds.push(...update.inDoubtNodeIds);
       }
@@ -1015,6 +1029,7 @@ export class OutboxRedriveService {
           deliveredReceipts: outcome.deliveredReceipts,
           failures: outcome.failures,
           pendingNodeIds: [...(outcome.pendingNodeIds ?? resolved ?? eligibleTargets), ...untouchedPendingNodeIds],
+          approvalPendingNodeIds: outcome.approvalPendingNodeIds,
           inDoubtNodeIds: outcome.inDoubtNodeIds?.slice(),
           relaySpooledNodeIds: outcome.relaySpooledNodeIds?.slice(),
           lastError: outcome.lastError,

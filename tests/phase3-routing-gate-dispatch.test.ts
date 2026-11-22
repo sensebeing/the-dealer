@@ -277,12 +277,13 @@ test('admission and policy rejections sign the evidence available before executi
   assert.equal(firstRejection.executionReceipt?.handoff, 'unattempted');
   assert.equal(firstRejection.executionReceipt?.envelopeSignature, firstDenied.signature);
   assert.equal(isRetryablePreEffectReceipt(firstRejection), true);
-  for (const [message, handoff] of [[completed, 'settled'], [policyDenied, 'unattempted']] as const) {
-    const rejected = await inbound(message);
-    assert.equal(rejected.stage, 'rejected');
-    assert.equal(rejected.executionReceipt?.handoff, handoff);
-    assert.equal(isRetryablePreEffectReceipt(rejected), handoff === 'unattempted');
-  }
+  const completedReplay = await inbound(completed);
+  assert.equal(completedReplay.stage, 'dispatched');
+  assert.equal(isRetryablePreEffectReceipt(completedReplay), false);
+  const rejected = await inbound(policyDenied);
+  assert.equal(rejected.stage, 'rejected');
+  assert.equal(rejected.executionReceipt?.handoff, 'unattempted');
+  assert.equal(isRetryablePreEffectReceipt(rejected), true);
   assert.equal(calls.length, 1);
 });
 

@@ -6,12 +6,14 @@ import {
   isNetworkUnmountedError,
   isOfflinePeerSpooledError,
   isPeerOfflineError,
+  isRetainedApprovalReceipt,
   isTerminalDeliveryFailure,
   isUnattemptedOutboxItem,
   isUnresolvedTargetError,
   LocalDeliveryError,
   NetworkUnmountedError,
   outboxReconciliationTargets,
+  outstandingRelaySpooledTargets,
   receiptMatchesEnvelopeSignature,
   resolveSemanticHeader,
   sameEnvelopeIntent,
@@ -132,6 +134,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             error: string;
             inDoubt: boolean;
             relaySpooled: boolean;
+            approvalPending?: boolean;
             /** Nonterminal live receipt (e.g. pending_approval) returned to the caller. */
             receipt?: DeliveryReceipt;
           }
@@ -217,6 +220,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             error: detail,
             inDoubt: false,
             relaySpooled: false,
+            approvalPending: receipt.stage === 'pending_approval' || isRetainedApprovalReceipt(receipt),
             receipt,
           };
         } catch (error) {
@@ -461,6 +465,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               const pendingNodeIds: string[] = [];
               const inDoubtNodeIds: string[] = [];
               const relaySpooledNodeIds: string[] = [];
+              const approvalPendingNodeIds: string[] = [];
               let offlineDetail: string | undefined;
               let fatalError: Error | undefined;
               if (route.mode === 'broadcast') {
@@ -499,6 +504,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                       continue;
                     }
                     pendingNodeIds.push(target);
+                    if (attempt.approvalPending) approvalPendingNodeIds.push(target);
                     if (attempt.inDoubt) {
                       inDoubtNodeIds.push(target);
                     }
@@ -534,6 +540,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                   failedNodeIds,
                   inDoubtNodeIds,
                   relaySpooledNodeIds,
+                  ...(approvalPendingNodeIds.length > 0 ? { approvalPendingNodeIds } : {}),
                   filePaths: stagedPaths,
                   ...(offlineDetail !== undefined ? { lastError: offlineDetail } : {}),
                 });
@@ -676,6 +683,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const pendingNodeIds: string[] = [];
           const outcomeInDoubtNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
+          const approvalPendingNodeIds: string[] = [];
           const failures: OutboxDeliveryFailure[] = [];
           let lastError: string | undefined;
           // All targets share a deadline but start independently; a dead peer cannot
@@ -723,6 +731,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               continue;
             }
             pendingNodeIds.push(target);
+            if (attempt.approvalPending) approvalPendingNodeIds.push(target);
             if (attempt.relaySpooled) {
               relaySpooledNodeIds.push(target);
             }
@@ -739,7 +748,10 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             deliveredReceipts,
             pendingNodeIds: pending,
             inDoubtNodeIds,
-            relaySpooledNodeIds,
+            relaySpooledNodeIds: outstandingRelaySpooledTargets(
+              [...item.relaySpooledNodeIds, ...relaySpooledNodeIds], { ...item.deliveredReceipts, ...deliveredReceipts },
+            ),
+            ...(approvalPendingNodeIds.length > 0 ? { approvalPendingNodeIds } : {}),
             ...(failures.length > 0 ? { failures } : {}),
             ...(lastError !== undefined ? { lastError } : {}),
           };
@@ -815,7 +827,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
 
       /** Retry only original unsettled targets, retaining the envelope and confirmed siblings. */
       const reconcileObligation = async (observed: OutboxItem): Promise<EmitResult> => {
-        if (observed.status === 'queued' || outboxReconciliationTargets(observed).length === 0) {
+        if (outboxReconciliationTargets(observed).length === 0) {
           return replayObligation(observed);
         }
         const retryOriginal = isUnattemptedOutboxItem(observed);
@@ -833,7 +845,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
         if ('claimed' in claim && !claim.claimed) return replayObligation(claim.item);
         const { item: existing, attemptToken } = claim;
         try {
-          if (!retryOriginal && existing.status === 'queued') return replayObligation(existing);
           const targets = retryOriginal ? existing.pendingNodeIds : outboxReconciliationTargets(existing);
           if (targets.length === 0) return replayObligation(existing);
           const { transport } = ctx.services;
@@ -859,6 +870,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const pendingNodeIds: string[] = [];
           const inDoubtNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
+          const approvalPendingNodeIds: string[] = [];
           let fatalError: Error | undefined;
           let lastError: string | undefined;
           for (const [index, target] of targets.entries()) {
@@ -876,6 +888,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               if (attempt.receipt) livePendingReceipts[target] = attempt.receipt;
               if (!isConfirmedHandoffReceipt(existing.deliveredReceipts[target], { allowQueued: true })) {
                 pendingNodeIds.push(target);
+                if (attempt.approvalPending) approvalPendingNodeIds.push(target);
                 if (attempt.inDoubt) inDoubtNodeIds.push(target);
                 if (attempt.relaySpooled) relaySpooledNodeIds.push(target);
               }
@@ -884,6 +897,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           }
           const updated = outbox!.enqueue({ attemptToken, envelope: existing.envelope, explicitTargets: existing.explicitTargets,
             reconcileNodeIds: targets, deliveredReceipts, failedReceipts, failedNodeIds, pendingNodeIds,
+            ...(approvalPendingNodeIds.length > 0 ? { approvalPendingNodeIds } : {}),
             inDoubtNodeIds, relaySpooledNodeIds, ...(lastError !== undefined ? { lastError: fatalError?.message ?? lastError } : {}) });
           // Return the live rejection for this attempt while retaining prior custody in the store.
           const receipts = (updated.status === 'queued' ? replayObligation(updated).receipts

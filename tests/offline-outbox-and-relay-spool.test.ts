@@ -33,6 +33,7 @@ import type { RuntimeConfig } from '../packages/cli/config.ts';
 import {
   DeliveryTimeoutError,
   LocalDeliveryError,
+  OfflinePeerSpooledError,
   PeerUnreachableError,
   deriveNetworkKeys,
   generateNodeKeyPair,
@@ -4983,6 +4984,52 @@ test('a gate rejection after a timed-out send retains uncertainty and forbids re
   });
   assert.equal(replacement?.claimed, false);
   assert.deepEqual(harness.outbox.list().map(item => item.id), [first.messageId]);
+});
+
+test('a direct pre-effect rejection leaves the disconnected relay copy in custody until execution', async t => {
+  let receiver: 'offline' | 'closed' | 'queued' | 'open' = 'offline';
+  let executions = 0;
+  const harness = await emitterHarness(t, {
+    extraMembers: ['carol'],
+    plan: target => {
+      if (receiver === 'offline') return { error: new OfflinePeerSpooledError(target, 'seed', 'spooled-copy') };
+      if (receiver === 'closed') return { stage: 'rejected', executionReceipt: { handoff: 'unattempted' } };
+      if (receiver === 'queued') return { stage: 'queued', executionReceipt: { durable: true } };
+      executions++;
+      return { stage: 'dispatched' };
+    },
+  });
+  const session = 'terminal:relay-copy';
+  const input: EmitMessageInput = {
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'wave', subject: 'wave', body: 'original', payload: {}, idempotencyKey: 'spooled-obligation',
+    semantic: { type: 'question', replyMailbox: session },
+  };
+  const first = await harness.emitter.emit(input);
+  const target = harness.targetCard.nodeId;
+  assert.deepEqual(harness.outbox.get(first.messageId)?.relaySpooledNodeIds, [target]);
+  receiver = 'closed';
+  const redrive = new OutboxRedriveService({ outbox: harness.outbox, deliver: harness.emitter.redriveOutboxItem! });
+  const failed = (await redrive.flush({ force: true })).items[0];
+  assert.equal(isRetryablePreEffectReceipt(failed.failedReceipts[target]), true);
+  assert.deepEqual(failed.relaySpooledNodeIds, [target]);
+  assert.equal(isUnattemptedOutboxItem(failed), false);
+  assert.equal(harness.mailbox.inspectSlotObligations('stream:relay', {
+    sessionMailboxId: session, outbox: harness.outbox,
+  }).immediateBusyReason, 'outbound_thread_open');
+
+  const changed = { ...input, routing: { mode: 'unicast' as const, targets: ['member:carol'] }, body: 'other node' };
+  assert.equal((await harness.emitter.emit(changed)).messageId, first.messageId);
+  assert.deepEqual(harness.outbox.get(first.messageId)?.relaySpooledNodeIds, [target]);
+  receiver = 'queued';
+  assert.equal((await harness.emitter.emit(input)).receipts[0].stage, 'queued');
+  assert.deepEqual(harness.outbox.get(first.messageId)?.relaySpooledNodeIds, [target]);
+  receiver = 'open';
+  assert.equal((await harness.emitter.emit(input)).receipts[0].stage, 'dispatched');
+  assert.deepEqual(harness.outbox.get(first.messageId)?.relaySpooledNodeIds, []);
+  assert.equal((await harness.emitter.emit(changed)).messageId, first.messageId);
+  assert.equal(executions, 1);
+  assert.ok(harness.sendCalls.every(call => call.targetNodeId === target && call.envelope.id === first.messageId));
 });
 
 test('later pre-effect rejection cannot overwrite earlier unknown outbox evidence', async t => {

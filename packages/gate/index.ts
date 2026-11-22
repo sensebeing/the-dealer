@@ -88,6 +88,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
       const modes = new Map(Object.entries(config.networkModes ?? {}));
       const rules = new Set<GateRulePlugin>();
       const pending = new Map<string, PendingApprovalItem>();
+      const cancelledApprovals = new Map<string, string>();
       const maxDndItems = config.maxDndItems ?? 1000;
       if (!Number.isSafeInteger(maxDndItems) || maxDndItems < 1) {
         throw new Error('Invalid DND queue capacity');
@@ -113,6 +114,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
       const trusted = new Set<string>();
       const rejections: { envelope: MessageEnvelope; reason: string }[] = [];
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
+      const cancellationKey = (e: MessageEnvelope) => `${key(e)}\0${e.signature}`;
       const trustKeys = (e: MessageEnvelope) => [
         JSON.stringify([e.networkId, 'node', e.from.nodeId]),
         JSON.stringify([e.networkId, 'member', e.from.member]),
@@ -181,6 +183,10 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         }
         if (retained && existingDnd.status === 'queued' && verdict.status === 'reject' && !drainingCurrent) {
           return { ...verdict, code: DND_CUSTODY_RETAINED, durable };
+        }
+        const cancellation = cancelledApprovals.get(cancellationKey(envelope));
+        if (cancellation !== undefined) {
+          return { status: 'reject', code: 'approval_rejected', reason: cancellation };
         }
         if (verdict.status === 'reject' && [...pending.values()].some(item =>
           key(item.envelope) === key(envelope),
@@ -321,9 +327,11 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             throw new Error(`Unknown approval: ${id}`);
           }
           if (approving.has(id)) throw new Error(`Approval already in progress: ${id}`);
-          pending.delete(id);
           const queuedId = dndKey(item.envelope);
-          if (dnd.get(queuedId)?.envelope.signature === item.envelope.signature) updateDnd(queuedId);
+          const queued = dnd.get(queuedId);
+          if (queued?.status === 'queued' && queued.envelope.signature === item.envelope.signature) updateDnd(queuedId);
+          cancelledApprovals.set(cancellationKey(item.envelope), reason);
+          pending.delete(id);
           rejections.push({ envelope: item.envelope, reason });
         },
       };
