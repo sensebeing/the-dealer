@@ -144,6 +144,11 @@ service inside `apply`, and dispose that registration during plugin cleanup. Reg
 so unlinking and reloading can clean them up. Factories should construct plugin
 objects; keep reversible runtime effects in `apply` and its cleanup.
 
+External sources can call `await context.runtime.probeSlot(mailboxId)` to read
+slot activity and readiness. Use `busy` to decide whether to keep an outstanding
+wave active and `ready` to select a slot for new mail. The optional `reason`
+explains the result. The probe leaves leases, mail, and terminals untouched.
+
 Example `~/.dealer/projects/my-project.patch.json`:
 
 ```json
@@ -184,7 +189,9 @@ to compose built-in factories and host-owned binding hooks. Host names and setup
 come from `AGENT_HOST_DESCRIPTORS`; adding a host does not require a runtime whitelist.
 `WakeupDriver` implementations live in plugins and are injected into the host-neutral
 `WakeupRedriveService`. Durable mailbox obligations and atomic session pinning remain owned
-by `MailboxStore`.
+by `MailboxStore`, which also derives the slot’s local obligations from the
+ledger. Drivers can expose a session mailbox alias and probe host activity or
+readiness through their existing idle checks.
 
 An external `.dealer/plugins/custom-exec.ts` can register both extension points:
 

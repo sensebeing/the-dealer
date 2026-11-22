@@ -34,6 +34,7 @@ import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
+import type { SlotProbeResult } from '../mailbox/index.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -1308,6 +1309,16 @@ export class DealerNodeRuntime {
   /** Deterministic flush of pending durable wakeups (primary test/inspection hook). */
   async flushWakeups(): Promise<void> {
     await this.wakeups.flushWakeups();
+  }
+
+  /** Read the slot's current activity and readiness without leasing or waking its mail. */
+  probeSlot(mailboxId: string): Promise<SlotProbeResult> {
+    if (!this.wakeups) {
+      const pending = this.mailbox.check({ mailboxId, peek: true });
+      const busy = Boolean(pending.deliveryId || pending.items.length > 0);
+      return Promise.resolve({ busy, ready: !busy });
+    }
+    return this.wakeups.probeSlot(mailboxId, { outbox: this.outbox });
   }
 
   listOutbox(filter: OutboxListFilter = {}): OutboxItem[] {

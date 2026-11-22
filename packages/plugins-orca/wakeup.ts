@@ -30,7 +30,7 @@ import {
   settleWakeDeliveryFailure,
   SettledWakeLaunchError,
 } from '../mailbox/wakeup.ts';
-import type { WakeupDriver, WakeupDriverContext, WakeupDriverOutcome } from '../mailbox/wakeup.ts';
+import type { SlotProbeResult, WakeupDriver, WakeupDriverContext, WakeupDriverOutcome, WakeupProbeContext } from '../mailbox/wakeup.ts';
 
 export interface OrcaTerminalDriverConfig {
   orcaCommand?: string;
@@ -550,13 +550,106 @@ class OrcaWakeDelivery {
   private readonly now: () => number;
   private readonly report: (error: unknown) => void;
 
-  constructor(context: WakeupDriverContext, options: OrcaWakeupDriverOptions) {
+  constructor(context: Pick<WakeupDriverContext, 'store' | 'now' | 'reportError'>, options: OrcaWakeupDriverOptions) {
     this.store = context.store;
     this.now = context.now;
     this.report = context.reportError;
     this.runner = options.commandRunner ?? runCommand;
     this.command = options.orcaCommand ?? 'orca';
     this.idleCheck = options.idleCheck;
+  }
+
+  async probe(context: WakeupProbeContext): Promise<SlotProbeResult> {
+    const { mailboxId, hasPendingWave, hasOpenOutboundThread } = context;
+    try {
+      const { target, excludedHandles } = this.excludeClaimedTerminal(mailboxId, readOrcaWakeTarget(context.target));
+      const command = target.orcaCommand ?? this.command;
+      if (hasPendingWave) {
+        return await this.probeLeasedWave(target, command, hasOpenOutboundThread, excludedHandles);
+      }
+      if (hasOpenOutboundThread) {
+        const live = this.idleCheck ? true : target.workspacePath
+          ? Boolean((target.terminalHandle || target.paneKey) && await isOrcaWorkspaceTerminalLive(
+            this.runner, command, target.workspacePath, target.terminalHandle, undefined, target.paneKey,
+          ))
+          : Boolean(target.terminalHandle);
+        if (live) return { busy: true, ready: false, reason: 'outbound_thread_open' };
+      }
+
+      const preview: MailboxCheckResult = { mailboxId, deliveryId: null, redelivered: false, newerQueuedCount: 0, items: [] };
+      const retired = target.retiredTerminalHandle?.trim();
+      if (needsSessionRotation(target, preview) && retired && retired !== target.terminalHandle?.trim() &&
+        target.workspacePath && !this.idleCheck) {
+        const activeClaims = claimedOrcaTerminalHandles(this.store, mailboxId, target, { includeRetired: false });
+        if (!activeClaims.has(retired)) {
+          const retiredIdle = await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
+            targetTerminalHandle: null, retiringTerminalHandle: retired, agent: target.agent, excludedHandles,
+            throwOnProbeError: true,
+          });
+          if (!retiredIdle.idle) return { busy: true, ready: false, reason: retiredIdle.reason ?? 'Retired terminal is busy' };
+        }
+      }
+
+      const idle = await this.authoritativeIdle(target, preview, this.needsDedicatedTab(mailboxId, target), excludedHandles, true);
+      return idle.idle ? { busy: false, ready: true } : { busy: true, ready: false, reason: idle.reason };
+    } catch (error) {
+      this.report(error);
+      return { busy: true, ready: false, reason: String(error) };
+    }
+  }
+
+  private async probeLeasedWave(
+    target: OrcaWakeTarget,
+    command: string,
+    hasOpenOutboundThread: boolean,
+    excludedHandles: ReadonlySet<string>,
+  ): Promise<SlotProbeResult> {
+    const openThread = { busy: true, ready: false, reason: 'outbound_thread_open' };
+    const quiescent = { busy: false, ready: false, reason: 'quiescent_leased_wave' };
+    const unbound = { busy: false, ready: false, reason: 'unbound_leased_wave' };
+    const waveActivity = (idle: OrcaIdleResult): SlotProbeResult => ({
+      busy: !idle.idle, ready: false, reason: idle.reason ?? (idle.idle ? quiescent.reason : undefined),
+    });
+    if (this.idleCheck) {
+      return hasOpenOutboundThread ? openThread : waveActivity(await this.idleCheck());
+    }
+    const { workspacePath, terminalHandle, paneKey, agent } = target;
+    if (target.driver === 'orca-run') {
+      if (!workspacePath) return quiescent;
+      const idle = await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, { throwOnProbeError: true });
+      return { busy: !idle.idle, ready: false, reason: idle.reason };
+    }
+    if (!workspacePath) {
+      if (!terminalHandle) return unbound;
+      if (hasOpenOutboundThread) return openThread;
+      return waveActivity(await probeOrcaTerminalIdle(this.runner, command, terminalHandle, undefined, undefined, {
+        throwOnProbeError: true,
+      }));
+    }
+    if (!terminalHandle && !paneKey) return unbound;
+
+    const terminalLive = await isOrcaWorkspaceTerminalLive(this.runner, command, workspacePath, terminalHandle, undefined, paneKey);
+    if (terminalLive) {
+      if (hasOpenOutboundThread) return openThread;
+      return waveActivity(await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, {
+        targetTerminalHandle: terminalHandle, targetPaneKey: paneKey, agent, excludedHandles,
+        throwOnProbeError: true,
+      }));
+    }
+    if (!paneKey?.trim()) return { busy: false, ready: false, reason: 'terminal_gone' };
+    const idle = await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, {
+      targetTerminalHandle: null, retiringTerminalHandle: terminalHandle, retiringPaneKey: paneKey, agent, excludedHandles,
+      throwOnProbeError: true,
+    });
+    return { busy: !idle.idle, ready: false, reason: idle.idle ? 'terminal_gone' : idle.reason };
+  }
+
+  private excludeClaimedTerminal(mailboxId: string, target: OrcaWakeTarget) {
+    const excludedHandles = target.driver === 'orca-terminal' ? claimedOrcaTerminalHandles(this.store, mailboxId, target) : new Set<string>();
+    if (target.terminalHandle && excludedHandles.has(target.terminalHandle)) {
+      return { target: { ...target, terminalHandle: undefined, paneKey: undefined }, excludedHandles };
+    }
+    return { target, excludedHandles };
   }
 
   async run(context: WakeupDriverContext): Promise<WakeupDriverOutcome> {
@@ -582,10 +675,9 @@ class OrcaWakeDelivery {
         }
       }
       activeRevision = target.bindingRevision ?? 0;
-      const excludedHandles = target.driver === 'orca-terminal' ? claimedOrcaTerminalHandles(this.store, mailboxId, target) : new Set<string>();
-      if (target.terminalHandle && excludedHandles.has(target.terminalHandle)) {
-        target = { ...target, terminalHandle: undefined, paneKey: undefined };
-      }
+      const scoped = this.excludeClaimedTerminal(mailboxId, target);
+      target = scoped.target;
+      const { excludedHandles } = scoped;
       const dedicatedTab = this.needsDedicatedTab(mailboxId, target);
       const idle = await this.authoritativeIdle(target, preview, dedicatedTab, excludedHandles);
       if (!idle.idle) {
@@ -661,6 +753,7 @@ class OrcaWakeDelivery {
     preview: MailboxCheckResult,
     dedicatedTab: boolean,
     excludedHandles: ReadonlySet<string>,
+    throwOnProbeError = false,
   ): Promise<WakeupIdleDecision> {
     const command = target.orcaCommand ?? this.command;
     const spawnFreshSession = await this.spawnsFreshSession(target, preview, command, dedicatedTab);
@@ -671,7 +764,7 @@ class OrcaWakeDelivery {
     }
     if (target.driver === 'orca-run') {
       if (target.workspacePath) {
-        return withPlan(await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath));
+        return withPlan(await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, { throwOnProbeError }));
       }
       // Orchestration mail queues without touching a TUI composer, so no keystroke race exists.
       return withPlan({ idle: true });
@@ -688,12 +781,13 @@ class OrcaWakeDelivery {
           retiringPaneKey: spawnFreshSession ? target.paneKey : undefined,
           agent: target.agent,
           excludedHandles,
+          throwOnProbeError,
         }),
       );
     }
     if (target.terminalHandle) {
       return withPlan(
-        await probeOrcaTerminalIdle(this.runner, command, target.terminalHandle, target.workspacePath),
+        await probeOrcaTerminalIdle(this.runner, command, target.terminalHandle, target.workspacePath, undefined, { throwOnProbeError }),
       );
     }
     return withPlan({
@@ -1033,6 +1127,12 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
   return {
     name: 'orca-terminal',
     deliver: (context) => new OrcaWakeDelivery(context, options).run(context),
+    probeSlot: (context) => new OrcaWakeDelivery(context, options).probe(context),
+    sessionMailboxIdFor(target) {
+      const { terminalHandle } = readOrcaDriverConfig(target);
+      const handle = terminalHandle?.trim();
+      return target.rotateAfterWaves !== undefined && handle ? `terminal:${handle}` : undefined;
+    },
     async resolveSessionTarget(mailboxId) {
       if (mailboxId.startsWith('terminal:') && mailboxId.length > 9) {
         let workspacePath: string | undefined;
@@ -1080,6 +1180,7 @@ export function createOrcaRunWakeupDriver(options: OrcaWakeupDriverOptions = {})
   return {
     name: 'orca-run',
     deliver: (context) => new OrcaWakeDelivery(context, options).run(context),
+    probeSlot: (context) => new OrcaWakeDelivery(context, options).probe(context),
   };
 }
 

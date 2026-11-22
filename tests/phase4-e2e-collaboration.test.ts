@@ -1215,6 +1215,29 @@ test('external configuration defers names until plugin loading but rejects unreg
 });
 
 
+test('an external plugin can probe slot readiness through its runtime context', async t => {
+  const root = directory(t);
+  const plugin = join(root, 'slot-probe.ts');
+  const resultPath = join(root, 'slot-probe.json');
+  writeFileSync(plugin, `
+    import { writeFileSync } from 'node:fs';
+    export async function createPlugin(config, context) {
+      const result = await context.runtime.probeSlot('stream:alert-wave:2');
+      writeFileSync(config.resultPath, JSON.stringify(result));
+      return { name: 'slot-probe', apply() {} };
+    }
+  `);
+  const runtime = new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+    patch: { userPlugins: [{ name: 'slot-probe', module: plugin, config: { resultPath } }] },
+  });
+  t.after(() => runtime.stop());
+  await runtime.start();
+  assert.deepEqual(JSON.parse(readFileSync(resultPath, 'utf8')), { busy: false, ready: true });
+});
+
 test('startup script dispatch waits for external executors and policies before mounting traffic', async t => {
   const root = directory(t);
   const plugin = join(root, 'startup-plugin.ts');

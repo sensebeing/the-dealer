@@ -2,6 +2,23 @@ import { CommandNotStartedError, singleLine } from '../subprocess/index.ts';
 import type { Disposable } from '../core-types/index.ts';
 import { normalizeMailboxId, wakeupBackoffDelay } from './store.ts';
 import type { MailboxCheckResult, MailboxItem, MailboxStore, WakeTargetState } from './store.ts';
+import type { OutboxStore } from './outbox.ts';
+
+export interface SlotProbeResult {
+  readonly busy: boolean;
+  readonly ready: boolean;
+  readonly reason?: string;
+}
+
+export interface WakeupProbeContext {
+  readonly store: MailboxStore;
+  readonly mailboxId: string;
+  readonly target: WakeTargetState;
+  readonly hasPendingWave: boolean;
+  readonly hasOpenOutboundThread: boolean;
+  readonly now: () => number;
+  readonly reportError: (error: unknown) => void;
+}
 
 export interface WakeupDriverContext {
   readonly store: MailboxStore;
@@ -30,6 +47,8 @@ export type WakeupDriverOutcome =
 export interface WakeupDriver {
   readonly name: string;
   deliver(context: WakeupDriverContext): Promise<WakeupDriverOutcome>;
+  sessionMailboxIdFor?(target: WakeTargetState): string | undefined;
+  probeSlot?(context: WakeupProbeContext): Promise<SlotProbeResult>;
   resolveSessionTarget?(
     mailboxId: string,
     store: MailboxStore,
@@ -235,6 +254,44 @@ export class WakeupRedriveService {
 
   getLastError(): string | undefined {
     return this.lastError;
+  }
+
+  async probeSlot(mailboxId: string, options: { outbox?: OutboxStore } = {}): Promise<SlotProbeResult> {
+    const id = normalizeMailboxId(mailboxId);
+    if (this.stopped) return { busy: false, ready: false, reason: 'Wakeup service stopped' };
+    if (this.inFlight.has(id) || this.claims.has(id)) {
+      return { busy: true, ready: false, reason: 'wakeup_in_flight' };
+    }
+    const target = this.store.getWakeTarget(id);
+    const driver = target ? this.drivers.get(target.driver) : undefined;
+    const sessionMailboxId = target ? driver?.sessionMailboxIdFor?.(target) : undefined;
+    const obligations = this.store.inspectSlotObligations(id, { sessionMailboxId, outbox: options.outbox });
+    if (obligations.immediateBusyReason) {
+      return { busy: true, ready: false, reason: obligations.immediateBusyReason };
+    }
+    const { hasPendingWave, hasRemoteOpenOutboundThread } = obligations;
+    if (!target || target.driver === 'passive') {
+      return { busy: false, ready: !hasPendingWave, ...(hasPendingWave ? { reason: 'quiescent_leased_wave' } : {}) };
+    }
+    if (!driver) {
+      return { busy: true, ready: false, reason: `Unsupported wakeup driver: ${target.driver}` };
+    }
+    if (!driver.probeSlot) {
+      return {
+        busy: hasRemoteOpenOutboundThread,
+        ready: !hasPendingWave && !hasRemoteOpenOutboundThread,
+        ...(hasRemoteOpenOutboundThread ? { reason: 'outbound_thread_open' } : {}),
+      };
+    }
+    return await driver.probeSlot({
+      store: this.store,
+      mailboxId: id,
+      target,
+      hasPendingWave,
+      hasOpenOutboundThread: hasRemoteOpenOutboundThread,
+      now: this.now,
+      reportError: error => this.report(error),
+    });
   }
 
   /**

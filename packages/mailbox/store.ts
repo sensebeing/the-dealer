@@ -16,6 +16,7 @@ import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-typ
 import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
+import type { OutboxStore } from './outbox.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
 export type { AgentConversationMode, ActiveConversationMode } from '../core-types/index.ts';
 export { normalizeConversationModeInput } from '../core-types/index.ts';
@@ -194,6 +195,12 @@ export interface MailboxCheckResult {
   /** Sequence witness is independent of receivedAt ordering (including clock rollback). */
   maxQueuedSequence?: number;
   items: MailboxItem[];
+}
+
+export interface SlotObligationSnapshot {
+  hasPendingWave: boolean;
+  immediateBusyReason?: 'wakeup_pending' | 'session_reply_pending' | 'local_outbound_pending';
+  hasRemoteOpenOutboundThread: boolean;
 }
 
 export interface MailboxWaitOptions extends MailboxCheckOptions {
@@ -1752,6 +1759,85 @@ export class MailboxStore {
     const id = normalizeMailboxId(mailboxId);
     const target = this.read().wakeTargets[id];
     return target ? structuredClone(target) : undefined;
+  }
+
+  inspectSlotObligations(
+    mailboxId: string,
+    options?: { sessionMailboxId?: string; outbox?: OutboxStore },
+  ): SlotObligationSnapshot {
+    const id = normalizeMailboxId(mailboxId);
+    const sessionId = options?.sessionMailboxId ? normalizeMailboxId(options.sessionMailboxId) : undefined;
+    const state = this.read();
+    const ownedMailboxes = new Set(sessionId ? [id, sessionId] : [id]);
+    const selfInboundThreadIds = new Set<string>();
+    const localUnackedMessages = new Set<string>();
+    const localUnackedThreads = new Set<string>();
+    let activeSince: string | undefined;
+    let sessionUnacked = false;
+    for (const item of state.items) {
+      const threadId = item.envelope.semantic?.threadId;
+      if (ownedMailboxes.has(item.mailboxId)) {
+        selfInboundThreadIds.add(item.id);
+        if (threadId !== undefined) selfInboundThreadIds.add(threadId);
+        if (item.status === 'acked') continue;
+        if (item.mailboxId === id) {
+          if (activeSince === undefined || item.receivedAt < activeSince) activeSince = item.receivedAt;
+        } else {
+          sessionUnacked = true;
+        }
+      } else if (item.status !== 'acked') {
+        localUnackedMessages.add(item.id);
+        localUnackedThreads.add(threadId ?? item.envelope.id);
+      }
+    }
+
+    const target = state.wakeTargets[id];
+    const sessionTarget = sessionId && sessionId !== id ? state.wakeTargets[sessionId] : undefined;
+    let immediateBusyReason: SlotObligationSnapshot['immediateBusyReason'];
+    if (target?.pendingWake || target?.deliveryInDoubt) {
+      immediateBusyReason = 'wakeup_pending';
+    } else if (sessionUnacked || sessionTarget?.pendingWake || sessionTarget?.deliveryInDoubt) {
+      immediateBusyReason = 'session_reply_pending';
+    }
+
+    const records = Object.values(state.threads);
+    const closedThreadsByNetwork = new Map<string, Set<string>>();
+    for (const record of records) {
+      if (record.direction === 'inbound' && record.mailboxCommitted !== false && ownedMailboxes.has(record.localMailbox)) {
+        selfInboundThreadIds.add(record.threadId);
+      }
+      // A replied or settled leg makes the merged thread non-open on its own network.
+      if (record.state !== 'open') {
+        const closedThreads = closedThreadsByNetwork.get(record.networkId) ?? new Set<string>();
+        closedThreads.add(record.threadId);
+        closedThreadsByNetwork.set(record.networkId, closedThreads);
+      }
+    }
+
+    const hasPendingWave = activeSince !== undefined;
+    let hasRemoteOpenOutboundThread = false;
+    for (const record of records) {
+      if (record.direction !== 'outbound' || selfInboundThreadIds.has(record.threadId) ||
+        closedThreadsByNetwork.get(record.networkId)?.has(record.threadId)) continue;
+      const replyMailbox = record.envelope?.semantic?.replyMailbox;
+      const belongsToSlot = activeSince !== undefined
+        ? record.createdAt >= activeSince && (replyMailbox === undefined
+          ? ownedMailboxes.has(record.localMailbox)
+          : ownedMailboxes.has(replyMailbox))
+        : sessionId !== undefined && replyMailbox === sessionId;
+      if (!belongsToSlot || options?.outbox?.get(record.messageId)?.status === 'failed') continue;
+
+      if (localUnackedThreads.has(record.threadId) || localUnackedMessages.has(record.messageId)) {
+        immediateBusyReason ??= 'local_outbound_pending';
+      } else if (hasPendingWave || record.envelope?.semantic?.type === 'question') {
+        hasRemoteOpenOutboundThread = true;
+      }
+    }
+    return {
+      hasPendingWave,
+      ...(immediateBusyReason ? { immediateBusyReason } : {}),
+      hasRemoteOpenOutboundThread,
+    };
   }
 
   listWakeTargets(): WakeTargetState[] {

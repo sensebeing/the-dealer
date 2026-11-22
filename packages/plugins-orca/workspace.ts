@@ -56,7 +56,12 @@ export interface OrcaTerminalRow {
   leafId?: string;
 }
 
-export interface OrcaWorkspaceIdleOptions {
+interface OrcaProbeOptions {
+  /** Slot probes report invalid observations through their caller. */
+  throwOnProbeError?: boolean;
+}
+
+export interface OrcaWorkspaceIdleOptions extends OrcaProbeOptions {
   /**
    * The terminal this wakeup will write into. `null` means delivery creates an independent session
    * tab first, so retained tabs must never gate the wakeup; a handle restricts composer inspection
@@ -128,6 +133,7 @@ export async function checkOrcaWorkspaceIdle(
   const raw = JSON.parse(output.stdout);
   const inventory = raw.result;
   if (raw.ok !== true || !inventory || inventory.truncated || !Array.isArray(inventory.worktrees)) {
+    if (options?.throwOnProbeError) throw new Error('Incomplete workspace inventory');
     return { idle: false, reason: 'Incomplete workspace inventory' };
   }
   type Workspace = {
@@ -163,6 +169,7 @@ export async function checkOrcaWorkspaceIdle(
     });
     const terminals = JSON.parse(listed.stdout);
     if (terminals.ok !== true || terminals.result?.truncated || !Array.isArray(terminals.result?.terminals)) {
+      if (options?.throwOnProbeError) throw new Error('Incomplete Orca terminal inventory');
       return false;
     }
     const handles: OrcaTerminalRow[] = terminals.result.terminals;
@@ -260,7 +267,7 @@ export async function checkOrcaWorkspaceIdle(
       // A bare shell has no agent TUI yet; its workspace proof permits only the bootstrap path.
       if (
         (terminal.agentIdentity || typeof terminal.preview !== 'string') &&
-        !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal)).idle
+        !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal, options)).idle
       ) return false;
     }
     for (const id of row.childWorktreeIds ?? []) {
@@ -294,6 +301,7 @@ export async function waitOrcaTerminalIdle(
   cwd?: string,
   timeoutMs = 5000,
   signal?: AbortSignal,
+  options?: OrcaProbeOptions,
 ): Promise<OrcaIdleResult> {
   try {
     const waited = await checkedCommand(runner, {
@@ -312,11 +320,17 @@ export async function waitOrcaTerminalIdle(
       cwd,
       signal,
     });
-    if (JSON.parse(waited.stdout).ok !== true) {
+    const response = JSON.parse(waited.stdout);
+    if (options?.throwOnProbeError && typeof response?.ok !== 'boolean') {
+      throw new SyntaxError('Invalid Orca terminal wait response');
+    }
+    if (response.ok !== true) {
       return { idle: false, reason: 'Terminal is busy' };
     }
     return { idle: true };
   } catch (error) {
+    // Orca may return a nonzero exit for the bounded idle timeout.
+    if (options?.throwOnProbeError && (error instanceof CommandNotStartedError || error instanceof SyntaxError)) throw error;
     return {
       idle: false,
       reason: `Terminal idle wait failed: ${String(error)}`,
@@ -353,6 +367,7 @@ export async function probeOrcaTerminalIdle(
   terminalHandle: string,
   cwd?: string,
   signal?: AbortSignal,
+  options?: OrcaProbeOptions,
 ): Promise<OrcaIdleResult> {
   try {
     const terminal = await readOrcaTerminal(runner, command, terminalHandle, cwd, signal);
@@ -366,7 +381,7 @@ export async function probeOrcaTerminalIdle(
       !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
     )
       return { idle: false, reason: 'Terminal composer has unsent draft' };
-    const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal);
+    const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal, options);
     return result.idle
       ? result
       : {
@@ -374,6 +389,7 @@ export async function probeOrcaTerminalIdle(
           reason: `Terminal idle probe failed: ${result.reason ?? 'Terminal is busy'}`,
         };
   } catch (error) {
+    if (options?.throwOnProbeError) throw error;
     return {
       idle: false,
       reason: `Terminal idle probe failed: ${String(error)}`,
