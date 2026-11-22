@@ -6,12 +6,12 @@ import {
   isNetworkUnmountedError,
   isOfflinePeerSpooledError,
   isPeerOfflineError,
-  isRetryablePreEffectReceipt,
   isTerminalDeliveryFailure,
   isUnattemptedOutboxItem,
   isUnresolvedTargetError,
   LocalDeliveryError,
   NetworkUnmountedError,
+  outboxReconciliationTargets,
   resolveSemanticHeader,
   sameEnvelopeIntent,
   signEnvelope,
@@ -130,8 +130,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             error: string;
             inDoubt: boolean;
             relaySpooled: boolean;
-            /** False when no byte was sent (deadline/unmount), preserving prior doubt flags. */
-            attempted: boolean;
             /** Nonterminal live receipt (e.g. pending_approval) returned to the caller. */
             receipt?: DeliveryReceipt;
           }
@@ -170,7 +168,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 error: error.message,
                 inDoubt: false,
                 relaySpooled: false,
-                attempted: false,
               }
             : localFailure(error);
         }
@@ -185,7 +182,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 error: error.message,
                 inDoubt: false,
                 relaySpooled: false,
-                attempted: false,
               }
             : localFailure(error);
         }
@@ -219,7 +215,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             error: detail,
             inDoubt: false,
             relaySpooled: false,
-            attempted: true,
             receipt,
           };
         } catch (error) {
@@ -230,7 +225,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                   error: error.message,
                   inDoubt: false,
                   relaySpooled: false,
-                  attempted: false,
                 }
               : localFailure(error);
           }
@@ -246,7 +240,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               // timeout may already have executed at the target and must stay parked.
               inDoubt: !relaySpooled && isDeliveryTimeoutFailure(error),
               relaySpooled,
-              attempted: true,
             };
           }
           if (isDeliveryTimeoutFailure(error)) {
@@ -258,7 +251,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               error: error instanceof Error ? error.message : String(error),
               inDoubt: true,
               relaySpooled: false,
-              attempted: true,
             };
           }
           // Receipt forgery, signature failures, malformed responses, and every other
@@ -389,192 +381,201 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const keyed = queueIfOffline && envelope.idempotencyKey !== undefined && envelope.routing.mode !== 'broadcast';
           const deliver = async (): Promise<EmitResult> => {
             let claimedItem: OutboxItem | undefined;
+            let attemptToken: string | undefined;
             let replaceable: OutboxItem | undefined;
             const claimInput = { envelope, explicitTargets: [...(envelope.routing.targets ?? [])], filePaths: stagedPaths };
-            if (keyed) {
-              const version = envelopeClaimVersion(envelope);
-              if (version === null) throw new Error('Invalid claim version');
-              let existing: OutboxItem | undefined;
-              if (outbox.findKeyedObligation) {
-                existing = outbox.findKeyedObligation(envelope.networkId, envelope.idempotencyKey!, version);
-              } else {
-                const claim = outbox.claimIdempotency(claimInput);
-                if (claim.claimed) claimedItem = claim.item;
-                else existing = claim.item;
-              }
-              if (existing) {
-                if (envelopeClaimVersion(existing.envelope) !== version || !isUnattemptedOutboxItem(existing) ||
-                    sameEnvelopeIntent(existing.envelope, envelope)) return reconcileObligation(existing);
-                replaceable = existing;
-              }
-            }
-            let route: RouteDecision | { unresolved: string };
             try {
-              route = await router.route(envelope);
-              if (keyed && route.mode === 'broadcast') {
-                throw new LocalDeliveryError('Keyed outbox obligation cannot route to broadcast');
+              if (keyed) {
+                const version = envelopeClaimVersion(envelope);
+                if (version === null) throw new Error('Invalid claim version');
+                let existing: OutboxItem | undefined;
+                if (outbox.findKeyedObligation) {
+                  existing = outbox.findKeyedObligation(envelope.networkId, envelope.idempotencyKey!, version);
+                } else {
+                  const claim = outbox.claimIdempotency(claimInput);
+                  if (claim.claimed) {
+                    claimedItem = claim.item;
+                    attemptToken = claim.attemptToken;
+                  } else existing = claim.item;
+                }
+                if (existing) {
+                  if (envelopeClaimVersion(existing.envelope) !== version || !isUnattemptedOutboxItem(existing) ||
+                      sameEnvelopeIntent(existing.envelope, envelope)) return reconcileObligation(existing);
+                  replaceable = existing;
+                }
               }
-            } catch (error) {
-              // An unresolved explicit selector is a peering gap, not a routing bug: the
-              // durable outbox retries it once the peer directory learns the member again.
-              // Network mount state is irrelevant here; identity resolution is directory-owned.
-              if (!isUnresolvedTargetError(error) || !queueIfOffline) throw error;
-              route = { unresolved: error.message };
-            }
-            if (keyed && !claimedItem) {
-              const claim = replaceable
-                ? outbox.replaceUnattemptedIdempotency({ ...claimInput, expectedId: replaceable.id })
-                : outbox.claimIdempotency(claimInput);
-              if (!claim) throw new LocalDeliveryError('Outbox obligation disappeared before replacement');
-              if (!claim.claimed) return reconcileObligation(claim.item);
-              claimedItem = claim.item;
-            }
-            if ('unresolved' in route) {
-              outbox!.enqueue({ ...claimInput, pendingNodeIds: [], lastError: route.unresolved });
-              const receipt = queuedReceipt(envelope, self, undefined, false, route.unresolved);
-              ctx.emit('emitter/sent', { envelope, targetNodeIds: [], receipts: [receipt] });
-              return { messageId: envelope.id, traceId: envelope.traceId, receipts: [receipt] };
-            }
-            const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));
-            const spoolBlobHashes = [
-              ...new Set([
-                ...Object.keys(stagedPaths),
-                ...envelope.attachments.map(attachment => attachment.blake3Hash),
-              ]),
-            ];
-            // Spooling is caller-owned policy: an explicit queueIfOffline:false send must not
-            // leave any durable relay copy, otherwise the caller could retry a queued message.
-            const spoolOptions = queueIfOffline
-              ? {
-                  spoolIfOffline: true,
-                  spoolKey: envelope.id,
-                  spoolBlobHashes,
+              let route: RouteDecision | { unresolved: string };
+              try {
+                route = await router.route(envelope);
+                if (keyed && route.mode === 'broadcast') {
+                  throw new LocalDeliveryError('Keyed outbox obligation cannot route to broadcast');
                 }
-              : {};
-            const deliveredReceipts: Record<string, DeliveryReceipt> = {};
-            // Reached but not durably handed off (for example pending_approval). The target
-            // did receive the envelope, so the send is observable even though it stays out of
-            // the durable pending set when queueing is disabled.
-            const livePendingReceipts: Record<string, DeliveryReceipt> = {};
-            const failedReceipts: Record<string, DeliveryReceipt> = {};
-            const failedNodeIds: string[] = [];
-            const observedReceipts: DeliveryReceipt[] = [];
-            const pendingNodeIds: string[] = [];
-            const inDoubtNodeIds: string[] = [];
-            const relaySpooledNodeIds: string[] = [];
-            let offlineDetail: string | undefined;
-            let fatalError: Error | undefined;
-            if (route.mode === 'broadcast') {
-              await transport.broadcast(envelope.networkId, envelope.routing.topic ?? 'messages', frame);
-            } else {
-              const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
-              const attempts = await Promise.all(route.targetNodeIds.map(target =>
-                attemptTarget(envelope, target, frame, {
-                  deadline,
-                  mounted,
-                  queueIfOffline,
-                  spoolOptions,
-                }),
-              ));
-              for (const [index, target] of route.targetNodeIds.entries()) {
-                const attempt = attempts[index];
-                if (attempt.status === 'delivered') {
-                  deliveredReceipts[target] = attempt.receipt;
-                  observedReceipts.push(attempt.receipt);
-                  continue;
-                }
-                if (attempt.status === 'failed') {
-                  // A signed rejection/failure is evidence, never delivery. If another
-                  // target needs the durable outbox, preserve this per-target decision.
-                  failedReceipts[target] = attempt.receipt;
-                  observedReceipts.push(attempt.receipt);
-                  offlineDetail ??= attempt.error;
-                  continue;
-                }
-                if (attempt.status === 'pending') {
-                  if (attempt.receipt) {
-                    observedReceipts.push(attempt.receipt);
-                    livePendingReceipts[target] = attempt.receipt;
+              } catch (error) {
+                // An unresolved explicit selector is a peering gap, not a routing bug: the
+                // durable outbox retries it once the peer directory learns the member again.
+                // Network mount state is irrelevant here; identity resolution is directory-owned.
+                if (!isUnresolvedTargetError(error) || !queueIfOffline) throw error;
+                route = { unresolved: error.message };
+              }
+              if (keyed && !claimedItem) {
+                const claim = replaceable
+                  ? outbox.replaceUnattemptedIdempotency({ ...claimInput, expectedId: replaceable.id })
+                  : outbox.claimIdempotency(claimInput);
+                if (!claim) throw new LocalDeliveryError('Outbox obligation disappeared before replacement');
+                if (!claim.claimed) return reconcileObligation(claim.item);
+                claimedItem = claim.item;
+                attemptToken = claim.attemptToken;
+              }
+              if ('unresolved' in route) {
+                outbox!.enqueue({ ...claimInput, attemptToken, pendingNodeIds: [], lastError: route.unresolved });
+                const receipt = queuedReceipt(envelope, self, undefined, false, route.unresolved);
+                ctx.emit('emitter/sent', { envelope, targetNodeIds: [], receipts: [receipt] });
+                return { messageId: envelope.id, traceId: envelope.traceId, receipts: [receipt] };
+              }
+              const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));
+              const spoolBlobHashes = [
+                ...new Set([
+                  ...Object.keys(stagedPaths),
+                  ...envelope.attachments.map(attachment => attachment.blake3Hash),
+                ]),
+              ];
+              // Spooling is caller-owned policy: an explicit queueIfOffline:false send must not
+              // leave any durable relay copy, otherwise the caller could retry a queued message.
+              const spoolOptions = queueIfOffline
+                ? {
+                    spoolIfOffline: true,
+                    spoolKey: envelope.id,
+                    spoolBlobHashes,
                   }
-                  if (!queueIfOffline) {
+                : {};
+              const deliveredReceipts: Record<string, DeliveryReceipt> = {};
+              // Reached but not durably handed off (for example pending_approval). The target
+              // did receive the envelope, so the send is observable even though it stays out of
+              // the durable pending set when queueing is disabled.
+              const livePendingReceipts: Record<string, DeliveryReceipt> = {};
+              const failedReceipts: Record<string, DeliveryReceipt> = {};
+              const failedNodeIds: string[] = [];
+              const observedReceipts: DeliveryReceipt[] = [];
+              const pendingNodeIds: string[] = [];
+              const inDoubtNodeIds: string[] = [];
+              const relaySpooledNodeIds: string[] = [];
+              let offlineDetail: string | undefined;
+              let fatalError: Error | undefined;
+              if (route.mode === 'broadcast') {
+                await transport.broadcast(envelope.networkId, envelope.routing.topic ?? 'messages', frame);
+              } else {
+                const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
+                const attempts = await Promise.all(route.targetNodeIds.map(target =>
+                  attemptTarget(envelope, target, frame, {
+                    deadline,
+                    mounted,
+                    queueIfOffline,
+                    spoolOptions,
+                  }),
+                ));
+                for (const [index, target] of route.targetNodeIds.entries()) {
+                  const attempt = attempts[index];
+                  if (attempt.status === 'delivered') {
+                    deliveredReceipts[target] = attempt.receipt;
+                    observedReceipts.push(attempt.receipt);
                     continue;
                   }
-                  pendingNodeIds.push(target);
-                  if (attempt.inDoubt) {
-                    inDoubtNodeIds.push(target);
+                  if (attempt.status === 'failed') {
+                    // A signed rejection/failure is evidence, never delivery. If another
+                    // target needs the durable outbox, preserve this per-target decision.
+                    failedReceipts[target] = attempt.receipt;
+                    observedReceipts.push(attempt.receipt);
+                    offlineDetail ??= attempt.error;
+                    continue;
                   }
-                  if (attempt.relaySpooled) {
-                    relaySpooledNodeIds.push(target);
+                  if (attempt.status === 'pending') {
+                    if (attempt.receipt) {
+                      observedReceipts.push(attempt.receipt);
+                      livePendingReceipts[target] = attempt.receipt;
+                    }
+                    if (!queueIfOffline) {
+                      continue;
+                    }
+                    pendingNodeIds.push(target);
+                    if (attempt.inDoubt) {
+                      inDoubtNodeIds.push(target);
+                    }
+                    if (attempt.relaySpooled) {
+                      relaySpooledNodeIds.push(target);
+                    }
+                    offlineDetail = attempt.error;
+                    continue;
                   }
-                  offlineDetail = attempt.error;
-                  continue;
+                  if (!queueIfOffline) {
+                    throw attempt.error;
+                  }
+                  // Deterministic local/protocol failure: terminal for this target, but sibling
+                  // offline obligations must be durably enqueued before the error surfaces.
+                  failedNodeIds.push(target);
+                  offlineDetail ??= attempt.error.message;
+                  fatalError ??= attempt.error;
                 }
-                if (!queueIfOffline) {
-                  throw attempt.error;
+              }
+              if (claimedItem && route.mode !== 'broadcast' && route.targetNodeIds.length === 0) {
+                outbox.markFailed(claimedItem.id, 'Outbox item has no addressable target', attemptToken);
+                throw new LocalDeliveryError('Outbox item has no addressable target');
+              }
+              const receipts: DeliveryReceipt[] = [...observedReceipts];
+              if (queueIfOffline && (pendingNodeIds.length > 0 || claimedItem !== undefined)) {
+                outbox.enqueue({
+                  attemptToken,
+                  envelope,
+                  explicitTargets: [...(envelope.routing.targets ?? [])],
+                  pendingNodeIds,
+                  deliveredReceipts,
+                  failedReceipts,
+                  failedNodeIds,
+                  inDoubtNodeIds,
+                  relaySpooledNodeIds,
+                  filePaths: stagedPaths,
+                  ...(offlineDetail !== undefined ? { lastError: offlineDetail } : {}),
+                });
+                for (const targetNodeId of pendingNodeIds) {
+                  const spooled = relaySpooledNodeIds.includes(targetNodeId);
+                  const detail = spooled
+                    ? `Queued in local outbox and spooled on relay seed for offline peer ${targetNodeId}`
+                    : `Queued in local outbox for offline peer ${targetNodeId}`;
+                  receipts.push(queuedReceipt(envelope, self, targetNodeId, spooled, detail));
                 }
-                // Deterministic local/protocol failure: terminal for this target, but sibling
-                // offline obligations must be durably enqueued before the error surfaces.
-                failedNodeIds.push(target);
-                offlineDetail ??= attempt.error.message;
-                fatalError ??= attempt.error;
               }
-            }
-            if (claimedItem && route.mode !== 'broadcast' && route.targetNodeIds.length === 0) {
-              outbox.markFailed(claimedItem.id, 'Outbox item has no addressable target');
-              throw new LocalDeliveryError('Outbox item has no addressable target');
-            }
-            const receipts: DeliveryReceipt[] = [...observedReceipts];
-            if (queueIfOffline && (pendingNodeIds.length > 0 || claimedItem !== undefined)) {
-              outbox.enqueue({
-                envelope,
-                explicitTargets: [...(envelope.routing.targets ?? [])],
-                pendingNodeIds,
-                deliveredReceipts,
-                failedReceipts,
-                failedNodeIds,
-                inDoubtNodeIds,
-                relaySpooledNodeIds,
-                filePaths: stagedPaths,
-                ...(offlineDetail !== undefined ? { lastError: offlineDetail } : {}),
-              });
-              for (const targetNodeId of pendingNodeIds) {
-                const spooled = relaySpooledNodeIds.includes(targetNodeId);
-                const detail = spooled
-                  ? `Queued in local outbox and spooled on relay seed for offline peer ${targetNodeId}`
-                  : `Queued in local outbox for offline peer ${targetNodeId}`;
-                receipts.push(queuedReceipt(envelope, self, targetNodeId, spooled, detail));
+              // `emitter/sent` is the single commitment signal for observers such as the thread
+              // ledger: only a broadcast that left the transport, a live handoff receipt, or a
+              // durable outbox obligation may create reverse-route state. Unqueued failures and
+              // terminal rejections leave no orphan outbound record behind.
+              const committedTargetNodeIds = route.targetNodeIds.filter(
+                target =>
+                  deliveredReceipts[target] !== undefined ||
+                  livePendingReceipts[target] !== undefined ||
+                  (queueIfOffline && pendingNodeIds.includes(target)),
+              );
+              const emitSent = (): void => {
+                if (route.mode !== 'broadcast' && committedTargetNodeIds.length === 0) {
+                  return;
+                }
+                ctx.emit('emitter/sent', {
+                  envelope,
+                  targetNodeIds:
+                    route.mode === 'broadcast' ? route.targetNodeIds : committedTargetNodeIds,
+                  receipts,
+                });
+              };
+              if (fatalError !== undefined) {
+                // Queued sibling receipts remain observable even though this deterministic
+                // target failure is surfaced to the caller.
+                (fatalError as Error & { receipts?: DeliveryReceipt[] }).receipts = receipts;
+                emitSent();
+                throw fatalError;
               }
-            }
-            // `emitter/sent` is the single commitment signal for observers such as the thread
-            // ledger: only a broadcast that left the transport, a live handoff receipt, or a
-            // durable outbox obligation may create reverse-route state. Unqueued failures and
-            // terminal rejections leave no orphan outbound record behind.
-            const committedTargetNodeIds = route.targetNodeIds.filter(
-              target =>
-                deliveredReceipts[target] !== undefined ||
-                livePendingReceipts[target] !== undefined ||
-                (queueIfOffline && pendingNodeIds.includes(target)),
-            );
-            const emitSent = (): void => {
-              if (route.mode !== 'broadcast' && committedTargetNodeIds.length === 0) {
-                return;
-              }
-              ctx.emit('emitter/sent', {
-                envelope,
-                targetNodeIds:
-                  route.mode === 'broadcast' ? route.targetNodeIds : committedTargetNodeIds,
-                receipts,
-              });
-            };
-            if (fatalError !== undefined) {
-              // Queued sibling receipts remain observable even though this deterministic
-              // target failure is surfaced to the caller.
-              (fatalError as Error & { receipts?: DeliveryReceipt[] }).receipts = receipts;
               emitSent();
-              throw fatalError;
+              return { messageId: envelope.id, traceId: envelope.traceId, receipts };
+            } finally {
+              if (attemptToken !== undefined) outbox!.releaseAttempt(envelope.id, attemptToken);
             }
-            emitSent();
-            return { messageId: envelope.id, traceId: envelope.traceId, receipts };
           };
           if (!keyed) return deliver();
           const key = `${envelope.networkId}\0${envelope.idempotencyKey}`;
@@ -674,7 +675,6 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const outcomeInDoubtNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
           const failures: OutboxDeliveryFailure[] = [];
-          const attemptedTargets = new Set<string>();
           let lastError: string | undefined;
           // All targets share a deadline but start independently; a dead peer cannot
           // consume a live sibling's send budget. Fold evidence in target order.
@@ -700,14 +700,12 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               continue;
             }
             if (attempt.status === 'delivered') {
-              attemptedTargets.add(target);
               deliveredReceipts[target] = attempt.receipt;
               continue;
             }
             if (attempt.status === 'failed') {
               // A signed rejection/failure is terminal for this target only; other
               // multicast targets must still be attempted and persisted independently.
-              attemptedTargets.add(target);
               failures.push({
                 nodeId: target,
                 receipt: attempt.receipt,
@@ -716,15 +714,11 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               continue;
             }
             if (attempt.status === 'local-failure') {
-              attemptedTargets.add(target);
               failures.push({
                 nodeId: target,
                 error: `Local or protocol failure: ${attempt.error.message}`,
               });
               continue;
-            }
-            if (attempt.attempted) {
-              attemptedTargets.add(target);
             }
             pendingNodeIds.push(target);
             if (attempt.relaySpooled) {
@@ -736,16 +730,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             lastError = attempt.error;
           }
           const pending = [...new Set([...untouched, ...pendingNodeIds])];
-          // Requested-but-never-sent targets keep their prior in-doubt flags; only an
-          // actual attempt may clear or replace them.
-          const inDoubtNodeIds = [
-            ...new Set([
-              ...outcomeInDoubtNodeIds,
-              ...item.inDoubtNodeIds.filter(
-                nodeId => pending.includes(nodeId) && !attemptedTargets.has(nodeId),
-              ),
-            ]),
-          ];
+          const inDoubtNodeIds = [...new Set([...item.inDoubtNodeIds, ...outcomeInDoubtNodeIds])]
+            .filter(nodeId => !deliveredReceipts[nodeId]);
           return {
             ...(resolvedTargetNodeIds !== undefined ? { resolvedTargetNodeIds } : {}),
             deliveredReceipts,
@@ -826,92 +812,95 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
       };
 
       /** Retry only original unsettled targets, retaining the envelope and confirmed siblings. */
-      const reconcileObligation = async (existing: OutboxItem): Promise<EmitResult> => {
-        if (existing.status === 'queued') return replayObligation(existing);
-        const targets = [...new Set([
-          ...Object.entries(existing.deliveredReceipts)
-            .filter(([, receipt]) => !isConfirmedHandoffReceipt(receipt, { allowQueued: false }))
-            .map(([target]) => target),
-          ...existing.failedNodeIds,
-          ...Object.keys(existing.failedReceipts),
-        ])].filter(target => {
-          const failure = existing.failedReceipts[target];
-          return (!failure || isRetryablePreEffectReceipt(failure)) &&
-            !isConfirmedHandoffReceipt(existing.deliveredReceipts[target], { allowQueued: false });
-        });
-        if (targets.length === 0) return replayObligation(existing);
-        const { transport } = ctx.services;
-        for (const attachment of existing.envelope.attachments) {
-          if (!existing.stagedFiles[attachment.blake3Hash]) {
-            throw new LocalDeliveryError(`Missing staged attachment ${attachment.blake3Hash}`);
-          }
+      const reconcileObligation = async (observed: OutboxItem): Promise<EmitResult> => {
+        if (observed.status === 'queued' || outboxReconciliationTargets(observed).length === 0) {
+          return replayObligation(observed);
         }
-        for (const [hash, path] of Object.entries(existing.stagedFiles)) transport.registerBlob?.(hash, path);
-        if (isUnattemptedOutboxItem(existing)) {
-          const claim = outbox!.replaceUnattemptedIdempotency({
-            envelope: existing.envelope, explicitTargets: existing.explicitTargets, expectedId: existing.id,
-          });
-          if (!claim) throw new LocalDeliveryError('Outbox obligation disappeared before retry');
-          if (!claim.claimed) return replayObligation(claim.item);
+        const retryOriginal = isUnattemptedOutboxItem(observed);
+        const claim = retryOriginal
+          ? outbox!.replaceUnattemptedIdempotency({
+              envelope: observed.envelope, explicitTargets: observed.explicitTargets, expectedId: observed.id,
+            })
+          : outbox!.beginAttempt(observed.id, { reconcile: true });
+        if (!claim) {
+          const latest = outbox!.findKeyedObligation?.(
+            observed.networkId, observed.envelope.idempotencyKey!, envelopeClaimVersion(observed.envelope) ?? 0,
+          );
+          return replayObligation(latest ?? observed);
         }
-        const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope: existing.envelope }));
-        const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
-        const attempts = await Promise.all(targets.map(target => attemptTarget(existing.envelope, target, frame, {
-          deadline,
-          mounted: transport.listMountedNetworks().includes(existing.networkId),
-          queueIfOffline: true,
-          spoolOptions: { spoolIfOffline: true, spoolKey: existing.id,
-            spoolBlobHashes: Object.keys(existing.stagedFiles) },
-        })));
-        const deliveredReceipts: Record<string, DeliveryReceipt> = {};
-        const livePendingReceipts: Record<string, DeliveryReceipt> = {};
-        const failedReceipts: Record<string, DeliveryReceipt> = {};
-        const failedNodeIds: string[] = [];
-        const pendingNodeIds: string[] = [];
-        const inDoubtNodeIds: string[] = [];
-        const relaySpooledNodeIds: string[] = [];
-        let fatalError: Error | undefined;
-        let lastError: string | undefined;
-        for (const [index, target] of targets.entries()) {
-          const attempt = attempts[index];
-          if (attempt.status === 'delivered') deliveredReceipts[target] = attempt.receipt;
-          else if (attempt.status === 'failed') {
-            failedReceipts[target] = attempt.receipt;
-            failedNodeIds.push(target);
-            lastError = attempt.error;
-          } else if (attempt.status === 'local-failure') {
-            failedNodeIds.push(target);
-            fatalError ??= attempt.error;
-            lastError = attempt.error.message;
-          } else {
-            if (attempt.receipt) livePendingReceipts[target] = attempt.receipt;
-            const prior = existing.deliveredReceipts[target];
-            if (isConfirmedHandoffReceipt(prior, { allowQueued: true })) deliveredReceipts[target] = prior;
-            else {
-              pendingNodeIds.push(target);
-              if (attempt.inDoubt) inDoubtNodeIds.push(target);
-              if (attempt.relaySpooled) relaySpooledNodeIds.push(target);
+        if ('claimed' in claim && !claim.claimed) return replayObligation(claim.item);
+        const { item: existing, attemptToken } = claim;
+        try {
+          if (!retryOriginal && existing.status === 'queued') return replayObligation(existing);
+          const targets = retryOriginal ? existing.pendingNodeIds : outboxReconciliationTargets(existing);
+          if (targets.length === 0) return replayObligation(existing);
+          const { transport } = ctx.services;
+          for (const attachment of existing.envelope.attachments) {
+            if (!existing.stagedFiles[attachment.blake3Hash]) {
+              throw new LocalDeliveryError(`Missing staged attachment ${attachment.blake3Hash}`);
             }
-            lastError = attempt.error;
           }
+          for (const [hash, path] of Object.entries(existing.stagedFiles)) transport.registerBlob?.(hash, path);
+          const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope: existing.envelope }));
+          const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
+          const attempts = await Promise.all(targets.map(target => attemptTarget(existing.envelope, target, frame, {
+            deadline,
+            mounted: transport.listMountedNetworks().includes(existing.networkId),
+            queueIfOffline: true,
+            spoolOptions: { spoolIfOffline: true, spoolKey: existing.id,
+              spoolBlobHashes: Object.keys(existing.stagedFiles) },
+          })));
+          const deliveredReceipts: Record<string, DeliveryReceipt> = {};
+          const livePendingReceipts: Record<string, DeliveryReceipt> = {};
+          const failedReceipts: Record<string, DeliveryReceipt> = {};
+          const failedNodeIds: string[] = [];
+          const pendingNodeIds: string[] = [];
+          const inDoubtNodeIds: string[] = [];
+          const relaySpooledNodeIds: string[] = [];
+          let fatalError: Error | undefined;
+          let lastError: string | undefined;
+          for (const [index, target] of targets.entries()) {
+            const attempt = attempts[index];
+            if (attempt.status === 'delivered') deliveredReceipts[target] = attempt.receipt;
+            else if (attempt.status === 'failed') {
+              failedReceipts[target] = attempt.receipt;
+              failedNodeIds.push(target);
+              lastError = attempt.error;
+            } else if (attempt.status === 'local-failure') {
+              failedNodeIds.push(target);
+              fatalError ??= attempt.error;
+              lastError = attempt.error.message;
+            } else {
+              if (attempt.receipt) livePendingReceipts[target] = attempt.receipt;
+              const prior = existing.deliveredReceipts[target];
+              if (isConfirmedHandoffReceipt(prior, { allowQueued: true })) deliveredReceipts[target] = prior;
+              else {
+                pendingNodeIds.push(target);
+                if (attempt.inDoubt) inDoubtNodeIds.push(target);
+                if (attempt.relaySpooled) relaySpooledNodeIds.push(target);
+              }
+              lastError = attempt.error;
+            }
+          }
+          const updated = outbox!.enqueue({ attemptToken, envelope: existing.envelope, explicitTargets: existing.explicitTargets,
+            reconcileNodeIds: targets, deliveredReceipts, failedReceipts, failedNodeIds, pendingNodeIds,
+            inDoubtNodeIds, relaySpooledNodeIds, ...(lastError !== undefined ? { lastError: fatalError?.message ?? lastError } : {}) });
+          const receipts = updated.status === 'queued' ? replayObligation(updated).receipts
+            : [...Object.values(updated.deliveredReceipts), ...Object.values(updated.failedReceipts)];
+          receipts.push(...Object.values(livePendingReceipts));
+          const newlyCommitted = targets.some(target => deliveredReceipts[target] !== undefined ||
+            livePendingReceipts[target] !== undefined || pendingNodeIds.includes(target));
+          if (newlyCommitted) {
+            const fullCommittedTargets = [...new Set([
+              ...Object.keys(updated.deliveredReceipts), ...Object.keys(livePendingReceipts), ...updated.pendingNodeIds,
+            ])];
+            ctx.emit('emitter/sent', { envelope: existing.envelope, targetNodeIds: fullCommittedTargets, receipts });
+          }
+          if (fatalError) throw Object.assign(fatalError, { receipts });
+          return { messageId: updated.id, traceId: updated.envelope.traceId, receipts };
+        } finally {
+          outbox!.releaseAttempt(existing.id, attemptToken);
         }
-        const updated = outbox!.enqueue({ envelope: existing.envelope, explicitTargets: existing.explicitTargets,
-          reconcileNodeIds: targets, deliveredReceipts, failedReceipts, failedNodeIds, pendingNodeIds,
-          inDoubtNodeIds, relaySpooledNodeIds, ...(lastError !== undefined ? { lastError: fatalError?.message ?? lastError } : {}) });
-        const receipts = updated.status === 'queued' ? replayObligation(updated).receipts
-          : [...Object.values(updated.deliveredReceipts), ...Object.values(updated.failedReceipts)];
-        receipts.push(...Object.values(livePendingReceipts));
-        const newlyCommitted = targets.some(target => deliveredReceipts[target] !== undefined ||
-          livePendingReceipts[target] !== undefined || pendingNodeIds.includes(target));
-        if (newlyCommitted) {
-          const fullCommittedTargets = [...new Set([
-            ...Object.keys(updated.deliveredReceipts), ...Object.keys(livePendingReceipts), ...updated.pendingNodeIds,
-          ])];
-          ctx.emit('emitter/sent', { envelope: existing.envelope, targetNodeIds: fullCommittedTargets, receipts });
-        }
-        if (fatalError) throw Object.assign(fatalError, { receipts });
-        return { messageId: updated.id, traceId: updated.envelope.traceId, receipts };
-
       };
 
       /** Reuse an already durable obligation without emitting a second outbox entry. */

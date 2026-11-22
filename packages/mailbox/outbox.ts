@@ -1,6 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
-import { envelopeClaimVersion, isConfirmedHandoffReceipt, isUnattemptedOutboxItem, sameEnvelopeIntent } from '../core-types/index.ts';
+import {
+  envelopeClaimVersion, isConfirmedHandoffReceipt, isUnattemptedOutboxItem, outboxReconciliationTargets, sameEnvelopeIntent,
+} from '../core-types/index.ts';
 import {
   copyFileAtomically,
   withOwnedLock,
@@ -11,6 +14,7 @@ import type {
   Disposable,
   MessageEnvelope,
   NodeCard,
+  OutboxAttemptOptions,
   OutboxClaimInput,
   OutboxClaimResult,
   OutboxDeliveryOutcome,
@@ -42,7 +46,7 @@ function highestKeyedObligation(items: readonly OutboxItem[], networkId: string,
   let existing: OutboxItem | undefined;
   let highestVersion = minVersion;
   for (const item of items) {
-    if (item.networkId !== networkId || item.envelope.idempotencyKey !== key) continue;
+    if (item.supersededById !== undefined || item.networkId !== networkId || item.envelope.idempotencyKey !== key) continue;
     const version = envelopeClaimVersion(item.envelope) ?? 0;
     if (version >= highestVersion) {
       existing = item;
@@ -74,6 +78,8 @@ const DEFAULT_REDRIVE_TIMEOUT_MS = 10_000;
 const DEFAULT_CLAIM_LEASE_MS = 60_000;
 
 export interface OutboxAttemptUpdate {
+  deliveredReceipts?: OutboxDeliveryOutcome['deliveredReceipts'];
+  failures?: OutboxDeliveryOutcome['failures'];
   pendingNodeIds?: string[];
   inDoubtNodeIds?: string[];
   relaySpooledNodeIds?: string[];
@@ -88,6 +94,17 @@ interface OutboxFileState {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasActiveAttempt(item: OutboxItem, now = Date.now()): boolean {
+  return item.activeAttempt !== undefined && Date.parse(item.activeAttempt.expiresAt) > now;
+}
+
+function acceptsSettlement(item: OutboxItem | undefined, attemptToken: string | undefined): boolean {
+  if (!item) return attemptToken === undefined;
+  return item.supersededById === undefined && (attemptToken === undefined
+    ? !hasActiveAttempt(item)
+    : item.activeAttempt?.token === attemptToken);
 }
 
 function clone<T>(value: T): T {
@@ -154,18 +171,24 @@ function validItem(value: unknown): value is OutboxItem {
     typeof value.createdAt === 'string' &&
     typeof value.updatedAt === 'string' &&
     typeof value.nextAttemptAt === 'string' &&
-    (value.lastError === undefined || typeof value.lastError === 'string')
+    (value.lastError === undefined || typeof value.lastError === 'string') &&
+    (value.supersededById === undefined ||
+      (typeof value.supersededById === 'string' && value.supersededById.length > 0 && value.supersededById !== value.id)) &&
+    (value.activeAttempt === undefined || (
+      isRecord(value.activeAttempt) &&
+      typeof value.activeAttempt.token === 'string' && value.activeAttempt.token.length > 0 &&
+      typeof value.activeAttempt.expiresAt === 'string' && Number.isFinite(Date.parse(value.activeAttempt.expiresAt))
+    ))
   );
 }
 
-function normalizedItem(item: OutboxItem): OutboxItem {
-  return {
-    ...item,
-    inDoubtNodeIds: [...new Set(item.inDoubtNodeIds)],
-    pendingNodeIds: [...new Set(item.pendingNodeIds)].filter(
-      nodeId => !item.deliveredReceipts[nodeId] && !item.failedNodeIds.includes(nodeId),
-    ),
-  };
+function normalizeTargets(item: OutboxItem): OutboxItem {
+  item.pendingNodeIds = [...new Set(item.pendingNodeIds)].filter(
+    nodeId => !item.deliveredReceipts[nodeId] && !item.failedNodeIds.includes(nodeId),
+  );
+  // A later rejection cannot disprove an earlier delivery whose reply timed out.
+  item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(nodeId => !item.deliveredReceipts[nodeId]);
+  return item;
 }
 
 /**
@@ -214,7 +237,7 @@ export class OutboxStore {
     }
     return {
       schema: OUTBOX_SCHEMA,
-      items: (parsed.items as OutboxItem[]).map(normalizedItem),
+      items: (parsed.items as OutboxItem[]).map(normalizeTargets),
     };
   }
 
@@ -269,12 +292,7 @@ export class OutboxStore {
    * staged evidence is deleted only after every target delivered.
    */
   private settleItem(item: OutboxItem): void {
-    item.pendingNodeIds = [...new Set(item.pendingNodeIds)].filter(
-      nodeId => !item.deliveredReceipts[nodeId] && !item.failedNodeIds.includes(nodeId),
-    );
-    item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(
-      nodeId => item.pendingNodeIds.includes(nodeId),
-    );
+    normalizeTargets(item);
     if (item.pendingNodeIds.length > 0) {
       item.status = 'queued';
       return;
@@ -308,6 +326,9 @@ export class OutboxStore {
     return this.mutate(state => {
       const index = state.items.findIndex(item => item.id === id);
       const existing = index >= 0 ? state.items[index] : undefined;
+      if (!acceptsSettlement(existing, input.attemptToken)) {
+        throw new Error(`Outbox attempt no longer owns obligation ${id}`);
+      }
       const settled = Object.fromEntries(Object.entries(existing?.deliveredReceipts ?? {}).filter(
         ([, receipt]) => isConfirmedHandoffReceipt(receipt, { allowQueued: false }),
       ));
@@ -318,7 +339,6 @@ export class OutboxStore {
         delete existing.failedReceipts[nodeId];
         existing.failedNodeIds = existing.failedNodeIds.filter(id => id !== nodeId);
         existing.pendingNodeIds = existing.pendingNodeIds.filter(id => id !== nodeId);
-        existing.inDoubtNodeIds = existing.inDoubtNodeIds.filter(id => id !== nodeId);
         existing.relaySpooledNodeIds = existing.relaySpooledNodeIds.filter(id => id !== nodeId);
       }
       const deliveredReceipts = {
@@ -341,17 +361,8 @@ export class OutboxStore {
       for (const nodeId of Object.keys(deliveredReceipts)) {
         delete failedReceipts[nodeId];
       }
-      const pendingNodeIds = [
-        ...new Set([...(input.pendingNodeIds ?? []), ...(existing?.pendingNodeIds ?? [])]),
-      ].filter(
-        nodeId => !deliveredReceipts[nodeId] && !failedNodeIds.includes(nodeId),
-      );
-      const inDoubtNodeIds = [
-        ...new Set([
-          ...(existing?.inDoubtNodeIds ?? []),
-          ...(input.inDoubtNodeIds ?? []),
-        ]),
-      ].filter(nodeId => pendingNodeIds.includes(nodeId));
+      const pendingNodeIds = [...(input.pendingNodeIds ?? []), ...(existing?.pendingNodeIds ?? [])];
+      const inDoubtNodeIds = [...(existing?.inDoubtNodeIds ?? []), ...(input.inDoubtNodeIds ?? [])];
       const relaySpooledNodeIds = [
         ...new Set([
           ...(existing?.relaySpooledNodeIds ?? []),
@@ -428,13 +439,19 @@ export class OutboxStore {
       if (existing) {
         return { claimed: false, item: clone(existing) };
       }
-      const item = this.createClaim(input);
+      if (state.items.some(item => item.id === input.envelope.id)) throw new Error('Outbox claim id is already in use');
+      const activeAttempt = this.newAttempt(input.leaseMs);
+      const item = this.createClaim(input, activeAttempt);
       state.items.push(item);
-      return { claimed: true, item: clone(item) };
+      return { claimed: true, item: clone(item), attemptToken: activeAttempt.token };
     });
   }
 
-  private createClaim(input: OutboxClaimInput): OutboxItem {
+  private newAttempt(leaseMs?: number, now?: number): NonNullable<OutboxItem['activeAttempt']> {
+    return { token: randomUUID(), expiresAt: claimDeadline(leaseMs, now) };
+  }
+
+  private createClaim(input: OutboxClaimInput, activeAttempt: NonNullable<OutboxItem['activeAttempt']>): OutboxItem {
     const { envelope } = input;
     const now = Date.now();
     const createdAt = new Date(now).toISOString();
@@ -454,7 +471,8 @@ export class OutboxStore {
       attempts: 0,
       createdAt,
       updatedAt: createdAt,
-      nextAttemptAt: claimDeadline(input.leaseMs),
+      nextAttemptAt: activeAttempt.expiresAt,
+      activeAttempt,
     };
   }
 
@@ -465,15 +483,16 @@ export class OutboxStore {
       const state = this.read();
       const existing = highestKeyedObligation(state.items, input.envelope.networkId, key, version);
       if (!existing) return undefined;
-      if ((input.expectedId !== undefined && existing.id !== input.expectedId) ||
+      const now = Date.now();
+      if (hasActiveAttempt(existing, now) || (input.expectedId !== undefined && existing.id !== input.expectedId) ||
           envelopeClaimVersion(existing.envelope) !== version ||
           !isUnattemptedOutboxItem(existing)) return { claimed: false, item: clone(existing) };
 
       const retryOriginal = existing.id === input.envelope.id;
+      const activeAttempt = this.newAttempt(input.leaseMs, now);
       let item: OutboxItem;
       if (retryOriginal) {
         if (existing.envelope.signature !== input.envelope.signature) return { claimed: false, item: clone(existing) };
-        const now = Date.now();
         item = {
           ...existing,
           pendingNodeIds: [...new Set([...existing.failedNodeIds, ...Object.keys(existing.failedReceipts)])],
@@ -482,18 +501,61 @@ export class OutboxStore {
           status: 'queued',
           lastError: undefined,
           updatedAt: new Date(now).toISOString(),
-          nextAttemptAt: claimDeadline(input.leaseMs, now),
+          nextAttemptAt: activeAttempt.expiresAt,
+          activeAttempt,
         };
+        state.items[state.items.indexOf(existing)] = item;
       } else {
         if (sameEnvelopeIntent(existing.envelope, input.envelope)) return { claimed: false, item: clone(existing) };
         if (state.items.some(candidate => candidate.id === input.envelope.id)) throw new Error('Outbox replacement id is already in use');
-        item = this.createClaim(input);
+        item = this.createClaim(input, activeAttempt);
+        state.items[state.items.indexOf(existing)] = {
+          ...existing, supersededById: item.id, activeAttempt: undefined, stagedFiles: {},
+        };
+        state.items.push(item);
       }
-      state.items[state.items.indexOf(existing)] = item;
       // The old attachment copies remain valid until the new obligation is durably published.
       this.save(state);
       if (!retryOriginal) this.removeStagedFiles(existing.id, existing.stagedFiles);
-      return { claimed: true, item: clone(item) };
+      return { claimed: true, item: clone(item), attemptToken: activeAttempt.token };
+    });
+  }
+
+  beginAttempt(id: string, options: OutboxAttemptOptions = {}): {
+    item: OutboxItem; attemptToken: string;
+  } | undefined {
+    return this.withFileLock(() => {
+      const state = this.read();
+      const item = state.items.find(candidate => candidate.id === id);
+      const now = options.now ?? Date.now();
+      if (!item || item.supersededById !== undefined || hasActiveAttempt(item, now)) {
+        return undefined;
+      }
+      const eligible = options.reconcile === true ? outboxReconciliationTargets(item).length > 0 : item.status === 'queued';
+      if (!eligible) return undefined;
+      const activeAttempt = this.newAttempt(options.leaseMs, now);
+      item.activeAttempt = activeAttempt;
+      this.save(state);
+      return { item: clone(item), attemptToken: activeAttempt.token };
+    });
+  }
+
+  releaseAttempt(id: string, attemptToken: string): void {
+    this.mutateAttempt(id, attemptToken, item => {
+      delete item.activeAttempt;
+    });
+  }
+
+  private mutateAttempt<T>(
+    id: string, attemptToken: string | undefined, operation: (item: OutboxItem) => T,
+  ): T | undefined {
+    return this.withFileLock(() => {
+      const state = this.read();
+      const item = state.items.find(candidate => candidate.id === id);
+      if (!item || !acceptsSettlement(item, attemptToken)) return undefined;
+      const result = operation(item);
+      this.save(state);
+      return result;
     });
   }
 
@@ -503,11 +565,7 @@ export class OutboxStore {
    */
   requeue(id: string): OutboxItem | undefined {
     const now = new Date().toISOString();
-    return this.mutate(state => {
-      const item = state.items.find(candidate => candidate.id === id);
-      if (!item) {
-        return undefined;
-      }
+    return this.mutateAttempt(id, undefined, item => {
       if (item.status !== 'failed') {
         throw new Error('Only a failed outbox item can be requeued');
       }
@@ -534,11 +592,8 @@ export class OutboxStore {
       const retry = new Set(retryable);
       item.failedNodeIds = item.failedNodeIds.filter(nodeId => !retry.has(nodeId));
       item.pendingNodeIds = [...new Set([...pending, ...retryable])];
-      // In-doubt targets stay gated behind an explicit force or direct peer pulse.
-      item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(
-        nodeId => item.pendingNodeIds.includes(nodeId),
-      );
       item.status = 'queued';
+      delete item.activeAttempt;
       item.lastError = undefined;
       item.updatedAt = now;
       item.nextAttemptAt = now;
@@ -572,24 +627,15 @@ export class OutboxStore {
     id: string,
     nodeId: string,
     receipt: DeliveryReceipt,
+    attemptToken?: string,
   ): OutboxItem | undefined {
     if (typeof nodeId !== 'string' || !nodeId) {
       throw new Error('Invalid outbox target');
     }
     const now = new Date().toISOString();
-    return this.mutate(state => {
-      const item = state.items.find(candidate => candidate.id === id);
-      if (!item) {
-        return undefined;
-      }
-      item.deliveredReceipts = {
-        ...item.deliveredReceipts,
-        [nodeId]: structuredClone(receipt),
-      };
-      delete item.failedReceipts[nodeId];
-      item.failedNodeIds = item.failedNodeIds.filter(failed => failed !== nodeId);
-      item.pendingNodeIds = item.pendingNodeIds.filter(pending => pending !== nodeId);
-      item.inDoubtNodeIds = item.inDoubtNodeIds.filter(pending => pending !== nodeId);
+    return this.mutateAttempt(id, attemptToken, item => {
+      this.applyNodeDelivery(item, nodeId, receipt);
+      delete item.activeAttempt;
       item.updatedAt = now;
       item.nextAttemptAt = now;
       if (item.failedNodeIds.length === 0) {
@@ -598,6 +644,17 @@ export class OutboxStore {
       this.settleItem(item);
       return clone(item);
     });
+  }
+
+  private applyNodeDelivery(item: OutboxItem, nodeId: string, receipt: DeliveryReceipt): void {
+    item.deliveredReceipts[nodeId] = structuredClone(receipt);
+    delete item.failedReceipts[nodeId];
+    item.failedNodeIds = item.failedNodeIds.filter(failed => failed !== nodeId);
+  }
+
+  private applyNodeFailure(item: OutboxItem, nodeId: string, receipt?: DeliveryReceipt): void {
+    item.failedNodeIds = [...new Set([...item.failedNodeIds, nodeId])];
+    if (receipt) item.failedReceipts[nodeId] = structuredClone(receipt);
   }
 
   /**
@@ -610,25 +667,15 @@ export class OutboxStore {
     nodeId: string,
     lastError: string,
     receipt?: DeliveryReceipt,
+    attemptToken?: string,
   ): OutboxItem | undefined {
     if (typeof nodeId !== 'string' || !nodeId) {
       throw new Error('Invalid outbox target');
     }
     const now = new Date().toISOString();
-    return this.mutate(state => {
-      const item = state.items.find(candidate => candidate.id === id);
-      if (!item) {
-        return undefined;
-      }
-      item.failedNodeIds = [...new Set([...item.failedNodeIds, nodeId])];
-      if (receipt) {
-        item.failedReceipts = {
-          ...item.failedReceipts,
-          [nodeId]: structuredClone(receipt),
-        };
-      }
-      item.pendingNodeIds = item.pendingNodeIds.filter(pending => pending !== nodeId);
-      item.inDoubtNodeIds = item.inDoubtNodeIds.filter(pending => pending !== nodeId);
+    return this.mutateAttempt(id, attemptToken, item => {
+      this.applyNodeFailure(item, nodeId, receipt);
+      delete item.activeAttempt;
       item.lastError = lastError;
       item.updatedAt = now;
       item.nextAttemptAt = now;
@@ -642,24 +689,12 @@ export class OutboxStore {
    * in-doubt flags are retained as the operator's recovery obligation: an explicit requeue
    * resumes routing without ever resurrecting a target that already has terminal evidence.
    */
-  markFailed(id: string, lastError: string): OutboxItem | undefined {
+  markFailed(id: string, lastError: string, attemptToken?: string): OutboxItem | undefined {
     const now = new Date().toISOString();
-    return this.mutate(state => {
-      const item = state.items.find(candidate => candidate.id === id);
-      if (!item) {
-        return undefined;
-      }
+    return this.mutateAttempt(id, attemptToken, item => {
+      delete item.activeAttempt;
       item.status = 'failed';
       item.lastError = lastError;
-      // Keep only targets that are still deliverable; terminal decisions already settled.
-      item.pendingNodeIds = [...new Set(item.pendingNodeIds)].filter(
-        nodeId =>
-          !item.deliveredReceipts[nodeId] &&
-          !item.failedNodeIds.includes(nodeId),
-      );
-      item.inDoubtNodeIds = [...new Set(item.inDoubtNodeIds)].filter(
-        nodeId => item.pendingNodeIds.includes(nodeId),
-      );
       item.updatedAt = now;
       item.nextAttemptAt = now;
       // Staged files are deliberately retained as evidence for operator inspection.
@@ -667,38 +702,45 @@ export class OutboxStore {
     });
   }
 
-  recordAttempt(id: string, update: OutboxAttemptUpdate): OutboxItem | undefined {
+  recordAttempt(id: string, update: OutboxAttemptUpdate, attemptToken?: string): OutboxItem | undefined {
     if (typeof update?.nextAttemptAt !== 'string' || !Number.isFinite(Date.parse(update.nextAttemptAt))) {
       throw new Error('Invalid outbox attempt schedule');
     }
     const now = new Date().toISOString();
-    return this.mutate(state => {
-      const item = state.items.find(candidate => candidate.id === id);
-      if (!item) {
-        return undefined;
+    return this.mutateAttempt(id, attemptToken, item => {
+      for (const [nodeId, receipt] of Object.entries(update.deliveredReceipts ?? {})) {
+        this.applyNodeDelivery(item, nodeId, receipt);
+      }
+      let itemFailure: string | undefined;
+      for (const failure of update.failures ?? []) {
+        if (failure.nodeId !== undefined) this.applyNodeFailure(item, failure.nodeId, failure.receipt);
+        else itemFailure ??= failure.error;
       }
       if (update.pendingNodeIds !== undefined) {
         item.pendingNodeIds = [...new Set(update.pendingNodeIds)];
       }
       if (update.inDoubtNodeIds !== undefined) {
-        item.inDoubtNodeIds = [...new Set(update.inDoubtNodeIds)];
+        item.inDoubtNodeIds.push(...update.inDoubtNodeIds);
       }
       if (update.relaySpooledNodeIds?.length) {
         item.relaySpooledNodeIds = [
           ...new Set([...item.relaySpooledNodeIds, ...update.relaySpooledNodeIds]),
         ];
       }
-      if (update.lastError === undefined) {
+      const lastError = itemFailure ?? update.lastError ?? update.failures?.[0]?.error;
+      if (lastError === undefined) {
         if (item.failedNodeIds.length === 0) {
           item.lastError = undefined;
         }
       } else {
-        item.lastError = update.lastError;
+        item.lastError = lastError;
       }
       item.attempts += 1;
       item.updatedAt = now;
       item.nextAttemptAt = update.nextAttemptAt;
+      delete item.activeAttempt;
       this.settleItem(item);
+      if (itemFailure !== undefined) item.status = 'failed';
       return clone(item);
     });
   }
@@ -931,138 +973,78 @@ export class OutboxRedriveService {
         processed.push(candidate);
         continue;
       }
-      const eligibleTargets = candidate.pendingNodeIds.filter(
-        nodeId =>
-          !candidate.deliveredReceipts[nodeId] &&
-          !candidate.failedNodeIds.includes(nodeId),
-      );
-      const requestTargets = options.forceMatchingTarget && options.targetNodeId
-        ? eligibleTargets.filter(nodeId => nodeId === options.targetNodeId)
-        : options.force
-          // An explicit operator flush resolves in-doubt sends through the same stable
-          // envelope id; the target's dedup policy decides a duplicate safely.
-          ? eligibleTargets
-          // A timed-out send may already have executed. It stays parked until transport
-          // proves the peer live again (a fresh beacon or its own tunnel): the same signed
-          // envelope id is then reconciled by the receiver's DeliveryLedger/dedup-cas.
-          : eligibleTargets.filter(
-              nodeId =>
-                !candidate.inDoubtNodeIds.includes(nodeId) ||
-                this.isPeerReachable?.(candidate.networkId, nodeId) === true,
-            );
-      if (eligibleTargets.length > 0 && requestTargets.length === 0) {
-        blockedThreads.add(threadKey);
-        processed.push(candidate);
+      const claimed = this.outbox.beginAttempt(candidate.id, {
+        leaseMs: Math.max(DEFAULT_CLAIM_LEASE_MS, this.attemptTimeoutMs),
+      });
+      if (!claimed) {
+        if (this.outbox.get(candidate.id)?.status === 'queued') blockedThreads.add(threadKey);
         continue;
       }
-      attempted += 1;
-      let outcome: OutboxDeliveryOutcome;
+      const { item, attemptToken } = claimed;
       try {
-        // The emitter owns the total per-attempt deadline and returns every receipt it
-        // already obtained; an outer race here would discard confirmed targets and resend.
-        outcome = await this.deliver(candidate, {
-          // An empty list means "route the unresolved selector", not "deliver nowhere".
-          ...(requestTargets.length > 0 ? { targetNodeIds: requestTargets } : {}),
-          timeoutMs: this.attemptTimeoutMs,
-        });
-      } catch (error) {
-        const latest = this.outbox.get(candidate.id) ?? candidate;
-        const failed = this.outbox.recordAttempt(latest.id, {
-          lastError: String(error),
-          nextAttemptAt: new Date(
-            Date.now() + attemptDelayMs(latest.attempts + 1),
-          ).toISOString(),
-        }) ?? latest;
-        processed.push(failed);
-        blockedThreads.add(threadKey);
-        continue;
-      }
-      let item = this.outbox.get(candidate.id) ?? candidate;
-      for (const [nodeId, receipt] of Object.entries(outcome.deliveredReceipts ?? {})) {
-        item = this.outbox.markNodeDelivered(item.id, nodeId, receipt) ?? item;
-        delivered += 1;
-      }
-      let terminalError: string | undefined;
-      for (const failure of outcome.failures ?? []) {
-        if (failure.nodeId !== undefined) {
-          item = this.outbox.markNodeFailed(
-            item.id,
-            failure.nodeId,
-            failure.error,
-            failure.receipt,
-          ) ?? item;
-        } else {
-          item = this.outbox.markFailed(item.id, failure.error) ?? item;
+        // The snapshot orders the scan. Only the leased row can authorize a send.
+        const eligibleTargets = item.pendingNodeIds;
+        if ((!force && Date.parse(item.nextAttemptAt) > now) ||
+            (options.forceMatchingTarget && eligibleTargets.length === 0 && options.includeUnresolved !== true)) {
+          blockedThreads.add(threadKey);
+          processed.push(item);
+          continue;
         }
-        terminalError ??= failure.error;
-      }
-      const resolved = outcome.resolvedTargetNodeIds;
-      if (resolved?.length && candidate.pendingNodeIds.length === 0) {
-        // The initial emit recorded an empty outbound route; the peer directory now knows
-        // the target, so converge that durable reply route before declaring settlement.
+        const requestTargets = options.forceMatchingTarget && scopedTargetNodeId
+          ? eligibleTargets.filter(nodeId => nodeId === scopedTargetNodeId)
+          : options.force
+            ? eligibleTargets
+            : eligibleTargets.filter(nodeId =>
+                !item.inDoubtNodeIds.includes(nodeId) ||
+                this.isPeerReachable?.(item.networkId, nodeId) === true,
+              );
+        if (eligibleTargets.length > 0 && requestTargets.length === 0) {
+          blockedThreads.add(threadKey);
+          processed.push(item);
+          continue;
+        }
+        attempted += 1;
+        let outcome: OutboxDeliveryOutcome;
         try {
-          this.onTargetsResolved?.(candidate.envelope, resolved);
+          // An empty target list means the emitter should route an unresolved selector.
+          outcome = await this.deliver(item, {
+            ...(requestTargets.length > 0 ? { targetNodeIds: requestTargets } : {}),
+            timeoutMs: this.attemptTimeoutMs,
+          });
         } catch (error) {
-          this.onError(error);
+          outcome = { lastError: String(error) };
         }
+        const resolved = outcome.resolvedTargetNodeIds;
+        const requested = new Set(requestTargets);
+        const untouchedPendingNodeIds = requestTargets.length > 0
+          ? eligibleTargets.filter(nodeId => !requested.has(nodeId))
+          : [];
+        const updated = this.outbox.recordAttempt(item.id, {
+          deliveredReceipts: outcome.deliveredReceipts,
+          failures: outcome.failures,
+          pendingNodeIds: [...(outcome.pendingNodeIds ?? resolved ?? eligibleTargets), ...untouchedPendingNodeIds],
+          inDoubtNodeIds: outcome.inDoubtNodeIds?.slice(),
+          relaySpooledNodeIds: outcome.relaySpooledNodeIds?.slice(),
+          lastError: outcome.lastError,
+          nextAttemptAt: new Date(Date.now() + attemptDelayMs(item.attempts + 1)).toISOString(),
+        }, attemptToken);
+        if (!updated) {
+          if (this.outbox.get(item.id)?.status === 'queued') blockedThreads.add(threadKey);
+          continue;
+        }
+        delivered += Object.keys(outcome.deliveredReceipts ?? {}).length;
+        if (resolved?.length && eligibleTargets.length === 0) {
+          try {
+            this.onTargetsResolved?.(item.envelope, resolved);
+          } catch (error) {
+            this.onError(error);
+          }
+        }
+        if (updated.status === 'queued') blockedThreads.add(threadKey);
+        processed.push(updated);
+      } finally {
+        this.outbox.releaseAttempt(item.id, attemptToken);
       }
-      if (item.status !== 'queued') {
-        // Delivered or terminally failed: the thread's head is settled, so later queued
-        // events on the same thread may deliver in this very pass.
-        processed.push(item);
-        continue;
-      }
-      // Still owes a live target: later events on this thread must not overtake it.
-      blockedThreads.add(threadKey);
-      const settledNodeIds = new Set([
-        ...Object.keys(item.deliveredReceipts),
-        ...item.failedNodeIds,
-      ]);
-      // A scoped attempt can never settle a target it did not request, regardless of what
-      // the delivery outcome reports. Preserve those pending targets independently.
-      const requestedNodeIds = new Set(requestTargets);
-      const untouchedPendingNodeIds = requestTargets.length > 0
-        ? item.pendingNodeIds.filter(
-            nodeId =>
-              !requestedNodeIds.has(nodeId) &&
-              !settledNodeIds.has(nodeId) &&
-              !item.failedNodeIds.includes(nodeId),
-          )
-        : [];
-      const pendingNodeIds = [
-        ...new Set([
-          ...(outcome.pendingNodeIds ?? resolved ?? item.pendingNodeIds),
-          ...untouchedPendingNodeIds,
-        ].filter(nodeId => !settledNodeIds.has(nodeId))),
-      ];
-      const attemptedThisPass = new Set(
-        requestTargets.length > 0 ? requestTargets : pendingNodeIds,
-      );
-      // A scoped flush attempts only its requested targets. In-doubt flags on untouched
-      // pending targets remain authoritative; only an explicit attempt may clear them.
-      const inDoubtNodeIds = [
-        ...new Set([
-          ...(outcome.inDoubtNodeIds ?? []),
-          ...item.inDoubtNodeIds.filter(
-            nodeId =>
-              pendingNodeIds.includes(nodeId) && !attemptedThisPass.has(nodeId),
-          ),
-        ]),
-      ].filter(nodeId => pendingNodeIds.includes(nodeId));
-      item = this.outbox.recordAttempt(item.id, {
-        pendingNodeIds,
-        inDoubtNodeIds,
-        ...(outcome.relaySpooledNodeIds?.length
-          ? { relaySpooledNodeIds: [...outcome.relaySpooledNodeIds] }
-          : {}),
-        ...(outcome.lastError ?? terminalError !== undefined
-          ? { lastError: outcome.lastError ?? terminalError }
-          : {}),
-        nextAttemptAt: new Date(
-          Date.now() + attemptDelayMs(item.attempts + 1),
-        ).toISOString(),
-      }) ?? item;
-      processed.push(item);
     }
     return {
       attempted,

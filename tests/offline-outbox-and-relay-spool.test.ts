@@ -38,6 +38,7 @@ import {
   generateNodeKeyPair,
   isConfirmedHandoffReceipt,
   DEDUP_CAS_AMBIGUOUS_DETAIL,
+  DEDUP_CAS_DUPLICATE_DETAIL,
   isDeliveryTimeoutFailure,
   isLocalDeliveryError,
   isPeerUnreachableError,
@@ -48,7 +49,7 @@ import {
   signReceipt,
   unsealNetworkFrame,
 } from '../packages/core-types/index.ts';
-import { isUnattemptedOutboxItem } from '../packages/index.ts';
+import { isRetryablePreEffectReceipt, isUnattemptedOutboxItem } from '../packages/index.ts';
 import type {
   DeliveryReceipt,
   DeliveryStage,
@@ -4877,12 +4878,21 @@ test('outbox replacement requires signed pre-effect evidence for every failed ta
     { ...item, failedNodeIds: ['a', 'unsigned'] },
     { ...item, pendingNodeIds: ['a'] },
     { ...item, inDoubtNodeIds: ['a'] },
+    { ...item, supersededById: 'replacement' },
     { ...item, deliveredReceipts: { b: { stage: 'dispatched' } } },
     { ...item, failedReceipts: { a: { stage: 'failed' } } },
     { ...item, failedReceipts: { a: { stage: 'failed', executionReceipt: { handoff: 'unknown' } } } },
     { ...item, failedReceipts: { a: { stage: 'dispatching' } } },
     { ...item, failedReceipts: { a: { stage: 'rejected', detail: DEDUP_CAS_AMBIGUOUS_DETAIL } } },
   ]) assert.equal(isUnattemptedOutboxItem(blocked), false);
+  for (const handoff of ['settled', 'queued', 'dispatched', 'unknown']) {
+    const receipt = { stage: 'rejected', executionReceipt: { handoff, durable: false } };
+    for (const detail of ['Gate closed', DEDUP_CAS_DUPLICATE_DETAIL]) {
+      const failure = { ...receipt, detail };
+      assert.equal(isRetryablePreEffectReceipt(failure), false);
+      assert.equal(isUnattemptedOutboxItem({ ...item, failedReceipts: { a: failure } }), false);
+    }
+  }
 });
 
 for (const handoff of ['unattempted', 'unknown'] as const) {
@@ -4918,9 +4928,192 @@ for (const handoff of ['unattempted', 'unknown'] as const) {
       assert.equal(harness.sendCalls.length, 1);
       assert.ok(Object.values(before.stagedFiles).every(path => existsSync(path)));
     }
-    assert.deepEqual(harness.outbox.list().map(item => item.id), [retry.messageId]);
+    assert.deepEqual(harness.outbox.list().filter(item => !item.supersededById).map(item => item.id), [retry.messageId]);
+    if (handoff === 'unattempted') assert.equal(harness.outbox.get(first.messageId)?.supersededById, retry.messageId);
   });
 }
+
+test('a gate rejection after a timed-out send retains uncertainty and forbids replacement', async t => {
+  const harness = await emitterHarness(t, {
+    plan: (target, index) => index === 0
+      ? { error: new PeerUnreachableError(target, 'Transport timeout', { cause: new DeliveryTimeoutError('Transport timeout') }) }
+      : { stage: 'rejected', detail: 'Gate closed' },
+  });
+  const first = await harness.emitter.emit({
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'wave', subject: 'wave', body: 'slot 2', payload: {}, idempotencyKey: 'timed-out-wave',
+  });
+  const target = harness.targetCard.nodeId;
+  assert.deepEqual(harness.outbox.get(first.messageId)?.inDoubtNodeIds, [target]);
+  const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: harness.emitter.redriveOutboxItem! });
+  assert.equal((await service.flush({ force: true })).attempted, 1);
+  const failed = harness.outbox.get(first.messageId)!;
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.failedReceipts[target].stage, 'rejected');
+  assert.deepEqual(failed.inDoubtNodeIds, [target]);
+  assert.equal(isUnattemptedOutboxItem(failed), false);
+  const replacement = harness.outbox.replaceUnattemptedIdempotency({
+    envelope: signEnvelope({ ...failed.envelope, id: randomUUID(), body: 'slot 1' }, harness.sender.privateKeyPem),
+    explicitTargets: failed.explicitTargets,
+  });
+  assert.equal(replacement?.claimed, false);
+  assert.deepEqual(harness.outbox.list().map(item => item.id), [first.messageId]);
+});
+
+test('kind-only changes replace a proven-unattempted keyed envelope', async t => {
+  const harness = await emitterHarness(t, {
+    plan: (_target, index) => index === 0 ? { stage: 'failed', executionReceipt: { handoff: 'unattempted' } } : {},
+  });
+  const input: EmitMessageInput = {
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'initial-wave', subject: 'wave', body: 'same slot', payload: {}, idempotencyKey: 'kind-correction',
+  };
+  const first = await harness.emitter.emit(input);
+  const corrected = await harness.emitter.emit({ ...input, kind: 'corrected-wave' });
+  assert.notEqual(corrected.messageId, first.messageId);
+  assert.equal(harness.sendCalls.at(-1)?.envelope.kind, 'corrected-wave');
+});
+
+test('forced redrive skips a queued snapshot superseded while an earlier send waits', async t => {
+  const harness = await emitterHarness(t);
+  harness.setMounted(false);
+  const input: EmitMessageInput = {
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'wave', subject: 'wave', body: 'slot 2', payload: {}, idempotencyKey: 'snapshot-wave',
+  };
+  // Order these independent obligations without relying on clock precision or UUID ordering.
+  const head = signEnvelope({
+    ...envelopeFor(harness.sender, harness.networkId, 'member:diz'), id: '!head',
+  }, harness.sender.privateKeyPem);
+  harness.outbox.enqueue({ envelope: head, explicitTargets: [], pendingNodeIds: [harness.targetCard.nodeId] });
+  const original = await harness.emitter.emit(input);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const attemptedIds: string[] = [];
+  const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: async item => {
+    attemptedIds.push(item.id);
+    if (item.id === head.id) {
+      entered.resolve();
+      await release.promise;
+    }
+    return {};
+  } });
+  const flush = service.flush({ force: true });
+  const result = await Promise.race([
+    entered.promise.then(() => undefined),
+    flush.then(() => { throw new Error('Flush finished without reaching the first obligation'); }),
+  ]).then(async () => {
+    try {
+      const before = harness.outbox.get(original.messageId)!;
+      const rejection = signReceipt({
+        messageId: before.id, networkId: before.networkId, fromNodeId: harness.targetCard.nodeId,
+        stage: 'failed', executionReceipt: { handoff: 'unattempted' }, updatedAt: new Date().toISOString(),
+      }, harness.receiver.privateKeyPem);
+      assert.equal(harness.outbox.markNodeFailed(before.id, rejection.fromNodeId, 'Pre-effect failure', rejection)?.status, 'failed');
+      harness.setMounted(true);
+      return await harness.emitter.emit({ ...input, body: 'slot 1' });
+    } finally {
+      release.resolve();
+    }
+  });
+  assert.equal((await flush).attempted, 1);
+  assert.deepEqual(attemptedIds, [head.id]);
+  assert.deepEqual(harness.sendCalls.map(call => call.envelope.id), [result.messageId]);
+  assert.equal(harness.outbox.get(original.messageId)?.supersededById, result.messageId);
+  assert.deepEqual(harness.outbox.list().filter(item => item.envelope.idempotencyKey === input.idempotencyKey &&
+    !item.supersededById).map(item => item.id), [result.messageId]);
+});
+
+test('concurrent keyed emit joins an active forced redrive and can replace after pre-effect settlement', async t => {
+  const harness = await emitterHarness(t, {
+    plan: (_target, index) => index === 0 ? { stage: 'failed', executionReceipt: { handoff: 'unattempted' } } : {},
+  });
+  harness.setMounted(false);
+  const input: EmitMessageInput = {
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'wave', subject: 'wave', body: 'slot 2', payload: {}, idempotencyKey: 'forced-wave',
+  };
+  const first = await harness.emitter.emit(input);
+  harness.setMounted(true);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: async (item, options) => {
+    entered.resolve();
+    await release.promise;
+    return harness.emitter.redriveOutboxItem!(item, options);
+  } });
+  const flush = service.flush({ force: true });
+  const changed = { ...input, body: 'slot 1' };
+  try {
+    await entered.promise;
+    assert.ok(harness.outbox.get(first.messageId)?.activeAttempt?.token);
+    assert.equal((await harness.emitter.emit(changed)).messageId, first.messageId);
+    assert.equal(harness.sendCalls.length, 0);
+    assert.equal(harness.outbox.list().length, 1);
+  } finally {
+    release.resolve();
+  }
+  assert.equal((await flush).items[0].status, 'failed');
+  assert.equal(harness.outbox.get(first.messageId)?.activeAttempt, undefined);
+  const next = await harness.emitter.emit(changed);
+  assert.notEqual(next.messageId, first.messageId);
+  assert.deepEqual(harness.sendCalls.map(call => call.envelope.id), [first.messageId, next.messageId]);
+});
+
+test('an expired outbox attempt cannot settle or release a newer lease', async t => {
+  const harness = await emitterHarness(t);
+  const envelope = envelopeFor(harness.sender, harness.networkId, 'member:diz');
+  const target = harness.targetCard.nodeId;
+  harness.outbox.enqueue({ envelope, explicitTargets: [], pendingNodeIds: [target], inDoubtNodeIds: [target] });
+  const now = Date.now();
+  const first = harness.outbox.beginAttempt(envelope.id, { now, leaseMs: 10 })!;
+  const second = harness.outbox.beginAttempt(envelope.id, { now: now + 10 })!;
+  assert.notEqual(first.attemptToken, second.attemptToken);
+  assert.equal(harness.outbox.markFailed(envelope.id, 'stale failure', first.attemptToken), undefined);
+  assert.throws(() => harness.outbox.enqueue({
+    envelope, explicitTargets: [], pendingNodeIds: [], failedNodeIds: [target], attemptToken: first.attemptToken,
+  }), /Outbox attempt no longer owns/);
+  harness.outbox.releaseAttempt(envelope.id, first.attemptToken);
+  assert.equal(harness.outbox.get(envelope.id)?.activeAttempt?.token, second.attemptToken);
+
+  const delivered = signReceipt({
+    messageId: envelope.id, networkId: envelope.networkId, fromNodeId: target,
+    stage: 'dispatched', updatedAt: new Date().toISOString(),
+  }, harness.receiver.privateKeyPem);
+  const settled = harness.outbox.markNodeDelivered(envelope.id, target, delivered, second.attemptToken);
+  assert.equal(settled?.status, 'delivered');
+  assert.equal(settled?.activeAttempt, undefined);
+  assert.deepEqual(settled?.inDoubtNodeIds, []);
+});
+
+test('superseded offline requests retain failed evidence and stop blocking the slot', async t => {
+  const harness = await emitterHarness(t, {
+    plan: (_target, index) => index === 0 ? { stage: 'failed', executionReceipt: { handoff: 'unattempted' } } : {},
+  });
+  const slot = 'stream:alerts:2';
+  const session = 'terminal:alerts-2';
+  const inspect = () => harness.mailbox.inspectSlotObligations(slot, { sessionMailboxId: session, outbox: harness.outbox });
+  const input: EmitMessageInput = {
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'wave', subject: 'wave', body: 'original', payload: {}, idempotencyKey: 'offline-request',
+    semantic: { type: 'question', replyMailbox: session },
+  };
+  harness.setMounted(false);
+  const first = await harness.emitter.emit(input);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  harness.setMounted(true);
+  const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: harness.emitter.redriveOutboxItem! });
+  assert.equal((await service.flush({ force: true })).items[0].status, 'failed');
+  const replacement = await harness.emitter.emit({ ...input, body: 'replacement' });
+  assert.notEqual(replacement.messageId, first.messageId);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  harness.mailbox.recordInboundEnvelope(signEnvelope({
+    ...envelopeFor(harness.receiver, harness.networkId, harness.sender.nodeId),
+    replyToId: replacement.messageId, semantic: { type: 'reply', threadId: replacement.messageId },
+  }, harness.receiver.privateKeyPem), session, { committed: false });
+  assert.deepEqual(inspect(), { hasPendingWave: false });
+  assert.equal(harness.outbox.get(first.messageId)?.supersededById, replacement.messageId);
+});
 
 test('a retry of the original keyed envelope reserves its outbox obligation against replacement', async t => {
   const retryStarted = Promise.withResolvers<void>();
@@ -5092,6 +5285,8 @@ test('keyed DND retries retain the original target and staged attachment online 
   const first = await harness.emitter.emit(input);
   const staged = harness.outbox.get(first.messageId)!.stagedFiles;
   assert.equal(Object.keys(staged).length, 1);
+  assert.equal(harness.outbox.get(first.messageId)?.status, 'delivered');
+  assert.equal(harness.outbox.beginAttempt(first.messageId), undefined);
   selected = harness.targetByMember.get('aya')!.nodeId;
   const online = await harness.emitter.emit(input);
   assert.equal(online.messageId, first.messageId);
@@ -5106,6 +5301,7 @@ test('keyed DND retries retain the original target and staged attachment online 
   const delivered = await harness.emitter.emit(input);
   assert.equal(delivered.messageId, first.messageId);
   assert.equal(delivered.receipts[0].stage, 'dispatched');
+  assert.equal(harness.outbox.beginAttempt(first.messageId, { reconcile: true }), undefined);
   assert.ok(Object.values(staged).every(path => !existsSync(path)));
   assert.equal(route.mock.callCount(), 1);
   assert.ok(harness.sendCalls.every(call => call.targetNodeId === harness.targetCard.nodeId));

@@ -131,8 +131,8 @@ export function envelopeClaimVersion(envelope: Pick<MessageEnvelope, 'payload'>)
 
 /** Compare caller intent independently of the envelope id and its generated thread id. */
 export function sameEnvelopeIntent(left: MessageEnvelope, right: MessageEnvelope): boolean {
-  const intent = ({ id, subject, body, routing, payload, priority, replyToId, semantic, attachments }: MessageEnvelope) => ({
-    subject, body, routing, payload, priority, replyToId, attachments,
+  const intent = ({ id, kind, subject, body, routing, payload, priority, replyToId, semantic, attachments }: MessageEnvelope) => ({
+    kind, subject, body, routing, payload, priority, replyToId, attachments,
     semantic: semantic?.threadId === id ? { ...semantic, threadId: undefined } : semantic,
   });
   return canonicalJson(intent(left)) === canonicalJson(intent(right));
@@ -203,7 +203,9 @@ export function isRetryablePreEffectReceipt(receipt: HandoffReceipt | null | und
   if (receipt.stage === 'dispatching') return false;
   if (receipt.stage === 'failed') return receipt.executionReceipt?.handoff === 'unattempted';
   if (receipt.stage === 'rejected') {
-    return receipt.detail !== DEDUP_CAS_AMBIGUOUS_DETAIL && receipt.executionReceipt?.handoff !== 'unknown';
+    const handoff = receipt.executionReceipt?.handoff;
+    return receipt.detail !== DEDUP_CAS_AMBIGUOUS_DETAIL && receipt.detail !== DEDUP_CAS_DUPLICATE_DETAIL &&
+      (handoff === undefined || handoff === 'unattempted' || handoff === 'rejected');
   }
   return false;
 }
@@ -211,13 +213,14 @@ export function isRetryablePreEffectReceipt(receipt: HandoffReceipt | null | und
 /** True only when every target has signed pre-effect evidence and no remaining obligation. */
 export function isUnattemptedOutboxItem(item: {
   status?: string;
+  supersededById?: unknown;
   pendingNodeIds?: readonly string[];
   inDoubtNodeIds?: readonly string[];
   deliveredReceipts?: Readonly<Record<string, HandoffReceipt>>;
   failedNodeIds?: readonly string[];
   failedReceipts?: Readonly<Record<string, HandoffReceipt>>;
 } | null | undefined): boolean {
-  if (!item || item.status !== 'failed') return false;
+  if (!item || item.status !== 'failed' || item.supersededById !== undefined) return false;
   if ((item.pendingNodeIds?.length ?? 0) > 0 || (item.inDoubtNodeIds?.length ?? 0) > 0) return false;
   if (Object.keys(item.deliveredReceipts ?? {}).length > 0) return false;
   const failedReceipts = item.failedReceipts ?? {};
@@ -551,9 +554,34 @@ export interface OutboxItem {
   updatedAt: string;
   nextAttemptAt: string;
   lastError?: string;
+  activeAttempt?: { token: string; expiresAt: string };
+  /** The replacement owns the key; this row still provides terminal evidence for its envelope. */
+  supersededById?: string;
+}
+
+/** Original targets whose prior outcome permits explicit reconciliation. */
+export function outboxReconciliationTargets(item: OutboxItem): string[] {
+  const provisional = Object.entries(item.deliveredReceipts)
+    .filter(([, receipt]) => isConfirmedHandoffReceipt(receipt, { allowQueued: true }) &&
+      !isConfirmedHandoffReceipt(receipt, { allowQueued: false }))
+    .map(([target]) => target);
+  if (item.status === 'delivered') return provisional;
+  return [...new Set([...provisional, ...item.failedNodeIds, ...Object.keys(item.failedReceipts)])].filter(target => {
+    const failure = item.failedReceipts[target];
+    return (!failure || isRetryablePreEffectReceipt(failure)) &&
+      !isConfirmedHandoffReceipt(item.deliveredReceipts[target], { allowQueued: false });
+  });
+}
+
+export interface OutboxAttemptOptions {
+  leaseMs?: number;
+  now?: number;
+  /** Recheck unsettled outcomes on the original envelope, including provisional durable handoffs. */
+  reconcile?: boolean;
 }
 
 export interface OutboxEnqueueInput {
+  attemptToken?: string;
   /** Replace outcomes only for these original targets; confirmed execution is immutable. */
   reconcileNodeIds?: readonly string[];
   envelope: MessageEnvelope;
@@ -574,15 +602,13 @@ export interface OutboxClaimInput {
   envelope: MessageEnvelope;
   explicitTargets: string[];
   filePaths?: Record<string, string>;
-  /** How long a crash-before-first-send placeholder waits before redrive may send it. */
+  /** How long the attempt owns the obligation before another worker may resume it. */
   leaseMs?: number;
 }
 
-export interface OutboxClaimResult {
-  /** True only for the caller that created the obligation and may perform the first send. */
-  claimed: boolean;
-  item: OutboxItem;
-}
+export type OutboxClaimResult =
+  | { claimed: true; item: OutboxItem; attemptToken: string }
+  | { claimed: false; item: OutboxItem };
 
 export interface OutboxListFilter {
   networkId?: string;
@@ -642,10 +668,12 @@ export interface OutboxStoreLike {
   claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
   /** Reserve a same-version replacement or retry of the exact unattempted obligation observed. */
   replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined;
+  beginAttempt(id: string, options?: OutboxAttemptOptions): { item: OutboxItem; attemptToken: string } | undefined;
+  releaseAttempt(id: string, attemptToken: string): void;
   /** Read the highest matching version without reserving or changing an obligation. */
   findKeyedObligation?(networkId: string, key: string, minVersion: number): OutboxItem | undefined;
   /** Terminal local/routing failure with no signed target receipt. */
-  markFailed(id: string, lastError: string): OutboxItem | undefined;
+  markFailed(id: string, lastError: string, attemptToken?: string): OutboxItem | undefined;
 }
 
 export interface SourcePlugin {

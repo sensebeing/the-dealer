@@ -414,7 +414,9 @@ test('an invalid lineage inventory blocks the slot and surfaces a probe error', 
   store.upsertWakeTarget(probeMailbox, {
     driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle },
   });
-  for (const response of [{ ok: false }, { ok: true, result: { truncated: true, worktrees: [] } }]) {
+  for (const response of [
+    { ok: false }, { ok: true, result: { truncated: true, worktrees: [] } }, { ok: true, result: {} },
+  ]) {
     lineageResponse = response;
     const failed = await service.probeSlot(probeMailbox);
     assert.equal(failed.busy, true);
@@ -423,10 +425,10 @@ test('an invalid lineage inventory blocks the slot and surfaces a probe error', 
     assert.equal(String(errors.at(-1)), failed.reason);
     assert.equal((await checkOrcaWorkspaceIdle(commandRunner, 'orca', root, undefined, options)).idle, false);
   }
-  assert.equal(errors.length, 2);
-  lineageResponse = { ok: true };
+  assert.equal(errors.length, 3);
+  lineageResponse = { ok: true, result: { worktrees: [] } };
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
-  assert.equal(errors.length, 2, 'synthetic runners may omit worktrees');
+  assert.equal(errors.length, 3);
 });
 
 test('the real Orca command runner requires worktree rows for lineage', async t => {

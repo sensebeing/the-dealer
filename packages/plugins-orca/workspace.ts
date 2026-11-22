@@ -998,7 +998,6 @@ async function readOrcaWorkspaceList(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  allowMissingWorktrees = false,
 ): Promise<OrcaListedWorktree[]> {
   const listed = await checkedCommand(runner, {
     command,
@@ -1008,10 +1007,10 @@ async function readOrcaWorkspaceList(
   });
   const raw = JSON.parse(listed.stdout);
   const rows = raw?.result?.worktrees ?? raw?.worktrees ?? (Array.isArray(raw?.result) ? raw.result : undefined);
-  if (raw?.ok === false || raw?.result?.truncated || (!allowMissingWorktrees && !Array.isArray(rows))) {
+  if (raw?.ok === false || raw?.result?.truncated || !Array.isArray(rows)) {
     throw new Error('Incomplete Orca workspace inventory from Orca worktree list');
   }
-  return Array.isArray(rows) ? rows : [];
+  return rows;
 }
 
 async function readOrcaChildCreators(
@@ -1020,8 +1019,7 @@ async function readOrcaChildCreators(
   cwd: string,
   signal?: AbortSignal,
 ): Promise<Map<string, string>> {
-  // Synthetic runners may return a generic success without worktree rows. That proves no ownership.
-  const worktrees = await readOrcaWorkspaceList(runner, command, cwd, signal, runner !== runCommand);
+  const worktrees = await readOrcaWorkspaceList(runner, command, cwd, signal);
   const creators = new Map<string, string>();
   for (const worktree of worktrees) {
     const handle = worktree?.lineage?.createdByTerminalHandle;
