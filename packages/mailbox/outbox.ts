@@ -260,18 +260,17 @@ function concreteExplicitNodeIds(explicitTargets: readonly string[]): string[] |
 }
 
 function migrateLegacyItem(item: OutboxItem): OutboxItem {
+  delete item.unresolvedRoute;
   if (item.status !== 'queued' || item.pendingNodeIds.length > 0) return item;
   const concreteIds = concreteExplicitNodeIds(item.explicitTargets);
   if (concreteIds) {
     item.pendingNodeIds = concreteIds;
     item.inDoubtNodeIds.push(...concreteIds);
-  } else if (item.explicitTargets.length > 0 && item.lastError && item.failedNodeIds.length === 0 &&
-    Object.keys(item.failedReceipts).length === 0 && committedOutboxTargets(item).length === 0) {
-    item.unresolvedRoute = true;
   } else {
     item.status = 'failed';
     delete item.unattemptedFailure;
-    item.lastError ??= 'Interrupted v1 outbox claim before target persistence; outcome unknown';
+    const diagnostic = 'Interrupted v1 outbox claim before target persistence; outcome unknown';
+    item.lastError = item.lastError ? `${diagnostic}: ${item.lastError}` : diagnostic;
   }
   return item;
 }
@@ -296,13 +295,13 @@ export class OutboxStore {
     return withOwnedLock(this.lockDir, 'Outbox store', operation);
   }
 
-  private read(hasLock = false): OutboxFileState {
+  private readState(): { state: OutboxFileState; legacy: boolean } {
     let raw: string;
     try {
       raw = readFileSync(this.path, 'utf8');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return { schema: OUTBOX_SCHEMA, items: [] };
+        return { state: { schema: OUTBOX_SCHEMA, items: [] }, legacy: false };
       }
       throw error;
     }
@@ -321,13 +320,28 @@ export class OutboxStore {
       throw new Error('Invalid outbox store');
     }
     const legacy = parsed.schema === LEGACY_OUTBOX_SCHEMA;
-    if (legacy && !hasLock) return this.withFileLock(() => this.read(true));
-    const state: OutboxFileState = {
-      schema: OUTBOX_SCHEMA,
-      items: parsed.items.map(item => normalizeTargets(legacy ? migrateLegacyItem(item) : item)),
+    return {
+      state: {
+        schema: OUTBOX_SCHEMA,
+        items: parsed.items.map(item => normalizeTargets(legacy ? migrateLegacyItem(item) : item)),
+      },
+      legacy,
     };
-    if (legacy) this.save(state);
-    return state;
+  }
+
+  private read(): OutboxFileState {
+    return this.readState().state;
+  }
+
+  /** Persist the legacy projection at a writable lifecycle boundary. */
+  upgradeLegacyStore(): boolean {
+    if (!this.readState().legacy) return false;
+    return this.withFileLock(() => {
+      const { state, legacy } = this.readState();
+      if (!legacy) return false;
+      this.save(state);
+      return true;
+    });
   }
 
   private save(state: OutboxFileState): void {
@@ -336,7 +350,7 @@ export class OutboxStore {
 
   private mutate<T>(operation: (state: OutboxFileState, scheduleCleanup: ScheduleAttachmentCleanup) => T): T {
     return this.withFileLock(() => {
-      const state = this.read(true);
+      const state = this.read();
       return this.commitMutation(state, scheduleCleanup => operation(state, scheduleCleanup));
     });
   }
@@ -576,7 +590,7 @@ export class OutboxStore {
   replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined {
     const { key, version } = keyedClaim(input);
     return this.withFileLock(() => {
-      const state = this.read(true);
+      const state = this.read();
       const existing = highestKeyedObligation(state.items, input.envelope.networkId, key, version);
       if (!existing) return undefined;
       const now = Date.now();
@@ -624,7 +638,7 @@ export class OutboxStore {
     item: OutboxItem; attemptToken: string;
   } | undefined {
     return this.withFileLock(() => {
-      const state = this.read(true);
+      const state = this.read();
       const item = state.items.find(candidate => candidate.id === id);
       const now = options.now ?? Date.now();
       if (!item || item.supersededById !== undefined || hasActiveAttempt(item, now)) {
@@ -647,7 +661,7 @@ export class OutboxStore {
 
   markSentCommitted(id: string): boolean {
     return this.withFileLock(() => {
-      const state = this.read(true);
+      const state = this.read();
       const item = state.items.find(candidate => candidate.id === id);
       if (item?.sentCommitted !== false || item.supersededById !== undefined) return false;
       item.sentCommitted = true;
@@ -658,7 +672,7 @@ export class OutboxStore {
 
   prepareSend(id: string, attemptToken: string, targetNodeIds: readonly string[]): OutboxItem | undefined {
     return this.withFileLock(() => {
-      const state = this.read(true);
+      const state = this.read();
       const item = state.items.find(candidate => candidate.id === id);
       if (!item?.activeAttempt || !hasActiveAttempt(item) || !acceptsSettlement(item, attemptToken)) return undefined;
       if (targetNodeIds.length > 0) {
@@ -674,7 +688,7 @@ export class OutboxStore {
     operation: (item: OutboxItem, scheduleCleanup: ScheduleAttachmentCleanup) => T,
   ): T | undefined {
     return this.withFileLock(() => {
-      const state = this.read(true);
+      const state = this.read();
       const item = state.items.find(candidate => candidate.id === id);
       if (!item || !acceptsSettlement(item, attemptToken)) return undefined;
       return this.commitMutation(state, scheduleCleanup => operation(item, scheduleCleanup));

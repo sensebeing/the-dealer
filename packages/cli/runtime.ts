@@ -508,6 +508,7 @@ export class DealerNodeRuntime {
         join(this.stateDir, 'outbox.json'),
         join(this.stateDir, 'outbox-blobs'),
       );
+      this.outbox.upgradeLegacyStore();
       this.mailbox.reconcileOutboxThreads(this.outbox);
       this.wakeups = new WakeupRedriveService({
         store: this.mailbox,

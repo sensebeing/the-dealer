@@ -24,6 +24,7 @@ import { Kernel } from '../packages/kernel/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
+import { withOwnedLock } from '../packages/fs-atomic/index.ts';
 import { OutboxRedriveService, OutboxStore } from '../packages/mailbox/outbox.ts';
 import { MailboxStore } from '../packages/mailbox/store.ts';
 import { netKey } from '../packages/mailbox/network-key.ts';
@@ -39,6 +40,7 @@ import {
   PeerUnreachableError,
   deriveNetworkKeys,
   generateNodeKeyPair,
+  hasProvenUnattemptedFailure,
   isConfirmedHandoffReceipt,
   isBeforeSendError,
   DEDUP_CAS_AMBIGUOUS_DETAIL,
@@ -5458,7 +5460,7 @@ function legacyOutboxItem(envelope: MessageEnvelope, explicitTargets: string[], 
   };
 }
 
-test('v1 auto and skill claims with an unknown outcome stay parked after upgrade', async t => {
+test('legacy v1 non-concrete claims stay parked even with an earlier unresolved selector error', async t => {
   const harness = await emitterHarness(t, { extraMembers: ['carol'] });
   const { outbox, kernel, mailbox, sender, receiver, networkId } = harness;
   const bob = new Kernel();
@@ -5472,18 +5474,20 @@ test('v1 auto and skill claims with an unknown outcome stay parked after upgrade
     return { executor: 'capture', executionId: message.id };
   } }, {});
   const items: OutboxItem[] = [];
-  for (const selectors of [[], ['skill:incident']]) {
+  for (const selectors of [[], ['skill:incident'], ['member:diz']]) {
     const key = selectors[0] ?? 'auto';
     const envelope = signEnvelope({ ...envelopeFor(sender, networkId, harness.targetCard.nodeId),
       idempotencyKey: key, routing: { mode: 'auto', targets: selectors },
       semantic: { type: 'question', threadId: key, replyMailbox: `terminal:v1-${items.length}` },
     }, sender.privateKeyPem);
     assert.equal((await bob.ctx.services.dispatcher.dispatch(envelope)).stage, 'dispatched');
-    items.push(legacyOutboxItem(envelope, selectors));
+    items.push(legacyOutboxItem(envelope, selectors,
+      key === 'member:diz' ? `Unresolved explicit target: ${key}` : undefined));
   }
   assert.ok(existsSync(ledgerPath));
   assert.deepEqual(executions, items.map(item => item.id));
-  writeFileSync(outbox.path, JSON.stringify({ schema: 'the-dealer-outbox/v1', items }));
+  const legacy = JSON.stringify({ schema: 'the-dealer-outbox/v1', items });
+  writeFileSync(outbox.path, legacy);
   const carol = harness.targetByMember.get('carol')!.nodeId;
   const router = kernel.ctx.services.router;
   router.registerJudge({ name: 'new-recipient', priority: 1,
@@ -5491,15 +5495,22 @@ test('v1 auto and skill claims with an unknown outcome stay parked after upgrade
   });
   assert.deepEqual((await router.route(items[0].envelope)).targetNodeIds, [carol]);
   const route = t.mock.method(router, 'route');
-  const redrive = new OutboxRedriveService({ outbox, deliver: harness.emitter.redriveOutboxItem! });
+  const redrive = new OutboxRedriveService({ outbox, deliver: harness.emitter.redriveOutboxItem!, intervalMs: 60_000,
+    events: { on: (event, listener) => kernel.ctx.on(event, listener) } });
+  redrive.start();
   t.after(() => redrive.stop());
   assert.equal((await redrive.flush({ force: true })).attempted, 0);
-  assert.equal(JSON.parse(readFileSync(outbox.path, 'utf8')).schema, 'the-dealer-outbox/v2');
+  kernel.ctx.emit('node/peer-updated', harness.targetByMember.get('carol')!, { direct: true });
+  assert.equal((await redrive.flush()).attempted, 0);
+  assert.equal(readFileSync(outbox.path, 'utf8'), legacy);
   for (const original of items) {
     const parked = outbox.get(original.id)!;
     assert.equal(parked.status, 'failed');
     assert.match(parked.lastError!, /Interrupted v1 outbox claim/);
+    if (original.lastError) assert.ok(parked.lastError!.includes(original.lastError));
+    assert.equal(parked.unresolvedRoute, undefined);
     assert.equal(isUnattemptedOutboxItem(parked), false);
+    assert.equal(hasProvenUnattemptedFailure(parked), false);
     assert.equal(outbox.readDefinitivelyFailedKeys().has(netKey(networkId, parked.id)), false);
     assert.equal(mailbox.inspectSlotObligations('stream:legacy', {
       sessionMailboxId: original.envelope.semantic?.replyMailbox, outbox,
@@ -5511,47 +5522,67 @@ test('v1 auto and skill claims with an unknown outcome stay parked after upgrade
   }
   assert.equal(route.mock.callCount(), 0);
   assert.deepEqual(harness.sendCalls, []);
+  const recovered = outbox.requeue(items[2].id);
+  assert.equal(recovered?.status, 'queued');
+  assert.equal(recovered?.unresolvedRoute, true);
 });
 
-test('v1 concrete claims pin the original target and unresolved selectors still resolve after upgrade', async t => {
-  const harness = await emitterHarness(t, { extraMembers: ['carol', 'future'] });
+test('a v1 concrete claim pins the original target and upgrades on mutation', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['carol'] });
   const { outbox, sender, networkId } = harness;
   const bob = harness.targetCard.nodeId;
-  const future = harness.targetByMember.get('future')!.nodeId;
   const concrete = `node:${bob}`;
   const pinned = legacyOutboxItem(envelopeFor(sender, networkId, concrete), [concrete, bob]);
-  const unresolved = legacyOutboxItem(envelopeFor(sender, networkId, 'member:future'), ['member:future'],
-    'Unresolved explicit target: member:future');
-  writeFileSync(outbox.path, JSON.stringify({ schema: 'the-dealer-outbox/v1', items: [pinned, unresolved] }));
-  const node = harness.kernel.ctx.services.node;
-  const resolveTarget = node.resolveTarget.bind(node);
-  let joined = false;
-  t.mock.method(node, 'resolveTarget', (selector: string, network?: string) =>
-    !joined && selector === 'member:future' ? [] : resolveTarget(selector, network));
+  writeFileSync(outbox.path, JSON.stringify({ schema: 'the-dealer-outbox/v1', items: [{ ...pinned, unresolvedRoute: true }] }));
   let reachable = false;
   const redrive = new OutboxRedriveService({ outbox, deliver: harness.emitter.redriveOutboxItem!,
     isPeerReachable: () => reachable });
   t.after(() => redrive.stop());
-  const lease = outbox.beginAttempt(pinned.id)!;
-  outbox.releaseAttempt(pinned.id, lease.attemptToken);
   assert.deepEqual(outbox.get(pinned.id)?.pendingNodeIds, [bob]);
   assert.deepEqual(outbox.get(pinned.id)?.inDoubtNodeIds, [bob]);
   assert.equal(outbox.get(pinned.id)?.unresolvedRoute, undefined);
-  assert.equal(outbox.get(unresolved.id)?.unresolvedRoute, true);
   assert.equal((await redrive.flush({ id: pinned.id })).attempted, 0);
-  await redrive.flush({ id: unresolved.id });
   assert.deepEqual(harness.sendCalls, []);
-  assert.equal(outbox.get(unresolved.id)?.unresolvedRoute, true);
+  assert.equal(JSON.parse(readFileSync(outbox.path, 'utf8')).schema, 'the-dealer-outbox/v1');
   reachable = true;
   await redrive.flush({ id: pinned.id });
-  joined = true;
-  await redrive.flush({ id: unresolved.id, force: true });
-  assert.deepEqual(harness.sendCalls.map(call => [call.envelope.id, call.targetNodeId]), [[pinned.id, bob], [unresolved.id, future]]);
+  assert.deepEqual(harness.sendCalls.map(call => [call.envelope.id, call.targetNodeId]), [[pinned.id, bob]]);
   assert.equal(outbox.get(pinned.id)?.status, 'delivered');
   assert.deepEqual(outbox.get(pinned.id)?.inDoubtNodeIds, []);
-  assert.equal(outbox.get(unresolved.id)?.status, 'delivered');
-  assert.equal(outbox.get(unresolved.id)?.unresolvedRoute, undefined);
   assert.equal(JSON.parse(readFileSync(outbox.path, 'utf8')).schema, 'the-dealer-outbox/v2');
+});
+
+test('legacy outbox reads project obligations under an existing lock and explicit upgrade writes once', t => {
+  const root = directory(t);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+  const mailbox = new MailboxStore(join(root, 'mailbox.json'));
+  const sender = generateNodeKeyPair();
+  const session = 'terminal:locked-v1';
+  const envelope = signEnvelope({ ...envelopeFor(sender, NETWORK, 'member:diz'), idempotencyKey: 'locked-v1',
+    semantic: { type: 'question', threadId: 'locked-v1', replyMailbox: session },
+  }, sender.privateKeyPem);
+  const legacy = JSON.stringify({ schema: 'the-dealer-outbox/v1', items: [legacyOutboxItem(envelope, ['member:diz'])] });
+  assert.equal(outbox.upgradeLegacyStore(), false, 'a missing store needs no upgrade');
+  assert.equal(existsSync(outbox.path), false);
+  writeFileSync(outbox.path, legacy);
+  withOwnedLock(outbox.lockDir, 'Test outbox', () => {
+    const ownerPath = join(outbox.lockDir, 'owner.json');
+    const owner = readFileSync(ownerPath, 'utf8');
+    assert.equal(outbox.get(envelope.id)?.status, 'failed');
+    assert.deepEqual(outbox.list({ status: 'all' }).map(item => item.id), [envelope.id]);
+    assert.equal(outbox.findKeyedObligation(NETWORK, 'locked-v1', 0)?.id, envelope.id);
+    assert.equal(outbox.readDefinitivelyFailedKeys().size, 0);
+    assert.equal(mailbox.inspectSlotObligations('stream:legacy', { sessionMailboxId: session, outbox }).immediateBusyReason,
+      'outbound_thread_open');
+    assert.equal(readFileSync(outbox.path, 'utf8'), legacy);
+    assert.equal(readFileSync(ownerPath, 'utf8'), owner);
+  });
+  assert.equal(existsSync(outbox.lockDir), false);
+  assert.equal(outbox.upgradeLegacyStore(), true);
+  const upgraded = readFileSync(outbox.path, 'utf8');
+  assert.equal(JSON.parse(upgraded).schema, 'the-dealer-outbox/v2');
+  withOwnedLock(outbox.lockDir, 'Test outbox', () => assert.equal(outbox.upgradeLegacyStore(), false));
+  assert.equal(readFileSync(outbox.path, 'utf8'), upgraded);
 });
 
 test('redrive resumes a v2 claim reserved before routing and fences the recipient before send', async t => {
@@ -5714,7 +5745,7 @@ test('redrive, replay and reconciliation restore interrupted outbound threads wi
   }
 });
 
-test('runtime startup restores the reply route of a persisted pre-send claim before redrive', async t => {
+test('runtime startup upgrades a legacy claim and restores its reply route before redrive', async t => {
   const root = directory(t);
   const stateDir = join(root, 'ben');
   mkdirSync(stateDir);
@@ -5726,13 +5757,13 @@ test('runtime startup restores the reply route of a persisted pre-send claim bef
     ...envelopeFor(sender, NETWORK, peer.nodeId), idempotencyKey: 'startup-recovery',
     semantic: { type: 'question', threadId: 'startup-recovery', replyMailbox: session },
   }, sender.privateKeyPem);
-  const { item } = outbox.claimIdempotency({
-    envelope: request, explicitTargets: [peer.nodeId], plannedTargetNodeIds: [peer.nodeId],
-  });
+  const item = legacyOutboxItem(request, [peer.nodeId]);
+  writeFileSync(outbox.path, JSON.stringify({ schema: 'the-dealer-outbox/v1', items: [item] }));
   assert.equal(new MailboxStore(join(stateDir, 'mailbox.json')).getThread(request.id), undefined);
   const runtime = runtimeFor(root, 'ben');
   await runtime.start();
   t.after(() => runtime.stop());
+  assert.equal(JSON.parse(readFileSync(outbox.path, 'utf8')).schema, 'the-dealer-outbox/v2');
   const restored = new MailboxStore(join(stateDir, 'mailbox.json')).getThread(request.id)!;
   assert.equal(restored.createdAt, item.createdAt);
   assert.equal(restored.localMailbox, session);
