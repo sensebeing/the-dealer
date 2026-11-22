@@ -561,23 +561,11 @@ class OrcaWakeDelivery {
   }
 
   async probe(context: WakeupProbeContext): Promise<SlotProbeResult> {
-    const { mailboxId, hasPendingWave, hasOpenOutboundThread } = context;
+    const { mailboxId, hasPendingWave } = context;
     try {
       const { target, excludedHandles } = this.excludeClaimedTerminal(mailboxId, readOrcaWakeTarget(context.target));
-      const command = target.orcaCommand ?? this.command;
       if (hasPendingWave) {
-        return await this.probeLeasedWave(target, command, hasOpenOutboundThread, excludedHandles);
-      }
-      if (hasOpenOutboundThread) {
-        let live = Boolean(this.idleCheck || target.terminalHandle);
-        if (target.driver === 'orca-run') {
-          live = Boolean(target.runId?.trim());
-        } else if (!this.idleCheck && target.workspacePath) {
-          live = Boolean((target.terminalHandle || target.paneKey) && await isOrcaWorkspaceTerminalLive(
-            this.runner, command, target.workspacePath, target.terminalHandle, undefined, target.paneKey,
-          ));
-        }
-        if (live) return { busy: true, ready: false, reason: 'outbound_thread_open' };
+        return await this.probeLeasedWave(target, excludedHandles);
       }
 
       const preview: MailboxCheckResult = { mailboxId, deliveryId: null, redelivered: false, newerQueuedCount: 0, items: [] };
@@ -586,6 +574,7 @@ class OrcaWakeDelivery {
         target.workspacePath && !this.idleCheck) {
         const activeClaims = claimedOrcaTerminalHandles(this.store, mailboxId, target, { includeRetired: false });
         if (!activeClaims.has(retired)) {
+          const command = target.orcaCommand ?? this.command;
           const retiredIdle = await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
             targetTerminalHandle: null, retiringTerminalHandle: retired, agent: target.agent, excludedHandles,
             throwOnProbeError: true,
@@ -604,29 +593,25 @@ class OrcaWakeDelivery {
 
   private async probeLeasedWave(
     target: OrcaWakeTarget,
-    command: string,
-    hasOpenOutboundThread: boolean,
     excludedHandles: ReadonlySet<string>,
   ): Promise<SlotProbeResult> {
-    const openThread = { busy: true, ready: false, reason: 'outbound_thread_open' };
     const quiescent = { busy: false, ready: false, reason: 'quiescent_leased_wave' };
     const unbound = { busy: false, ready: false, reason: 'unbound_leased_wave' };
     const waveActivity = (idle: OrcaIdleResult): SlotProbeResult => ({
       busy: !idle.idle, ready: false, reason: idle.reason ?? (idle.idle ? quiescent.reason : undefined),
     });
     if (this.idleCheck) {
-      return hasOpenOutboundThread ? openThread : waveActivity(await this.idleCheck());
+      return waveActivity(await this.idleCheck());
     }
+    const command = target.orcaCommand ?? this.command;
     const { workspacePath, terminalHandle, paneKey, agent } = target;
     if (target.driver === 'orca-run') {
-      if (hasOpenOutboundThread && target.runId?.trim()) return openThread;
       if (!workspacePath) return quiescent;
       const idle = await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, { throwOnProbeError: true });
       return { busy: !idle.idle, ready: false, reason: idle.reason };
     }
     if (!workspacePath) {
       if (!terminalHandle) return unbound;
-      if (hasOpenOutboundThread) return openThread;
       return waveActivity(await probeOrcaTerminalIdle(this.runner, command, terminalHandle, undefined, undefined, {
         throwOnProbeError: true,
       }));
@@ -638,7 +623,6 @@ class OrcaWakeDelivery {
       return { busy: true, ready: false, reason: 'Terminal is disconnected or not writable' };
     }
     if (presence === 'live') {
-      if (hasOpenOutboundThread) return openThread;
       return waveActivity(await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, {
         targetTerminalHandle: terminalHandle, targetPaneKey: paneKey, agent, excludedHandles,
         throwOnProbeError: true,

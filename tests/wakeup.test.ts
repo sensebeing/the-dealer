@@ -224,10 +224,13 @@ test('slot probe leaves an active sibling child alone when the leased terminal i
   store.upsertWakeTarget('stream:alert-wave:2', {
     driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: sibling.handle },
   });
+  state.agents = [{ state: 'working', paneKey: 'sibling:root' }];
   assert.deepEqual(await service.probeSlot(probeMailbox), {
     busy: false, ready: false, reason: 'terminal_gone',
   });
   assert.equal(state.calls.some(call => call.args.includes(`path:${state.children[0].path}`)), false);
+  state.agents = [{ state: 'working', paneKey: 'unmatched:root' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
   state.agents = [{ state: 'working' }];
   assert.equal((await service.probeSlot(probeMailbox)).busy, true);
   state.agents = [];
@@ -250,20 +253,47 @@ test('a leased slot stays busy when its bound terminal is present but unusable',
   });
 });
 
-test('slot probe protects an idle session waiting for an outbound question', async t => {
+test('an outbound question holds its slot across terminal unwritability and disappearance', async t => {
   const { store, service, state } = slotProbeFixture(t, { wave: true });
   const sessionMailbox = `terminal:${probeTerminal.handle}`;
   store.recordOutboundEnvelope(alert('question', {
     semantic: { type: 'question', threadId: 'question', replyMailbox: sessionMailbox },
   }), ['remote'], sessionMailbox);
-  assert.deepEqual(await service.probeSlot(probeMailbox), {
+  const waiting = {
     busy: true, ready: false, reason: 'outbound_thread_open',
-  });
-  store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
-  assert.deepEqual(await service.probeSlot(probeMailbox), {
-    busy: true, ready: false, reason: 'outbound_thread_open',
-  });
+  };
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
+  state.terminals[0].writable = false;
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
   state.terminals = [];
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
+  store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
+  assert.deepEqual(state.calls, []);
+
+  store.recordInboundEnvelope(alert('answer', {
+    replyToId: 'question', semantic: { type: 'reply', threadId: 'question' },
+  }), sessionMailbox, { committed: false });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+});
+
+test('a settled or pruned outbound question releases its slot after the terminal is gone', async t => {
+  const { store, service, state } = slotProbeFixture(t);
+  const sessionMailbox = `terminal:${probeTerminal.handle}`;
+  state.terminals = [];
+  const ask = (id: string) => store.recordOutboundEnvelope(alert(id, {
+    semantic: { type: 'question', threadId: id, replyMailbox: sessionMailbox },
+  }), ['remote'], sessionMailbox);
+  ask('question-to-settle');
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'outbound_thread_open');
+  store.recordInboundEnvelope(alert('settlement', {
+    semantic: { type: 'settle', threadId: 'question-to-settle', outcome: 'succeeded' },
+  }), sessionMailbox, { committed: false });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+
+  ask('question-to-prune');
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'outbound_thread_open');
+  assert.ok(store.pruneOutboundThreadRecord('question-to-prune'));
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
 });
 

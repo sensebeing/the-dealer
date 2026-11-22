@@ -200,8 +200,7 @@ export interface MailboxCheckResult {
 
 export interface SlotObligationSnapshot {
   hasPendingWave: boolean;
-  immediateBusyReason?: 'wakeup_pending' | 'session_reply_pending' | 'local_outbound_pending';
-  hasRemoteOpenOutboundThread: boolean;
+  immediateBusyReason?: 'wakeup_pending' | 'session_reply_pending' | 'local_outbound_pending' | 'outbound_thread_open';
 }
 
 export interface MailboxWaitOptions extends MailboxCheckOptions {
@@ -1792,13 +1791,14 @@ export class MailboxStore {
       }
     }
 
+    const hasPendingWave = activeSince !== undefined;
     const target = state.wakeTargets[id];
     const sessionTarget = sessionId && sessionId !== id ? state.wakeTargets[sessionId] : undefined;
-    let immediateBusyReason: SlotObligationSnapshot['immediateBusyReason'];
     if (target?.pendingWake || target?.deliveryInDoubt) {
-      immediateBusyReason = 'wakeup_pending';
-    } else if (sessionUnacked || sessionTarget?.pendingWake || sessionTarget?.deliveryInDoubt) {
-      immediateBusyReason = 'session_reply_pending';
+      return { hasPendingWave, immediateBusyReason: 'wakeup_pending' };
+    }
+    if (sessionUnacked || sessionTarget?.pendingWake || sessionTarget?.deliveryInDoubt) {
+      return { hasPendingWave, immediateBusyReason: 'session_reply_pending' };
     }
 
     const records = Object.values(state.threads);
@@ -1820,12 +1820,10 @@ export class MailboxStore {
       }
     }
 
-    const hasPendingWave = activeSince !== undefined;
     const postAckMailboxes = target?.rotateAfterWaves !== undefined
       ? new Set(sessionId ? [sessionId] : [])
       : ownedMailboxes;
-    let definitivelyFailed: ReadonlySet<string> | undefined;
-    let hasRemoteOpenOutboundThread = false;
+    const remoteMessageKeys: string[] = [];
     for (const record of records) {
       if (record.direction !== 'outbound') continue;
       const semantic = record.envelope?.semantic;
@@ -1839,8 +1837,8 @@ export class MailboxStore {
         : semantic?.type === 'question' && postAckMailboxes.has(replyMailbox);
       if (!belongsToSlot) continue;
       const answered = inboundByThread.get(threadKey)?.some(inbound => {
-        if (inbound.messageId === record.messageId) return false;
-        const replyToId = inbound.envelope?.replyToId;
+        if (inbound.messageId === record.messageId || inbound.envelope?.semantic?.type !== 'reply') return false;
+        const replyToId = inbound.envelope.replyToId;
         // The message a follow-up asks about cannot answer it, even on the same clock tick.
         return replyToId === record.messageId ||
           (inbound.messageId !== record.envelope?.replyToId &&
@@ -1849,17 +1847,17 @@ export class MailboxStore {
       if (answered) continue;
 
       if (localUnackedThreads.has(threadKey) || localUnackedMessages.has(messageKey)) {
-        immediateBusyReason ??= 'local_outbound_pending';
-      } else if (!hasRemoteOpenOutboundThread) {
-        definitivelyFailed ??= options?.outbox?.readDefinitivelyFailedKeys() ?? new Set<string>();
-        hasRemoteOpenOutboundThread = !definitivelyFailed.has(messageKey);
+        return { hasPendingWave, immediateBusyReason: 'local_outbound_pending' };
+      }
+      remoteMessageKeys.push(messageKey);
+    }
+    if (remoteMessageKeys.length > 0) {
+      const definitivelyFailed = options?.outbox?.readDefinitivelyFailedKeys();
+      if (remoteMessageKeys.some(key => !definitivelyFailed?.has(key))) {
+        return { hasPendingWave, immediateBusyReason: 'outbound_thread_open' };
       }
     }
-    return {
-      hasPendingWave,
-      ...(immediateBusyReason ? { immediateBusyReason } : {}),
-      hasRemoteOpenOutboundThread,
-    };
+    return { hasPendingWave };
   }
 
   listWakeTargets(): WakeTargetState[] {

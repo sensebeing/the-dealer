@@ -15,7 +15,6 @@ export interface WakeupProbeContext {
   readonly mailboxId: string;
   readonly target: WakeTargetState;
   readonly hasPendingWave: boolean;
-  readonly hasOpenOutboundThread: boolean;
   readonly now: () => number;
   readonly reportError: (error: unknown) => void;
 }
@@ -269,7 +268,7 @@ export class WakeupRedriveService {
     if (obligations.immediateBusyReason) {
       return { busy: true, ready: false, reason: obligations.immediateBusyReason };
     }
-    const { hasPendingWave, hasRemoteOpenOutboundThread } = obligations;
+    const { hasPendingWave } = obligations;
     if (!target || target.driver === 'passive') {
       return { busy: false, ready: !hasPendingWave, ...(hasPendingWave ? { reason: 'quiescent_leased_wave' } : {}) };
     }
@@ -277,18 +276,13 @@ export class WakeupRedriveService {
       return { busy: true, ready: false, reason: `Unsupported wakeup driver: ${target.driver}` };
     }
     if (!driver.probeSlot) {
-      return {
-        busy: hasRemoteOpenOutboundThread,
-        ready: !hasPendingWave && !hasRemoteOpenOutboundThread,
-        ...(hasRemoteOpenOutboundThread ? { reason: 'outbound_thread_open' } : {}),
-      };
+      return { busy: false, ready: !hasPendingWave };
     }
     return await driver.probeSlot({
       store: this.store,
       mailboxId: id,
       target,
       hasPendingWave,
-      hasOpenOutboundThread: hasRemoteOpenOutboundThread,
       now: this.now,
       reportError: error => this.report(error),
     });

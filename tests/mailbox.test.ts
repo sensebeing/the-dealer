@@ -62,7 +62,6 @@ test('slot obligations prioritize fenced wakeups and then session replies', t =>
   assert.deepEqual(inspect(), {
     hasPendingWave: false,
     immediateBusyReason: 'session_reply_pending',
-    hasRemoteOpenOutboundThread: false,
   });
   store.ack(store.check({ mailboxId: slotSession }).deliveryId!, slotSession);
   store.beginWakeDelivery(slotSession);
@@ -85,11 +84,9 @@ test('slot obligations follow local downstream mail through acknowledgement', t 
   assert.deepEqual(inspect(), {
     hasPendingWave: true,
     immediateBusyReason: 'local_outbound_pending',
-    hasRemoteOpenOutboundThread: false,
   });
   store.ack(lease.deliveryId!, releaseMailbox);
-  assert.equal(inspect().immediateBusyReason, undefined);
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
 });
 
 test('slot obligations exclude replied, settled and failed outbound messages', t => {
@@ -103,25 +100,25 @@ test('slot obligations exclude replied, settled and failed outbound messages', t
   const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession, outbox });
 
   store.recordOutboundEnvelope(remote('replied'), ['remote'], slotSession);
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   store.recordInboundEnvelope(envelope('reply', {
     semantic: { type: 'reply', threadId: 'replied' },
   }), slotSession, { committed: false });
-  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  assert.equal(inspect().immediateBusyReason, undefined);
 
   store.recordOutboundEnvelope(remote('settled'), ['remote'], slotSession);
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   store.recordInboundEnvelope(envelope('settlement', {
     semantic: { type: 'settle', threadId: 'settled', outcome: 'succeeded' },
   }), slotSession, { committed: false });
-  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  assert.equal(inspect().immediateBusyReason, undefined);
 
   const failed = remote('failed');
   store.recordOutboundEnvelope(failed, ['remote'], slotSession);
   outbox.enqueue({ envelope: failed, explicitTargets: [], pendingNodeIds: [] });
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   assert.equal(outbox.markFailed(failed.id, 'Local delivery failed')?.status, 'failed');
-  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  assert.equal(inspect().immediateBusyReason, undefined);
 });
 
 test('slot obligations exclude the local wave after both thread legs are pinned to its session', t => {
@@ -143,14 +140,13 @@ test('slot obligations exclude the local wave after both thread legs are pinned 
   ]);
   assert.deepEqual(store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession }), {
     hasPendingWave: true,
-    hasRemoteOpenOutboundThread: false,
   });
 
   store.recordOutboundEnvelope(envelope('wave-follow-up', {
     replyToId: wave.id,
     semantic: { type: 'question', threadId: wave.id, replyMailbox: slotSession },
   }), ['remote'], slotSession);
-  assert.equal(store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession }).hasRemoteOpenOutboundThread, true);
+  assert.equal(store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession }).immediateBusyReason, 'outbound_thread_open');
 });
 
 test('an empty slot only waits remotely for questions addressed back to the session', t => {
@@ -163,11 +159,11 @@ test('an empty slot only waits remotely for questions addressed back to the sess
     semantic: { type: 'question', threadId: 'old-slot-question', replyMailbox: waveSlot },
   }), ['remote'], waveSlot);
   const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession });
-  assert.deepEqual(inspect(), { hasPendingWave: false, hasRemoteOpenOutboundThread: false });
+  assert.deepEqual(inspect(), { hasPendingWave: false });
   store.recordOutboundEnvelope(envelope('session-question', {
     semantic: { type: 'question', threadId: 'session-question', replyMailbox: slotSession },
   }), ['remote'], slotSession);
-  assert.deepEqual(inspect(), { hasPendingWave: false, hasRemoteOpenOutboundThread: true });
+  assert.deepEqual(inspect(), { hasPendingWave: false, immediateBusyReason: 'outbound_thread_open' });
 });
 
 test('a reply to one question leaves the next question on the same thread open', t => {
@@ -183,18 +179,44 @@ test('a reply to one question leaves the next question on the same thread open',
   store.recordInboundEnvelope(envelope('answer-1', {
     replyToId: 'q1', semantic: { type: 'reply', threadId: 'conversation' },
   }), slotSession, { committed: false });
-  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  assert.equal(inspect().immediateBusyReason, undefined);
   t.mock.timers.tick(1);
   ask('q2');
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   t.mock.timers.tick(1);
   store.recordInboundEnvelope(envelope('thread-answer', {
     replyToId: 'conversation', semantic: { type: 'reply', threadId: 'conversation' },
   }), slotSession, { committed: false });
-  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  assert.equal(inspect().immediateBusyReason, undefined);
   t.mock.timers.tick(1);
   ask('q3');
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+});
+
+test('answering and acknowledging a peer clarification leaves the original question open', t => {
+  const store = new MailboxStore(workspace(t).path);
+  store.upsertWakeTarget(waveSlot, { rotateAfterWaves: 1 });
+  store.recordOutboundEnvelope(envelope('original-question', {
+    semantic: { type: 'question', threadId: 'conversation', replyMailbox: slotSession },
+  }), ['remote'], slotSession);
+  store.enqueue([envelope('clarification', {
+    replyToId: 'original-question',
+    semantic: { type: 'question', threadId: 'conversation', targetMailbox: slotSession },
+  })], { mailboxId: slotSession });
+  const lease = store.check({ mailboxId: slotSession });
+  store.recordOutboundEnvelope(envelope('clarification-answer', {
+    replyToId: 'clarification',
+    semantic: { type: 'reply', threadId: 'conversation', replyMailbox: slotSession },
+  }), ['remote'], slotSession);
+  store.ack(lease.deliveryId!, slotSession);
+
+  const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession });
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  store.recordInboundEnvelope(envelope('original-answer', {
+    replyToId: 'original-question',
+    semantic: { type: 'reply', threadId: 'conversation' },
+  }), slotSession, { committed: false });
+  assert.equal(inspect().immediateBusyReason, undefined);
 });
 
 test('slot thread custody and answers are scoped to each network', t => {
@@ -212,7 +234,7 @@ test('slot thread custody and answers are scoped to each network', t => {
   }), slotSession);
   assert.deepEqual(store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession }), {
     hasPendingWave: true,
-    hasRemoteOpenOutboundThread: true,
+    immediateBusyReason: 'outbound_thread_open',
   });
 });
 
@@ -223,21 +245,12 @@ test('slot obligations read outbox once and retain custody with partial or uncer
   const outboxReads = t.mock.method(outbox as unknown as { read(): unknown }, 'read');
   const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession, outbox });
   store.enqueue([envelope('wave')], { mailboxId: waveSlot });
-  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  assert.equal(inspect().immediateBusyReason, undefined);
   assert.equal(outboxReads.mock.callCount(), 0);
 
   const request = (id: string, targetMailbox?: string) => envelope(id, {
     semantic: { type: 'question', threadId: id, replyMailbox: slotSession, targetMailbox },
   });
-  const local = request('definitively-failed-but-local', 'stream:downstream');
-  outbox.enqueue({ envelope: local, explicitTargets: [], pendingNodeIds: [] });
-  outbox.markFailed(local.id, 'No remote delivery');
-  store.recordOutboundEnvelope(local, [local.from.nodeId], slotSession);
-  store.enqueue([local], { mailboxId: 'stream:downstream' });
-  outboxReads.mock.resetCalls();
-  assert.equal(inspect().immediateBusyReason, 'local_outbound_pending');
-  assert.equal(outboxReads.mock.callCount(), 0);
-
   const partial = request('partial');
   const receipt: DeliveryReceipt = {
     messageId: partial.id, networkId: partial.networkId, fromNodeId: 'delivered',
@@ -248,7 +261,18 @@ test('slot obligations read outbox once and retain custody with partial or uncer
     deliveredReceipts: { delivered: receipt }, failedNodeIds: ['rejected'],
   }).status, 'failed');
   store.recordOutboundEnvelope(partial, ['delivered', 'rejected'], slotSession);
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+
+  const local = request('definitively-failed-but-local', 'stream:downstream');
+  outbox.enqueue({ envelope: local, explicitTargets: [], pendingNodeIds: [] });
+  outbox.markFailed(local.id, 'No remote delivery');
+  store.recordOutboundEnvelope(local, [local.from.nodeId], slotSession);
+  store.enqueue([local], { mailboxId: 'stream:downstream' });
+  outboxReads.mock.resetCalls();
+  assert.equal(inspect().immediateBusyReason, 'local_outbound_pending');
+  assert.equal(outboxReads.mock.callCount(), 0);
+  store.ack(store.check({ mailboxId: 'stream:downstream' }).deliveryId!, 'stream:downstream');
+
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   store.recordInboundEnvelope(envelope('partial-answer', {
     replyToId: partial.id, semantic: { type: 'reply', threadId: partial.id },
   }), slotSession, { committed: false });
@@ -258,7 +282,7 @@ test('slot obligations read outbox once and retain custody with partial or uncer
   assert.deepEqual(outbox.markFailed(uncertain.id, 'Unknown effect')?.inDoubtNodeIds, ['remote']);
   store.recordOutboundEnvelope(uncertain, ['remote'], slotSession);
   outboxReads.mock.resetCalls();
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   assert.equal(outboxReads.mock.callCount(), 1);
 
   const failed = request('no-effect');
@@ -266,7 +290,7 @@ test('slot obligations read outbox once and retain custody with partial or uncer
   outbox.markFailed(failed.id, 'No effect');
   store.recordOutboundEnvelope(failed, ['remote'], slotSession);
   outboxReads.mock.resetCalls();
-  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   assert.equal(outboxReads.mock.callCount(), 1);
 });
 

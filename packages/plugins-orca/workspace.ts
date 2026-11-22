@@ -211,7 +211,12 @@ export async function checkOrcaWorkspaceIdle(
       // A rotation waits only for the retiring slot's own agent; retained and unverifiable tabs
       // never block opening a new session tab. A retiring terminal that cannot be pane-attributed
       // fails closed instead of guessing; its child worktrees are still inspected below.
-      if (targetTerm ? allAgentsBusy() : !row.agents || row.agents.some(agent => !agent.paneKey && agent.state !== 'done')) {
+      if (targetTerm
+        ? allAgentsBusy()
+        : !row.agents || row.agents.some(agent =>
+          agent.state !== 'done' && !(typeof agent.paneKey === 'string' && siblingPaneKeys?.has(agent.paneKey)),
+        )
+      ) {
         return false;
       }
     } else if (row.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
