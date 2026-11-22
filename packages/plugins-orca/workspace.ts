@@ -227,16 +227,17 @@ export async function checkOrcaWorkspaceIdle(
     const knownSiblingPaneKeys = new Set(siblingTerminals.flatMap(terminalPaneKeys));
     const canExcludeByLineage = siblingHandles.size > 0 ||
       [...(options?.excludedHandles ?? [])].some(handle => handle !== ownHandle && handle !== retiringHandle);
+    const agents = row.agents;
+    if (!Array.isArray(agents)) return false;
     const ownedAgentsBusy = (): boolean =>
-      !row.agents ||
-      row.agents
+      agents
         .filter((agent) =>
           (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) ||
           // A new tab still has to wait for work that cannot be attributed to a sibling.
           (!agent.paneKey?.trim() && (rotating || missingTargetPane || handles.length <= 1)),
         )
         .some((agent) => agent.state !== 'done');
-    const allAgentsBusy = (): boolean => !row.agents || row.agents.some((agent) => agent.state !== 'done');
+    const allAgentsBusy = (): boolean => agents.some((agent) => agent.state !== 'done');
     if (targetPaneKeys.size > 0) {
       if (ownedAgentsBusy()) return false;
     } else if (rotating) {
@@ -245,7 +246,7 @@ export async function checkOrcaWorkspaceIdle(
       // fails closed instead of guessing; its child worktrees are still inspected below.
       if (targetTerm
         ? allAgentsBusy()
-        : !row.agents || row.agents.some(agent =>
+        : agents.some(agent =>
           agent.state !== 'done' && !(typeof agent.paneKey === 'string' && knownSiblingPaneKeys.has(agent.paneKey)),
         )
       ) {
@@ -302,7 +303,8 @@ export async function checkOrcaWorkspaceIdle(
       const visit = (node: Workspace): boolean => {
         if (seen.has(node.worktreeId)) return false;
         seen.add(node.worktreeId);
-        const agents = node.agents ?? [];
+        if (!Array.isArray(node.agents)) return false;
+        const agents = node.agents;
         let allAgentsExplicitlyAttributed = agents.length > 0;
         for (const agent of agents) {
           const pane = typeof agent.parentPaneKey === 'string' ? agent.parentPaneKey.trim() : '';

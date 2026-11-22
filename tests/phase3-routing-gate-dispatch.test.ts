@@ -1320,7 +1320,9 @@ test('DND persists signed queued receipts, restores capacity and rechecks admiss
   await second.gate.setMode('open');
   assert.deepEqual(second.calls.map(batch => batch[0].id), [allowed.id]);
   assert.equal(second.gate.listRejections().at(-1)?.reason, 'new rule');
-  assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), { queued: {} });
+  const drained = JSON.parse(await readFile(dndQueuePath, 'utf8'));
+  assert.deepEqual(drained.queued, {});
+  assert.deepEqual(Object.values(drained.withdrawn), ['new rule']);
   await second.gate.drainDnd();
   assert.equal(second.calls.length, 1);
 });
@@ -1359,7 +1361,10 @@ test('DND keeps failures durable, drains later items, and rejects corrupt or ove
   assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 1);
   const invalid = { ...missing, body: 'tampered' };
   const validKey = JSON.stringify([missing.networkId, missing.from.nodeId, missing.id]);
-  for (const saved of ['bad json', JSON.stringify({ queued: { [validKey]: invalid } }), JSON.stringify({ queued: [] }), JSON.stringify({ queued: { wrong: missing } })]) {
+  for (const saved of [
+    'bad json', JSON.stringify({ queued: { [validKey]: invalid } }), JSON.stringify({ queued: [] }),
+    JSON.stringify({ queued: { wrong: missing } }), JSON.stringify({ queued: {}, withdrawn: { [validKey]: 42 } }),
+  ]) {
     await writeFile(dndQueuePath, saved);
     const kernel = new Kernel();
     await assert.rejects(kernel.use(createGatePlugin({ dndQueuePath })), /Invalid gate DND store/);
@@ -1399,7 +1404,9 @@ test('DND rechecks network mode mid-drain and retains approval items across rest
   await second.gate.approve(approve.id);
   await second.gate.reject(reject.id);
   assert.equal(second.calls.length, 1);
-  assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), { queued: {} });
+  const settled = JSON.parse(await readFile(dndQueuePath, 'utf8'));
+  assert.deepEqual(settled.queued, {});
+  assert.deepEqual(Object.values(settled.withdrawn), ['Rejected by operator']);
 });
 
 test('DND and approval retain every unconfirmed handoff and only clear confirmed receipts', async t => {

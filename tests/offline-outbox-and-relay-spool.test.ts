@@ -38,6 +38,7 @@ import {
   deriveNetworkKeys,
   generateNodeKeyPair,
   isConfirmedHandoffReceipt,
+  isBeforeSendError,
   DEDUP_CAS_AMBIGUOUS_DETAIL,
   DEDUP_CAS_DUPLICATE_DETAIL,
   isDeliveryTimeoutFailure,
@@ -925,7 +926,7 @@ test('initial emit keeps a gate rejection out of delivered receipts', async t =>
       if (target === rejectTarget) {
         return { stage: 'rejected', detail: 'gate closed' };
       }
-      return dizOnline ? {} : { error: new PeerUnreachableError(target) };
+      return dizOnline ? {} : { error: markBeforeSendError(new PeerUnreachableError(target)) };
     },
   });
   const diz = harness.targetByMember.get('diz')!.nodeId;
@@ -979,7 +980,7 @@ test('initial emit enqueues offline siblings before surfacing a deterministic pr
       if (target === ayaTarget && !ayaOnline) {
         throw new LocalDeliveryError('Invalid or mismatched delivery receipt');
       }
-      return dizOnline ? {} : { error: new PeerUnreachableError(target) };
+      return dizOnline ? {} : { error: markBeforeSendError(new PeerUnreachableError(target)) };
     },
   });
   const diz = harness.targetByMember.get('diz')!.nodeId;
@@ -1122,7 +1123,7 @@ test('partial multicast emits emitter/sent only for the targets that actually co
       if (target === ayaTarget) {
         throw markBeforeSendError(new LocalDeliveryError('Frame exceeds limit'));
       }
-      return dizOnline ? {} : { error: new PeerUnreachableError(target) };
+      return dizOnline ? {} : { error: markBeforeSendError(new PeerUnreachableError(target)) };
     },
   });
   const diz = harness.targetByMember.get('diz')!.nodeId;
@@ -1626,7 +1627,7 @@ test('session --ack validates before sending and only burns the lease after comm
 test('unmounted network keeps outbox obligations queued through remount', async t => {
   let online = false;
   const harness = await emitterHarness(t, {
-    plan: target => (online ? {} : { error: new PeerUnreachableError(target) }),
+    plan: target => (online ? {} : { error: markBeforeSendError(new PeerUnreachableError(target)) }),
   });
   const target = harness.targetCard.nodeId;
   harness.setMounted(false);
@@ -1707,7 +1708,7 @@ test('staged attachments survive a failed outbox settlement save and are removed
 test('durable outbox stages declared attachments from attachmentPaths across redrive', async t => {
   let online = false;
   const harness = await emitterHarness(t, {
-    plan: target => (online ? {} : { error: new PeerUnreachableError(target) }),
+    plan: target => (online ? {} : { error: markBeforeSendError(new PeerUnreachableError(target)) }),
   });
   const target = harness.targetCard.nodeId;
   const bytes = Buffer.from('declared attachment bytes');
@@ -1768,7 +1769,7 @@ test('durable outbox stages declared attachments from attachmentPaths across red
 
 test('concurrent idempotent emits create one obligation and send one envelope', async t => {
   const harness = await emitterHarness(t, {
-    plan: target => ({ error: new PeerUnreachableError(target) }),
+    plan: target => ({ error: markBeforeSendError(new PeerUnreachableError(target)) }),
   });
   const input = {
     networkId: harness.networkId,
@@ -1803,7 +1804,7 @@ test('multicast redrive records terminal failures per target and keeps retrying 
         return { stage: 'rejected', detail: 'gate closed' };
       }
       if (target === boTarget && !boOnline) {
-        return { error: new PeerUnreachableError(target) };
+        return { error: markBeforeSendError(new PeerUnreachableError(target)) };
       }
       return {};
     },
@@ -1991,7 +1992,7 @@ test('requeue recovers mixed unsigned failures while keeping signed rejections t
         return { error: new LocalDeliveryError('local integrity failure') };
       }
       if (target === cyTarget && !cyOnline) {
-        return { error: new PeerUnreachableError(target) };
+        return { error: markBeforeSendError(new PeerUnreachableError(target)) };
       }
       return {};
     },
@@ -2982,13 +2983,14 @@ test('mixed-version seeds keep live sends on the legacy relay verb and fail spoo
   }
   assert.ok(
     isPeerUnreachableError(failure),
-    'a legacy seed closing on relay_send is an offline peer, not an in-doubt send',
+    'a legacy seed closing on relay_send is classified as unreachable',
   );
   assert.equal(
     isDeliveryTimeoutFailure(failure),
     false,
-    'the closed socket must not park the target in inDoubtNodeIds',
+    'the socket closed before a timeout',
   );
+  assert.equal(isBeforeSendError(failure), false, 'the relay request was already written');
   assert.deepEqual(legacy.relayTypes, ['relay', 'relay_send']);
 });
 
@@ -3146,9 +3148,90 @@ test('spool-enabled send to a pre-upgrade seed queues locally once the target be
     .listOutbox({ status: 'queued' })
     .find(candidate => candidate.id === emitted.messageId)!;
   assert.deepEqual(item.pendingNodeIds, [dizNodeId]);
-  assert.deepEqual(item.inDoubtNodeIds, []);
+  assert.deepEqual(item.inDoubtNodeIds, [dizNodeId]);
   assert.deepEqual(item.relaySpooledNodeIds, []);
   assert.deepEqual(legacy.envelopeRelayTypes, ['relay_send']);
+});
+
+test('a lost relay spool acknowledgment preserves uncertainty through later direct rejection', async t => {
+  const root = directory(t);
+  const network = { networkId: NETWORK, passphrase: 'secret' };
+  const start = async (member: string, options: NodeOptions = {}) => {
+    const runtime = runtimeFor(root, member, { discovery: 'mesh', ...options });
+    await runtime.start();
+    t.after(() => runtime.stop());
+    return runtime;
+  };
+  const seed = await start('seed', { discovery: 'isolated' });
+  await seed.mountNetwork(network);
+  const port = portOf(seed.transport.endpointAddr!);
+  let spooledId: string | undefined;
+  const proxy = createServer(socket => {
+    socket.on('error', () => {});
+    let buffer = Buffer.alloc(0);
+    const readRequest = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length < 4 || buffer.length < 4 + buffer.readUInt32BE(0)) return;
+      socket.off('data', readRequest);
+      const request = JSON.parse(buffer.subarray(4, 4 + buffer.readUInt32BE(0)).toString('utf8'));
+      if (request.type !== 'relay_send') {
+        socket.destroy();
+        return;
+      }
+      void tcpRequest(port, request).then(response => {
+        if (response.spooled === true) spooledId = response.spoolId;
+      }).then(() => socket.end(), error => socket.destroy(error));
+    };
+    socket.on('data', readRequest);
+  });
+  await new Promise<void>((resolve, reject) => {
+    proxy.once('error', reject);
+    proxy.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise<void>(resolve => proxy.close(() => resolve())));
+  const { port: proxyPort } = proxy.address() as { port: number };
+  const alice = await start('alice');
+  const bob = await start('bob');
+  const carol = await start('carol');
+  await alice.mountNetwork({ ...network, bootstrapPeers: [`127.0.0.1:${proxyPort}`] });
+  await bob.mountNetwork(network);
+  await carol.mountNetwork(network);
+  const target = bob.node.getSelfCard(NETWORK).nodeId;
+  await until(() => ['bob', 'carol'].every(member => alice.node.resolveTarget(`member:${member}`, NETWORK).length === 1),
+    'sender learns both destinations');
+  await bob.stop();
+  const request: EmitMessageInput = {
+    networkId: NETWORK, routing: { mode: 'unicast', targets: ['member:bob'] },
+    kind: 'question', subject: 'Relay acknowledgment lost', body: 'Original', payload: {}, idempotencyKey: 'lost-ack',
+    semantic: { type: 'question', replyMailbox: 'terminal:lost-ack' },
+  };
+  const first = await alice.emitter.emit(request);
+  assert.ok(spooledId, 'the real seed stored a copy before the proxy closed the response');
+  assert.deepEqual(alice.outbox.get(first.messageId)?.relaySpooledNodeIds, []);
+  assert.deepEqual(alice.outbox.get(first.messageId)?.inDoubtNodeIds, [target]);
+  await seed.stop();
+
+  const returning = await start('bob', { patch: { gateMode: 'closed' } });
+  await returning.mountNetwork(network);
+  await until(() => alice.node.resolveTarget('member:bob', NETWORK)[0]?.endpointAddr === returning.transport.endpointAddr,
+    'sender learns the returning target endpoint');
+  const failed = (await alice.outboxRedrive.flush({ id: first.messageId, force: true })).items[0];
+  assert.equal(isRetryablePreEffectReceipt(failed.failedReceipts[target]), true);
+  assert.deepEqual(failed.inDoubtNodeIds, [target]);
+  assert.equal(isUnattemptedOutboxItem(failed), false);
+  const changed = { ...request, routing: { mode: 'unicast' as const, targets: ['member:carol'] }, body: 'Revised' };
+  assert.equal((await alice.emitter.emit(changed)).messageId, first.messageId);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+
+  await returning.gate.setMode('open');
+  const restarted = await start('seed');
+  await restarted.mountNetwork(network);
+  await until(() => returning.mailbox.list().totalCount === 1, 'the restarted seed delivers its persisted copy');
+  assert.equal((await alice.emitter.emit(request)).receipts[0]?.stage, 'dispatched');
+  assert.deepEqual(alice.outbox.get(first.messageId)?.inDoubtNodeIds, []);
+  assert.deepEqual(returning.mailbox.list().items.map(item => item.id), [first.messageId]);
+  assert.equal((await alice.emitter.emit(changed)).messageId, first.messageId);
+  assert.equal(carol.mailbox.list().totalCount, 0);
 });
 
 test('malformed relay responses surface as local protocol failures, not offline queueing', async t => {
@@ -4589,8 +4672,16 @@ test('bootstrapPeers with self aliases and a hairpin forwarder never self-tunnel
 
   // The target is offline and every configured "seed" is self: queue locally, never claim
   // a durable spool handoff on this node itself.
+  let probeSelfRelay = true;
   const harness = await emitterHarness(t, {
-    send: (targetNodeId, frame, opts) => transport.sendUnicast(NETWORK, targetNodeId, frame, opts),
+    send: (targetNodeId, frame, opts) => {
+      if (probeSelfRelay) {
+        // Force this send to confirm the hairpin via the relay response itself.
+        probeSelfRelay = false;
+        selfEndpoints.delete(hairpin);
+      }
+      return transport.sendUnicast(NETWORK, targetNodeId, frame, opts);
+    },
   });
   const selfOnly = await harness.emitter.emit({
     networkId: harness.networkId,
@@ -4605,6 +4696,7 @@ test('bootstrapPeers with self aliases and a hairpin forwarder never self-tunnel
   const selfOnlyItem = harness.outbox.get(selfOnly.messageId)!;
   assert.deepEqual(selfOnlyItem.inDoubtNodeIds, []);
   assert.deepEqual(selfOnlyItem.relaySpooledNodeIds, []);
+  assert.equal(selfEndpoints.has(hairpin), true, 'the relay response proved that no external hop began');
   const spoolFile = join(root, 'spool', `${keys.swarmTopicId}.json`);
   assert.equal(
     existsSync(spoolFile) ? readRelaySpool(spoolFile).entries.length : 0,
@@ -4806,7 +4898,7 @@ test('a mounted transport purges pre-existing self-spooled snapshot and journal 
 test('prepare keys claim one sender obligation for resolved and unresolved targets', async t => {
   for (const selector of ['member:diz', 'member:unknown']) {
     const harness = await emitterHarness(t, {
-      plan: target => ({ error: new PeerUnreachableError(target) }),
+      plan: target => ({ error: markBeforeSendError(new PeerUnreachableError(target)) }),
     });
     harness.kernel.ctx.on('emitter/prepare', envelope => ({ ...envelope, idempotencyKey: 'topic-request' }));
     const input: EmitMessageInput = {
@@ -4875,7 +4967,7 @@ test('initial emit and redrive launch live siblings before the first target time
   let offline = false;
   const harness = await emitterHarness(t, {
     extraMembers: ['aya'], attemptTimeoutMs: 100,
-    plan: target => offline ? { error: new PeerUnreachableError(target) }
+    plan: target => offline ? { error: markBeforeSendError(new PeerUnreachableError(target)) }
       : target === stalled ? { delayMs: 1000 } : {},
   });
   const targets = harness.targetCards.map(card => card.nodeId).sort();
@@ -4906,12 +4998,13 @@ test('initial emit and redrive launch live siblings before the first target time
 });
 
 
-test('pre-connect handshake timeout stays retryable through ordinary outbox redrive', async t => {
+for (const hop of ['direct', 'relay']) test(`${hop} pre-connect handshake timeout stays retryable through ordinary outbox redrive`, async t => {
   const harness = await emitterHarness(t, { attemptTimeoutMs: 30 });
   const transport = new P2PTransportService({ discoveryDir: join(harness.dir, 'isolated'), multicast: false });
-  await transport.mountNetwork({ networkId: harness.networkId, passphrase: 'offline-test-only' });
+  await transport.mountNetwork({ networkId: harness.networkId, passphrase: 'offline-test-only',
+    ...(hop === 'relay' ? { bootstrapPeers: ['127.0.0.1:1'] } : {}) });
   t.after(() => transport.dispose());
-  transport.registerPeerEndpoint(harness.networkId, harness.targetCard.nodeId, '127.0.0.1:1');
+  if (hop === 'direct') transport.registerPeerEndpoint(harness.networkId, harness.targetCard.nodeId, '127.0.0.1:1');
   const connect = t.mock.method(Socket.prototype, 'connect', function (this: Socket) { return this; });
   const send = t.mock.method(harness.kernel.ctx.services.transport, 'sendUnicast',
     (...args: Parameters<TransportService['sendUnicast']>) => transport.sendUnicast(...args));
@@ -4919,6 +5012,7 @@ test('pre-connect handshake timeout stays retryable through ordinary outbox redr
     networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
     kind: 'task', subject: 'connect timeout', body: 'no bytes sent', payload: {},
   });
+  assert.ok(connect.mock.callCount() > 0);
   connect.mock.restore();
   send.mock.restore();
   const item = harness.outbox.get(emitted.messageId)!;
@@ -5049,7 +5143,7 @@ test('online-only keyed replacements retain approval or uncertain custody withou
         }
         if (outcome === 'approval') return { stage: 'pending_approval' };
         if (outcome === 'volatile') return { stage: 'queued', executionReceipt: { durable: false } };
-        return { error: new PeerUnreachableError(target) };
+        return { error: new PeerUnreachableError(target, 'Connection closed after write') };
       },
     });
     const input: EmitMessageInput = {
@@ -5597,7 +5691,7 @@ test('keyed sends, exact retries and redrive persist a fresh fence before transp
       assert.deepEqual(item.inDoubtNodeIds, [target]);
       assert.deepEqual(item.activeAttempt?.fencedNodeIds, [target]);
       if (index === 0) return { stage: 'failed', executionReceipt: { handoff: 'unattempted' } };
-      if (index === 1) return { error: new PeerUnreachableError(target, 'Peer offline') };
+      if (index === 1) return { error: markBeforeSendError(new PeerUnreachableError(target, 'Peer offline')) };
       return { stage: 'dispatched' };
     },
   });
@@ -5625,7 +5719,7 @@ test('only resolved failed sends release their outbound thread after redrive', a
     ['rejected', 'Policy declined before dispatch', 'rejected', true],
   ] as const) {
     const harness = await emitterHarness(t, {
-      plan: (target, index) => index === 0 ? { error: new PeerUnreachableError(target, 'Peer offline') }
+      plan: (target, index) => index === 0 ? { error: markBeforeSendError(new PeerUnreachableError(target, 'Peer offline')) }
         : { stage, detail, ...(handoff ? { executionReceipt: { handoff } } : {}) },
     });
     const session = 'terminal:failed-wave';
@@ -5789,7 +5883,7 @@ test('keyed claims replay the highest version and dispatch only strictly newer w
 
 test('outbox retains prepare-normalized targets for unresolved and resolved offline sends', async t => {
   for (const target of ['member:missing', 'member:diz']) {
-    const harness = await emitterHarness(t, { plan: id => ({ error: new PeerUnreachableError(id) }) });
+    const harness = await emitterHarness(t, { plan: id => ({ error: markBeforeSendError(new PeerUnreachableError(id)) }) });
     harness.kernel.ctx.on('emitter/prepare', envelope => ({ ...envelope,
       routing: { ...envelope.routing, targets: [target] } }));
     const sent = await harness.emitter.emit({ networkId: harness.networkId,
@@ -5837,7 +5931,7 @@ test('keyed DND retries retain the original target and staged attachment online 
   let offline = false;
   let settled = false;
   const harness = await emitterHarness(t, { extraMembers: ['aya'], plan: target => offline
-    ? { error: new PeerUnreachableError(target) } : settled ? {}
+    ? { error: markBeforeSendError(new PeerUnreachableError(target)) } : settled ? {}
       : { stage: 'queued', executionReceipt: { executor: 'gate-dnd', durable: true, handoff: 'queued' } } });
   let selected = harness.targetCard.nodeId;
   const route = t.mock.method(harness.kernel.ctx.services.router, 'route', async () => ({

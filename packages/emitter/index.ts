@@ -260,9 +260,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             return {
               status: 'pending',
               error: error instanceof Error ? error.message : String(error),
-              // A confirmed relay-spool handoff has a durable external owner; a raw
-              // timeout may already have executed at the target and must stay parked.
-              inDoubt: !relaySpooled && isDeliveryTimeoutFailure(error),
+              // A lost response after a write leaves execution or relay custody unresolved.
+              inDoubt: !relaySpooled && !beforeSend,
               relaySpooled,
             };
           }

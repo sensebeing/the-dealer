@@ -2114,8 +2114,8 @@ export class P2PTransportService implements TransportService {
     // instead of waiting the full request timeout on the direct attempt.
     const fallbacks = this.peerFallbacks(target, [m]);
     let lastError: Error = new PeerUnreachableError(target, `Unknown peer: ${target}`);
-    // A post-connect direct timeout is genuine in-doubt evidence and must survive later
-    // fallback failures; a relay-only or pre-connect failure never becomes in-doubt.
+    // Preserve the typed delivery timeout across fallback failures. Write evidence
+    // separately tracks uncertainty on every leg, including relay-only exchanges.
     let targetDeliveryTimeout: Error | undefined;
     if (address) {
       try {
@@ -2330,6 +2330,35 @@ export class P2PTransportService implements TransportService {
     return address;
   }
 
+  private writeOnConnect(
+    socket: Socket,
+    wirePacket: Buffer,
+    timeoutMs: number,
+    onWrite?: () => void,
+  ): () => void {
+    // track owns timeout classification; disable its RPC timer until TCP connects.
+    const startedAt = Date.now();
+    socket.setTimeout(0);
+    const connectTimer = setTimeout(() => {
+      socket.destroy(Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' }));
+    }, Math.max(1, Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS)));
+    const onConnect = () => {
+      clearTimeout(connectTimer);
+      socket.setTimeout(Math.max(1, timeoutMs - (Date.now() - startedAt)));
+      try {
+        onWrite?.();
+        socket.write(wirePacket);
+      } catch (error) {
+        socket.destroy(asError(error));
+      }
+    };
+    socket.once('connect', onConnect);
+    return () => {
+      socket.off('connect', onConnect);
+      clearTimeout(connectTimer);
+    };
+  }
+
   private async directFrame(
     m: Mount,
     target: string,
@@ -2340,22 +2369,7 @@ export class P2PTransportService implements TransportService {
   ): Promise<SealedNetworkFrame> {
     const wirePacket = packet({ type: 'frame', frame });
     const socket = this.track(createConnection(parseEndpoint(address)));
-    // track owns timeout classification; disable its RPC timer until TCP connects.
-    socket.setTimeout(0);
-    const connectTimer = setTimeout(() => {
-      socket.destroy(Object.assign(new Error('Direct connect timeout'), { code: 'ETIMEDOUT' }));
-    }, Math.max(1, Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS)));
-    const onConnect = () => {
-      clearTimeout(connectTimer);
-      socket.setTimeout(timeoutMs);
-      try {
-        onWrite?.();
-        socket.write(wirePacket);
-      } catch (error) {
-        socket.destroy(error instanceof Error ? error : new Error(String(error)));
-      }
-    };
-    socket.once('connect', onConnect);
+    const stopWriting = this.writeOnConnect(socket, wirePacket, timeoutMs, onWrite);
     try {
       // Read immediately so pre-connect errors and shutdown closes settle this call too.
       const response = await new SocketReader(socket).json();
@@ -2367,8 +2381,7 @@ export class P2PTransportService implements TransportService {
       }
       return response.frame;
     } finally {
-      socket.off('connect', onConnect);
-      clearTimeout(connectTimer);
+      stopWriting();
       socket.destroy();
     }
   }
@@ -2421,18 +2434,17 @@ export class P2PTransportService implements TransportService {
     const socket = this.track(
       createConnection(parseEndpoint(seed)),
       () =>
-        // A connected-but-silent relay seed only proves a target execution timeout when
-        // the target itself has a fresh beacon. Otherwise this is a relay/offline
-        // reachability failure and must never park the target in inDoubtNodeIds.
+        // The beacon distinguishes a target delivery timeout from a relay timeout.
+        // Either can leave custody uncertain after a write.
         (m.beacons.get(target)?.expires ?? 0) >= Date.now()
           ? new DeliveryTimeoutError('Transport timeout')
           : Object.assign(new Error('Relay transport timeout'), { code: 'ETIMEDOUT' }),
     );
-    socket.setTimeout(timeoutMs);
+    let hopWriteStarted = false;
+    let provenSelfRelay = false;
+    const stopWriting = this.writeOnConnect(socket, wirePacket, timeoutMs, () => { hopWriteStarted = true; });
     try {
       this.inFlightSelfNonces.add(frame.nonce);
-      onWrite?.();
-      socket.write(wirePacket);
       let response: any;
       try {
         response = await new SocketReader(socket).json();
@@ -2443,7 +2455,7 @@ export class P2PTransportService implements TransportService {
         // original `relay` verb delivers now instead of queueing a reachable peer; without
         // one the fast failure is genuine and flows into the durable outbox.
         if (
-          options.spoolIfOffline === true &&
+          hopWriteStarted && options.spoolIfOffline === true &&
           (error as Error | undefined)?.message === 'Truncated stream'
         ) {
           const hasFreshBeacon = (m.beacons.get(target)?.expires ?? 0) >= Date.now();
@@ -2465,6 +2477,7 @@ export class P2PTransportService implements TransportService {
         if (!this.verifySelfLoopProof('relay', frame.nonce, response.selfProof)) {
           throw new LocalDeliveryError('Unauthenticated self-relay response');
         }
+        provenSelfRelay = true;
         this.recordSelfEndpoint(seed);
         throw new PeerUnreachableError(target, 'Skipped self relay endpoint');
       }
@@ -2494,8 +2507,10 @@ export class P2PTransportService implements TransportService {
       }
       return Buffer.from(payload.dataBase64, 'base64');
     } finally {
+      stopWriting();
       this.inFlightSelfNonces.delete(frame.nonce);
       socket.destroy();
+      if (hopWriteStarted && !provenSelfRelay) onWrite?.();
     }
   }
 

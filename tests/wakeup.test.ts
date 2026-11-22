@@ -404,6 +404,13 @@ test('durable lineage lets an idle slot rotate and wake while sibling follow-ups
   assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'unverifiable child terminals keep the child in scope');
   state.children[0].unverifiableTerminalCount = 0;
 
+  const siblingAgents = state.children[0].agents;
+  state.children[0].agents = undefined;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Workspace or descendant is busy or unverifiable',
+  });
+  state.children[0].agents = siblingAgents;
+
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
   state.terminals.pop();
   state.children[0].unverifiableTerminalCount = 1;
@@ -411,8 +418,14 @@ test('durable lineage lets an idle slot rotate and wake while sibling follow-ups
   state.children[0].unverifiableTerminalCount = 0;
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true }, 'a sibling claim survives a missing terminal');
   state.terminals.push(sibling);
-  state.calls.length = 0;
+  state.children[0].agents = undefined;
   store.enqueue([alert('next-wave')], { mailboxId: probeMailbox });
+  const blockedWake = await service.flushMailbox(probeMailbox, { force: true });
+  assert.equal(blockedWake.woke, false);
+  assert.equal(state.created, 0);
+  assert.deepEqual(state.terminals.map(terminal => terminal.handle), [probeTerminal.handle, sibling.handle]);
+  state.children[0].agents = siblingAgents;
+  state.calls.length = 0;
   const wake = await service.flushMailbox(probeMailbox, { force: true });
   assert.equal(wake.woke, true, wake.reason);
   assert.equal(wake.rotated, true);
