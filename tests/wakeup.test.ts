@@ -97,6 +97,7 @@ interface FakeOrcaAgent {
 interface FakeOrcaChild {
   path: string;
   worktreeId: string;
+  childWorktreeIds?: string[];
   unverifiableTerminalCount: number;
   agents?: FakeOrcaAgent[];
   terminals?: FakeTerminalRow[];
@@ -112,6 +113,7 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
     created: 0,
     agents: undefined as FakeOrcaAgent[] | undefined,
     children: [] as FakeOrcaChild[],
+    childWorktreeIds: undefined as string[] | undefined,
   };
   const runner: CommandRunner = async request => {
     state.calls.push(request);
@@ -124,11 +126,11 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
             worktrees: [{
               path: workspacePath,
               worktreeId: 'fake-worktree',
-              childWorktreeIds: state.children.map(child => child.worktreeId),
+              childWorktreeIds: state.childWorktreeIds ?? state.children.map(child => child.worktreeId),
               unverifiableTerminalCount: 0,
               agents: state.agents ?? state.terminals.filter(t => t.connected).map(t => ({ state: 'done', ...(t.tabId && t.leafId ? { paneKey: `${t.tabId}:${t.leafId}` } : {}) })),
-            }, ...state.children.map(({ path, worktreeId, unverifiableTerminalCount, agents }) =>
-              ({ path, worktreeId, unverifiableTerminalCount, agents }))],
+            }, ...state.children.map(({ path, worktreeId, childWorktreeIds, unverifiableTerminalCount, agents }) =>
+              ({ path, worktreeId, childWorktreeIds, unverifiableTerminalCount, agents }))],
           },
         }),
       };
@@ -259,6 +261,72 @@ test('slot probe leaves an active sibling child alone when the leased terminal i
 function worktreeListCalls(calls: readonly CommandRequest[]): number {
   return calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'list').length;
 }
+
+for (const mode of ['retiring', 'bound'] as const) {
+  test(`an unmatched explicit parent pane blocks a vanished ${mode} terminal despite sibling lineage`, async t => {
+    const root = directory(t);
+    const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+    const { runner, state } = fakeOrcaWorkspace(root, [sibling]);
+    const child: FakeOrcaChild = {
+      path: join(root, 'child'), worktreeId: 'child', unverifiableTerminalCount: 0,
+      agents: [{ state: 'working', parentPaneKey: '%vanished-retiring-pane' }],
+      lineage: { createdByTerminalHandle: sibling.handle },
+    };
+    state.children = [child];
+    const options = mode === 'retiring'
+      ? { targetTerminalHandle: null, retiringTerminalHandle: probeTerminal.handle }
+      : { targetTerminalHandle: probeTerminal.handle, excludedHandles: new Set([sibling.handle]) };
+    const idle = async () => (await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, options)).idle;
+
+    assert.equal(await idle(), false);
+    child.agents!.push({ state: 'working', parentPaneKey: null });
+    assert.equal(await idle(), false, 'missing pane records cannot override an unmatched explicit parent');
+    child.agents = [{ state: 'working', parentPaneKey: ' sibling:root ' }];
+    assert.equal(await idle(), true, 'a known sibling pane positively attributes the child');
+    assert.equal(worktreeListCalls(state.calls), 0);
+  });
+}
+
+test('sibling exclusion requires positive attribution throughout the subtree', async t => {
+  const root = directory(t);
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  const { runner, state } = fakeOrcaWorkspace(root, [probeTerminal, sibling]);
+  const child: FakeOrcaChild = {
+    path: join(root, 'child'), worktreeId: 'child', childWorktreeIds: ['grandchild'],
+    unverifiableTerminalCount: 0, agents: [], lineage: { createdByTerminalHandle: sibling.handle },
+  };
+  const grandchild: FakeOrcaChild = {
+    path: join(child.path, 'grandchild'), worktreeId: 'grandchild', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: ' wave:root ' }],
+    lineage: { createdByTerminalHandle: sibling.handle },
+  };
+  state.childWorktreeIds = [child.worktreeId];
+  state.children = [child, grandchild];
+  const idle = async () => (await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, {
+    targetTerminalHandle: probeTerminal.handle,
+  })).idle;
+
+  assert.equal(await idle(), false, 'a grandchild with the target parent pane stays in scope');
+  child.agents = [{ state: 'working', parentPaneKey: 'sibling:root' }];
+  assert.equal(await idle(), false, 'an explicit sibling parent cannot hide its descendant');
+  child.agents = [];
+  grandchild.agents = [{ state: 'working', parentPaneKey: null }];
+  grandchild.lineage = { createdByTerminalHandle: probeTerminal.handle };
+  assert.equal(await idle(), false, 'a grandchild created by the target terminal stays in scope');
+
+  grandchild.lineage.createdByTerminalHandle = sibling.handle;
+  state.calls.length = 0;
+  assert.equal(await idle(), true);
+  assert.equal(worktreeListCalls(state.calls), 1, 'both levels use the same lineage inventory');
+
+  grandchild.unverifiableTerminalCount = 1;
+  assert.equal(await idle(), false, 'an unverifiable grandchild stays in scope');
+  grandchild.unverifiableTerminalCount = 0;
+  grandchild.childWorktreeIds = [child.worktreeId];
+  assert.equal(await idle(), false, 'a cycle cannot establish sibling ownership');
+  state.children.pop();
+  assert.equal(await idle(), false, 'a missing grandchild cannot establish sibling ownership');
+});
 
 test('durable lineage lets an idle slot rotate and wake while sibling follow-ups are working', async t => {
   const { root, store, service, state } = slotProbeFixture(t);

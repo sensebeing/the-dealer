@@ -195,9 +195,34 @@ export async function checkOrcaWorkspaceIdle(
     if (isRoot && !rotating && options?.targetPaneKey?.trim() && !targetTerm) return true;
     const targetPaneKeys = new Set(targetTerm ? terminalPaneKeys(targetTerm) : []);
     if (rotating && options?.retiringPaneKey?.trim()) targetPaneKeys.add(options.retiringPaneKey.trim());
-    const siblingPaneKeys = rotating && !targetTerm && targetPaneKeys.size === 0
-      ? new Set(handles.filter(isUsableTerminal).flatMap(terminalPaneKeys))
+    const ownHandle = rotating ? retiringHandle : targetTerm
+      ? String(targetTerm.handle)
+      : typeof options?.targetTerminalHandle === 'string' ? options.targetTerminalHandle.trim() : undefined;
+    const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
+    const eligibleObservableHandles = observableHandles.filter(canUse);
+    const rootTarget = isRoot
+      ? rotating
+        ? null
+        : targetTerm
+          ? String(targetTerm.handle)
+          : options?.targetTerminalHandle
       : undefined;
+    const targetPresent =
+      typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
+    const reuseHandles =
+      typeof rootTarget === 'string' && !targetPresent
+        ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
+        : undefined;
+    const siblingTerminals = isRoot && slotScoped
+      ? handles.filter(terminal =>
+        isUsableTerminal(terminal) && terminal !== targetTerm &&
+        String(terminal.handle) !== ownHandle && String(terminal.handle) !== retiringHandle &&
+        !reuseHandles?.has(String(terminal.handle)) &&
+        !terminalPaneKeys(terminal).some(key => targetPaneKeys.has(key)),
+      )
+      : [];
+    const siblingHandles = new Set(siblingTerminals.map(terminal => String(terminal.handle)));
+    const knownSiblingPaneKeys = new Set(siblingTerminals.flatMap(terminalPaneKeys));
     const ownedAgentsBusy = (): boolean =>
       !row.agents ||
       row.agents
@@ -218,7 +243,7 @@ export async function checkOrcaWorkspaceIdle(
       if (targetTerm
         ? allAgentsBusy()
         : !row.agents || row.agents.some(agent =>
-          agent.state !== 'done' && !(typeof agent.paneKey === 'string' && siblingPaneKeys?.has(agent.paneKey)),
+          agent.state !== 'done' && !(typeof agent.paneKey === 'string' && knownSiblingPaneKeys.has(agent.paneKey)),
         )
       ) {
         return false;
@@ -227,7 +252,6 @@ export async function checkOrcaWorkspaceIdle(
       return false;
     }
     // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
-    const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
     if (
       !rotating &&
       targetPaneKeys.size === 0 &&
@@ -240,20 +264,6 @@ export async function checkOrcaWorkspaceIdle(
     // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
     // rebind could reuse when it was closed). A rotation never inspects the retiring composer:
     // an unsent human draft there must not keep the replacement tab from opening.
-    const rootTarget = isRoot
-      ? rotating
-        ? null
-        : targetTerm
-          ? String(targetTerm.handle)
-          : options?.targetTerminalHandle
-      : undefined;
-    const eligibleObservableHandles = observableHandles.filter(canUse);
-    const targetPresent =
-      typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
-    const reuseHandles =
-      typeof rootTarget === 'string' && !targetPresent
-        ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
-        : undefined;
     const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
       if (!isRoot) return true;
       if (rootTarget === null) return false;
@@ -281,45 +291,44 @@ export async function checkOrcaWorkspaceIdle(
         !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal, options)).idle
       ) return false;
     }
-    const ownHandle = rotating ? retiringHandle : targetTerm
-      ? String(targetTerm.handle)
-      : typeof options?.targetTerminalHandle === 'string' ? options.targetTerminalHandle.trim() : undefined;
-    let siblingHandles: Set<string> | undefined;
+    const canExcludeSiblingSubtree = async (node: Workspace, seen = new Set<string>()): Promise<boolean> => {
+      if (seen.has(node.worktreeId)) return false;
+      seen.add(node.worktreeId);
+      const agents = node.agents ?? [];
+      let allAgentsExplicitlyAttributed = agents.length > 0;
+      for (const agent of agents) {
+        const pane = typeof agent.parentPaneKey === 'string' ? agent.parentPaneKey.trim() : '';
+        if (!pane) {
+          allAgentsExplicitlyAttributed = false;
+          continue;
+        }
+        // Explicit dispatch provenance must establish sibling ownership before lineage can help.
+        const siblingPane = targetPaneKeys.size > 0 ? !targetPaneKeys.has(pane) : knownSiblingPaneKeys.has(pane);
+        if (!siblingPane) return false;
+      }
+      const paneAttributedWithSingleTerminal = allAgentsExplicitlyAttributed && targetPaneKeys.size > 0 && handles.length <= 1;
+      if (!paneAttributedWithSingleTerminal && node.unverifiableTerminalCount !== 0) return false;
+      if (!allAgentsExplicitlyAttributed) {
+        childCreators ??= await readOrcaChildCreators(runner, command, cwd, signal);
+        const creatorHandle = childCreators.get(node.worktreeId);
+        if (!creatorHandle || creatorHandle === ownHandle || creatorHandle === retiringHandle ||
+          !(siblingHandles.has(creatorHandle) || options?.excludedHandles?.has(creatorHandle))) return false;
+      }
+      for (const id of node.childWorktreeIds ?? []) {
+        const descendant = rows.find(item => item.worktreeId === id);
+        if (!descendant || !(await canExcludeSiblingSubtree(descendant, seen))) return false;
+      }
+      return true;
+    };
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
       if (!child) return false;
-      if (
-        targetPaneKeys.size > 0 && child.agents?.length &&
-        (handles.length <= 1 || child.unverifiableTerminalCount === 0) &&
-        child.agents.every(agent =>
-          typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey),
-        )
-      ) continue;
-      // A vanished terminal without a recorded pane can only rule out work attributed to a live sibling.
-      if (siblingPaneKeys?.size && child.unverifiableTerminalCount === 0 && child.agents?.length &&
-        child.agents.every(agent => typeof agent.parentPaneKey === 'string' && siblingPaneKeys.has(agent.parentPaneKey))
-      ) continue;
-      // Follow-up dispatches can lose their parent pane. An explicit parent in this slot takes
-      // precedence over the worktree's creator, since this slot may have dispatched into it.
-      if (isRoot && slotScoped && !child.agents?.some(agent =>
-        typeof agent.parentPaneKey === 'string' && targetPaneKeys.has(agent.parentPaneKey),
-      )) {
-        if (!childCreators) {
-          try {
-            childCreators = await readOrcaChildCreators(runner, command, cwd, signal);
-          } catch (error) {
-            if (options?.throwOnProbeError) throw error;
-            return false;
-          }
-        }
-        const creatorHandle = childCreators.get(child.worktreeId);
-        if (child.unverifiableTerminalCount === 0 && creatorHandle && creatorHandle !== ownHandle && creatorHandle !== retiringHandle) {
-          siblingHandles ??= new Set(handles.filter(terminal =>
-            isUsableTerminal(terminal) && terminal !== targetTerm && String(terminal.handle) !== ownHandle &&
-            !reuseHandles?.has(String(terminal.handle)) &&
-            !terminalPaneKeys(terminal).some(key => targetPaneKeys.has(key)),
-          ).map(terminal => String(terminal.handle)));
-          if (siblingHandles.has(creatorHandle) || options?.excludedHandles?.has(creatorHandle)) continue;
+      if (isRoot && slotScoped) {
+        try {
+          if (await canExcludeSiblingSubtree(child)) continue;
+        } catch (error) {
+          if (options?.throwOnProbeError) throw error;
+          return false;
         }
       }
       if (!(await idleTree(child))) {
