@@ -9,7 +9,7 @@ import { CommandNotStartedError, runCommand } from '../packages/subprocess/index
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -147,6 +147,458 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
   };
   return { runner, state };
 }
+
+const probeMailbox = 'stream:alert-wave:1';
+const probeTerminal = {
+  handle: 'term-wave',
+  connected: true,
+  writable: true,
+  agentIdentity: 'antigravity',
+  tabId: 'wave',
+  leafId: 'root',
+  preview: '',
+};
+
+function slotProbeFixture(t: TestContext, options: { wave?: boolean; paneKey?: string } = {}) {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const orca = fakeOrcaWorkspace(root, [{ ...probeTerminal }]);
+  if (options.wave) {
+    store.enqueue([alert('wave')], { mailboxId: probeMailbox });
+    store.check({ mailboxId: probeMailbox });
+  }
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-terminal',
+    rotateAfterWaves: 1,
+    driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle, paneKey: options.paneKey },
+  });
+  return { root, store, ...orca, ...startSlotProbeService(t, store, orca.runner) };
+}
+
+function startSlotProbeService(t: TestContext, store: MailboxStore, commandRunner: CommandRunner) {
+  const errors: unknown[] = [];
+  const service = new WakeupRedriveService({
+    store, drivers: createTestWakeupDrivers({ commandRunner }),
+    flushIntervalMs: 100_000, onError: error => errors.push(error),
+  });
+  t.after(() => service.stop());
+  return { service, errors };
+}
+
+test('slot probe uses agent state, the composer draft and TUI-idle for a leased wave', async t => {
+  const { service, state, errors } = slotProbeFixture(t, { wave: true, paneKey: 'wave:root' });
+  state.agents = [{ state: 'working', paneKey: 'wave:root' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.agents[0].state = 'done';
+  state.terminals[0].preview = '> approval draft';
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.terminals[0].preview = '';
+  state.waitOk = false;
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.waitOk = true;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: false, ready: false, reason: 'quiescent_leased_wave',
+  });
+  assert.deepEqual(errors, []);
+});
+
+test('slot probe follows a closed terminal’s pane to its active child worktree', async t => {
+  const { root, service, state, errors } = slotProbeFixture(t, { wave: true, paneKey: 'wave:root' });
+  state.terminals = [];
+  state.children = [{
+    path: join(root, 'child'), worktreeId: 'child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: 'wave:root' }],
+  }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.children[0].agents = [];
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: false, ready: false, reason: 'terminal_gone',
+  });
+  assert.deepEqual(errors, []);
+});
+
+test('slot probe leaves an active sibling child alone when the leased terminal is gone without a pane', async t => {
+  const { root, store, service, state } = slotProbeFixture(t, { wave: true });
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  state.terminals = [sibling];
+  state.children = [{
+    path: join(root, 'sibling-child'), worktreeId: 'sibling-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: 'sibling:root' }],
+  }];
+  store.upsertWakeTarget('stream:alert-wave:2', {
+    driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: sibling.handle },
+  });
+  state.agents = [{ state: 'working', paneKey: 'sibling:root' }];
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: false, ready: false, reason: 'terminal_gone',
+  });
+  assert.equal(state.calls.some(call => call.args.includes(`path:${state.children[0].path}`)), false);
+  state.agents = [{ state: 'working', paneKey: 'unmatched:root' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.agents = [{ state: 'working' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.agents = [];
+  state.children[0].agents = [{ state: 'working' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+});
+
+test('a leased slot stays busy when its bound terminal is present but unusable', async t => {
+  const { service, state } = slotProbeFixture(t, { wave: true });
+  state.terminals[0].writable = false;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Terminal is disconnected or not writable',
+  });
+  state.terminals[0].writable = true;
+  state.terminals[0].connected = false;
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.terminals = [];
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: false, ready: false, reason: 'terminal_gone',
+  });
+});
+
+test('an outbound question holds its slot across terminal unwritability and disappearance', async t => {
+  const { store, service, state } = slotProbeFixture(t, { wave: true });
+  const sessionMailbox = `terminal:${probeTerminal.handle}`;
+  store.recordOutboundEnvelope(alert('question', {
+    semantic: { type: 'question', threadId: 'question', replyMailbox: sessionMailbox },
+  }), ['remote'], sessionMailbox);
+  const waiting = {
+    busy: true, ready: false, reason: 'outbound_thread_open',
+  };
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
+  state.terminals[0].writable = false;
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
+  state.terminals = [];
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
+  store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), waiting);
+  assert.deepEqual(state.calls, []);
+
+  store.recordInboundEnvelope(alert('answer', {
+    replyToId: 'question', semantic: { type: 'reply', threadId: 'question' },
+  }), sessionMailbox, { committed: false });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+});
+
+test('a settled or pruned outbound question releases its slot after the terminal is gone', async t => {
+  const { store, service, state } = slotProbeFixture(t);
+  const sessionMailbox = `terminal:${probeTerminal.handle}`;
+  state.terminals = [];
+  const ask = (id: string) => store.recordOutboundEnvelope(alert(id, {
+    semantic: { type: 'question', threadId: id, replyMailbox: sessionMailbox },
+  }), ['remote'], sessionMailbox);
+  ask('question-to-settle');
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'outbound_thread_open');
+  store.recordInboundEnvelope(alert('settlement', {
+    semantic: { type: 'settle', threadId: 'question-to-settle', outcome: 'succeeded' },
+  }), sessionMailbox, { committed: false });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+
+  ask('question-to-prune');
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'outbound_thread_open');
+  assert.ok(store.pruneOutboundThreadRecord('question-to-prune'));
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+});
+
+test('fixed workspace, direct terminal and Orca run slots stay busy on unanswered post-ack questions', async t => {
+  const { root, store, service } = slotProbeFixture(t);
+  const cases = [
+    {
+      mailboxId: 'stream:fixed',
+      driver: 'orca-terminal',
+      driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle },
+    },
+    {
+      mailboxId: 'terminal:term-direct',
+      driver: 'orca-terminal',
+      driverConfig: { terminalHandle: 'term-direct' },
+    },
+    { mailboxId: 'stream:run', driver: 'orca-run', driverConfig: { runId: 'run-worker' } },
+  ];
+  // The fixed stream owns this terminal for the case below.
+  store.upsertWakeTarget(probeMailbox, { driverConfig: { terminalHandle: undefined } });
+  for (const { mailboxId, driver, driverConfig } of cases) {
+    store.enqueue([alert(`wave-${mailboxId}`)], { mailboxId });
+    const lease = store.check({ mailboxId });
+    store.upsertWakeTarget(mailboxId, { driver, driverConfig });
+    const questionId = `question-${mailboxId}`;
+    store.recordOutboundEnvelope(alert(questionId, {
+      semantic: { type: 'question', threadId: questionId, replyMailbox: mailboxId },
+    }), ['remote'], mailboxId);
+    store.ack(lease.deliveryId!, mailboxId);
+    assert.deepEqual(await service.probeSlot(mailboxId), {
+      busy: true, ready: false, reason: 'outbound_thread_open',
+    }, mailboxId);
+  }
+});
+
+test('an Orca run is busy with a leased wave and an outbound question even without a workspace', async t => {
+  const { store, service, state } = slotProbeFixture(t, { wave: true });
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-run', rotateAfterWaves: undefined, driverConfig: { runId: 'run-worker' },
+  });
+  store.recordOutboundEnvelope(alert('run-question', {
+    semantic: { type: 'question', threadId: 'run-question', replyMailbox: probeMailbox },
+  }), ['remote'], probeMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'outbound_thread_open',
+  });
+  assert.deepEqual(state.calls, []);
+});
+
+test('Orca run readiness requires inactive workers and an observed idle coordinator', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const runId = 'run-probe';
+  let workers = [{ state: 'ready', outcome: 'in_progress' }];
+  let activeWorkerOnNextPage = true;
+  let coordinatorHandle: string | undefined = probeTerminal.handle;
+  let waitOk = true;
+  const { service, errors } = startSlotProbeService(t, store, async request => {
+    const [surface, action] = request.args;
+    if (surface === 'orchestration' && action === 'worker-list') {
+      const base = ['orchestration', 'worker-list', '--run', runId];
+      if (activeWorkerOnNextPage && !request.args.includes('--cursor')) {
+        assert.deepEqual(request.args, [...base, '--json']);
+        return { stdout: '{"ok":true,"result":{"workers":[{"state":"succeeded"}],"nextCursor":"next"}}' };
+      }
+      assert.deepEqual(request.args, [...base, ...(activeWorkerOnNextPage ? ['--cursor', 'next'] : []), '--json']);
+      return { stdout: JSON.stringify({ ok: true, result: { workers } }) };
+    }
+    if (surface === 'orchestration' && action === 'run-show') {
+      assert.deepEqual(request.args, ['orchestration', 'run-show', '--id', runId, '--full', '--json']);
+      return { stdout: JSON.stringify({ ok: true, result: { run: { coordinator_handle: coordinatorHandle } } }) };
+    }
+    assert.equal(surface, 'terminal');
+    assert.ok(request.args.includes(probeTerminal.handle));
+    if (action === 'show') return { stdout: JSON.stringify({ ok: true, result: { terminal: probeTerminal } }) };
+    assert.equal(action, 'wait');
+    return { stdout: JSON.stringify({ ok: waitOk }) };
+  });
+  store.upsertWakeTarget(probeMailbox, { driver: 'orca-run' });
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'orca-run target requires runId',
+  });
+  store.upsertWakeTarget(probeMailbox, { driverConfig: { runId } });
+  const claim = service.claim(probeMailbox);
+  store.enqueue([alert('run-wave')], { mailboxId: probeMailbox });
+  const lease = store.check({ mailboxId: probeMailbox });
+  store.completeWakeDelivery(probeMailbox, lease.items[0].sequence);
+  claim.dispose();
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Orca run has active workers',
+  });
+  store.ack(lease.deliveryId!, probeMailbox);
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'Orca run has active workers');
+
+  workers = [{ state: 'succeeded', outcome: 'succeeded' }];
+  activeWorkerOnNextPage = false;
+  waitOk = false;
+  assert.match((await service.probeSlot(probeMailbox)).reason!, /Terminal is busy/);
+  coordinatorHandle = undefined;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Orca run coordinator activity is unobservable',
+  });
+  coordinatorHandle = probeTerminal.handle;
+  waitOk = true;
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.deepEqual(errors, []);
+});
+
+test('an empty auto-create slot checks workspace provisioning without creating it', async t => {
+  const repoRoot = directory(t);
+  const workspacePath = join(repoRoot, 'missing-workspace');
+  const store = new MailboxStore(join(repoRoot, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const { service, errors } = startSlotProbeService(t, store, async request => {
+    calls.push(request);
+    assert.equal(request.args[0], 'worktree');
+    assert.ok(['ps', 'list'].includes(request.args[1]));
+    return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
+  });
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-terminal', driverConfig: { workspacePath, autoCreateWorkspace: true, repoRoot },
+  });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.deepEqual(calls.map(call => call.args[1]), ['ps', 'list']);
+  assert.equal(calls[1].cwd, repoRoot);
+  assert.equal(existsSync(workspacePath), false);
+  assert.deepEqual(errors, []);
+
+  store.upsertWakeTarget(probeMailbox, { driverConfig: { repoRoot: undefined } });
+  const failed = await service.probeSlot(probeMailbox);
+  assert.equal(failed.busy, true);
+  assert.equal(failed.ready, false);
+  assert.match(failed.reason!, /requires a receiver-local repoRoot/);
+  assert.equal(errors.length, 1);
+});
+
+test('terminal wait timeouts are busy observations and server failures retain their diagnostics', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const terminalMailbox = `terminal:${probeTerminal.handle}`;
+  store.upsertWakeTarget(terminalMailbox, {
+    driver: 'orca-terminal', driverConfig: { terminalHandle: probeTerminal.handle },
+  });
+  let waitResult: Awaited<ReturnType<CommandRunner>> = {
+    stdout: '{"ok":false,"error":{"code":"timeout","message":"timeout"}}', exitCode: 1,
+  };
+  let rejectWait = false;
+  const { service, errors } = startSlotProbeService(t, store, async request => {
+    if (request.args[1] === 'show') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: probeTerminal } }) };
+    }
+    assert.equal(request.args[1], 'wait');
+    if (rejectWait) throw Object.assign(new Error(waitResult.stderr || waitResult.stdout), waitResult);
+    return waitResult;
+  });
+  for (const rejectsOnExit of [false, true]) {
+    rejectWait = rejectsOnExit;
+    const timeout = await service.probeSlot(terminalMailbox);
+    assert.equal(timeout.busy, true);
+    assert.equal(timeout.ready, false);
+    assert.match(timeout.reason!, /Terminal is busy/);
+    assert.deepEqual(errors, []);
+  }
+
+  const failures = [
+    { result: { stdout: '{"ok":false,"error":{"code":"runtime_unavailable","message":"Orca daemon unreachable"}}', exitCode: 1 }, diagnostic: 'Orca daemon unreachable' },
+    { result: { stdout: '', stderr: 'connection refused', exitCode: 1 }, diagnostic: 'connection refused' },
+  ];
+  rejectWait = false;
+  for (const { result, diagnostic } of failures) {
+    waitResult = result;
+    const failed = await service.probeSlot(terminalMailbox);
+    assert.equal(failed.busy, true);
+    assert.equal(failed.ready, false);
+    assert.ok(failed.reason?.includes(diagnostic), failed.reason);
+    assert.ok(String(errors.at(-1)).includes(diagnostic));
+  }
+  assert.equal(errors.length, failures.length);
+});
+
+test('an empty rotating slot is ready when its retired terminal is idle or gone', async t => {
+  const { store, service, state, errors } = slotProbeFixture(t);
+  const retired = { ...probeTerminal, handle: 'term-retired', tabId: 'retired' };
+  state.terminals.push(retired);
+  state.agents = [{ state: 'working', paneKey: 'retired:root' }];
+  store.upsertWakeTarget(probeMailbox, {
+    completedWaves: 1, driverConfig: { retiredTerminalHandle: retired.handle },
+  });
+  assert.equal((await service.probeSlot(probeMailbox)).ready, false);
+  state.agents[0].state = 'done';
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  state.terminals.pop();
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.equal(store.getWakeTarget(probeMailbox)?.driverConfig?.retiredTerminalHandle, retired.handle);
+  assert.deepEqual(errors, []);
+});
+
+test('slot probe answers from the ledger without invoking Orca when there is no host work to inspect', async t => {
+  const { store, service, state } = slotProbeFixture(t, { wave: true });
+  assert.deepEqual(await service.probeSlot('stream:alert-wave:2'), { busy: false, ready: true });
+  const claim = service.claim(probeMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'wakeup_in_flight',
+  });
+  claim.dispose();
+  store.beginWakeDelivery(probeMailbox);
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'wakeup_pending');
+  const [wave] = store.check({ mailboxId: probeMailbox }).items;
+  store.completeWakeDelivery(probeMailbox, wave.sequence);
+  const replyMailbox = `terminal:${probeTerminal.handle}`;
+  store.enqueue([alert('session-reply')], { mailboxId: replyMailbox });
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'session_reply_pending');
+  store.ack(store.check({ mailboxId: replyMailbox }).deliveryId!, replyMailbox);
+  const targetMailbox = 'stream:prod-release';
+  const release = alert('release', {
+    kind: 'release.prod.v1', semantic: { type: 'message', threadId: 'release', replyMailbox, targetMailbox },
+  });
+  store.recordOutboundEnvelope(release, [release.from.nodeId], replyMailbox);
+  store.enqueue([release], { mailboxId: targetMailbox });
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'local_outbound_pending');
+  assert.deepEqual(state.calls, []);
+});
+
+test('slot probe is busy after wave acknowledgement until queued and leased downstream mail is acknowledged', async t => {
+  for (const replyMailbox of [`terminal:${probeTerminal.handle}`, probeMailbox]) {
+    await t.test(replyMailbox, async t => {
+      const { store, service, state } = slotProbeFixture(t, { wave: true });
+      const targetMailbox = 'stream:prod-release';
+      const release = alert('release', {
+        kind: 'release.prod.v1', semantic: { type: 'message', threadId: 'release', replyMailbox, targetMailbox },
+      });
+      store.recordOutboundEnvelope(release, [release.from.nodeId], replyMailbox);
+      store.enqueue([release], { mailboxId: targetMailbox });
+      store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
+
+      const busy = { busy: true, ready: false, reason: 'local_outbound_pending' };
+      assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+      const downstreamLease = store.check({ mailboxId: targetMailbox });
+      assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+      assert.deepEqual(state.calls, []);
+      store.ack(downstreamLease.deliveryId!, targetMailbox);
+      assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+    });
+  }
+});
+
+test('slot probe stays busy on a settled thread while another downstream message is queued or leased', async t => {
+  const { store, service, state } = slotProbeFixture(t, { wave: true });
+  const replyMailbox = `terminal:${probeTerminal.handle}`;
+  const targetMailbox = 'stream:prod-release';
+  const release = alert('release', {
+    kind: 'release.prod.v1', semantic: { type: 'message', threadId: 'release', replyMailbox, targetMailbox },
+  });
+  store.recordOutboundEnvelope(release, [release.from.nodeId], replyMailbox);
+  store.enqueue([alert('follow-up', {
+    semantic: { type: 'message', threadId: release.id, targetMailbox },
+  })], { mailboxId: targetMailbox });
+  store.recordInboundEnvelope(alert('settlement', {
+    semantic: { type: 'settle', threadId: release.id, outcome: 'succeeded' },
+  }), replyMailbox, { committed: false });
+
+  const busy = { busy: true, ready: false, reason: 'local_outbound_pending' };
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+  const downstreamLease = store.check({ mailboxId: targetMailbox });
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+  store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+  assert.deepEqual(state.calls, []);
+  store.ack(downstreamLease.deliveryId!, targetMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+});
+
+test('slot probe reports failed Orca reads and fails closed', async t => {
+  const workspacePath = directory(t);
+  const store = new MailboxStore(join(workspacePath, 'mailbox.json'));
+  const reports: unknown[] = [];
+  let response: Awaited<ReturnType<CommandRunner>> = { stdout: '', stderr: 'Orca unavailable', exitCode: 1 };
+  const service = new WakeupRedriveService({
+    store,
+    drivers: createTestWakeupDrivers({ commandRunner: async () => response }),
+    onError: error => reports.push(error),
+  });
+  t.after(() => service.stop());
+
+  store.upsertWakeTarget(probeMailbox, { driver: 'orca-run', driverConfig: { workspacePath } });
+  const failed = await service.probeSlot(probeMailbox);
+  assert.equal(failed.busy, true);
+  assert.equal(failed.ready, false);
+  assert.match(failed.reason!, /Orca unavailable/);
+
+  response = { stdout: '{"ok":true,"result":{"truncated":true,"worktrees":[]}}' };
+  assert.match((await service.probeSlot(probeMailbox)).reason!, /Incomplete workspace inventory/);
+
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-terminal', driverConfig: { terminalHandle: probeTerminal.handle },
+  });
+  response = { stdout: 'not JSON' };
+  const unreadable = await service.probeSlot(probeMailbox);
+  assert.equal(unreadable.busy, true);
+  assert.equal(unreadable.ready, false);
+  assert.equal(reports.length, 3);
+  assert.ok(reports[2] instanceof SyntaxError);
+});
 
 async function cli(runtime: DealerNodeRuntime, ...args: string[]) {
   const out: string[] = [];

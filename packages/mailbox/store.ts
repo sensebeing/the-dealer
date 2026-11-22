@@ -16,6 +16,8 @@ import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-typ
 import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
+import { netKey } from './network-key.ts';
+import type { OutboxStore } from './outbox.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
 export type { AgentConversationMode, ActiveConversationMode } from '../core-types/index.ts';
 export { normalizeConversationModeInput } from '../core-types/index.ts';
@@ -194,6 +196,11 @@ export interface MailboxCheckResult {
   /** Sequence witness is independent of receivedAt ordering (including clock rollback). */
   maxQueuedSequence?: number;
   items: MailboxItem[];
+}
+
+export interface SlotObligationSnapshot {
+  hasPendingWave: boolean;
+  immediateBusyReason?: 'wakeup_pending' | 'session_reply_pending' | 'local_outbound_pending' | 'outbound_thread_open';
 }
 
 export interface MailboxWaitOptions extends MailboxCheckOptions {
@@ -1752,6 +1759,118 @@ export class MailboxStore {
     const id = normalizeMailboxId(mailboxId);
     const target = this.read().wakeTargets[id];
     return target ? structuredClone(target) : undefined;
+  }
+
+  inspectSlotObligations(
+    mailboxId: string,
+    options?: { sessionMailboxId?: string; outbox?: OutboxStore },
+  ): SlotObligationSnapshot {
+    const id = normalizeMailboxId(mailboxId);
+    const sessionId = options?.sessionMailboxId ? normalizeMailboxId(options.sessionMailboxId) : undefined;
+    const state = this.read();
+    const ownedMailboxes = new Set(sessionId ? [id, sessionId] : [id]);
+    const selfInboundMessages = new Set<string>();
+    const localUnackedMessages = new Set<string>();
+    const localUnackedThreads = new Set<string>();
+    let activeSince: string | undefined;
+    let sessionUnacked = false;
+    for (const item of state.items) {
+      const { networkId, semantic } = item.envelope;
+      const messageKey = netKey(networkId, item.id);
+      if (ownedMailboxes.has(item.mailboxId)) {
+        selfInboundMessages.add(messageKey);
+        if (item.status === 'acked') continue;
+        if (item.mailboxId === id) {
+          if (activeSince === undefined || item.receivedAt < activeSince) activeSince = item.receivedAt;
+        } else {
+          sessionUnacked = true;
+        }
+      } else if (item.status !== 'acked') {
+        localUnackedMessages.add(messageKey);
+        localUnackedThreads.add(netKey(networkId, semantic?.threadId ?? item.envelope.id));
+      }
+    }
+
+    const hasPendingWave = activeSince !== undefined;
+    const target = state.wakeTargets[id];
+    const sessionTarget = sessionId && sessionId !== id ? state.wakeTargets[sessionId] : undefined;
+    if (target?.pendingWake || target?.deliveryInDoubt) {
+      return { hasPendingWave, immediateBusyReason: 'wakeup_pending' };
+    }
+    if (sessionUnacked || sessionTarget?.pendingWake || sessionTarget?.deliveryInDoubt) {
+      return { hasPendingWave, immediateBusyReason: 'session_reply_pending' };
+    }
+
+    const records = Object.values(state.threads);
+    const settledThreads = new Set<string>();
+    const ownedOutboundMessages = new Set<string>();
+    const inboundByThread = new Map<string, ThreadRouteRecord[]>();
+    for (const record of records) {
+      const key = netKey(record.networkId, record.threadId);
+      // Settlement snapshots are copied to other legs. Prefer the individual envelope's semantics.
+      if (record.envelope ? record.envelope.semantic?.type === 'settle' : record.settlement !== undefined) {
+        settledThreads.add(key);
+      }
+      if (record.direction === 'inbound') {
+        if (record.mailboxCommitted !== false && ownedMailboxes.has(record.localMailbox)) {
+          selfInboundMessages.add(netKey(record.networkId, record.messageId));
+        }
+        const inbound = inboundByThread.get(key) ?? [];
+        inbound.push(record);
+        inboundByThread.set(key, inbound);
+      } else if (ownedMailboxes.has(record.envelope?.semantic?.replyMailbox ?? record.localMailbox)) {
+        ownedOutboundMessages.add(netKey(record.networkId, record.messageId));
+      }
+    }
+
+    const postAckMailboxes = target?.rotateAfterWaves !== undefined
+      ? new Set(sessionId ? [sessionId] : [])
+      : ownedMailboxes;
+    const remoteMessageKeys: string[] = [];
+    for (const record of records) {
+      if (record.direction !== 'outbound') continue;
+      const messageKey = netKey(record.networkId, record.messageId);
+      if (selfInboundMessages.has(messageKey)) continue;
+      const semantic = record.envelope?.semantic;
+      const replyMailbox = semantic?.replyMailbox ?? record.localMailbox;
+      const threadKey = netKey(record.networkId, record.threadId);
+      const isReplyOrSettlement = semantic?.type === 'reply' || semantic?.type === 'settle';
+      const ownsReplyMailbox = ownedMailboxes.has(replyMailbox);
+      // Local custody lasts until acknowledgement, even after the wave or thread ends.
+      if (
+        ownsReplyMailbox &&
+        (localUnackedMessages.has(messageKey) || (!isReplyOrSettlement && localUnackedThreads.has(threadKey)))
+      ) {
+        return { hasPendingWave, immediateBusyReason: 'local_outbound_pending' };
+      }
+
+      if (isReplyOrSettlement || settledThreads.has(threadKey)) continue;
+      const isOwnedQuestion = semantic?.type === 'question' && postAckMailboxes.has(replyMailbox);
+      const isActiveWaveOutbound = activeSince !== undefined && record.createdAt >= activeSince && ownsReplyMailbox;
+      if (!isOwnedQuestion && !isActiveWaveOutbound) continue;
+
+      const answered = inboundByThread.get(threadKey)?.some(inbound => {
+        // The candidate's reply mailbox already belongs to this slot or its session.
+        if (inbound.messageId === record.messageId ||
+          inbound.envelope?.semantic?.type !== 'reply' ||
+          ownedOutboundMessages.has(netKey(inbound.networkId, inbound.messageId)) ||
+          !ownedMailboxes.has(inbound.localMailbox)) return false;
+        const replyToId = inbound.envelope.replyToId;
+        if (replyToId === record.messageId) return true;
+        // Only an unaddressed reply can fall back to thread and time correlation.
+        return replyToId === undefined && inbound.messageId !== record.envelope?.replyToId &&
+          inbound.createdAt >= record.createdAt;
+      });
+      if (answered) continue;
+      remoteMessageKeys.push(messageKey);
+    }
+    if (remoteMessageKeys.length > 0) {
+      const definitivelyFailed = options?.outbox?.readDefinitivelyFailedKeys();
+      if (remoteMessageKeys.some(key => !definitivelyFailed?.has(key))) {
+        return { hasPendingWave, immediateBusyReason: 'outbound_thread_open' };
+      }
+    }
+    return { hasPendingWave };
   }
 
   listWakeTargets(): WakeTargetState[] {
