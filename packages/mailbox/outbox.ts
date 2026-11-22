@@ -2,9 +2,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import {
-  committedOutboxTargets, envelopeClaimVersion, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
+  committedOutboxTargets, envelopeClaimVersion, hasProvenUnattemptedFailure, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
   isRetryablePreEffectReceipt, isUnattemptedOutboxItem, isUnknownEffectReceipt, outboxReconciliationTargets,
-  outstandingRelaySpooledTargets, receiptMatchesEnvelopeSignature, sameEnvelopeIntent,
+  outstandingRelaySpooledTargets, sameEnvelopeIntent,
 } from '../core-types/index.ts';
 import {
   copyFileAtomically,
@@ -73,7 +73,8 @@ function claimDeadline(leaseMs: number | undefined, now = Date.now()): string {
     ? leaseMs : DEFAULT_CLAIM_LEASE_MS)).toISOString();
 }
 
-export const OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
+export const OUTBOX_SCHEMA = 'the-dealer-outbox/v2';
+const LEGACY_OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
 const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
 const MIN_ATTEMPT_DELAY_MS = 2_000;
 const MAX_ATTEMPT_DELAY_MS = 60_000;
@@ -116,6 +117,8 @@ function acceptsSettlement(item: OutboxItem | undefined, attemptToken: string | 
 }
 
 function fenceAttempt(item: OutboxItem, attempt: NonNullable<OutboxItem['activeAttempt']>, targets: readonly string[]): void {
+  if (targets.length === 0) return;
+  delete item.unresolvedRoute;
   item.pendingNodeIds = [...new Set([...item.pendingNodeIds, ...targets])]
     .filter(nodeId => !item.deliveredReceipts[nodeId] && !item.failedNodeIds.includes(nodeId));
   const newlyFenced = [...new Set(targets)].filter(nodeId => !item.inDoubtNodeIds.includes(nodeId));
@@ -181,6 +184,7 @@ function validItem(value: unknown): value is OutboxItem {
     value.explicitTargets.every(target => typeof target === 'string') &&
     Array.isArray(value.pendingNodeIds) &&
     value.pendingNodeIds.every(nodeId => typeof nodeId === 'string') &&
+    (value.unresolvedRoute === undefined || typeof value.unresolvedRoute === 'boolean') &&
     (value.approvalPendingNodeIds === undefined ||
       (Array.isArray(value.approvalPendingNodeIds) && value.approvalPendingNodeIds.every(nodeId => typeof nodeId === 'string'))) &&
     isRecord(value.deliveredReceipts) &&
@@ -238,6 +242,37 @@ function normalizeTargets(item: OutboxItem): OutboxItem {
   if (item.approvalPendingNodeIds !== undefined) {
     item.approvalPendingNodeIds = [...new Set(item.approvalPendingNodeIds)].filter(nodeId => item.pendingNodeIds.includes(nodeId));
   }
+  if (item.unresolvedRoute === true && (item.status !== 'queued' || item.failedNodeIds.length > 0 ||
+    Object.keys(item.failedReceipts).length > 0 || committedOutboxTargets(item).length > 0)) {
+    delete item.unresolvedRoute;
+  }
+  return item;
+}
+
+function concreteExplicitNodeIds(explicitTargets: readonly string[]): string[] | undefined {
+  const ids = new Set<string>();
+  for (const selector of explicitTargets) {
+    const match = /^(?:node:)?(ed25519:[0-9a-f]{64})$/.exec(selector);
+    if (!match) return undefined;
+    ids.add(match[1]);
+  }
+  return ids.size > 0 ? [...ids] : undefined;
+}
+
+function migrateLegacyItem(item: OutboxItem): OutboxItem {
+  if (item.status !== 'queued' || item.pendingNodeIds.length > 0) return item;
+  const concreteIds = concreteExplicitNodeIds(item.explicitTargets);
+  if (concreteIds) {
+    item.pendingNodeIds = concreteIds;
+    item.inDoubtNodeIds.push(...concreteIds);
+  } else if (item.explicitTargets.length > 0 && item.lastError && item.failedNodeIds.length === 0 &&
+    Object.keys(item.failedReceipts).length === 0 && committedOutboxTargets(item).length === 0) {
+    item.unresolvedRoute = true;
+  } else {
+    item.status = 'failed';
+    delete item.unattemptedFailure;
+    item.lastError ??= 'Interrupted v1 outbox claim before target persistence; outcome unknown';
+  }
   return item;
 }
 
@@ -261,7 +296,7 @@ export class OutboxStore {
     return withOwnedLock(this.lockDir, 'Outbox store', operation);
   }
 
-  private read(): OutboxFileState {
+  private read(hasLock = false): OutboxFileState {
     let raw: string;
     try {
       raw = readFileSync(this.path, 'utf8');
@@ -279,16 +314,20 @@ export class OutboxStore {
     }
     if (
       !isRecord(parsed) ||
-      parsed.schema !== OUTBOX_SCHEMA ||
+      (parsed.schema !== OUTBOX_SCHEMA && parsed.schema !== LEGACY_OUTBOX_SCHEMA) ||
       !Array.isArray(parsed.items) ||
       !parsed.items.every(validItem)
     ) {
       throw new Error('Invalid outbox store');
     }
-    return {
+    const legacy = parsed.schema === LEGACY_OUTBOX_SCHEMA;
+    if (legacy && !hasLock) return this.withFileLock(() => this.read(true));
+    const state: OutboxFileState = {
       schema: OUTBOX_SCHEMA,
-      items: (parsed.items as OutboxItem[]).map(normalizeTargets),
+      items: parsed.items.map(item => normalizeTargets(legacy ? migrateLegacyItem(item) : item)),
     };
+    if (legacy) this.save(state);
+    return state;
   }
 
   private save(state: OutboxFileState): void {
@@ -297,7 +336,7 @@ export class OutboxStore {
 
   private mutate<T>(operation: (state: OutboxFileState, scheduleCleanup: ScheduleAttachmentCleanup) => T): T {
     return this.withFileLock(() => {
-      const state = this.read();
+      const state = this.read(true);
       return this.commitMutation(state, scheduleCleanup => operation(state, scheduleCleanup));
     });
   }
@@ -416,6 +455,7 @@ export class OutboxStore {
         envelope: structuredClone(input.envelope),
         explicitTargets: [...new Set(input.explicitTargets ?? [])],
         pendingNodeIds,
+        ...(input.unresolvedRoute === true || existing?.unresolvedRoute === true ? { unresolvedRoute: true } : {}),
         ...(approvalPendingNodeIds !== undefined ? { approvalPendingNodeIds } : {}),
         deliveredReceipts: existing?.deliveredReceipts ?? {},
         failedReceipts: existing?.failedReceipts ?? {},
@@ -461,16 +501,11 @@ export class OutboxStore {
     return item ? clone(item) : undefined;
   }
 
-  /** Failures with no remaining custody and positive pre-effect evidence for signed outcomes. */
+  /** Failures with no remaining custody and positive pre-effect evidence for every target. */
   readDefinitivelyFailedKeys(items: readonly OutboxItem[] = this.read().items): ReadonlySet<string> {
     const keys = new Set<string>();
     for (const item of items) {
-      if (item.status === 'failed' && !hasActiveAttempt(item) && item.pendingNodeIds.length === 0 &&
-        item.inDoubtNodeIds.length === 0 && item.relaySpooledNodeIds.length === 0 &&
-        (item.approvalPendingNodeIds?.length ?? 0) === 0 && Object.keys(item.deliveredReceipts).length === 0 &&
-        Object.values(item.failedReceipts).every(receipt =>
-          isRetryablePreEffectReceipt(receipt) && receiptMatchesEnvelopeSignature(receipt, item.envelope.signature)
-        )) {
+      if (!hasActiveAttempt(item) && hasProvenUnattemptedFailure(item)) {
         keys.add(netKey(item.networkId, item.id));
       }
     }
@@ -518,6 +553,7 @@ export class OutboxStore {
       envelope: clone(envelope),
       explicitTargets: [...new Set(input.explicitTargets ?? [])],
       pendingNodeIds: [],
+      ...(input.unresolvedRoute === true ? { unresolvedRoute: true } : {}),
       deliveredReceipts: {},
       failedReceipts: {},
       failedNodeIds: [],
@@ -540,7 +576,7 @@ export class OutboxStore {
   replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined {
     const { key, version } = keyedClaim(input);
     return this.withFileLock(() => {
-      const state = this.read();
+      const state = this.read(true);
       const existing = highestKeyedObligation(state.items, input.envelope.networkId, key, version);
       if (!existing) return undefined;
       const now = Date.now();
@@ -588,7 +624,7 @@ export class OutboxStore {
     item: OutboxItem; attemptToken: string;
   } | undefined {
     return this.withFileLock(() => {
-      const state = this.read();
+      const state = this.read(true);
       const item = state.items.find(candidate => candidate.id === id);
       const now = options.now ?? Date.now();
       if (!item || item.supersededById !== undefined || hasActiveAttempt(item, now)) {
@@ -611,7 +647,7 @@ export class OutboxStore {
 
   markSentCommitted(id: string): boolean {
     return this.withFileLock(() => {
-      const state = this.read();
+      const state = this.read(true);
       const item = state.items.find(candidate => candidate.id === id);
       if (item?.sentCommitted !== false || item.supersededById !== undefined) return false;
       item.sentCommitted = true;
@@ -621,8 +657,14 @@ export class OutboxStore {
   }
 
   prepareSend(id: string, attemptToken: string, targetNodeIds: readonly string[]): OutboxItem | undefined {
-    return this.mutateAttempt(id, attemptToken, item => {
-      fenceAttempt(item, item.activeAttempt!, targetNodeIds);
+    return this.withFileLock(() => {
+      const state = this.read(true);
+      const item = state.items.find(candidate => candidate.id === id);
+      if (!item?.activeAttempt || !hasActiveAttempt(item) || !acceptsSettlement(item, attemptToken)) return undefined;
+      if (targetNodeIds.length > 0) {
+        fenceAttempt(item, item.activeAttempt, targetNodeIds);
+        this.save(state);
+      }
       return clone(item);
     });
   }
@@ -632,7 +674,7 @@ export class OutboxStore {
     operation: (item: OutboxItem, scheduleCleanup: ScheduleAttachmentCleanup) => T,
   ): T | undefined {
     return this.withFileLock(() => {
-      const state = this.read();
+      const state = this.read(true);
       const item = state.items.find(candidate => candidate.id === id);
       if (!item || !acceptsSettlement(item, attemptToken)) return undefined;
       return this.commitMutation(state, scheduleCleanup => operation(item, scheduleCleanup));
@@ -673,6 +715,7 @@ export class OutboxStore {
       item.failedNodeIds = item.failedNodeIds.filter(nodeId => !retry.has(nodeId));
       item.pendingNodeIds = [...new Set([...pending, ...retryable])];
       item.status = 'queued';
+      if (reroutable && item.pendingNodeIds.length === 0) item.unresolvedRoute = true;
       delete item.activeAttempt;
       delete item.unattemptedFailure;
       normalizeTargets(item);
@@ -793,8 +836,10 @@ export class OutboxStore {
     const now = new Date().toISOString();
     return this.mutateAttempt(id, attemptToken, item => {
       delete item.activeAttempt;
+      const wasQueued = item.status === 'queued';
       item.status = 'failed';
-      if (item.failedNodeIds.length === 0 && Object.keys(item.failedReceipts).length === 0 &&
+      delete item.unresolvedRoute;
+      if ((wasQueued || item.unattemptedFailure === true) && item.failedNodeIds.length === 0 && Object.keys(item.failedReceipts).length === 0 &&
           committedOutboxTargets(item).length === 0) {
         item.unattemptedFailure = true;
       } else {
@@ -852,7 +897,10 @@ export class OutboxStore {
       item.nextAttemptAt = update.nextAttemptAt;
       delete item.activeAttempt;
       scheduleCleanup(item.id, this.settleItem(item));
-      if (itemFailure !== undefined) item.status = 'failed';
+      if (itemFailure !== undefined) {
+        item.status = 'failed';
+        delete item.unresolvedRoute;
+      }
       if (committedOutboxTargets(item).length > 0) item.sentCommitted = true;
       return clone(item);
     });
@@ -1029,7 +1077,8 @@ export class OutboxRedriveService {
     const eligibleRequestTargets = (item: OutboxItem): string[] | undefined => {
       const targets = item.pendingNodeIds;
       if ((!force && Date.parse(item.nextAttemptAt) > now) ||
-          (options.forceMatchingTarget && targets.length === 0 && options.includeUnresolved !== true)) {
+          (options.forceMatchingTarget && targets.length === 0 &&
+            !(options.includeUnresolved === true && item.unresolvedRoute === true))) {
         return undefined;
       }
       const requestTargets = options.forceMatchingTarget && scopedTargetNodeId
@@ -1076,7 +1125,7 @@ export class OutboxRedriveService {
         options.forceMatchingTarget &&
         !(
           candidate.pendingNodeIds.includes(scopedTargetNodeId!) ||
-          (options.includeUnresolved === true && candidate.pendingNodeIds.length === 0)
+          (options.includeUnresolved === true && candidate.unresolvedRoute === true)
         )
       ) {
         // A peer pulse advances only obligations for that peer; an earlier event on the
@@ -1113,7 +1162,7 @@ export class OutboxRedriveService {
         attempted += 1;
         let outcome: OutboxDeliveryOutcome;
         try {
-          // An empty target list means the emitter should route an unresolved selector.
+          // The emitter checks the stored routing state when no targets were selected.
           outcome = await this.deliver(item, {
             ...(requestTargets.length > 0 ? { targetNodeIds: requestTargets } : {}),
             timeoutMs: this.attemptTimeoutMs,

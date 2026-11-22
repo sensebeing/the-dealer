@@ -22,9 +22,11 @@ import { DealerNodeRuntime } from '../packages/cli/runtime.ts';
 import { runDealerCli, summarizeNextStep } from '../packages/cli/index.ts';
 import { Kernel } from '../packages/kernel/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
+import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
 import { OutboxRedriveService, OutboxStore } from '../packages/mailbox/outbox.ts';
 import { MailboxStore } from '../packages/mailbox/store.ts';
+import { netKey } from '../packages/mailbox/network-key.ts';
 import { createNodePlugin } from '../packages/node/index.ts';
 import { createPollWatermarkSourcePlugin } from '../packages/plugins-source/index.ts';
 import { P2PTransportService, blake3, createTransportPlugin } from '../packages/transport/index.ts';
@@ -4515,6 +4517,7 @@ test('steady-state seed probes never fabricate reachability or force-flush parke
     envelope: envelopeFor(sender, NETWORK, 'member:unseen'),
     explicitTargets: ['member:unseen'],
     pendingNodeIds: [],
+    unresolvedRoute: true,
   });
   const parked = outbox.enqueue({
     envelope: threadedEnvelope(sender, NETWORK, seed.localNodeId, 'EVT-PARKED', 'thread-parked'),
@@ -4581,6 +4584,7 @@ test('a reachability pulse never reroutes unresolved selectors while an identity
     envelope: envelopeFor(harness.sender, harness.networkId, 'member:unseen'),
     explicitTargets: ['member:unseen'],
     pendingNodeIds: [],
+    unresolvedRoute: true,
   });
   const parked = harness.outbox.recordAttempt(item.id, {
     nextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
@@ -4989,7 +4993,9 @@ test('initial emit and redrive launch live siblings before the first target time
   const queued = await harness.emitter.emit({ ...input, subject: 'redrive sibling' });
   offline = false;
   const before = harness.sendCalls.length;
-  const outcome = await harness.emitter.redriveOutboxItem!(harness.outbox.get(queued.messageId)!, { timeoutMs: 100 });
+  const claim = harness.outbox.beginAttempt(queued.messageId)!;
+  const outcome = await harness.emitter.redriveOutboxItem!(claim.item, { timeoutMs: 100, attemptToken: claim.attemptToken })
+    .finally(() => harness.outbox.releaseAttempt(claim.item.id, claim.attemptToken));
   assert.equal(harness.sendCalls.length - before, 2);
   assert.ok(harness.sendCalls[before + 1].opts!.timeoutMs! > 50);
   assert.equal(outcome.deliveredReceipts?.[live]?.stage, 'dispatched');
@@ -5397,6 +5403,178 @@ test('an expired outbox attempt cannot settle or release a newer lease', async t
   assert.deepEqual(settled?.inDoubtNodeIds, []);
 });
 
+test('outbox redrive requires a live token and uses only the leased row', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['carol'],
+    plan: () => ({ stage: 'rejected', executionReceipt: { handoff: 'unattempted' } }) });
+  const bob = harness.targetCard.nodeId;
+  const carol = harness.targetByMember.get('carol')!.nodeId;
+  const envelope = signEnvelope({ ...envelopeFor(harness.sender, harness.networkId, bob),
+    idempotencyKey: 'lease-only' }, harness.sender.privateKeyPem);
+  const cached = harness.outbox.enqueue({ envelope, explicitTargets: [bob], pendingNodeIds: [bob] });
+  const redrive = harness.emitter.redriveOutboxItem!;
+  const stoppedBeforeSend = (error: unknown) => error instanceof LocalDeliveryError && isBeforeSendError(error);
+  await assert.rejects(redrive(cached), stoppedBeforeSend);
+  const expired = harness.outbox.beginAttempt(envelope.id, { now: 0, leaseMs: 1 })!;
+  await assert.rejects(redrive(cached, { attemptToken: expired.attemptToken }), stoppedBeforeSend);
+  assert.equal(harness.sendCalls.length, 0);
+
+  const claimed = harness.outbox.beginAttempt(envelope.id)!;
+  try {
+    await assert.rejects(redrive(cached, { attemptToken: 'different-lease' }), stoppedBeforeSend);
+    await assert.rejects(redrive(cached, { attemptToken: claimed.attemptToken, targetNodeIds: [carol] }), stoppedBeforeSend);
+    assert.equal(harness.sendCalls.length, 0);
+    const stale = { ...cached, pendingNodeIds: [carol], envelope: { ...envelope, body: 'stale body' } };
+    const outcome = await redrive(stale, { attemptToken: claimed.attemptToken });
+    assert.deepEqual(harness.sendCalls.map(call => [call.targetNodeId, call.envelope.body]), [[bob, envelope.body]]);
+    harness.outbox.recordAttempt(envelope.id, { pendingNodeIds: [], nextAttemptAt: envelope.createdAt,
+      clearFenceNodeIds: outcome.clearFenceNodeIds, failures: outcome.failures,
+    }, claimed.attemptToken);
+  } finally {
+    harness.outbox.releaseAttempt(envelope.id, claimed.attemptToken);
+  }
+
+  const replacement = signEnvelope({ ...envelope, id: randomUUID(), routing: { mode: 'unicast', targets: [carol] } },
+    harness.sender.privateKeyPem);
+  const reserved = harness.outbox.replaceUnattemptedIdempotency({ envelope: replacement,
+    explicitTargets: [carol], plannedTargetNodeIds: [carol], expectedId: envelope.id });
+  assert.equal(reserved?.claimed, true);
+  assert.equal(harness.outbox.get(envelope.id)?.supersededById, replacement.id);
+  const sentBefore = harness.sendCalls.length;
+  await assert.rejects(redrive(cached), stoppedBeforeSend);
+  await assert.rejects(redrive(cached, { attemptToken: claimed.attemptToken }), stoppedBeforeSend);
+  if (reserved?.claimed) {
+    await assert.rejects(redrive(cached, { attemptToken: reserved.attemptToken }), stoppedBeforeSend);
+    harness.outbox.releaseAttempt(replacement.id, reserved.attemptToken);
+  }
+  assert.equal(harness.sendCalls.length, sentBefore);
+});
+
+function legacyOutboxItem(envelope: MessageEnvelope, explicitTargets: string[], lastError?: string): OutboxItem {
+  return {
+    id: envelope.id, networkId: envelope.networkId, envelope, explicitTargets, pendingNodeIds: [],
+    deliveredReceipts: {}, failedReceipts: {}, failedNodeIds: [], inDoubtNodeIds: [], relaySpooledNodeIds: [], stagedFiles: {},
+    status: 'queued', attempts: 0, createdAt: envelope.createdAt, updatedAt: envelope.createdAt,
+    nextAttemptAt: envelope.createdAt, lastError,
+  };
+}
+
+test('v1 auto and skill claims with an unknown outcome stay parked after upgrade', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['carol'] });
+  const { outbox, kernel, mailbox, sender, receiver, networkId } = harness;
+  const bob = new Kernel();
+  t.after(() => bob.stop());
+  bob.ctx.provide('node', { getSelfCard: () => harness.targetCard });
+  const ledgerPath = join(harness.dir, 'bob-deliveries.json');
+  await bob.use(createDispatcherPlugin({ privateKeyPem: receiver.privateKeyPem, ledgerPath }));
+  const executions: string[] = [];
+  bob.ctx.services.dispatcher.registerExecutor({ name: 'inbox', async execute([message]) {
+    executions.push(message.id);
+    return { executor: 'capture', executionId: message.id };
+  } }, {});
+  const items: OutboxItem[] = [];
+  for (const selectors of [[], ['skill:incident']]) {
+    const key = selectors[0] ?? 'auto';
+    const envelope = signEnvelope({ ...envelopeFor(sender, networkId, harness.targetCard.nodeId),
+      idempotencyKey: key, routing: { mode: 'auto', targets: selectors },
+      semantic: { type: 'question', threadId: key, replyMailbox: `terminal:v1-${items.length}` },
+    }, sender.privateKeyPem);
+    assert.equal((await bob.ctx.services.dispatcher.dispatch(envelope)).stage, 'dispatched');
+    items.push(legacyOutboxItem(envelope, selectors));
+  }
+  assert.ok(existsSync(ledgerPath));
+  assert.deepEqual(executions, items.map(item => item.id));
+  writeFileSync(outbox.path, JSON.stringify({ schema: 'the-dealer-outbox/v1', items }));
+  const carol = harness.targetByMember.get('carol')!.nodeId;
+  const router = kernel.ctx.services.router;
+  router.registerJudge({ name: 'new-recipient', priority: 1,
+    async decide() { return { mode: 'unicast', targetNodeIds: [carol], matchedBy: 'judge', reason: 'now available' }; },
+  });
+  assert.deepEqual((await router.route(items[0].envelope)).targetNodeIds, [carol]);
+  const route = t.mock.method(router, 'route');
+  const redrive = new OutboxRedriveService({ outbox, deliver: harness.emitter.redriveOutboxItem! });
+  t.after(() => redrive.stop());
+  assert.equal((await redrive.flush({ force: true })).attempted, 0);
+  assert.equal(JSON.parse(readFileSync(outbox.path, 'utf8')).schema, 'the-dealer-outbox/v2');
+  for (const original of items) {
+    const parked = outbox.get(original.id)!;
+    assert.equal(parked.status, 'failed');
+    assert.match(parked.lastError!, /Interrupted v1 outbox claim/);
+    assert.equal(isUnattemptedOutboxItem(parked), false);
+    assert.equal(outbox.readDefinitivelyFailedKeys().has(netKey(networkId, parked.id)), false);
+    assert.equal(mailbox.inspectSlotObligations('stream:legacy', {
+      sessionMailboxId: original.envelope.semantic?.replyMailbox, outbox,
+    }).immediateBusyReason, 'outbound_thread_open');
+    await assert.rejects(harness.emitter.emit({ ...original.envelope, body: 'different intent',
+      routing: { mode: 'unicast', targets: [carol] },
+    }), /Interrupted v1 outbox claim/);
+    assert.equal(outbox.findKeyedObligation(networkId, original.envelope.idempotencyKey!, 0)?.id, original.id);
+  }
+  assert.equal(route.mock.callCount(), 0);
+  assert.deepEqual(harness.sendCalls, []);
+});
+
+test('v1 concrete claims pin the original target and unresolved selectors still resolve after upgrade', async t => {
+  const harness = await emitterHarness(t, { extraMembers: ['carol', 'future'] });
+  const { outbox, sender, networkId } = harness;
+  const bob = harness.targetCard.nodeId;
+  const future = harness.targetByMember.get('future')!.nodeId;
+  const concrete = `node:${bob}`;
+  const pinned = legacyOutboxItem(envelopeFor(sender, networkId, concrete), [concrete, bob]);
+  const unresolved = legacyOutboxItem(envelopeFor(sender, networkId, 'member:future'), ['member:future'],
+    'Unresolved explicit target: member:future');
+  writeFileSync(outbox.path, JSON.stringify({ schema: 'the-dealer-outbox/v1', items: [pinned, unresolved] }));
+  const node = harness.kernel.ctx.services.node;
+  const resolveTarget = node.resolveTarget.bind(node);
+  let joined = false;
+  t.mock.method(node, 'resolveTarget', (selector: string, network?: string) =>
+    !joined && selector === 'member:future' ? [] : resolveTarget(selector, network));
+  let reachable = false;
+  const redrive = new OutboxRedriveService({ outbox, deliver: harness.emitter.redriveOutboxItem!,
+    isPeerReachable: () => reachable });
+  t.after(() => redrive.stop());
+  const lease = outbox.beginAttempt(pinned.id)!;
+  outbox.releaseAttempt(pinned.id, lease.attemptToken);
+  assert.deepEqual(outbox.get(pinned.id)?.pendingNodeIds, [bob]);
+  assert.deepEqual(outbox.get(pinned.id)?.inDoubtNodeIds, [bob]);
+  assert.equal(outbox.get(pinned.id)?.unresolvedRoute, undefined);
+  assert.equal(outbox.get(unresolved.id)?.unresolvedRoute, true);
+  assert.equal((await redrive.flush({ id: pinned.id })).attempted, 0);
+  await redrive.flush({ id: unresolved.id });
+  assert.deepEqual(harness.sendCalls, []);
+  assert.equal(outbox.get(unresolved.id)?.unresolvedRoute, true);
+  reachable = true;
+  await redrive.flush({ id: pinned.id });
+  joined = true;
+  await redrive.flush({ id: unresolved.id, force: true });
+  assert.deepEqual(harness.sendCalls.map(call => [call.envelope.id, call.targetNodeId]), [[pinned.id, bob], [unresolved.id, future]]);
+  assert.equal(outbox.get(pinned.id)?.status, 'delivered');
+  assert.deepEqual(outbox.get(pinned.id)?.inDoubtNodeIds, []);
+  assert.equal(outbox.get(unresolved.id)?.status, 'delivered');
+  assert.equal(outbox.get(unresolved.id)?.unresolvedRoute, undefined);
+  assert.equal(JSON.parse(readFileSync(outbox.path, 'utf8')).schema, 'the-dealer-outbox/v2');
+});
+
+test('a targetless v2 obligation needs explicit routing evidence or operator requeue', async t => {
+  const { outbox, sender, networkId, emitter, sendCalls, targetCard } = await emitterHarness(t);
+  const original = envelopeFor(sender, networkId, 'member:diz');
+  const envelope = signEnvelope({ ...original, idempotencyKey: original.id }, sender.privateKeyPem);
+  const { item } = outbox.claimIdempotency({ envelope,
+    explicitTargets: ['member:diz'], leaseMs: 1 });
+  const redrive = new OutboxRedriveService({ outbox, deliver: emitter.redriveOutboxItem! });
+  t.after(() => redrive.stop());
+  await until(() => Date.now() >= Date.parse(item.activeAttempt!.expiresAt), 'the interrupted attempt expires');
+  await redrive.flush({ force: true });
+  assert.deepEqual(sendCalls, []);
+  assert.match(outbox.get(item.id)!.lastError!, /no persisted targets; operator reconciliation required/);
+  assert.equal(isUnattemptedOutboxItem(outbox.get(item.id)), false);
+
+  assert.equal(outbox.requeue(item.id)?.unresolvedRoute, true);
+  await redrive.flush({ force: true });
+  assert.deepEqual(sendCalls.map(call => call.targetNodeId), [targetCard.nodeId]);
+  assert.equal(outbox.get(item.id)?.status, 'delivered');
+  assert.equal(outbox.get(item.id)?.unresolvedRoute, undefined);
+});
+
 test('interrupted claims and prepared sends pin keyed delivery to the original recipient', async t => {
   let closed = true;
   const harness = await emitterHarness(t, { extraMembers: ['carol'],
@@ -5422,7 +5600,7 @@ test('interrupted claims and prepared sends pin keyed delivery to the original r
     });
     assert.equal(claim.claimed, true);
     if (interruptedAt === 'prepare') {
-      const lease = harness.outbox.beginAttempt(envelope.id, { now: Date.parse(claim.item.activeAttempt!.expiresAt), leaseMs: 1 })!;
+      const lease = harness.outbox.beginAttempt(envelope.id, { now: Date.parse(claim.item.activeAttempt!.expiresAt), leaseMs: 250 })!;
       assert.ok(harness.outbox.prepareSend(envelope.id, lease.attemptToken, [target]));
     }
     const persisted = recovered.get(envelope.id)!;

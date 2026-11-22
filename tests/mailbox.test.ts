@@ -16,6 +16,7 @@ import {
   DEDUP_CAS_DUPLICATE_DETAIL,
   OutboxStore,
   WakeupRedriveService,
+  isUnattemptedOutboxItem,
   isUnknownEffectReceipt,
   normalizeMailboxId,
   resolveMailboxId,
@@ -482,6 +483,48 @@ test('uncertified signed rejections keep the outbound thread open', t => {
     outbox.enqueue({ envelope: request, explicitTargets: ['bob'], pendingNodeIds: [], failedReceipts: { bob: receipt } });
     assert.equal(outbox.readDefinitivelyFailedKeys().has(netKey(request.networkId, id)), false);
     assert.equal(store.inspectSlotObligations(waveSlot, { sessionMailboxId, outbox }).immediateBusyReason, 'outbound_thread_open');
+  }
+});
+
+test('replacement and slot readiness require the same positive outbox failure evidence', t => {
+  const { path, root } = workspace(t);
+  const store = new MailboxStore(path);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
+  for (const scenario of ['targetless', 'unsigned', 'mixed', 'no-attempt', 'before-send', 'signed', 'superseded']) {
+    const sessionMailboxId = `terminal:${scenario}`;
+    const request = envelope(scenario, {
+      idempotencyKey: scenario, signature: 'request-signature',
+      semantic: { type: 'question', threadId: scenario, replyMailbox: sessionMailboxId },
+    });
+    const receipt: DeliveryReceipt = {
+      messageId: request.id, networkId: request.networkId, fromNodeId: 'bob', stage: 'rejected',
+      updatedAt: request.createdAt, signature: 'receipt-signature',
+      executionReceipt: { executor: 'gate', executionId: request.id, handoff: 'unattempted', envelopeSignature: request.signature },
+    };
+    const signed = ['mixed', 'signed', 'superseded'].includes(scenario);
+    outbox.enqueue({ envelope: request, explicitTargets: ['bob'], pendingNodeIds: [],
+      ...(signed ? { failedReceipts: { bob: receipt } } : {}),
+      ...(scenario === 'mixed' ? { failedNodeIds: ['bob', 'carol'] } : {}),
+      ...(['unsigned', 'before-send'].includes(scenario) ? { failedNodeIds: ['bob'] } : {}),
+      ...(scenario === 'before-send' ? { unattemptedNodeIds: ['bob'] } : {}),
+    });
+    store.recordOutboundEnvelope(request, ['bob'], sessionMailboxId);
+    if (scenario === 'targetless') {
+      outbox.recordAttempt(request.id, { failures: [{ error: 'Unknown outcome' }], nextAttemptAt: request.createdAt });
+    } else if (scenario === 'no-attempt') {
+      outbox.markFailed(request.id, 'No addressable target');
+    } else if (scenario === 'superseded') {
+      const replacement = envelope('replacement', { ...request, id: 'replacement', body: 'new intent',
+        semantic: { type: 'question', threadId: 'replacement', replyMailbox: 'terminal:replacement' } });
+      assert.equal(outbox.replaceUnattemptedIdempotency({ envelope: replacement, explicitTargets: ['carol'],
+        plannedTargetNodeIds: ['carol'], expectedId: request.id })?.claimed, true);
+      assert.equal(outbox.get(request.id)?.supersededById, replacement.id);
+    }
+    const proven = ['no-attempt', 'before-send', 'signed', 'superseded'].includes(scenario);
+    assert.equal(isUnattemptedOutboxItem(outbox.get(request.id)), proven && scenario !== 'superseded', scenario);
+    assert.equal(outbox.readDefinitivelyFailedKeys().has(netKey(request.networkId, request.id)), proven, scenario);
+    assert.equal(store.inspectSlotObligations(waveSlot, { sessionMailboxId, outbox }).immediateBusyReason,
+      proven ? undefined : 'outbound_thread_open', scenario);
   }
 });
 

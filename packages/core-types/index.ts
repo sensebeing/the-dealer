@@ -235,8 +235,7 @@ export function receiptMatchesEnvelopeSignature(receipt: HandoffReceipt | undefi
   return typeof signature !== 'string' || signature.length === 0 || typeof bound !== 'string' || bound === signature;
 }
 
-/** True when positive evidence rules out an attempt and no obligation remains. */
-export function isUnattemptedOutboxItem(item: {
+interface OutboxFailureEvidence {
   status?: string;
   envelope?: { signature?: unknown };
   supersededById?: unknown;
@@ -249,8 +248,11 @@ export function isUnattemptedOutboxItem(item: {
   failedReceipts?: Readonly<Record<string, HandoffReceipt>>;
   unattemptedNodeIds?: readonly string[];
   unattemptedFailure?: boolean;
-} | null | undefined): boolean {
-  if (!item || item.status !== 'failed' || item.supersededById !== undefined) return false;
+}
+
+/** Positive failure evidence still applies to an envelope that has been superseded. */
+export function hasProvenUnattemptedFailure(item: OutboxFailureEvidence | null | undefined): boolean {
+  if (!item || item.status !== 'failed') return false;
   if ((item.pendingNodeIds?.length ?? 0) > 0 || (item.inDoubtNodeIds?.length ?? 0) > 0) return false;
   if ((item.relaySpooledNodeIds?.length ?? 0) > 0 || (item.approvalPendingNodeIds?.length ?? 0) > 0) return false;
   if (Object.keys(item.deliveredReceipts ?? {}).length > 0) return false;
@@ -264,6 +266,11 @@ export function isUnattemptedOutboxItem(item: {
       ? isRetryablePreEffectReceipt(receipt) && receiptMatchesEnvelopeSignature(receipt, item.envelope?.signature)
       : unattemptedLocal.has(id);
   });
+}
+
+/** True when a failed obligation can be replaced without repeating an effect. */
+export function isUnattemptedOutboxItem(item: OutboxFailureEvidence | null | undefined): boolean {
+  return Boolean(item && item.supersededById === undefined && hasProvenUnattemptedFailure(item));
 }
 
 export interface SealedNetworkFrame {
@@ -584,6 +591,8 @@ export interface OutboxItem {
   envelope: MessageEnvelope;
   explicitTargets: string[];
   pendingNodeIds: string[];
+  /** Routing has positively found no recipient yet, or an operator has authorized rerouting. */
+  unresolvedRoute?: boolean;
   approvalPendingNodeIds?: string[];
   deliveredReceipts: Record<string, DeliveryReceipt>;
   /** Signed terminal decisions, kept as operator evidence and never reported as delivered. */
@@ -663,6 +672,7 @@ export interface OutboxAttemptOptions {
 export interface OutboxEnqueueInput {
   attemptToken?: string;
   sentCommitted?: boolean;
+  unresolvedRoute?: boolean;
   /** Targets whose current attempt recorded a non-ambiguous outcome. */
   clearFenceNodeIds?: readonly string[];
   /** Replace outcomes only for these original targets; confirmed execution is immutable. */
@@ -686,6 +696,7 @@ export interface OutboxEnqueueInput {
 export interface OutboxClaimInput {
   envelope: MessageEnvelope;
   explicitTargets: string[];
+  unresolvedRoute?: boolean;
   plannedTargetNodeIds?: readonly string[];
   filePaths?: Record<string, string>;
   /** How long the attempt owns the obligation before another worker may resume it. */
@@ -752,13 +763,14 @@ export interface OutboxDeliveryOutcome {
 
 /** Persistence surface the emitter needs; the concrete OutboxStore implements it. */
 export interface OutboxStoreLike {
+  get?(id: string): OutboxItem | undefined;
   enqueue(input: OutboxEnqueueInput): OutboxItem;
   /** Atomically reserve monotonic versions per (networkId, idempotencyKey) under the store lock. */
   claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
   /** Reserve a same-version replacement or retry of the exact unattempted obligation observed. */
   replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined;
   beginAttempt(id: string, options?: OutboxAttemptOptions): { item: OutboxItem; attemptToken: string } | undefined;
-  prepareSend?(id: string, attemptToken: string, targetNodeIds: readonly string[]): OutboxItem | undefined;
+  prepareSend(id: string, attemptToken: string, targetNodeIds: readonly string[]): OutboxItem | undefined;
   markSentCommitted?(id: string): boolean;
   releaseAttempt(id: string, attemptToken: string): void;
   /** Read the highest matching version without reserving or changing an obligation. */

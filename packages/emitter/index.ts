@@ -14,6 +14,7 @@ import {
   isUnknownEffectReceipt,
   isUnresolvedTargetError,
   LocalDeliveryError,
+  markBeforeSendError,
   NetworkUnmountedError,
   outboxReconciliationTargets,
   outstandingRelaySpooledTargets,
@@ -151,10 +152,10 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           return attempt?.status !== 'pending' || !attempt.inDoubt;
         });
 
-      const prepareSend = (id: string, attemptToken: string, targets: readonly string[]): void => {
-        if (outbox?.prepareSend && targets.length > 0 && !outbox.prepareSend(id, attemptToken, targets)) {
-          throw new LocalDeliveryError(`Outbox attempt no longer owns obligation ${id}`);
-        }
+      const prepareSend = (id: string, attemptToken: string, targets: readonly string[]): OutboxItem => {
+        const leased = outbox?.prepareSend(id, attemptToken, targets);
+        if (!leased) throw markBeforeSendError(new LocalDeliveryError(`Outbox attempt no longer owns obligation ${id}`));
+        return leased;
       };
 
       /**
@@ -434,7 +435,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 route = { unresolved: error.message };
               }
               if (keyedClaim) {
-                const plannedClaim = 'unresolved' in route || route.mode === 'broadcast' ? claimInput
+                const plannedClaim = 'unresolved' in route ? { ...claimInput, unresolvedRoute: true }
                   : { ...claimInput, plannedTargetNodeIds: route.targetNodeIds };
                 let claim = replaceable ? undefined : outbox.claimIdempotency(plannedClaim);
                 if (claim && !claim.claimed && mayReplace(claim.item)) replaceable = claim.item;
@@ -448,7 +449,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               }
               if ('unresolved' in route) {
                 const queued = outbox!.enqueue({
-                  ...claimInput, attemptToken, sentCommitted: true, pendingNodeIds: [], lastError: route.unresolved,
+                  ...claimInput, attemptToken, sentCommitted: true, pendingNodeIds: [], unresolvedRoute: true, lastError: route.unresolved,
                 });
                 const receipt = queuedReceipt(envelope, self, undefined, false, route.unresolved);
                 ctx.emit('emitter/sent', { envelope, targetNodeIds: [], receipts: [receipt], createdAt: queued.createdAt });
@@ -633,9 +634,17 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           }
         },
         async redriveOutboxItem(
-          item: OutboxItem,
+          suppliedItem: OutboxItem,
           options: OutboxRedriveDeliveryOptions = {},
         ): Promise<OutboxDeliveryOutcome> {
+          const { attemptToken } = options;
+          let item = suppliedItem;
+          if (outbox) {
+            if (typeof attemptToken !== 'string' || !attemptToken) {
+              throw markBeforeSendError(new LocalDeliveryError('Outbox redrive requires an active attemptToken'));
+            }
+            item = prepareSend(suppliedItem.id, attemptToken, []);
+          }
           const { transport, router } = ctx.services;
           const mounted = transport.listMountedNetworks().includes(item.networkId);
           // Every attachment in the signed envelope must have durable local evidence; a
@@ -665,12 +674,15 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             }
           }
           let targets = options.targetNodeIds !== undefined
-            ? [...options.targetNodeIds]
+            ? [...new Set(options.targetNodeIds)]
             : item.pendingNodeIds.filter(
                 nodeId =>
                   !item.deliveredReceipts[nodeId] &&
                   !item.failedNodeIds.includes(nodeId),
               );
+          if (outbox && targets.some(nodeId => !item.pendingNodeIds.includes(nodeId))) {
+            throw markBeforeSendError(new LocalDeliveryError(`Outbox redrive targets are outside obligation ${item.id}`));
+          }
           const untouched = item.pendingNodeIds.filter(
             nodeId =>
               !targets.includes(nodeId) &&
@@ -682,6 +694,9 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           // deliver through the transport without a mount.
           let resolvedTargetNodeIds: readonly string[] | undefined;
           if (targets.length === 0 && options.targetNodeIds === undefined) {
+            if (item.unresolvedRoute !== true) {
+              return { failures: [{ error: 'Outbox obligation has no persisted targets; operator reconciliation required' }] };
+            }
             let route: RouteDecision;
             try {
               route = await router.route(item.envelope);
@@ -724,7 +739,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           let lastError: string | undefined;
           // All targets share a deadline but start independently; a dead peer cannot
           // consume a live sibling's send budget. Fold evidence in target order.
-          if (options.attemptToken !== undefined) prepareSend(item.id, options.attemptToken, targets);
+          if (outbox && attemptToken && targets.length > 0) item = prepareSend(item.id, attemptToken, targets);
           const deadline = Date.now() + (options.timeoutMs ?? 10_000);
           const attempts = await Promise.all(targets.map(target => {
             if (Date.now() >= deadline) return undefined;
@@ -780,14 +795,17 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             lastError = attempt.error;
           }
           const pending = [...new Set([...untouched, ...pendingNodeIds])];
-          const inDoubtNodeIds = [...new Set([...item.inDoubtNodeIds, ...outcomeInDoubtNodeIds])]
-            .filter(nodeId => !isConfirmedHandoffReceipt(deliveredReceipts[nodeId], { allowQueued: false }));
+          const clearFenceNodeIds = clearedFences(targets, attempts);
+          // The store retains earlier uncertainty and settles its own provisional fences.
+          const inDoubtNodeIds = outbox ? outcomeInDoubtNodeIds
+            : [...new Set([...item.inDoubtNodeIds, ...outcomeInDoubtNodeIds])]
+              .filter(nodeId => !isConfirmedHandoffReceipt(deliveredReceipts[nodeId], { allowQueued: false }));
           return {
             ...(resolvedTargetNodeIds !== undefined ? { resolvedTargetNodeIds } : {}),
             deliveredReceipts,
             pendingNodeIds: pending,
             inDoubtNodeIds,
-            clearFenceNodeIds: clearedFences(targets, attempts),
+            clearFenceNodeIds,
             ...(unattemptedNodeIds.length > 0 ? { unattemptedNodeIds } : {}),
             relaySpooledNodeIds: outstandingRelaySpooledTargets(
               [...item.relaySpooledNodeIds, ...relaySpooledNodeIds], { ...item.deliveredReceipts, ...deliveredReceipts },
