@@ -141,7 +141,7 @@ export async function checkOrcaWorkspaceIdle(
     worktreeId: string;
     childWorktreeIds?: string[];
     unverifiableTerminalCount?: number;
-    agents?: { state?: string; paneKey?: string; parentPaneKey?: string }[];
+    agents?: { state?: string; paneKey?: string; parentPaneKey?: string | null }[];
   };
   const rows: Workspace[] = inventory.worktrees;
   const root = rows.find((row) => row.path === cwd);
@@ -155,7 +155,11 @@ export async function checkOrcaWorkspaceIdle(
       return { idle: true, reason: undefined };
     }
   }
+  const slotScoped = options?.targetTerminalHandle !== undefined || Boolean(
+    options?.targetPaneKey?.trim() || options?.retiringTerminalHandle?.trim() || options?.retiringPaneKey?.trim(),
+  );
   const visited = new Set<string>();
+  let childCreators: Map<string, string> | undefined;
   const idleTree = async (row: Workspace): Promise<boolean> => {
     if (visited.has(row.worktreeId)) {
       return false;
@@ -277,20 +281,46 @@ export async function checkOrcaWorkspaceIdle(
         !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal, options)).idle
       ) return false;
     }
+    const ownHandle = rotating ? retiringHandle : targetTerm
+      ? String(targetTerm.handle)
+      : typeof options?.targetTerminalHandle === 'string' ? options.targetTerminalHandle.trim() : undefined;
+    let siblingHandles: Set<string> | undefined;
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
       if (!child) return false;
+      const canExcludeChild = handles.length <= 1 || child.unverifiableTerminalCount === 0;
       if (
-        targetPaneKeys.size > 0 && child.agents?.length &&
-        (handles.length <= 1 || child.unverifiableTerminalCount === 0) &&
+        targetPaneKeys.size > 0 && child.agents?.length && canExcludeChild &&
         child.agents.every(agent =>
           typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey),
         )
       ) continue;
       // A vanished terminal without a recorded pane can only rule out work attributed to a live sibling.
       if (siblingPaneKeys?.size && child.unverifiableTerminalCount === 0 && child.agents?.length &&
-        child.agents.every(agent => agent.parentPaneKey !== undefined && siblingPaneKeys.has(agent.parentPaneKey))
+        child.agents.every(agent => typeof agent.parentPaneKey === 'string' && siblingPaneKeys.has(agent.parentPaneKey))
       ) continue;
+      // Follow-up dispatches can lose their parent pane. An explicit parent in this slot takes
+      // precedence over the worktree's creator, since this slot may have dispatched into it.
+      if (isRoot && slotScoped && !child.agents?.some(agent =>
+        typeof agent.parentPaneKey === 'string' && targetPaneKeys.has(agent.parentPaneKey),
+      )) {
+        if (!childCreators) {
+          try {
+            childCreators = await readOrcaChildCreators(runner, command, cwd, signal);
+          } catch (error) {
+            if (options?.throwOnProbeError) throw error;
+            return false;
+          }
+        }
+        const creatorHandle = childCreators.get(child.worktreeId);
+        if (canExcludeChild && creatorHandle && creatorHandle !== ownHandle && creatorHandle !== retiringHandle) {
+          siblingHandles ??= new Set(handles.filter(terminal =>
+            isUsableTerminal(terminal) && terminal !== targetTerm && String(terminal.handle) !== ownHandle &&
+            !terminalPaneKeys(terminal).some(key => targetPaneKeys.has(key)),
+          ).map(terminal => String(terminal.handle)));
+          if (siblingHandles.has(creatorHandle) || options?.excludedHandles?.has(creatorHandle)) continue;
+        }
+      }
       if (!(await idleTree(child))) {
         return false;
       }
@@ -943,6 +973,23 @@ export async function listOrcaWorkspaces(
   cwd: string,
   signal?: AbortSignal,
 ): Promise<{ path?: unknown }[]> {
+  return readOrcaWorkspaceList(runner, command, cwd, signal);
+}
+
+interface OrcaListedWorktree {
+  path?: unknown;
+  id?: unknown;
+  worktreeId?: unknown;
+  lineage?: { worktreeId?: unknown; createdByTerminalHandle?: unknown };
+}
+
+async function readOrcaWorkspaceList(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+  allowMissingWorktrees = false,
+): Promise<OrcaListedWorktree[]> {
   const listed = await checkedCommand(runner, {
     command,
     args: ['worktree', 'list', '--json'],
@@ -951,9 +998,30 @@ export async function listOrcaWorkspaces(
   });
   const raw = JSON.parse(listed.stdout);
   const rows = raw?.result?.worktrees ?? raw?.worktrees ?? (Array.isArray(raw?.result) ? raw.result : undefined);
-  if (raw?.ok === false || !Array.isArray(rows) || raw?.result?.truncated)
-    throw new Error('Incomplete Orca workspace inventory');
-  return rows;
+  if (raw?.ok === false || raw?.result?.truncated || (!allowMissingWorktrees && !Array.isArray(rows))) {
+    throw new Error('Incomplete Orca workspace inventory from Orca worktree list');
+  }
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function readOrcaChildCreators(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<Map<string, string>> {
+  // Synthetic runners may return a generic success without worktree rows. That proves no ownership.
+  const worktrees = await readOrcaWorkspaceList(runner, command, cwd, signal, runner !== runCommand);
+  const creators = new Map<string, string>();
+  for (const worktree of worktrees) {
+    const handle = worktree?.lineage?.createdByTerminalHandle;
+    const creator = typeof handle === 'string' ? handle.trim() : '';
+    if (!creator) continue;
+    for (const id of [worktree.id, worktree.worktreeId, worktree.lineage?.worktreeId]) {
+      if (typeof id === 'string' && id) creators.set(id, creator);
+    }
+  }
+  return creators;
 }
 
 export async function ensureOrcaWorkspace(

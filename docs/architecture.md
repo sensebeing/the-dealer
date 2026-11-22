@@ -617,8 +617,11 @@ sequences. Confirmed delivery may atomically pin its session mailbox and deliver
 mail arriving during delivery remains pending. Proven command non-starts back off, while unknown
 outcomes remain fenced across mail arrivals, forced flushes and restarts. Orca drivers retain
 idle proof and empty target-composer verification, create independent tabs for rotation only after
-the retiring slot's own agent and pane-owned child worktrees are done, then close the retired
-terminal and keep its handle reserved until the close is confirmed. Rotation never resets or
+the retiring slot's own agent and child worktrees are done, then close the retired terminal and
+keep its handle reserved until the close is confirmed. Slot-scoped checks use parent panes and
+consult Orca's persisted worktree creator once if attribution is unresolved. A child can be
+excluded when its creator is a live or claimed sibling and the child has no parent pane in the
+current slot. An incomplete lineage inventory blocks readiness. Rotation never resets or
 writes into a retained session. An already-absent retired terminal settles the retirement, while a
 deterministic Orca refusal (for example a pinned tab) parks the wake target in `deliveryInDoubt`
 for operator reconciliation instead of retrying forever. Any human draft or unconfirmed Turn Pilot recommendation holds mail
