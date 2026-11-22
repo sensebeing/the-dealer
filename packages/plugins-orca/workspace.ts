@@ -371,33 +371,39 @@ export async function checkOrcaWorkspaceIdle(
       return visit(subtree) ? candidates : undefined;
     };
     let childCreators: Map<string, string> | undefined;
-    let rootDescendants: Workspace[] | undefined;
-    const provenSiblingWorktreeIds = new Set<string>();
-    const isWorktreeProvenSibling = async (node: Workspace, visiting = new Set<string>()): Promise<boolean> => {
-      const id = node.worktreeId;
-      if (provenSiblingWorktreeIds.has(id)) return true;
-      if (visiting.has(id)) return false;
-      const attribution = siblingAttribution(node);
-      if (!attribution) return false;
-      if (attribution === 'pane') {
-        provenSiblingWorktreeIds.add(id);
-        return true;
-      }
-      const creator = childCreators?.get(id);
-      if (!allowedSiblingHandle(creator)) return false;
-      if (siblingHandles.has(creator) || options?.excludedHandles?.has(creator)) {
-        provenSiblingWorktreeIds.add(id);
-        return true;
-      }
-      const nextVisiting = new Set(visiting).add(id);
-      for (const ancestor of rootDescendants ??= descendantsOfRoot()) {
-        if (!await isWorktreeProvenSibling(ancestor, nextVisiting)) continue;
-        if ((await readWorktreeTerminalHandles(ancestor)).has(creator)) {
-          provenSiblingWorktreeIds.add(id);
-          return true;
+    let ownerByTerminalHandle: Promise<Map<string, Workspace | null>> | undefined;
+    const siblingProofMemo = new Map<string, boolean>();
+    const indexDescendantTerminalOwners = async (): Promise<Map<string, Workspace | null>> => {
+      const owners = new Map<string, Workspace | null>();
+      for (const descendant of descendantsOfRoot()) {
+        if (!siblingAttribution(descendant)) continue;
+        for (const handle of await readWorktreeTerminalHandles(descendant)) {
+          owners.set(handle, owners.has(handle) ? null : descendant);
         }
       }
-      return false;
+      return owners;
+    };
+    const isWorktreeProvenSibling = async (node: Workspace, visiting = new Set<string>()): Promise<boolean> => {
+      const id = node.worktreeId;
+      const cached = siblingProofMemo.get(id);
+      if (cached !== undefined) return cached;
+      const remember = (result: boolean): boolean => {
+        siblingProofMemo.set(id, result);
+        return result;
+      };
+      if (visiting.has(id)) return remember(false);
+      const attribution = siblingAttribution(node);
+      if (!attribution) return remember(false);
+      if (attribution === 'pane') return remember(true);
+      const creator = childCreators?.get(id);
+      if (!allowedSiblingHandle(creator)) return remember(false);
+      if (siblingHandles.has(creator) || options?.excludedHandles?.has(creator)) return remember(true);
+      const owners = await (ownerByTerminalHandle ??= indexDescendantTerminalOwners());
+      const owner = owners.get(creator);
+      if (!owner || owner.worktreeId === id) return remember(false);
+      // A unique owner is the only next edge, so this walk can share one visiting set.
+      visiting.add(id);
+      return remember(await isWorktreeProvenSibling(owner, visiting));
     };
     for (const id of row.childWorktreeIds ?? []) {
       const child = rowsById.get(id);

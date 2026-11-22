@@ -421,6 +421,16 @@ test('sibling attribution follows a descendant creator terminal during slot prob
     }), /Incomplete Orca terminal inventory/);
     child.terminalsTruncated = false;
 
+    const duplicate: FakeOrcaChild = {
+      path: join(root, 'c-duplicate'), worktreeId: 'c-duplicate', unverifiableTerminalCount: 0,
+      agents: [], terminals: [childTerminal], lineage: { createdByTerminalHandle: sibling.handle },
+    };
+    state.children.push(duplicate);
+    state.childWorktreeIds.push(duplicate.worktreeId);
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'an ambiguous creator terminal cannot prove sibling ownership');
+    state.children.pop();
+    state.childWorktreeIds.pop();
+
     state.calls.length = 0;
     assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
     assert.equal(worktreeListCalls(state.calls), 1);
@@ -437,6 +447,35 @@ test('sibling attribution follows a descendant creator terminal during slot prob
     assert.equal(wake.rotated, true);
     assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
     assert.equal(sendsTo(state.calls, sibling.handle).length, 0);
+  }
+});
+
+test('slot probes bound creator proof for vanished handles and cycles', { timeout: 5_000 }, async t => {
+  const { root, service, state } = slotProbeFixture(t, { paneKey: 'wave:root' });
+  state.terminals.push({ ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' });
+  const busyChild = (worktreeId: string, creator: string): FakeOrcaChild => ({
+    path: join(root, worktreeId), worktreeId, unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: null }],
+    terminals: [{ ...probeTerminal, handle: `term-${worktreeId}` }],
+    lineage: { createdByTerminalHandle: creator },
+  });
+  const vanished = Array.from({ length: 12 }, (_, index) => busyChild(`c-${index}`, `term-vanished-${index}`));
+  const cycle = [busyChild('c-cycle-a', 'term-c-cycle-b'), busyChild('c-cycle-b', 'term-c-cycle-a')];
+  state.children = [...vanished, ...cycle];
+
+  // The probe stops at the first unprovable subtree. Exercise both forms of dead end.
+  for (const first of [vanished[0], cycle[0]]) {
+    state.childWorktreeIds = [first.worktreeId,
+      ...state.children.filter(child => child !== first).map(child => child.worktreeId)];
+    state.calls.length = 0;
+    assert.deepEqual(await service.probeSlot(probeMailbox), {
+      busy: true, ready: false, reason: 'Workspace or descendant is busy or unverifiable',
+    });
+    assert.equal(worktreeListCalls(state.calls), 1);
+    const terminalLists = state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list');
+    for (const child of state.children) {
+      assert.equal(terminalLists.filter(call => call.args.includes(`path:${child.path}`)).length, 1, child.worktreeId);
+    }
   }
 });
 
