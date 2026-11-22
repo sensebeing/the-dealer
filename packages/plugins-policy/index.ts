@@ -81,7 +81,7 @@ export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): Dispa
           stage: 'rejected', detail: 'Invalid claim version',
           executionReceipt: {
             executor: 'dedup-cas', executionId: 'dedup-cas:' + envelope.id,
-            handoff: 'unattempted', durable: Boolean(options.watermarksPath),
+            handoff: 'unattempted', durable: Boolean(options.watermarksPath), envelopeSignature: envelope.signature,
           },
         };
       }

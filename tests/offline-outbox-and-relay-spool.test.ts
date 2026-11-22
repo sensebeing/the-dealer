@@ -4874,6 +4874,12 @@ test('outbox replacement requires signed pre-effect evidence for every failed ta
   const unattempted = { stage: 'failed', executionReceipt: { handoff: 'unattempted' } };
   const item = { status: 'failed', failedNodeIds: ['a'], failedReceipts: { a: unattempted } };
   assert.equal(isUnattemptedOutboxItem(item), true);
+  const boundItem = {
+    ...item, envelope: { signature: 'original' },
+    failedReceipts: { a: { stage: 'failed', executionReceipt: { handoff: 'unattempted', envelopeSignature: 'other' } } },
+  };
+  assert.equal(isUnattemptedOutboxItem(boundItem), false);
+  assert.equal(isUnattemptedOutboxItem({ ...boundItem, envelope: { signature: 'other' } }), true);
   const unannotated = { stage: 'rejected', detail: 'custom' };
   assert.equal(isRetryablePreEffectReceipt(unannotated), false);
   for (const blocked of [
@@ -4896,6 +4902,22 @@ test('outbox replacement requires signed pre-effect evidence for every failed ta
       assert.equal(isUnattemptedOutboxItem({ ...item, failedReceipts: { a: failure } }), false);
     }
   }
+});
+
+test('a receipt bound to a different envelope cannot authorize outbox replacement', async t => {
+  const harness = await emitterHarness(t, { plan: () => ({
+    stage: 'rejected', executionReceipt: { handoff: 'unattempted', envelopeSignature: 'other-envelope' },
+  }) });
+  const input: EmitMessageInput = {
+    networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'wave', subject: 'wave', body: 'slot 2', payload: {}, idempotencyKey: 'receipt-binding',
+  };
+  await assert.rejects(harness.emitter.emit(input), /Invalid or mismatched delivery receipt/);
+  const [original] = harness.outbox.list();
+  assert.equal(isUnattemptedOutboxItem(original), false);
+  await assert.rejects(harness.emitter.emit({ ...input, body: 'slot 1' }), /Invalid or mismatched delivery receipt/);
+  assert.deepEqual(harness.sendCalls.map(call => call.envelope.id), [original.id, original.id]);
+  assert.deepEqual(harness.outbox.list().map(item => item.id), [original.id]);
 });
 
 for (const handoff of ['unattempted', 'unknown'] as const) {

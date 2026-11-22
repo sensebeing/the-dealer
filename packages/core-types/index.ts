@@ -210,9 +210,16 @@ export function isRetryablePreEffectReceipt(receipt: HandoffReceipt | null | und
   return false;
 }
 
+/** A bound receipt applies only to its envelope. Older receipts may omit the binding. */
+export function receiptMatchesEnvelopeSignature(receipt: HandoffReceipt | undefined, signature: unknown): boolean {
+  const bound = receipt?.executionReceipt?.envelopeSignature;
+  return typeof signature !== 'string' || signature.length === 0 || typeof bound !== 'string' || bound === signature;
+}
+
 /** True only when every target has signed pre-effect evidence and no remaining obligation. */
 export function isUnattemptedOutboxItem(item: {
   status?: string;
+  envelope?: { signature?: unknown };
   supersededById?: unknown;
   pendingNodeIds?: readonly string[];
   inDoubtNodeIds?: readonly string[];
@@ -225,7 +232,9 @@ export function isUnattemptedOutboxItem(item: {
   if (Object.keys(item.deliveredReceipts ?? {}).length > 0) return false;
   const failedReceipts = item.failedReceipts ?? {};
   const failedIds = new Set([...(item.failedNodeIds ?? []), ...Object.keys(failedReceipts)]);
-  return failedIds.size > 0 && [...failedIds].every(id => isRetryablePreEffectReceipt(failedReceipts[id]));
+  return failedIds.size > 0 && [...failedIds].every(id =>
+    isRetryablePreEffectReceipt(failedReceipts[id]) && receiptMatchesEnvelopeSignature(failedReceipts[id], item.envelope?.signature),
+  );
 }
 
 export interface SealedNetworkFrame {
@@ -716,6 +725,7 @@ export interface RouterService {
 
 export const DND_HANDOFF_PARKED = 'dnd_handoff_parked';
 export const DND_CUSTODY_RETAINED = 'dnd_custody_retained';
+export const APPROVAL_CUSTODY_RETAINED = 'approval_custody_retained';
 
 export type GateVerdict =
   | { status: 'allow' }

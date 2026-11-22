@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
-import { DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, isConfirmedHandoffReceipt, verifyEnvelope } from '../core-types/index.ts';
+import {
+  APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, isConfirmedHandoffReceipt, verifyEnvelope,
+} from '../core-types/index.ts';
 import type {
   AdmissionMode,
   GateRulePlugin,
@@ -180,6 +182,11 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         if (retained && existingDnd.status === 'queued' && verdict.status === 'reject' && !drainingCurrent) {
           return { ...verdict, code: DND_CUSTODY_RETAINED, durable };
         }
+        if (verdict.status === 'reject' && [...pending.values()].some(item =>
+          key(item.envelope) === key(envelope),
+        )) {
+          return { ...verdict, code: APPROVAL_CUSTODY_RETAINED, durable: false };
+        }
         if (verdict.status === 'pending_approval') {
           const existing = [...pending.values()].find(
             item => key(item.envelope) === key(envelope),
@@ -244,6 +251,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
                 const verdict = await evaluate(envelope, entry);
                 if (verdict.status === 'reject') {
                   if (verdict.code !== DND_HANDOFF_PARKED && verdict.code !== DND_CUSTODY_RETAINED &&
+                      verdict.code !== APPROVAL_CUSTODY_RETAINED &&
                       service.getNetworkMode(envelope.networkId) === 'open' &&
                       dnd.get(id)?.envelope.signature === envelope.signature) updateDnd(id);
                   continue;
@@ -312,6 +320,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
           if (!item) {
             throw new Error(`Unknown approval: ${id}`);
           }
+          if (approving.has(id)) throw new Error(`Approval already in progress: ${id}`);
           pending.delete(id);
           const queuedId = dndKey(item.envelope);
           if (dnd.get(queuedId)?.envelope.signature === item.envelope.signature) updateDnd(queuedId);

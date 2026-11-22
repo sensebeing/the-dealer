@@ -12,6 +12,7 @@ import {
   LocalDeliveryError,
   NetworkUnmountedError,
   outboxReconciliationTargets,
+  receiptMatchesEnvelopeSignature,
   resolveSemanticHeader,
   sameEnvelopeIntent,
   signEnvelope,
@@ -115,7 +116,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           !verifyReceipt(receipt) ||
           receipt.messageId !== envelope.id ||
           receipt.networkId !== envelope.networkId ||
-          receipt.fromNodeId !== target
+          receipt.fromNodeId !== target ||
+          !receiptMatchesEnvelopeSignature(receipt, envelope.signature)
         ) {
           throw new LocalDeliveryError('Invalid or mismatched delivery receipt');
         }

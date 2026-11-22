@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import {
-  DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt,
+  APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, isRetryablePreEffectReceipt,
+  PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt,
 } from '../core-types/index.ts';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type {
@@ -110,6 +111,12 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         await Promise.allSettled(active.values());
       });
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
+      const readDeliveryFence = (id: string): DispatchReceipt | undefined => {
+        const receipt = ledger.get(id);
+        if (!isRetryablePreEffectReceipt(receipt)) return receipt;
+        ledger.delete(id);
+        return undefined;
+      };
       const select = (e: MessageEnvelope) => {
         const resolved = config.resolveExecutor?.(e);
         if (resolved !== undefined) return resolved;
@@ -154,7 +161,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         if (!executor) {
           throw Object.assign(new Error(`Executor unavailable: ${name}`), { beforeExternalEffect: true });
         }
-        const members = batch.map(envelope => ({ envelope, id: key(envelope), prior: ledger.get(key(envelope)) }));
+        const members = batch.map(envelope => ({ envelope, id: key(envelope), prior: readDeliveryFence(key(envelope)) }));
         for (const { envelope, prior } of members) {
           if (prior && prior.stage !== 'queued') {
             throw new Error(`Execution already attempted: ${envelope.id} (${prior.stage})`);
@@ -270,7 +277,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           if (ongoing) {
             return ongoing;
           }
-          const prior = ledger.get(id);
+          const prior = readDeliveryFence(id);
           if (prior) {
             return Promise.resolve(prior);
           }
@@ -279,7 +286,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               if (controller.signal.aborted) {
                 throw Object.assign(new Error('Dispatcher stopped'), { beforeExternalEffect: true });
               }
-              const settled = ledger.get(id);
+              const settled = readDeliveryFence(id);
               if (settled) return settled;
               assertRequiredPolicies();
               const chain = [...policies];
@@ -311,6 +318,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                         executor: result.executionReceipt?.executor ?? policy.name,
                         executionId: result.executionReceipt?.executionId ?? `${policy.name}:${e.id}`,
                         handoff: 'rejected',
+                        envelopeSignature: e.signature,
                       },
                     };
                   }
@@ -322,7 +330,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             .then(result => {
               // A queued policy owns its pending buffer; do not overwrite a later wave's completed state.
               const recorded = ledger.get(id);
-              if (!recorded) {
+              if (!recorded && !isRetryablePreEffectReceipt(result)) {
                 ledger.set(id, result);
               }
               // Record the authenticated inbound route only after the gate allowed this delivery.
@@ -393,10 +401,6 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           receipt = {
             stage: 'rejected',
             detail: 'Invalid envelope signature or authenticated sender/network mismatch',
-            executionReceipt: {
-              executor: 'dispatcher', executionId: `dispatcher:${envelope.id}`,
-              handoff: 'unattempted', durable: Boolean(config.ledgerPath),
-            },
           };
         } else {
           const verdict = await ctx.services.gate.evaluate(envelope);
@@ -418,18 +422,19 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             }
           } else if (verdict.status === 'reject') {
             const id = key(envelope);
-            const prior = ledger.get(id);
+            const prior = readDeliveryFence(id);
             const dndCustody = verdict.code === DND_HANDOFF_PARKED || verdict.code === DND_CUSTODY_RETAINED;
+            const approvalCustody = verdict.code === APPROVAL_CUSTODY_RETAINED;
             const executor = dndCustody ? 'gate-dnd' : 'gate';
             let handoff = 'unattempted';
-            if (dndCustody) handoff = 'unknown';
+            if (dndCustody || approvalCustody) handoff = 'unknown';
             else if (prior?.stage === 'dispatched' || prior?.stage === 'settled') handoff = 'settled';
             else if (prior || active.has(id)) handoff = 'unknown';
             receipt = {
               stage: 'rejected', detail: verdict.reason,
               executionReceipt: {
                 executor, executionId: `${executor}:${envelope.id}`, handoff,
-                durable: dndCustody ? Boolean(verdict.durable) : Boolean(config.ledgerPath),
+                durable: dndCustody ? Boolean(verdict.durable) : !approvalCustody && Boolean(config.ledgerPath),
               },
             };
           } else {
@@ -444,6 +449,11 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                 },
               } : {}),
             };
+          }
+          const evidence = receipt.executionReceipt;
+          if ((evidence?.handoff === 'unattempted' || evidence?.handoff === 'rejected') &&
+              typeof evidence.envelopeSignature !== 'string') {
+            receipt = { ...receipt, executionReceipt: { ...evidence, envelopeSignature: envelope.signature } };
           }
         }
         const signed = signReceipt(

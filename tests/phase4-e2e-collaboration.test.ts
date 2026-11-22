@@ -1078,6 +1078,93 @@ test('Phase 4: closed admission retains earlier DND custody and a keyed retry st
   assert.equal(carol.mailbox.list().totalCount, 0);
 });
 
+test('Phase 4: a retained approval blocks replacement until an approved execution or explicit cancellation', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'approval_required', defaultExecutor: 'inbox' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+
+  const request = { ...input('bob'), idempotencyKey: 'retained-approval' };
+  const first = await alice.emitter.emit(request);
+  assert.ok(first.receipts.some(receipt => receipt.stage === 'pending_approval'));
+  const [approval] = bob.gate.listPendingApprovals();
+  await bob.gate.setNetworkMode(request.networkId, 'closed');
+  const report = await alice.outboxRedrive.flush({ id: first.messageId, force: true });
+  assert.equal(report.attempted, 1);
+  const [failed] = report.items;
+  const [rejection] = Object.values(failed.failedReceipts);
+  assert.equal(rejection.executionReceipt?.handoff, 'unknown');
+  assert.equal(isRetryablePreEffectReceipt(rejection), false);
+  assert.equal(isUnattemptedOutboxItem(failed), false);
+  assert.equal((await alice.emitter.emit({ ...input('carol'), idempotencyKey: request.idempotencyKey })).messageId, first.messageId);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const policy = bob.kernel.ctx.services.dispatcher.registerPolicy({
+    name: 'hold-approval',
+    async process(message, next) {
+      entered.resolve();
+      await release.promise;
+      return next([message]);
+    },
+  });
+  const approving = bob.gate.approve(approval.id);
+  try {
+    await entered.promise;
+    assert.deepEqual(await bob.gate.evaluate(approval.envelope), {
+      status: 'reject', code: 'approval_custody_retained', durable: false, reason: 'Node admission gate is closed',
+    });
+    await assert.rejects(bob.gate.reject(approval.id), /Approval already in progress/);
+  } finally {
+    release.resolve();
+    await approving;
+    policy.dispose();
+  }
+  assert.deepEqual(bob.mailbox.list().items.map(item => item.id), [first.messageId]);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+
+  await bob.gate.setNetworkMode(request.networkId, 'approval_required');
+  const cancelledRequest = { ...request, idempotencyKey: 'cancelled-approval' };
+  const cancellable = await alice.emitter.emit(cancelledRequest);
+  const [cancellation] = bob.gate.listPendingApprovals();
+  await bob.gate.reject(cancellation.id);
+  await bob.gate.setNetworkMode(request.networkId, 'closed');
+  const cancelled = (await alice.outboxRedrive.flush({ id: cancellable.messageId, force: true })).items[0];
+  const [beforeEffect] = Object.values(cancelled.failedReceipts);
+  assert.equal(beforeEffect.executionReceipt?.envelopeSignature, cancellation.envelope.signature);
+  assert.equal(isRetryablePreEffectReceipt(beforeEffect), true);
+  assert.equal(isUnattemptedOutboxItem(cancelled), true);
+  const retargeted = await alice.emitter.emit({ ...input('carol'), idempotencyKey: cancelledRequest.idempotencyKey });
+  assert.notEqual(retargeted.messageId, cancellable.messageId);
+  assert.deepEqual(carol.mailbox.list().items.map(item => item.id), [retargeted.messageId]);
+  assert.deepEqual(bob.mailbox.list().items.map(item => item.id), [first.messageId]);
+});
+
+test('Phase 4: retryable policy rejections re-evaluate the original outbox envelope with a durable ledger', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob);
+  const rule = bob.kernel.ctx.services.dispatcher.registerPolicy({
+    name: 'temporarily-deny',
+    async process() { return { stage: 'rejected', detail: 'Temporarily denied' }; },
+  });
+  const request = { ...input('bob'), idempotencyKey: 'policy-retry' };
+  const first = await alice.emitter.emit(request);
+  const original = alice.listOutbox()[0];
+  assert.equal(isUnattemptedOutboxItem(original), true);
+  assert.equal(first.receipts[0].executionReceipt?.envelopeSignature, original.envelope.signature);
+  assert.equal(bob.mailbox.list().totalCount, 0);
+  rule.dispose();
+  const retry = await alice.emitter.emit(request);
+  assert.equal(retry.messageId, first.messageId);
+  assert.equal(retry.receipts[0].stage, 'dispatched');
+  assert.deepEqual(bob.mailbox.list().items.map(item => item.id), [first.messageId]);
+  assert.deepEqual(await alice.emitter.emit(request), retry);
+});
+
 test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND obligation after restart', async t => {
   const root = directory(t);
   const alice = await node(t, root, 'legacy-alice');
