@@ -990,6 +990,22 @@ export class OutboxRedriveService {
       throw new Error('forceMatchingTarget requires targetNodeId');
     }
     const scopedTargetNodeId = options.targetNodeId;
+    const force = options.force === true;
+    const eligibleRequestTargets = (item: OutboxItem): string[] | undefined => {
+      const targets = item.pendingNodeIds;
+      if ((!force && Date.parse(item.nextAttemptAt) > now) ||
+          (options.forceMatchingTarget && targets.length === 0 && options.includeUnresolved !== true)) {
+        return undefined;
+      }
+      const requestTargets = options.forceMatchingTarget && scopedTargetNodeId
+        ? targets.filter(nodeId => nodeId === scopedTargetNodeId)
+        : force
+          ? targets
+          : targets.filter(nodeId =>
+            !item.inDoubtNodeIds.includes(nodeId) || this.isPeerReachable?.(item.networkId, nodeId) === true,
+          );
+      return targets.length > 0 && requestTargets.length === 0 ? undefined : requestTargets;
+    };
     // Causal order is per thread: `list` is oldest-first by createdAt then id, so an earlier
     // undelivered event on a thread (backoff, in-doubt gate, or excluded by --id) must block
     // every later event on that same thread from overtaking it, without blocking other
@@ -1037,14 +1053,8 @@ export class OutboxRedriveService {
         processed.push(candidate);
         continue;
       }
-      // A forced peer flush bypasses only the matching item's schedule; ordinary timer
-      // flushes still honour each item's exponential backoff.
-      const matchesTarget =
-        !options.forceMatchingTarget ||
-        candidate.pendingNodeIds.includes(options.targetNodeId!) ||
-        (options.includeUnresolved === true && candidate.pendingNodeIds.length === 0);
-      const force = options.force && matchesTarget;
-      if (!force && Date.parse(candidate.nextAttemptAt) > now) {
+      // A parked thread head can block later entries without taking a write lease.
+      if (eligibleRequestTargets(candidate) === undefined) {
         blockedThreads.add(threadKey);
         processed.push(candidate);
         continue;
@@ -1059,22 +1069,8 @@ export class OutboxRedriveService {
       const { item, attemptToken } = claimed;
       try {
         // The snapshot orders the scan. Only the leased row can authorize a send.
-        const eligibleTargets = item.pendingNodeIds;
-        if ((!force && Date.parse(item.nextAttemptAt) > now) ||
-            (options.forceMatchingTarget && eligibleTargets.length === 0 && options.includeUnresolved !== true)) {
-          blockedThreads.add(threadKey);
-          processed.push(item);
-          continue;
-        }
-        const requestTargets = options.forceMatchingTarget && scopedTargetNodeId
-          ? eligibleTargets.filter(nodeId => nodeId === scopedTargetNodeId)
-          : options.force
-            ? eligibleTargets
-            : eligibleTargets.filter(nodeId =>
-                !item.inDoubtNodeIds.includes(nodeId) ||
-                this.isPeerReachable?.(item.networkId, nodeId) === true,
-              );
-        if (eligibleTargets.length > 0 && requestTargets.length === 0) {
+        const requestTargets = eligibleRequestTargets(item);
+        if (requestTargets === undefined) {
           blockedThreads.add(threadKey);
           processed.push(item);
           continue;
@@ -1094,7 +1090,7 @@ export class OutboxRedriveService {
         const resolved = outcome.resolvedTargetNodeIds;
         const requested = new Set(requestTargets);
         const untouchedPendingNodeIds = requestTargets.length > 0
-          ? eligibleTargets.filter(nodeId => !requested.has(nodeId))
+          ? item.pendingNodeIds.filter(nodeId => !requested.has(nodeId))
           : [];
         const pending = outcome.pendingNodeIds ?? resolved;
         const updated = this.outbox.recordAttempt(item.id, {

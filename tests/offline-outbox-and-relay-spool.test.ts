@@ -4082,6 +4082,37 @@ test('a sleeping peer behind a zombie relay tunnel is spooled as offline and its
   );
 });
 
+test('ordinary redrive leaves an unreachable in-doubt thread head and its successors untouched', async t => {
+  const root = directory(t);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const target = generateNodeKeyPair().nodeId;
+  const ids = ['parked-head', 'queued-successor'];
+  for (const id of ids) {
+    outbox.enqueue({
+      envelope: threadedEnvelope(sender, NETWORK, target, id, 'parked-thread'),
+      explicitTargets: [target], pendingNodeIds: [target],
+    });
+  }
+  outbox.recordAttempt(ids[0], {
+    nextAttemptAt: new Date(Date.now() - 1_000).toISOString(), inDoubtNodeIds: [target],
+  });
+  const saved = t.mock.method(outbox as unknown as { save(state: unknown): void }, 'save');
+  const deliver = t.mock.fn(async () => ({}));
+  const service = new OutboxRedriveService({ outbox, isPeerReachable: () => false, deliver });
+  const before = readFileSync(outbox.path, 'utf8');
+
+  for (let count = 0; count < 2; count += 1) {
+    const result = await service.flush();
+    assert.equal(result.attempted, 0);
+    assert.equal(result.stillQueued, 2);
+    assert.deepEqual(result.items.map(item => item.id), ids);
+  }
+  assert.equal(deliver.mock.callCount(), 0);
+  assert.equal(saved.mock.callCount(), 0);
+  assert.equal(readFileSync(outbox.path, 'utf8'), before);
+});
+
 test('an in-doubt send reconciles on its normal schedule once transport proves the peer live without executing twice', async t => {
   const root = directory(t);
   const keys = deriveNetworkKeys(NETWORK, 'secret');

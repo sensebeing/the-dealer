@@ -225,6 +225,8 @@ export async function checkOrcaWorkspaceIdle(
       : [];
     const siblingHandles = new Set(siblingTerminals.map(terminal => String(terminal.handle)));
     const knownSiblingPaneKeys = new Set(siblingTerminals.flatMap(terminalPaneKeys));
+    const canExcludeByLineage = siblingHandles.size > 0 ||
+      [...(options?.excludedHandles ?? [])].some(handle => handle !== ownHandle && handle !== retiringHandle);
     const ownedAgentsBusy = (): boolean =>
       !row.agents ||
       row.agents
@@ -292,49 +294,57 @@ export async function checkOrcaWorkspaceIdle(
         !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal, options)).idle
       ) return false;
     }
-    const canExcludeSiblingSubtree = async (node: Workspace, seen = new Set<string>()): Promise<boolean> => {
-      if (seen.has(node.worktreeId)) return false;
-      seen.add(node.worktreeId);
-      const agents = node.agents ?? [];
-      let allAgentsExplicitlyAttributed = agents.length > 0;
-      for (const agent of agents) {
-        const pane = typeof agent.parentPaneKey === 'string' ? agent.parentPaneKey.trim() : '';
-        if (!pane) {
-          allAgentsExplicitlyAttributed = false;
-          continue;
+    // Return the worktrees that still need creator proof, or undefined if the pane or
+    // terminal evidence prevents sibling attribution anywhere in the subtree.
+    const siblingLineageCandidates = (subtree: Workspace): string[] | undefined => {
+      const candidates: string[] = [];
+      const seen = new Set<string>();
+      const visit = (node: Workspace): boolean => {
+        if (seen.has(node.worktreeId)) return false;
+        seen.add(node.worktreeId);
+        const agents = node.agents ?? [];
+        let allAgentsExplicitlyAttributed = agents.length > 0;
+        for (const agent of agents) {
+          const pane = typeof agent.parentPaneKey === 'string' ? agent.parentPaneKey.trim() : '';
+          if (!pane) {
+            allAgentsExplicitlyAttributed = false;
+            continue;
+          }
+          // Explicit dispatch provenance takes precedence over creator lineage.
+          const siblingPane = targetPaneKeys.size > 0 ? !targetPaneKeys.has(pane) : knownSiblingPaneKeys.has(pane);
+          if (!siblingPane) return false;
         }
-        // Explicit dispatch provenance must establish sibling ownership before lineage can help.
-        const siblingPane = targetPaneKeys.size > 0 ? !targetPaneKeys.has(pane) : knownSiblingPaneKeys.has(pane);
-        if (!siblingPane) return false;
-      }
-      const paneAttributedWithSingleTerminal = allAgentsExplicitlyAttributed && targetPaneKeys.size > 0 && handles.length <= 1;
-      if (!paneAttributedWithSingleTerminal && node.unverifiableTerminalCount !== 0) return false;
-      if (!allAgentsExplicitlyAttributed) {
-        childCreators ??= await readOrcaChildCreators(runner, command, cwd, signal);
-        const creatorHandle = childCreators.get(node.worktreeId);
-        if (!creatorHandle || creatorHandle === ownHandle || creatorHandle === retiringHandle ||
-          !(siblingHandles.has(creatorHandle) || options?.excludedHandles?.has(creatorHandle))) return false;
-      }
-      for (const id of node.childWorktreeIds ?? []) {
-        const descendant = rows.find(item => item.worktreeId === id);
-        if (!descendant || !(await canExcludeSiblingSubtree(descendant, seen))) return false;
-      }
-      return true;
+        const paneAttributedWithSingleTerminal = allAgentsExplicitlyAttributed && targetPaneKeys.size > 0 && handles.length <= 1;
+        if (!paneAttributedWithSingleTerminal && node.unverifiableTerminalCount !== 0) return false;
+        if (!allAgentsExplicitlyAttributed) candidates.push(node.worktreeId);
+        for (const id of node.childWorktreeIds ?? []) {
+          const descendant = rows.find(item => item.worktreeId === id);
+          if (!descendant || !visit(descendant)) return false;
+        }
+        return true;
+      };
+      return visit(subtree) ? candidates : undefined;
     };
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
       if (!child) return false;
-      if (isRoot && slotScoped) {
+      const lineageCandidates = isRoot && slotScoped ? siblingLineageCandidates(child) : undefined;
+      if (lineageCandidates?.length === 0) continue;
+      if (await idleTree(child)) continue;
+      if (canExcludeByLineage && lineageCandidates) {
         try {
-          if (await canExcludeSiblingSubtree(child)) continue;
+          const creators = childCreators ??= await readOrcaChildCreators(runner, command, cwd, signal);
+          if (lineageCandidates.every(worktreeId => {
+            const creator = creators.get(worktreeId);
+            return creator && creator !== ownHandle && creator !== retiringHandle &&
+              (siblingHandles.has(creator) || options?.excludedHandles?.has(creator));
+          })) continue;
         } catch (error) {
           if (options?.throwOnProbeError) throw error;
           return false;
         }
       }
-      if (!(await idleTree(child))) {
-        return false;
-      }
+      return false;
     }
     return true;
   };

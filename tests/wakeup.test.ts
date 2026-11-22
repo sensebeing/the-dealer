@@ -449,17 +449,22 @@ test('durable lineage keeps a slot busy on its own follow-up after the root term
   assert.equal(terminalSends(state.calls).length, 0);
 });
 
-test('an invalid lineage inventory blocks the slot and surfaces a probe error', async t => {
+test('slot probes consult invalid lineage inventory only for a busy subtree with a possible sibling owner', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
   const { runner, state } = fakeOrcaWorkspace(root, [probeTerminal]);
-  state.children = [{
-    path: join(root, 'idle-child'), worktreeId: 'idle-child', unverifiableTerminalCount: 0, agents: [],
-  }];
+  const child: FakeOrcaChild = {
+    path: join(root, 'child'), worktreeId: 'child', unverifiableTerminalCount: 0, agents: [],
+    terminals: [{ ...probeTerminal, handle: 'term-child' }],
+  };
+  state.children = [child];
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
   let lineageResponse: unknown;
-  const commandRunner: CommandRunner = async request => request.args[0] === 'worktree' && request.args[1] === 'list'
-    ? { stdout: JSON.stringify(lineageResponse) }
-    : runner(request);
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] !== 'worktree' || request.args[1] !== 'list') return runner(request);
+    state.calls.push(request);
+    return { stdout: JSON.stringify(lineageResponse) };
+  };
   const { service, errors } = startSlotProbeService(t, store, commandRunner);
   const options = { targetTerminalHandle: probeTerminal.handle };
   store.upsertWakeTarget(probeMailbox, {
@@ -469,39 +474,74 @@ test('an invalid lineage inventory blocks the slot and surfaces a probe error', 
     { ok: false }, { ok: true, result: { truncated: true, worktrees: [] } }, { ok: true, result: {} },
   ]) {
     lineageResponse = response;
+    state.calls.length = 0;
+    for (const terminals of [[probeTerminal], [probeTerminal, sibling]]) {
+      state.terminals = terminals;
+      child.agents = [];
+      assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+    }
+    state.terminals = [probeTerminal];
+    child.agents = [{ state: 'working' }];
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+    assert.equal(worktreeListCalls(state.calls), 0);
+
+    state.terminals.push(sibling);
     const failed = await service.probeSlot(probeMailbox);
     assert.equal(failed.busy, true);
     assert.equal(failed.ready, false);
     assert.match(failed.reason!, /Orca worktree list/);
     assert.equal(String(errors.at(-1)), failed.reason);
     assert.equal((await checkOrcaWorkspaceIdle(commandRunner, 'orca', root, undefined, options)).idle, false);
+    assert.equal(worktreeListCalls(state.calls), 2);
   }
-  assert.equal(errors.length, 3);
-  lineageResponse = { ok: true, result: { worktrees: [] } };
-  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
   assert.equal(errors.length, 3);
 });
 
-test('the real Orca command runner requires worktree rows for lineage', async t => {
+test('the real Orca command runner only requires lineage inventory when it can exclude busy work', async t => {
   const root = directory(t);
   const fakeOrca = join(root, 'fake-orca');
+  const fixture = join(root, 'inventory.json');
+  const calls = join(root, 'lineage.log');
+  const childPath = join(root, 'child');
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
   writeFileSync(fakeOrca, [
     `#!${process.execPath}`,
+    'const { readFileSync, appendFileSync } = require("node:fs");',
     'const command = process.argv.slice(2, 4).join(" ");',
+    `const { agents, terminals, lineage } = JSON.parse(readFileSync(${JSON.stringify(fixture)}, "utf8"));`,
+    `const childPath = ${JSON.stringify(childPath)};`,
     'const idle = { agents: [], unverifiableTerminalCount: 0 };',
     `const worktrees = [
       { ...idle, path: ${JSON.stringify(root)}, worktreeId: 'root', childWorktreeIds: ['child'] },
-      { ...idle, path: ${JSON.stringify(join(root, 'child'))}, worktreeId: 'child' },
+      { ...idle, path: childPath, worktreeId: 'child', agents },
     ];`,
-    'const result = command === "worktree ps" ? { worktrees } : command === "terminal list" ? { terminals: [] } : {};',
-    'process.stdout.write(JSON.stringify({ ok: true, result }));',
+    'const child = process.argv.includes("path:" + childPath);',
+    'const result = command === "worktree ps" ? { worktrees } : command === "terminal list" ? { terminals: child ? [] : terminals } : {};',
+    `if (command === "worktree list") appendFileSync(${JSON.stringify(calls)}, "list\\n");`,
+    'process.stdout.write(JSON.stringify(command === "worktree list" ? lineage : { ok: true, result }));',
     '',
   ].join('\n'), { mode: 0o755 });
-  const options = { targetTerminalHandle: 'term-slot' };
-  assert.equal((await checkOrcaWorkspaceIdle(runCommand, fakeOrca, root, undefined, options)).idle, false);
-  await assert.rejects(checkOrcaWorkspaceIdle(runCommand, fakeOrca, root, undefined, {
-    ...options, throwOnProbeError: true,
-  }), /Orca worktree list/);
+  const check = (throwOnProbeError = true) => checkOrcaWorkspaceIdle(runCommand, fakeOrca, root, undefined, {
+    targetTerminalHandle: probeTerminal.handle, throwOnProbeError,
+  });
+  for (const lineage of [
+    { ok: false }, { ok: true, result: { truncated: true, worktrees: [] } }, { ok: true, result: {} },
+  ]) {
+    writeFileSync(calls, '');
+    for (const terminals of [[probeTerminal], [probeTerminal, sibling]]) {
+      writeFileSync(fixture, JSON.stringify({ agents: [], terminals, lineage }));
+      assert.equal((await check()).idle, true);
+    }
+    const agents = [{ state: 'working' }];
+    writeFileSync(fixture, JSON.stringify({ agents, terminals: [probeTerminal], lineage }));
+    assert.equal((await check()).idle, false);
+    assert.equal(readFileSync(calls, 'utf8'), '');
+
+    writeFileSync(fixture, JSON.stringify({ agents, terminals: [probeTerminal, sibling], lineage }));
+    assert.equal((await check(false)).idle, false);
+    await assert.rejects(check(), /Orca worktree list/);
+    assert.equal(readFileSync(calls, 'utf8'), 'list\nlist\n');
+  }
 });
 
 test('slot idle checks skip lineage inventory when there are no children or panes already attribute them', async t => {
@@ -513,6 +553,7 @@ test('slot idle checks skip lineage inventory when there are no children or pane
     agents: [{ state: 'working', parentPaneKey: 'sibling:root' }],
   }];
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.equal(state.calls.some(call => call.args.includes(`path:${state.children[0].path}`)), false);
   state.children[0].agents = [{ state: 'working', parentPaneKey: 'wave:root' }];
   assert.equal((await service.probeSlot(probeMailbox)).busy, true);
   state.children[0].agents = [{ state: 'working', parentPaneKey: null }];
