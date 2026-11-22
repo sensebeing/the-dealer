@@ -5554,12 +5554,40 @@ test('v1 concrete claims pin the original target and unresolved selectors still 
   assert.equal(JSON.parse(readFileSync(outbox.path, 'utf8')).schema, 'the-dealer-outbox/v2');
 });
 
-test('a targetless v2 obligation needs explicit routing evidence or operator requeue', async t => {
+test('redrive resumes a v2 claim reserved before routing and fences the recipient before send', async t => {
+  let atSend: OutboxItem | undefined;
+  const harness = await emitterHarness(t, { plan: () => {
+    atSend = harness.outbox.get(envelope.id);
+    return {};
+  } });
+  const { outbox, sender, networkId, emitter, sendCalls, targetCard } = harness;
+  const original = envelopeFor(sender, networkId, 'member:diz');
+  const envelope = signEnvelope({ ...original, idempotencyKey: original.id }, sender.privateKeyPem);
+  const claim = outbox.claimIdempotency({ envelope, explicitTargets: ['member:diz'] });
+  assert.ok(claim.claimed);
+  assert.equal(claim.item.unresolvedRoute, true);
+  assert.deepEqual(claim.item.pendingNodeIds, []);
+  assert.deepEqual(claim.item.inDoubtNodeIds, []);
+  outbox.releaseAttempt(envelope.id, claim.attemptToken);
+
+  const redrive = new OutboxRedriveService({ outbox, deliver: emitter.redriveOutboxItem! });
+  t.after(() => redrive.stop());
+  assert.equal((await redrive.flush({ id: envelope.id, force: true })).delivered, 1);
+  assert.deepEqual(sendCalls.map(call => [call.envelope.id, call.targetNodeId]), [[envelope.id, targetCard.nodeId]]);
+  assert.ok(atSend);
+  assert.equal(atSend.unresolvedRoute, undefined);
+  assert.deepEqual(atSend.pendingNodeIds, [targetCard.nodeId]);
+  assert.deepEqual(atSend.inDoubtNodeIds, [targetCard.nodeId]);
+  assert.deepEqual(outbox.get(envelope.id)?.inDoubtNodeIds, []);
+});
+
+test('a v2 claim with an explicitly empty route stays parked until operator requeue', async t => {
   const { outbox, sender, networkId, emitter, sendCalls, targetCard } = await emitterHarness(t);
   const original = envelopeFor(sender, networkId, 'member:diz');
   const envelope = signEnvelope({ ...original, idempotencyKey: original.id }, sender.privateKeyPem);
   const { item } = outbox.claimIdempotency({ envelope,
-    explicitTargets: ['member:diz'], leaseMs: 1 });
+    explicitTargets: ['member:diz'], plannedTargetNodeIds: [], leaseMs: 1 });
+  assert.equal(item.unresolvedRoute, undefined);
   const redrive = new OutboxRedriveService({ outbox, deliver: emitter.redriveOutboxItem! });
   t.after(() => redrive.stop());
   await until(() => Date.now() >= Date.parse(item.activeAttempt!.expiresAt), 'the interrupted attempt expires');
@@ -5590,6 +5618,7 @@ test('interrupted claims and prepared sends pin keyed delivery to the original r
   const redrive = new OutboxRedriveService({
     outbox: recovered, deliver: (item, options) => harness.emitter.redriveOutboxItem!(item, options),
   });
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   for (const interruptedAt of ['claim', 'prepare']) {
     const envelope = signEnvelope({
       ...envelopeFor(harness.sender, harness.networkId, 'member:diz'), routing: { mode: 'auto' },
@@ -5600,13 +5629,14 @@ test('interrupted claims and prepared sends pin keyed delivery to the original r
     });
     assert.equal(claim.claimed, true);
     if (interruptedAt === 'prepare') {
-      const lease = harness.outbox.beginAttempt(envelope.id, { now: Date.parse(claim.item.activeAttempt!.expiresAt), leaseMs: 250 })!;
+      t.mock.timers.tick(1);
+      const lease = harness.outbox.beginAttempt(envelope.id, { leaseMs: 1 })!;
       assert.ok(harness.outbox.prepareSend(envelope.id, lease.attemptToken, [target]));
     }
     const persisted = recovered.get(envelope.id)!;
     assert.deepEqual(persisted.pendingNodeIds, [target]);
     assert.deepEqual(persisted.inDoubtNodeIds, [target]);
-    await until(() => Date.now() >= Date.parse(persisted.activeAttempt!.expiresAt), 'the interrupted attempt expires');
+    t.mock.timers.tick(1);
     closed = true;
     const [failed] = (await redrive.flush({ id: envelope.id, force: true })).items;
     assert.deepEqual(failed.inDoubtNodeIds, [target]);

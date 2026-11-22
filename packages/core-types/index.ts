@@ -591,7 +591,7 @@ export interface OutboxItem {
   envelope: MessageEnvelope;
   explicitTargets: string[];
   pendingNodeIds: string[];
-  /** Routing has positively found no recipient yet, or an operator has authorized rerouting. */
+  /** Routing has yet to resolve a recipient, or an operator has authorized rerouting. */
   unresolvedRoute?: boolean;
   approvalPendingNodeIds?: string[];
   deliveredReceipts: Record<string, DeliveryReceipt>;
@@ -697,6 +697,7 @@ export interface OutboxClaimInput {
   envelope: MessageEnvelope;
   explicitTargets: string[];
   unresolvedRoute?: boolean;
+  /** Omit before routing; an empty array records a completed route with no targets. */
   plannedTargetNodeIds?: readonly string[];
   filePaths?: Record<string, string>;
   /** How long the attempt owns the obligation before another worker may resume it. */

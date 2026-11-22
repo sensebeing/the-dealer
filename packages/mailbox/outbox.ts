@@ -544,7 +544,7 @@ export class OutboxStore {
   }
 
   private createClaim(input: OutboxClaimInput, activeAttempt: NonNullable<OutboxItem['activeAttempt']>): OutboxItem {
-    const { envelope } = input;
+    const { envelope, plannedTargetNodeIds } = input;
     const now = Date.now();
     const createdAt = new Date(now).toISOString();
     const item: OutboxItem = {
@@ -553,7 +553,7 @@ export class OutboxStore {
       envelope: clone(envelope),
       explicitTargets: [...new Set(input.explicitTargets ?? [])],
       pendingNodeIds: [],
-      ...(input.unresolvedRoute === true ? { unresolvedRoute: true } : {}),
+      ...(input.unresolvedRoute === true || plannedTargetNodeIds === undefined ? { unresolvedRoute: true } : {}),
       deliveredReceipts: {},
       failedReceipts: {},
       failedNodeIds: [],
@@ -568,7 +568,7 @@ export class OutboxStore {
       sentCommitted: false,
       activeAttempt,
     };
-    fenceAttempt(item, activeAttempt, input.plannedTargetNodeIds ?? []);
+    fenceAttempt(item, activeAttempt, plannedTargetNodeIds ?? []);
     return item;
   }
 
