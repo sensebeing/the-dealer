@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
-import { isConfirmedHandoffReceipt, verifyEnvelope } from '../core-types/index.ts';
+import {
+  APPROVAL_CANCELLED, APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED,
+  isConfirmedHandoffReceipt, verifyEnvelope,
+} from '../core-types/index.ts';
 import type {
   AdmissionMode,
   GateRulePlugin,
@@ -32,6 +35,11 @@ export interface DndQueueItem {
 
 type DndEntry = Omit<DndQueueItem, 'id'>;
 
+interface GateCustodyState {
+  queued: Map<string, DndEntry>;
+  withdrawn: Map<string, string>;
+}
+
 function revision(envelope: MessageEnvelope): number {
   const value = envelope.payload?.claimVersion ?? envelope.payload?.revision ?? 0;
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : -1;
@@ -49,12 +57,19 @@ function dndKey(envelope: MessageEnvelope): string {
   return JSON.stringify([envelope.networkId, envelope.from.nodeId, envelope.idempotencyKey ?? envelope.id]);
 }
 
-function loadDnd(path: string | undefined, limit: number): Map<string, DndEntry> {
-  if (!path || !existsSync(path)) return new Map();
+function loadDnd(path: string | undefined, limit: number): GateCustodyState {
+  if (!path || !existsSync(path)) return { queued: new Map(), withdrawn: new Map() };
   try {
     const saved = JSON.parse(readFileSync(path, 'utf8'));
-    if (!saved || typeof saved !== 'object' || Array.isArray(saved) ||
-        !saved.queued || typeof saved.queued !== 'object' || Array.isArray(saved.queued)) throw new Error();
+    if (!isRecord(saved) || !isRecord(saved.queued)) throw new Error();
+    const withdrawn = new Map<string, string>();
+    if (saved.withdrawn !== undefined) {
+      if (!isRecord(saved.withdrawn)) throw new Error();
+      for (const [key, reason] of Object.entries(saved.withdrawn)) {
+        if (typeof reason !== 'string') throw new Error();
+        withdrawn.set(key, reason);
+      }
+    }
     const entries: [string, DndEntry][] = Object.entries(saved.queued).map(([key, value]) => {
       const raw = value as DndEntry & MessageEnvelope;
       const entry: DndEntry = raw?.envelope ? raw : {
@@ -68,14 +83,14 @@ function loadDnd(path: string | undefined, limit: number): Map<string, DndEntry>
       return [key, entry];
     });
     if (entries.length > limit) throw new Error();
-    return new Map(entries);
+    return { queued: new Map(entries), withdrawn };
   } catch {
     throw new Error('Invalid gate DND store');
   }
 }
 
-function persistDnd(path: string, queued: ReadonlyMap<string, DndEntry>): void {
-  writeFileAtomically(path, JSON.stringify({ queued: Object.fromEntries(queued) }));
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 export function createGatePlugin(config: GateConfig = {}): Plugin {
@@ -90,13 +105,20 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
       if (!Number.isSafeInteger(maxDndItems) || maxDndItems < 1) {
         throw new Error('Invalid DND queue capacity');
       }
-      let dnd = loadDnd(config.dndQueuePath, maxDndItems);
+      let { queued: dnd, withdrawn } = loadDnd(config.dndQueuePath, maxDndItems);
+      const persistGateState = (queued: Map<string, DndEntry>, withdrawals = withdrawn) => {
+        if (config.dndQueuePath) {
+          writeFileAtomically(config.dndQueuePath, JSON.stringify({ queued: Object.fromEntries(queued),
+            ...(withdrawals.size > 0 ? { withdrawn: Object.fromEntries(withdrawals) } : {}) }));
+        }
+        dnd = queued;
+        withdrawn = withdrawals;
+      };
       const updateDnd = (id: string, entry?: DndEntry) => {
         const updated = new Map(dnd);
         if (entry) updated.set(id, structuredClone(entry));
         else updated.delete(id);
-        if (config.dndQueuePath) persistDnd(config.dndQueuePath, updated);
-        dnd = updated;
+        persistGateState(updated);
       };
       const parkDnd = (id: string, envelope: MessageEnvelope, error: unknown) => {
         const entry = dnd.get(id);
@@ -111,11 +133,141 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
       const trusted = new Set<string>();
       const rejections: { envelope: MessageEnvelope; reason: string }[] = [];
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
+      const cancellationKey = (e: MessageEnvelope) => `${key(e)}\0${e.signature}`;
+      const withdrawCustody = (envelope: MessageEnvelope, reason: string) => {
+        const queued = new Map(dnd);
+        const id = dndKey(envelope);
+        const entry = queued.get(id);
+        if (entry?.status === 'queued' && entry.envelope.signature === envelope.signature) queued.delete(id);
+        const withdrawals = new Map(withdrawn);
+        withdrawals.set(cancellationKey(envelope), reason);
+        persistGateState(queued, withdrawals);
+      };
       const trustKeys = (e: MessageEnvelope) => [
         JSON.stringify([e.networkId, 'node', e.from.nodeId]),
         JSON.stringify([e.networkId, 'member', e.from.member]),
       ];
       let draining: Promise<void> = Promise.resolve();
+      const evaluate = async (envelope: MessageEnvelope, drainEntry?: DndEntry): Promise<GateVerdict> => {
+        let verdict = await ctx.bail('gate/evaluate', envelope);
+        if (!verdict) {
+          for (const rule of [...rules].sort((a, b) => b.priority - a.priority)) {
+            verdict = (await rule.evaluate(envelope)) ?? undefined;
+            if (verdict) {
+              break;
+            }
+          }
+        }
+        if (!verdict && trustKeys(envelope).some(k => trusted.has(k))) {
+          verdict = { status: 'allow' };
+        }
+        if (!verdict && config.localNodeId && envelope.from.nodeId === config.localNodeId) {
+          const networkMode = service.getNetworkMode(envelope.networkId);
+          // Self-originated local deliveries are admission checks, not knocks. DND
+          // still queues them and closed still rejects them.
+          if (networkMode !== 'closed' && networkMode !== 'dnd') {
+            verdict = { status: 'allow' };
+          }
+        }
+        if (!verdict) {
+          switch (service.getNetworkMode(envelope.networkId)) {
+            case 'open':
+              verdict = { status: 'allow' };
+              break;
+            case 'closed':
+              verdict = {
+                status: 'reject',
+                code: 'gate_closed',
+                reason: 'Node admission gate is closed',
+              };
+              break;
+            case 'dnd':
+              verdict = {
+                status: 'queued_dnd',
+                reason: 'Node is in DND mode; message queued',
+              };
+              break;
+            case 'approval_required':
+              verdict = {
+                status: 'pending_approval',
+                approvalId: randomUUID(),
+                reason: 'Approval required',
+              };
+              break;
+          }
+        }
+        const id = dndKey(envelope);
+        const existingDnd = dnd.get(id);
+        const retained = existingDnd && revision(envelope) <= revision(existingDnd.envelope);
+        // Only an exact queue entry being drained may proceed past its own custody check.
+        const drainingCurrent = drainEntry !== undefined && existingDnd === drainEntry &&
+          service.getNetworkMode(envelope.networkId) === 'open';
+        const durable = Boolean(config.dndQueuePath);
+        const existingApproval = [...pending.values()].find(item => key(item.envelope) === key(envelope));
+        const approvalInProgress = existingApproval && approving.has(existingApproval.id);
+        if (existingApproval && (approvalInProgress || existingApproval.envelope.signature !== envelope.signature)) {
+          return {
+            status: 'reject', code: APPROVAL_CUSTODY_RETAINED, durable: false,
+            reason: approvalInProgress ? 'Approval already in progress' : existingApproval.reason,
+          };
+        }
+        if (retained && existingDnd.status === 'parked' && (!drainingCurrent || verdict.status === 'reject')) {
+          return {
+            status: 'reject', code: DND_HANDOFF_PARKED, durable,
+            reason: existingDnd.lastError ?? 'Previous DND handoff outcome unknown; newer revision required',
+          };
+        }
+        const withdrawal = withdrawn.get(cancellationKey(envelope));
+        if (retained && existingDnd.status === 'queued' && !drainingCurrent) {
+          if (verdict.status === 'reject' || withdrawal !== undefined ||
+              (verdict.status === 'allow' && existingDnd.envelope.signature !== envelope.signature)) {
+            return { status: 'reject', code: DND_CUSTODY_RETAINED, durable,
+              reason: verdict.status === 'reject' ? verdict.reason : 'Queued DND copy retained' };
+          }
+          if (verdict.status === 'allow') {
+            if (durable) return { status: 'queued_dnd', reason: 'Message queued in DND store', durable };
+            updateDnd(id);
+          }
+        }
+        if (existingApproval && (verdict.status === 'reject' || withdrawal !== undefined)) {
+          return { status: 'reject', code: APPROVAL_CUSTODY_RETAINED, durable: false,
+            reason: verdict.status === 'reject' ? verdict.reason : existingApproval.reason };
+        }
+        if (withdrawal !== undefined) {
+          return { status: 'reject', code: APPROVAL_CANCELLED, reason: withdrawal, durable };
+        }
+        if (verdict.status === 'allow' && existingApproval) pending.delete(existingApproval.id);
+        if (verdict.status === 'pending_approval') {
+          if (existingApproval) {
+            return { ...verdict, approvalId: existingApproval.id };
+          }
+          if (pending.has(verdict.approvalId)) {
+            throw new Error('Approval ID collision');
+          }
+          const item: PendingApprovalItem = {
+            id: verdict.approvalId,
+            envelope: structuredClone(envelope),
+            reason: verdict.reason,
+            createdAt: new Date().toISOString(),
+          };
+          pending.set(item.id, item);
+          ctx.emit('gate/pending-approval', structuredClone(item));
+        } else if (verdict.status === 'queued_dnd') {
+          if (!existingDnd && dnd.size >= maxDndItems) {
+            if (existingApproval) {
+              return { status: 'reject', code: APPROVAL_CUSTODY_RETAINED, durable: false, reason: existingApproval.reason };
+            }
+            return { status: 'reject', code: 'dnd_queue_full', reason: 'DND queue capacity exceeded' };
+          }
+          if (!retained) {
+            updateDnd(id, { envelope, status: 'queued', attempts: 0, updatedAt: new Date().toISOString() });
+          }
+          return { ...verdict, durable };
+        } else if (verdict.status === 'reject') {
+          rejections.push({ envelope: structuredClone(envelope), reason: verdict.reason });
+        }
+        return verdict;
+      };
       const service: NetworkGateService = {
         getMode: () => mode,
         getNetworkMode: id => modes.get(id) ?? mode,
@@ -146,9 +298,12 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
               if (service.getNetworkMode(envelope.networkId) !== 'open') continue;
               try {
                 if (!verifyEnvelope(envelope)) throw new Error('Invalid queued envelope signature');
-                const verdict = await service.evaluate(envelope);
+                const verdict = await evaluate(envelope, entry);
                 if (verdict.status === 'reject') {
-                  if (dnd.get(id)?.envelope.signature === envelope.signature) updateDnd(id);
+                  if (entry.status === 'queued' && verdict.code !== DND_HANDOFF_PARKED && verdict.code !== DND_CUSTODY_RETAINED &&
+                      verdict.code !== APPROVAL_CUSTODY_RETAINED &&
+                      service.getNetworkMode(envelope.networkId) === 'open' &&
+                      dnd.get(id) === entry) withdrawCustody(envelope, verdict.reason);
                   continue;
                 }
                 // Approval queues are volatile; retain the durable copy until approval succeeds.
@@ -179,93 +334,7 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             },
           };
         },
-        async evaluate(envelope) {
-          let verdict = await ctx.bail('gate/evaluate', envelope);
-          if (!verdict) {
-            for (const rule of [...rules].sort((a, b) => b.priority - a.priority)) {
-              verdict = (await rule.evaluate(envelope)) ?? undefined;
-              if (verdict) {
-                break;
-              }
-            }
-          }
-          if (!verdict && trustKeys(envelope).some(k => trusted.has(k))) {
-            verdict = { status: 'allow' };
-          }
-          if (!verdict && config.localNodeId && envelope.from.nodeId === config.localNodeId) {
-            const networkMode = service.getNetworkMode(envelope.networkId);
-            // Self-originated local deliveries are admission checks, not knocks. DND
-            // still queues them and closed still rejects them.
-            if (networkMode !== 'closed' && networkMode !== 'dnd') {
-              verdict = { status: 'allow' };
-            }
-          }
-          if (!verdict) {
-            switch (service.getNetworkMode(envelope.networkId)) {
-              case 'open':
-                verdict = { status: 'allow' };
-                break;
-              case 'closed':
-                verdict = {
-                  status: 'reject',
-                  code: 'gate_closed',
-                  reason: 'Node admission gate is closed',
-                };
-                break;
-              case 'dnd':
-                verdict = {
-                  status: 'queued_dnd',
-                  reason: 'Node is in DND mode; message queued',
-                };
-                break;
-              case 'approval_required':
-                verdict = {
-                  status: 'pending_approval',
-                  approvalId: randomUUID(),
-                  reason: 'Approval required',
-                };
-                break;
-            }
-          }
-          if (verdict.status === 'pending_approval') {
-            const existing = [...pending.values()].find(
-              item => key(item.envelope) === key(envelope),
-            );
-            if (existing) {
-              return { ...verdict, approvalId: existing.id };
-            }
-            if (pending.has(verdict.approvalId)) {
-              throw new Error('Approval ID collision');
-            }
-            const item: PendingApprovalItem = {
-              id: verdict.approvalId,
-              envelope: structuredClone(envelope),
-              reason: verdict.reason,
-              createdAt: new Date().toISOString(),
-            };
-            pending.set(item.id, item);
-            ctx.emit('gate/pending-approval', structuredClone(item));
-          } else if (verdict.status === 'queued_dnd') {
-            const id = dndKey(envelope);
-            if (!dnd.has(id) && dnd.size >= maxDndItems) {
-              return { status: 'reject', code: 'dnd_queue_full', reason: 'DND queue capacity exceeded' };
-            }
-            const existing = dnd.get(id);
-            if (existing?.status === 'parked' && revision(envelope) <= revision(existing.envelope)) {
-              return {
-                status: 'reject', code: 'dnd_handoff_parked',
-                reason: existing.lastError ?? 'Previous DND handoff outcome unknown; newer revision required',
-              };
-            }
-            if (!existing || revision(envelope) > revision(existing.envelope)) {
-              updateDnd(id, { envelope, status: 'queued', attempts: 0, updatedAt: new Date().toISOString() });
-            }
-            return { ...verdict, durable: Boolean(config.dndQueuePath) };
-          } else if (verdict.status === 'reject') {
-            rejections.push({ envelope: structuredClone(envelope), reason: verdict.reason });
-          }
-          return verdict;
-        },
+        evaluate: envelope => evaluate(envelope),
         listDndQueue: () => structuredClone([...dnd].map(([id, entry]) => ({ id, ...entry }))),
         listPendingApprovals: () => structuredClone([...pending.values()]),
         listRejections: () => structuredClone(rejections),
@@ -301,9 +370,9 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
           if (!item) {
             throw new Error(`Unknown approval: ${id}`);
           }
+          if (approving.has(id)) throw new Error(`Approval already in progress: ${id}`);
+          withdrawCustody(item.envelope, reason);
           pending.delete(id);
-          const queuedId = dndKey(item.envelope);
-          if (dnd.get(queuedId)?.envelope.signature === item.envelope.signature) updateDnd(queuedId);
           rejections.push({ envelope: item.envelope, reason });
         },
       };

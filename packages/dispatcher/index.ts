@@ -1,5 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt } from '../core-types/index.ts';
+import {
+  APPROVAL_CANCELLED, APPROVAL_CUSTODY_RETAINED, DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, isRetryablePreEffectReceipt,
+  PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt,
+} from '../core-types/index.ts';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type {
   DispatchPolicyPlugin,
@@ -100,6 +103,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
       >();
       const ledger = new DeliveryLedger(config.ledgerPath);
       const active = new Map<string, Promise<DispatchReceipt>>();
+      const inboundLocks = new Map<string, { signature: string; run: Promise<DispatchReceipt> }>();
       const idleListeners = new Set<() => void>();
       const controller = new AbortController();
       let lastError: DispatchErrorEvent | undefined;
@@ -108,6 +112,12 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         await Promise.allSettled(active.values());
       });
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
+      const readDeliveryFence = (id: string): DispatchReceipt | undefined => {
+        const receipt = ledger.get(id);
+        if (!isRetryablePreEffectReceipt(receipt)) return receipt;
+        ledger.delete(id);
+        return undefined;
+      };
       const select = (e: MessageEnvelope) => {
         const resolved = config.resolveExecutor?.(e);
         if (resolved !== undefined) return resolved;
@@ -152,7 +162,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
         if (!executor) {
           throw Object.assign(new Error(`Executor unavailable: ${name}`), { beforeExternalEffect: true });
         }
-        const members = batch.map(envelope => ({ envelope, id: key(envelope), prior: ledger.get(key(envelope)) }));
+        const members = batch.map(envelope => ({ envelope, id: key(envelope), prior: readDeliveryFence(key(envelope)) }));
         for (const { envelope, prior } of members) {
           if (prior && prior.stage !== 'queued') {
             throw new Error(`Execution already attempted: ${envelope.id} (${prior.stage})`);
@@ -171,7 +181,16 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             const unattempted = beforeEffect || partial?.unattemptedIds.has(envelope.id) === true;
             const receipt: DispatchReceipt | undefined = settled && Object.hasOwn(settled, envelope.id)
               ? { stage: 'dispatched', executionReceipt: settled[envelope.id] }
-              : unattempted ? undefined : { stage: 'failed', detail: String(error) };
+              : unattempted ? undefined : {
+                stage: 'failed',
+                detail: String(error),
+                executionReceipt: {
+                  executor: name,
+                  executionId: `${name}:${envelope.id}`,
+                  handoff: 'unknown',
+                  durable: Boolean(config.ledgerPath),
+                },
+              };
             return { envelope, id, receipt, unattempted };
           });
           // Policies handed these members to the executor. Release unattempted claims for retry.
@@ -259,7 +278,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           if (ongoing) {
             return ongoing;
           }
-          const prior = ledger.get(id);
+          const prior = readDeliveryFence(id);
           if (prior) {
             return Promise.resolve(prior);
           }
@@ -268,7 +287,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
               if (controller.signal.aborted) {
                 throw Object.assign(new Error('Dispatcher stopped'), { beforeExternalEffect: true });
               }
-              const settled = ledger.get(id);
+              const settled = readDeliveryFence(id);
               if (settled) return settled;
               assertRequiredPolicies();
               const chain = [...policies];
@@ -281,16 +300,32 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                   return core(batch, callerKey);
                 }
                 // Policies consume individual envelopes; batching policies should be registered last.
+                const policy = chain[index];
                 let result: DispatchReceipt = { stage: 'queued' };
                 for (const e of batch) {
                   let called = false;
-                  result = await chain[index].process(e, nextBatch => {
+                  result = await policy.process(e, nextBatch => {
                     if (called) {
                       throw new Error('Policy next may only be called once');
                     }
                     called = true;
                     return run(index + 1, nextBatch, key(e));
                   });
+                  if (!called && result.stage === 'rejected' && result.executionReceipt?.handoff === undefined) {
+                    result = {
+                      ...result,
+                      executionReceipt: {
+                        ...result.executionReceipt,
+                        executor: result.executionReceipt?.executor ?? policy.name,
+                        executionId: result.executionReceipt?.executionId ?? `${policy.name}:${e.id}`,
+                        handoff: 'rejected',
+                        envelopeSignature: e.signature,
+                      },
+                    };
+                  } else if (!called && result.stage === 'failed' && result.executionReceipt?.handoff === 'unattempted' &&
+                      typeof result.executionReceipt.envelopeSignature !== 'string') {
+                    result = { ...result, executionReceipt: { ...result.executionReceipt, envelopeSignature: e.signature } };
+                  }
                 }
                 return result;
               };
@@ -299,7 +334,7 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             .then(result => {
               // A queued policy owns its pending buffer; do not overwrite a later wave's completed state.
               const recorded = ledger.get(id);
-              if (!recorded) {
+              if (!recorded && !isRetryablePreEffectReceipt(result)) {
                 ledger.set(id, result);
               }
               // Record the authenticated inbound route only after the gate allowed this delivery.
@@ -335,6 +370,69 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           return promise;
         },
       });
+      const admitInbound = async (envelope: MessageEnvelope, id: string): Promise<DispatchReceipt> => {
+        let receipt: DispatchReceipt;
+        const prior = readDeliveryFence(id);
+        const alreadyExecuted = prior?.stage === 'dispatched' || prior?.stage === 'settled';
+        const verdict = alreadyExecuted ? { status: 'allow' as const } : await ctx.services.gate.evaluate(envelope);
+        const latest = alreadyExecuted ? prior : readDeliveryFence(id);
+        if (latest?.stage === 'dispatched' || latest?.stage === 'settled') {
+          receipt = latest;
+        } else if (verdict.status === 'allow') {
+          try {
+            receipt = await ctx.services.dispatcher.dispatch(envelope);
+          } catch (error) {
+            const beforeEffect = (error as { beforeExternalEffect?: boolean } | null)?.beforeExternalEffect === true;
+            receipt = {
+              stage: 'failed',
+              detail: String(error),
+              executionReceipt: {
+                executor: 'dispatcher',
+                executionId: `dispatcher:${envelope.id}`,
+                handoff: beforeEffect ? 'unattempted' : 'unknown',
+                durable: Boolean(config.ledgerPath),
+              },
+            };
+          }
+        } else if (verdict.status === 'reject') {
+          const dndCustody = verdict.code === DND_HANDOFF_PARKED || verdict.code === DND_CUSTODY_RETAINED;
+          const approvalCustody = verdict.code === APPROVAL_CUSTODY_RETAINED;
+          const executor = dndCustody ? 'gate-dnd' : 'gate';
+          let handoff = 'unattempted';
+          if (approvalCustody) handoff = 'approval_pending';
+          else if (dndCustody || latest || active.has(id)) handoff = 'unknown';
+          const custodyRelinquished = verdict.code === APPROVAL_CANCELLED && handoff === 'unattempted';
+          receipt = {
+            stage: 'rejected', detail: verdict.reason,
+            executionReceipt: {
+              executor, executionId: `${executor}:${envelope.id}`, handoff,
+              durable: dndCustody || custodyRelinquished
+                ? Boolean(verdict.durable)
+                : !approvalCustody && Boolean(config.ledgerPath),
+              ...(custodyRelinquished ? { custodyRelinquished: true } : {}),
+            },
+          };
+        } else {
+          receipt = {
+            stage: verdict.status === 'pending_approval' ? 'pending_approval' : 'queued',
+            detail: verdict.reason,
+            ...(verdict.status === 'queued_dnd' ? {
+              executionReceipt: {
+                executor: 'gate-dnd',
+                executionId: 'gate-dnd:' + envelope.id,
+                durable: Boolean(verdict.durable),
+              },
+            } : {}),
+          };
+        }
+        const evidence = receipt.executionReceipt;
+        if ((evidence?.handoff === 'unattempted' || evidence?.handoff === 'rejected') &&
+            typeof evidence.envelopeSignature !== 'string') {
+          receipt = { ...receipt, executionReceipt: { ...evidence, envelopeSignature: envelope.signature } };
+        }
+        return receipt;
+      };
+
       ctx.on('transport/inbound', async event => {
         const frame = event.payload as { type?: string; envelope?: MessageEnvelope } | null;
         if (frame?.type !== 'message.envelope' || !frame.envelope) {
@@ -372,30 +470,18 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             detail: 'Invalid envelope signature or authenticated sender/network mismatch',
           };
         } else {
-          const verdict = await ctx.services.gate.evaluate(envelope);
-          if (verdict.status === 'allow') {
-            try {
-              receipt = await ctx.services.dispatcher.dispatch(envelope);
-            } catch (error) {
-              receipt = { stage: 'failed', detail: String(error) };
-            }
-          } else {
-            receipt = {
-              stage:
-                verdict.status === 'pending_approval'
-                  ? 'pending_approval'
-                  : verdict.status === 'queued_dnd'
-                    ? 'queued'
-                    : 'rejected',
-              detail: verdict.reason,
-              ...(verdict.status === 'queued_dnd' ? {
-                executionReceipt: {
-                  executor: 'gate-dnd',
-                  executionId: 'gate-dnd:' + envelope.id,
-                  durable: Boolean(verdict.durable),
-                },
-              } : {}),
-            };
+          const id = key(envelope);
+          const previous = inboundLocks.get(id);
+          // Concurrent copies of the same signed envelope share one admission result.
+          // A different signature still waits on this identity before it is evaluated.
+          const run = previous?.signature === envelope.signature
+            ? previous.run
+            : (previous?.run.catch(() => undefined) ?? Promise.resolve()).then(() => admitInbound(envelope, id));
+          if (run !== previous?.run) inboundLocks.set(id, { signature: envelope.signature, run });
+          try {
+            receipt = await run;
+          } finally {
+            if (inboundLocks.get(id)?.run === run) inboundLocks.delete(id);
           }
         }
         const signed = signReceipt(

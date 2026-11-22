@@ -91,7 +91,18 @@ interface FakeTerminalRow {
 interface FakeOrcaAgent {
   state: string;
   paneKey?: string;
-  parentPaneKey?: string;
+  parentPaneKey?: string | null;
+}
+
+interface FakeOrcaChild {
+  path: string;
+  worktreeId: string;
+  childWorktreeIds?: string[];
+  unverifiableTerminalCount: number;
+  agents?: FakeOrcaAgent[];
+  terminals?: FakeTerminalRow[];
+  terminalsTruncated?: boolean;
+  lineage?: { createdByTerminalHandle?: string };
 }
 
 /** Minimal Orca inventory: one fixed workspace whose `terminal create` adds a live tab. */
@@ -102,7 +113,8 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
     waitOk: true,
     created: 0,
     agents: undefined as FakeOrcaAgent[] | undefined,
-    children: [] as { path: string; worktreeId: string; unverifiableTerminalCount: number; agents?: FakeOrcaAgent[]; terminals?: FakeTerminalRow[] }[],
+    children: [] as FakeOrcaChild[],
+    childWorktreeIds: undefined as string[] | undefined,
   };
   const runner: CommandRunner = async request => {
     state.calls.push(request);
@@ -115,17 +127,24 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
             worktrees: [{
               path: workspacePath,
               worktreeId: 'fake-worktree',
-              childWorktreeIds: state.children.map(child => child.worktreeId),
+              childWorktreeIds: state.childWorktreeIds ?? state.children.map(child => child.worktreeId),
               unverifiableTerminalCount: 0,
               agents: state.agents ?? state.terminals.filter(t => t.connected).map(t => ({ state: 'done', ...(t.tabId && t.leafId ? { paneKey: `${t.tabId}:${t.leafId}` } : {}) })),
-            }, ...state.children],
+            }, ...state.children.map(({ path, worktreeId, childWorktreeIds, unverifiableTerminalCount, agents }) =>
+              ({ path, worktreeId, childWorktreeIds, unverifiableTerminalCount, agents }))],
           },
         }),
       };
     }
+    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
+      const worktrees = state.children.map(({ worktreeId, lineage }) => ({ id: worktreeId, lineage }));
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees } }) };
+    }
     if (request.args[0] === 'terminal' && request.args[1] === 'list') {
       const child = state.children.find(item => request.args.includes(`path:${item.path}`));
-      return { stdout: JSON.stringify({ ok: true, result: { terminals: child ? child.terminals ?? [] : state.terminals } }) };
+      return { stdout: JSON.stringify({ ok: true, result: {
+        terminals: child ? child.terminals ?? [] : state.terminals, truncated: child?.terminalsTruncated,
+      } }) };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'create') {
       state.created += 1;
@@ -217,6 +236,57 @@ test('slot probe follows a closed terminal’s pane to its active child worktree
   assert.deepEqual(errors, []);
 });
 
+test('a vanished pane still gates workspace and Orca run readiness on its own work', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling', preview: '> human draft' };
+  const { runner, state } = fakeOrcaWorkspace(root, [sibling]);
+  const paneKey = 'vanished:root';
+  const terminalHandle = 'term-vanished';
+  const ownChild: FakeOrcaChild = {
+    path: join(root, 'own-child'), worktreeId: 'own-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: paneKey }],
+    terminals: [{ ...probeTerminal, handle: 'term-child' }],
+    lineage: { createdByTerminalHandle: terminalHandle },
+  };
+  state.children = [ownChild, {
+    path: join(root, 'sibling-child'), worktreeId: 'sibling-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: 'sibling:root' }],
+  }];
+  state.agents = [{ state: 'working', paneKey: 'sibling:root' }];
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-run', driverConfig: { workspacePath: root, paneKey, terminalHandle, runId: 'run-test' },
+  });
+  const { service, errors } = startSlotProbeService(t, store, request =>
+    request.args[0] === 'orchestration' && request.args[1] === 'worker-list'
+      ? Promise.resolve({ stdout: '{"ok":true,"result":{"workers":[]}}' })
+      : runner(request),
+  );
+  const workspaceIdle = () => checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, {
+    targetPaneKey: paneKey, targetTerminalHandle: terminalHandle,
+  });
+  const assertBusy = async () => {
+    assert.equal((await workspaceIdle()).idle, false);
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  };
+
+  await assertBusy();
+  ownChild.agents = [{ state: 'working', parentPaneKey: null }];
+  await assertBusy();
+  ownChild.agents = [{ state: 'done', parentPaneKey: null }];
+  state.agents.push({ state: 'working', paneKey });
+  await assertBusy();
+  state.agents.pop();
+  state.agents.push({ state: 'working' });
+  await assertBusy();
+  state.agents[1].state = 'done';
+  assert.equal((await workspaceIdle()).idle, true);
+  const slot = await service.probeSlot(probeMailbox);
+  assert.equal(slot.busy, false, slot.reason);
+  assert.equal(slot.ready, true, slot.reason);
+  assert.deepEqual(errors, []);
+});
+
 test('slot probe leaves an active sibling child alone when the leased terminal is gone without a pane', async t => {
   const { root, store, service, state } = slotProbeFixture(t, { wave: true });
   const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
@@ -240,6 +310,368 @@ test('slot probe leaves an active sibling child alone when the leased terminal i
   state.agents = [];
   state.children[0].agents = [{ state: 'working' }];
   assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+});
+
+function worktreeListCalls(calls: readonly CommandRequest[]): number {
+  return calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'list').length;
+}
+
+for (const mode of ['retiring', 'bound'] as const) {
+  test(`an unmatched explicit parent pane blocks a vanished ${mode} terminal despite sibling lineage`, async t => {
+    const root = directory(t);
+    const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+    const { runner, state } = fakeOrcaWorkspace(root, [sibling]);
+    const child: FakeOrcaChild = {
+      path: join(root, 'child'), worktreeId: 'child', unverifiableTerminalCount: 0,
+      agents: [{ state: 'working', parentPaneKey: '%vanished-retiring-pane' }],
+      lineage: { createdByTerminalHandle: sibling.handle },
+    };
+    state.children = [child];
+    const options = mode === 'retiring'
+      ? { targetTerminalHandle: null, retiringTerminalHandle: probeTerminal.handle }
+      : { targetTerminalHandle: probeTerminal.handle, excludedHandles: new Set([sibling.handle]) };
+    const idle = async () => (await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, options)).idle;
+
+    assert.equal(await idle(), false);
+    child.agents!.push({ state: 'working', parentPaneKey: null });
+    assert.equal(await idle(), false, 'missing pane records cannot override an unmatched explicit parent');
+    child.agents = [{ state: 'working', parentPaneKey: ' sibling:root ' }];
+    assert.equal(await idle(), true, 'a known sibling pane positively attributes the child');
+    assert.equal(worktreeListCalls(state.calls), 0);
+  });
+}
+
+test('sibling exclusion requires positive attribution throughout the subtree', async t => {
+  const root = directory(t);
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  const { runner, state } = fakeOrcaWorkspace(root, [probeTerminal, sibling]);
+  const child: FakeOrcaChild = {
+    path: join(root, 'child'), worktreeId: 'child', childWorktreeIds: ['grandchild'],
+    unverifiableTerminalCount: 0, agents: [], lineage: { createdByTerminalHandle: sibling.handle },
+  };
+  const grandchild: FakeOrcaChild = {
+    path: join(child.path, 'grandchild'), worktreeId: 'grandchild', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: ' wave:root ' }],
+    lineage: { createdByTerminalHandle: sibling.handle },
+  };
+  state.childWorktreeIds = [child.worktreeId];
+  state.children = [child, grandchild];
+  const idle = async () => (await checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, {
+    targetTerminalHandle: probeTerminal.handle,
+  })).idle;
+
+  assert.equal(await idle(), false, 'a grandchild with the target parent pane stays in scope');
+  child.agents = [{ state: 'working', parentPaneKey: 'sibling:root' }];
+  assert.equal(await idle(), false, 'an explicit sibling parent cannot hide its descendant');
+  child.agents = [];
+  grandchild.agents = [{ state: 'working', parentPaneKey: null }];
+  grandchild.lineage = { createdByTerminalHandle: probeTerminal.handle };
+  assert.equal(await idle(), false, 'a grandchild created by the target terminal stays in scope');
+
+  grandchild.lineage.createdByTerminalHandle = sibling.handle;
+  state.calls.length = 0;
+  assert.equal(await idle(), true);
+  assert.equal(worktreeListCalls(state.calls), 1, 'both levels use the same lineage inventory');
+
+  grandchild.unverifiableTerminalCount = 1;
+  assert.equal(await idle(), false, 'an unverifiable grandchild stays in scope');
+  grandchild.unverifiableTerminalCount = 0;
+  grandchild.childWorktreeIds = [child.worktreeId];
+  assert.equal(await idle(), false, 'a cycle cannot establish sibling ownership');
+  state.children.pop();
+  assert.equal(await idle(), false, 'a missing grandchild cannot establish sibling ownership');
+});
+
+test('sibling attribution follows a descendant creator terminal during slot probes and rotation', async t => {
+  for (const byPane of [false, true]) {
+    const { root, store, service, state, runner } = slotProbeFixture(t, { paneKey: 'wave:root' });
+    const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+    const childTerminal = { ...probeTerminal, handle: 'term-c1', tabId: 'c1' };
+    state.terminals.push(sibling);
+    const child: FakeOrcaChild = {
+      path: join(root, 'c1'), worktreeId: 'c1', childWorktreeIds: ['c2'], unverifiableTerminalCount: 0,
+      agents: byPane ? [{ state: 'working', parentPaneKey: 'sibling:root' }] : [],
+      terminals: [childTerminal],
+      ...(byPane ? {} : { lineage: { createdByTerminalHandle: sibling.handle } }),
+    };
+    const grandchild: FakeOrcaChild = {
+      path: join(child.path, 'c2'), worktreeId: 'c2', unverifiableTerminalCount: 0,
+      agents: [{ state: 'working', parentPaneKey: null }], lineage: { createdByTerminalHandle: childTerminal.handle },
+    };
+    state.childWorktreeIds = [child.worktreeId];
+    state.children = [child, grandchild];
+
+    if (!byPane) {
+      child.lineage!.createdByTerminalHandle = probeTerminal.handle;
+      assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'an owned creator cannot pass through its terminals');
+      child.lineage!.createdByTerminalHandle = sibling.handle;
+    }
+    grandchild.agents![0].parentPaneKey = 'wave:root';
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'explicit ownership wins over transitive lineage');
+    grandchild.agents![0].parentPaneKey = null;
+    child.terminals = [];
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'the creator terminal must be in the inventory');
+    child.terminals = [childTerminal];
+    child.terminalsTruncated = true;
+    const failed = await service.probeSlot(probeMailbox);
+    assert.equal(failed.busy, true);
+    assert.match(failed.reason!, /Incomplete Orca terminal inventory/);
+    await assert.rejects(checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, {
+      targetTerminalHandle: probeTerminal.handle, throwOnProbeError: true,
+    }), /Incomplete Orca terminal inventory/);
+    child.terminalsTruncated = false;
+
+    const duplicate: FakeOrcaChild = {
+      path: join(root, 'c-duplicate'), worktreeId: 'c-duplicate', unverifiableTerminalCount: 0,
+      agents: [], terminals: [childTerminal], lineage: { createdByTerminalHandle: sibling.handle },
+    };
+    state.children.push(duplicate);
+    state.childWorktreeIds.push(duplicate.worktreeId);
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'an ambiguous creator terminal cannot prove sibling ownership');
+    state.children.pop();
+    state.childWorktreeIds.pop();
+
+    state.calls.length = 0;
+    assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+    assert.equal(worktreeListCalls(state.calls), 1);
+    assert.equal(state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list' &&
+      call.args.includes(`path:${child.path}`)).length, 1);
+
+    store.upsertWakeTarget('stream:alert-wave:2', {
+      driver: 'orca-terminal', rotateAfterWaves: 1, driverConfig: { workspacePath: root, terminalHandle: sibling.handle },
+    });
+    store.upsertWakeTarget(probeMailbox, { completedWaves: 1 });
+    store.enqueue([alert('next-wave')], { mailboxId: probeMailbox });
+    const wake = await service.flushMailbox(probeMailbox, { force: true });
+    assert.equal(wake.woke, true, wake.reason);
+    assert.equal(wake.rotated, true);
+    assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+    assert.equal(sendsTo(state.calls, sibling.handle).length, 0);
+  }
+});
+
+test('slot probes bound creator proof for vanished handles and cycles', { timeout: 5_000 }, async t => {
+  const { root, service, state } = slotProbeFixture(t, { paneKey: 'wave:root' });
+  state.terminals.push({ ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' });
+  const busyChild = (worktreeId: string, creator: string): FakeOrcaChild => ({
+    path: join(root, worktreeId), worktreeId, unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: null }],
+    terminals: [{ ...probeTerminal, handle: `term-${worktreeId}` }],
+    lineage: { createdByTerminalHandle: creator },
+  });
+  const vanished = Array.from({ length: 12 }, (_, index) => busyChild(`c-${index}`, `term-vanished-${index}`));
+  const cycle = [busyChild('c-cycle-a', 'term-c-cycle-b'), busyChild('c-cycle-b', 'term-c-cycle-a')];
+  state.children = [...vanished, ...cycle];
+
+  // The probe stops at the first unprovable subtree. Exercise both forms of dead end.
+  for (const first of [vanished[0], cycle[0]]) {
+    state.childWorktreeIds = [first.worktreeId,
+      ...state.children.filter(child => child !== first).map(child => child.worktreeId)];
+    state.calls.length = 0;
+    assert.deepEqual(await service.probeSlot(probeMailbox), {
+      busy: true, ready: false, reason: 'Workspace or descendant is busy or unverifiable',
+    });
+    assert.equal(worktreeListCalls(state.calls), 1);
+    const terminalLists = state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list');
+    for (const child of state.children) {
+      assert.equal(terminalLists.filter(call => call.args.includes(`path:${child.path}`)).length, 1, child.worktreeId);
+    }
+  }
+});
+
+test('durable lineage lets an idle slot rotate and wake while sibling follow-ups are working', async t => {
+  const { root, store, service, state } = slotProbeFixture(t);
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  state.terminals.push(sibling);
+  state.agents = [{ state: 'done', paneKey: 'wave:root' }, { state: 'working', paneKey: 'sibling:root' }];
+  state.children = ['follow-up-a', 'follow-up-b'].map(worktreeId => ({
+    path: join(root, worktreeId), worktreeId, unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: null }],
+    lineage: { createdByTerminalHandle: ` ${sibling.handle} ` },
+  }));
+
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.equal(worktreeListCalls(state.calls), 1, 'one lookup covers both children');
+  store.upsertWakeTarget('stream:alert-wave:2', {
+    driver: 'orca-terminal', rotateAfterWaves: 1, driverConfig: { workspacePath: root, terminalHandle: sibling.handle },
+  });
+  store.upsertWakeTarget(probeMailbox, { completedWaves: 1 });
+
+  state.children[0].agents!.push({ state: 'done', parentPaneKey: 'wave:root' });
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'an explicit parent pane keeps the child in scope');
+  state.children[0].agents!.pop();
+  state.children[0].unverifiableTerminalCount = 1;
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'unverifiable child terminals keep the child in scope');
+  state.children[0].unverifiableTerminalCount = 0;
+
+  const siblingAgents = state.children[0].agents;
+  state.children[0].agents = undefined;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Workspace or descendant is busy or unverifiable',
+  });
+  state.children[0].agents = siblingAgents;
+
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  state.terminals.pop();
+  state.children[0].unverifiableTerminalCount = 1;
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'a sibling claim cannot exclude an unverifiable child with one live tab');
+  state.children[0].unverifiableTerminalCount = 0;
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true }, 'a sibling claim survives a missing terminal');
+  state.terminals.push(sibling);
+  state.children[0].agents = undefined;
+  store.enqueue([alert('next-wave')], { mailboxId: probeMailbox });
+  const blockedWake = await service.flushMailbox(probeMailbox, { force: true });
+  assert.equal(blockedWake.woke, false);
+  assert.equal(state.created, 0);
+  assert.deepEqual(state.terminals.map(terminal => terminal.handle), [probeTerminal.handle, sibling.handle]);
+  state.children[0].agents = siblingAgents;
+  state.calls.length = 0;
+  const wake = await service.flushMailbox(probeMailbox, { force: true });
+  assert.equal(wake.woke, true, wake.reason);
+  assert.equal(wake.rotated, true);
+  assert.equal(worktreeListCalls(state.calls), 2, 'rotation and the fresh tab each prove readiness');
+  assert.deepEqual(state.terminals.map(terminal => terminal.handle), [sibling.handle, 'term-new-1']);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+  assert.equal(sendsTo(state.calls, sibling.handle).length, 0);
+});
+
+test('durable lineage keeps a slot busy on its own follow-up after the root terminal closes', async t => {
+  const { root, store, service, state } = slotProbeFixture(t, { wave: true });
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  state.terminals.push(sibling);
+  state.children = [{
+    path: join(root, 'follow-up'), worktreeId: 'follow-up', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working' }], lineage: { createdByTerminalHandle: probeTerminal.handle },
+  }];
+  const busy = { busy: true, ready: false, reason: 'Workspace or descendant is busy or unverifiable' };
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+  state.terminals = [sibling];
+  assert.deepEqual(await service.probeSlot(probeMailbox), busy);
+
+  store.ack(store.check({ mailboxId: probeMailbox }).deliveryId!, probeMailbox);
+  store.upsertWakeTarget(probeMailbox, { completedWaves: 1 });
+  store.enqueue([alert('next-wave')], { mailboxId: probeMailbox });
+  for (const terminals of [[probeTerminal, sibling], [sibling]]) {
+    state.terminals = terminals;
+    const wake = await service.flushMailbox(probeMailbox, { force: true });
+    assert.equal(wake.woke, false);
+    assert.equal(wake.reason, busy.reason);
+  }
+  assert.equal(state.created, 0);
+  assert.equal(state.calls.some(call => call.args[1] === 'close'), false);
+  assert.equal(terminalSends(state.calls).length, 0);
+});
+
+test('slot probes consult invalid lineage inventory only for a busy subtree with a possible sibling owner', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const { runner, state } = fakeOrcaWorkspace(root, [probeTerminal]);
+  const child: FakeOrcaChild = {
+    path: join(root, 'child'), worktreeId: 'child', unverifiableTerminalCount: 0, agents: [],
+    terminals: [{ ...probeTerminal, handle: 'term-child' }],
+  };
+  state.children = [child];
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  let lineageResponse: unknown;
+  const commandRunner: CommandRunner = async request => {
+    if (request.args[0] !== 'worktree' || request.args[1] !== 'list') return runner(request);
+    state.calls.push(request);
+    return { stdout: JSON.stringify(lineageResponse) };
+  };
+  const { service, errors } = startSlotProbeService(t, store, commandRunner);
+  const options = { targetTerminalHandle: probeTerminal.handle };
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle },
+  });
+  for (const response of [
+    { ok: false }, { ok: true, result: { truncated: true, worktrees: [] } }, { ok: true, result: {} },
+  ]) {
+    lineageResponse = response;
+    state.calls.length = 0;
+    for (const terminals of [[probeTerminal], [probeTerminal, sibling]]) {
+      state.terminals = terminals;
+      child.agents = [];
+      assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+    }
+    state.terminals = [probeTerminal];
+    child.agents = [{ state: 'working' }];
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+    assert.equal(worktreeListCalls(state.calls), 0);
+
+    state.terminals.push(sibling);
+    const failed = await service.probeSlot(probeMailbox);
+    assert.equal(failed.busy, true);
+    assert.equal(failed.ready, false);
+    assert.match(failed.reason!, /Orca worktree list/);
+    assert.equal(String(errors.at(-1)), failed.reason);
+    assert.equal((await checkOrcaWorkspaceIdle(commandRunner, 'orca', root, undefined, options)).idle, false);
+    assert.equal(worktreeListCalls(state.calls), 2);
+  }
+  assert.equal(errors.length, 3);
+});
+
+test('the real Orca command runner only requires lineage inventory when it can exclude busy work', async t => {
+  const root = directory(t);
+  const fakeOrca = join(root, 'fake-orca');
+  const fixture = join(root, 'inventory.json');
+  const calls = join(root, 'lineage.log');
+  const childPath = join(root, 'child');
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  writeFileSync(fakeOrca, [
+    `#!${process.execPath}`,
+    'const { readFileSync, appendFileSync } = require("node:fs");',
+    'const command = process.argv.slice(2, 4).join(" ");',
+    `const { agents, terminals, lineage } = JSON.parse(readFileSync(${JSON.stringify(fixture)}, "utf8"));`,
+    `const childPath = ${JSON.stringify(childPath)};`,
+    'const idle = { agents: [], unverifiableTerminalCount: 0 };',
+    `const worktrees = [
+      { ...idle, path: ${JSON.stringify(root)}, worktreeId: 'root', childWorktreeIds: ['child'] },
+      { ...idle, path: childPath, worktreeId: 'child', agents },
+    ];`,
+    'const child = process.argv.includes("path:" + childPath);',
+    'const result = command === "worktree ps" ? { worktrees } : command === "terminal list" ? { terminals: child ? [] : terminals } : {};',
+    `if (command === "worktree list") appendFileSync(${JSON.stringify(calls)}, "list\\n");`,
+    'process.stdout.write(JSON.stringify(command === "worktree list" ? lineage : { ok: true, result }));',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const check = (throwOnProbeError = true) => checkOrcaWorkspaceIdle(runCommand, fakeOrca, root, undefined, {
+    targetTerminalHandle: probeTerminal.handle, throwOnProbeError,
+  });
+  for (const lineage of [
+    { ok: false }, { ok: true, result: { truncated: true, worktrees: [] } }, { ok: true, result: {} },
+  ]) {
+    writeFileSync(calls, '');
+    for (const terminals of [[probeTerminal], [probeTerminal, sibling]]) {
+      writeFileSync(fixture, JSON.stringify({ agents: [], terminals, lineage }));
+      assert.equal((await check()).idle, true);
+    }
+    const agents = [{ state: 'working' }];
+    writeFileSync(fixture, JSON.stringify({ agents, terminals: [probeTerminal], lineage }));
+    assert.equal((await check()).idle, false);
+    assert.equal(readFileSync(calls, 'utf8'), '');
+
+    writeFileSync(fixture, JSON.stringify({ agents, terminals: [probeTerminal, sibling], lineage }));
+    assert.equal((await check(false)).idle, false);
+    await assert.rejects(check(), /Orca worktree list/);
+    assert.equal(readFileSync(calls, 'utf8'), 'list\nlist\n');
+  }
+});
+
+test('slot idle checks skip lineage inventory when there are no children or panes already attribute them', async t => {
+  const { root, runner, service, state } = slotProbeFixture(t);
+  state.terminals.push({ ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  state.children = [{
+    path: join(root, 'sibling-child'), worktreeId: 'sibling-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: 'sibling:root' }],
+  }];
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.equal(state.calls.some(call => call.args.includes(`path:${state.children[0].path}`)), false);
+  state.children[0].agents = [{ state: 'working', parentPaneKey: 'wave:root' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.children[0].agents = [{ state: 'working', parentPaneKey: null }];
+  assert.equal((await checkOrcaWorkspaceIdle(runner, 'orca', root)).idle, false);
+  assert.equal(worktreeListCalls(state.calls), 0);
 });
 
 test('a leased slot stays busy when its bound terminal is present but unusable', async t => {
@@ -1738,13 +2170,20 @@ test('a stale alert slot binding never writes into a sibling slot tab', async t 
   assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
 });
 
-test('a fixed workspace rebind skips a claimed tab and reuses an available tab', async t => {
+test('a fixed workspace rebind skips claimed tabs and waits for the available tab’s child', async t => {
   const workspacePath = directory(t);
   const store = new MailboxStore(join(workspacePath, 'mailbox.json'));
   const { runner, state } = fakeOrcaWorkspace(workspacePath, [
     { handle: 'other-stream', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> unsent draft' },
     { handle: 'available', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
   ]);
+  const child: FakeOrcaChild = {
+    path: join(workspacePath, 'follow-up'), worktreeId: 'follow-up', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: null }],
+    terminals: [{ ...probeTerminal, handle: 'term-child' }],
+    lineage: { createdByTerminalHandle: 'available' },
+  };
+  state.children = [child];
   store.upsertWakeTarget('stream:other', { driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'other-stream' } });
   const mailboxId = 'stream:tools-alert';
   store.enqueue([alert('closed-fixed')], {
@@ -1753,6 +2192,13 @@ test('a fixed workspace rebind skips a claimed tab and reuses an available tab',
   const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
   t.after(() => service.stop());
 
+  const deferred = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, 'closed');
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  child.agents = [{ state: 'done', parentPaneKey: null }];
   const result = await service.flushMailbox(mailboxId, { force: true });
   assert.equal(result.woke, true, result.reason);
   assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, 'available');

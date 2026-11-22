@@ -56,6 +56,7 @@ export interface Events {
     envelope: MessageEnvelope;
     targetNodeIds: readonly string[];
     receipts: readonly DeliveryReceipt[];
+    createdAt?: string;
   }) => void;
 }
 

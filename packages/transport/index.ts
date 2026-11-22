@@ -24,6 +24,8 @@ import {
   deriveNetworkKeys,
   generateNodeKeyPair,
   isDeliveryTimeoutFailure,
+  isOfflinePeerSpooledError,
+  markBeforeSendError,
   sealNetworkFrame,
   unsealNetworkFrame,
 } from '../core-types/index.ts';
@@ -277,7 +279,7 @@ function ipv4Broadcast(address: string, netmask: string): string | undefined {
 function packet(value: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(value));
   if (body.length > MAX_FRAME) {
-    throw new LocalDeliveryError('Frame exceeds limit');
+    throw markBeforeSendError(new LocalDeliveryError('Frame exceeds limit'));
   }
   const size = Buffer.alloc(4);
   size.writeUInt32BE(body.length);
@@ -2101,6 +2103,7 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
     options: RelayRequestOptions = {},
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     // The caller's timeout is the whole exchange budget, not a per-attempt allowance: a
     // blackholed direct endpoint followed by hanging relay seeds must not multiply it.
@@ -2111,8 +2114,8 @@ export class P2PTransportService implements TransportService {
     // instead of waiting the full request timeout on the direct attempt.
     const fallbacks = this.peerFallbacks(target, [m]);
     let lastError: Error = new PeerUnreachableError(target, `Unknown peer: ${target}`);
-    // A post-connect direct timeout is genuine in-doubt evidence and must survive later
-    // fallback failures; a relay-only or pre-connect failure never becomes in-doubt.
+    // Preserve the typed delivery timeout across fallback failures. Write evidence
+    // separately tracks uncertainty on every leg, including relay-only exchanges.
     let targetDeliveryTimeout: Error | undefined;
     if (address) {
       try {
@@ -2122,6 +2125,7 @@ export class P2PTransportService implements TransportService {
           address,
           frame,
           fallbacks.length ? Math.min(remaining(), RELAY_CONNECT_TIMEOUT_MS) : remaining(),
+          onWrite,
         );
       } catch (error) {
         lastError = asError(error);
@@ -2157,7 +2161,7 @@ export class P2PTransportService implements TransportService {
             (m.beacons.get(target)?.expires ?? 0) >= Date.now()
               ? attemptTimeoutMs
               : Math.min(attemptTimeoutMs, RELAY_CONNECT_TIMEOUT_MS);
-          return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, tunnelTimeoutMs);
+          return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, tunnelTimeoutMs, onWrite);
         }
         const attachmentPacket = options.blobHashes?.length
           ? await (blobs ??= this.readSpoolBlobs(
@@ -2190,6 +2194,7 @@ export class P2PTransportService implements TransportService {
               ? { blobs: attachmentPacket.blobs }
               : {}),
           },
+          onWrite,
         );
       } catch (error) {
         // A confirmed spool is a successful handoff to durable relay storage: never try a
@@ -2325,30 +2330,46 @@ export class P2PTransportService implements TransportService {
     return address;
   }
 
+  private writeOnConnect(
+    socket: Socket,
+    wirePacket: Buffer,
+    timeoutMs: number,
+    onWrite?: () => void,
+  ): () => void {
+    // track owns timeout classification; disable its RPC timer until TCP connects.
+    const startedAt = Date.now();
+    socket.setTimeout(0);
+    const connectTimer = setTimeout(() => {
+      socket.destroy(Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' }));
+    }, Math.max(1, Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS)));
+    const onConnect = () => {
+      clearTimeout(connectTimer);
+      socket.setTimeout(Math.max(1, timeoutMs - (Date.now() - startedAt)));
+      try {
+        onWrite?.();
+        socket.write(wirePacket);
+      } catch (error) {
+        socket.destroy(asError(error));
+      }
+    };
+    socket.once('connect', onConnect);
+    return () => {
+      socket.off('connect', onConnect);
+      clearTimeout(connectTimer);
+    };
+  }
+
   private async directFrame(
     m: Mount,
     target: string,
     address: string,
     frame: SealedNetworkFrame,
     timeoutMs: number,
+    onWrite?: () => void,
   ): Promise<SealedNetworkFrame> {
     const wirePacket = packet({ type: 'frame', frame });
     const socket = this.track(createConnection(parseEndpoint(address)));
-    // track owns timeout classification; disable its RPC timer until TCP connects.
-    socket.setTimeout(0);
-    const connectTimer = setTimeout(() => {
-      socket.destroy(Object.assign(new Error('Direct connect timeout'), { code: 'ETIMEDOUT' }));
-    }, Math.max(1, Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS)));
-    const onConnect = () => {
-      clearTimeout(connectTimer);
-      socket.setTimeout(timeoutMs);
-      try {
-        socket.write(wirePacket);
-      } catch (error) {
-        socket.destroy(error instanceof Error ? error : new Error(String(error)));
-      }
-    };
-    socket.once('connect', onConnect);
+    const stopWriting = this.writeOnConnect(socket, wirePacket, timeoutMs, onWrite);
     try {
       // Read immediately so pre-connect errors and shutdown closes settle this call too.
       const response = await new SocketReader(socket).json();
@@ -2360,8 +2381,7 @@ export class P2PTransportService implements TransportService {
       }
       return response.frame;
     } finally {
-      socket.off('connect', onConnect);
-      clearTimeout(connectTimer);
+      stopWriting();
       socket.destroy();
     }
   }
@@ -2372,8 +2392,9 @@ export class P2PTransportService implements TransportService {
     address: string,
     frame: SealedNetworkFrame,
     timeoutMs: number,
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
-    const responseFrame = await this.directFrame(m, target, address, frame, timeoutMs);
+    const responseFrame = await this.directFrame(m, target, address, frame, timeoutMs, onWrite);
     let payload: { requestNonce: string; dataBase64: string };
     try {
       payload = unsealNetworkFrame<{ requestNonce: string; dataBase64: string }>(
@@ -2397,34 +2418,33 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs: number,
     options: { spoolIfOffline?: boolean; spoolKey?: string; blobs?: Record<string, string> } = {},
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     const startedAt = Date.now();
+    const wirePacket = packet({
+      // Use the original verb for a live send so older seeds can still forward it.
+      type: options.spoolIfOffline ? 'relay_send' : 'relay',
+      networkId: m.config.networkId,
+      target,
+      frame,
+      ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
+      ...(options.spoolKey !== undefined ? { spoolKey: options.spoolKey } : {}),
+      ...(options.blobs && Object.keys(options.blobs).length ? { blobs: options.blobs } : {}),
+    });
     const socket = this.track(
       createConnection(parseEndpoint(seed)),
       () =>
-        // A connected-but-silent relay seed only proves a target execution timeout when
-        // the target itself has a fresh beacon. Otherwise this is a relay/offline
-        // reachability failure and must never park the target in inDoubtNodeIds.
+        // The beacon distinguishes a target delivery timeout from a relay timeout.
+        // Either can leave custody uncertain after a write.
         (m.beacons.get(target)?.expires ?? 0) >= Date.now()
           ? new DeliveryTimeoutError('Transport timeout')
           : Object.assign(new Error('Relay transport timeout'), { code: 'ETIMEDOUT' }),
     );
-    socket.setTimeout(timeoutMs);
+    let hopWriteStarted = false;
+    let provenSelfRelay = false;
+    const stopWriting = this.writeOnConnect(socket, wirePacket, timeoutMs, () => { hopWriteStarted = true; });
     try {
       this.inFlightSelfNonces.add(frame.nonce);
-      socket.write(packet({
-        // Live non-spooling sends use the original `relay` verb so pre-upgrade seeds keep
-        // forwarding them; only a spool offer needs the newer `relay_send` verb.
-        type: options.spoolIfOffline ? 'relay_send' : 'relay',
-        networkId: m.config.networkId,
-        target,
-        frame,
-        ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
-        ...(options.spoolKey !== undefined ? { spoolKey: options.spoolKey } : {}),
-        ...(options.blobs && Object.keys(options.blobs).length
-          ? { blobs: options.blobs }
-          : {}),
-      }));
       let response: any;
       try {
         response = await new SocketReader(socket).json();
@@ -2435,14 +2455,14 @@ export class P2PTransportService implements TransportService {
         // original `relay` verb delivers now instead of queueing a reachable peer; without
         // one the fast failure is genuine and flows into the durable outbox.
         if (
-          options.spoolIfOffline === true &&
+          hopWriteStarted && options.spoolIfOffline === true &&
           (error as Error | undefined)?.message === 'Truncated stream'
         ) {
           const hasFreshBeacon = (m.beacons.get(target)?.expires ?? 0) >= Date.now();
           const remainingMs = timeoutMs - (Date.now() - startedAt);
           if (hasFreshBeacon && remainingMs > 0) {
             socket.destroy();
-            return await this.relayExchange(m, seed, target, frame, remainingMs, {});
+            return await this.relayExchange(m, seed, target, frame, remainingMs, {}, onWrite);
           }
         }
         throw error;
@@ -2457,6 +2477,7 @@ export class P2PTransportService implements TransportService {
         if (!this.verifySelfLoopProof('relay', frame.nonce, response.selfProof)) {
           throw new LocalDeliveryError('Unauthenticated self-relay response');
         }
+        provenSelfRelay = true;
         this.recordSelfEndpoint(seed);
         throw new PeerUnreachableError(target, 'Skipped self relay endpoint');
       }
@@ -2486,8 +2507,10 @@ export class P2PTransportService implements TransportService {
       }
       return Buffer.from(payload.dataBase64, 'base64');
     } finally {
+      stopWriting();
       this.inFlightSelfNonces.delete(frame.nonce);
       socket.destroy();
+      if (hopWriteStarted && !provenSelfRelay) onWrite?.();
     }
   }
 
@@ -2498,10 +2521,11 @@ export class P2PTransportService implements TransportService {
     tunnel: Tunnel,
     frame: SealedNetworkFrame,
     timeoutMs: number,
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     let response: any;
     try {
-      response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs);
+      response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs, onWrite);
     } catch (error) {
       if (
         error instanceof DeliveryTimeoutError &&
@@ -2553,20 +2577,29 @@ export class P2PTransportService implements TransportService {
       spoolBlobHashes?: readonly string[];
     },
   ): Promise<Uint8Array> {
-    const m = this.mounts.get(networkId);
-    if (target === this.localNodeId) {
-      return this.deliverLocal(networkId, bytes, m);
+    let writeStarted = false;
+    const onWrite = () => { writeStarted = true; };
+    try {
+      const m = this.mounts.get(networkId);
+      if (target === this.localNodeId) {
+        return await this.deliverLocal(networkId, bytes, m, onWrite);
+      }
+      if (!m) throw new NetworkUnmountedError(networkId);
+      // Spooling remains caller-owned. Attachment hashes come from the caller, so
+      // transport can forward sealed frames without interpreting their envelopes.
+      return await this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs, {
+        ...(opts?.spoolIfOffline === true ? { spoolIfOffline: true } : {}),
+        ...(opts?.spoolKey !== undefined ? { spoolKey: opts.spoolKey } : {}),
+        blobHashes: opts?.spoolBlobHashes ?? [],
+      }, onWrite);
+    } catch (cause) {
+      const error = asError(cause);
+      // The whole exchange owns this evidence. A later leg may fail before writing
+      // even after an earlier leg already sent the request.
+      if (writeStarted) throw Object.assign(error, { beforeSend: false });
+      if (isDeliveryTimeoutFailure(error) || isOfflinePeerSpooledError(error)) throw error;
+      throw markBeforeSendError(error);
     }
-    if (!m) {
-      throw new NetworkUnmountedError(networkId);
-    }
-    // Spooling is caller-owned policy: an explicit opt-out must leave no durable relay
-    // copy. Attachment hashes still come from the caller, so transport stays envelope-blind.
-    return this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs, {
-      ...(opts?.spoolIfOffline === true ? { spoolIfOffline: true } : {}),
-      ...(opts?.spoolKey !== undefined ? { spoolKey: opts.spoolKey } : {}),
-      blobHashes: opts?.spoolBlobHashes ?? [],
-    });
   }
 
   /** Same-machine mode: deliver a frame addressed to this node without opening a socket. */
@@ -2574,6 +2607,7 @@ export class P2PTransportService implements TransportService {
     networkId: string,
     bytes: Uint8Array,
     mount?: Mount,
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     let payload: unknown;
     try {
@@ -2607,6 +2641,7 @@ export class P2PTransportService implements TransportService {
     if (this.handlers.size === 0 && !this.ctx) {
       throw new Error('No inbound handler registered');
     }
+    onWrite?.();
     return this.inboundReply(event);
   }
 
@@ -2821,6 +2856,7 @@ export class P2PTransportService implements TransportService {
     body: Record<string, unknown>,
     requestSocket?: Socket,
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
+    onWrite?: () => void,
   ): Promise<any> {
     const relayId = randomUUID();
     return new Promise((resolve, reject) => {
@@ -2844,7 +2880,9 @@ export class P2PTransportService implements TransportService {
       // socket expires (or forever, when that requester never notices).
       timer = setTimeout(() => finish(new DeliveryTimeoutError('Relay tunnel timeout')), timeoutMs);
       try {
-        tunnel.socket.write(packet({ ...body, relayId }));
+        const wirePacket = packet({ ...body, relayId });
+        onWrite?.();
+        tunnel.socket.write(wirePacket);
       } catch (error) {
         finish(error instanceof Error ? error : new Error(String(error)));
       }

@@ -14,6 +14,8 @@ import {
   signEnvelope,
   isDedupCasDuplicateReceipt,
   isConfirmedHandoffReceipt,
+  isRetryablePreEffectReceipt,
+  isUnattemptedOutboxItem,
   runDealerCli,
   getBuiltInProfile,
   readPatch,
@@ -232,12 +234,17 @@ test('Phase 4: polling, CAS dedup, durable busy waves and run-managed delivery a
     idempotencyKey: 'alert-0',
   });
   assert.equal(duplicate.receipts[0].stage, 'dispatched', 'sender replays its durable handoff');
-  // Bypass sender obligations explicitly to exercise the receiver CAS boundary too.
-  const wireDuplicate = await alice.emitter.emit({
-    ...input('bob', { executor: 'orca-wave', streamKey: 'alerts', revision: 1 }),
-    idempotencyKey: 'alert-0', queueIfOffline: false,
-  });
-  assert.equal(wireDuplicate.receipts[0].stage, 'rejected');
+  // Exercise receiver CAS independently of sender reconciliation by sending a fresh wire envelope.
+  const { envelope } = alice.outbox.get(duplicate.messageId)!;
+  const { privateKeyPem } = JSON.parse(readFileSync(join(root, 'alice', 'identity.json'), 'utf8'));
+  const wireEnvelope = signEnvelope({ ...envelope, id: 'alert-0-wire-duplicate' }, privateKeyPem);
+  const wireDuplicate = JSON.parse(Buffer.from(await alice.transport.sendUnicast(
+    envelope.networkId,
+    duplicate.receipts[0].fromNodeId,
+    Buffer.from(JSON.stringify({ type: 'message.envelope', envelope: wireEnvelope })),
+  )).toString('utf8'));
+  assert.equal(wireDuplicate.stage, 'rejected');
+  assert.equal(wireDuplicate.detail, DEDUP_CAS_DUPLICATE_DETAIL);
   assert.equal(bob.mailbox.list({ mailboxId: 'stream:alerts' }).queuedCount, 2);
 
   idle = true;
@@ -711,7 +718,8 @@ export default (_config: any, context: any) => {
     'writeAtomicCursorFile', 'readJsonCursorFile', 'everyReceiptSettled',
     'parseYaml', 'parseMarkdownFrontmatter', 'parseTeamRegistry', 'resolveTeamRegistryMembers', 'createTeamRegistryRouterPlugin',
     'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
-    'createDedupCasPolicyPlugin', 'isConfirmedHandoffReceipt', 'isDedupCasDuplicateReceipt', 'isDurableQueuedReceipt', 'createOrcaSpawnExecutorPlugin',
+    'createDedupCasPolicyPlugin', 'isConfirmedHandoffReceipt', 'isDedupCasDuplicateReceipt', 'isDurableQueuedReceipt',
+    'isRetryablePreEffectReceipt', 'isUnattemptedOutboxItem', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
     'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin', 'createInboxExecutorPlugin',
   ];
@@ -883,7 +891,9 @@ export default {
   t.after(() => restarted.stop());
   assert.equal(restarted.mailbox.list({ mailboxId: 'default' }).queuedCount, 1);
   assert.equal(restarted.gate.listRejections()[0]?.reason, 'Current admission rule');
-  assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
+  const drained = JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8'));
+  assert.deepEqual(drained.queued, {});
+  assert.deepEqual(Object.values(drained.withdrawn), ['Current admission rule']);
   await restarted.gate.drainDnd();
   assert.equal(restarted.mailbox.list({ mailboxId: 'default' }).queuedCount, 1);
 });
@@ -1040,16 +1050,393 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
 });
 
 
+test('Phase 4: closed admission retains earlier DND custody and a keyed retry stays on its original node', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'dnd', defaultExecutor: 'inbox' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const request = { ...input('bob'), idempotencyKey: 'durable-dnd' };
+  const first = await alice.emitter.emit(request);
+  const [dnd] = bob.gate.listDndQueue();
+  assert.equal(first.receipts[0].stage, 'queued');
+  const getObligation = () => alice.listOutbox().find(item => item.id === first.messageId)!;
+  const targetNodeId = first.receipts[0].fromNodeId;
+  assert.deepEqual(getObligation().deliveredReceipts[targetNodeId], first.receipts[0]);
+
+  await bob.gate.setNetworkMode(request.networkId, 'closed');
+  const previous = await alice.emitter.emit(request);
+  assert.equal(previous.receipts[0].stage, 'rejected');
+  assert.equal(previous.receipts[0].executionReceipt?.handoff, 'unknown');
+  assert.equal(isRetryablePreEffectReceipt(previous.receipts[0]), false);
+  assert.deepEqual(getObligation().deliveredReceipts[targetNodeId], first.receipts[0]);
+  assert.deepEqual(getObligation().failedReceipts, {});
+  assert.equal(isUnattemptedOutboxItem(getObligation()), false);
+  const retargeted = await alice.emitter.emit({
+    ...input('carol'), idempotencyKey: request.idempotencyKey, body: 'other node', queueIfOffline: false,
+  });
+  assert.equal(retargeted.messageId, first.messageId);
+  const broadcast = await alice.emitter.emit({ ...request, routing: { mode: 'broadcast' } });
+  assert.equal(broadcast.messageId, first.messageId);
+  assert.deepEqual(bob.gate.listDndQueue(), [dnd]);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+
+  await bob.gate.setNetworkMode(request.networkId, 'open');
+  assert.equal(bob.gate.listDndQueue().length, 0);
+  assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'dispatched');
+  assert.equal(getObligation().deliveredReceipts[targetNodeId].stage, 'dispatched');
+  assert.equal(bob.mailbox.list().totalCount, 1);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+});
+
+test('Phase 4: a keyed gate rejection permits an online replacement but prevents broadcast', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'closed' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const request = { ...input('bob'), idempotencyKey: 'replace-without-queueing' };
+  const first = await alice.emitter.emit(request);
+  assert.equal(isUnattemptedOutboxItem(alice.outbox.get(first.messageId)), true);
+  await assert.rejects(
+    alice.emitter.emit({ ...request, routing: { mode: 'broadcast' } }),
+    /Keyed outbox obligation cannot route to broadcast/,
+  );
+  const replacement = await alice.emitter.emit({ ...input('carol'), idempotencyKey: request.idempotencyKey, queueIfOffline: false });
+  assert.equal(replacement.receipts[0].stage, 'dispatched');
+  assert.equal(alice.outbox.get(first.messageId)?.supersededById, replacement.messageId);
+  assert.equal(alice.outbox.get(replacement.messageId)?.status, 'delivered');
+  assert.deepEqual(carol.mailbox.list().items.map(item => item.id), [replacement.messageId]);
+  assert.equal(bob.mailbox.list().totalCount, 0);
+});
+
+test('Phase 4: concurrent authenticated copies share admission and fence retargeting', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { defaultExecutor: 'inbox' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let admissions = 0;
+  bob.gate.registerRule({
+    name: 'delayed-admission', priority: 10,
+    async evaluate() {
+      if (++admissions !== 1) return { status: 'reject', code: 'second-copy', reason: 'Later admission denied' };
+      entered.resolve();
+      await release.promise;
+      return { status: 'allow' };
+    },
+  });
+  const send = alice.transport.sendUnicast.bind(alice.transport);
+  const senderNodeId = alice.node.getSelfCard('sensebeing').nodeId;
+  let firstStage: string | undefined;
+  t.mock.method(alice.transport, 'sendUnicast', async (...args: Parameters<typeof send>) => {
+    const [networkId, , bytes] = args;
+    const first = send(...args);
+    await entered.promise;
+    const second = bob.kernel.ctx.bail('transport/inbound', {
+      networkId, senderNodeId, mode: 'unicast', payload: JSON.parse(Buffer.from(bytes).toString('utf8')),
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release.resolve();
+    const [received, duplicate] = await Promise.all([first, second]);
+    firstStage = JSON.parse(Buffer.from(received).toString('utf8')).stage;
+    return duplicate!;
+  });
+
+  const request = { ...input('bob'), idempotencyKey: 'parallel-admission' };
+  const original = await alice.emitter.emit(request);
+  assert.equal(firstStage, 'dispatched');
+  assert.equal(original.receipts[0].stage, 'dispatched');
+  assert.equal(admissions, 1);
+  assert.equal(isUnattemptedOutboxItem(alice.outbox.get(original.messageId)), false);
+  const retargeted = await alice.emitter.emit({ ...input('carol'), idempotencyKey: request.idempotencyKey, body: 'other target' });
+  assert.equal(retargeted.messageId, original.messageId);
+  assert.equal(bob.mailbox.list().totalCount, 1);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+});
+
+test('Phase 4: approval custody stays open until approved or cancelled', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'approval_required', defaultExecutor: 'inbox' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const approvedIds: string[] = [];
+  for (const resolution of ['emit', 'flush', 'cancel'] as const) {
+    const replyMailbox = `terminal:approval-${resolution}`;
+    const request: EmitMessageInput = {
+      ...input('bob'), idempotencyKey: `approval-${resolution}`, semantic: { type: 'question', replyMailbox },
+    };
+    const inspect = () => alice.mailbox.inspectSlotObligations('stream:approvals', {
+      sessionMailboxId: replyMailbox, outbox: alice.outbox,
+    });
+    await bob.gate.setNetworkMode(request.networkId, 'approval_required');
+    const first = await alice.emitter.emit(request);
+    const [approval] = bob.gate.listPendingApprovals();
+    const target = first.receipts.find(receipt => receipt.stage === 'pending_approval')!.fromNodeId;
+    assert.deepEqual(alice.outbox.get(first.messageId)?.approvalPendingNodeIds, [target]);
+
+    await bob.gate.setNetworkMode(request.networkId, 'closed');
+    const report = await alice.outboxRedrive.flush({ id: first.messageId, force: true });
+    assert.equal(report.attempted, 1);
+    const [queued] = report.items;
+    assert.equal(queued.status, 'queued');
+    assert.deepEqual(queued.pendingNodeIds, [target]);
+    assert.deepEqual(queued.approvalPendingNodeIds, [target]);
+    assert.equal(isUnattemptedOutboxItem(queued), false);
+    assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+    const changed = { ...request, routing: { mode: 'unicast' as const, targets: ['member:carol'] } };
+    const retained = await alice.emitter.emit(changed);
+    assert.equal(retained.messageId, first.messageId);
+    const retry = retained.receipts.find(receipt => receipt.executionReceipt?.handoff === 'approval_pending')!;
+    assert.ok(retry);
+    assert.equal(isRetryablePreEffectReceipt(retry), false);
+    assert.equal(retry.executionReceipt?.durable, false);
+    assert.equal(carol.mailbox.list().totalCount, 0);
+
+    if (resolution === 'cancel') {
+      await bob.gate.setNetworkMode(request.networkId, 'approval_required');
+      await bob.gate.reject(approval.id, 'Cancellation recorded');
+      const cancelled = (await alice.outboxRedrive.flush({ id: first.messageId, force: true })).items[0];
+      const failure = cancelled.failedReceipts[target];
+      assert.equal(failure.detail, 'Cancellation recorded');
+      assert.equal(failure.executionReceipt?.envelopeSignature, approval.envelope.signature);
+      assert.equal(isRetryablePreEffectReceipt(failure), true);
+      assert.equal(isUnattemptedOutboxItem(cancelled), true);
+      assert.deepEqual(cancelled.approvalPendingNodeIds, []);
+      assert.equal(inspect().immediateBusyReason, undefined);
+      assert.deepEqual(bob.gate.listPendingApprovals(), []);
+      const retargeted = await alice.emitter.emit(changed);
+      assert.notEqual(retargeted.messageId, first.messageId);
+      assert.deepEqual(carol.mailbox.list().items.map(item => item.id), [retargeted.messageId]);
+      continue;
+    }
+
+    if (resolution === 'emit') {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const policy = bob.kernel.ctx.services.dispatcher.registerPolicy({
+        name: 'hold-approval',
+        async process(message, next) {
+          entered.resolve();
+          await release.promise;
+          return next([message]);
+        },
+      });
+      const approving = bob.gate.approve(approval.id);
+      try {
+        await entered.promise;
+        assert.deepEqual(await bob.gate.evaluate(approval.envelope), {
+          status: 'reject', code: 'approval_custody_retained', durable: false, reason: 'Approval already in progress',
+        });
+        await bob.gate.setNetworkMode(request.networkId, 'open');
+        const inProgress = await alice.emitter.emit(request);
+        assert.equal(inProgress.receipts.find(receipt => receipt.stage === 'rejected')?.executionReceipt?.handoff, 'approval_pending');
+        await bob.gate.setNetworkMode(request.networkId, 'closed');
+        await assert.rejects(bob.gate.reject(approval.id), /Approval already in progress/);
+      } finally {
+        release.resolve();
+        await approving;
+        policy.dispose();
+      }
+      assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'dispatched');
+    } else {
+      await bob.gate.approve(approval.id);
+      assert.equal((await alice.outboxRedrive.flush({ id: first.messageId, force: true })).delivered, 1);
+    }
+    const settled = alice.outbox.get(first.messageId)!;
+    assert.equal(settled.status, 'delivered');
+    assert.deepEqual(settled.approvalPendingNodeIds, []);
+    assert.equal(bob.gate.getNetworkMode(request.networkId), 'closed');
+    approvedIds.push(first.messageId);
+  }
+  assert.deepEqual(bob.mailbox.list().items.map(item => item.id).sort(), approvedIds.sort());
+});
+
+test('Phase 4: retryable policy rejections re-evaluate the original outbox envelope with a durable ledger', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob);
+  const rule = bob.kernel.ctx.services.dispatcher.registerPolicy({
+    name: 'temporarily-deny',
+    async process() { return { stage: 'rejected', detail: 'Temporarily denied' }; },
+  });
+  const request = { ...input('bob'), idempotencyKey: 'policy-retry' };
+  const first = await alice.emitter.emit(request);
+  const original = alice.listOutbox()[0];
+  assert.equal(isUnattemptedOutboxItem(original), true);
+  assert.equal(first.receipts[0].executionReceipt?.envelopeSignature, original.envelope.signature);
+  assert.equal(bob.mailbox.list().totalCount, 0);
+  rule.dispose();
+  const retry = await alice.emitter.emit(request);
+  assert.equal(retry.messageId, first.messageId);
+  assert.equal(retry.receipts[0].stage, 'dispatched');
+  assert.deepEqual(bob.mailbox.list().items.map(item => item.id), [first.messageId]);
+  assert.deepEqual(await alice.emitter.emit(request), retry);
+});
+
+test('Phase 4: reopened admission retires the old approval before certifying a pre-effect outcome', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob');
+  await connect(alice, bob);
+  const dispatcher = bob.kernel.ctx.services.dispatcher;
+  const executor = dispatcher.registerExecutor({
+    name: 'pre-effect-failure',
+    async execute() {
+      throw Object.assign(new Error('Executor could not start'), { beforeExternalEffect: true });
+    },
+  });
+  const policy = dispatcher.registerPolicy({
+    name: 'reject-reopened',
+    async process(envelope, next) {
+      return envelope.subject === 'policy' ? { stage: 'rejected', detail: 'Policy denied' } : next([envelope]);
+    },
+  });
+  t.after(() => { executor.dispose(); policy.dispose(); });
+  for (const path of ['policy', 'executor']) {
+    const request = { ...input('bob', { executor: 'pre-effect-failure' }), subject: path, idempotencyKey: path };
+    await bob.gate.setNetworkMode(request.networkId, 'approval_required');
+    const first = await alice.emitter.emit(request);
+    const [approval] = bob.gate.listPendingApprovals();
+    await bob.gate.setNetworkMode(request.networkId, 'open');
+    const retried = await alice.emitter.emit(request);
+    assert.equal(retried.messageId, first.messageId);
+    assert.equal(retried.receipts[0].stage, path === 'policy' ? 'rejected' : 'failed');
+    assert.equal(isRetryablePreEffectReceipt(retried.receipts[0]), true);
+    assert.deepEqual(bob.gate.listPendingApprovals(), []);
+    await assert.rejects(bob.gate.approve(approval.id), /Unknown approval/);
+  }
+});
+
+test('Phase 4: explicit approval cancellation relinquishes intervening durable DND custody', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'approval_required' } });
+  const carol = await node(t, root, 'carol');
+  await connect(alice, bob, carol);
+  const target = bob.node.getSelfCard('sensebeing').nodeId;
+  await until(() => alice.transport.isPeerReachable('sensebeing', target), 'sender can reach the approval receiver');
+  const replyMailbox = 'terminal:cancel-dnd';
+  const request: EmitMessageInput = {
+    ...input('bob'), idempotencyKey: 'cancel-dnd', semantic: { type: 'question', replyMailbox },
+  };
+  const inspect = () => alice.mailbox.inspectSlotObligations('stream:approvals', {
+    sessionMailboxId: replyMailbox, outbox: alice.outbox,
+  });
+  const first = await alice.emitter.emit(request);
+  const [approval] = bob.gate.listPendingApprovals();
+  assert.ok(first.receipts.some(receipt => receipt.stage === 'pending_approval' && receipt.fromNodeId === target),
+    JSON.stringify(first.receipts));
+  await bob.gate.setNetworkMode(request.networkId, 'dnd');
+  const queued = await alice.emitter.emit(request);
+  assert.equal(queued.receipts[0].stage, 'queued');
+  assert.equal(queued.receipts[0].executionReceipt?.executor, 'gate-dnd');
+  assert.equal(alice.outbox.get(first.messageId)?.status, 'delivered');
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  await bob.gate.reject(approval.id, 'Operator cancelled both copies');
+  assert.deepEqual(bob.gate.listDndQueue(), []);
+
+  const changed = { ...request, routing: { mode: 'unicast' as const, targets: ['member:carol'] } };
+  const reconciled = await alice.emitter.emit(changed);
+  assert.equal(reconciled.messageId, first.messageId);
+  const failed = alice.outbox.get(first.messageId)!;
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.deliveredReceipts[target], undefined);
+  assert.equal(failed.failedReceipts[target].executionReceipt?.custodyRelinquished, true);
+  assert.equal(failed.failedReceipts[target].executionReceipt?.envelopeSignature, approval.envelope.signature);
+  assert.equal(isUnattemptedOutboxItem(failed), true);
+  assert.equal(inspect().immediateBusyReason, undefined);
+  assert.equal(inspect().hasPendingWave, false);
+
+  const replaced = await alice.emitter.emit(changed);
+  assert.notEqual(replaced.messageId, first.messageId);
+  assert.deepEqual(carol.mailbox.list().items.map(item => item.id), [replaced.messageId]);
+  await bob.gate.setNetworkMode(request.networkId, 'open');
+  assert.equal(bob.mailbox.list().totalCount, 0);
+});
+
+test('Phase 4: rule rejection withdraws durable DND custody across restart', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'dnd' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const obligations = [];
+  for (const evidence of ['none', 'independent-custody']) {
+    const replyMailbox = `terminal:withdrawal-${evidence}`;
+    const request: EmitMessageInput = {
+      ...input('bob'), idempotencyKey: evidence, semantic: { type: 'question', replyMailbox },
+    };
+    const inspect = () => alice.mailbox.inspectSlotObligations('stream:dnd-withdrawal', {
+      sessionMailboxId: replyMailbox, outbox: alice.outbox,
+    });
+    const first = await alice.emitter.emit(request);
+    const item = alice.outbox.get(first.messageId)!;
+    const target = first.receipts[0].fromNodeId;
+    assert.equal(item.deliveredReceipts[target].executionReceipt?.executor, 'gate-dnd');
+    assert.equal(item.status, 'delivered');
+    assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+    if (evidence === 'independent-custody') {
+      alice.outbox.enqueue({ envelope: item.envelope, explicitTargets: item.explicitTargets, pendingNodeIds: [],
+        inDoubtNodeIds: [target], relaySpooledNodeIds: [target] });
+    }
+    obligations.push({ evidence, request, item, target, inspect });
+  }
+
+  bob.gate.registerRule({ name: 'retire-queued-requests', priority: 10, async evaluate() {
+    return { status: 'reject', code: 'new_rule', reason: 'Rule withdrew custody' };
+  } });
+  await bob.gate.setMode('open');
+  assert.deepEqual(bob.gate.listDndQueue(), []);
+  await bob.stop();
+  const restarted = await node(t, root, 'bob', { patch: { gateMode: 'open' } });
+  await connect(alice, restarted, carol);
+
+  for (const { evidence, request, item, target, inspect } of obligations) {
+    const changed = { ...request, routing: { mode: 'unicast' as const, targets: ['member:carol'] }, body: 'Revised request' };
+    const reconciliation = await alice.emitter.emit(changed);
+    assert.equal(reconciliation.messageId, item.id);
+    const failed = alice.outbox.get(item.id)!;
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.deliveredReceipts[target], undefined);
+    assert.equal(failed.failedReceipts[target].detail, 'Rule withdrew custody');
+    assert.equal(failed.failedReceipts[target].executionReceipt?.custodyRelinquished, true);
+    assert.equal(failed.failedReceipts[target].executionReceipt?.envelopeSignature, item.envelope.signature);
+    if (evidence === 'none') {
+      assert.equal(isUnattemptedOutboxItem(failed), true);
+      assert.equal(inspect().immediateBusyReason, undefined);
+      const replaced = await alice.emitter.emit(changed);
+      assert.notEqual(replaced.messageId, item.id);
+      assert.deepEqual(carol.mailbox.list().items.map(mail => mail.id), [replaced.messageId]);
+    } else {
+      assert.deepEqual(failed.inDoubtNodeIds, [target]);
+      assert.deepEqual(failed.relaySpooledNodeIds, [target]);
+      assert.equal(isUnattemptedOutboxItem(failed), false);
+      assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+      assert.equal((await alice.emitter.emit(changed)).messageId, item.id);
+      assert.equal(carol.mailbox.list().totalCount, 1);
+    }
+  }
+  const originalIds = new Set(obligations.map(({ item }) => item.id));
+  assert.deepEqual(restarted.mailbox.list({ includeAcked: true }).items.filter(mail => originalIds.has(mail.id)), []);
+});
+
 test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND obligation after restart', async t => {
   const root = directory(t);
   const alice = await node(t, root, 'legacy-alice');
   const bob = await node(t, root, 'legacy-bob', {
     patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
   });
-  await connect(alice, bob);
+  const carol = await node(t, root, 'legacy-carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
   // A prior gate-dnd handoff must not hide the receiver's ambiguous recovery state.
   const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity' };
-  assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'queued');
+  const first = await alice.emitter.emit(request);
+  assert.equal(first.receipts[0].stage, 'queued');
   const message = bob.gate.listDndQueue()[0].envelope;
   const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);
   const stateDir = bob.stateDir;
@@ -1072,16 +1459,22 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'dedup-watermarks.json'), 'utf8'))[key], {
     revision: 2, status: 'unknown',
   });
-  const retry = await alice.emitter.emit(request);
-  assert.equal(isConfirmedHandoffReceipt(retry.receipts[0], { allowQueued: true }), false);
-  assert.deepEqual(restarted.gate.listDndQueue(), [parked]);
-  assert.equal(restarted.mailbox.list().totalCount, 0);
-  await restarted.gate.setMode('dnd');
-  for (const revision of [2, 1]) {
-    const rejected = await alice.emitter.emit({ ...request, payload: { revision } });
+  for (const mode of ['open', 'closed', 'approval_required', 'dnd'] as const) {
+    await restarted.gate.setNetworkMode(request.networkId, mode);
+    const verdict = await restarted.gate.evaluate(message);
+    assert.deepEqual(verdict, { status: 'reject', code: 'dnd_handoff_parked', durable: true, reason: parked.lastError });
+    const rejected = await alice.emitter.emit({ ...input('legacy-carol', { revision: 1 }), idempotencyKey: request.idempotencyKey });
+    assert.equal(rejected.messageId, first.messageId);
     assert.equal(rejected.receipts[0].stage, 'rejected');
+    assert.equal(rejected.receipts[0].executionReceipt?.handoff, 'unknown');
+    assert.equal(isRetryablePreEffectReceipt(rejected.receipts[0]), false);
     assert.equal(isConfirmedHandoffReceipt(rejected.receipts[0], { allowQueued: true }), false);
+    const stored = alice.listOutbox().find(item => item.id === first.messageId)!;
+    assert.deepEqual(stored.deliveredReceipts[first.receipts[0].fromNodeId], first.receipts[0]);
+    assert.equal(isUnattemptedOutboxItem(stored), false);
+    assert.equal(carol.mailbox.list().totalCount, 0);
     assert.deepEqual(restarted.gate.listDndQueue(), [parked]);
+    assert.equal(restarted.mailbox.list().totalCount, 0);
     assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')).queued[id], persisted);
   }
   const recovered = await alice.emitter.emit({ ...request, payload: { revision: 3 } });
@@ -1090,7 +1483,7 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.equal(queued.status, 'queued');
   assert.equal(queued.attempts, 0);
   assert.equal(queued.lastError, undefined);
-  await restarted.gate.setMode('open');
+  await restarted.gate.setNetworkMode(request.networkId, 'open');
   assert.deepEqual(restarted.gate.listDndQueue(), []);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
   assert.equal(restarted.mailbox.list().totalCount, 1);

@@ -10,8 +10,8 @@ import os, { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { Kernel } from '../packages/kernel/index.ts';
-import { generateNodeKeyPair, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
-import type { DeliveryReceipt, EmitMessageInput, MessageEnvelope, NodeCard, NodeService, TransportService, ExecutorPlugin } from '../packages/core-types/index.ts';
+import { generateNodeKeyPair, isRetryablePreEffectReceipt, isUnknownEffectReceipt, isUnattemptedOutboxItem, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
+import type { DeliveryReceipt, DispatchReceipt, EmitMessageInput, MessageEnvelope, NodeCard, NodeService, TransportService, ExecutorPlugin } from '../packages/core-types/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
 import { createGatePlugin } from '../packages/gate/index.ts';
 import type { NetworkGateService } from '../packages/gate/index.ts';
@@ -149,7 +149,9 @@ test('CAS dedup serializes concurrent equal versions, rejects stale and permits 
   assert.equal(isDedupCasDuplicateReceipt(stale), false);
   assert.equal((await policy.process(envelope({ ...message, payload: { claimVersion: 3 } }), next)).stage, 'dispatched');
   assert.equal(executions, 2);
-  assert.equal((await policy.process(envelope({ payload: { claimVersion: 'bad' } }), next)).stage, 'rejected');
+  const invalid = await policy.process(envelope({ payload: { claimVersion: 'bad' } }), next);
+  assert.equal(invalid.stage, 'rejected');
+  assert.equal(invalid.executionReceipt?.handoff, 'unattempted');
 });
 
 test('CAS duplicate receipt classification excludes other outcomes and missing receipts', () => {
@@ -172,6 +174,30 @@ test('dispatcher ledger survives restart and concurrent duplicate does not execu
   await Promise.all([first.dispatcher.dispatch(message), first.dispatcher.dispatch(message)]); assert.equal(first.calls.length, 1);
   const second = await setup(t, { ledgerPath }); assert.equal((await second.dispatcher.dispatch(message)).stage, 'dispatched'); assert.equal(second.calls.length, 0);
   assert.match(await readFile(ledgerPath, 'utf8'), /dispatched/);
+});
+
+test('dispatcher replays legacy execution fences and re-evaluates stored pre-effect rejections', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-legacy-policy-receipt-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ledgerPath = join(dir, 'ledger.json');
+  const retryable = envelope();
+  const unknown = envelope();
+  const key = (message: MessageEnvelope) => JSON.stringify([message.networkId, message.from.nodeId, message.id]);
+  await writeFile(ledgerPath, JSON.stringify({
+    [key(retryable)]: {
+      stage: 'rejected', executionReceipt: { executor: 'old-policy', executionId: retryable.id, handoff: 'rejected' },
+    },
+    [key(unknown)]: {
+      stage: 'failed', executionReceipt: { executor: 'old-executor', executionId: unknown.id, handoff: 'unknown' },
+    },
+  }));
+  const { dispatcher, calls } = await setup(t, { ledgerPath });
+  assert.equal((await dispatcher.dispatch(retryable)).stage, 'dispatched');
+  assert.equal((await dispatcher.dispatch(unknown)).executionReceipt?.handoff, 'unknown');
+  assert.deepEqual(calls.map(batch => batch[0].id), [retryable.id]);
+  const saved = JSON.parse(await readFile(ledgerPath, 'utf8'));
+  assert.equal(saved[key(retryable)].stage, 'dispatched');
+  assert.equal(saved[key(unknown)].stage, 'failed');
 });
 
 async function connected(t: TestContext) {
@@ -203,9 +229,62 @@ test('emitter -> authenticated inbound -> gate -> dispatcher yields signed recei
   for (const [mode, stage] of [['approval_required', 'pending_approval'], ['dnd', 'queued'], ['closed', 'rejected']] as const) { await gate.setMode(mode); assert.equal((await emitter.emit(input)).receipts[0].stage, stage); }
   const invalid = envelope(); invalid.body = 'tampered';
   const response = await kernel.ctx.bail('transport/inbound', { networkId: 'test', senderNodeId: sender.nodeId, mode: 'unicast', payload: { type: 'message.envelope', envelope: invalid } });
-  assert.equal(JSON.parse(Buffer.from(response!).toString()).stage, 'rejected');
+  const invalidSignature = JSON.parse(Buffer.from(response!).toString()) as DeliveryReceipt;
+  assert.equal(invalidSignature.stage, 'rejected');
+  assert.equal(isRetryablePreEffectReceipt(invalidSignature), false);
   const mismatch = await kernel.ctx.bail('transport/inbound', { networkId: 'other', senderNodeId: sender.nodeId, mode: 'unicast', payload: { type: 'message.envelope', envelope: envelope() } });
-  assert.equal(JSON.parse(Buffer.from(mismatch!).toString()).stage, 'rejected');
+  const wrongNetwork = JSON.parse(Buffer.from(mismatch!).toString()) as DeliveryReceipt;
+  assert.equal(wrongNetwork.stage, 'rejected');
+  assert.equal(isRetryablePreEffectReceipt(wrongNetwork), false);
+});
+
+test('admission and policy rejections sign the evidence available before execution', async t => {
+  const { kernel, gate, dispatcher, calls } = await setup(t);
+  const inbound = async (message: MessageEnvelope): Promise<DeliveryReceipt> => {
+    const reply = await kernel.ctx.bail('transport/inbound', {
+      networkId: message.networkId, senderNodeId: sender.nodeId, mode: 'unicast',
+      payload: { type: 'message.envelope', envelope: message },
+    });
+    const receipt = JSON.parse(Buffer.from(reply!).toString()) as DeliveryReceipt;
+    assert.equal(verifyReceipt(receipt), true);
+    return receipt;
+  };
+  const completed = envelope();
+  assert.equal((await inbound(completed)).stage, 'dispatched');
+  const invalid = await inbound({ ...completed, signature: 'invalid-signature' });
+  assert.equal(invalid.stage, 'rejected');
+  assert.equal(invalid.executionReceipt, undefined);
+  assert.equal(isRetryablePreEffectReceipt(invalid), false);
+  assert.equal(isUnattemptedOutboxItem({
+    status: 'failed', envelope: completed, failedReceipts: { [invalid.fromNodeId]: invalid },
+  }), false);
+  const rule = dispatcher.registerPolicy({
+    name: 'kind-deny',
+    async process() { return { stage: 'rejected', detail: 'kind denied' }; },
+  });
+  const policyDenied = envelope();
+  const typedPolicyRejection = await inbound(policyDenied);
+  assert.deepEqual(typedPolicyRejection.executionReceipt, {
+    executor: 'kind-deny', executionId: 'kind-deny:' + policyDenied.id, handoff: 'rejected',
+    envelopeSignature: policyDenied.signature,
+  });
+  assert.equal(isRetryablePreEffectReceipt(typedPolicyRejection), true);
+  rule.dispose();
+
+  await gate.setMode('closed');
+  const firstDenied = envelope();
+  const firstRejection = await inbound(firstDenied);
+  assert.equal(firstRejection.executionReceipt?.handoff, 'unattempted');
+  assert.equal(firstRejection.executionReceipt?.envelopeSignature, firstDenied.signature);
+  assert.equal(isRetryablePreEffectReceipt(firstRejection), true);
+  const completedReplay = await inbound(completed);
+  assert.equal(completedReplay.stage, 'dispatched');
+  assert.equal(isRetryablePreEffectReceipt(completedReplay), false);
+  const rejected = await inbound(policyDenied);
+  assert.equal(rejected.stage, 'rejected');
+  assert.equal(rejected.executionReceipt?.handoff, 'unattempted');
+  assert.equal(isRetryablePreEffectReceipt(rejected), true);
+  assert.equal(calls.length, 1);
 });
 
 test('all official executors deliver via Emitter using injected commands and notify inbox', async t => {
@@ -1150,22 +1229,44 @@ test('CAS rolls back definite pre-effect outcomes and restores the prior version
   const dir = await mkdtemp(join(tmpdir(), 'dealer-cas-rollback-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const watermarksPath = join(dir, 'dedup.json');
+  const policyEvidence = { executor: 'policy', executionId: 'id' };
+  const rollbacks: (DispatchReceipt | 'throw')[] = [
+    { stage: 'rejected', executionReceipt: { ...policyEvidence, handoff: 'rejected' } },
+    { stage: 'failed', executionReceipt: { ...policyEvidence, handoff: 'unattempted' } },
+    { stage: 'rejected', executionReceipt: { ...policyEvidence, handoff: 'approval_pending' } },
+    { stage: 'pending_approval' }, { stage: 'queued' }, 'throw',
+  ];
   for (const hadPrior of [false, true]) {
-    for (const stage of ['rejected', 'pending_approval', 'queued', 'throw'] as const) {
+    for (const receipt of rollbacks) {
       await writeFile(watermarksPath, '{}');
       const policy = createDedupCasPolicyPlugin({ watermarksPath });
       const message = envelope({ idempotencyKey: 'retry', payload: { revision: 2 } });
       if (hadPrior) await policy.process(envelope({ ...message, payload: { revision: 1 } }), async () => ({ stage: 'settled' }));
       const before = await readFile(watermarksPath, 'utf8');
       const operation = policy.process(message, async () => {
-        if (stage === 'throw') throw Object.assign(new Error('not started'), { beforeExternalEffect: true });
-        return { stage };
+        if (receipt === 'throw') throw Object.assign(new Error('not started'), { beforeExternalEffect: true });
+        return receipt;
       });
-      if (stage === 'throw') await assert.rejects(operation, /not started/);
-      else assert.equal((await operation).stage, stage);
+      if (receipt === 'throw') await assert.rejects(operation, /not started/);
+      else assert.deepEqual(await operation, receipt);
       assert.equal(await readFile(watermarksPath, 'utf8'), before);
       assert.equal((await policy.process(message, async () => ({ stage: 'dispatched' }))).stage, 'dispatched');
     }
+  }
+  const unresolved: DispatchReceipt[] = [
+    { stage: 'rejected' },
+    { stage: 'rejected', executionReceipt: { ...policyEvidence, handoff: 'unknown' } },
+    { stage: 'rejected', detail: DEDUP_CAS_AMBIGUOUS_DETAIL },
+    { stage: 'rejected', detail: DEDUP_CAS_DUPLICATE_DETAIL,
+      executionReceipt: { executor: 'dedup-cas', executionId: 'id', handoff: 'queued', durable: false } },
+  ];
+  for (const receipt of unresolved) {
+    await writeFile(watermarksPath, '{}');
+    const policy = createDedupCasPolicyPlugin({ watermarksPath });
+    const message = envelope({ idempotencyKey: 'unresolved', payload: { revision: 2 } });
+    const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);
+    assert.deepEqual(await policy.process(message, async () => receipt), receipt);
+    assert.deepEqual(JSON.parse(await readFile(watermarksPath, 'utf8'))[key], { revision: 2, status: 'unknown' });
   }
   const { dispatcher, calls } = await setup(t);
   dispatcher.registerPolicy(createDedupCasPolicyPlugin());
@@ -1174,6 +1275,116 @@ test('CAS rolls back definite pre-effect outcomes and restores the prior version
   dispatcher.registerExecutor({ name: 'later', async execute() { return { executor: 'later', executionId: 'ok' }; } }, {});
   assert.equal((await dispatcher.dispatch(message)).stage, 'dispatched');
   assert.equal(calls.length, 0);
+});
+
+test('dispatcher and CAS preserve the same policy receipt evidence across restart', async t => {
+  const inbound = async (kernel: Kernel, message: MessageEnvelope): Promise<DeliveryReceipt> => {
+    const result = await kernel.ctx.bail('transport/inbound', {
+      networkId: message.networkId, senderNodeId: message.from.nodeId, mode: 'unicast',
+      payload: { type: 'message.envelope', envelope: message },
+    });
+    const receipt = JSON.parse(Buffer.from(result!).toString());
+    assert.equal(verifyReceipt(receipt), true);
+    assert.equal(receipt.messageId, message.id);
+    return receipt;
+  };
+  for (const handoff of ['unattempted', 'unknown'] as const) {
+    await t.test(handoff, async t => {
+      const dir = await mkdtemp(join(tmpdir(), 'dealer-cas-policy-receipt-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const watermarksPath = join(dir, 'watermarks.json');
+      const ledgerPath = join(dir, 'ledger.json');
+      const original = envelope({ idempotencyKey: 'policy-chain', payload: { revision: 2 } });
+      const key = JSON.stringify([original.networkId, original.from.nodeId, original.idempotencyKey]);
+      const readWatermark = async () => JSON.parse(await readFile(watermarksPath, 'utf8'))[key];
+      const first = await setup(t, { ledgerPath });
+      first.dispatcher.registerPolicy(createDedupCasPolicyPlugin({ watermarksPath }));
+      const prior = envelope({ idempotencyKey: original.idempotencyKey, payload: { revision: 1 } });
+      assert.equal((await first.dispatcher.dispatch(prior)).stage, 'dispatched');
+      const unattempted = handoff === 'unattempted';
+      const decision: DispatchReceipt = {
+        stage: unattempted ? 'failed' : 'rejected',
+        detail: unattempted ? 'transient policy check unavailable' : 'external side-effect status lost',
+        executionReceipt: { executor: 'ext-policy', executionId: unattempted ? 'p1' : 'p2', handoff },
+      };
+      const downstream = first.dispatcher.registerPolicy({ name: 'ext-policy', async process() { return decision; } });
+      const signed = await inbound(first.kernel, original);
+      assert.equal(signed.detail, decision.detail);
+      assert.equal(isRetryablePreEffectReceipt(signed), unattempted);
+      assert.equal(isUnknownEffectReceipt(signed), !unattempted);
+      const duplicate = () => envelope({ idempotencyKey: original.idempotencyKey, payload: original.payload });
+      const expectedWatermark = unattempted ? { revision: 1, status: 'settled' } : { revision: 2, status: 'unknown' };
+      assert.deepEqual(await readWatermark(), expectedWatermark);
+      if (unattempted) {
+        assert.equal(signed.executionReceipt?.envelopeSignature, original.signature);
+        const direct = await first.dispatcher.dispatch(original);
+        assert.equal(direct.stage, 'failed');
+        assert.equal(direct.executionReceipt?.envelopeSignature, original.signature);
+      }
+      downstream.dispose();
+      const assertFenced = async (kernel: Kernel) => {
+        // A fresh envelope ID reaches CAS instead of the exact-envelope ledger entry.
+        const rejected = await inbound(kernel, duplicate());
+        assert.equal(rejected.stage, 'rejected');
+        assert.equal(rejected.detail, DEDUP_CAS_AMBIGUOUS_DETAIL);
+        assert.equal(rejected.executionReceipt?.handoff, 'unknown');
+        assert.deepEqual(await readWatermark(), expectedWatermark);
+      };
+      if (!unattempted) await assertFenced(first.kernel);
+      assert.deepEqual(first.calls.map(batch => batch[0].id), [prior.id]);
+      await first.kernel.stop();
+
+      const restarted = await setup(t, { ledgerPath });
+      restarted.dispatcher.registerPolicy(createDedupCasPolicyPlugin({ watermarksPath }));
+      if (unattempted) {
+        assert.equal((await inbound(restarted.kernel, original)).stage, 'dispatched');
+        assert.deepEqual(restarted.calls.map(batch => batch[0].id), [original.id]);
+        assert.deepEqual(await readWatermark(), { revision: 2, status: 'settled' });
+      } else {
+        await assertFenced(restarted.kernel);
+        assert.deepEqual(restarted.calls, []);
+      }
+    });
+  }
+});
+
+test('transport returns signed pre-effect and unknown failures and persists only the unknown attempt', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-receipt-handoff-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { kernel, dispatcher } = await setup(t, { ledgerPath: join(dir, 'ledger.json') });
+  dispatcher.registerPolicy(createDedupCasPolicyPlugin({ watermarksPath: join(dir, 'watermarks.json') }));
+  let attempts = 0;
+  dispatcher.registerExecutor({ name: 'failure', async execute([message]) {
+    attempts++;
+    if (message.payload.beforeEffect === true) {
+      throw Object.assign(new Error('not started'), { beforeExternalEffect: true });
+    }
+    throw new Error('lost external outcome');
+  } }, {});
+  const inbound = async (message: MessageEnvelope) => {
+    const result = await kernel.ctx.bail('transport/inbound', {
+      networkId: 'test', senderNodeId: sender.nodeId, mode: 'unicast',
+      payload: { type: 'message.envelope', envelope: message },
+    });
+    const receipt = JSON.parse(Buffer.from(result!).toString());
+    assert.equal(receipt.stage, 'failed');
+    assert.equal(verifyReceipt(receipt), true);
+    return receipt;
+  };
+  const unattempted = envelope({ idempotencyKey: 'pre-effect', payload: { executor: 'failure', beforeEffect: true } });
+  const unknown = envelope({ idempotencyKey: 'unknown-effect', payload: { executor: 'failure' } });
+  assert.deepEqual((await inbound(unattempted)).executionReceipt, {
+    executor: 'dispatcher', executionId: `dispatcher:${unattempted.id}`, handoff: 'unattempted', durable: true,
+    envelopeSignature: unattempted.signature,
+  });
+  assert.equal((await inbound(unattempted)).executionReceipt.handoff, 'unattempted');
+  assert.deepEqual((await inbound(unknown)).executionReceipt, {
+    executor: 'dispatcher', executionId: `dispatcher:${unknown.id}`, handoff: 'unknown', durable: true,
+  });
+  assert.deepEqual((await inbound(unknown)).executionReceipt, {
+    executor: 'failure', executionId: `failure:${unknown.id}`, handoff: 'unknown', durable: true,
+  });
+  assert.equal(attempts, 3);
 });
 
 test('DND persists signed queued receipts, restores capacity and rechecks admission before draining', async t => {
@@ -1202,9 +1413,28 @@ test('DND persists signed queued receipts, restores capacity and rechecks admiss
   await second.gate.setMode('open');
   assert.deepEqual(second.calls.map(batch => batch[0].id), [allowed.id]);
   assert.equal(second.gate.listRejections().at(-1)?.reason, 'new rule');
-  assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), { queued: {} });
+  const drained = JSON.parse(await readFile(dndQueuePath, 'utf8'));
+  assert.deepEqual(drained.queued, {});
+  assert.deepEqual(Object.values(drained.withdrawn), ['new rule']);
   await second.gate.drainDnd();
   assert.equal(second.calls.length, 1);
+});
+
+test('an allow rule preserves durable DND custody and retires only the exact volatile copy', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-allow-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const durable of [true, false]) {
+    const { gate } = await setup(t, { mode: 'dnd', ...(durable ? { dndQueuePath: join(dir, 'queue.json') } : {}) });
+    const original = envelope();
+    assert.equal((await gate.evaluate(original)).status, 'queued_dnd');
+    gate.registerRule({ name: 'allow-retry', priority: 1, async evaluate() { return { status: 'allow' }; } });
+    const changed = signEnvelope({ ...original, body: 'different signature' }, sender.privateKeyPem);
+    assert.deepEqual(await gate.evaluate(changed), {
+      status: 'reject', code: 'dnd_custody_retained', durable, reason: 'Queued DND copy retained',
+    });
+    assert.equal((await gate.evaluate(original)).status, durable ? 'queued_dnd' : 'allow');
+    assert.deepEqual(gate.listDndQueue().map(item => item.envelope.signature), durable ? [original.signature] : []);
+  }
 });
 
 test('DND keeps failures durable, drains later items, and rejects corrupt or oversized stores', async t => {
@@ -1224,7 +1454,10 @@ test('DND keeps failures durable, drains later items, and rejects corrupt or ove
   assert.equal(Object.keys(JSON.parse(await readFile(dndQueuePath, 'utf8')).queued).length, 1);
   const invalid = { ...missing, body: 'tampered' };
   const validKey = JSON.stringify([missing.networkId, missing.from.nodeId, missing.id]);
-  for (const saved of ['bad json', JSON.stringify({ queued: { [validKey]: invalid } }), JSON.stringify({ queued: [] }), JSON.stringify({ queued: { wrong: missing } })]) {
+  for (const saved of [
+    'bad json', JSON.stringify({ queued: { [validKey]: invalid } }), JSON.stringify({ queued: [] }),
+    JSON.stringify({ queued: { wrong: missing } }), JSON.stringify({ queued: {}, withdrawn: { [validKey]: 42 } }),
+  ]) {
     await writeFile(dndQueuePath, saved);
     const kernel = new Kernel();
     await assert.rejects(kernel.use(createGatePlugin({ dndQueuePath })), /Invalid gate DND store/);
@@ -1264,7 +1497,9 @@ test('DND rechecks network mode mid-drain and retains approval items across rest
   await second.gate.approve(approve.id);
   await second.gate.reject(reject.id);
   assert.equal(second.calls.length, 1);
-  assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), { queued: {} });
+  const settled = JSON.parse(await readFile(dndQueuePath, 'utf8'));
+  assert.deepEqual(settled.queued, {});
+  assert.deepEqual(Object.values(settled.withdrawn), ['Rejected by operator']);
 });
 
 test('DND and approval retain every unconfirmed handoff and only clear confirmed receipts', async t => {
@@ -1343,7 +1578,7 @@ test('DND legacy loading, revision admission and signature CAS preserve newer ob
   const parked = gate.listDndQueue()[0];
   for (const message of [old, envelope({ ...old, id: 'equal' }), envelope({ ...old, payload: { revision: 1 } })]) {
     assert.deepEqual(await gate.evaluate(message), {
-      status: 'reject', code: 'dnd_handoff_parked', reason: parked.lastError,
+      status: 'reject', code: 'dnd_handoff_parked', durable: true, reason: parked.lastError,
     });
     assert.deepEqual(gate.listDndQueue()[0], parked);
     const { id, ...entry } = parked;
