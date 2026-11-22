@@ -227,7 +227,27 @@ test('slot probe leaves an active sibling child alone when the leased terminal i
   assert.deepEqual(await service.probeSlot(probeMailbox), {
     busy: false, ready: false, reason: 'terminal_gone',
   });
-  assert.deepEqual(state.calls.map(call => call.args.slice(0, 2)), [['terminal', 'list']]);
+  assert.equal(state.calls.some(call => call.args.includes(`path:${state.children[0].path}`)), false);
+  state.agents = [{ state: 'working' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.agents = [];
+  state.children[0].agents = [{ state: 'working' }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+});
+
+test('a leased slot stays busy when its bound terminal is present but unusable', async t => {
+  const { service, state } = slotProbeFixture(t, { wave: true });
+  state.terminals[0].writable = false;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Terminal is disconnected or not writable',
+  });
+  state.terminals[0].writable = true;
+  state.terminals[0].connected = false;
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  state.terminals = [];
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: false, ready: false, reason: 'terminal_gone',
+  });
 });
 
 test('slot probe protects an idle session waiting for an outbound question', async t => {
@@ -245,6 +265,52 @@ test('slot probe protects an idle session waiting for an outbound question', asy
   });
   state.terminals = [];
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+});
+
+test('fixed workspace, direct terminal and Orca run slots stay busy on unanswered post-ack questions', async t => {
+  const { root, store, service } = slotProbeFixture(t);
+  const cases = [
+    {
+      mailboxId: 'stream:fixed',
+      driver: 'orca-terminal',
+      driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle },
+    },
+    {
+      mailboxId: 'terminal:term-direct',
+      driver: 'orca-terminal',
+      driverConfig: { terminalHandle: 'term-direct' },
+    },
+    { mailboxId: 'stream:run', driver: 'orca-run', driverConfig: { runId: 'run-worker' } },
+  ];
+  // The fixed stream owns this terminal for the case below.
+  store.upsertWakeTarget(probeMailbox, { driverConfig: { terminalHandle: undefined } });
+  for (const { mailboxId, driver, driverConfig } of cases) {
+    store.enqueue([alert(`wave-${mailboxId}`)], { mailboxId });
+    const lease = store.check({ mailboxId });
+    store.upsertWakeTarget(mailboxId, { driver, driverConfig });
+    const questionId = `question-${mailboxId}`;
+    store.recordOutboundEnvelope(alert(questionId, {
+      semantic: { type: 'question', threadId: questionId, replyMailbox: mailboxId },
+    }), ['remote'], mailboxId);
+    store.ack(lease.deliveryId!, mailboxId);
+    assert.deepEqual(await service.probeSlot(mailboxId), {
+      busy: true, ready: false, reason: 'outbound_thread_open',
+    }, mailboxId);
+  }
+});
+
+test('an Orca run is busy with a leased wave and an outbound question even without a workspace', async t => {
+  const { store, service, state } = slotProbeFixture(t, { wave: true });
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-run', rotateAfterWaves: undefined, driverConfig: { runId: 'run-worker' },
+  });
+  store.recordOutboundEnvelope(alert('run-question', {
+    semantic: { type: 'question', threadId: 'run-question', replyMailbox: probeMailbox },
+  }), ['remote'], probeMailbox);
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'outbound_thread_open',
+  });
+  assert.deepEqual(state.calls, []);
 });
 
 test('an empty rotating slot is ready when its retired terminal is idle or gone', async t => {

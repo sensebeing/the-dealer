@@ -189,11 +189,11 @@ export async function checkOrcaWorkspaceIdle(
           ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
       : undefined;
     if (isRoot && !rotating && options?.targetPaneKey?.trim() && !targetTerm) return true;
-    const targetPaneKeys = new Set<string>();
-    if (typeof targetTerm?.tabId === 'string' && targetTerm.tabId && typeof targetTerm.leafId === 'string' && targetTerm.leafId)
-      targetPaneKeys.add(`${targetTerm.tabId}:${targetTerm.leafId}`);
-    if (typeof targetTerm?.recordedPaneKey === 'string' && targetTerm.recordedPaneKey) targetPaneKeys.add(targetTerm.recordedPaneKey);
+    const targetPaneKeys = new Set(targetTerm ? terminalPaneKeys(targetTerm) : []);
     if (rotating && options?.retiringPaneKey?.trim()) targetPaneKeys.add(options.retiringPaneKey.trim());
+    const siblingPaneKeys = rotating && !targetTerm && targetPaneKeys.size === 0
+      ? new Set(handles.filter(isUsableTerminal).flatMap(terminalPaneKeys))
+      : undefined;
     const ownedAgentsBusy = (): boolean =>
       !row.agents ||
       row.agents
@@ -211,7 +211,9 @@ export async function checkOrcaWorkspaceIdle(
       // A rotation waits only for the retiring slot's own agent; retained and unverifiable tabs
       // never block opening a new session tab. A retiring terminal that cannot be pane-attributed
       // fails closed instead of guessing; its child worktrees are still inspected below.
-      if (targetTerm && allAgentsBusy()) return false;
+      if (targetTerm ? allAgentsBusy() : !row.agents || row.agents.some(agent => !agent.paneKey && agent.state !== 'done')) {
+        return false;
+      }
     } else if (row.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
       return false;
     }
@@ -279,6 +281,10 @@ export async function checkOrcaWorkspaceIdle(
         child.agents.every(agent =>
           typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey),
         )
+      ) continue;
+      // A vanished terminal without a recorded pane can only rule out work attributed to a live sibling.
+      if (siblingPaneKeys?.size && child.unverifiableTerminalCount === 0 && child.agents?.length &&
+        child.agents.every(agent => agent.parentPaneKey !== undefined && siblingPaneKeys.has(agent.parentPaneKey))
       ) continue;
       if (!(await idleTree(child))) {
         return false;
@@ -599,22 +605,31 @@ export async function spawnOrcaWorkspaceTerminal(
   return { handle: handle.trim(), raw: parsed };
 }
 
-/** A persisted handle is reusable only while Orca still reports it connected and writable. */
-function matchesPane(terminal: OrcaTerminalRow, paneKey?: string): boolean {
-  return Boolean(paneKey) && terminal.connected === true && terminal.writable !== false &&
-    (terminal.recordedPaneKey === paneKey ||
-      (typeof terminal.tabId === 'string' && typeof terminal.leafId === 'string' &&
-        `${terminal.tabId}:${terminal.leafId}` === paneKey));
+function terminalPaneKeys(terminal: OrcaTerminalRow): string[] {
+  const keys: string[] = [];
+  if (typeof terminal.tabId === 'string' && terminal.tabId && typeof terminal.leafId === 'string' && terminal.leafId) {
+    keys.push(`${terminal.tabId}:${terminal.leafId}`);
+  }
+  if (typeof terminal.recordedPaneKey === 'string' && terminal.recordedPaneKey) keys.push(terminal.recordedPaneKey);
+  return keys;
 }
 
-export async function isOrcaWorkspaceTerminalLive(
+function isUsableTerminal(terminal: OrcaTerminalRow): boolean {
+  return terminal.connected === true && terminal.writable !== false;
+}
+
+function matchesPane(terminal: OrcaTerminalRow, paneKey?: string): boolean {
+  return isUsableTerminal(terminal) && paneKey !== undefined && terminalPaneKeys(terminal).includes(paneKey);
+}
+
+export async function inspectOrcaWorkspaceTerminal(
   runner: CommandRunner,
   command: string,
   cwd: string,
   terminalHandle?: string,
   signal?: AbortSignal,
   preferredPaneKey?: string,
-): Promise<boolean> {
+): Promise<'live' | 'unusable' | 'absent'> {
   const listed = await checkedCommand(runner, {
     command,
     args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
@@ -625,11 +640,26 @@ export async function isOrcaWorkspaceTerminalLive(
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
-  const terminal = (inventory.result.terminals as OrcaTerminalRow[]).find(
-    row => row && row.connected === true && row.writable !== false &&
-      ((Boolean(terminalHandle) && String(row.handle) === terminalHandle) || matchesPane(row, preferredPaneKey)),
-  );
-  return terminal !== undefined && terminal.connected === true && terminal.writable !== false;
+  let presence: 'unusable' | 'absent' = 'absent';
+  for (const row of inventory.result.terminals as OrcaTerminalRow[]) {
+    if (!row || !((terminalHandle && String(row.handle) === terminalHandle) ||
+      (preferredPaneKey && terminalPaneKeys(row).includes(preferredPaneKey)))) continue;
+    if (isUsableTerminal(row)) return 'live';
+    presence = 'unusable';
+  }
+  return presence;
+}
+
+/** A persisted handle is reusable only while Orca still reports it connected and writable. */
+export async function isOrcaWorkspaceTerminalLive(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  terminalHandle?: string,
+  signal?: AbortSignal,
+  preferredPaneKey?: string,
+): Promise<boolean> {
+  return (await inspectOrcaWorkspaceTerminal(runner, command, cwd, terminalHandle, signal, preferredPaneKey)) === 'live';
 }
 
 /** Read-only terminal selection: callers must fence the returned launch plan before executing it. */

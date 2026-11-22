@@ -7,6 +7,7 @@ import {
   checkOrcaWorkspaceIdle,
   closeOrcaWorkspaceTerminal,
   ensureOrcaWorkspace,
+  inspectOrcaWorkspaceTerminal,
   isOrcaWorkspaceTerminalLive,
   planOrcaWorkspaceTerminal,
   probeOrcaTerminalIdle,
@@ -568,11 +569,14 @@ class OrcaWakeDelivery {
         return await this.probeLeasedWave(target, command, hasOpenOutboundThread, excludedHandles);
       }
       if (hasOpenOutboundThread) {
-        const live = this.idleCheck ? true : target.workspacePath
-          ? Boolean((target.terminalHandle || target.paneKey) && await isOrcaWorkspaceTerminalLive(
+        let live = Boolean(this.idleCheck || target.terminalHandle);
+        if (target.driver === 'orca-run') {
+          live = Boolean(target.runId?.trim());
+        } else if (!this.idleCheck && target.workspacePath) {
+          live = Boolean((target.terminalHandle || target.paneKey) && await isOrcaWorkspaceTerminalLive(
             this.runner, command, target.workspacePath, target.terminalHandle, undefined, target.paneKey,
-          ))
-          : Boolean(target.terminalHandle);
+          ));
+        }
         if (live) return { busy: true, ready: false, reason: 'outbound_thread_open' };
       }
 
@@ -615,6 +619,7 @@ class OrcaWakeDelivery {
     }
     const { workspacePath, terminalHandle, paneKey, agent } = target;
     if (target.driver === 'orca-run') {
+      if (hasOpenOutboundThread && target.runId?.trim()) return openThread;
       if (!workspacePath) return quiescent;
       const idle = await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, { throwOnProbeError: true });
       return { busy: !idle.idle, ready: false, reason: idle.reason };
@@ -628,15 +633,17 @@ class OrcaWakeDelivery {
     }
     if (!terminalHandle && !paneKey) return unbound;
 
-    const terminalLive = await isOrcaWorkspaceTerminalLive(this.runner, command, workspacePath, terminalHandle, undefined, paneKey);
-    if (terminalLive) {
+    const presence = await inspectOrcaWorkspaceTerminal(this.runner, command, workspacePath, terminalHandle, undefined, paneKey);
+    if (presence === 'unusable') {
+      return { busy: true, ready: false, reason: 'Terminal is disconnected or not writable' };
+    }
+    if (presence === 'live') {
       if (hasOpenOutboundThread) return openThread;
       return waveActivity(await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, {
         targetTerminalHandle: terminalHandle, targetPaneKey: paneKey, agent, excludedHandles,
         throwOnProbeError: true,
       }));
     }
-    if (!paneKey?.trim()) return { busy: false, ready: false, reason: 'terminal_gone' };
     const idle = await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, {
       targetTerminalHandle: null, retiringTerminalHandle: terminalHandle, retiringPaneKey: paneKey, agent, excludedHandles,
       throwOnProbeError: true,

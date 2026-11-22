@@ -16,6 +16,7 @@ import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-typ
 import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
+import { netKey } from './network-key.ts';
 import type { OutboxStore } from './outbox.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
 export type { AgentConversationMode, ActiveConversationMode } from '../core-types/index.ts';
@@ -1769,16 +1770,16 @@ export class MailboxStore {
     const sessionId = options?.sessionMailboxId ? normalizeMailboxId(options.sessionMailboxId) : undefined;
     const state = this.read();
     const ownedMailboxes = new Set(sessionId ? [id, sessionId] : [id]);
-    const selfInboundThreadIds = new Set<string>();
+    const selfInboundMessages = new Set<string>();
     const localUnackedMessages = new Set<string>();
     const localUnackedThreads = new Set<string>();
     let activeSince: string | undefined;
     let sessionUnacked = false;
     for (const item of state.items) {
-      const threadId = item.envelope.semantic?.threadId;
+      const { networkId, semantic } = item.envelope;
+      const messageKey = netKey(networkId, item.id);
       if (ownedMailboxes.has(item.mailboxId)) {
-        selfInboundThreadIds.add(item.id);
-        if (threadId !== undefined) selfInboundThreadIds.add(threadId);
+        selfInboundMessages.add(messageKey);
         if (item.status === 'acked') continue;
         if (item.mailboxId === id) {
           if (activeSince === undefined || item.receivedAt < activeSince) activeSince = item.receivedAt;
@@ -1786,8 +1787,8 @@ export class MailboxStore {
           sessionUnacked = true;
         }
       } else if (item.status !== 'acked') {
-        localUnackedMessages.add(item.id);
-        localUnackedThreads.add(threadId ?? item.envelope.id);
+        localUnackedMessages.add(messageKey);
+        localUnackedThreads.add(netKey(networkId, semantic?.threadId ?? item.envelope.id));
       }
     }
 
@@ -1801,36 +1802,57 @@ export class MailboxStore {
     }
 
     const records = Object.values(state.threads);
-    const closedThreadsByNetwork = new Map<string, Set<string>>();
+    const settledThreads = new Set<string>();
+    const inboundByThread = new Map<string, ThreadRouteRecord[]>();
     for (const record of records) {
-      if (record.direction === 'inbound' && record.mailboxCommitted !== false && ownedMailboxes.has(record.localMailbox)) {
-        selfInboundThreadIds.add(record.threadId);
+      const key = netKey(record.networkId, record.threadId);
+      // Settlement snapshots are copied to other legs. Prefer the individual envelope's semantics.
+      if (record.envelope ? record.envelope.semantic?.type === 'settle' : record.settlement !== undefined) {
+        settledThreads.add(key);
       }
-      // A replied or settled leg makes the merged thread non-open on its own network.
-      if (record.state !== 'open') {
-        const closedThreads = closedThreadsByNetwork.get(record.networkId) ?? new Set<string>();
-        closedThreads.add(record.threadId);
-        closedThreadsByNetwork.set(record.networkId, closedThreads);
+      if (record.direction === 'inbound') {
+        if (record.mailboxCommitted !== false && ownedMailboxes.has(record.localMailbox)) {
+          selfInboundMessages.add(netKey(record.networkId, record.messageId));
+        }
+        const inbound = inboundByThread.get(key) ?? [];
+        inbound.push(record);
+        inboundByThread.set(key, inbound);
       }
     }
 
     const hasPendingWave = activeSince !== undefined;
+    const postAckMailboxes = target?.rotateAfterWaves !== undefined
+      ? new Set(sessionId ? [sessionId] : [])
+      : ownedMailboxes;
+    let definitivelyFailed: ReadonlySet<string> | undefined;
     let hasRemoteOpenOutboundThread = false;
     for (const record of records) {
-      if (record.direction !== 'outbound' || selfInboundThreadIds.has(record.threadId) ||
-        closedThreadsByNetwork.get(record.networkId)?.has(record.threadId)) continue;
-      const replyMailbox = record.envelope?.semantic?.replyMailbox;
+      if (record.direction !== 'outbound') continue;
+      const semantic = record.envelope?.semantic;
+      if (semantic?.type === 'reply' || semantic?.type === 'settle') continue;
+      const messageKey = netKey(record.networkId, record.messageId);
+      const threadKey = netKey(record.networkId, record.threadId);
+      if (selfInboundMessages.has(messageKey) || settledThreads.has(threadKey)) continue;
+      const replyMailbox = semantic?.replyMailbox ?? record.localMailbox;
       const belongsToSlot = activeSince !== undefined
-        ? record.createdAt >= activeSince && (replyMailbox === undefined
-          ? ownedMailboxes.has(record.localMailbox)
-          : ownedMailboxes.has(replyMailbox))
-        : sessionId !== undefined && replyMailbox === sessionId;
-      if (!belongsToSlot || options?.outbox?.get(record.messageId)?.status === 'failed') continue;
+        ? record.createdAt >= activeSince && ownedMailboxes.has(replyMailbox)
+        : semantic?.type === 'question' && postAckMailboxes.has(replyMailbox);
+      if (!belongsToSlot) continue;
+      const answered = inboundByThread.get(threadKey)?.some(inbound => {
+        if (inbound.messageId === record.messageId) return false;
+        const replyToId = inbound.envelope?.replyToId;
+        // The message a follow-up asks about cannot answer it, even on the same clock tick.
+        return replyToId === record.messageId ||
+          (inbound.messageId !== record.envelope?.replyToId &&
+            (replyToId === undefined || replyToId === record.threadId) && inbound.createdAt >= record.createdAt);
+      });
+      if (answered) continue;
 
-      if (localUnackedThreads.has(record.threadId) || localUnackedMessages.has(record.messageId)) {
+      if (localUnackedThreads.has(threadKey) || localUnackedMessages.has(messageKey)) {
         immediateBusyReason ??= 'local_outbound_pending';
-      } else if (hasPendingWave || record.envelope?.semantic?.type === 'question') {
-        hasRemoteOpenOutboundThread = true;
+      } else if (!hasRemoteOpenOutboundThread) {
+        definitivelyFailed ??= options?.outbox?.readDefinitivelyFailedKeys() ?? new Set<string>();
+        hasRemoteOpenOutboundThread = !definitivelyFailed.has(messageKey);
       }
     }
     return {

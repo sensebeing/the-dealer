@@ -22,6 +22,7 @@ import type {
   OutboxListFilter,
   PeerReachableEvent,
 } from '../core-types/index.ts';
+import { netKey } from './network-key.ts';
 
 export type {
   OutboxDeliveryFailure,
@@ -380,6 +381,18 @@ export class OutboxStore {
   get(id: string): OutboxItem | undefined {
     const item = this.read().items.find(candidate => candidate.id === id);
     return item ? clone(item) : undefined;
+  }
+
+  /** Failures with no remaining target, uncertain attempt, or confirmed delivery. */
+  readDefinitivelyFailedKeys(): ReadonlySet<string> {
+    const keys = new Set<string>();
+    for (const item of this.read().items) {
+      if (item.status === 'failed' && item.pendingNodeIds.length === 0 &&
+        item.inDoubtNodeIds.length === 0 && Object.keys(item.deliveredReceipts).length === 0) {
+        keys.add(netKey(item.networkId, item.id));
+      }
+    }
+    return keys;
   }
 
   findKeyedObligation(networkId: string, key: string, minVersion: number): OutboxItem | undefined {

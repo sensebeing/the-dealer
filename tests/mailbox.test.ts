@@ -19,7 +19,7 @@ import {
   resolveMailboxId,
   resolveBoundMailboxId,
 } from '../packages/index.ts';
-import type { MessageEnvelope } from '../packages/index.ts';
+import type { DeliveryReceipt, MessageEnvelope } from '../packages/index.ts';
 
 function envelope(id: string, patch: Partial<MessageEnvelope> = {}): MessageEnvelope {
   return {
@@ -118,13 +118,14 @@ test('slot obligations exclude replied, settled and failed outbound messages', t
 
   const failed = remote('failed');
   store.recordOutboundEnvelope(failed, ['remote'], slotSession);
-  outbox.enqueue({ envelope: failed, pendingNodeIds: ['remote'] });
+  outbox.enqueue({ envelope: failed, explicitTargets: [], pendingNodeIds: [] });
   assert.equal(inspect().hasRemoteOpenOutboundThread, true);
   assert.equal(outbox.markFailed(failed.id, 'Local delivery failed')?.status, 'failed');
   assert.equal(inspect().hasRemoteOpenOutboundThread, false);
 });
 
 test('slot obligations exclude the local wave after both thread legs are pinned to its session', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   const store = new MailboxStore(workspace(t).path);
   const wave = envelope('self-wave', {
     kind: 'wave.alert.v1',
@@ -144,10 +145,17 @@ test('slot obligations exclude the local wave after both thread legs are pinned 
     hasPendingWave: true,
     hasRemoteOpenOutboundThread: false,
   });
+
+  store.recordOutboundEnvelope(envelope('wave-follow-up', {
+    replyToId: wave.id,
+    semantic: { type: 'question', threadId: wave.id, replyMailbox: slotSession },
+  }), ['remote'], slotSession);
+  assert.equal(store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession }).hasRemoteOpenOutboundThread, true);
 });
 
 test('an empty slot only waits remotely for questions addressed back to the session', t => {
   const store = new MailboxStore(workspace(t).path);
+  store.upsertWakeTarget(waveSlot, { rotateAfterWaves: 1 });
   store.recordOutboundEnvelope(envelope('old-task', {
     semantic: { type: 'message', threadId: 'old-task', replyMailbox: slotSession },
   }), ['remote'], slotSession);
@@ -160,6 +168,106 @@ test('an empty slot only waits remotely for questions addressed back to the sess
     semantic: { type: 'question', threadId: 'session-question', replyMailbox: slotSession },
   }), ['remote'], slotSession);
   assert.deepEqual(inspect(), { hasPendingWave: false, hasRemoteOpenOutboundThread: true });
+});
+
+test('a reply to one question leaves the next question on the same thread open', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
+  const store = new MailboxStore(workspace(t).path);
+  store.enqueue([envelope('wave')], { mailboxId: waveSlot });
+  const ask = (id: string) => store.recordOutboundEnvelope(envelope(id, {
+    semantic: { type: 'question', threadId: 'conversation', replyMailbox: slotSession },
+  }), ['remote'], slotSession);
+  const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession });
+  ask('q1');
+  t.mock.timers.tick(1);
+  store.recordInboundEnvelope(envelope('answer-1', {
+    replyToId: 'q1', semantic: { type: 'reply', threadId: 'conversation' },
+  }), slotSession, { committed: false });
+  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  t.mock.timers.tick(1);
+  ask('q2');
+  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  t.mock.timers.tick(1);
+  store.recordInboundEnvelope(envelope('thread-answer', {
+    replyToId: 'conversation', semantic: { type: 'reply', threadId: 'conversation' },
+  }), slotSession, { committed: false });
+  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  t.mock.timers.tick(1);
+  ask('q3');
+  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+});
+
+test('slot thread custody and answers are scoped to each network', t => {
+  const store = new MailboxStore(workspace(t).path);
+  store.enqueue([envelope('wave')], { mailboxId: waveSlot });
+  const threadId = 'shared-thread';
+  store.recordOutboundEnvelope(envelope('team-question', {
+    semantic: { type: 'question', threadId, replyMailbox: slotSession },
+  }), ['remote'], slotSession);
+  store.enqueue([envelope('other-network-local', {
+    networkId: 'other', semantic: { type: 'message', threadId },
+  })], { mailboxId: 'stream:other' });
+  store.recordInboundEnvelope(envelope('other-network-settlement', {
+    networkId: 'other', semantic: { type: 'settle', threadId, outcome: 'succeeded' },
+  }), slotSession);
+  assert.deepEqual(store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession }), {
+    hasPendingWave: true,
+    hasRemoteOpenOutboundThread: true,
+  });
+});
+
+test('slot obligations read outbox once and retain custody with partial or uncertain delivery', t => {
+  const { path, root } = workspace(t);
+  const store = new MailboxStore(path);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
+  const outboxReads = t.mock.method(outbox as unknown as { read(): unknown }, 'read');
+  const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession, outbox });
+  store.enqueue([envelope('wave')], { mailboxId: waveSlot });
+  assert.equal(inspect().hasRemoteOpenOutboundThread, false);
+  assert.equal(outboxReads.mock.callCount(), 0);
+
+  const request = (id: string, targetMailbox?: string) => envelope(id, {
+    semantic: { type: 'question', threadId: id, replyMailbox: slotSession, targetMailbox },
+  });
+  const local = request('definitively-failed-but-local', 'stream:downstream');
+  outbox.enqueue({ envelope: local, explicitTargets: [], pendingNodeIds: [] });
+  outbox.markFailed(local.id, 'No remote delivery');
+  store.recordOutboundEnvelope(local, [local.from.nodeId], slotSession);
+  store.enqueue([local], { mailboxId: 'stream:downstream' });
+  outboxReads.mock.resetCalls();
+  assert.equal(inspect().immediateBusyReason, 'local_outbound_pending');
+  assert.equal(outboxReads.mock.callCount(), 0);
+
+  const partial = request('partial');
+  const receipt: DeliveryReceipt = {
+    messageId: partial.id, networkId: partial.networkId, fromNodeId: 'delivered',
+    stage: 'dispatched', updatedAt: partial.createdAt, signature: 'receipt',
+  };
+  assert.equal(outbox.enqueue({
+    envelope: partial, explicitTargets: [], pendingNodeIds: [],
+    deliveredReceipts: { delivered: receipt }, failedNodeIds: ['rejected'],
+  }).status, 'failed');
+  store.recordOutboundEnvelope(partial, ['delivered', 'rejected'], slotSession);
+  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  store.recordInboundEnvelope(envelope('partial-answer', {
+    replyToId: partial.id, semantic: { type: 'reply', threadId: partial.id },
+  }), slotSession, { committed: false });
+
+  const uncertain = request('uncertain');
+  outbox.enqueue({ envelope: uncertain, explicitTargets: [], pendingNodeIds: ['remote'], inDoubtNodeIds: ['remote'] });
+  assert.deepEqual(outbox.markFailed(uncertain.id, 'Unknown effect')?.inDoubtNodeIds, ['remote']);
+  store.recordOutboundEnvelope(uncertain, ['remote'], slotSession);
+  outboxReads.mock.resetCalls();
+  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(outboxReads.mock.callCount(), 1);
+
+  const failed = request('no-effect');
+  outbox.enqueue({ envelope: failed, explicitTargets: [], pendingNodeIds: [] });
+  outbox.markFailed(failed.id, 'No effect');
+  store.recordOutboundEnvelope(failed, ['remote'], slotSession);
+  outboxReads.mock.resetCalls();
+  assert.equal(inspect().hasRemoteOpenOutboundThread, true);
+  assert.equal(outboxReads.mock.callCount(), 1);
 });
 
 test('single outstanding lease never merges newer mail until acknowledged', t => {

@@ -140,7 +140,7 @@
           "packages/plugins-executor"
         ],
         "layer": "plugin",
-        "role": "Orca workspace and terminal inspection, composer guards, session/pane binding transitions and retirement provenance, validated fresh/continuation TUI commands, wakeup drivers and executors."
+        "role": "Orca workspace and terminal inspection, composer guards, rotation and retirement, slot host activity and readiness probing, session/pane binding transitions, validated fresh/continuation TUI commands, wakeup drivers and executors."
       },
       {
         "path": "packages/transport",
@@ -256,7 +256,9 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md",
+          "docs/plugin-guide.md"
         ],
         "dependencies": [
           "packages/core-types",
@@ -264,7 +266,7 @@
           "packages/subprocess"
         ],
         "layer": "core",
-        "role": "Host-agnostic v2 mailbox ledgers with opaque driverConfig, bindingRevision CAS launch and settlement fencing, and WakeupDriver scheduling."
+        "role": "Host-agnostic durable v2 mailbox ledger and durable outbox ledger, opaque driverConfig, bindingRevision CAS launch and settlement fencing, read-only slot and outbox obligation projections, and WakeupDriver redrive plus slot activity and readiness coordination."
       },
       {
         "path": "packages/plugins-policy",
