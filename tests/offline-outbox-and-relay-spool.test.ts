@@ -4874,6 +4874,8 @@ test('outbox replacement requires signed pre-effect evidence for every failed ta
   const unattempted = { stage: 'failed', executionReceipt: { handoff: 'unattempted' } };
   const item = { status: 'failed', failedNodeIds: ['a'], failedReceipts: { a: unattempted } };
   assert.equal(isUnattemptedOutboxItem(item), true);
+  const unannotated = { stage: 'rejected', detail: 'custom' };
+  assert.equal(isRetryablePreEffectReceipt(unannotated), false);
   for (const blocked of [
     { ...item, failedNodeIds: ['a', 'unsigned'] },
     { ...item, pendingNodeIds: ['a'] },
@@ -4883,6 +4885,7 @@ test('outbox replacement requires signed pre-effect evidence for every failed ta
     { ...item, failedReceipts: { a: { stage: 'failed' } } },
     { ...item, failedReceipts: { a: { stage: 'failed', executionReceipt: { handoff: 'unknown' } } } },
     { ...item, failedReceipts: { a: { stage: 'dispatching' } } },
+    { ...item, failedReceipts: { a: unannotated } },
     { ...item, failedReceipts: { a: { stage: 'rejected', detail: DEDUP_CAS_AMBIGUOUS_DETAIL } } },
   ]) assert.equal(isUnattemptedOutboxItem(blocked), false);
   for (const handoff of ['settled', 'queued', 'dispatched', 'unknown']) {
@@ -4937,7 +4940,7 @@ test('a gate rejection after a timed-out send retains uncertainty and forbids re
   const harness = await emitterHarness(t, {
     plan: (target, index) => index === 0
       ? { error: new PeerUnreachableError(target, 'Transport timeout', { cause: new DeliveryTimeoutError('Transport timeout') }) }
-      : { stage: 'rejected', detail: 'Gate closed' },
+      : { stage: 'rejected', detail: 'Gate closed', executionReceipt: { handoff: 'unattempted' } },
   });
   const first = await harness.emitter.emit({
     networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
@@ -4958,6 +4961,28 @@ test('a gate rejection after a timed-out send retains uncertainty and forbids re
   });
   assert.equal(replacement?.claimed, false);
   assert.deepEqual(harness.outbox.list().map(item => item.id), [first.messageId]);
+});
+
+test('later pre-effect rejection cannot overwrite earlier unknown outbox evidence', async t => {
+  const harness = await emitterHarness(t);
+  const target = harness.targetCard.nodeId;
+  const original = envelopeFor(harness.sender, harness.networkId, 'member:diz');
+  const unknown = signReceipt({
+    messageId: original.id, networkId: original.networkId, fromNodeId: target,
+    stage: 'failed', executionReceipt: { handoff: 'unknown' }, updatedAt: new Date().toISOString(),
+  }, harness.receiver.privateKeyPem);
+  const rejection = signReceipt({
+    ...unknown, stage: 'rejected', executionReceipt: { handoff: 'unattempted' },
+  }, harness.receiver.privateKeyPem);
+  const base = { envelope: original, explicitTargets: ['member:diz'], pendingNodeIds: [] };
+  harness.outbox.enqueue({ ...base, failedReceipts: { [target]: unknown } });
+  const failed = harness.outbox.markNodeFailed(original.id, target, 'Gate closed', rejection)!;
+  assert.deepEqual(failed.failedReceipts[target], unknown);
+  const reconciled = harness.outbox.enqueue({
+    ...base, reconcileNodeIds: [target], failedReceipts: { [target]: rejection },
+  });
+  assert.deepEqual(reconciled.failedReceipts[target], unknown);
+  assert.equal(isUnattemptedOutboxItem(reconciled), false);
 });
 
 test('kind-only changes replace a proven-unattempted keyed envelope', async t => {
@@ -5148,7 +5173,7 @@ test('keyed gate rejections and local failures allow retry and reuse a later exe
     const harness = await emitterHarness(t, {
       plan: () => recovered ? {} : localFailure
         ? { error: new LocalDeliveryError('invalid wire reply') }
-        : { stage: 'rejected', detail: 'Gate closed' },
+        : { stage: 'rejected', detail: 'Gate closed', executionReceipt: { handoff: 'unattempted' } },
     });
     const input: EmitMessageInput = { networkId: harness.networkId,
       routing: { mode: 'unicast', targets: ['member:diz'] },
@@ -5313,7 +5338,8 @@ test('keyed mixed multicast reconciles only the original failed sibling', async 
     let recovered = false;
     const harness = await emitterHarness(t, { extraMembers: ['aya', 'bo'], plan: target =>
       target === harness.targetByMember.get('aya')!.nodeId && !recovered
-        ? localFailure ? { error: new LocalDeliveryError('local protocol failure') } : { stage: 'rejected', detail: 'Gate closed' }
+        ? localFailure ? { error: new LocalDeliveryError('local protocol failure') }
+          : { stage: 'rejected', detail: 'Gate closed', executionReceipt: { handoff: 'unattempted' } }
         : {} });
     const diz = harness.targetCard.nodeId;
     const aya = harness.targetByMember.get('aya')!.nodeId;
@@ -5380,7 +5406,9 @@ test('reconciliation returns a live pending receipt and retains the complete out
   let pending = false;
   const harness = await emitterHarness(t, { extraMembers: ['aya'], plan: target =>
     target === harness.targetByMember.get('aya')!.nodeId
-      ? { stage: pending ? 'pending_approval' : 'rejected' } : {} });
+      ? pending ? { stage: 'pending_approval' }
+        : { stage: 'rejected', executionReceipt: { handoff: 'unattempted' } }
+      : {} });
   const input: EmitMessageInput = { networkId: harness.networkId,
     routing: { mode: 'multicast', targets: ['member:diz', 'member:aya'] }, kind: 'task',
     subject: 'pending recovery', body: 'preserve observed evidence', payload: {}, idempotencyKey: 'pending-route' };

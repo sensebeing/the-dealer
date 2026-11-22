@@ -10,7 +10,7 @@ import os, { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { Kernel } from '../packages/kernel/index.ts';
-import { generateNodeKeyPair, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
+import { generateNodeKeyPair, isRetryablePreEffectReceipt, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
 import type { DeliveryReceipt, EmitMessageInput, MessageEnvelope, NodeCard, NodeService, TransportService, ExecutorPlugin } from '../packages/core-types/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
 import { createGatePlugin } from '../packages/gate/index.ts';
@@ -149,7 +149,9 @@ test('CAS dedup serializes concurrent equal versions, rejects stale and permits 
   assert.equal(isDedupCasDuplicateReceipt(stale), false);
   assert.equal((await policy.process(envelope({ ...message, payload: { claimVersion: 3 } }), next)).stage, 'dispatched');
   assert.equal(executions, 2);
-  assert.equal((await policy.process(envelope({ payload: { claimVersion: 'bad' } }), next)).stage, 'rejected');
+  const invalid = await policy.process(envelope({ payload: { claimVersion: 'bad' } }), next);
+  assert.equal(invalid.stage, 'rejected');
+  assert.equal(invalid.executionReceipt?.handoff, 'unattempted');
 });
 
 test('CAS duplicate receipt classification excludes other outcomes and missing receipts', () => {
@@ -203,9 +205,51 @@ test('emitter -> authenticated inbound -> gate -> dispatcher yields signed recei
   for (const [mode, stage] of [['approval_required', 'pending_approval'], ['dnd', 'queued'], ['closed', 'rejected']] as const) { await gate.setMode(mode); assert.equal((await emitter.emit(input)).receipts[0].stage, stage); }
   const invalid = envelope(); invalid.body = 'tampered';
   const response = await kernel.ctx.bail('transport/inbound', { networkId: 'test', senderNodeId: sender.nodeId, mode: 'unicast', payload: { type: 'message.envelope', envelope: invalid } });
-  assert.equal(JSON.parse(Buffer.from(response!).toString()).stage, 'rejected');
+  const invalidSignature = JSON.parse(Buffer.from(response!).toString()) as DeliveryReceipt;
+  assert.equal(invalidSignature.stage, 'rejected');
+  assert.equal(invalidSignature.executionReceipt?.handoff, 'unattempted');
   const mismatch = await kernel.ctx.bail('transport/inbound', { networkId: 'other', senderNodeId: sender.nodeId, mode: 'unicast', payload: { type: 'message.envelope', envelope: envelope() } });
-  assert.equal(JSON.parse(Buffer.from(mismatch!).toString()).stage, 'rejected');
+  const wrongNetwork = JSON.parse(Buffer.from(mismatch!).toString()) as DeliveryReceipt;
+  assert.equal(wrongNetwork.stage, 'rejected');
+  assert.equal(wrongNetwork.executionReceipt?.handoff, 'unattempted');
+});
+
+test('admission and policy rejections sign the evidence available before execution', async t => {
+  const { kernel, gate, dispatcher, calls } = await setup(t);
+  const inbound = async (message: MessageEnvelope): Promise<DeliveryReceipt> => {
+    const reply = await kernel.ctx.bail('transport/inbound', {
+      networkId: message.networkId, senderNodeId: sender.nodeId, mode: 'unicast',
+      payload: { type: 'message.envelope', envelope: message },
+    });
+    const receipt = JSON.parse(Buffer.from(reply!).toString()) as DeliveryReceipt;
+    assert.equal(verifyReceipt(receipt), true);
+    return receipt;
+  };
+  const completed = envelope();
+  assert.equal((await inbound(completed)).stage, 'dispatched');
+  const rule = dispatcher.registerPolicy({
+    name: 'kind-deny',
+    async process() { return { stage: 'rejected', detail: 'kind denied' }; },
+  });
+  const policyDenied = envelope();
+  const typedPolicyRejection = await inbound(policyDenied);
+  assert.deepEqual(typedPolicyRejection.executionReceipt, {
+    executor: 'kind-deny', executionId: 'kind-deny:' + policyDenied.id, handoff: 'rejected',
+  });
+  assert.equal(isRetryablePreEffectReceipt(typedPolicyRejection), true);
+  rule.dispose();
+
+  await gate.setMode('closed');
+  const firstRejection = await inbound(envelope());
+  assert.equal(firstRejection.executionReceipt?.handoff, 'unattempted');
+  assert.equal(isRetryablePreEffectReceipt(firstRejection), true);
+  for (const [message, handoff] of [[completed, 'settled'], [policyDenied, 'unknown']] as const) {
+    const rejected = await inbound(message);
+    assert.equal(rejected.stage, 'rejected');
+    assert.equal(rejected.executionReceipt?.handoff, handoff);
+    assert.equal(isRetryablePreEffectReceipt(rejected), false);
+  }
+  assert.equal(calls.length, 1);
 });
 
 test('all official executors deliver via Emitter using injected commands and notify inbox', async t => {
@@ -1381,7 +1425,7 @@ test('DND legacy loading, revision admission and signature CAS preserve newer ob
   const parked = gate.listDndQueue()[0];
   for (const message of [old, envelope({ ...old, id: 'equal' }), envelope({ ...old, payload: { revision: 1 } })]) {
     assert.deepEqual(await gate.evaluate(message), {
-      status: 'reject', code: 'dnd_handoff_parked', reason: parked.lastError,
+      status: 'reject', code: 'dnd_handoff_parked', durable: true, reason: parked.lastError,
     });
     assert.deepEqual(gate.listDndQueue()[0], parked);
     const { id, ...entry } = parked;

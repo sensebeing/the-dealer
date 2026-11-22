@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import {
-  envelopeClaimVersion, isConfirmedHandoffReceipt, isUnattemptedOutboxItem, outboxReconciliationTargets, sameEnvelopeIntent,
+  envelopeClaimVersion, isConfirmedHandoffReceipt, isRetryablePreEffectReceipt, isUnattemptedOutboxItem,
+  outboxReconciliationTargets, sameEnvelopeIntent,
 } from '../core-types/index.ts';
 import {
   copyFileAtomically,
@@ -329,37 +330,16 @@ export class OutboxStore {
       if (!acceptsSettlement(existing, input.attemptToken)) {
         throw new Error(`Outbox attempt no longer owns obligation ${id}`);
       }
-      const settled = Object.fromEntries(Object.entries(existing?.deliveredReceipts ?? {}).filter(
-        ([, receipt]) => isConfirmedHandoffReceipt(receipt, { allowQueued: false }),
-      ));
-      // Reconciliation replaces only named unsettled outcomes, never confirmed execution.
+      // Retryable outcomes can be reopened. Keep durable custody and unresolved effect evidence.
       for (const nodeId of input.reconcileNodeIds ?? []) {
-        if (!existing || settled[nodeId]) continue;
-        delete existing.deliveredReceipts[nodeId];
-        delete existing.failedReceipts[nodeId];
-        existing.failedNodeIds = existing.failedNodeIds.filter(id => id !== nodeId);
+        if (!existing) continue;
+        const failure = existing.failedReceipts[nodeId];
+        if (!failure || isRetryablePreEffectReceipt(failure)) {
+          delete existing.failedReceipts[nodeId];
+          existing.failedNodeIds = existing.failedNodeIds.filter(id => id !== nodeId);
+        }
         existing.pendingNodeIds = existing.pendingNodeIds.filter(id => id !== nodeId);
         existing.relaySpooledNodeIds = existing.relaySpooledNodeIds.filter(id => id !== nodeId);
-      }
-      const deliveredReceipts = {
-        ...(existing?.deliveredReceipts ?? {}),
-        ...structuredClone(input.deliveredReceipts ?? {}),
-        ...settled,
-      };
-      const failedReceipts = {
-        ...(existing?.failedReceipts ?? {}),
-        ...structuredClone(input.failedReceipts ?? {}),
-      };
-      for (const nodeId of Object.keys(input.failedReceipts ?? {})) {
-        if (!settled[nodeId] && !input.deliveredReceipts?.[nodeId]) delete deliveredReceipts[nodeId];
-      }
-      const failedNodeIds = [...new Set([
-        ...(existing?.failedNodeIds ?? []),
-        ...(input.failedNodeIds ?? []),
-        ...Object.keys(failedReceipts),
-      ])].filter(nodeId => !deliveredReceipts[nodeId]);
-      for (const nodeId of Object.keys(deliveredReceipts)) {
-        delete failedReceipts[nodeId];
       }
       const pendingNodeIds = [...(input.pendingNodeIds ?? []), ...(existing?.pendingNodeIds ?? [])];
       const inDoubtNodeIds = [...(existing?.inDoubtNodeIds ?? []), ...(input.inDoubtNodeIds ?? [])];
@@ -376,9 +356,9 @@ export class OutboxStore {
         envelope: structuredClone(input.envelope),
         explicitTargets: [...new Set(input.explicitTargets ?? [])],
         pendingNodeIds,
-        deliveredReceipts,
-        failedReceipts,
-        failedNodeIds,
+        deliveredReceipts: existing?.deliveredReceipts ?? {},
+        failedReceipts: existing?.failedReceipts ?? {},
+        failedNodeIds: existing?.failedNodeIds ?? [],
         inDoubtNodeIds,
         relaySpooledNodeIds,
         stagedFiles,
@@ -393,6 +373,12 @@ export class OutboxStore {
             ? { lastError: existing.lastError }
             : {}),
       };
+      for (const [nodeId, receipt] of Object.entries(input.deliveredReceipts ?? {})) {
+        this.applyNodeDelivery(item, nodeId, receipt);
+      }
+      for (const nodeId of new Set([...(input.failedNodeIds ?? []), ...Object.keys(input.failedReceipts ?? {})])) {
+        this.applyNodeFailure(item, nodeId, input.failedReceipts?.[nodeId]);
+      }
       this.settleItem(item);
       if (index >= 0) {
         state.items[index] = item;
@@ -647,14 +633,20 @@ export class OutboxStore {
   }
 
   private applyNodeDelivery(item: OutboxItem, nodeId: string, receipt: DeliveryReceipt): void {
+    if (!isConfirmedHandoffReceipt(receipt, { allowQueued: true }) ||
+        isConfirmedHandoffReceipt(item.deliveredReceipts[nodeId], { allowQueued: false })) return;
     item.deliveredReceipts[nodeId] = structuredClone(receipt);
     delete item.failedReceipts[nodeId];
     item.failedNodeIds = item.failedNodeIds.filter(failed => failed !== nodeId);
   }
 
   private applyNodeFailure(item: OutboxItem, nodeId: string, receipt?: DeliveryReceipt): void {
+    if (isConfirmedHandoffReceipt(item.deliveredReceipts[nodeId], { allowQueued: true })) return;
     item.failedNodeIds = [...new Set([...item.failedNodeIds, nodeId])];
-    if (receipt) item.failedReceipts[nodeId] = structuredClone(receipt);
+    const prior = item.failedReceipts[nodeId];
+    if (receipt && (!prior || isRetryablePreEffectReceipt(prior) || !isRetryablePreEffectReceipt(receipt))) {
+      item.failedReceipts[nodeId] = structuredClone(receipt);
+    }
   }
 
   /**

@@ -872,9 +872,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               lastError = attempt.error.message;
             } else {
               if (attempt.receipt) livePendingReceipts[target] = attempt.receipt;
-              const prior = existing.deliveredReceipts[target];
-              if (isConfirmedHandoffReceipt(prior, { allowQueued: true })) deliveredReceipts[target] = prior;
-              else {
+              if (!isConfirmedHandoffReceipt(existing.deliveredReceipts[target], { allowQueued: true })) {
                 pendingNodeIds.push(target);
                 if (attempt.inDoubt) inDoubtNodeIds.push(target);
                 if (attempt.relaySpooled) relaySpooledNodeIds.push(target);
@@ -885,9 +883,11 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const updated = outbox!.enqueue({ attemptToken, envelope: existing.envelope, explicitTargets: existing.explicitTargets,
             reconcileNodeIds: targets, deliveredReceipts, failedReceipts, failedNodeIds, pendingNodeIds,
             inDoubtNodeIds, relaySpooledNodeIds, ...(lastError !== undefined ? { lastError: fatalError?.message ?? lastError } : {}) });
-          const receipts = updated.status === 'queued' ? replayObligation(updated).receipts
-            : [...Object.values(updated.deliveredReceipts), ...Object.values(updated.failedReceipts)];
-          receipts.push(...Object.values(livePendingReceipts));
+          // Return the live rejection for this attempt while retaining prior custody in the store.
+          const receipts = (updated.status === 'queued' ? replayObligation(updated).receipts
+            : [...Object.values(updated.deliveredReceipts), ...Object.values(updated.failedReceipts)])
+            .filter(receipt => !failedReceipts[receipt.fromNodeId]);
+          receipts.push(...Object.values(failedReceipts), ...Object.values(livePendingReceipts));
           const newlyCommitted = targets.some(target => deliveredReceipts[target] !== undefined ||
             livePendingReceipts[target] !== undefined || pendingNodeIds.includes(target));
           if (newlyCommitted) {

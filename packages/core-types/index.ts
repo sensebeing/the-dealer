@@ -205,7 +205,7 @@ export function isRetryablePreEffectReceipt(receipt: HandoffReceipt | null | und
   if (receipt.stage === 'rejected') {
     const handoff = receipt.executionReceipt?.handoff;
     return receipt.detail !== DEDUP_CAS_AMBIGUOUS_DETAIL && receipt.detail !== DEDUP_CAS_DUPLICATE_DETAIL &&
-      (handoff === undefined || handoff === 'unattempted' || handoff === 'rejected');
+      (handoff === 'unattempted' || handoff === 'rejected');
   }
   return false;
 }
@@ -714,11 +714,14 @@ export interface RouterService {
   registerJudge(judge: RouteJudgePlugin): Disposable;
 }
 
+export const DND_HANDOFF_PARKED = 'dnd_handoff_parked';
+export const DND_CUSTODY_RETAINED = 'dnd_custody_retained';
+
 export type GateVerdict =
   | { status: 'allow' }
   | { status: 'pending_approval'; approvalId: string; reason: string }
   | { status: 'queued_dnd'; reason: string; durable?: boolean }
-  | { status: 'reject'; code: string; reason: string };
+  | { status: 'reject'; code: string; reason: string; durable?: boolean };
 
 export interface GateRulePlugin {
   name: string;

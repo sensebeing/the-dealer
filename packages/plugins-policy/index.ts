@@ -77,7 +77,13 @@ export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): Dispa
       ]);
       const raw = envelopeClaimVersion(envelope);
       if (raw === null) {
-        return { stage: 'rejected', detail: 'Invalid claim version' };
+        return {
+          stage: 'rejected', detail: 'Invalid claim version',
+          executionReceipt: {
+            executor: 'dedup-cas', executionId: 'dedup-cas:' + envelope.id,
+            handoff: 'unattempted', durable: Boolean(options.watermarksPath),
+          },
+        };
       }
       const previous = locks.get(key) ?? Promise.resolve();
       const operation = previous.catch(() => {}).then(async (): Promise<DispatchReceipt> => {

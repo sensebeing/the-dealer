@@ -14,6 +14,8 @@ import {
   signEnvelope,
   isDedupCasDuplicateReceipt,
   isConfirmedHandoffReceipt,
+  isRetryablePreEffectReceipt,
+  isUnattemptedOutboxItem,
   runDealerCli,
   getBuiltInProfile,
   readPatch,
@@ -1041,16 +1043,53 @@ test('Phase 4: legacy numeric watermark upgrade uses durable evidence, persists 
 });
 
 
+test('Phase 4: closed admission retains earlier DND custody and a keyed retry stays on its original node', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'dnd', defaultExecutor: 'inbox' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const request = { ...input('bob'), idempotencyKey: 'durable-dnd' };
+  const first = await alice.emitter.emit(request);
+  const [dnd] = bob.gate.listDndQueue();
+  assert.equal(first.receipts[0].stage, 'queued');
+  const getObligation = () => alice.listOutbox().find(item => item.id === first.messageId)!;
+  const targetNodeId = first.receipts[0].fromNodeId;
+  assert.deepEqual(getObligation().deliveredReceipts[targetNodeId], first.receipts[0]);
+
+  await bob.gate.setNetworkMode(request.networkId, 'closed');
+  const previous = await alice.emitter.emit(request);
+  assert.equal(previous.receipts[0].stage, 'rejected');
+  assert.equal(previous.receipts[0].executionReceipt?.handoff, 'unknown');
+  assert.equal(isRetryablePreEffectReceipt(previous.receipts[0]), false);
+  assert.deepEqual(getObligation().deliveredReceipts[targetNodeId], first.receipts[0]);
+  assert.deepEqual(getObligation().failedReceipts, {});
+  assert.equal(isUnattemptedOutboxItem(getObligation()), false);
+  const retargeted = await alice.emitter.emit({ ...input('carol'), idempotencyKey: request.idempotencyKey, body: 'other node' });
+  assert.equal(retargeted.messageId, first.messageId);
+  assert.deepEqual(bob.gate.listDndQueue(), [dnd]);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+
+  await bob.gate.setNetworkMode(request.networkId, 'open');
+  assert.equal(bob.gate.listDndQueue().length, 0);
+  assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'dispatched');
+  assert.equal(getObligation().deliveredReceipts[targetNodeId].stage, 'dispatched');
+  assert.equal(bob.mailbox.list().totalCount, 1);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+});
+
 test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND obligation after restart', async t => {
   const root = directory(t);
   const alice = await node(t, root, 'legacy-alice');
   const bob = await node(t, root, 'legacy-bob', {
     patch: { gateMode: 'dnd', defaultExecutor: 'inbox', policies: ['dedup-cas'] },
   });
-  await connect(alice, bob);
+  const carol = await node(t, root, 'legacy-carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
   // A prior gate-dnd handoff must not hide the receiver's ambiguous recovery state.
   const request = { ...input('legacy-bob', { revision: 2 }), idempotencyKey: 'legacy-entity' };
-  assert.equal((await alice.emitter.emit(request)).receipts[0].stage, 'queued');
+  const first = await alice.emitter.emit(request);
+  assert.equal(first.receipts[0].stage, 'queued');
   const message = bob.gate.listDndQueue()[0].envelope;
   const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);
   const stateDir = bob.stateDir;
@@ -1073,16 +1112,22 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'dedup-watermarks.json'), 'utf8'))[key], {
     revision: 2, status: 'unknown',
   });
-  const retry = await alice.emitter.emit(request);
-  assert.equal(isConfirmedHandoffReceipt(retry.receipts[0], { allowQueued: true }), false);
-  assert.deepEqual(restarted.gate.listDndQueue(), [parked]);
-  assert.equal(restarted.mailbox.list().totalCount, 0);
-  await restarted.gate.setMode('dnd');
-  for (const revision of [2, 1]) {
-    const rejected = await alice.emitter.emit({ ...request, payload: { revision } });
+  for (const mode of ['open', 'closed', 'approval_required', 'dnd'] as const) {
+    await restarted.gate.setNetworkMode(request.networkId, mode);
+    const verdict = await restarted.gate.evaluate(message);
+    assert.deepEqual(verdict, { status: 'reject', code: 'dnd_handoff_parked', durable: true, reason: parked.lastError });
+    const rejected = await alice.emitter.emit({ ...input('legacy-carol', { revision: 1 }), idempotencyKey: request.idempotencyKey });
+    assert.equal(rejected.messageId, first.messageId);
     assert.equal(rejected.receipts[0].stage, 'rejected');
+    assert.equal(rejected.receipts[0].executionReceipt?.handoff, 'unknown');
+    assert.equal(isRetryablePreEffectReceipt(rejected.receipts[0]), false);
     assert.equal(isConfirmedHandoffReceipt(rejected.receipts[0], { allowQueued: true }), false);
+    const stored = alice.listOutbox().find(item => item.id === first.messageId)!;
+    assert.deepEqual(stored.deliveredReceipts[first.receipts[0].fromNodeId], first.receipts[0]);
+    assert.equal(isUnattemptedOutboxItem(stored), false);
+    assert.equal(carol.mailbox.list().totalCount, 0);
     assert.deepEqual(restarted.gate.listDndQueue(), [parked]);
+    assert.equal(restarted.mailbox.list().totalCount, 0);
     assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')).queued[id], persisted);
   }
   const recovered = await alice.emitter.emit({ ...request, payload: { revision: 3 } });
@@ -1091,7 +1136,7 @@ test('Phase 4: legacy numeric reservation cannot self-confirm its pending DND ob
   assert.equal(queued.status, 'queued');
   assert.equal(queued.attempts, 0);
   assert.equal(queued.lastError, undefined);
-  await restarted.gate.setMode('open');
+  await restarted.gate.setNetworkMode(request.networkId, 'open');
   assert.deepEqual(restarted.gate.listDndQueue(), []);
   assert.deepEqual(JSON.parse(readFileSync(join(stateDir, 'gate-dnd.json'), 'utf8')), { queued: {} });
   assert.equal(restarted.mailbox.list().totalCount, 1);

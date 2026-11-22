@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt } from '../core-types/index.ts';
+import {
+  DND_CUSTODY_RETAINED, DND_HANDOFF_PARKED, PartialBatchExecutionError, signReceipt, verifyEnvelope, verifyReceipt,
+} from '../core-types/index.ts';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
 import type {
   DispatchPolicyPlugin,
@@ -290,16 +292,28 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                   return core(batch, callerKey);
                 }
                 // Policies consume individual envelopes; batching policies should be registered last.
+                const policy = chain[index];
                 let result: DispatchReceipt = { stage: 'queued' };
                 for (const e of batch) {
                   let called = false;
-                  result = await chain[index].process(e, nextBatch => {
+                  result = await policy.process(e, nextBatch => {
                     if (called) {
                       throw new Error('Policy next may only be called once');
                     }
                     called = true;
                     return run(index + 1, nextBatch, key(e));
                   });
+                  if (!called && result.stage === 'rejected' && result.executionReceipt?.handoff === undefined) {
+                    result = {
+                      ...result,
+                      executionReceipt: {
+                        ...result.executionReceipt,
+                        executor: result.executionReceipt?.executor ?? policy.name,
+                        executionId: result.executionReceipt?.executionId ?? `${policy.name}:${e.id}`,
+                        handoff: 'rejected',
+                      },
+                    };
+                  }
                 }
                 return result;
               };
@@ -379,6 +393,10 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
           receipt = {
             stage: 'rejected',
             detail: 'Invalid envelope signature or authenticated sender/network mismatch',
+            executionReceipt: {
+              executor: 'dispatcher', executionId: `dispatcher:${envelope.id}`,
+              handoff: 'unattempted', durable: Boolean(config.ledgerPath),
+            },
           };
         } else {
           const verdict = await ctx.services.gate.evaluate(envelope);
@@ -398,14 +416,25 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                 },
               };
             }
+          } else if (verdict.status === 'reject') {
+            const id = key(envelope);
+            const prior = ledger.get(id);
+            const dndCustody = verdict.code === DND_HANDOFF_PARKED || verdict.code === DND_CUSTODY_RETAINED;
+            const executor = dndCustody ? 'gate-dnd' : 'gate';
+            let handoff = 'unattempted';
+            if (dndCustody) handoff = 'unknown';
+            else if (prior?.stage === 'dispatched' || prior?.stage === 'settled') handoff = 'settled';
+            else if (prior || active.has(id)) handoff = 'unknown';
+            receipt = {
+              stage: 'rejected', detail: verdict.reason,
+              executionReceipt: {
+                executor, executionId: `${executor}:${envelope.id}`, handoff,
+                durable: dndCustody ? Boolean(verdict.durable) : Boolean(config.ledgerPath),
+              },
+            };
           } else {
             receipt = {
-              stage:
-                verdict.status === 'pending_approval'
-                  ? 'pending_approval'
-                  : verdict.status === 'queued_dnd'
-                    ? 'queued'
-                    : 'rejected',
+              stage: verdict.status === 'pending_approval' ? 'pending_approval' : 'queued',
               detail: verdict.reason,
               ...(verdict.status === 'queued_dnd' ? {
                 executionReceipt: {
