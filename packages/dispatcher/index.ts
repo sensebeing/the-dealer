@@ -322,6 +322,9 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
                         envelopeSignature: e.signature,
                       },
                     };
+                  } else if (!called && result.stage === 'failed' && result.executionReceipt?.handoff === 'unattempted' &&
+                      typeof result.executionReceipt.envelopeSignature !== 'string') {
+                    result = { ...result, executionReceipt: { ...result.executionReceipt, envelopeSignature: e.signature } };
                   }
                 }
                 return result;

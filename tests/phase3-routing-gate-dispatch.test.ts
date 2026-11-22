@@ -10,8 +10,8 @@ import os, { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { Kernel } from '../packages/kernel/index.ts';
-import { generateNodeKeyPair, isRetryablePreEffectReceipt, isUnattemptedOutboxItem, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
-import type { DeliveryReceipt, EmitMessageInput, MessageEnvelope, NodeCard, NodeService, TransportService, ExecutorPlugin } from '../packages/core-types/index.ts';
+import { generateNodeKeyPair, isRetryablePreEffectReceipt, isUnknownEffectReceipt, isUnattemptedOutboxItem, signEnvelope, signNodeCard, verifyEnvelope, verifyReceipt } from '../packages/core-types/index.ts';
+import type { DeliveryReceipt, DispatchReceipt, EmitMessageInput, MessageEnvelope, NodeCard, NodeService, TransportService, ExecutorPlugin } from '../packages/core-types/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
 import { createGatePlugin } from '../packages/gate/index.ts';
 import type { NetworkGateService } from '../packages/gate/index.ts';
@@ -1229,22 +1229,44 @@ test('CAS rolls back definite pre-effect outcomes and restores the prior version
   const dir = await mkdtemp(join(tmpdir(), 'dealer-cas-rollback-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const watermarksPath = join(dir, 'dedup.json');
+  const policyEvidence = { executor: 'policy', executionId: 'id' };
+  const rollbacks: (DispatchReceipt | 'throw')[] = [
+    { stage: 'rejected', executionReceipt: { ...policyEvidence, handoff: 'rejected' } },
+    { stage: 'failed', executionReceipt: { ...policyEvidence, handoff: 'unattempted' } },
+    { stage: 'rejected', executionReceipt: { ...policyEvidence, handoff: 'approval_pending' } },
+    { stage: 'pending_approval' }, { stage: 'queued' }, 'throw',
+  ];
   for (const hadPrior of [false, true]) {
-    for (const stage of ['rejected', 'pending_approval', 'queued', 'throw'] as const) {
+    for (const receipt of rollbacks) {
       await writeFile(watermarksPath, '{}');
       const policy = createDedupCasPolicyPlugin({ watermarksPath });
       const message = envelope({ idempotencyKey: 'retry', payload: { revision: 2 } });
       if (hadPrior) await policy.process(envelope({ ...message, payload: { revision: 1 } }), async () => ({ stage: 'settled' }));
       const before = await readFile(watermarksPath, 'utf8');
       const operation = policy.process(message, async () => {
-        if (stage === 'throw') throw Object.assign(new Error('not started'), { beforeExternalEffect: true });
-        return { stage };
+        if (receipt === 'throw') throw Object.assign(new Error('not started'), { beforeExternalEffect: true });
+        return receipt;
       });
-      if (stage === 'throw') await assert.rejects(operation, /not started/);
-      else assert.equal((await operation).stage, stage);
+      if (receipt === 'throw') await assert.rejects(operation, /not started/);
+      else assert.deepEqual(await operation, receipt);
       assert.equal(await readFile(watermarksPath, 'utf8'), before);
       assert.equal((await policy.process(message, async () => ({ stage: 'dispatched' }))).stage, 'dispatched');
     }
+  }
+  const unresolved: DispatchReceipt[] = [
+    { stage: 'rejected' },
+    { stage: 'rejected', executionReceipt: { ...policyEvidence, handoff: 'unknown' } },
+    { stage: 'rejected', detail: DEDUP_CAS_AMBIGUOUS_DETAIL },
+    { stage: 'rejected', detail: DEDUP_CAS_DUPLICATE_DETAIL,
+      executionReceipt: { executor: 'dedup-cas', executionId: 'id', handoff: 'queued', durable: false } },
+  ];
+  for (const receipt of unresolved) {
+    await writeFile(watermarksPath, '{}');
+    const policy = createDedupCasPolicyPlugin({ watermarksPath });
+    const message = envelope({ idempotencyKey: 'unresolved', payload: { revision: 2 } });
+    const key = JSON.stringify([message.networkId, message.from.nodeId, message.idempotencyKey]);
+    assert.deepEqual(await policy.process(message, async () => receipt), receipt);
+    assert.deepEqual(JSON.parse(await readFile(watermarksPath, 'utf8'))[key], { revision: 2, status: 'unknown' });
   }
   const { dispatcher, calls } = await setup(t);
   dispatcher.registerPolicy(createDedupCasPolicyPlugin());
@@ -1253,6 +1275,77 @@ test('CAS rolls back definite pre-effect outcomes and restores the prior version
   dispatcher.registerExecutor({ name: 'later', async execute() { return { executor: 'later', executionId: 'ok' }; } }, {});
   assert.equal((await dispatcher.dispatch(message)).stage, 'dispatched');
   assert.equal(calls.length, 0);
+});
+
+test('dispatcher and CAS preserve the same policy receipt evidence across restart', async t => {
+  const inbound = async (kernel: Kernel, message: MessageEnvelope): Promise<DeliveryReceipt> => {
+    const result = await kernel.ctx.bail('transport/inbound', {
+      networkId: message.networkId, senderNodeId: message.from.nodeId, mode: 'unicast',
+      payload: { type: 'message.envelope', envelope: message },
+    });
+    const receipt = JSON.parse(Buffer.from(result!).toString());
+    assert.equal(verifyReceipt(receipt), true);
+    assert.equal(receipt.messageId, message.id);
+    return receipt;
+  };
+  for (const handoff of ['unattempted', 'unknown'] as const) {
+    await t.test(handoff, async t => {
+      const dir = await mkdtemp(join(tmpdir(), 'dealer-cas-policy-receipt-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const watermarksPath = join(dir, 'watermarks.json');
+      const ledgerPath = join(dir, 'ledger.json');
+      const original = envelope({ idempotencyKey: 'policy-chain', payload: { revision: 2 } });
+      const key = JSON.stringify([original.networkId, original.from.nodeId, original.idempotencyKey]);
+      const readWatermark = async () => JSON.parse(await readFile(watermarksPath, 'utf8'))[key];
+      const first = await setup(t, { ledgerPath });
+      first.dispatcher.registerPolicy(createDedupCasPolicyPlugin({ watermarksPath }));
+      const prior = envelope({ idempotencyKey: original.idempotencyKey, payload: { revision: 1 } });
+      assert.equal((await first.dispatcher.dispatch(prior)).stage, 'dispatched');
+      const unattempted = handoff === 'unattempted';
+      const decision: DispatchReceipt = {
+        stage: unattempted ? 'failed' : 'rejected',
+        detail: unattempted ? 'transient policy check unavailable' : 'external side-effect status lost',
+        executionReceipt: { executor: 'ext-policy', executionId: unattempted ? 'p1' : 'p2', handoff },
+      };
+      const downstream = first.dispatcher.registerPolicy({ name: 'ext-policy', async process() { return decision; } });
+      const signed = await inbound(first.kernel, original);
+      assert.equal(signed.detail, decision.detail);
+      assert.equal(isRetryablePreEffectReceipt(signed), unattempted);
+      assert.equal(isUnknownEffectReceipt(signed), !unattempted);
+      const duplicate = () => envelope({ idempotencyKey: original.idempotencyKey, payload: original.payload });
+      const expectedWatermark = unattempted ? { revision: 1, status: 'settled' } : { revision: 2, status: 'unknown' };
+      assert.deepEqual(await readWatermark(), expectedWatermark);
+      if (unattempted) {
+        assert.equal(signed.executionReceipt?.envelopeSignature, original.signature);
+        const direct = await first.dispatcher.dispatch(original);
+        assert.equal(direct.stage, 'failed');
+        assert.equal(direct.executionReceipt?.envelopeSignature, original.signature);
+      }
+      downstream.dispose();
+      const assertFenced = async (kernel: Kernel) => {
+        // A fresh envelope ID reaches CAS instead of the exact-envelope ledger entry.
+        const rejected = await inbound(kernel, duplicate());
+        assert.equal(rejected.stage, 'rejected');
+        assert.equal(rejected.detail, DEDUP_CAS_AMBIGUOUS_DETAIL);
+        assert.equal(rejected.executionReceipt?.handoff, 'unknown');
+        assert.deepEqual(await readWatermark(), expectedWatermark);
+      };
+      if (!unattempted) await assertFenced(first.kernel);
+      assert.deepEqual(first.calls.map(batch => batch[0].id), [prior.id]);
+      await first.kernel.stop();
+
+      const restarted = await setup(t, { ledgerPath });
+      restarted.dispatcher.registerPolicy(createDedupCasPolicyPlugin({ watermarksPath }));
+      if (unattempted) {
+        assert.equal((await inbound(restarted.kernel, original)).stage, 'dispatched');
+        assert.deepEqual(restarted.calls.map(batch => batch[0].id), [original.id]);
+        assert.deepEqual(await readWatermark(), { revision: 2, status: 'settled' });
+      } else {
+        await assertFenced(restarted.kernel);
+        assert.deepEqual(restarted.calls, []);
+      }
+    });
+  }
 });
 
 test('transport returns signed pre-effect and unknown failures and persists only the unknown attempt', async t => {

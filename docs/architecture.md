@@ -447,7 +447,7 @@ export interface ExecutorPlugin<C = unknown> {
 #### 内置服务与插件职责
 
 1. **调度策略插件 (`packages/plugins-policy/`)**：
-   - **`plugin-policy-dedup-cas`**：基于 `idempotencyKey` 与单调代次水位（`claim_version / revision`）的本地持久化状态账本，确保同一事件精确派发一次，故障重启后沿用原回执对账，绝不重复建工作区。
+   - **`plugin-policy-dedup-cas`**：基于 `idempotencyKey` 与单调代次水位（`claim_version / revision`）的本地持久化状态账本。水位按共享回执判定记录已完成或持久排队的交接；明确的执行前失败、待审批或非持久排队恢复旧水位。执行结果未明时保留新水位，重启后继续阻止同代次重复派发。
 2. **持久化信箱、出站 outbox 与唤醒重驱 (`packages/mailbox/`)**：
    - **`MailboxStore`**：持有宿主无关 bindingRevision CAS，锁内校验启动提交、延迟、路径更新和投递结算；唯一原子落盘的信箱账本，承载逻辑 `mailboxId`、单未决租约 `dlv_*`、`wakeTargets` 重驱状态、`inbound:` / `outbound:` 方向化线程路由与旧 `inbox.json` 一次性迁移；通过文件锁 + `fsync`/`rename` 落盘，并以事件唤醒而非轮询驱动消费者。`assertAckableLease` 在发送前只读校验 `--ack` 租约，`pruneOutboundThreadRecord` 只允许删除孤儿 `outbound:` 记录，并按剩余记录自身的信封重算线程状态与 settlement。
    - **`OutboxStore`**：发送端唯一的持久化出站义务账本（`outbox.json` + `outbox-blobs/`）。`claimIdempotency` 在目录锁内按 `(networkId, idempotencyKey)` 原子创建或加入义务，并发调用只能有一个 claim owner；同一条信封幂等入队，记录未确认的目标节点、已确认回执 `deliveredReceipts`、每目标终态失败 `failedReceipts` / `failedNodeIds`、可能已执行但回执超时的 `inDoubtNodeIds`、附件暂存路径、中继已暂存目标、尝试次数与下次退避时间；只有经 emitter 统一校验、属于确认交接阶段的真实回执才标记 `delivered`，签名拒绝/派发失败/本地完整性错误按目标记录并保留暂存证据，全部目标最终交付或确定未尝试的义务被替换后，先落盘回执与终态，再清理对应暂存文件。本轮租约只能清除本轮新增且已有明确结论的存疑标记。历史存疑标记需要目标确认最终交付才能清除。签名回执表明执行中断或结果未知时，出站线程仍保持未结。后续拒绝或失败仍保留之前发送结果的不确定性与已确认的持久交接。中继持有的副本在目标确认最终交付前继续阻止替换和终态失败判定，目标拒绝或确认排队交接均不解除中继托管。只有带明确未执行标记的签名拒绝可证明本次未尝试，先前的 DND 排队交接只有凭同一信封签名绑定的明确取消回执才能解除。已停放的 DND 条目在任何门禁模式下都报告结果未知，防止改投其他节点。`queued` / `delivered` / `failed` 是账本状态，不是进程猜测；仍有可交付目标时条目保持 `queued`。

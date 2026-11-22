@@ -7,7 +7,10 @@ import type {
 import {
   DEDUP_CAS_AMBIGUOUS_DETAIL,
   DEDUP_CAS_DUPLICATE_DETAIL,
+  isConfirmedHandoffReceipt,
   isDurableQueuedReceipt,
+  isRetainedApprovalReceipt,
+  isRetryablePreEffectReceipt,
   envelopeClaimVersion,
 } from '../core-types/index.ts';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
@@ -120,11 +123,16 @@ export function createDedupCasPolicyPlugin(options: DedupCasOptions = {}): Dispa
           }
           throw error;
         }
-        if (receipt.stage === 'dispatched' || receipt.stage === 'settled') {
+        if (isConfirmedHandoffReceipt(receipt, { allowQueued: false })) {
           save({ revision: raw, status: 'settled' });
-        } else if (isDurableQueuedReceipt(receipt)) {
+        } else if (isConfirmedHandoffReceipt(receipt, { allowQueued: true })) {
           save({ revision: raw, status: 'queued' });
-        } else if (['rejected', 'pending_approval', 'queued'].includes(receipt.stage)) {
+        } else if (
+          isRetryablePreEffectReceipt(receipt) ||
+          isRetainedApprovalReceipt(receipt) ||
+          receipt.stage === 'pending_approval' ||
+          (receipt.stage === 'queued' && !isDurableQueuedReceipt(receipt))
+        ) {
           save(prior);
         }
         return receipt;
