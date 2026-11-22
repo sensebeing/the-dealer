@@ -406,7 +406,7 @@ test('slot obligations read outbox once and retain custody with partial or uncer
   const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession, outbox });
   store.enqueue([envelope('wave')], { mailboxId: waveSlot });
   assert.equal(inspect().immediateBusyReason, undefined);
-  assert.equal(outboxReads.mock.callCount(), 0);
+  assert.equal(outboxReads.mock.callCount(), 1);
 
   const request = (id: string, targetMailbox?: string) => envelope(id, {
     semantic: { type: 'question', threadId: id, replyMailbox: slotSession, targetMailbox },
@@ -429,7 +429,7 @@ test('slot obligations read outbox once and retain custody with partial or uncer
   store.enqueue([local], { mailboxId: 'stream:downstream' });
   outboxReads.mock.resetCalls();
   assert.equal(inspect().immediateBusyReason, 'local_outbound_pending');
-  assert.equal(outboxReads.mock.callCount(), 0);
+  assert.equal(outboxReads.mock.callCount(), 1);
   store.ack(store.check({ mailboxId: 'stream:downstream' }).deliveryId!, 'stream:downstream');
 
   assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
@@ -452,6 +452,43 @@ test('slot obligations read outbox once and retain custody with partial or uncer
   outboxReads.mock.resetCalls();
   assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   assert.equal(outboxReads.mock.callCount(), 1);
+});
+
+test('an interrupted keyed claim owns its slot before its outbound thread is restored', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
+  const { path, root } = workspace(t);
+  const store = new MailboxStore(path);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
+  const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession, outbox });
+  const request = envelope('interrupted-wave', {
+    idempotencyKey: 'interrupted-wave', routing: { mode: 'unicast', targets: ['bob'] },
+    semantic: { type: 'message', threadId: 'interrupted-wave', replyMailbox: slotSession },
+  });
+  t.mock.timers.tick(10);
+  store.enqueue([envelope('active-wave')], { mailboxId: waveSlot });
+  t.mock.timers.tick(10);
+  const { item } = outbox.claimIdempotency({
+    envelope: request, explicitTargets: ['bob'], plannedTargetNodeIds: ['bob'],
+  });
+  assert.deepEqual(item.pendingNodeIds, ['bob']);
+  assert.deepEqual(item.inDoubtNodeIds, ['bob']);
+  assert.equal(store.getThread(request.id), undefined);
+  assert.deepEqual(inspect(), { hasPendingWave: true, immediateBusyReason: 'outbound_thread_open' });
+  assert.equal(store.getThread(request.id), undefined, 'probing projects the claim without writing a thread');
+
+  t.mock.timers.tick(10);
+  store.reconcileOutboxThreads(outbox);
+  const recovered = new MailboxStore(path).getThread(request.id)!;
+  assert.equal(recovered.createdAt, item.createdAt);
+  assert.equal(recovered.localMailbox, slotSession);
+  assert.deepEqual(recovered.peerNodeIds, ['bob']);
+  const reply = envelope('interrupted-wave-reply', {
+    replyToId: request.id, semantic: { type: 'reply', threadId: request.id },
+  });
+  store.enqueue([reply]);
+  assert.equal(store.list({ mailboxId: slotSession }).items[0]?.id, reply.id);
+  store.ack(store.check({ mailboxId: slotSession }).deliveryId!, slotSession);
+  assert.deepEqual(inspect(), { hasPendingWave: true });
 });
 
 test('single outstanding lease never merges newer mail until acknowledged', t => {

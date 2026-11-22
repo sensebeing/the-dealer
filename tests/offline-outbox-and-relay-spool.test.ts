@@ -837,6 +837,7 @@ async function emitterHarness(
       event.envelope,
       event.targetNodeIds,
       event.envelope.semantic?.replyMailbox ?? 'default',
+      { createdAt: event.createdAt },
     );
   });
   t.after(() => kernel.stop());
@@ -5226,6 +5227,98 @@ test('interrupted claims and prepared sends pin keyed delivery to the original r
       [target, target, target]);
   }
   assert.equal(routes, 0);
+});
+
+test('redrive, replay and reconciliation restore interrupted outbound threads with their claim timestamps', async t => {
+  for (const path of ['redrive', 'replay', 'reconcile'] as const) {
+    const harness = await emitterHarness(t, {
+      plan: () => path === 'reconcile' ? { stage: 'rejected', executionReceipt: { handoff: 'unattempted' } } : {},
+    });
+    const session = `terminal:recovered-${path}`;
+    const target = harness.targetCard.nodeId;
+    const request = signEnvelope({
+      ...envelopeFor(harness.sender, harness.networkId, 'member:diz'),
+      idempotencyKey: path, semantic: { type: 'question', threadId: path, replyMailbox: session },
+      createdAt: '2025-01-01T00:00:00.000Z',
+    }, harness.sender.privateKeyPem);
+    const { item } = harness.outbox.claimIdempotency({
+      envelope: request, explicitTargets: ['member:diz'], plannedTargetNodeIds: [target], leaseMs: 1,
+    });
+    assert.equal(harness.mailbox.getThread(request.id), undefined);
+    const inspect = () => harness.mailbox.inspectSlotObligations('stream:test', { sessionMailboxId: session, outbox: harness.outbox });
+    assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+    if (path === 'redrive') {
+      const redrive = new OutboxRedriveService({
+        outbox: harness.outbox, deliver: (candidate, options) => harness.emitter.redriveOutboxItem!(candidate, options),
+        onTargetsResolved: (envelope, peers, createdAt) => harness.mailbox.recordOutboundEnvelope(envelope, peers, session, { createdAt }),
+      });
+      await until(() => Date.now() >= Date.parse(item.activeAttempt!.expiresAt), 'the interrupted attempt expires');
+      assert.equal((await redrive.flush({ force: true })).delivered, 1);
+      assert.equal(harness.sendCalls.length, 1);
+    } else if (path === 'replay') {
+      assert.equal((await harness.emitter.emit(request)).messageId, request.id);
+      assert.equal((await harness.emitter.emit(request)).messageId, request.id);
+      assert.equal(harness.sentEvents.length, 1);
+      assert.deepEqual(harness.sentEvents[0].targetNodeIds, [target]);
+      assert.equal(harness.sendCalls.length, 0);
+    } else {
+      harness.outbox.markNodeFailed(request.id, target, 'Interrupted response', undefined, item.activeAttempt?.token);
+      const retried = await harness.emitter.emit(request);
+      assert.equal(retried.messageId, request.id);
+      assert.equal(retried.receipts[0].stage, 'rejected');
+      assert.equal(harness.sendCalls.length, 1);
+      assert.deepEqual(harness.outbox.get(request.id)?.inDoubtNodeIds, [target]);
+      assert.deepEqual(harness.sentEvents.map(event => event.targetNodeIds), [[target]]);
+    }
+    assert.equal(harness.outbox.get(request.id)?.sentCommitted, true);
+    const restored = harness.mailbox.getThread(request.id)!;
+    assert.equal(restored.createdAt, item.createdAt);
+    assert.deepEqual(restored.peerNodeIds, [target]);
+    const reply = signEnvelope({
+      ...envelopeFor(harness.receiver, harness.networkId, harness.sender.nodeId),
+      replyToId: request.id, semantic: { type: 'reply', threadId: path },
+    }, harness.receiver.privateKeyPem);
+    harness.mailbox.enqueue([reply]);
+    assert.equal(harness.mailbox.list({ mailboxId: session }).items[0]?.id, reply.id);
+    harness.mailbox.ack(harness.mailbox.check({ mailboxId: session }).deliveryId!, session);
+    assert.equal(inspect().immediateBusyReason, undefined);
+  }
+});
+
+test('runtime startup restores the reply route of a persisted pre-send claim before redrive', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'ben');
+  mkdirSync(stateDir);
+  const outbox = new OutboxStore(join(stateDir, 'outbox.json'), join(stateDir, 'outbox-blobs'));
+  const sender = generateNodeKeyPair();
+  const peer = generateNodeKeyPair();
+  const session = 'terminal:startup-recovery';
+  const request = signEnvelope({
+    ...envelopeFor(sender, NETWORK, peer.nodeId), idempotencyKey: 'startup-recovery',
+    semantic: { type: 'question', threadId: 'startup-recovery', replyMailbox: session },
+  }, sender.privateKeyPem);
+  const { item } = outbox.claimIdempotency({
+    envelope: request, explicitTargets: [peer.nodeId], plannedTargetNodeIds: [peer.nodeId],
+  });
+  assert.equal(new MailboxStore(join(stateDir, 'mailbox.json')).getThread(request.id), undefined);
+  const runtime = runtimeFor(root, 'ben');
+  await runtime.start();
+  t.after(() => runtime.stop());
+  const restored = new MailboxStore(join(stateDir, 'mailbox.json')).getThread(request.id)!;
+  assert.equal(restored.createdAt, item.createdAt);
+  assert.equal(restored.localMailbox, session);
+  assert.deepEqual(restored.peerNodeIds, [peer.nodeId]);
+  assert.deepEqual(runtime.outbox.get(request.id)?.inDoubtNodeIds, [peer.nodeId]);
+  const reply = signEnvelope({
+    ...envelopeFor(peer, NETWORK, sender.nodeId),
+    replyToId: request.id, semantic: { type: 'reply', threadId: 'startup-recovery' },
+  }, peer.privateKeyPem);
+  runtime.mailbox.enqueue([reply]);
+  assert.equal(runtime.mailbox.list({ mailboxId: session }).items[0]?.id, reply.id);
+  runtime.mailbox.ack(runtime.mailbox.check({ mailboxId: session }).deliveryId!, session);
+  assert.equal(runtime.mailbox.inspectSlotObligations('stream:test', {
+    sessionMailboxId: session, outbox: runtime.outbox,
+  }).immediateBusyReason, undefined);
 });
 
 test('a malformed receipt after a keyed send leaves the recipient in doubt', async t => {

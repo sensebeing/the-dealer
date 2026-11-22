@@ -591,9 +591,18 @@ export interface OutboxItem {
   updatedAt: string;
   nextAttemptAt: string;
   lastError?: string;
+  /** False until a new keyed claim has a committed send outcome or is replayed. */
+  sentCommitted?: boolean;
   activeAttempt?: { token: string; expiresAt: string; fencedNodeIds?: string[] };
   /** The replacement owns the key; this row still provides terminal evidence for its envelope. */
   supersededById?: string;
+}
+
+/** Targets covered by delivery, local pending work, uncertainty, or relay custody. */
+export function committedOutboxTargets(item: OutboxItem): string[] {
+  return [...new Set([
+    ...Object.keys(item.deliveredReceipts), ...item.pendingNodeIds, ...item.inDoubtNodeIds, ...item.relaySpooledNodeIds,
+  ])];
 }
 
 /** Original targets whose prior outcome permits explicit reconciliation. */
@@ -631,6 +640,7 @@ export interface OutboxAttemptOptions {
 
 export interface OutboxEnqueueInput {
   attemptToken?: string;
+  sentCommitted?: boolean;
   /** Targets whose current attempt recorded a non-ambiguous outcome. */
   clearFenceNodeIds?: readonly string[];
   /** Replace outcomes only for these original targets; confirmed execution is immutable. */
@@ -725,6 +735,7 @@ export interface OutboxStoreLike {
   replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined;
   beginAttempt(id: string, options?: OutboxAttemptOptions): { item: OutboxItem; attemptToken: string } | undefined;
   prepareSend?(id: string, attemptToken: string, targetNodeIds: readonly string[]): OutboxItem | undefined;
+  markSentCommitted?(id: string): boolean;
   releaseAttempt(id: string, attemptToken: string): void;
   /** Read the highest matching version without reserving or changing an obligation. */
   findKeyedObligation?(networkId: string, key: string, minVersion: number): OutboxItem | undefined;

@@ -8,11 +8,12 @@ import {
 import { resolve } from 'node:path';
 import {
   canonicalJson,
+  committedOutboxTargets,
   isValidMailboxId,
   validateSemanticHeader,
   verifyEnvelope,
 } from '../core-types/index.ts';
-import type { Disposable, MessageEnvelope, SettlementOutcome } from '../core-types/index.ts';
+import type { Disposable, MessageEnvelope, OutboxItem, SettlementOutcome } from '../core-types/index.ts';
 import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
@@ -1016,6 +1017,46 @@ function stateForSemantic(envelope: MessageEnvelope): ThreadRouteRecord['state']
   return 'open';
 }
 
+function outboundThreadRecord(
+  envelope: MessageEnvelope, peers: readonly string[], localMailbox: string, createdAt: string, updatedAt: string,
+): ThreadRouteRecord {
+  const settlement = settlementOf(envelope, createdAt);
+  return {
+    threadId: envelope.semantic?.threadId ?? envelope.id,
+    messageId: envelope.id,
+    envelope,
+    direction: 'outbound',
+    peerNodeId: peers[0] ?? '',
+    peerNodeIds: peers,
+    networkId: envelope.networkId,
+    peerReplyMailbox: outboundPeerMailbox(envelope),
+    localMailbox,
+    traceId: envelope.traceId,
+    kind: envelope.kind,
+    subject: envelope.subject,
+    state: stateForSemantic(envelope),
+    ...(settlement ? { settlement } : {}),
+    createdAt,
+    updatedAt,
+  };
+}
+
+function outboxThreadRecord(item: OutboxItem): ThreadRouteRecord {
+  return outboundThreadRecord(
+    item.envelope, committedOutboxTargets(item), normalizeMailboxId(item.envelope.semantic?.replyMailbox ?? 'default'),
+    item.createdAt, item.updatedAt,
+  );
+}
+
+function readOutboxThreadOwners(outbox: OutboxStore) {
+  const items = outbox.list({ status: 'all' });
+  const definitivelyFailed = outbox.readDefinitivelyFailedKeys(items);
+  return {
+    definitivelyFailed,
+    items: items.filter(item => item.supersededById === undefined && !definitivelyFailed.has(netKey(item.networkId, item.id))),
+  };
+}
+
 function createAbortError(): Error {
   const error = new Error('Mailbox wait aborted');
   error.name = 'AbortError';
@@ -1802,6 +1843,10 @@ export class MailboxStore {
     }
 
     const records = Object.values(state.threads);
+    const outbox = options?.outbox && readOutboxThreadOwners(options.outbox);
+    for (const item of outbox?.items ?? []) {
+      if (!state.threads[threadKey({ direction: 'outbound', messageId: item.id })]) records.push(outboxThreadRecord(item));
+    }
     const settledThreads = new Set<string>();
     const ownedOutboundMessages = new Set<string>();
     const inboundByThread = new Map<string, ThreadRouteRecord[]>();
@@ -1864,11 +1909,8 @@ export class MailboxStore {
       if (answered) continue;
       remoteMessageKeys.push(messageKey);
     }
-    if (remoteMessageKeys.length > 0) {
-      const definitivelyFailed = options?.outbox?.readDefinitivelyFailedKeys();
-      if (remoteMessageKeys.some(key => !definitivelyFailed?.has(key))) {
-        return { hasPendingWave, immediateBusyReason: 'outbound_thread_open' };
-      }
+    if (remoteMessageKeys.some(key => !outbox?.definitivelyFailed.has(key))) {
+      return { hasPendingWave, immediateBusyReason: 'outbound_thread_open' };
     }
     return { hasPendingWave };
   }
@@ -1988,6 +2030,7 @@ export class MailboxStore {
     envelope: MessageEnvelope,
     peerNodeIds: readonly string[],
     localMailbox = 'default',
+    options?: { createdAt?: string; restore?: boolean },
   ): ThreadRouteRecord {
     const local = normalizeMailboxId(localMailbox, 'local mailbox');
     if (!Array.isArray(peerNodeIds) || peerNodeIds.some(id => !isNonEmptyString(id))) {
@@ -1999,28 +2042,30 @@ export class MailboxStore {
     if (envelope.semantic !== undefined) {
       validateSemanticHeader(envelope.semantic);
     }
-    const peers = [...new Set(peerNodeIds)];
     const now = new Date().toISOString();
-    const threadId = envelope.semantic?.threadId ?? envelope.id;
-    const settlement = settlementOf(envelope, now);
-    return this.mutate(state => structuredClone(this.upsertThreadRecord(state, {
-      threadId,
-      messageId: envelope.id,
-      envelope: structuredClone(envelope),
-      direction: 'outbound',
-      peerNodeId: peers[0] ?? '',
-      peerNodeIds: peers,
-      networkId: envelope.networkId,
-      peerReplyMailbox: outboundPeerMailbox(envelope),
-      localMailbox: local,
-      traceId: envelope.traceId,
-      kind: envelope.kind,
-      subject: envelope.subject,
-      state: stateForSemantic(envelope),
-      ...(settlement ? { settlement } : {}),
-      createdAt: now,
-      updatedAt: now,
-    })));
+    const record = outboundThreadRecord(envelope, [...new Set(peerNodeIds)], local, options?.createdAt ?? now, now);
+    if (options?.restore) return this.restoreOutboundThreads([record])[0];
+    return this.mutate(state => structuredClone(this.upsertThreadRecord(state, record)));
+  }
+
+  reconcileOutboxThreads(outbox: OutboxStore): void {
+    const { items } = readOutboxThreadOwners(outbox);
+    if (items.length > 0) this.restoreOutboundThreads(items.map(outboxThreadRecord));
+  }
+
+  private restoreOutboundThreads(records: readonly ThreadRouteRecord[]): ThreadRouteRecord[] {
+    return this.withFileLock(() => {
+      const state = this.read();
+      let changed = false;
+      const restored = records.map(record => {
+        const existing = state.threads[threadKey(record)];
+        if (existing && (existing.peerNodeIds.length > 0 || record.peerNodeIds.length === 0)) return existing;
+        changed = true;
+        return this.upsertThreadRecord(state, existing ? { ...record, localMailbox: existing.localMailbox } : record);
+      });
+      if (changed) this.save(state);
+      return structuredClone(restored);
+    });
   }
 
   /**

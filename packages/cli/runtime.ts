@@ -508,6 +508,7 @@ export class DealerNodeRuntime {
         join(this.stateDir, 'outbox.json'),
         join(this.stateDir, 'outbox-blobs'),
       );
+      this.mailbox.reconcileOutboxThreads(this.outbox);
       this.wakeups = new WakeupRedriveService({
         store: this.mailbox,
         drivers: [
@@ -601,11 +602,12 @@ export class DealerNodeRuntime {
         onError: error => {
           this.lastError = String(error);
         },
-        onTargetsResolved: (envelope, targetNodeIds) => {
+        onTargetsResolved: (envelope, targetNodeIds, createdAt) => {
           this.mailbox.recordOutboundEnvelope(
             envelope,
             targetNodeIds,
             envelope.semantic?.replyMailbox ?? 'default',
+            { createdAt, restore: true },
           );
         },
       });
@@ -1252,12 +1254,13 @@ export class DealerNodeRuntime {
             ...envelope, semantic: { ...(envelope.semantic ?? { type: 'message' as const, threadId: envelope.id }), replyMailbox },
           });
         });
-        ctx.on('emitter/sent', ({ envelope, targetNodeIds }) => {
+        ctx.on('emitter/sent', ({ envelope, targetNodeIds, createdAt }) => {
           try {
             this.mailbox.recordOutboundEnvelope(
               envelope,
               targetNodeIds,
               envelope.semantic?.replyMailbox ?? 'default',
+              { createdAt },
             );
           } catch (error) {
             this.lastError = String(error);

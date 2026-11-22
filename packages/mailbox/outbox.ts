@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import {
-  envelopeClaimVersion, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
+  committedOutboxTargets, envelopeClaimVersion, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
   isRetryablePreEffectReceipt, isUnattemptedOutboxItem, isUnknownEffectReceipt, outboxReconciliationTargets,
   outstandingRelaySpooledTargets, sameEnvelopeIntent,
 } from '../core-types/index.ts';
@@ -200,6 +200,7 @@ function validItem(value: unknown): value is OutboxItem {
     typeof value.createdAt === 'string' &&
     typeof value.updatedAt === 'string' &&
     typeof value.nextAttemptAt === 'string' &&
+    (value.sentCommitted === undefined || typeof value.sentCommitted === 'boolean') &&
     (value.lastError === undefined || typeof value.lastError === 'string') &&
     (value.supersededById === undefined ||
       (typeof value.supersededById === 'string' && value.supersededById.length > 0 && value.supersededById !== value.id)) &&
@@ -405,6 +406,7 @@ export class OutboxStore {
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
         nextAttemptAt: now,
+        ...(existing?.sentCommitted !== undefined ? { sentCommitted: existing.sentCommitted } : {}),
         ...(input.lastError !== undefined
           ? { lastError: input.lastError }
           : existing?.lastError !== undefined
@@ -418,6 +420,7 @@ export class OutboxStore {
         this.applyNodeFailure(item, nodeId, input.failedReceipts?.[nodeId]);
       }
       this.settleItem(item);
+      if (input.sentCommitted === true || committedOutboxTargets(item).length > 0) item.sentCommitted = true;
       if (index >= 0) {
         state.items[index] = item;
       } else {
@@ -433,9 +436,9 @@ export class OutboxStore {
   }
 
   /** Failures with no remaining target, uncertain attempt, or confirmed delivery. */
-  readDefinitivelyFailedKeys(): ReadonlySet<string> {
+  readDefinitivelyFailedKeys(items: readonly OutboxItem[] = this.read().items): ReadonlySet<string> {
     const keys = new Set<string>();
-    for (const item of this.read().items) {
+    for (const item of items) {
       if (item.status === 'failed' && !hasActiveAttempt(item) && item.pendingNodeIds.length === 0 &&
         item.inDoubtNodeIds.length === 0 && item.relaySpooledNodeIds.length === 0 &&
         (item.approvalPendingNodeIds?.length ?? 0) === 0 && Object.keys(item.deliveredReceipts).length === 0 &&
@@ -498,6 +501,7 @@ export class OutboxStore {
       createdAt,
       updatedAt: createdAt,
       nextAttemptAt: activeAttempt.expiresAt,
+      sentCommitted: false,
       activeAttempt,
     };
     fenceAttempt(item, activeAttempt, input.plannedTargetNodeIds ?? []);
@@ -572,6 +576,17 @@ export class OutboxStore {
   releaseAttempt(id: string, attemptToken: string): void {
     this.mutateAttempt(id, attemptToken, item => {
       delete item.activeAttempt;
+    });
+  }
+
+  markSentCommitted(id: string): boolean {
+    return this.withFileLock(() => {
+      const state = this.read();
+      const item = state.items.find(candidate => candidate.id === id);
+      if (item?.sentCommitted !== false || item.supersededById !== undefined) return false;
+      item.sentCommitted = true;
+      this.save(state);
+      return true;
     });
   }
 
@@ -791,6 +806,7 @@ export class OutboxStore {
       delete item.activeAttempt;
       this.settleItem(item);
       if (itemFailure !== undefined) item.status = 'failed';
+      if (committedOutboxTargets(item).length > 0) item.sentCommitted = true;
       return clone(item);
     });
   }
@@ -824,10 +840,11 @@ export interface OutboxRedriveOptions {
   /** Transport-owned level check: may an in-doubt target be reconciled on its normal schedule? */
   isPeerReachable?: (networkId: string, nodeId: string) => boolean;
   onError?: (error: unknown) => void;
-  /** Called once a previously unresolved explicit selector has produced real targets. */
+  /** Ensures committed targets have a durable outbound thread route. */
   onTargetsResolved?: (
     envelope: MessageEnvelope,
     targetNodeIds: readonly string[],
+    createdAt: string,
   ) => void;
   intervalMs?: number;
   attemptTimeoutMs?: number;
@@ -848,10 +865,7 @@ export class OutboxRedriveService {
   private readonly events?: OutboxRedriveEvents;
   private readonly isPeerReachable?: (networkId: string, nodeId: string) => boolean;
   private readonly onError: (error: unknown) => void;
-  private readonly onTargetsResolved?: (
-    envelope: MessageEnvelope,
-    targetNodeIds: readonly string[],
-  ) => void;
+  private readonly onTargetsResolved?: OutboxRedriveOptions['onTargetsResolved'];
   private readonly intervalMs: number;
   private readonly attemptTimeoutMs: number;
   private timer?: ReturnType<typeof setInterval>;
@@ -1087,9 +1101,10 @@ export class OutboxRedriveService {
           continue;
         }
         delivered += Object.keys(outcome.deliveredReceipts ?? {}).length;
-        if (resolved?.length && eligibleTargets.length === 0) {
+        const committedTargets = committedOutboxTargets(updated);
+        if (committedTargets.length > 0) {
           try {
-            this.onTargetsResolved?.(item.envelope, resolved);
+            this.onTargetsResolved?.(updated.envelope, committedTargets, updated.createdAt);
           } catch (error) {
             this.onError(error);
           }

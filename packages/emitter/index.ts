@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
+  committedOutboxTargets,
   isConfirmedHandoffReceipt,
   envelopeClaimVersion,
   isDeliveryTimeoutFailure,
@@ -445,9 +446,11 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 attemptToken = claim.attemptToken;
               }
               if ('unresolved' in route) {
-                outbox!.enqueue({ ...claimInput, attemptToken, pendingNodeIds: [], lastError: route.unresolved });
+                const queued = outbox!.enqueue({
+                  ...claimInput, attemptToken, sentCommitted: true, pendingNodeIds: [], lastError: route.unresolved,
+                });
                 const receipt = queuedReceipt(envelope, self, undefined, false, route.unresolved);
-                ctx.emit('emitter/sent', { envelope, targetNodeIds: [], receipts: [receipt] });
+                ctx.emit('emitter/sent', { envelope, targetNodeIds: [], receipts: [receipt], createdAt: queued.createdAt });
                 return { messageId: envelope.id, traceId: envelope.traceId, receipts: [receipt] };
               }
               const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));
@@ -544,8 +547,9 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 throw new LocalDeliveryError('Outbox item has no addressable target');
               }
               const receipts: DeliveryReceipt[] = [...observedReceipts];
+              let committedItem: OutboxItem | undefined;
               if (queueIfOffline && (pendingNodeIds.length > 0 || claimedItem !== undefined)) {
-                outbox.enqueue({
+                committedItem = outbox.enqueue({
                   attemptToken,
                   clearFenceNodeIds,
                   envelope,
@@ -568,15 +572,13 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                   receipts.push(queuedReceipt(envelope, self, targetNodeId, spooled, detail));
                 }
               }
-              // `emitter/sent` is the single commitment signal for observers such as the thread
-              // ledger: only a broadcast that left the transport, a live handoff receipt, or a
-              // durable outbox obligation may create reverse-route state. Unqueued failures and
-              // terminal rejections leave no orphan outbound record behind.
+              // Only a broadcast, live handoff, or durable obligation commits a reverse route.
+              const outboxTargets = new Set(claimedItem && committedItem ? committedOutboxTargets(committedItem) : pendingNodeIds);
               const committedTargetNodeIds = route.targetNodeIds.filter(
                 target =>
                   deliveredReceipts[target] !== undefined ||
                   livePendingReceipts[target] !== undefined ||
-                  (queueIfOffline && pendingNodeIds.includes(target)),
+                  outboxTargets.has(target),
               );
               const emitSent = (): void => {
                 if (route.mode !== 'broadcast' && committedTargetNodeIds.length === 0) {
@@ -587,6 +589,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                   targetNodeIds:
                     route.mode === 'broadcast' ? route.targetNodeIds : committedTargetNodeIds,
                   receipts,
+                  ...(committedItem ? { createdAt: committedItem.createdAt } : {}),
                 });
               };
               if (fatalError !== undefined) {
@@ -922,17 +925,17 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             ...(approvalPendingNodeIds.length > 0 ? { approvalPendingNodeIds } : {}),
             inDoubtNodeIds, relaySpooledNodeIds, ...(lastError !== undefined ? { lastError: fatalError?.message ?? lastError } : {}) });
           // Return the live rejection for this attempt while retaining prior custody in the store.
-          const receipts = (updated.status === 'queued' ? replayObligation(updated).receipts
-            : [...Object.values(updated.deliveredReceipts), ...Object.values(updated.failedReceipts)])
+          const receipts = obligationReceipts(updated)
             .filter(receipt => !failedReceipts[receipt.fromNodeId]);
           receipts.push(...Object.values(failedReceipts), ...Object.values(livePendingReceipts));
           const newlyCommitted = targets.some(target => deliveredReceipts[target] !== undefined ||
             livePendingReceipts[target] !== undefined || pendingNodeIds.includes(target));
-          if (newlyCommitted) {
-            const fullCommittedTargets = [...new Set([
-              ...Object.keys(updated.deliveredReceipts), ...Object.keys(livePendingReceipts), ...updated.pendingNodeIds,
-            ])];
-            ctx.emit('emitter/sent', { envelope: existing.envelope, targetNodeIds: fullCommittedTargets, receipts });
+          const fullCommittedTargets = [...new Set([...committedOutboxTargets(updated), ...Object.keys(livePendingReceipts)])];
+          if ((newlyCommitted || existing.sentCommitted === false) &&
+              (fullCommittedTargets.length > 0 || updated.status === 'queued')) {
+            ctx.emit('emitter/sent', {
+              envelope: updated.envelope, targetNodeIds: fullCommittedTargets, receipts, createdAt: updated.createdAt,
+            });
           }
           if (fatalError) throw Object.assign(fatalError, { receipts });
           return { messageId: updated.id, traceId: updated.envelope.traceId, receipts };
@@ -941,20 +944,12 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
         }
       };
 
-      /** Reuse an already durable obligation without emitting a second outbox entry. */
-      const replayObligation = (existing: OutboxItem): EmitResult => {
+      const obligationReceipts = (existing: OutboxItem): DeliveryReceipt[] => {
         const receipts: DeliveryReceipt[] = [
           ...Object.values(existing.deliveredReceipts),
           ...Object.values(existing.failedReceipts),
         ];
-        if (existing.status === 'failed' &&
-            !(existing.failedNodeIds.length > 0 &&
-              existing.failedNodeIds.every(id => Boolean(existing.failedReceipts[id])))) {
-          throw Object.assign(new LocalDeliveryError(existing.lastError ?? 'Durable outbox obligation failed'), { receipts });
-        }
-        if (existing.status !== 'queued') {
-          return { messageId: existing.id, traceId: existing.envelope.traceId, receipts };
-        }
+        if (existing.status !== 'queued') return receipts;
         const pending = existing.pendingNodeIds.length > 0
           ? existing.pendingNodeIds
           : [undefined];
@@ -968,6 +963,23 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 ? `Reused durable outbox obligation ${existing.id}; spooled on relay seed for offline peer ${targetNodeId}`
                 : `Reused durable outbox obligation ${existing.id} for offline peer ${targetNodeId}`;
           receipts.push(queuedReceipt(existing.envelope, selfCardFor(existing), targetNodeId, spooled, detail));
+        }
+        return receipts;
+      };
+
+      /** Reuse the durable claim and recover any commitment interrupted before the send event. */
+      const replayObligation = (existing: OutboxItem): EmitResult => {
+        const receipts = obligationReceipts(existing);
+        if (existing.sentCommitted === false) {
+          const targetNodeIds = committedOutboxTargets(existing);
+          if ((existing.status === 'queued' || targetNodeIds.length > 0) && outbox?.markSentCommitted?.(existing.id) !== false) {
+            ctx.emit('emitter/sent', { envelope: existing.envelope, targetNodeIds, receipts, createdAt: existing.createdAt });
+          }
+        }
+        if (existing.status === 'failed' &&
+            !(existing.failedNodeIds.length > 0 &&
+              existing.failedNodeIds.every(id => Boolean(existing.failedReceipts[id])))) {
+          throw Object.assign(new LocalDeliveryError(existing.lastError ?? 'Durable outbox obligation failed'), { receipts });
         }
         return {
           messageId: existing.envelope.id,
