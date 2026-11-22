@@ -711,7 +711,8 @@ export default (_config: any, context: any) => {
     'writeAtomicCursorFile', 'readJsonCursorFile', 'everyReceiptSettled',
     'parseYaml', 'parseMarkdownFrontmatter', 'parseTeamRegistry', 'resolveTeamRegistryMembers', 'createTeamRegistryRouterPlugin',
     'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
-    'createDedupCasPolicyPlugin', 'isConfirmedHandoffReceipt', 'isDedupCasDuplicateReceipt', 'isDurableQueuedReceipt', 'createOrcaSpawnExecutorPlugin',
+    'createDedupCasPolicyPlugin', 'isConfirmedHandoffReceipt', 'isDedupCasDuplicateReceipt', 'isDurableQueuedReceipt',
+    'isRetryablePreEffectReceipt', 'isUnattemptedOutboxItem', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
     'createLocalAgentRouterPlugin', 'createLlmApiRouterPlugin', 'createInboxExecutorPlugin',
   ];

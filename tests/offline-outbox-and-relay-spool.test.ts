@@ -37,6 +37,7 @@ import {
   deriveNetworkKeys,
   generateNodeKeyPair,
   isConfirmedHandoffReceipt,
+  DEDUP_CAS_AMBIGUOUS_DETAIL,
   isDeliveryTimeoutFailure,
   isLocalDeliveryError,
   isPeerUnreachableError,
@@ -47,6 +48,7 @@ import {
   signReceipt,
   unsealNetworkFrame,
 } from '../packages/core-types/index.ts';
+import { isUnattemptedOutboxItem } from '../packages/index.ts';
 import type {
   DeliveryReceipt,
   DeliveryStage,
@@ -4865,6 +4867,86 @@ test('terminal keyed delivery replays its signed receipt before auto-routing can
   assert.deepEqual(second, first);
   assert.equal(second.receipts[0].stage, 'dispatched');
   assert.equal(second.receipts[0].fromNodeId, harness.targetCard.nodeId);
+});
+
+test('outbox replacement requires signed pre-effect evidence for every failed target', () => {
+  const unattempted = { stage: 'failed', executionReceipt: { handoff: 'unattempted' } };
+  const item = { status: 'failed', failedNodeIds: ['a'], failedReceipts: { a: unattempted } };
+  assert.equal(isUnattemptedOutboxItem(item), true);
+  for (const blocked of [
+    { ...item, failedNodeIds: ['a', 'unsigned'] },
+    { ...item, pendingNodeIds: ['a'] },
+    { ...item, inDoubtNodeIds: ['a'] },
+    { ...item, deliveredReceipts: { b: { stage: 'dispatched' } } },
+    { ...item, failedReceipts: { a: { stage: 'failed' } } },
+    { ...item, failedReceipts: { a: { stage: 'failed', executionReceipt: { handoff: 'unknown' } } } },
+    { ...item, failedReceipts: { a: { stage: 'dispatching' } } },
+    { ...item, failedReceipts: { a: { stage: 'rejected', detail: DEDUP_CAS_AMBIGUOUS_DETAIL } } },
+  ]) assert.equal(isUnattemptedOutboxItem(blocked), false);
+});
+
+for (const handoff of ['unattempted', 'unknown'] as const) {
+  test(`keyed waves retarget only with ${handoff} failure evidence`, async t => {
+    let ready = false;
+    const harness = await emitterHarness(t, {
+      plan: () => ready ? {} : { stage: 'failed', executionReceipt: { handoff } },
+    });
+    const file = join(harness.dir, 'wave.txt');
+    writeFileSync(file, 'wave evidence');
+    const input: EmitMessageInput = { networkId: harness.networkId,
+      routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'wave', subject: 'wave', body: 'slot 2', payload: { streamKey: 'alerts:2', revision: 2 },
+      idempotencyKey: 'same-wave', semantic: { type: 'message' }, filePaths: [file] };
+    const first = await harness.emitter.emit(input);
+    const before = harness.outbox.get(first.messageId)!;
+    assert.equal(before.status, 'failed');
+    if (handoff === 'unattempted') {
+      assert.equal((await harness.emitter.emit(input)).messageId, first.messageId);
+      assert.equal(harness.sendCalls.length, 2);
+    }
+
+    ready = true;
+    const retry = await harness.emitter.emit({ ...input, body: 'slot 1', payload: { revision: 2, streamKey: 'alerts:1' } });
+    if (handoff === 'unattempted') {
+      assert.notEqual(retry.messageId, first.messageId);
+      assert.equal(retry.receipts[0].stage, 'dispatched');
+      assert.equal(harness.sendCalls.at(-1)?.envelope.payload.streamKey, 'alerts:1');
+      assert.equal(harness.sendCalls.at(-1)?.envelope.body, 'slot 1');
+      assert.ok(Object.values(before.stagedFiles).every(path => !existsSync(path)));
+    } else {
+      assert.deepEqual(retry, first);
+      assert.equal(harness.sendCalls.length, 1);
+      assert.ok(Object.values(before.stagedFiles).every(path => existsSync(path)));
+    }
+    assert.deepEqual(harness.outbox.list().map(item => item.id), [retry.messageId]);
+  });
+}
+
+test('a retry of the original keyed envelope reserves its outbox obligation against replacement', async t => {
+  const retryStarted = Promise.withResolvers<void>();
+  const harness = await emitterHarness(t, { plan: (_target, index) => {
+    if (index === 0) return { stage: 'failed', executionReceipt: { handoff: 'unattempted' } };
+    retryStarted.resolve();
+    return { delayMs: 100 };
+  } });
+  const input: EmitMessageInput = { networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'wave', subject: 'wave', body: 'slot 2', payload: {}, idempotencyKey: 'racing-wave' };
+  const first = await harness.emitter.emit(input);
+  const otherStore = new OutboxStore(harness.outbox.path, harness.outbox.blobDir);
+  const before = otherStore.get(first.messageId)!;
+  const retry = harness.emitter.emit(input);
+  await retryStarted.promise;
+  const replacement = otherStore.replaceUnattemptedIdempotency({
+    expectedId: before.id,
+    envelope: signEnvelope({ ...before.envelope, id: randomUUID(), body: 'slot 1' }, harness.sender.privateKeyPem),
+    explicitTargets: before.explicitTargets,
+  });
+  assert.equal(replacement?.claimed, false);
+  assert.equal(replacement?.item.id, before.id);
+  assert.equal(replacement?.item.status, 'queued');
+  assert.equal((await retry).messageId, before.id);
+  assert.deepEqual(otherStore.list().map(item => item.id), [before.id]);
 });
 
 test('keyed gate rejections and local failures allow retry and reuse a later execution', async t => {

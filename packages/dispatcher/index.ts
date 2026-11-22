@@ -171,7 +171,16 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             const unattempted = beforeEffect || partial?.unattemptedIds.has(envelope.id) === true;
             const receipt: DispatchReceipt | undefined = settled && Object.hasOwn(settled, envelope.id)
               ? { stage: 'dispatched', executionReceipt: settled[envelope.id] }
-              : unattempted ? undefined : { stage: 'failed', detail: String(error) };
+              : unattempted ? undefined : {
+                stage: 'failed',
+                detail: String(error),
+                executionReceipt: {
+                  executor: name,
+                  executionId: `${name}:${envelope.id}`,
+                  handoff: 'unknown',
+                  durable: Boolean(config.ledgerPath),
+                },
+              };
             return { envelope, id, receipt, unattempted };
           });
           // Policies handed these members to the executor. Release unattempted claims for retry.
@@ -377,7 +386,17 @@ export function createDispatcherPlugin(config: DispatcherConfig = {}): Plugin {
             try {
               receipt = await ctx.services.dispatcher.dispatch(envelope);
             } catch (error) {
-              receipt = { stage: 'failed', detail: String(error) };
+              const beforeEffect = (error as { beforeExternalEffect?: boolean } | null)?.beforeExternalEffect === true;
+              receipt = {
+                stage: 'failed',
+                detail: String(error),
+                executionReceipt: {
+                  executor: 'dispatcher',
+                  executionId: `dispatcher:${envelope.id}`,
+                  handoff: beforeEffect ? 'unattempted' : 'unknown',
+                  durable: Boolean(config.ledgerPath),
+                },
+              };
             }
           } else {
             receipt = {

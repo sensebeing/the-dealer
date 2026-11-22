@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { envelopeClaimVersion, isConfirmedHandoffReceipt } from '../core-types/index.ts';
+import { envelopeClaimVersion, isConfirmedHandoffReceipt, isUnattemptedOutboxItem, sameEnvelopeIntent } from '../core-types/index.ts';
 import {
   copyFileAtomically,
   withOwnedLock,
@@ -50,6 +50,20 @@ function highestKeyedObligation(items: readonly OutboxItem[], networkId: string,
     }
   }
   return existing;
+}
+
+function keyedClaim(input: OutboxClaimInput): { key: string; version: number } {
+  if (!validEnvelope(input?.envelope)) throw new Error('Invalid outbox envelope');
+  const key = input.envelope.idempotencyKey;
+  if (!key) throw new Error('Outbox claim requires an idempotency key');
+  const version = envelopeClaimVersion(input.envelope);
+  if (version === null) throw new Error('Invalid claim version');
+  return { key, version };
+}
+
+function claimDeadline(leaseMs: number | undefined, now = Date.now()): string {
+  return new Date(now + (leaseMs !== undefined && Number.isFinite(leaseMs) && leaseMs > 0
+    ? leaseMs : DEFAULT_CLAIM_LEASE_MS)).toISOString();
 }
 
 export const OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
@@ -408,45 +422,77 @@ export class OutboxStore {
    * send/merge, ordinary redrive later sends the same signed envelope at least once.
    */
   claimIdempotency(input: OutboxClaimInput): OutboxClaimResult {
-    if (!validEnvelope(input?.envelope)) {
-      throw new Error('Invalid outbox envelope');
-    }
-    const key = input.envelope.idempotencyKey;
-    if (!key) {
-      throw new Error('Outbox claim requires an idempotency key');
-    }
-    const version = envelopeClaimVersion(input.envelope);
-    if (version === null) throw new Error('Invalid claim version');
-    const id = input.envelope.id;
-    const now = new Date().toISOString();
+    const { key, version } = keyedClaim(input);
     return this.mutate(state => {
       const existing = highestKeyedObligation(state.items, input.envelope.networkId, key, version);
       if (existing) {
         return { claimed: false, item: clone(existing) };
       }
-      const leaseMs = Number.isFinite(input.leaseMs) && (input.leaseMs ?? 0) > 0
-        ? input.leaseMs!
-        : DEFAULT_CLAIM_LEASE_MS;
-      const item: OutboxItem = {
-        id,
-        networkId: input.envelope.networkId,
-        envelope: structuredClone(input.envelope),
-        explicitTargets: [...new Set(input.explicitTargets ?? [])],
-        pendingNodeIds: [],
-        deliveredReceipts: {},
-        failedReceipts: {},
-        failedNodeIds: [],
-        inDoubtNodeIds: [],
-        relaySpooledNodeIds: [],
-        stagedFiles: this.stageFiles(id, input.filePaths, {}),
-        status: 'queued',
-        attempts: 0,
-        createdAt: now,
-        updatedAt: now,
-        nextAttemptAt: new Date(Date.now() + leaseMs).toISOString(),
-      };
-      this.settleItem(item);
+      const item = this.createClaim(input);
       state.items.push(item);
+      return { claimed: true, item: clone(item) };
+    });
+  }
+
+  private createClaim(input: OutboxClaimInput): OutboxItem {
+    const { envelope } = input;
+    const now = Date.now();
+    const createdAt = new Date(now).toISOString();
+    return {
+      id: envelope.id,
+      networkId: envelope.networkId,
+      envelope: clone(envelope),
+      explicitTargets: [...new Set(input.explicitTargets ?? [])],
+      pendingNodeIds: [],
+      deliveredReceipts: {},
+      failedReceipts: {},
+      failedNodeIds: [],
+      inDoubtNodeIds: [],
+      relaySpooledNodeIds: [],
+      stagedFiles: this.stageFiles(envelope.id, input.filePaths, {}),
+      status: 'queued',
+      attempts: 0,
+      createdAt,
+      updatedAt: createdAt,
+      nextAttemptAt: claimDeadline(input.leaseMs),
+    };
+  }
+
+  /** Same-id retries lease the original targets, so they cannot race a retargeted send. */
+  replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined {
+    const { key, version } = keyedClaim(input);
+    return this.withFileLock(() => {
+      const state = this.read();
+      const existing = highestKeyedObligation(state.items, input.envelope.networkId, key, version);
+      if (!existing) return undefined;
+      if ((input.expectedId !== undefined && existing.id !== input.expectedId) ||
+          envelopeClaimVersion(existing.envelope) !== version ||
+          !isUnattemptedOutboxItem(existing)) return { claimed: false, item: clone(existing) };
+
+      const retryOriginal = existing.id === input.envelope.id;
+      let item: OutboxItem;
+      if (retryOriginal) {
+        if (existing.envelope.signature !== input.envelope.signature) return { claimed: false, item: clone(existing) };
+        const now = Date.now();
+        item = {
+          ...existing,
+          pendingNodeIds: [...new Set([...existing.failedNodeIds, ...Object.keys(existing.failedReceipts)])],
+          failedNodeIds: [],
+          failedReceipts: {},
+          status: 'queued',
+          lastError: undefined,
+          updatedAt: new Date(now).toISOString(),
+          nextAttemptAt: claimDeadline(input.leaseMs, now),
+        };
+      } else {
+        if (sameEnvelopeIntent(existing.envelope, input.envelope)) return { claimed: false, item: clone(existing) };
+        if (state.items.some(candidate => candidate.id === input.envelope.id)) throw new Error('Outbox replacement id is already in use');
+        item = this.createClaim(input);
+      }
+      state.items[state.items.indexOf(existing)] = item;
+      // The old attachment copies remain valid until the new obligation is durably published.
+      this.save(state);
+      if (!retryOriginal) this.removeStagedFiles(existing.id, existing.stagedFiles);
       return { claimed: true, item: clone(item) };
     });
   }

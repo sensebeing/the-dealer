@@ -25,6 +25,8 @@ import {
   isConfirmedHandoffReceipt,
   isDedupCasDuplicateReceipt,
   isDurableQueuedReceipt,
+  isRetryablePreEffectReceipt,
+  isUnattemptedOutboxItem,
   isValidMailboxId,
 } from '../core-types/index.ts';
 import { createOrcaSpawnExecutorPlugin, createOrcaExecutorPlugin, createOrcaWaveExecutorPlugin } from '../plugins-orca/index.ts';
@@ -84,6 +86,8 @@ export interface ExternalPluginContext {
     DEDUP_CAS_DUPLICATE_DETAIL: typeof DEDUP_CAS_DUPLICATE_DETAIL;
     DEDUP_CAS_AMBIGUOUS_DETAIL: typeof DEDUP_CAS_AMBIGUOUS_DETAIL;
     isConfirmedHandoffReceipt: typeof isConfirmedHandoffReceipt;
+    isRetryablePreEffectReceipt: typeof isRetryablePreEffectReceipt;
+    isUnattemptedOutboxItem: typeof isUnattemptedOutboxItem;
     isDedupCasDuplicateReceipt: typeof isDedupCasDuplicateReceipt;
     isDurableQueuedReceipt: typeof isDurableQueuedReceipt;
     createOrcaSpawnExecutorPlugin: typeof createOrcaSpawnExecutorPlugin;
@@ -683,6 +687,8 @@ export class DealerNodeRuntime {
         DEDUP_CAS_DUPLICATE_DETAIL,
         DEDUP_CAS_AMBIGUOUS_DETAIL,
         isConfirmedHandoffReceipt,
+        isRetryablePreEffectReceipt,
+        isUnattemptedOutboxItem,
         isDedupCasDuplicateReceipt,
         isDurableQueuedReceipt,
         createOrcaSpawnExecutorPlugin,

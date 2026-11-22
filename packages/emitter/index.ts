@@ -6,11 +6,14 @@ import {
   isNetworkUnmountedError,
   isOfflinePeerSpooledError,
   isPeerOfflineError,
+  isRetryablePreEffectReceipt,
   isTerminalDeliveryFailure,
+  isUnattemptedOutboxItem,
   isUnresolvedTargetError,
   LocalDeliveryError,
   NetworkUnmountedError,
   resolveSemanticHeader,
+  sameEnvelopeIntent,
   signEnvelope,
   signReceipt,
   verifyEnvelope,
@@ -386,20 +389,26 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const keyed = queueIfOffline && envelope.idempotencyKey !== undefined && envelope.routing.mode !== 'broadcast';
           const deliver = async (): Promise<EmitResult> => {
             let claimedItem: OutboxItem | undefined;
+            let replaceable: OutboxItem | undefined;
             const claimInput = { envelope, explicitTargets: [...(envelope.routing.targets ?? [])], filePaths: stagedPaths };
             if (keyed) {
               const version = envelopeClaimVersion(envelope);
               if (version === null) throw new Error('Invalid claim version');
+              let existing: OutboxItem | undefined;
               if (outbox.findKeyedObligation) {
-                const existing = outbox.findKeyedObligation(envelope.networkId, envelope.idempotencyKey!, version);
-                if (existing) return reconcileObligation(existing);
+                existing = outbox.findKeyedObligation(envelope.networkId, envelope.idempotencyKey!, version);
               } else {
                 const claim = outbox.claimIdempotency(claimInput);
-                if (!claim.claimed) return reconcileObligation(claim.item);
-                claimedItem = claim.item;
+                if (claim.claimed) claimedItem = claim.item;
+                else existing = claim.item;
+              }
+              if (existing) {
+                if (envelopeClaimVersion(existing.envelope) !== version || !isUnattemptedOutboxItem(existing) ||
+                    sameEnvelopeIntent(existing.envelope, envelope)) return reconcileObligation(existing);
+                replaceable = existing;
               }
             }
-            let route: RouteDecision;
+            let route: RouteDecision | { unresolved: string };
             try {
               route = await router.route(envelope);
               if (keyed && route.mode === 'broadcast') {
@@ -409,29 +418,22 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               // An unresolved explicit selector is a peering gap, not a routing bug: the
               // durable outbox retries it once the peer directory learns the member again.
               // Network mount state is irrelevant here; identity resolution is directory-owned.
-              if (isUnresolvedTargetError(error) && queueIfOffline) {
-                const detail = error.message;
-                outbox.enqueue({
-                  envelope,
-                  explicitTargets: [...(envelope.routing.targets ?? [])],
-                  pendingNodeIds: [],
-                  filePaths: stagedPaths,
-                  lastError: detail,
-                });
-                const receipt = queuedReceipt(envelope, self, undefined, false, detail);
-                ctx.emit('emitter/sent', {
-                  envelope,
-                  targetNodeIds: [],
-                  receipts: [receipt],
-                });
-                return { messageId: envelope.id, traceId: envelope.traceId, receipts: [receipt] };
-              }
-              throw error;
+              if (!isUnresolvedTargetError(error) || !queueIfOffline) throw error;
+              route = { unresolved: error.message };
             }
             if (keyed && !claimedItem) {
-              const claim = outbox.claimIdempotency(claimInput);
+              const claim = replaceable
+                ? outbox.replaceUnattemptedIdempotency({ ...claimInput, expectedId: replaceable.id })
+                : outbox.claimIdempotency(claimInput);
+              if (!claim) throw new LocalDeliveryError('Outbox obligation disappeared before replacement');
               if (!claim.claimed) return reconcileObligation(claim.item);
               claimedItem = claim.item;
+            }
+            if ('unresolved' in route) {
+              outbox!.enqueue({ ...claimInput, pendingNodeIds: [], lastError: route.unresolved });
+              const receipt = queuedReceipt(envelope, self, undefined, false, route.unresolved);
+              ctx.emit('emitter/sent', { envelope, targetNodeIds: [], receipts: [receipt] });
+              return { messageId: envelope.id, traceId: envelope.traceId, receipts: [receipt] };
             }
             const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));
             const spoolBlobHashes = [
@@ -831,7 +833,12 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             .filter(([, receipt]) => !isConfirmedHandoffReceipt(receipt, { allowQueued: false }))
             .map(([target]) => target),
           ...existing.failedNodeIds,
-        ])].filter(target => !isConfirmedHandoffReceipt(existing.deliveredReceipts[target], { allowQueued: false }));
+          ...Object.keys(existing.failedReceipts),
+        ])].filter(target => {
+          const failure = existing.failedReceipts[target];
+          return (!failure || isRetryablePreEffectReceipt(failure)) &&
+            !isConfirmedHandoffReceipt(existing.deliveredReceipts[target], { allowQueued: false });
+        });
         if (targets.length === 0) return replayObligation(existing);
         const { transport } = ctx.services;
         for (const attachment of existing.envelope.attachments) {
@@ -840,6 +847,13 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           }
         }
         for (const [hash, path] of Object.entries(existing.stagedFiles)) transport.registerBlob?.(hash, path);
+        if (isUnattemptedOutboxItem(existing)) {
+          const claim = outbox!.replaceUnattemptedIdempotency({
+            envelope: existing.envelope, explicitTargets: existing.explicitTargets, expectedId: existing.id,
+          });
+          if (!claim) throw new LocalDeliveryError('Outbox obligation disappeared before retry');
+          if (!claim.claimed) return replayObligation(claim.item);
+        }
         const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope: existing.envelope }));
         const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
         const attempts = await Promise.all(targets.map(target => attemptTarget(existing.envelope, target, frame, {

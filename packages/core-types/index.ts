@@ -129,6 +129,15 @@ export function envelopeClaimVersion(envelope: Pick<MessageEnvelope, 'payload'>)
   return typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0 ? raw : null;
 }
 
+/** Compare caller intent independently of the envelope id and its generated thread id. */
+export function sameEnvelopeIntent(left: MessageEnvelope, right: MessageEnvelope): boolean {
+  const intent = ({ id, subject, body, routing, payload, priority, replyToId, semantic, attachments }: MessageEnvelope) => ({
+    subject, body, routing, payload, priority, replyToId, attachments,
+    semantic: semantic?.threadId === id ? { ...semantic, threadId: undefined } : semantic,
+  });
+  return canonicalJson(intent(left)) === canonicalJson(intent(right));
+}
+
 export interface DeliveryReceipt {
   messageId: string;
   networkId: string;
@@ -186,6 +195,34 @@ export function isConfirmedHandoffReceipt(
     (Boolean(options?.allowQueued) && isDurableQueuedReceipt(receipt)) ||
     isDedupCasDuplicateReceipt(receipt, options) ||
     isDurableOutboxReceipt(receipt);
+}
+
+/** True when a signed failure or rejection proves no external effect was attempted. */
+export function isRetryablePreEffectReceipt(receipt: HandoffReceipt | null | undefined): boolean {
+  if (!receipt || isConfirmedHandoffReceipt(receipt, { allowQueued: true })) return false;
+  if (receipt.stage === 'dispatching') return false;
+  if (receipt.stage === 'failed') return receipt.executionReceipt?.handoff === 'unattempted';
+  if (receipt.stage === 'rejected') {
+    return receipt.detail !== DEDUP_CAS_AMBIGUOUS_DETAIL && receipt.executionReceipt?.handoff !== 'unknown';
+  }
+  return false;
+}
+
+/** True only when every target has signed pre-effect evidence and no remaining obligation. */
+export function isUnattemptedOutboxItem(item: {
+  status?: string;
+  pendingNodeIds?: readonly string[];
+  inDoubtNodeIds?: readonly string[];
+  deliveredReceipts?: Readonly<Record<string, HandoffReceipt>>;
+  failedNodeIds?: readonly string[];
+  failedReceipts?: Readonly<Record<string, HandoffReceipt>>;
+} | null | undefined): boolean {
+  if (!item || item.status !== 'failed') return false;
+  if ((item.pendingNodeIds?.length ?? 0) > 0 || (item.inDoubtNodeIds?.length ?? 0) > 0) return false;
+  if (Object.keys(item.deliveredReceipts ?? {}).length > 0) return false;
+  const failedReceipts = item.failedReceipts ?? {};
+  const failedIds = new Set([...(item.failedNodeIds ?? []), ...Object.keys(failedReceipts)]);
+  return failedIds.size > 0 && [...failedIds].every(id => isRetryablePreEffectReceipt(failedReceipts[id]));
 }
 
 export interface SealedNetworkFrame {
@@ -603,6 +640,8 @@ export interface OutboxStoreLike {
   enqueue(input: OutboxEnqueueInput): OutboxItem;
   /** Atomically reserve monotonic versions per (networkId, idempotencyKey) under the store lock. */
   claimIdempotency(input: OutboxClaimInput): OutboxClaimResult;
+  /** Reserve a same-version replacement or retry of the exact unattempted obligation observed. */
+  replaceUnattemptedIdempotency(input: OutboxClaimInput & { expectedId?: string }): OutboxClaimResult | undefined;
   /** Read the highest matching version without reserving or changing an obligation. */
   findKeyedObligation?(networkId: string, key: string, minVersion: number): OutboxItem | undefined;
   /** Terminal local/routing failure with no signed target receipt. */

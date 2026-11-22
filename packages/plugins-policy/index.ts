@@ -17,6 +17,8 @@ export {
   isDedupCasDuplicateReceipt,
   isDurableQueuedReceipt,
   isConfirmedHandoffReceipt,
+  isRetryablePreEffectReceipt,
+  isUnattemptedOutboxItem,
 } from '../core-types/index.ts';
 
 export type DedupWatermarkStatus = 'unknown' | 'queued' | 'settled';

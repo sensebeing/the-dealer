@@ -1176,6 +1176,44 @@ test('CAS rolls back definite pre-effect outcomes and restores the prior version
   assert.equal(calls.length, 0);
 });
 
+test('transport returns signed pre-effect and unknown failures and persists only the unknown attempt', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-receipt-handoff-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { kernel, dispatcher } = await setup(t, { ledgerPath: join(dir, 'ledger.json') });
+  dispatcher.registerPolicy(createDedupCasPolicyPlugin({ watermarksPath: join(dir, 'watermarks.json') }));
+  let attempts = 0;
+  dispatcher.registerExecutor({ name: 'failure', async execute([message]) {
+    attempts++;
+    if (message.payload.beforeEffect === true) {
+      throw Object.assign(new Error('not started'), { beforeExternalEffect: true });
+    }
+    throw new Error('lost external outcome');
+  } }, {});
+  const inbound = async (message: MessageEnvelope) => {
+    const result = await kernel.ctx.bail('transport/inbound', {
+      networkId: 'test', senderNodeId: sender.nodeId, mode: 'unicast',
+      payload: { type: 'message.envelope', envelope: message },
+    });
+    const receipt = JSON.parse(Buffer.from(result!).toString());
+    assert.equal(receipt.stage, 'failed');
+    assert.equal(verifyReceipt(receipt), true);
+    return receipt;
+  };
+  const unattempted = envelope({ idempotencyKey: 'pre-effect', payload: { executor: 'failure', beforeEffect: true } });
+  const unknown = envelope({ idempotencyKey: 'unknown-effect', payload: { executor: 'failure' } });
+  assert.deepEqual((await inbound(unattempted)).executionReceipt, {
+    executor: 'dispatcher', executionId: `dispatcher:${unattempted.id}`, handoff: 'unattempted', durable: true,
+  });
+  assert.equal((await inbound(unattempted)).executionReceipt.handoff, 'unattempted');
+  assert.deepEqual((await inbound(unknown)).executionReceipt, {
+    executor: 'dispatcher', executionId: `dispatcher:${unknown.id}`, handoff: 'unknown', durable: true,
+  });
+  assert.deepEqual((await inbound(unknown)).executionReceipt, {
+    executor: 'failure', executionId: `failure:${unknown.id}`, handoff: 'unknown', durable: true,
+  });
+  assert.equal(attempts, 3);
+});
+
 test('DND persists signed queued receipts, restores capacity and rechecks admission before draining', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-dnd-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
