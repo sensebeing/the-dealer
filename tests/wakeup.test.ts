@@ -287,6 +287,9 @@ test('durable lineage lets an idle slot rotate and wake while sibling follow-ups
 
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
   state.terminals.pop();
+  state.children[0].unverifiableTerminalCount = 1;
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true, 'a sibling claim cannot exclude an unverifiable child with one live tab');
+  state.children[0].unverifiableTerminalCount = 0;
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true }, 'a sibling claim survives a missing terminal');
   state.terminals.push(sibling);
   state.calls.length = 0;
@@ -1892,13 +1895,20 @@ test('a stale alert slot binding never writes into a sibling slot tab', async t 
   assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
 });
 
-test('a fixed workspace rebind skips a claimed tab and reuses an available tab', async t => {
+test('a fixed workspace rebind skips claimed tabs and waits for the available tab’s child', async t => {
   const workspacePath = directory(t);
   const store = new MailboxStore(join(workspacePath, 'mailbox.json'));
   const { runner, state } = fakeOrcaWorkspace(workspacePath, [
     { handle: 'other-stream', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> unsent draft' },
     { handle: 'available', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
   ]);
+  const child: FakeOrcaChild = {
+    path: join(workspacePath, 'follow-up'), worktreeId: 'follow-up', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: null }],
+    terminals: [{ ...probeTerminal, handle: 'term-child' }],
+    lineage: { createdByTerminalHandle: 'available' },
+  };
+  state.children = [child];
   store.upsertWakeTarget('stream:other', { driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'other-stream' } });
   const mailboxId = 'stream:tools-alert';
   store.enqueue([alert('closed-fixed')], {
@@ -1907,6 +1917,13 @@ test('a fixed workspace rebind skips a claimed tab and reuses an available tab',
   const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
   t.after(() => service.stop());
 
+  const deferred = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(deferred.woke, false);
+  assert.equal(deferred.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, 'closed');
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  child.agents = [{ state: 'done', parentPaneKey: null }];
   const result = await service.flushMailbox(mailboxId, { force: true });
   assert.equal(result.woke, true, result.reason);
   assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, 'available');

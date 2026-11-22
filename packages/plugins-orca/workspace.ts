@@ -288,9 +288,9 @@ export async function checkOrcaWorkspaceIdle(
     for (const id of row.childWorktreeIds ?? []) {
       const child = rows.find((item) => item.worktreeId === id);
       if (!child) return false;
-      const canExcludeChild = handles.length <= 1 || child.unverifiableTerminalCount === 0;
       if (
-        targetPaneKeys.size > 0 && child.agents?.length && canExcludeChild &&
+        targetPaneKeys.size > 0 && child.agents?.length &&
+        (handles.length <= 1 || child.unverifiableTerminalCount === 0) &&
         child.agents.every(agent =>
           typeof agent.parentPaneKey === 'string' && agent.parentPaneKey.length > 0 && !targetPaneKeys.has(agent.parentPaneKey),
         )
@@ -313,9 +313,10 @@ export async function checkOrcaWorkspaceIdle(
           }
         }
         const creatorHandle = childCreators.get(child.worktreeId);
-        if (canExcludeChild && creatorHandle && creatorHandle !== ownHandle && creatorHandle !== retiringHandle) {
+        if (child.unverifiableTerminalCount === 0 && creatorHandle && creatorHandle !== ownHandle && creatorHandle !== retiringHandle) {
           siblingHandles ??= new Set(handles.filter(terminal =>
             isUsableTerminal(terminal) && terminal !== targetTerm && String(terminal.handle) !== ownHandle &&
+            !reuseHandles?.has(String(terminal.handle)) &&
             !terminalPaneKeys(terminal).some(key => targetPaneKeys.has(key)),
           ).map(terminal => String(terminal.handle)));
           if (siblingHandles.has(creatorHandle) || options?.excludedHandles?.has(creatorHandle)) continue;
