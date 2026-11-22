@@ -235,7 +235,7 @@ export function receiptMatchesEnvelopeSignature(receipt: HandoffReceipt | undefi
   return typeof signature !== 'string' || signature.length === 0 || typeof bound !== 'string' || bound === signature;
 }
 
-/** True only when every target has signed pre-effect evidence and no remaining obligation. */
+/** True when positive evidence rules out an attempt and no obligation remains. */
 export function isUnattemptedOutboxItem(item: {
   status?: string;
   envelope?: { signature?: unknown };
@@ -247,6 +247,8 @@ export function isUnattemptedOutboxItem(item: {
   deliveredReceipts?: Readonly<Record<string, HandoffReceipt>>;
   failedNodeIds?: readonly string[];
   failedReceipts?: Readonly<Record<string, HandoffReceipt>>;
+  unattemptedNodeIds?: readonly string[];
+  unattemptedFailure?: boolean;
 } | null | undefined): boolean {
   if (!item || item.status !== 'failed' || item.supersededById !== undefined) return false;
   if ((item.pendingNodeIds?.length ?? 0) > 0 || (item.inDoubtNodeIds?.length ?? 0) > 0) return false;
@@ -254,9 +256,14 @@ export function isUnattemptedOutboxItem(item: {
   if (Object.keys(item.deliveredReceipts ?? {}).length > 0) return false;
   const failedReceipts = item.failedReceipts ?? {};
   const failedIds = new Set([...(item.failedNodeIds ?? []), ...Object.keys(failedReceipts)]);
-  return failedIds.size > 0 && [...failedIds].every(id =>
-    isRetryablePreEffectReceipt(failedReceipts[id]) && receiptMatchesEnvelopeSignature(failedReceipts[id], item.envelope?.signature),
-  );
+  if (failedIds.size === 0) return item.unattemptedFailure === true;
+  const unattemptedLocal = new Set(item.unattemptedNodeIds ?? []);
+  return [...failedIds].every(id => {
+    const receipt = failedReceipts[id];
+    return receipt
+      ? isRetryablePreEffectReceipt(receipt) && receiptMatchesEnvelopeSignature(receipt, item.envelope?.signature)
+      : unattemptedLocal.has(id);
+  });
 }
 
 export interface SealedNetworkFrame {
@@ -404,6 +411,16 @@ export function isDeliveryTimeoutFailure(error: unknown): boolean {
     current = (current as { cause?: unknown }).cause;
   }
   return false;
+}
+
+/** The send failed before a socket write or local dispatch began. */
+export function markBeforeSendError<T extends Error>(error: T): T {
+  return Object.assign(error, { beforeSend: true });
+}
+
+export function isBeforeSendError(error: unknown): boolean {
+  return (error as { beforeSend?: unknown } | null)?.beforeSend === true &&
+    !isDeliveryTimeoutFailure(error) && !isOfflinePeerSpooledError(error);
 }
 
 /** The mount disappeared between an outbox write and a redrive attempt: retry after remount. */
@@ -577,6 +594,10 @@ export interface OutboxItem {
    * that an explicit operator requeue may restore.
    */
   failedNodeIds: string[];
+  /** Local evidence that a failed target's send never started. */
+  unattemptedNodeIds?: string[];
+  /** Item-level failure before any target was attempted. */
+  unattemptedFailure?: boolean;
   inDoubtNodeIds: string[];
   relaySpooledNodeIds: string[];
   stagedFiles: Record<string, string>;
@@ -595,8 +616,12 @@ export interface OutboxItem {
 
 /** Targets covered by delivery, local pending work, uncertainty, or relay custody. */
 export function committedOutboxTargets(item: OutboxItem): string[] {
+  const unresolvedFailed = Object.entries(item.failedReceipts)
+    .filter(([, receipt]) => isUnknownEffectReceipt(receipt) || isRetainedApprovalReceipt(receipt))
+    .map(([nodeId]) => nodeId);
   return [...new Set([
     ...Object.keys(item.deliveredReceipts), ...item.pendingNodeIds, ...item.inDoubtNodeIds, ...item.relaySpooledNodeIds,
+    ...(item.approvalPendingNodeIds ?? []), ...unresolvedFailed,
   ])];
 }
 
@@ -612,10 +637,12 @@ export function outboxReconciliationTargets(item: OutboxItem): string[] {
       !isConfirmedHandoffReceipt(receipt, { allowQueued: false }))
     .map(([target]) => target);
   if (item.status === 'delivered') return provisional;
+  const provisionalSet = new Set(provisional);
   return [...new Set([...approvals, ...provisional, ...item.failedNodeIds, ...Object.keys(item.failedReceipts)])].filter(target => {
     const failure = item.failedReceipts[target];
-    return (!failure || isRetainedApprovalReceipt(failure) || isRetryablePreEffectReceipt(failure)) &&
-      !isConfirmedHandoffReceipt(item.deliveredReceipts[target], { allowQueued: false });
+    return !isConfirmedHandoffReceipt(item.deliveredReceipts[target], { allowQueued: false }) &&
+      (approvals.has(target) || provisionalSet.has(target) ||
+        Boolean(failure && (isRetainedApprovalReceipt(failure) || isRetryablePreEffectReceipt(failure))));
   });
 }
 
@@ -647,6 +674,7 @@ export interface OutboxEnqueueInput {
   deliveredReceipts?: Record<string, DeliveryReceipt>;
   failedReceipts?: Record<string, DeliveryReceipt>;
   failedNodeIds?: string[];
+  unattemptedNodeIds?: readonly string[];
   inDoubtNodeIds?: string[];
   relaySpooledNodeIds?: string[];
   /** hash -> source path; copied into the durable outbox blob directory on first enqueue. */
@@ -713,6 +741,7 @@ export interface OutboxDeliveryOutcome {
   pendingNodeIds?: readonly string[];
   approvalPendingNodeIds?: readonly string[];
   clearFenceNodeIds?: readonly string[];
+  unattemptedNodeIds?: readonly string[];
   /** Targets whose send timed out after a possible external effect; retry only on pulse/force. */
   inDoubtNodeIds?: readonly string[];
   relaySpooledNodeIds?: readonly string[];

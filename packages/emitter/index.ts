@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   committedOutboxTargets,
+  isBeforeSendError,
   isConfirmedHandoffReceipt,
   envelopeClaimVersion,
   isDeliveryTimeoutFailure,
@@ -10,6 +11,7 @@ import {
   isRetainedApprovalReceipt,
   isTerminalDeliveryFailure,
   isUnattemptedOutboxItem,
+  isUnknownEffectReceipt,
   isUnresolvedTargetError,
   LocalDeliveryError,
   NetworkUnmountedError,
@@ -239,6 +241,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             receipt,
           };
         } catch (error) {
+          const beforeSend = isBeforeSendError(error);
           if (isNetworkUnmountedError(error)) {
             return options.queueIfOffline
               ? {
@@ -247,11 +250,11 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                   inDoubt: false,
                   relaySpooled: false,
                 }
-              : localFailure(error);
+              : localFailure(error, beforeSend);
           }
           if (isPeerOfflineError(error)) {
             if (!options.queueIfOffline) {
-              return localFailure(error);
+              return localFailure(error, beforeSend);
             }
             const relaySpooled = isOfflinePeerSpooledError(error);
             return {
@@ -265,7 +268,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           }
           if (isDeliveryTimeoutFailure(error)) {
             if (!options.queueIfOffline) {
-              return localFailure(error);
+              return localFailure(error, beforeSend);
             }
             return {
               status: 'pending',
@@ -276,7 +279,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           }
           // Receipt forgery, signature failures, malformed responses, and every other
           // deterministic local/protocol bug surface instead of becoming offline state.
-          return localFailure(error);
+          return localFailure(error, beforeSend);
         }
       };
 
@@ -473,6 +476,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               const livePendingReceipts: Record<string, DeliveryReceipt> = {};
               const failedReceipts: Record<string, DeliveryReceipt> = {};
               const failedNodeIds: string[] = [];
+              const unattemptedNodeIds: string[] = [];
               const observedReceipts: DeliveryReceipt[] = [];
               const pendingNodeIds: string[] = [];
               const inDoubtNodeIds: string[] = [];
@@ -538,13 +542,14 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                     offlineDetail = attempt.error;
                     continue;
                   }
-                  if (!queueIfOffline && !claimedItem) {
+                  if (!outbox) {
                     throw attempt.error;
                   }
                   // Deterministic local/protocol failure: terminal for this target, but sibling
                   // offline obligations must be durably enqueued before the error surfaces.
                   failedNodeIds.push(target);
-                  if (!attempt.beforeSend) inDoubtNodeIds.push(target);
+                  if (attempt.beforeSend) unattemptedNodeIds.push(target);
+                  else inDoubtNodeIds.push(target);
                   offlineDetail ??= attempt.error.message;
                   fatalError ??= attempt.error;
                 }
@@ -555,7 +560,9 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               }
               const receipts: DeliveryReceipt[] = [...observedReceipts];
               let committedItem: OutboxItem | undefined;
-              if (outbox && ((queueIfOffline && pendingNodeIds.length > 0) || claimedItem !== undefined)) {
+              const hasUnresolvedFailureEvidence = inDoubtNodeIds.length > 0 ||
+                Object.values(failedReceipts).some(receipt => isUnknownEffectReceipt(receipt) || isRetainedApprovalReceipt(receipt));
+              if (outbox && ((queueIfOffline && pendingNodeIds.length > 0) || claimedItem !== undefined || hasUnresolvedFailureEvidence)) {
                 committedItem = outbox.enqueue({
                   attemptToken,
                   clearFenceNodeIds,
@@ -565,6 +572,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                   deliveredReceipts,
                   failedReceipts,
                   failedNodeIds,
+                  unattemptedNodeIds,
                   inDoubtNodeIds,
                   relaySpooledNodeIds,
                   ...(approvalPendingNodeIds.length > 0 ? { approvalPendingNodeIds } : {}),
@@ -582,7 +590,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 }
               }
               // Only a broadcast, live handoff, or durable obligation commits a reverse route.
-              const outboxTargets = new Set(claimedItem && committedItem ? committedOutboxTargets(committedItem) : pendingNodeIds);
+              const outboxTargets = new Set(committedItem ? committedOutboxTargets(committedItem) : pendingNodeIds);
               const committedTargetNodeIds = route.targetNodeIds.filter(
                 target =>
                   deliveredReceipts[target] !== undefined ||
@@ -710,6 +718,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const deliveredReceipts: Record<string, DeliveryReceipt> = {};
           const pendingNodeIds: string[] = [];
           const outcomeInDoubtNodeIds: string[] = [];
+          const unattemptedNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
           const approvalPendingNodeIds: string[] = [];
           const failures: OutboxDeliveryFailure[] = [];
@@ -757,7 +766,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 nodeId: target,
                 error: `Local or protocol failure: ${attempt.error.message}`,
               });
-              if (!attempt.beforeSend) outcomeInDoubtNodeIds.push(target);
+              if (attempt.beforeSend) unattemptedNodeIds.push(target);
+              else outcomeInDoubtNodeIds.push(target);
               continue;
             }
             pendingNodeIds.push(target);
@@ -779,6 +789,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             pendingNodeIds: pending,
             inDoubtNodeIds,
             clearFenceNodeIds: clearedFences(targets, attempts),
+            ...(unattemptedNodeIds.length > 0 ? { unattemptedNodeIds } : {}),
             relaySpooledNodeIds: outstandingRelaySpooledTargets(
               [...item.relaySpooledNodeIds, ...relaySpooledNodeIds], { ...item.deliveredReceipts, ...deliveredReceipts },
             ),
@@ -861,7 +872,9 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
         if (outboxReconciliationTargets(observed).length === 0) {
           return replayObligation(observed);
         }
-        const retryOriginal = isUnattemptedOutboxItem(observed);
+        // Signed pre-effect failures can retry the original. A mixed multicast failure
+        // reconciles only its eligible targets, leaving deterministic local failures parked.
+        const retryOriginal = isUnattemptedOutboxItem(observed) && !observed.unattemptedNodeIds?.length;
         const claim = retryOriginal
           ? outbox!.replaceUnattemptedIdempotency({
               envelope: observed.envelope, explicitTargets: observed.explicitTargets, expectedId: observed.id,
@@ -899,6 +912,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           const livePendingReceipts: Record<string, DeliveryReceipt> = {};
           const failedReceipts: Record<string, DeliveryReceipt> = {};
           const failedNodeIds: string[] = [];
+          const unattemptedNodeIds: string[] = [];
           const pendingNodeIds: string[] = [];
           const inDoubtNodeIds: string[] = [];
           const relaySpooledNodeIds: string[] = [];
@@ -914,7 +928,8 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               lastError = attempt.error;
             } else if (attempt.status === 'local-failure') {
               failedNodeIds.push(target);
-              if (!attempt.beforeSend) inDoubtNodeIds.push(target);
+              if (attempt.beforeSend) unattemptedNodeIds.push(target);
+              else inDoubtNodeIds.push(target);
               fatalError ??= attempt.error;
               lastError = attempt.error.message;
             } else {
@@ -929,7 +944,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             }
           }
           const updated = outbox!.enqueue({ attemptToken, envelope: existing.envelope, explicitTargets: existing.explicitTargets,
-            reconcileNodeIds: targets, deliveredReceipts, failedReceipts, failedNodeIds, pendingNodeIds,
+            reconcileNodeIds: targets, deliveredReceipts, failedReceipts, failedNodeIds, unattemptedNodeIds, pendingNodeIds,
             clearFenceNodeIds: clearedFences(targets, attempts),
             ...(approvalPendingNodeIds.length > 0 ? { approvalPendingNodeIds } : {}),
             inDoubtNodeIds, relaySpooledNodeIds, ...(lastError !== undefined ? { lastError: fatalError?.message ?? lastError } : {}) });

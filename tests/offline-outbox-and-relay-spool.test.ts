@@ -44,6 +44,7 @@ import {
   isLocalDeliveryError,
   isPeerUnreachableError,
   isUnresolvedTargetError,
+  markBeforeSendError,
   sealNetworkFrame,
   signEnvelope,
   signNodeCard,
@@ -1050,9 +1051,10 @@ test('initial emit enqueues offline siblings before surfacing a deterministic pr
 });
 
 test('uncommitted sends never emit emitter/sent or pollute the outbound thread ledger', async t => {
-  // A signed terminal rejection is evidence, not a handoff: nothing entered the outbox, so
-  // observers must not create a reverse route for it.
-  const rejecting = await emitterHarness(t, { stage: 'rejected' });
+  // The signed rejection proves the recipient did not attempt execution.
+  const rejecting = await emitterHarness(t, {
+    plan: () => ({ stage: 'rejected', executionReceipt: { handoff: 'unattempted' } }),
+  });
   const rejected = await rejecting.emitter.emit({
     networkId: rejecting.networkId,
     routing: { mode: 'unicast', targets: ['member:diz'] },
@@ -1066,10 +1068,10 @@ test('uncommitted sends never emit emitter/sent or pollute the outbound thread l
   assert.deepEqual(rejecting.outbox.list({ status: 'all' }), []);
   assert.deepEqual(rejecting.mailbox.listThreads(), []);
 
-  // A deterministic local/protocol failure never reaches the outbox either.
+  // The outbound framing check failed before transport could reach any peer.
   const failing = await emitterHarness(t, {
     plan: () => {
-      throw new LocalDeliveryError('Invalid or mismatched delivery receipt');
+      throw markBeforeSendError(new LocalDeliveryError('Frame exceeds limit'));
     },
   });
   let failure: unknown;
@@ -1079,7 +1081,7 @@ test('uncommitted sends never emit emitter/sent or pollute the outbound thread l
       routing: { mode: 'unicast', targets: ['member:diz'] },
       kind: 'task',
       subject: 'local failure',
-      body: 'receipt verification failed',
+      body: 'framing rejected before send',
       payload: {},
     });
   } catch (error) {
@@ -1092,7 +1094,7 @@ test('uncommitted sends never emit emitter/sent or pollute the outbound thread l
 
   // An explicit opt-out from offline queueing must not invent a durable obligation either.
   const optOut = await emitterHarness(t, {
-    plan: target => ({ error: new PeerUnreachableError(target) }),
+    plan: target => ({ error: markBeforeSendError(new PeerUnreachableError(target)) }),
   });
   await assert.rejects(
     optOut.emitter.emit({
@@ -1118,7 +1120,7 @@ test('partial multicast emits emitter/sent only for the targets that actually co
     extraMembers: ['aya'],
     plan: target => {
       if (target === ayaTarget) {
-        throw new LocalDeliveryError('Invalid or mismatched delivery receipt');
+        throw markBeforeSendError(new LocalDeliveryError('Frame exceeds limit'));
       }
       return dizOnline ? {} : { error: new PeerUnreachableError(target) };
     },
@@ -2123,7 +2125,7 @@ test('redrive preserves completed receipts and parks timed-out sends in doubt', 
 
 test('queueIfOffline opt-out leaves no durable copy and idempotent re-emits converge', async t => {
   const harness = await emitterHarness(t, {
-    sendError: new PeerUnreachableError(`ed25519:${'a'.repeat(64)}`),
+    sendError: markBeforeSendError(new PeerUnreachableError(`ed25519:${'a'.repeat(64)}`)),
   });
   const input = {
     networkId: harness.networkId,
@@ -4947,10 +4949,12 @@ test('terminal keyed delivery replays its signed receipt before auto-routing can
   assert.equal(second.receipts[0].fromNodeId, harness.targetCard.nodeId);
 });
 
-test('outbox replacement requires signed pre-effect evidence for every failed target', () => {
+test('outbox replacement requires positive pre-effect evidence for every failed target', () => {
   const unattempted = { stage: 'failed', executionReceipt: { handoff: 'unattempted' } };
   const item = { status: 'failed', failedNodeIds: ['a'], failedReceipts: { a: unattempted } };
   assert.equal(isUnattemptedOutboxItem(item), true);
+  assert.equal(isUnattemptedOutboxItem({ ...item, failedNodeIds: ['a', 'local'], unattemptedNodeIds: ['local'] }), true);
+  assert.equal(isUnattemptedOutboxItem({ ...item, failedNodeIds: [], failedReceipts: {}, unattemptedFailure: true }), true);
   const boundItem = {
     ...item, envelope: { signature: 'original' },
     failedReceipts: { a: { stage: 'failed', executionReceipt: { handoff: 'unattempted', envelopeSignature: 'other' } } },
@@ -4993,7 +4997,7 @@ test('a receipt bound to a different envelope cannot authorize outbox replacemen
   const [original] = harness.outbox.list();
   assert.equal(isUnattemptedOutboxItem(original), false);
   await assert.rejects(harness.emitter.emit({ ...input, body: 'slot 1' }), /Invalid or mismatched delivery receipt/);
-  assert.deepEqual(harness.sendCalls.map(call => call.envelope.id), [original.id, original.id]);
+  assert.deepEqual(harness.sendCalls.map(call => call.envelope.id), [original.id]);
   assert.deepEqual(harness.outbox.list().map(item => item.id), [original.id]);
 });
 
@@ -5380,7 +5384,12 @@ test('redrive, replay and reconciliation restore interrupted outbound threads wi
       assert.deepEqual(harness.sentEvents[0].targetNodeIds, [target]);
       assert.equal(harness.sendCalls.length, 0);
     } else {
-      harness.outbox.markNodeFailed(request.id, target, 'Interrupted response', undefined, item.activeAttempt?.token);
+      const receipt = signReceipt({
+        messageId: request.id, networkId: request.networkId, fromNodeId: target,
+        stage: 'rejected', updatedAt: new Date().toISOString(),
+        executionReceipt: { executor: 'gate', executionId: request.id, handoff: 'unattempted' },
+      }, harness.receiver.privateKeyPem);
+      harness.outbox.markNodeFailed(request.id, target, 'Interrupted response', receipt, item.activeAttempt?.token);
       const retried = await harness.emitter.emit(request);
       assert.equal(retried.messageId, request.id);
       assert.equal(retried.receipts[0].stage, 'rejected');
@@ -5437,6 +5446,136 @@ test('runtime startup restores the reply route of a persisted pre-send claim bef
   assert.equal(runtime.mailbox.inspectSlotObligations('stream:test', {
     sessionMailboxId: session, outbox: runtime.outbox,
   }).immediateBusyReason, undefined);
+});
+
+test('TCP frame limits distinguish local non-start from an uncertain reply', async t => {
+  const root = directory(t);
+  const sender = runtimeFor(root, 'ben', { discovery: 'mesh' });
+  const receiver = runtimeFor(root, 'diz', { discovery: 'mesh' });
+  const alternate = runtimeFor(root, 'carol', { discovery: 'mesh' });
+  for (const runtime of [sender, receiver, alternate]) {
+    await runtime.start();
+    t.after(() => runtime.stop());
+    await runtime.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  }
+  await until(() => sender.node.listPeers({ networkId: NETWORK }).length === 2, 'direct peers');
+  const recipient = receiver.node.getSelfCard(NETWORK).nodeId;
+  let sockets = 0;
+  const server = createServer(socket => {
+    sockets++;
+    socket.on('error', () => {});
+    socket.once('data', () => {
+      const header = Buffer.alloc(4);
+      header.writeUInt32BE(8 * 1024 * 1024 + 1);
+      socket.end(header);
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const endpoint = server.address();
+  assert.ok(endpoint && typeof endpoint !== 'string');
+  const useReplyFixture = () => sender.transport.registerPeerEndpoint(NETWORK, recipient, `127.0.0.1:${endpoint.port}`);
+  useReplyFixture();
+  const send = t.mock.method(sender.transport, 'sendUnicast');
+  const request: EmitMessageInput = {
+    networkId: NETWORK, routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'question', subject: 'frame limit', body: 'x'.repeat(8 * 1024 * 1024), payload: {},
+    idempotencyKey: 'frame-limit', semantic: { type: 'question', replyMailbox: 'terminal:frame-limit' },
+  };
+  const busyReason = (sessionMailboxId: string) =>
+    sender.mailbox.inspectSlotObligations('stream:frame-limit', { sessionMailboxId, outbox: sender.outbox }).immediateBusyReason;
+
+  await assert.rejects(sender.emitter.emit(request), /Frame exceeds limit/);
+  const [failed] = sender.outbox.list();
+  assert.deepEqual(failed.inDoubtNodeIds, []);
+  assert.deepEqual(failed.unattemptedNodeIds, [recipient]);
+  assert.equal(isUnattemptedOutboxItem(failed), true);
+  assert.equal(busyReason('terminal:frame-limit'), undefined);
+  await assert.rejects(sender.emitter.emit(request), /Frame exceeds limit/);
+  assert.equal(send.mock.callCount(), 1);
+  assert.equal(sockets, 0);
+
+  sender.transport.registerPeerEndpoint(NETWORK, recipient, receiver.transport.endpointAddr!);
+  const corrected = await sender.emitter.emit({ ...request, body: 'small enough' });
+  assert.equal(corrected.receipts[0]?.stage, 'dispatched');
+  assert.equal(sender.outbox.get(failed.id)?.supersededById, corrected.messageId);
+
+  useReplyFixture();
+  const uncertain: EmitMessageInput = {
+    ...request, body: 'small request, oversized reply', idempotencyKey: 'reply-limit',
+    semantic: { type: 'question', replyMailbox: 'terminal:reply-limit' },
+  };
+  await assert.rejects(sender.emitter.emit(uncertain), /Frame exceeds limit/);
+  assert.equal(sockets, 1);
+  const unclear = sender.outbox.list().find(item => item.envelope.idempotencyKey === uncertain.idempotencyKey)!;
+  assert.deepEqual(unclear.inDoubtNodeIds, [recipient]);
+  assert.equal(isUnattemptedOutboxItem(unclear), false);
+  assert.equal(busyReason('terminal:reply-limit'), 'outbound_thread_open');
+  await assert.rejects(sender.emitter.emit({
+    ...uncertain, routing: { mode: 'unicast', targets: ['member:carol'] }, body: 'changed target',
+  }), /Frame exceeds limit/);
+  assert.equal(send.mock.callCount(), 3);
+  assert.equal(alternate.mailbox.list().totalCount, 0);
+});
+
+test('unkeyed questions keep unresolved send effects fenced without redrive', async t => {
+  for (const stage of ['failed', 'dispatching', 'rejected', 'unattempted', 'malformed'] as const) {
+    const harness = await emitterHarness(t, {
+      plan: () => stage === 'malformed' ? { error: new LocalDeliveryError('Invalid or mismatched delivery receipt') }
+        : stage === 'unattempted' ? { stage: 'rejected', executionReceipt: { handoff: 'unattempted' } }
+        : { stage, ...(stage === 'failed' ? { executionReceipt: { executor: 'test', executionId: 'failure', handoff: 'unknown' } } : {}) },
+    });
+    const session = 'terminal:unkeyed-question';
+    const request: EmitMessageInput = {
+      ...envelopeFor(harness.sender, harness.networkId, 'member:diz'),
+      semantic: { type: 'question', replyMailbox: session },
+    };
+    if (stage === 'malformed') await assert.rejects(harness.emitter.emit(request), LocalDeliveryError);
+    else await harness.emitter.emit(request);
+    const obligations = harness.mailbox.inspectSlotObligations('stream:unkeyed', {
+      sessionMailboxId: session, outbox: harness.outbox,
+    });
+    const [item] = harness.outbox.list();
+    if (stage === 'unattempted') {
+      assert.equal(item, undefined);
+      assert.equal(obligations.immediateBusyReason, undefined);
+      assert.deepEqual(harness.mailbox.listThreads(), []);
+    } else {
+      assert.equal(item?.status, 'failed');
+      assert.equal(item.envelope.idempotencyKey, undefined);
+      assert.equal(obligations.immediateBusyReason, 'outbound_thread_open');
+      assert.deepEqual(harness.mailbox.getThread(item.id)?.peerNodeIds, [harness.targetCard.nodeId]);
+      const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: harness.emitter.redriveOutboxItem! });
+      assert.equal((await service.flush({ force: true })).attempted, 0);
+      assert.equal(harness.sendCalls.length, 1);
+    }
+  }
+});
+
+test('a redrive non-start records local evidence without clearing earlier custody or uncertainty', async t => {
+  for (const prior of ['offline', 'approval', 'timeout'] as const) {
+    const harness = await emitterHarness(t, {
+      plan: (target, index) => {
+        if (index > 0) return { error: markBeforeSendError(new LocalDeliveryError('Frame exceeds limit')) };
+        if (prior === 'approval') return { stage: 'pending_approval' };
+        return { error: prior === 'timeout'
+          ? new PeerUnreachableError(target, 'Transport timeout', { cause: new DeliveryTimeoutError('Transport timeout') })
+          : markBeforeSendError(new PeerUnreachableError(target)) };
+      },
+    });
+    const original = await harness.emitter.emit({
+      ...envelopeFor(harness.sender, harness.networkId, 'member:diz'), idempotencyKey: 'redrive-non-start',
+    });
+    const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: harness.emitter.redriveOutboxItem! });
+    assert.equal((await service.flush({ force: true })).attempted, 1);
+    const item = harness.outbox.get(original.messageId)!;
+    const target = harness.targetCard.nodeId;
+    assert.deepEqual(item.inDoubtNodeIds, prior === 'timeout' ? [target] : []);
+    assert.deepEqual(item.unattemptedNodeIds, prior === 'offline' ? [target] : []);
+    assert.equal(isUnattemptedOutboxItem(item), prior === 'offline');
+    assert.equal(item.status, prior === 'approval' ? 'queued' : 'failed');
+    if (prior === 'approval') assert.deepEqual(item.approvalPendingNodeIds, [target]);
+  }
 });
 
 test('a malformed receipt after a keyed send leaves the recipient in doubt', async t => {
@@ -5562,7 +5701,7 @@ test('a retry of the original keyed envelope reserves its outbox obligation agai
   assert.deepEqual(otherStore.list().map(item => item.id), [before.id]);
 });
 
-test('keyed gate rejections and local failures allow retry and reuse a later execution', async t => {
+test('keyed gate rejections reconcile while unsigned local failures require explicit requeue', async t => {
   for (const localFailure of [false, true]) {
     let recovered = false;
     const harness = await emitterHarness(t, {
@@ -5577,13 +5716,20 @@ test('keyed gate rejections and local failures allow retry and reuse a later exe
       if (localFailure) await assert.rejects(harness.emitter.emit(input), /invalid wire reply/);
       else assert.equal((await harness.emitter.emit(input)).receipts[0].detail, 'Gate closed');
     }
-    assert.equal(harness.sendCalls.length, 2);
-    assert.equal(harness.outbox.list({ status: 'failed' }).length, 1);
+    assert.equal(harness.sendCalls.length, localFailure ? 1 : 2);
+    const [original] = harness.outbox.list({ status: 'failed' });
+    assert.ok(original);
     recovered = true;
+    if (localFailure) {
+      harness.outbox.requeue(original.id);
+      const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: harness.emitter.redriveOutboxItem! });
+      assert.equal((await service.flush({ force: true })).delivered, 1);
+    }
     const delivered = await harness.emitter.emit(input);
+    assert.equal(delivered.messageId, original.id);
     assert.equal(delivered.receipts[0].stage, 'dispatched');
     assert.deepEqual(await harness.emitter.emit(input), delivered);
-    assert.equal(harness.sendCalls.length, 3, 'lookup skips earlier failed items and reuses settled execution');
+    assert.equal(harness.sendCalls.length, localFailure ? 2 : 3, 'lookup reuses settled execution');
   }
 });
 
@@ -5728,7 +5874,7 @@ test('keyed DND retries retain the original target and staged attachment online 
   assert.ok(harness.sendCalls.every(call => call.envelope.id === first.messageId));
 });
 
-test('keyed mixed multicast reconciles only the original failed sibling', async t => {
+test('keyed mixed multicast recovery retries only the original failed sibling', async t => {
   for (const localFailure of [false, true]) {
     let recovered = false;
     const harness = await emitterHarness(t, { extraMembers: ['aya', 'bo'], plan: target =>
@@ -5760,6 +5906,12 @@ test('keyed mixed multicast reconciles only the original failed sibling', async 
       assert.equal(retry.receipts.find(r => r.fromNodeId === aya)?.stage, 'rejected');
     }
     recovered = true;
+    if (localFailure) {
+      assert.equal(harness.sendCalls.filter(c => c.targetNodeId === aya).length, 1);
+      harness.outbox.requeue(first.id);
+      const service = new OutboxRedriveService({ outbox: harness.outbox, deliver: harness.emitter.redriveOutboxItem! });
+      assert.equal((await service.flush({ force: true })).delivered, 1);
+    }
     const recoveredResult = await harness.emitter.emit(input);
     assert.equal(recoveredResult.messageId, first.id);
     const item = harness.outbox.get(first.id)!;
@@ -5769,7 +5921,7 @@ test('keyed mixed multicast reconciles only the original failed sibling', async 
     assert.deepEqual(item.failedReceipts, {});
     assert.equal(harness.outbox.list({ status: 'all' }).length, 1);
     assert.equal(harness.sendCalls.filter(c => c.targetNodeId === diz).length, 1);
-    assert.equal(harness.sendCalls.filter(c => c.targetNodeId === aya).length, 3);
+    assert.equal(harness.sendCalls.filter(c => c.targetNodeId === aya).length, localFailure ? 2 : 3);
     assert.equal(harness.sendCalls.filter(c => c.targetNodeId === bo).length, 0);
     assert.equal(route.mock.callCount(), 1);
     assert.ok(harness.sendCalls.every(c => c.envelope.id === first.id));

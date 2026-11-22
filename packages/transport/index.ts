@@ -24,6 +24,8 @@ import {
   deriveNetworkKeys,
   generateNodeKeyPair,
   isDeliveryTimeoutFailure,
+  isOfflinePeerSpooledError,
+  markBeforeSendError,
   sealNetworkFrame,
   unsealNetworkFrame,
 } from '../core-types/index.ts';
@@ -277,7 +279,7 @@ function ipv4Broadcast(address: string, netmask: string): string | undefined {
 function packet(value: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(value));
   if (body.length > MAX_FRAME) {
-    throw new LocalDeliveryError('Frame exceeds limit');
+    throw markBeforeSendError(new LocalDeliveryError('Frame exceeds limit'));
   }
   const size = Buffer.alloc(4);
   size.writeUInt32BE(body.length);
@@ -2101,6 +2103,7 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
     options: RelayRequestOptions = {},
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     // The caller's timeout is the whole exchange budget, not a per-attempt allowance: a
     // blackholed direct endpoint followed by hanging relay seeds must not multiply it.
@@ -2122,6 +2125,7 @@ export class P2PTransportService implements TransportService {
           address,
           frame,
           fallbacks.length ? Math.min(remaining(), RELAY_CONNECT_TIMEOUT_MS) : remaining(),
+          onWrite,
         );
       } catch (error) {
         lastError = asError(error);
@@ -2157,7 +2161,7 @@ export class P2PTransportService implements TransportService {
             (m.beacons.get(target)?.expires ?? 0) >= Date.now()
               ? attemptTimeoutMs
               : Math.min(attemptTimeoutMs, RELAY_CONNECT_TIMEOUT_MS);
-          return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, tunnelTimeoutMs);
+          return await this.exchangeOverTunnel(m, target, fallback.tunnel, frame, tunnelTimeoutMs, onWrite);
         }
         const attachmentPacket = options.blobHashes?.length
           ? await (blobs ??= this.readSpoolBlobs(
@@ -2190,6 +2194,7 @@ export class P2PTransportService implements TransportService {
               ? { blobs: attachmentPacket.blobs }
               : {}),
           },
+          onWrite,
         );
       } catch (error) {
         // A confirmed spool is a successful handoff to durable relay storage: never try a
@@ -2331,6 +2336,7 @@ export class P2PTransportService implements TransportService {
     address: string,
     frame: SealedNetworkFrame,
     timeoutMs: number,
+    onWrite?: () => void,
   ): Promise<SealedNetworkFrame> {
     const wirePacket = packet({ type: 'frame', frame });
     const socket = this.track(createConnection(parseEndpoint(address)));
@@ -2343,6 +2349,7 @@ export class P2PTransportService implements TransportService {
       clearTimeout(connectTimer);
       socket.setTimeout(timeoutMs);
       try {
+        onWrite?.();
         socket.write(wirePacket);
       } catch (error) {
         socket.destroy(error instanceof Error ? error : new Error(String(error)));
@@ -2372,8 +2379,9 @@ export class P2PTransportService implements TransportService {
     address: string,
     frame: SealedNetworkFrame,
     timeoutMs: number,
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
-    const responseFrame = await this.directFrame(m, target, address, frame, timeoutMs);
+    const responseFrame = await this.directFrame(m, target, address, frame, timeoutMs, onWrite);
     let payload: { requestNonce: string; dataBase64: string };
     try {
       payload = unsealNetworkFrame<{ requestNonce: string; dataBase64: string }>(
@@ -2397,8 +2405,19 @@ export class P2PTransportService implements TransportService {
     frame: SealedNetworkFrame,
     timeoutMs: number,
     options: { spoolIfOffline?: boolean; spoolKey?: string; blobs?: Record<string, string> } = {},
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     const startedAt = Date.now();
+    const wirePacket = packet({
+      // Use the original verb for a live send so older seeds can still forward it.
+      type: options.spoolIfOffline ? 'relay_send' : 'relay',
+      networkId: m.config.networkId,
+      target,
+      frame,
+      ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
+      ...(options.spoolKey !== undefined ? { spoolKey: options.spoolKey } : {}),
+      ...(options.blobs && Object.keys(options.blobs).length ? { blobs: options.blobs } : {}),
+    });
     const socket = this.track(
       createConnection(parseEndpoint(seed)),
       () =>
@@ -2412,19 +2431,8 @@ export class P2PTransportService implements TransportService {
     socket.setTimeout(timeoutMs);
     try {
       this.inFlightSelfNonces.add(frame.nonce);
-      socket.write(packet({
-        // Live non-spooling sends use the original `relay` verb so pre-upgrade seeds keep
-        // forwarding them; only a spool offer needs the newer `relay_send` verb.
-        type: options.spoolIfOffline ? 'relay_send' : 'relay',
-        networkId: m.config.networkId,
-        target,
-        frame,
-        ...(options.spoolIfOffline ? { spoolIfOffline: true } : {}),
-        ...(options.spoolKey !== undefined ? { spoolKey: options.spoolKey } : {}),
-        ...(options.blobs && Object.keys(options.blobs).length
-          ? { blobs: options.blobs }
-          : {}),
-      }));
+      onWrite?.();
+      socket.write(wirePacket);
       let response: any;
       try {
         response = await new SocketReader(socket).json();
@@ -2442,7 +2450,7 @@ export class P2PTransportService implements TransportService {
           const remainingMs = timeoutMs - (Date.now() - startedAt);
           if (hasFreshBeacon && remainingMs > 0) {
             socket.destroy();
-            return await this.relayExchange(m, seed, target, frame, remainingMs, {});
+            return await this.relayExchange(m, seed, target, frame, remainingMs, {}, onWrite);
           }
         }
         throw error;
@@ -2498,10 +2506,11 @@ export class P2PTransportService implements TransportService {
     tunnel: Tunnel,
     frame: SealedNetworkFrame,
     timeoutMs: number,
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     let response: any;
     try {
-      response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs);
+      response = await this.requestOverTunnel(tunnel, { type: 'relay_deliver', frame }, undefined, timeoutMs, onWrite);
     } catch (error) {
       if (
         error instanceof DeliveryTimeoutError &&
@@ -2553,20 +2562,29 @@ export class P2PTransportService implements TransportService {
       spoolBlobHashes?: readonly string[];
     },
   ): Promise<Uint8Array> {
-    const m = this.mounts.get(networkId);
-    if (target === this.localNodeId) {
-      return this.deliverLocal(networkId, bytes, m);
+    let writeStarted = false;
+    const onWrite = () => { writeStarted = true; };
+    try {
+      const m = this.mounts.get(networkId);
+      if (target === this.localNodeId) {
+        return await this.deliverLocal(networkId, bytes, m, onWrite);
+      }
+      if (!m) throw new NetworkUnmountedError(networkId);
+      // Spooling remains caller-owned. Attachment hashes come from the caller, so
+      // transport can forward sealed frames without interpreting their envelopes.
+      return await this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs, {
+        ...(opts?.spoolIfOffline === true ? { spoolIfOffline: true } : {}),
+        ...(opts?.spoolKey !== undefined ? { spoolKey: opts.spoolKey } : {}),
+        blobHashes: opts?.spoolBlobHashes ?? [],
+      }, onWrite);
+    } catch (cause) {
+      const error = asError(cause);
+      // The whole exchange owns this evidence. A later leg may fail before writing
+      // even after an earlier leg already sent the request.
+      if (writeStarted) throw Object.assign(error, { beforeSend: false });
+      if (isDeliveryTimeoutFailure(error) || isOfflinePeerSpooledError(error)) throw error;
+      throw markBeforeSendError(error);
     }
-    if (!m) {
-      throw new NetworkUnmountedError(networkId);
-    }
-    // Spooling is caller-owned policy: an explicit opt-out must leave no durable relay
-    // copy. Attachment hashes still come from the caller, so transport stays envelope-blind.
-    return this.exchange(m, target, this.sealed(m, 'unicast', bytes), opts?.timeoutMs, {
-      ...(opts?.spoolIfOffline === true ? { spoolIfOffline: true } : {}),
-      ...(opts?.spoolKey !== undefined ? { spoolKey: opts.spoolKey } : {}),
-      blobHashes: opts?.spoolBlobHashes ?? [],
-    });
   }
 
   /** Same-machine mode: deliver a frame addressed to this node without opening a socket. */
@@ -2574,6 +2592,7 @@ export class P2PTransportService implements TransportService {
     networkId: string,
     bytes: Uint8Array,
     mount?: Mount,
+    onWrite?: () => void,
   ): Promise<Uint8Array> {
     let payload: unknown;
     try {
@@ -2607,6 +2626,7 @@ export class P2PTransportService implements TransportService {
     if (this.handlers.size === 0 && !this.ctx) {
       throw new Error('No inbound handler registered');
     }
+    onWrite?.();
     return this.inboundReply(event);
   }
 
@@ -2821,6 +2841,7 @@ export class P2PTransportService implements TransportService {
     body: Record<string, unknown>,
     requestSocket?: Socket,
     timeoutMs = this.options.socketTimeoutMs ?? 90_000,
+    onWrite?: () => void,
   ): Promise<any> {
     const relayId = randomUUID();
     return new Promise((resolve, reject) => {
@@ -2844,7 +2865,9 @@ export class P2PTransportService implements TransportService {
       // socket expires (or forever, when that requester never notices).
       timer = setTimeout(() => finish(new DeliveryTimeoutError('Relay tunnel timeout')), timeoutMs);
       try {
-        tunnel.socket.write(packet({ ...body, relayId }));
+        const wirePacket = packet({ ...body, relayId });
+        onWrite?.();
+        tunnel.socket.write(wirePacket);
       } catch (error) {
         finish(error instanceof Error ? error : new Error(String(error)));
       }

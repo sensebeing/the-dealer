@@ -1108,6 +1108,53 @@ test('Phase 4: a keyed gate rejection permits an online replacement but prevents
   assert.equal(bob.mailbox.list().totalCount, 0);
 });
 
+test('Phase 4: concurrent authenticated copies share admission and fence retargeting', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { defaultExecutor: 'inbox' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let admissions = 0;
+  bob.gate.registerRule({
+    name: 'delayed-admission', priority: 10,
+    async evaluate() {
+      if (++admissions !== 1) return { status: 'reject', code: 'second-copy', reason: 'Later admission denied' };
+      entered.resolve();
+      await release.promise;
+      return { status: 'allow' };
+    },
+  });
+  const send = alice.transport.sendUnicast.bind(alice.transport);
+  const senderNodeId = alice.node.getSelfCard('sensebeing').nodeId;
+  let firstStage: string | undefined;
+  t.mock.method(alice.transport, 'sendUnicast', async (...args: Parameters<typeof send>) => {
+    const [networkId, , bytes] = args;
+    const first = send(...args);
+    await entered.promise;
+    const second = bob.kernel.ctx.bail('transport/inbound', {
+      networkId, senderNodeId, mode: 'unicast', payload: JSON.parse(Buffer.from(bytes).toString('utf8')),
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release.resolve();
+    const [received, duplicate] = await Promise.all([first, second]);
+    firstStage = JSON.parse(Buffer.from(received).toString('utf8')).stage;
+    return duplicate!;
+  });
+
+  const request = { ...input('bob'), idempotencyKey: 'parallel-admission' };
+  const original = await alice.emitter.emit(request);
+  assert.equal(firstStage, 'dispatched');
+  assert.equal(original.receipts[0].stage, 'dispatched');
+  assert.equal(admissions, 1);
+  assert.equal(isUnattemptedOutboxItem(alice.outbox.get(original.messageId)), false);
+  const retargeted = await alice.emitter.emit({ ...input('carol'), idempotencyKey: request.idempotencyKey, body: 'other target' });
+  assert.equal(retargeted.messageId, original.messageId);
+  assert.equal(bob.mailbox.list().totalCount, 1);
+  assert.equal(carol.mailbox.list().totalCount, 0);
+});
+
 test('Phase 4: approval custody stays open until approved or cancelled', async t => {
   const root = directory(t);
   const alice = await node(t, root, 'alice');
