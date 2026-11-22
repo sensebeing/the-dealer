@@ -215,17 +215,12 @@ export function isRetryablePreEffectReceipt(receipt: HandoffReceipt | null | und
   return false;
 }
 
-/** Signed evidence of interrupted or potentially irreversible execution. */
+/** A receipt without confirmed handoff, retained approval, or positive pre-effect proof. */
 export function isUnknownEffectReceipt(receipt: HandoffReceipt | null | undefined): boolean {
   if (!receipt || isConfirmedHandoffReceipt(receipt, { allowQueued: true }) || isRetainedApprovalReceipt(receipt)) {
     return false;
   }
-  if (receipt.stage === 'dispatching') return true;
-  if (receipt.stage === 'failed') return receipt.executionReceipt?.handoff !== 'unattempted';
-  if (receipt.stage === 'rejected') {
-    return receipt.detail === DEDUP_CAS_AMBIGUOUS_DETAIL || receipt.executionReceipt?.handoff === 'unknown';
-  }
-  return false;
+  return !isRetryablePreEffectReceipt(receipt);
 }
 
 /** Only the receipt for this exact envelope can release its provisional custody. */

@@ -192,8 +192,10 @@ export async function checkOrcaWorkspaceIdle(
         : eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
           ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
       : undefined;
-    if (isRoot && !rotating && options?.targetPaneKey?.trim() && !targetTerm) return true;
+    const explicitTargetPaneKey = isRoot && !rotating ? options?.targetPaneKey?.trim() : undefined;
+    const missingTargetPane = Boolean(explicitTargetPaneKey && !targetTerm);
     const targetPaneKeys = new Set(targetTerm ? terminalPaneKeys(targetTerm) : []);
+    if (explicitTargetPaneKey) targetPaneKeys.add(explicitTargetPaneKey);
     if (rotating && options?.retiringPaneKey?.trim()) targetPaneKeys.add(options.retiringPaneKey.trim());
     const ownHandle = rotating ? retiringHandle : targetTerm
       ? String(targetTerm.handle)
@@ -201,7 +203,7 @@ export async function checkOrcaWorkspaceIdle(
     const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
     const eligibleObservableHandles = observableHandles.filter(canUse);
     const rootTarget = isRoot
-      ? rotating
+      ? rotating || missingTargetPane
         ? null
         : targetTerm
           ? String(targetTerm.handle)
@@ -228,9 +230,8 @@ export async function checkOrcaWorkspaceIdle(
       row.agents
         .filter((agent) =>
           (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) ||
-          // During rotation an agent without a paneKey cannot be proven to belong to a sibling,
-          // so it is counted against the retiring slot instead of being silently ignored.
-          (!agent.paneKey && (rotating || handles.length <= 1)),
+          // A new tab still has to wait for work that cannot be attributed to a sibling.
+          (!agent.paneKey?.trim() && (rotating || missingTargetPane || handles.length <= 1)),
         )
         .some((agent) => agent.state !== 'done');
     const allAgentsBusy = (): boolean => !row.agents || row.agents.some((agent) => agent.state !== 'done');

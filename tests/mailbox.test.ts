@@ -13,8 +13,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   MailboxStore,
+  DEDUP_CAS_DUPLICATE_DETAIL,
   OutboxStore,
   WakeupRedriveService,
+  isUnknownEffectReceipt,
   normalizeMailboxId,
   resolveMailboxId,
   resolveBoundMailboxId,
@@ -452,6 +454,35 @@ test('slot obligations read outbox once and retain custody with partial or uncer
   outboxReads.mock.resetCalls();
   assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   assert.equal(outboxReads.mock.callCount(), 1);
+});
+
+test('uncertified signed rejections keep the outbound thread open', t => {
+  const { path, root } = workspace(t);
+  const store = new MailboxStore(path);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
+  for (const [id, evidence] of [
+    ['unannotated', {}],
+    ['nondurable-duplicate', {
+      detail: DEDUP_CAS_DUPLICATE_DETAIL,
+      executionReceipt: { executor: 'dedup-cas', executionId: 'duplicate', handoff: 'queued', durable: false },
+    }],
+    ['mismatched-signature', {
+      executionReceipt: { executor: 'gate', executionId: 'rejection', handoff: 'unattempted', envelopeSignature: 'another-envelope' },
+    }],
+  ] as const) {
+    const sessionMailboxId = `terminal:${id}`;
+    const request = envelope(id, {
+      signature: 'request-signature', semantic: { type: 'question', threadId: id, replyMailbox: sessionMailboxId },
+    });
+    const receipt: DeliveryReceipt = {
+      messageId: id, networkId: request.networkId, fromNodeId: 'bob', stage: 'rejected',
+      updatedAt: request.createdAt, signature: 'receipt-signature', ...evidence,
+    };
+    if (id !== 'mismatched-signature') assert.equal(isUnknownEffectReceipt(receipt), true);
+    outbox.enqueue({ envelope: request, explicitTargets: ['bob'], pendingNodeIds: [], failedReceipts: { bob: receipt } });
+    assert.equal(outbox.readDefinitivelyFailedKeys().has(netKey(request.networkId, id)), false);
+    assert.equal(store.inspectSlotObligations(waveSlot, { sessionMailboxId, outbox }).immediateBusyReason, 'outbound_thread_open');
+  }
 });
 
 test('an interrupted keyed claim owns its slot before its outbound thread is restored', t => {

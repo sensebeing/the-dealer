@@ -233,6 +233,57 @@ test('slot probe follows a closed terminal’s pane to its active child worktree
   assert.deepEqual(errors, []);
 });
 
+test('a vanished pane still gates workspace and Orca run readiness on its own work', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling', preview: '> human draft' };
+  const { runner, state } = fakeOrcaWorkspace(root, [sibling]);
+  const paneKey = 'vanished:root';
+  const terminalHandle = 'term-vanished';
+  const ownChild: FakeOrcaChild = {
+    path: join(root, 'own-child'), worktreeId: 'own-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: paneKey }],
+    terminals: [{ ...probeTerminal, handle: 'term-child' }],
+    lineage: { createdByTerminalHandle: terminalHandle },
+  };
+  state.children = [ownChild, {
+    path: join(root, 'sibling-child'), worktreeId: 'sibling-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'working', parentPaneKey: 'sibling:root' }],
+  }];
+  state.agents = [{ state: 'working', paneKey: 'sibling:root' }];
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-run', driverConfig: { workspacePath: root, paneKey, terminalHandle, runId: 'run-test' },
+  });
+  const { service, errors } = startSlotProbeService(t, store, request =>
+    request.args[0] === 'orchestration' && request.args[1] === 'worker-list'
+      ? Promise.resolve({ stdout: '{"ok":true,"result":{"workers":[]}}' })
+      : runner(request),
+  );
+  const workspaceIdle = () => checkOrcaWorkspaceIdle(runner, 'orca', root, undefined, {
+    targetPaneKey: paneKey, targetTerminalHandle: terminalHandle,
+  });
+  const assertBusy = async () => {
+    assert.equal((await workspaceIdle()).idle, false);
+    assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  };
+
+  await assertBusy();
+  ownChild.agents = [{ state: 'working', parentPaneKey: null }];
+  await assertBusy();
+  ownChild.agents = [{ state: 'done', parentPaneKey: null }];
+  state.agents.push({ state: 'working', paneKey });
+  await assertBusy();
+  state.agents.pop();
+  state.agents.push({ state: 'working' });
+  await assertBusy();
+  state.agents[1].state = 'done';
+  assert.equal((await workspaceIdle()).idle, true);
+  const slot = await service.probeSlot(probeMailbox);
+  assert.equal(slot.busy, false, slot.reason);
+  assert.equal(slot.ready, true, slot.reason);
+  assert.deepEqual(errors, []);
+});
+
 test('slot probe leaves an active sibling child alone when the leased terminal is gone without a pane', async t => {
   const { root, store, service, state } = slotProbeFixture(t, { wave: true });
   const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };

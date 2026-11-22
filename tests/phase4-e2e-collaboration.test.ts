@@ -234,12 +234,17 @@ test('Phase 4: polling, CAS dedup, durable busy waves and run-managed delivery a
     idempotencyKey: 'alert-0',
   });
   assert.equal(duplicate.receipts[0].stage, 'dispatched', 'sender replays its durable handoff');
-  // Bypass sender obligations explicitly to exercise the receiver CAS boundary too.
-  const wireDuplicate = await alice.emitter.emit({
-    ...input('bob', { executor: 'orca-wave', streamKey: 'alerts', revision: 1 }),
-    idempotencyKey: 'alert-0', queueIfOffline: false,
-  });
-  assert.equal(wireDuplicate.receipts[0].stage, 'rejected');
+  // Exercise receiver CAS independently of sender reconciliation by sending a fresh wire envelope.
+  const { envelope } = alice.outbox.get(duplicate.messageId)!;
+  const { privateKeyPem } = JSON.parse(readFileSync(join(root, 'alice', 'identity.json'), 'utf8'));
+  const wireEnvelope = signEnvelope({ ...envelope, id: 'alert-0-wire-duplicate' }, privateKeyPem);
+  const wireDuplicate = JSON.parse(Buffer.from(await alice.transport.sendUnicast(
+    envelope.networkId,
+    duplicate.receipts[0].fromNodeId,
+    Buffer.from(JSON.stringify({ type: 'message.envelope', envelope: wireEnvelope })),
+  )).toString('utf8'));
+  assert.equal(wireDuplicate.stage, 'rejected');
+  assert.equal(wireDuplicate.detail, DEDUP_CAS_DUPLICATE_DETAIL);
   assert.equal(bob.mailbox.list({ mailboxId: 'stream:alerts' }).queuedCount, 2);
 
   idle = true;
@@ -1065,8 +1070,12 @@ test('Phase 4: closed admission retains earlier DND custody and a keyed retry st
   assert.deepEqual(getObligation().deliveredReceipts[targetNodeId], first.receipts[0]);
   assert.deepEqual(getObligation().failedReceipts, {});
   assert.equal(isUnattemptedOutboxItem(getObligation()), false);
-  const retargeted = await alice.emitter.emit({ ...input('carol'), idempotencyKey: request.idempotencyKey, body: 'other node' });
+  const retargeted = await alice.emitter.emit({
+    ...input('carol'), idempotencyKey: request.idempotencyKey, body: 'other node', queueIfOffline: false,
+  });
   assert.equal(retargeted.messageId, first.messageId);
+  const broadcast = await alice.emitter.emit({ ...request, routing: { mode: 'broadcast' } });
+  assert.equal(broadcast.messageId, first.messageId);
   assert.deepEqual(bob.gate.listDndQueue(), [dnd]);
   assert.equal(carol.mailbox.list().totalCount, 0);
 
@@ -1076,6 +1085,27 @@ test('Phase 4: closed admission retains earlier DND custody and a keyed retry st
   assert.equal(getObligation().deliveredReceipts[targetNodeId].stage, 'dispatched');
   assert.equal(bob.mailbox.list().totalCount, 1);
   assert.equal(carol.mailbox.list().totalCount, 0);
+});
+
+test('Phase 4: a keyed gate rejection permits an online replacement but prevents broadcast', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'closed' } });
+  const carol = await node(t, root, 'carol', { patch: { defaultExecutor: 'inbox' } });
+  await connect(alice, bob, carol);
+  const request = { ...input('bob'), idempotencyKey: 'replace-without-queueing' };
+  const first = await alice.emitter.emit(request);
+  assert.equal(isUnattemptedOutboxItem(alice.outbox.get(first.messageId)), true);
+  await assert.rejects(
+    alice.emitter.emit({ ...request, routing: { mode: 'broadcast' } }),
+    /Keyed outbox obligation cannot route to broadcast/,
+  );
+  const replacement = await alice.emitter.emit({ ...input('carol'), idempotencyKey: request.idempotencyKey, queueIfOffline: false });
+  assert.equal(replacement.receipts[0].stage, 'dispatched');
+  assert.equal(alice.outbox.get(first.messageId)?.supersededById, replacement.messageId);
+  assert.equal(alice.outbox.get(replacement.messageId)?.status, 'delivered');
+  assert.deepEqual(carol.mailbox.list().items.map(item => item.id), [replacement.messageId]);
+  assert.equal(bob.mailbox.list().totalCount, 0);
 });
 
 test('Phase 4: approval custody stays open until approved or cancelled', async t => {

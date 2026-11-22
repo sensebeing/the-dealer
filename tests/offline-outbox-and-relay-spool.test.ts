@@ -1658,6 +1658,50 @@ test('unmounted network keeps outbox obligations queued through remount', async 
   await service.stop();
 });
 
+test('staged attachments survive a failed outbox settlement save and are removed after retry', t => {
+  const root = directory(t);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
+  const sender = generateNodeKeyPair();
+  const peer = generateNodeKeyPair();
+  const source = join(root, 'source.txt');
+  const body = Buffer.from('recoverable attachment');
+  const hash = blake3(body);
+  writeFileSync(source, body);
+  for (const mutation of ['enqueue', 'recordAttempt', 'markNodeDelivered'] as const) {
+    const envelope = signEnvelope({
+      ...envelopeFor(sender, NETWORK, peer.nodeId),
+      attachments: [{ name: 'source.txt', mimeType: 'text/plain', sizeBytes: body.length, blake3Hash: hash, ticket: `local:${hash}` }],
+    }, sender.privateKeyPem);
+    const input = { envelope, explicitTargets: [peer.nodeId], pendingNodeIds: [peer.nodeId] };
+    const item = outbox.enqueue({ ...input, filePaths: { [hash]: source } });
+    const staged = item.stagedFiles[hash];
+    const receipt = signReceipt({
+      messageId: envelope.id, networkId: envelope.networkId, fromNodeId: peer.nodeId,
+      stage: 'dispatched', updatedAt: envelope.createdAt,
+    }, peer.privateKeyPem);
+    const deliveredReceipts = { [peer.nodeId]: receipt };
+    const settle = () => {
+      if (mutation === 'enqueue') return outbox.enqueue({ ...input, deliveredReceipts });
+      if (mutation === 'recordAttempt') return outbox.recordAttempt(item.id, { deliveredReceipts, nextAttemptAt: item.nextAttemptAt });
+      return outbox.markNodeDelivered(item.id, peer.nodeId, receipt);
+    };
+    const save = t.mock.method(outbox as unknown as { save(state: unknown): void }, 'save', () => {
+      throw new Error('outbox save failed');
+    });
+    try {
+      assert.throws(settle, /outbox save failed/);
+      assert.equal(outbox.get(item.id)?.status, 'queued');
+      assert.equal(outbox.get(item.id)?.stagedFiles[hash], staged);
+      assert.deepEqual(readFileSync(staged), body);
+    } finally {
+      save.mock.restore();
+    }
+    assert.equal(settle()?.status, 'delivered');
+    assert.deepEqual(outbox.get(item.id)?.stagedFiles, {});
+    assert.equal(existsSync(staged), false);
+  }
+});
+
 test('durable outbox stages declared attachments from attachmentPaths across redrive', async t => {
   let online = false;
   const harness = await emitterHarness(t, {
@@ -4959,6 +5003,49 @@ for (const handoff of ['unattempted', 'unknown'] as const) {
     if (handoff === 'unattempted') assert.equal(harness.outbox.get(first.messageId)?.supersededById, retry.messageId);
   });
 }
+
+test('online-only keyed replacements retain approval or uncertain custody without offline queueing', async t => {
+  for (const outcome of ['approval', 'volatile', 'offline'] as const) {
+    const harness = await emitterHarness(t, {
+      extraMembers: ['carol'],
+      plan: target => {
+        if (target === harness.targetCard.nodeId) {
+          return { stage: 'rejected', executionReceipt: { handoff: 'unattempted' } };
+        }
+        if (outcome === 'approval') return { stage: 'pending_approval' };
+        if (outcome === 'volatile') return { stage: 'queued', executionReceipt: { durable: false } };
+        return { error: new PeerUnreachableError(target) };
+      },
+    });
+    const input: EmitMessageInput = {
+      networkId: harness.networkId, routing: { mode: 'unicast', targets: ['member:diz'] },
+      kind: 'wave', subject: 'wave', body: 'original', payload: {}, idempotencyKey: 'online-replacement',
+    };
+    const original = await harness.emitter.emit(input);
+    const emitReplacement = () => harness.emitter.emit({
+      ...input, routing: { mode: 'unicast', targets: ['member:carol'] }, body: 'replacement', queueIfOffline: false,
+    });
+    if (outcome === 'offline') {
+      await assert.rejects(emitReplacement(), isPeerUnreachableError);
+    } else {
+      const result = await emitReplacement();
+      assert.deepEqual(result.receipts.map(receipt => receipt.stage), [outcome === 'approval' ? 'pending_approval' : 'queued']);
+    }
+    const carol = harness.sendCalls[1].targetNodeId;
+    const active = harness.outbox.get(harness.outbox.get(original.messageId)!.supersededById!)!;
+    assert.equal(harness.sendCalls[1].opts?.spoolIfOffline, undefined);
+    assert.equal(isUnattemptedOutboxItem(active), false);
+    if (outcome === 'approval') {
+      assert.equal(active.status, 'queued');
+      assert.deepEqual(active.pendingNodeIds, [carol]);
+      assert.deepEqual(active.approvalPendingNodeIds, [carol]);
+    } else {
+      assert.equal(active.status, 'failed');
+      assert.deepEqual(active.pendingNodeIds, []);
+      assert.deepEqual(active.inDoubtNodeIds, [carol]);
+    }
+  }
+});
 
 test('a gate rejection after a timed-out send retains uncertainty and forbids replacement', async t => {
   const harness = await emitterHarness(t, {

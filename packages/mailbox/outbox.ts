@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import {
   committedOutboxTargets, envelopeClaimVersion, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
   isRetryablePreEffectReceipt, isUnattemptedOutboxItem, isUnknownEffectReceipt, outboxReconciliationTargets,
-  outstandingRelaySpooledTargets, sameEnvelopeIntent,
+  outstandingRelaySpooledTargets, receiptMatchesEnvelopeSignature, sameEnvelopeIntent,
 } from '../core-types/index.ts';
 import {
   copyFileAtomically,
@@ -96,6 +96,8 @@ interface OutboxFileState {
   schema: typeof OUTBOX_SCHEMA;
   items: OutboxItem[];
 }
+
+type ScheduleAttachmentCleanup = (id: string, files: Record<string, string> | undefined) => void;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -282,13 +284,21 @@ export class OutboxStore {
     writeFileAtomically(this.path, JSON.stringify(state));
   }
 
-  private mutate<T>(operation: (state: OutboxFileState) => T): T {
+  private mutate<T>(operation: (state: OutboxFileState, scheduleCleanup: ScheduleAttachmentCleanup) => T): T {
     return this.withFileLock(() => {
       const state = this.read();
-      const result = operation(state);
-      this.save(state);
-      return result;
+      return this.commitMutation(state, scheduleCleanup => operation(state, scheduleCleanup));
     });
+  }
+
+  private commitMutation<T>(state: OutboxFileState, operation: (scheduleCleanup: ScheduleAttachmentCleanup) => T): T {
+    const cleanup: { id: string; files: Record<string, string> }[] = [];
+    const result = operation((id, files) => {
+      if (files) cleanup.push({ id, files });
+    });
+    this.save(state);
+    for (const { id, files } of cleanup) this.removeStagedFiles(id, files);
+    return result;
   }
 
   private stageFiles(
@@ -326,9 +336,9 @@ export class OutboxStore {
   /**
    * One settlement rule for every mutation: delivered and terminal-failed targets leave the
    * pending set, a live obligation stays queued while any deliverable target remains, and
-   * staged evidence is deleted only after every target delivered.
+   * staged evidence can be deleted after final delivery has been persisted.
    */
-  private settleItem(item: OutboxItem): void {
+  private settleItem(item: OutboxItem): Record<string, string> | undefined {
     normalizeTargets(item);
     if (item.pendingNodeIds.length > 0) {
       item.status = 'queued';
@@ -343,8 +353,9 @@ export class OutboxStore {
       item.status = 'delivered';
       if (Object.keys(item.stagedFiles).length > 0 &&
           Object.values(item.deliveredReceipts).every(receipt => isConfirmedHandoffReceipt(receipt, { allowQueued: false }))) {
-        this.removeStagedFiles(item.id, item.stagedFiles);
+        const stagedFiles = item.stagedFiles;
         item.stagedFiles = {};
+        return stagedFiles;
       }
       return;
     }
@@ -360,7 +371,7 @@ export class OutboxStore {
     }
     const id = input.envelope.id;
     const now = new Date().toISOString();
-    return this.mutate(state => {
+    return this.mutate((state, scheduleCleanup) => {
       const index = state.items.findIndex(item => item.id === id);
       const existing = index >= 0 ? state.items[index] : undefined;
       if (!acceptsSettlement(existing, input.attemptToken)) {
@@ -419,7 +430,7 @@ export class OutboxStore {
       for (const nodeId of new Set([...(input.failedNodeIds ?? []), ...Object.keys(input.failedReceipts ?? {})])) {
         this.applyNodeFailure(item, nodeId, input.failedReceipts?.[nodeId]);
       }
-      this.settleItem(item);
+      scheduleCleanup(item.id, this.settleItem(item));
       if (input.sentCommitted === true || committedOutboxTargets(item).length > 0) item.sentCommitted = true;
       if (index >= 0) {
         state.items[index] = item;
@@ -435,14 +446,16 @@ export class OutboxStore {
     return item ? clone(item) : undefined;
   }
 
-  /** Failures with no remaining target, uncertain attempt, or confirmed delivery. */
+  /** Failures with no remaining custody and positive pre-effect evidence for signed outcomes. */
   readDefinitivelyFailedKeys(items: readonly OutboxItem[] = this.read().items): ReadonlySet<string> {
     const keys = new Set<string>();
     for (const item of items) {
       if (item.status === 'failed' && !hasActiveAttempt(item) && item.pendingNodeIds.length === 0 &&
         item.inDoubtNodeIds.length === 0 && item.relaySpooledNodeIds.length === 0 &&
         (item.approvalPendingNodeIds?.length ?? 0) === 0 && Object.keys(item.deliveredReceipts).length === 0 &&
-        !Object.values(item.failedReceipts).some(receipt => isUnknownEffectReceipt(receipt) || isRetainedApprovalReceipt(receipt))) {
+        Object.values(item.failedReceipts).every(receipt =>
+          isRetryablePreEffectReceipt(receipt) && receiptMatchesEnvelopeSignature(receipt, item.envelope.signature)
+        )) {
         keys.add(netKey(item.networkId, item.id));
       }
     }
@@ -598,15 +611,14 @@ export class OutboxStore {
   }
 
   private mutateAttempt<T>(
-    id: string, attemptToken: string | undefined, operation: (item: OutboxItem) => T,
+    id: string, attemptToken: string | undefined,
+    operation: (item: OutboxItem, scheduleCleanup: ScheduleAttachmentCleanup) => T,
   ): T | undefined {
     return this.withFileLock(() => {
       const state = this.read();
       const item = state.items.find(candidate => candidate.id === id);
       if (!item || !acceptsSettlement(item, attemptToken)) return undefined;
-      const result = operation(item);
-      this.save(state);
-      return result;
+      return this.commitMutation(state, scheduleCleanup => operation(item, scheduleCleanup));
     });
   }
 
@@ -684,7 +696,7 @@ export class OutboxStore {
       throw new Error('Invalid outbox target');
     }
     const now = new Date().toISOString();
-    return this.mutateAttempt(id, attemptToken, item => {
+    return this.mutateAttempt(id, attemptToken, (item, scheduleCleanup) => {
       this.applyNodeDelivery(item, nodeId, receipt);
       delete item.activeAttempt;
       item.updatedAt = now;
@@ -692,7 +704,7 @@ export class OutboxStore {
       if (item.failedNodeIds.length === 0) {
         item.lastError = undefined;
       }
-      this.settleItem(item);
+      scheduleCleanup(item.id, this.settleItem(item));
       return clone(item);
     });
   }
@@ -737,13 +749,13 @@ export class OutboxStore {
       throw new Error('Invalid outbox target');
     }
     const now = new Date().toISOString();
-    return this.mutateAttempt(id, attemptToken, item => {
+    return this.mutateAttempt(id, attemptToken, (item, scheduleCleanup) => {
       this.applyNodeFailure(item, nodeId, receipt);
       delete item.activeAttempt;
       item.lastError = lastError;
       item.updatedAt = now;
       item.nextAttemptAt = now;
-      this.settleItem(item);
+      scheduleCleanup(item.id, this.settleItem(item));
       return clone(item);
     });
   }
@@ -771,7 +783,7 @@ export class OutboxStore {
       throw new Error('Invalid outbox attempt schedule');
     }
     const now = new Date().toISOString();
-    return this.mutateAttempt(id, attemptToken, item => {
+    return this.mutateAttempt(id, attemptToken, (item, scheduleCleanup) => {
       for (const [nodeId, receipt] of Object.entries(update.deliveredReceipts ?? {})) {
         this.applyNodeDelivery(item, nodeId, receipt);
       }
@@ -804,7 +816,7 @@ export class OutboxStore {
       item.updatedAt = now;
       item.nextAttemptAt = update.nextAttemptAt;
       delete item.activeAttempt;
-      this.settleItem(item);
+      scheduleCleanup(item.id, this.settleItem(item));
       if (itemFailure !== undefined) item.status = 'failed';
       if (committedOutboxTargets(item).length > 0) item.sentCommitted = true;
       return clone(item);
