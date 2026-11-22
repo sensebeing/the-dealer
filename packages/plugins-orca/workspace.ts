@@ -304,6 +304,10 @@ export async function checkOrcaWorkspaceIdle(
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 /** Bounded `terminal wait --for tui-idle`; timeout, busy, or command failure is never idle. */
 export async function waitOrcaTerminalIdle(
   runner: CommandRunner,
@@ -315,7 +319,7 @@ export async function waitOrcaTerminalIdle(
   options?: OrcaProbeOptions,
 ): Promise<OrcaIdleResult> {
   try {
-    const waited = await checkedCommand(runner, {
+    const waited = await runner({
       command,
       args: [
         'terminal',
@@ -330,18 +334,42 @@ export async function waitOrcaTerminalIdle(
       ],
       cwd,
       signal,
+    }).catch((error: unknown) => {
+      // The real runner rejects nonzero exits; Orca may still have returned a structured timeout.
+      if (!isRecord(error) || typeof error.exitCode !== 'number' || typeof error.stdout !== 'string') throw error;
+      return {
+        stdout: error.stdout,
+        stderr: typeof error.stderr === 'string' ? error.stderr : undefined,
+        exitCode: error.exitCode,
+      };
     });
-    const response = JSON.parse(waited.stdout);
-    if (options?.throwOnProbeError && typeof response?.ok !== 'boolean') {
+    const stderr = waited.stderr?.trim();
+    let response: unknown;
+    try {
+      response = JSON.parse(waited.stdout);
+    } catch (error) {
+      const diagnostic = stderr || waited.stdout.trim();
+      if (diagnostic) throw new SyntaxError(`Invalid Orca terminal wait response: ${diagnostic}`, { cause: error });
+      throw error;
+    }
+    if (!isRecord(response) || typeof response.ok !== 'boolean') {
       throw new SyntaxError('Invalid Orca terminal wait response');
     }
-    if (response.ok !== true) {
-      return { idle: false, reason: 'Terminal is busy' };
+    const successfulExit = waited.exitCode === undefined || waited.exitCode === 0;
+    if (response.ok) {
+      if (!successfulExit) {
+        throw new Error(`${command} exited ${waited.exitCode}: ${stderr || waited.stdout.trim()}`);
+      }
+      return { idle: true };
     }
-    return { idle: true };
+    const detail = isRecord(response.error) ? response.error : undefined;
+    const code = typeof detail?.code === 'string' ? detail.code : undefined;
+    const isBoundedTimeout = response.error === undefined ? successfulExit : code === 'timeout';
+    if (isBoundedTimeout) return { idle: false, reason: 'Terminal is busy' };
+    const diagnostic = (typeof detail?.message === 'string' && detail.message.trim()) || stderr;
+    throw new Error([code, diagnostic].filter(Boolean).join(': ') || `Orca terminal wait failed (exit ${waited.exitCode ?? 'unknown'})`);
   } catch (error) {
-    // Orca may return a nonzero exit for the bounded idle timeout.
-    if (options?.throwOnProbeError && (error instanceof CommandNotStartedError || error instanceof SyntaxError)) throw error;
+    if (options?.throwOnProbeError) throw error;
     return {
       idle: false,
       reason: `Terminal idle wait failed: ${String(error)}`,
@@ -909,6 +937,25 @@ export async function setOrcaWorkspaceComment(
   }
 }
 
+export async function listOrcaWorkspaces(
+  runner: CommandRunner,
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<{ path?: unknown }[]> {
+  const listed = await checkedCommand(runner, {
+    command,
+    args: ['worktree', 'list', '--json'],
+    cwd: existsSync(cwd) ? cwd : undefined,
+    signal,
+  });
+  const raw = JSON.parse(listed.stdout);
+  const rows = raw?.result?.worktrees ?? raw?.worktrees ?? (Array.isArray(raw?.result) ? raw.result : undefined);
+  if (raw?.ok === false || !Array.isArray(rows) || raw?.result?.truncated)
+    throw new Error('Incomplete Orca workspace inventory');
+  return rows;
+}
+
 export async function ensureOrcaWorkspace(
   runner: CommandRunner,
   command: string,
@@ -922,16 +969,7 @@ export async function ensureOrcaWorkspace(
   },
 ): Promise<{ workspacePath: string; created: boolean }> {
   const cwd = options.repoRoot ?? dirname(options.workspacePath);
-  const listed = await checkedCommand(runner, {
-    command,
-    args: ['worktree', 'list', '--json'],
-    cwd: existsSync(cwd) ? cwd : undefined,
-    signal: options.signal,
-  });
-  const raw = JSON.parse(listed.stdout);
-  const rows = raw.result?.worktrees ?? raw.worktrees ?? (Array.isArray(raw.result) ? raw.result : undefined);
-  if (raw.ok === false || !Array.isArray(rows) || raw.result?.truncated)
-    throw new Error('Incomplete Orca workspace inventory');
+  const rows = await listOrcaWorkspaces(runner, command, cwd, options.signal);
   const canonical = (path: string): string => {
     const absolute = resolve(path);
     if (existsSync(absolute)) return realpathSync(absolute);
@@ -939,7 +977,7 @@ export async function ensureOrcaWorkspace(
     return parent === absolute ? absolute : join(canonical(parent), basename(absolute));
   };
   const found = rows.find(
-    (row) => typeof row.path === 'string' && canonical(row.path) === canonical(options.workspacePath),
+    (row): row is { path: string } => typeof row?.path === 'string' && canonical(row.path) === canonical(options.workspacePath),
   );
   if (found) return { workspacePath: found.path, created: false };
   if (!options.repoRoot)

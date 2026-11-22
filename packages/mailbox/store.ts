@@ -1803,6 +1803,7 @@ export class MailboxStore {
 
     const records = Object.values(state.threads);
     const settledThreads = new Set<string>();
+    const ownedOutboundMessages = new Set<string>();
     const inboundByThread = new Map<string, ThreadRouteRecord[]>();
     for (const record of records) {
       const key = netKey(record.networkId, record.threadId);
@@ -1817,6 +1818,8 @@ export class MailboxStore {
         const inbound = inboundByThread.get(key) ?? [];
         inbound.push(record);
         inboundByThread.set(key, inbound);
+      } else if (ownedMailboxes.has(record.envelope?.semantic?.replyMailbox ?? record.localMailbox)) {
+        ownedOutboundMessages.add(netKey(record.networkId, record.messageId));
       }
     }
 
@@ -1832,21 +1835,28 @@ export class MailboxStore {
       const threadKey = netKey(record.networkId, record.threadId);
       if (selfInboundMessages.has(messageKey) || settledThreads.has(threadKey)) continue;
       const replyMailbox = semantic?.replyMailbox ?? record.localMailbox;
-      const belongsToSlot = activeSince !== undefined
-        ? record.createdAt >= activeSince && ownedMailboxes.has(replyMailbox)
-        : semantic?.type === 'question' && postAckMailboxes.has(replyMailbox);
-      if (!belongsToSlot) continue;
+      const isOwnedQuestion = semantic?.type === 'question' && postAckMailboxes.has(replyMailbox);
+      const isActiveWaveOutbound = activeSince !== undefined && record.createdAt >= activeSince && ownedMailboxes.has(replyMailbox);
+      if (!isOwnedQuestion && !isActiveWaveOutbound) continue;
+      if (localUnackedMessages.has(messageKey)) {
+        return { hasPendingWave, immediateBusyReason: 'local_outbound_pending' };
+      }
+
       const answered = inboundByThread.get(threadKey)?.some(inbound => {
-        if (inbound.messageId === record.messageId || inbound.envelope?.semantic?.type !== 'reply') return false;
+        // The candidate's reply mailbox already belongs to this slot or its session.
+        if (inbound.messageId === record.messageId ||
+          inbound.envelope?.semantic?.type !== 'reply' ||
+          ownedOutboundMessages.has(netKey(inbound.networkId, inbound.messageId)) ||
+          !ownedMailboxes.has(inbound.localMailbox)) return false;
         const replyToId = inbound.envelope.replyToId;
-        // The message a follow-up asks about cannot answer it, even on the same clock tick.
-        return replyToId === record.messageId ||
-          (inbound.messageId !== record.envelope?.replyToId &&
-            (replyToId === undefined || replyToId === record.threadId) && inbound.createdAt >= record.createdAt);
+        if (replyToId === record.messageId) return true;
+        // Only an unaddressed reply can fall back to thread and time correlation.
+        return replyToId === undefined && inbound.messageId !== record.envelope?.replyToId &&
+          inbound.createdAt >= record.createdAt;
       });
       if (answered) continue;
 
-      if (localUnackedThreads.has(threadKey) || localUnackedMessages.has(messageKey)) {
+      if (localUnackedThreads.has(threadKey)) {
         return { hasPendingWave, immediateBusyReason: 'local_outbound_pending' };
       }
       remoteMessageKeys.push(messageKey);

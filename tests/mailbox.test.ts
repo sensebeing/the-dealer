@@ -20,6 +20,7 @@ import {
   resolveBoundMailboxId,
 } from '../packages/index.ts';
 import type { DeliveryReceipt, MessageEnvelope } from '../packages/index.ts';
+import { netKey } from '../packages/mailbox/network-key.ts';
 
 function envelope(id: string, patch: Partial<MessageEnvelope> = {}): MessageEnvelope {
   return {
@@ -184,13 +185,106 @@ test('a reply to one question leaves the next question on the same thread open',
   ask('q2');
   assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
   t.mock.timers.tick(1);
-  store.recordInboundEnvelope(envelope('thread-answer', {
+  store.recordInboundEnvelope(envelope('root-progress', {
     replyToId: 'conversation', semantic: { type: 'reply', threadId: 'conversation' },
+  }), slotSession, { committed: false });
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  store.recordInboundEnvelope(envelope('thread-answer', {
+    semantic: { type: 'reply', threadId: 'conversation' },
   }), slotSession, { committed: false });
   assert.equal(inspect().immediateBusyReason, undefined);
   t.mock.timers.tick(1);
   ask('q3');
   assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+});
+
+test('older unanswered questions survive newer leased mail on fixed and rotating slots', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
+  const store = new MailboxStore(workspace(t).path);
+  for (const { mailboxId, sessionMailboxId } of [
+    { mailboxId: 'stream:fixed', sessionMailboxId: undefined },
+    { mailboxId: waveSlot, sessionMailboxId: slotSession },
+  ]) {
+    if (sessionMailboxId) store.upsertWakeTarget(mailboxId, { rotateAfterWaves: 1 });
+    const questionId = `question-${mailboxId}`;
+    const replyMailbox = sessionMailboxId ?? mailboxId;
+    store.recordOutboundEnvelope(envelope(questionId, {
+      semantic: { type: 'question', threadId: questionId, replyMailbox },
+    }), ['remote'], replyMailbox);
+    t.mock.timers.tick(1);
+    store.enqueue([envelope(`new-wave-${mailboxId}`)], { mailboxId });
+    store.check({ mailboxId });
+    assert.deepEqual(store.inspectSlotObligations(mailboxId, { sessionMailboxId }), {
+      hasPendingWave: true, immediateBusyReason: 'outbound_thread_open',
+    });
+  }
+});
+
+test('slot obligations only accept peer replies received by the slot or its session', t => {
+  const store = new MailboxStore(workspace(t).path);
+  const coordinator = 'stream:coordinator';
+  const inspect = () => store.inspectSlotObligations(waveSlot, { sessionMailboxId: slotSession });
+  store.enqueue([envelope('root')], { mailboxId: waveSlot });
+  store.recordOutboundEnvelope(envelope('child-question', {
+    replyToId: 'root', semantic: { type: 'question', threadId: 'root', replyMailbox: slotSession },
+  }), ['peer'], slotSession);
+  const progress = envelope('progress', {
+    replyToId: 'root',
+    semantic: { type: 'reply', threadId: 'root', replyMailbox: slotSession, targetMailbox: coordinator },
+  });
+  store.recordOutboundEnvelope(progress, [progress.from.nodeId], slotSession);
+  store.enqueue([progress], { mailboxId: coordinator });
+  store.ack(store.check({ mailboxId: coordinator }).deliveryId!, coordinator);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+
+  store.recordInboundEnvelope(envelope('misrouted-answer', {
+    replyToId: 'child-question', semantic: { type: 'reply', threadId: 'root' },
+  }), coordinator);
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  const selfAnswer = envelope('self-answer', {
+    replyToId: 'child-question', semantic: { type: 'reply', threadId: 'root', replyMailbox: slotSession },
+  });
+  store.recordOutboundEnvelope(selfAnswer, [selfAnswer.from.nodeId], slotSession);
+  store.recordInboundEnvelope(selfAnswer, slotSession, { committed: false });
+  assert.equal(inspect().immediateBusyReason, 'outbound_thread_open');
+  store.recordInboundEnvelope(envelope('delivered-answer', {
+    replyToId: 'child-question', semantic: { type: 'reply', threadId: 'root' },
+  }), slotSession, { committed: false });
+  assert.equal(inspect().immediateBusyReason, undefined);
+});
+
+test('an answer cannot discharge unacknowledged custody of the downstream message itself', t => {
+  const store = new MailboxStore(workspace(t).path);
+  const downstream = 'stream:downstream';
+  const question = envelope('local-question', {
+    semantic: { type: 'question', threadId: 'local-question', replyMailbox: waveSlot, targetMailbox: downstream },
+  });
+  store.recordOutboundEnvelope(question, [question.from.nodeId], waveSlot);
+  store.enqueue([question], { mailboxId: downstream });
+  store.recordInboundEnvelope(envelope('early-answer', {
+    replyToId: question.id, semantic: { type: 'reply', threadId: question.id },
+  }), waveSlot, { committed: false });
+  assert.equal(store.inspectSlotObligations(waveSlot).immediateBusyReason, 'local_outbound_pending');
+  store.ack(store.check({ mailboxId: downstream }).deliveryId!, downstream);
+  assert.equal(store.inspectSlotObligations(waveSlot).immediateBusyReason, undefined);
+});
+
+test('delimiter-containing network and message identities stay distinct in mailbox and outbox lookups', t => {
+  const { path, root } = workspace(t);
+  const store = new MailboxStore(path);
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
+  const first = envelope('b\0c', {
+    networkId: 'a', semantic: { type: 'question', threadId: 'b\0c', replyMailbox: waveSlot },
+  });
+  const second = envelope('c', {
+    networkId: 'a\0b', semantic: { type: 'question', threadId: 'c', replyMailbox: waveSlot },
+  });
+  outbox.enqueue({ envelope: first, explicitTargets: [], pendingNodeIds: [] });
+  outbox.markFailed(first.id, 'No effect');
+  store.recordOutboundEnvelope(second, ['remote'], waveSlot);
+  assert.equal(store.inspectSlotObligations(waveSlot, { outbox }).immediateBusyReason, 'outbound_thread_open');
+  assert.notEqual(netKey(first.networkId, first.id), netKey(second.networkId, second.id));
+  assert.deepEqual([...outbox.readDefinitivelyFailedKeys()], [netKey(first.networkId, first.id)]);
 });
 
 test('answering and acknowledging a peer clarification leaves the original question open', t => {

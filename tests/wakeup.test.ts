@@ -9,7 +9,7 @@ import { CommandNotStartedError, runCommand } from '../packages/subprocess/index
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -172,13 +172,17 @@ function slotProbeFixture(t: TestContext, options: { wave?: boolean; paneKey?: s
     rotateAfterWaves: 1,
     driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle, paneKey: options.paneKey },
   });
+  return { root, store, ...orca, ...startSlotProbeService(t, store, orca.runner) };
+}
+
+function startSlotProbeService(t: TestContext, store: MailboxStore, commandRunner: CommandRunner) {
   const errors: unknown[] = [];
   const service = new WakeupRedriveService({
-    store, drivers: createTestWakeupDrivers({ commandRunner: orca.runner }),
+    store, drivers: createTestWakeupDrivers({ commandRunner }),
     flushIntervalMs: 100_000, onError: error => errors.push(error),
   });
   t.after(() => service.stop());
-  return { root, store, service, ...orca, errors };
+  return { service, errors };
 }
 
 test('slot probe uses agent state, the composer draft and TUI-idle for a leased wave', async t => {
@@ -341,6 +345,135 @@ test('an Orca run is busy with a leased wave and an outbound question even witho
     busy: true, ready: false, reason: 'outbound_thread_open',
   });
   assert.deepEqual(state.calls, []);
+});
+
+test('Orca run readiness requires inactive workers and an observed idle coordinator', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const runId = 'run-probe';
+  let workers = [{ state: 'ready', outcome: 'in_progress' }];
+  let activeWorkerOnNextPage = true;
+  let coordinatorHandle: string | undefined = probeTerminal.handle;
+  let waitOk = true;
+  const { service, errors } = startSlotProbeService(t, store, async request => {
+    const [surface, action] = request.args;
+    if (surface === 'orchestration' && action === 'worker-list') {
+      const base = ['orchestration', 'worker-list', '--run', runId];
+      if (activeWorkerOnNextPage && !request.args.includes('--cursor')) {
+        assert.deepEqual(request.args, [...base, '--json']);
+        return { stdout: '{"ok":true,"result":{"workers":[{"state":"succeeded"}],"nextCursor":"next"}}' };
+      }
+      assert.deepEqual(request.args, [...base, ...(activeWorkerOnNextPage ? ['--cursor', 'next'] : []), '--json']);
+      return { stdout: JSON.stringify({ ok: true, result: { workers } }) };
+    }
+    if (surface === 'orchestration' && action === 'run-show') {
+      assert.deepEqual(request.args, ['orchestration', 'run-show', '--id', runId, '--full', '--json']);
+      return { stdout: JSON.stringify({ ok: true, result: { run: { coordinator_handle: coordinatorHandle } } }) };
+    }
+    assert.equal(surface, 'terminal');
+    assert.ok(request.args.includes(probeTerminal.handle));
+    if (action === 'show') return { stdout: JSON.stringify({ ok: true, result: { terminal: probeTerminal } }) };
+    assert.equal(action, 'wait');
+    return { stdout: JSON.stringify({ ok: waitOk }) };
+  });
+  store.upsertWakeTarget(probeMailbox, { driver: 'orca-run' });
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'orca-run target requires runId',
+  });
+  store.upsertWakeTarget(probeMailbox, { driverConfig: { runId } });
+  const claim = service.claim(probeMailbox);
+  store.enqueue([alert('run-wave')], { mailboxId: probeMailbox });
+  const lease = store.check({ mailboxId: probeMailbox });
+  store.completeWakeDelivery(probeMailbox, lease.items[0].sequence);
+  claim.dispose();
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Orca run has active workers',
+  });
+  store.ack(lease.deliveryId!, probeMailbox);
+  assert.equal((await service.probeSlot(probeMailbox)).reason, 'Orca run has active workers');
+
+  workers = [{ state: 'succeeded', outcome: 'succeeded' }];
+  activeWorkerOnNextPage = false;
+  waitOk = false;
+  assert.match((await service.probeSlot(probeMailbox)).reason!, /Terminal is busy/);
+  coordinatorHandle = undefined;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: true, ready: false, reason: 'Orca run coordinator activity is unobservable',
+  });
+  coordinatorHandle = probeTerminal.handle;
+  waitOk = true;
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.deepEqual(errors, []);
+});
+
+test('an empty auto-create slot checks workspace provisioning without creating it', async t => {
+  const repoRoot = directory(t);
+  const workspacePath = join(repoRoot, 'missing-workspace');
+  const store = new MailboxStore(join(repoRoot, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const { service, errors } = startSlotProbeService(t, store, async request => {
+    calls.push(request);
+    assert.equal(request.args[0], 'worktree');
+    assert.ok(['ps', 'list'].includes(request.args[1]));
+    return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
+  });
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-terminal', driverConfig: { workspacePath, autoCreateWorkspace: true, repoRoot },
+  });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.deepEqual(calls.map(call => call.args[1]), ['ps', 'list']);
+  assert.equal(calls[1].cwd, repoRoot);
+  assert.equal(existsSync(workspacePath), false);
+  assert.deepEqual(errors, []);
+
+  store.upsertWakeTarget(probeMailbox, { driverConfig: { repoRoot: undefined } });
+  const failed = await service.probeSlot(probeMailbox);
+  assert.equal(failed.busy, true);
+  assert.equal(failed.ready, false);
+  assert.match(failed.reason!, /requires a receiver-local repoRoot/);
+  assert.equal(errors.length, 1);
+});
+
+test('terminal wait timeouts are busy observations and server failures retain their diagnostics', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const terminalMailbox = `terminal:${probeTerminal.handle}`;
+  store.upsertWakeTarget(terminalMailbox, {
+    driver: 'orca-terminal', driverConfig: { terminalHandle: probeTerminal.handle },
+  });
+  let waitResult: Awaited<ReturnType<CommandRunner>> = {
+    stdout: '{"ok":false,"error":{"code":"timeout","message":"timeout"}}', exitCode: 1,
+  };
+  let rejectWait = false;
+  const { service, errors } = startSlotProbeService(t, store, async request => {
+    if (request.args[1] === 'show') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: probeTerminal } }) };
+    }
+    assert.equal(request.args[1], 'wait');
+    if (rejectWait) throw Object.assign(new Error(waitResult.stderr || waitResult.stdout), waitResult);
+    return waitResult;
+  });
+  for (const rejectsOnExit of [false, true]) {
+    rejectWait = rejectsOnExit;
+    const timeout = await service.probeSlot(terminalMailbox);
+    assert.equal(timeout.busy, true);
+    assert.equal(timeout.ready, false);
+    assert.match(timeout.reason!, /Terminal is busy/);
+    assert.deepEqual(errors, []);
+  }
+
+  const failures = [
+    { result: { stdout: '{"ok":false,"error":{"code":"runtime_unavailable","message":"Orca daemon unreachable"}}', exitCode: 1 }, diagnostic: 'Orca daemon unreachable' },
+    { result: { stdout: '', stderr: 'connection refused', exitCode: 1 }, diagnostic: 'connection refused' },
+  ];
+  rejectWait = false;
+  for (const { result, diagnostic } of failures) {
+    waitResult = result;
+    const failed = await service.probeSlot(terminalMailbox);
+    assert.equal(failed.busy, true);
+    assert.equal(failed.ready, false);
+    assert.ok(failed.reason?.includes(diagnostic), failed.reason);
+    assert.ok(String(errors.at(-1)).includes(diagnostic));
+  }
+  assert.equal(errors.length, failures.length);
 });
 
 test('an empty rotating slot is ready when its retired terminal is idle or gone', async t => {
