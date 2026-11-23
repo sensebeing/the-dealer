@@ -104,15 +104,11 @@ function reusableTerminalCandidates(
 }
 
 /**
- * Authoritative recursive idle inspection: every workspace in the root's subtree must report no
- * unverifiable terminals, every agent must be done with at least as many connected terminals as
- * agents, and every terminal the wakeup could write into must be connected, writable and free of
- * an unsent composer draft. When a fresh session tab will receive the pointer, retained tabs in
- * the root workspace neither block the wakeup nor mark the composer prefilled; only a rotation's
- * retiring terminal gates the replacement, through its own agent and child worktrees. Synthetic
- * inventories are confirmed with `terminal wait`. A `> ` composer line is treated as an empty
- * Antigravity composer only when it matches the exact mode-placeholder vocabulary and Orca's
- * readiness probe also reports idle; every other `> ` line stays busy as an unsent human draft.
+ * Root terminals eligible for pointer injection must be connected, writable, have an empty
+ * composer and pass `tui-idle` when an agent is present or the preview is unavailable. A
+ * fresh tab has its own composer, and rotation checks the retiring slot's execution activity.
+ * Non-excluded descendant worktrees prove execution quiescence with complete agent and
+ * terminal inventories, no unverifiable terminals, done agents and connected terminal coverage.
  */
 export async function checkOrcaWorkspaceIdle(
   runner: CommandRunner,
@@ -159,7 +155,7 @@ export async function checkOrcaWorkspaceIdle(
   const slotScoped = options?.targetTerminalHandle !== undefined || Boolean(
     options?.targetPaneKey?.trim() || options?.retiringTerminalHandle?.trim() || options?.retiringPaneKey?.trim(),
   );
-  const visited = new Set<string>();
+  const visited = new Set<string>([root.worktreeId]);
   const terminalInventories = new Map<string, Promise<OrcaTerminalRow[] | undefined>>();
   const terminalHandlesByWorktreeId = new Map<string, ReadonlySet<string>>();
   const fetchWorktreeTerminals = async (row: Workspace): Promise<OrcaTerminalRow[] | undefined> => {
@@ -206,7 +202,7 @@ export async function checkOrcaWorkspaceIdle(
     visit(root);
     return descendants;
   };
-  const idleTree = async (row: Workspace): Promise<boolean> => {
+  const isDescendantQuiescent = async (row: Workspace): Promise<boolean> => {
     if (visited.has(row.worktreeId)) return false;
     visited.add(row.worktreeId);
     const handles = await readWorktreeTerminals(row);
@@ -214,227 +210,231 @@ export async function checkOrcaWorkspaceIdle(
       if (options?.throwOnProbeError) throw new Error('Incomplete Orca terminal inventory');
       return false;
     }
-    const isRoot = row.path === cwd;
-    // Ownership limits the root tab selection; a relevant descendant still has to prove readiness.
-    const canUse = (terminal: OrcaTerminalRow) => !isRoot || !options?.excludedHandles?.has(String(terminal.handle));
-    const eligibleHandles = handles.filter(canUse);
-    // A rotation opens a brand-new tab, so only the slot it retires can gate it.
-    const rotating = isRoot && options?.targetTerminalHandle === null;
-    const retiringHandle = options?.retiringTerminalHandle?.trim();
-    const targetTerm = isRoot
-      ? rotating
-        ? (retiringHandle
-            ? eligibleHandles.find(t => String(t.handle) === retiringHandle)
-            : undefined) ?? eligibleHandles.find(t => matchesPane(t, options?.retiringPaneKey))
-        : eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
-          ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey))
-      : undefined;
-    const explicitTargetPaneKey = isRoot && !rotating ? options?.targetPaneKey?.trim() : undefined;
-    const missingTargetPane = Boolean(explicitTargetPaneKey && !targetTerm);
-    const targetPaneKeys = new Set(targetTerm ? terminalPaneKeys(targetTerm) : []);
-    if (explicitTargetPaneKey) targetPaneKeys.add(explicitTargetPaneKey);
-    if (rotating && options?.retiringPaneKey?.trim()) targetPaneKeys.add(options.retiringPaneKey.trim());
-    const ownHandle = rotating ? retiringHandle : targetTerm
-      ? String(targetTerm.handle)
-      : typeof options?.targetTerminalHandle === 'string' ? options.targetTerminalHandle.trim() : undefined;
-    const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
-    const eligibleObservableHandles = observableHandles.filter(canUse);
-    const rootTarget = isRoot
-      ? rotating || missingTargetPane
-        ? null
-        : targetTerm
-          ? String(targetTerm.handle)
-          : options?.targetTerminalHandle
-      : undefined;
-    const targetPresent =
-      typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
-    const reuseHandles =
-      typeof rootTarget === 'string' && !targetPresent
-        ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
-        : undefined;
-    const siblingTerminals = isRoot && slotScoped
-      ? handles.filter(terminal =>
-        isUsableTerminal(terminal) && terminal !== targetTerm &&
-        String(terminal.handle) !== ownHandle && String(terminal.handle) !== retiringHandle &&
-        !reuseHandles?.has(String(terminal.handle)) &&
-        !terminalPaneKeys(terminal).some(key => targetPaneKeys.has(key)),
-      )
-      : [];
-    const siblingHandles = new Set(siblingTerminals.map(terminal => String(terminal.handle)));
-    const knownSiblingPaneKeys = new Set(siblingTerminals.flatMap(terminalPaneKeys));
-    const allowedSiblingHandle = (handle: string | undefined): handle is string =>
-      Boolean(handle && handle !== ownHandle && handle !== retiringHandle && !reuseHandles?.has(handle));
-    const canExcludeByLineage = siblingHandles.size > 0 ||
-      [...(options?.excludedHandles ?? [])].some(allowedSiblingHandle);
     const agents = row.agents;
     if (!Array.isArray(agents)) return false;
-    const ownedAgentsBusy = (): boolean =>
-      agents
-        .filter((agent) =>
-          (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) ||
-          // A new tab still has to wait for work that cannot be attributed to a sibling.
-          (!agent.paneKey?.trim() && (rotating || missingTargetPane || handles.length <= 1)),
-        )
-        .some((agent) => agent.state !== 'done');
-    const allAgentsBusy = (): boolean => agents.some((agent) => agent.state !== 'done');
-    if (targetPaneKeys.size > 0) {
-      if (ownedAgentsBusy()) return false;
-    } else if (rotating) {
-      // A rotation waits only for the retiring slot's own agent; retained and unverifiable tabs
-      // never block opening a new session tab. A retiring terminal that cannot be pane-attributed
-      // fails closed instead of guessing; its child worktrees are still inspected below.
-      if (targetTerm
-        ? allAgentsBusy()
-        : agents.some(agent =>
-          agent.state !== 'done' && !(typeof agent.paneKey === 'string' && knownSiblingPaneKeys.has(agent.paneKey)),
-        )
-      ) {
-        return false;
-      }
-    } else if (row.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
-      return false;
-    }
-    // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
-    if (
-      !rotating &&
-      targetPaneKeys.size === 0 &&
-      observableHandles.filter((t) => Boolean(t.connected)).length < (row.agents?.length ?? 0)
-    ) {
-      return false;
-    }
-    // Liveness and composer state only matter for terminals this wakeup may actually write into:
-    // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
-    // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
-    // rebind could reuse when it was closed). A rotation never inspects the retiring composer:
-    // an unsent human draft there must not keep the replacement tab from opening.
-    const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
-      if (!isRoot) return true;
-      if (rootTarget === null) return false;
-      if (rootTarget === undefined) return true;
-      if (String(terminal.handle) === rootTarget) return true;
-      // The bound terminal was closed: only the terminals a rebind could reuse are inspected.
-      return reuseHandles?.has(String(terminal.handle)) === true;
-    };
-    for (const terminal of eligibleObservableHandles) {
-      if (!gatesWakeup(terminal)) {
-        continue;
-      }
-      if (!terminal.connected || !terminal.writable) {
-        return false;
-      }
-      if (
-        typeof terminal.preview === 'string' &&
-        !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
-      )
-        return false;
-      // A recognized agent (or inventory without preview metadata) needs authoritative TUI readiness.
-      // A bare shell has no agent TUI yet; its workspace proof permits only the bootstrap path.
-      if (
-        (terminal.agentIdentity || typeof terminal.preview !== 'string') &&
-        !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal, options)).idle
-      ) return false;
-    }
-    const siblingAttribution = (node: Workspace): 'pane' | 'creator' | undefined => {
-      if (!Array.isArray(node.agents)) return undefined;
-      let allAgentsExplicitlyAttributed = node.agents.length > 0;
-      for (const agent of node.agents) {
-        const pane = typeof agent.parentPaneKey === 'string' ? agent.parentPaneKey.trim() : '';
-        if (!pane) {
-          allAgentsExplicitlyAttributed = false;
-          continue;
-        }
-        // Explicit dispatch provenance takes precedence over creator lineage.
-        const siblingPane = targetPaneKeys.size > 0 ? !targetPaneKeys.has(pane) : knownSiblingPaneKeys.has(pane);
-        if (!siblingPane) return undefined;
-      }
-      const paneAttributedWithSingleTerminal = allAgentsExplicitlyAttributed && targetPaneKeys.size > 0 && handles.length <= 1;
-      if (!paneAttributedWithSingleTerminal && node.unverifiableTerminalCount !== 0) return undefined;
-      return allAgentsExplicitlyAttributed ? 'pane' : 'creator';
-    };
-    // Return the worktrees that still need creator proof, or undefined if any node
-    // in the subtree cannot be attributed to a sibling.
-    const siblingLineageCandidates = (subtree: Workspace): Workspace[] | undefined => {
-      const candidates: Workspace[] = [];
-      const seen = new Set<string>();
-      const visit = (node: Workspace): boolean => {
-        if (seen.has(node.worktreeId)) return false;
-        seen.add(node.worktreeId);
-        const attribution = siblingAttribution(node);
-        if (!attribution) return false;
-        if (attribution === 'creator') candidates.push(node);
-        for (const id of node.childWorktreeIds ?? []) {
-          const descendant = rowsById.get(id);
-          if (!descendant || !visit(descendant)) return false;
-        }
-        return true;
-      };
-      return visit(subtree) ? candidates : undefined;
-    };
-    let childCreators: Map<string, string> | undefined;
-    let ownerByTerminalHandle: Promise<Map<string, Workspace | null>> | undefined;
-    const siblingProofMemo = new Map<string, boolean>();
-    const indexDescendantTerminalOwners = async (): Promise<Map<string, Workspace | null>> => {
-      const owners = new Map<string, Workspace | null>();
-      for (const descendant of descendantsOfRoot()) {
-        if (!siblingAttribution(descendant)) continue;
-        for (const handle of await readWorktreeTerminalHandles(descendant)) {
-          owners.set(handle, owners.has(handle) ? null : descendant);
-        }
-      }
-      return owners;
-    };
-    const isWorktreeProvenSibling = async (node: Workspace, visiting = new Set<string>()): Promise<boolean> => {
-      const id = node.worktreeId;
-      const cached = siblingProofMemo.get(id);
-      if (cached !== undefined) return cached;
-      const remember = (result: boolean): boolean => {
-        siblingProofMemo.set(id, result);
-        return result;
-      };
-      if (visiting.has(id)) return remember(false);
-      const attribution = siblingAttribution(node);
-      if (!attribution) return remember(false);
-      if (attribution === 'pane') return remember(true);
-      const creator = childCreators?.get(id);
-      if (!allowedSiblingHandle(creator)) return remember(false);
-      if (siblingHandles.has(creator) || options?.excludedHandles?.has(creator)) return remember(true);
-      const owners = await (ownerByTerminalHandle ??= indexDescendantTerminalOwners());
-      const owner = owners.get(creator);
-      if (!owner || owner.worktreeId === id) return remember(false);
-      // A unique owner is the only next edge, so this walk can share one visiting set.
-      visiting.add(id);
-      return remember(await isWorktreeProvenSibling(owner, visiting));
-    };
+    if (row.unverifiableTerminalCount !== 0 || agents.some(agent => agent.state !== 'done')) return false;
+    const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
+    if (observableHandles.filter(t => Boolean(t.connected)).length < agents.length) return false;
     for (const id of row.childWorktreeIds ?? []) {
       const child = rowsById.get(id);
-      if (!child) return false;
-      const lineageCandidates = isRoot && slotScoped ? siblingLineageCandidates(child) : undefined;
-      if (lineageCandidates?.length === 0) continue;
-      if (await idleTree(child)) continue;
-      if (canExcludeByLineage && lineageCandidates) {
-        try {
-          childCreators ??= await readOrcaChildCreators(runner, command, cwd, signal);
-          let proven = true;
-          for (const candidate of lineageCandidates) {
-            if (await isWorktreeProvenSibling(candidate)) continue;
-            proven = false;
-            break;
-          }
-          if (proven) continue;
-        } catch (error) {
-          if (options?.throwOnProbeError) throw error;
-          return false;
-        }
-      }
-      return false;
+      if (!child || !(await isDescendantQuiescent(child))) return false;
     }
     return true;
   };
-  const idle = await idleTree(root);
-  return {
-    idle,
-    reason: idle ? undefined : 'Workspace or descendant is busy or unverifiable',
+
+  const notIdle = (): OrcaIdleResult => ({ idle: false, reason: 'Workspace or descendant is busy or unverifiable' });
+  const handles = await readWorktreeTerminals(root);
+  if (!handles) {
+    if (options?.throwOnProbeError) throw new Error('Incomplete Orca terminal inventory');
+    return notIdle();
+  }
+  const canUse = (terminal: OrcaTerminalRow) => !options?.excludedHandles?.has(String(terminal.handle));
+  const eligibleHandles = handles.filter(canUse);
+  // A rotation opens a brand-new tab, so only the slot it retires can gate it.
+  const rotating = options?.targetTerminalHandle === null;
+  const retiringHandle = options?.retiringTerminalHandle?.trim();
+  const targetTerm = rotating
+    ? (retiringHandle
+        ? eligibleHandles.find(t => String(t.handle) === retiringHandle)
+        : undefined) ?? eligibleHandles.find(t => matchesPane(t, options?.retiringPaneKey))
+    : eligibleHandles.find(t => typeof options?.targetTerminalHandle === 'string' && String(t.handle) === options.targetTerminalHandle)
+      ?? eligibleHandles.find(t => matchesPane(t, options?.targetPaneKey));
+  const explicitTargetPaneKey = rotating ? undefined : options?.targetPaneKey?.trim();
+  const missingTargetPane = Boolean(explicitTargetPaneKey && !targetTerm);
+  const targetPaneKeys = new Set(targetTerm ? terminalPaneKeys(targetTerm) : []);
+  if (explicitTargetPaneKey) targetPaneKeys.add(explicitTargetPaneKey);
+  if (rotating && options?.retiringPaneKey?.trim()) targetPaneKeys.add(options.retiringPaneKey.trim());
+  const ownHandle = rotating ? retiringHandle : targetTerm
+    ? String(targetTerm.handle)
+    : typeof options?.targetTerminalHandle === 'string' ? options.targetTerminalHandle.trim() : undefined;
+  const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
+  const eligibleObservableHandles = observableHandles.filter(canUse);
+  const rootTarget = rotating || missingTargetPane
+    ? null
+    : targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle;
+  const targetPresent =
+    typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
+  const reuseHandles =
+    typeof rootTarget === 'string' && !targetPresent
+      ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
+      : undefined;
+  const siblingTerminals = slotScoped
+    ? handles.filter(terminal =>
+      isUsableTerminal(terminal) && terminal !== targetTerm &&
+      String(terminal.handle) !== ownHandle && String(terminal.handle) !== retiringHandle &&
+      !reuseHandles?.has(String(terminal.handle)) &&
+      !terminalPaneKeys(terminal).some(key => targetPaneKeys.has(key)),
+    )
+    : [];
+  const siblingHandles = new Set(siblingTerminals.map(terminal => String(terminal.handle)));
+  const knownSiblingPaneKeys = new Set(siblingTerminals.flatMap(terminalPaneKeys));
+  const allowedSiblingHandle = (handle: string | undefined): handle is string =>
+    Boolean(handle && handle !== ownHandle && handle !== retiringHandle && !reuseHandles?.has(handle));
+  const canExcludeByLineage = siblingHandles.size > 0 ||
+    [...(options?.excludedHandles ?? [])].some(allowedSiblingHandle);
+  const agents = root.agents;
+  if (!Array.isArray(agents)) return notIdle();
+  const ownedAgentsBusy = (): boolean =>
+    agents
+      .filter((agent) =>
+        (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) ||
+        // A new tab still has to wait for work that cannot be attributed to a sibling.
+        (!agent.paneKey?.trim() && (rotating || missingTargetPane || handles.length <= 1)),
+      )
+      .some((agent) => agent.state !== 'done');
+  const allAgentsBusy = (): boolean => agents.some((agent) => agent.state !== 'done');
+  if (targetPaneKeys.size > 0) {
+    if (ownedAgentsBusy()) return notIdle();
+  } else if (rotating) {
+    // A rotation waits only for the retiring slot's own agent; retained and unverifiable tabs
+    // never block opening a new session tab. A retiring terminal that cannot be pane-attributed
+    // fails closed instead of guessing; its child worktrees are still inspected below.
+    if (targetTerm
+      ? allAgentsBusy()
+      : agents.some(agent =>
+        agent.state !== 'done' && !(typeof agent.paneKey === 'string' && knownSiblingPaneKeys.has(agent.paneKey)),
+      )
+    ) {
+      return notIdle();
+    }
+  } else if (root.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
+    return notIdle();
+  }
+  // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
+  if (
+    !rotating &&
+    targetPaneKeys.size === 0 &&
+    observableHandles.filter((t) => Boolean(t.connected)).length < agents.length
+  ) {
+    return notIdle();
+  }
+  // Liveness and composer state only matter for terminals this wakeup may actually write into:
+  // a fresh tab gets its own empty composer, so retained tabs never block it or mark it
+  // prefilled; a bound tab is the only composer that receives the pointer (or the terminals a
+  // rebind could reuse when it was closed). A rotation never inspects the retiring composer:
+  // an unsent human draft there must not keep the replacement tab from opening.
+  const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
+    if (rootTarget === null) return false;
+    if (rootTarget === undefined) return true;
+    if (String(terminal.handle) === rootTarget) return true;
+    // The bound terminal was closed: only the terminals a rebind could reuse are inspected.
+    return reuseHandles?.has(String(terminal.handle)) === true;
   };
+  for (const terminal of eligibleObservableHandles) {
+    if (!gatesWakeup(terminal)) {
+      continue;
+    }
+    if (!terminal.connected || !terminal.writable) {
+      return notIdle();
+    }
+    if (
+      typeof terminal.preview === 'string' &&
+      !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
+    )
+      return notIdle();
+    // A recognized agent (or inventory without preview metadata) needs authoritative TUI readiness.
+    // A bare shell has no agent TUI yet; its workspace proof permits only the bootstrap path.
+    if (
+      (terminal.agentIdentity || typeof terminal.preview !== 'string') &&
+      !(await waitOrcaTerminalIdle(runner, command, terminal.handle, cwd, 1, signal, options)).idle
+    ) return notIdle();
+  }
+
+  const siblingAttribution = (node: Workspace): 'pane' | 'creator' | undefined => {
+    if (!Array.isArray(node.agents)) return undefined;
+    let allAgentsExplicitlyAttributed = node.agents.length > 0;
+    for (const agent of node.agents) {
+      const pane = typeof agent.parentPaneKey === 'string' ? agent.parentPaneKey.trim() : '';
+      if (!pane) {
+        allAgentsExplicitlyAttributed = false;
+        continue;
+      }
+      // Explicit dispatch provenance takes precedence over creator lineage.
+      const siblingPane = targetPaneKeys.size > 0 ? !targetPaneKeys.has(pane) : knownSiblingPaneKeys.has(pane);
+      if (!siblingPane) return undefined;
+    }
+    const paneAttributedWithSingleTerminal = allAgentsExplicitlyAttributed && targetPaneKeys.size > 0 && handles.length <= 1;
+    if (!paneAttributedWithSingleTerminal && node.unverifiableTerminalCount !== 0) return undefined;
+    return allAgentsExplicitlyAttributed ? 'pane' : 'creator';
+  };
+  // Return the worktrees that still need creator proof, or undefined if any node
+  // in the subtree cannot be attributed to a sibling.
+  const siblingLineageCandidates = (subtree: Workspace): Workspace[] | undefined => {
+    const candidates: Workspace[] = [];
+    const seen = new Set<string>();
+    const visit = (node: Workspace): boolean => {
+      if (seen.has(node.worktreeId)) return false;
+      seen.add(node.worktreeId);
+      const attribution = siblingAttribution(node);
+      if (!attribution) return false;
+      if (attribution === 'creator') candidates.push(node);
+      for (const id of node.childWorktreeIds ?? []) {
+        const descendant = rowsById.get(id);
+        if (!descendant || !visit(descendant)) return false;
+      }
+      return true;
+    };
+    return visit(subtree) ? candidates : undefined;
+  };
+  let childCreators: Map<string, string> | undefined;
+  let ownerByTerminalHandle: Promise<Map<string, Workspace | null>> | undefined;
+  const siblingProofMemo = new Map<string, boolean>();
+  const indexDescendantTerminalOwners = async (): Promise<Map<string, Workspace | null>> => {
+    const owners = new Map<string, Workspace | null>();
+    for (const descendant of descendantsOfRoot()) {
+      if (!siblingAttribution(descendant)) continue;
+      for (const handle of await readWorktreeTerminalHandles(descendant)) {
+        owners.set(handle, owners.has(handle) ? null : descendant);
+      }
+    }
+    return owners;
+  };
+  const isWorktreeProvenSibling = async (node: Workspace, visiting = new Set<string>()): Promise<boolean> => {
+    const id = node.worktreeId;
+    const cached = siblingProofMemo.get(id);
+    if (cached !== undefined) return cached;
+    const remember = (result: boolean): boolean => {
+      siblingProofMemo.set(id, result);
+      return result;
+    };
+    if (visiting.has(id)) return remember(false);
+    const attribution = siblingAttribution(node);
+    if (!attribution) return remember(false);
+    if (attribution === 'pane') return remember(true);
+    const creator = childCreators?.get(id);
+    if (!allowedSiblingHandle(creator)) return remember(false);
+    if (siblingHandles.has(creator) || options?.excludedHandles?.has(creator)) return remember(true);
+    const owners = await (ownerByTerminalHandle ??= indexDescendantTerminalOwners());
+    const owner = owners.get(creator);
+    if (!owner || owner.worktreeId === id) return remember(false);
+    // A unique owner is the only next edge, so this walk can share one visiting set.
+    visiting.add(id);
+    return remember(await isWorktreeProvenSibling(owner, visiting));
+  };
+  for (const id of root.childWorktreeIds ?? []) {
+    const child = rowsById.get(id);
+    if (!child) return notIdle();
+    const lineageCandidates = slotScoped ? siblingLineageCandidates(child) : undefined;
+    if (lineageCandidates?.length === 0) continue;
+    if (await isDescendantQuiescent(child)) continue;
+    if (canExcludeByLineage && lineageCandidates) {
+      try {
+        childCreators ??= await readOrcaChildCreators(runner, command, cwd, signal);
+        let proven = true;
+        for (const candidate of lineageCandidates) {
+          if (await isWorktreeProvenSibling(candidate)) continue;
+          proven = false;
+          break;
+        }
+        if (proven) continue;
+      } catch (error) {
+        if (options?.throwOnProbeError) throw error;
+        return notIdle();
+      }
+    }
+    return notIdle();
+  }
+  return { idle: true, reason: undefined };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

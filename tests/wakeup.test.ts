@@ -221,6 +221,73 @@ test('slot probe uses agent state, the composer draft and TUI-idle for a leased 
   assert.deepEqual(errors, []);
 });
 
+test('done historical child worktrees allow slot readiness, rotation and leased-wave quiescence', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const sibling = { ...probeTerminal, handle: 'term-sibling', tabId: 'sibling' };
+  const { runner, state } = fakeOrcaWorkspace(root, [{ ...probeTerminal }, sibling]);
+  const restoredTerminal = {
+    handle: 'term-restored-child', connected: true, writable: true, agentIdentity: 'claude', preview: '────\n❯\n────',
+  };
+  const draftTerminal = {
+    handle: 'term-draft-child', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> draft',
+  };
+  const restoredChild: FakeOrcaChild = {
+    path: join(root, 'restored-child'), worktreeId: 'restored-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'done', parentPaneKey: null }], terminals: [restoredTerminal],
+    lineage: { createdByTerminalHandle: 'term-retired-8-waves-ago' },
+    childWorktreeIds: ['draft-child'],
+  };
+  state.childWorktreeIds = [restoredChild.worktreeId];
+  state.children = [restoredChild, {
+    path: join(root, 'draft-child'), worktreeId: 'draft-child', unverifiableTerminalCount: 0,
+    agents: [{ state: 'done', parentPaneKey: null }], terminals: [draftTerminal],
+    lineage: { createdByTerminalHandle: restoredTerminal.handle },
+  }];
+  const commandRunner: CommandRunner = async request => {
+    const output = await runner(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait' && request.args.includes(restoredTerminal.handle)) {
+      return { stdout: '{"ok":false,"error":{"code":"timeout","message":"timeout"}}', exitCode: 1 };
+    }
+    return output;
+  };
+  const waitedHandles = () => state.calls
+    .filter(call => call.args[0] === 'terminal' && call.args[1] === 'wait')
+    .map(call => call.args[call.args.indexOf('--terminal') + 1]);
+  const { service, errors } = startSlotProbeService(t, store, commandRunner);
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-terminal', rotateAfterWaves: 1,
+    driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle, paneKey: 'wave:root' },
+  });
+
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.deepEqual(waitedHandles(), [probeTerminal.handle]);
+
+  state.calls.length = 0;
+  store.upsertWakeTarget(probeMailbox, { completedWaves: 1 });
+  assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+  assert.deepEqual(waitedHandles(), []);
+  store.enqueue([alert('next-wave')], { mailboxId: probeMailbox });
+  const wake = await service.flushMailbox(probeMailbox, { force: true });
+  assert.equal(wake.woke, true, wake.reason);
+  assert.equal(wake.rotated, true);
+  assert.deepEqual(new Set(waitedHandles()), new Set(['term-new-1']));
+  assert.equal(terminalSends(state.calls).length, 1);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+
+  const lease = store.check({ mailboxId: probeMailbox });
+  assert.ok(lease.deliveryId);
+  assert.equal(store.inspectSlotObligations(probeMailbox).hasPendingWave, true);
+  state.calls.length = 0;
+  assert.deepEqual(await service.probeSlot(probeMailbox), {
+    busy: false, ready: false, reason: 'quiescent_leased_wave',
+  });
+  restoredChild.agents = [{ state: 'working', parentPaneKey: null }];
+  assert.equal((await service.probeSlot(probeMailbox)).busy, true);
+  assert.deepEqual(new Set(waitedHandles()), new Set(['term-new-1']));
+  assert.deepEqual(errors, []);
+});
+
 test('slot probe follows a closed terminal’s pane to its active child worktree', async t => {
   const { root, service, state, errors } = slotProbeFixture(t, { wave: true, paneKey: 'wave:root' });
   state.terminals = [];
@@ -2144,10 +2211,20 @@ test('a target tab requires complete inventory and checks claimed terminals in i
   });
   assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false, 'missing child inventory blocks');
   childMissing = false;
-  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false, 'the claimed child composer still gates its parent');
+  terminal.connected = false;
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false, 'a claimed child terminal still counts toward connected coverage');
   assert.equal(sendsTo(state.calls, 'term-2').length, 0);
-  terminal.preview = '';
+  terminal.connected = true;
   assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+  assert.equal(terminalSends(state.calls).length, 1);
+  assert.equal(sendsTo(state.calls, 'term-2').length, 1);
+
+  store.enqueue([alert('child-draft')], { mailboxId: 'task:child' });
+  assert.equal((await service.flushMailbox('task:child', { force: true })).woke, false, 'the draft blocks the child mailbox wakeup');
+  assert.equal(sendsTo(state.calls, 'term-child').length, 0);
+  terminal.preview = '';
+  assert.equal((await service.flushMailbox('task:child', { force: true })).woke, true);
+  assert.equal(sendsTo(state.calls, 'term-child').length, 1);
 });
 
 test('a stale alert slot binding never writes into a sibling slot tab', async t => {
