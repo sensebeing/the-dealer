@@ -194,11 +194,17 @@ function slotProbeFixture(t: TestContext, options: { wave?: boolean; paneKey?: s
   return { root, store, ...orca, ...startSlotProbeService(t, store, orca.runner) };
 }
 
-function startSlotProbeService(t: TestContext, store: MailboxStore, commandRunner: CommandRunner) {
+function startSlotProbeService(
+  t: TestContext,
+  store: MailboxStore,
+  commandRunner: CommandRunner,
+  options: { canInheritSlotTarget?: (mailboxId: string, baseMailboxId: string) => boolean } = {},
+) {
   const errors: unknown[] = [];
   const service = new WakeupRedriveService({
     store, drivers: createTestWakeupDrivers({ commandRunner }),
     flushIntervalMs: 100_000, onError: error => errors.push(error),
+    ...(options.canInheritSlotTarget ? { canInheritSlotTarget: options.canInheritSlotTarget } : {}),
   });
   t.after(() => service.stop());
   return { service, errors };
@@ -1092,22 +1098,37 @@ test('a sender payload workspace can never inherit provisioning without a receiv
   assert.equal(store.list({ mailboxId: 'stream:tools-alert' }).queuedCount, 1);
 });
 
-test('an uninitialized secondary slot inherits its base workspace target without persisting it', async t => {
+test('a slot probe inherits its base workspace only through an explicit authoritative decision', async t => {
   const repoRoot = directory(t);
   const workspacePath = join(repoRoot, 'missing-workspace');
   const store = new MailboxStore(join(repoRoot, 'mailbox.json'));
   const calls: CommandRequest[] = [];
-  const { service, errors } = startSlotProbeService(t, store, async request => {
+  const runner: CommandRunner = async request => {
     calls.push(request);
     assert.equal(request.args[0], 'worktree');
     assert.ok(['ps', 'list'].includes(request.args[1]));
     return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
-  });
+  };
   store.upsertWakeTarget('stream:tools-alert', {
     driver: 'orca-terminal',
     driverConfig: { workspacePath, repoRoot, autoCreateWorkspace: false },
   });
   const persisted = structuredClone(store.listWakeTargets());
+
+  // A missing wake target alone is never evidence: without the composition root's decision the
+  // slot stays unbound and is independently ready.
+  const unconfigured = startSlotProbeService(t, store, runner);
+  assert.deepEqual(await unconfigured.service.probeSlot('stream:tools-alert:2'), { busy: false, ready: true });
+  assert.equal(calls.length, 0);
+  assert.equal(store.getWakeTarget('stream:tools-alert:2'), undefined);
+  assert.deepEqual(store.listWakeTargets(), persisted);
+  assert.deepEqual(unconfigured.errors, []);
+
+  // The injected decision projects the base workspace read-only, without persisting anything.
+  const { service, errors } = startSlotProbeService(t, store, runner, {
+    canInheritSlotTarget: (mailboxId, baseMailboxId) =>
+      mailboxId === 'stream:tools-alert:2' && baseMailboxId === 'stream:tools-alert',
+  });
   assert.deepEqual(await service.probeSlot('stream:tools-alert:2'), {
     busy: true, ready: false, reason: 'Workspace not found',
   });
@@ -1122,6 +1143,119 @@ test('an uninitialized secondary slot inherits its base workspace target without
   assert.equal(calls[1].cwd, repoRoot);
   assert.equal(store.getWakeTarget('stream:tools-alert:2'), undefined);
   assert.deepEqual(errors, []);
+});
+
+test('a runtime slot probe inherits its base workspace only when the authoritative topic binding says so', async t => {
+  const root = directory(t);
+  const projectRoot = join(root, 'project');
+  mkdirSync(join(projectRoot, '.dealer'), { recursive: true });
+  writeFileSync(join(projectRoot, '.dealer/project.json'), JSON.stringify({
+    schema: 'the-dealer-project/v1', projectId: 'prod', defaultNetworkId: 'local',
+  }));
+  const fixedWorkspace = join(root, 'missing-fixed');
+  const managedWorkspace = join(projectRoot, 'worktrees', 'managed-alert');
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: '{"ok":true,"result":{"truncated":false,"worktrees":[]}}' };
+    }
+    if (request.args[0] === 'worktree' && request.args[1] === 'list') {
+      return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const runtime = await makeNode(t, root, 'slotalert', {
+    commandRunner: runner,
+    patch: {
+      executors: ['inbox', 'orca-wave'],
+      projects: [{ projectId: 'prod', rootPath: projectRoot }],
+      topicBindings: {
+        'wave.alert.v1:tools-alert': {
+          executor: 'orca-wave', streamKey: 'tools-alert', workspacePath: fixedWorkspace, autoCreateWorkspace: false,
+        },
+        'wave.alert.v2:tools-alert-b': {
+          executor: 'orca-wave', streamKey: 'tools-alert-b', workspacePath: managedWorkspace, projectId: 'prod',
+        },
+      },
+      wave: { flushIntervalMs: 100_000 },
+    },
+  });
+  assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert')?.driverConfig?.autoCreateWorkspace, false);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert-b')?.driverConfig?.autoCreateWorkspace, true);
+
+  calls.length = 0;
+  assert.deepEqual(await runtime.probeSlot('stream:tools-alert:2'), {
+    busy: true, ready: false, reason: 'Workspace not found',
+  });
+  assert.equal(calls.some(call => call.args[0] === 'worktree' && call.args[1] === 'list'), false);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert:2'), undefined);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert')?.driverConfig?.workspacePath, fixedWorkspace);
+
+  calls.length = 0;
+  assert.deepEqual(await runtime.probeSlot('stream:tools-alert-b:2'), { busy: false, ready: true });
+  const inventories = calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'list');
+  assert.equal(inventories.length, 1);
+  assert.equal(inventories[0].cwd, projectRoot);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert-b:2'), undefined);
+  assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert-b')?.driverConfig?.workspacePath, managedWorkspace);
+});
+
+for (const [name, slotBinding] of [
+  ['inbox', { executor: 'inbox' }],
+  ['orca-spawn', { executor: 'orca-spawn', projectId: 'prod' }],
+] as const) {
+  test(`an explicit ${name} slot binding never inherits the base Orca workspace`, async t => {
+    const root = directory(t);
+    const projectRoot = join(root, 'project');
+    mkdirSync(join(projectRoot, '.dealer'), { recursive: true });
+    writeFileSync(join(projectRoot, '.dealer/project.json'), JSON.stringify({
+      schema: 'the-dealer-project/v1', projectId: 'prod', defaultNetworkId: 'local',
+    }));
+    const calls: CommandRequest[] = [];
+    const runner: CommandRunner = async request => {
+      calls.push(request);
+      if (request.args[0] === 'worktree') {
+        return { stdout: '{"ok":true,"result":{"truncated":false,"worktrees":[]}}' };
+      }
+      return { stdout: '{"ok":true}' };
+    };
+    const runtime = await makeNode(t, root, `slot-${name}`, {
+      commandRunner: runner,
+      patch: {
+        executors: ['inbox', 'orca-wave', 'orca-spawn'],
+        projects: [{ projectId: 'prod', rootPath: projectRoot }],
+        topicBindings: {
+          'wave.alert.v1:tools-alert': {
+            executor: 'orca-wave', streamKey: 'tools-alert',
+            workspacePath: join(root, 'missing-base'), autoCreateWorkspace: false,
+          },
+          'wave.alert.v1:tools-alert:2': slotBinding,
+        },
+        wave: { flushIntervalMs: 100_000 },
+      },
+    });
+    assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert')?.driverConfig?.autoCreateWorkspace, false);
+    calls.length = 0;
+    assert.deepEqual(await runtime.probeSlot('stream:tools-alert:2'), { busy: false, ready: true });
+    assert.equal(calls.length, 0);
+    assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert:2'), undefined);
+  });
+}
+
+test('a missing slot target without an authoritative topic binding never inherits by name', async t => {
+  const root = directory(t);
+  const runtime = await makeNode(t, root, 'unbound-slot', {
+    commandRunner: async request => {
+      throw new Error(`Unexpected external command: ${request.args.join(' ')}`);
+    },
+  });
+  runtime.mailbox.upsertWakeTarget('stream:tools-alert', {
+    driver: 'orca-terminal',
+    driverConfig: { workspacePath: join(root, 'missing-workspace') },
+  });
+  assert.deepEqual(await runtime.probeSlot('stream:tools-alert:2'), { busy: false, ready: true });
+  assert.equal(runtime.mailbox.getWakeTarget('stream:tools-alert:2'), undefined);
 });
 
 test('terminal wait timeouts are busy observations and server failures retain their diagnostics', async t => {
