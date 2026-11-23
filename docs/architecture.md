@@ -615,13 +615,16 @@ wake-target keys and non-JSON configuration values are rejected.
 A driver persists `beginWakeDelivery` before an external boundary and settles only observed
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;
 mail arriving during delivery remains pending. Proven command non-starts back off, while unknown
-outcomes remain fenced across mail arrivals, forced flushes and restarts. Orca drivers retain
-idle proof and empty target-composer verification, create independent tabs for rotation only after
-the retiring slot's own agent and child worktrees are done, then close the retired terminal and
-keep its handle reserved until the close is confirmed. Slot-scoped checks first exclude subtrees
-attributed entirely by explicit sibling parent panes. Every worktree in an excluded subtree must
-have a complete agent inventory and meet the terminal verifiability check. When a subtree cannot prove its own quiescence and a
-sibling slot could own it, the probe reads Orca's persisted creators once to resolve missing parent
+outcomes remain fenced across mail arrivals, forced flushes and restarts. Root target terminals
+verify an empty composer and `tui-idle` readiness before pointer injection, while non-excluded
+descendant worktrees gate parent readiness, rotation and leased-wave quiescence through complete
+inventories, `done` agents and connected terminal coverage. Orca drivers create independent tabs
+for rotation only after the retiring slot's own agent and child worktrees are done, then close
+the retired terminal and keep its handle reserved until the close is confirmed. Slot-scoped
+checks first exclude subtrees attributed entirely by explicit sibling parent panes. Every worktree
+in an excluded subtree must have a complete agent inventory and meet the terminal verifiability
+check. When a subtree cannot prove its own quiescence and a sibling slot could own it, the probe
+reads Orca's persisted creators once to resolve missing parent
 panes or agentless worktrees through root sibling terminals or terminals in proven sibling-owned
 descendant worktrees. Incomplete lineage inventory blocks readiness when that lookup is
 required. If the bound pane vanishes, its agents and descendants still gate readiness.
