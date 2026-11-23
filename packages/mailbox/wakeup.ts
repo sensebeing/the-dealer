@@ -1,6 +1,6 @@
 import { CommandNotStartedError, singleLine } from '../subprocess/index.ts';
 import type { Disposable } from '../core-types/index.ts';
-import { normalizeMailboxId, wakeupBackoffDelay } from './store.ts';
+import { normalizeMailboxId, wakeupBackoffDelay, baseStreamKeyOf } from './store.ts';
 import type { MailboxCheckResult, MailboxItem, MailboxStore, WakeTargetState } from './store.ts';
 import type { OutboxStore } from './outbox.ts';
 
@@ -48,6 +48,11 @@ export interface WakeupDriver {
   deliver(context: WakeupDriverContext): Promise<WakeupDriverOutcome>;
   sessionMailboxIdFor?(target: WakeTargetState): string | undefined;
   probeSlot?(context: WakeupProbeContext): Promise<SlotProbeResult>;
+  /**
+   * Read-only projection of a base stream's target onto an uninitialized secondary slot. The
+   * driver owns its opaque configuration; the core only forwards the base state it already holds.
+   */
+  inheritSlotTarget?(mailboxId: string, baseTarget: WakeTargetState): WakeTargetState | undefined;
   resolveSessionTarget?(
     mailboxId: string,
     store: MailboxStore,
@@ -261,7 +266,7 @@ export class WakeupRedriveService {
     if (this.inFlight.has(id) || this.claims.has(id)) {
       return { busy: true, ready: false, reason: 'wakeup_in_flight' };
     }
-    const target = this.store.getWakeTarget(id);
+    const target = this.store.getWakeTarget(id) ?? this.inheritSlotTarget(id);
     const driver = target ? this.drivers.get(target.driver) : undefined;
     const sessionMailboxId = target ? driver?.sessionMailboxIdFor?.(target) : undefined;
     const obligations = this.store.inspectSlotObligations(id, { sessionMailboxId, outbox: options.outbox });
@@ -286,6 +291,21 @@ export class WakeupRedriveService {
       now: this.now,
       reportError: error => this.report(error),
     });
+  }
+
+  /**
+   * An uninitialized secondary slot (`stream:<name>:<n>`) reads its base stream's wake target
+   * through the registered driver only. The projection is never persisted, so a probe cannot
+   * fabricate mailbox state or borrow a sibling slot's private conversation identity.
+   */
+  private inheritSlotTarget(mailboxId: string): WakeTargetState | undefined {
+    if (!mailboxId.startsWith('stream:')) return undefined;
+    // `baseStreamKeyOf` matches the trailing numeric slot and returns the base mailbox id.
+    const baseMailboxId = baseStreamKeyOf(mailboxId);
+    const baseTarget = baseMailboxId ? this.store.getWakeTarget(baseMailboxId) : undefined;
+    if (!baseTarget) return undefined;
+    const baseDriver = this.drivers.get(baseTarget.driver);
+    return baseDriver?.inheritSlotTarget?.(mailboxId, baseTarget);
   }
 
   /**

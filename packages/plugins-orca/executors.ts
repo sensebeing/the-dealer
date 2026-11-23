@@ -25,6 +25,7 @@ import {
   defaultAgentCommandArgs,
 } from '../plugins-agent-host/hosts.ts';
 import {
+  resolveOrcaManagedAutoCreateWorkspace,
   resolveOrcaWaveRotateAfterWaves,
   createOrcaTerminalWakeupDriver,
   deliverSpawnedOrcaTerminalWakeup,
@@ -646,6 +647,13 @@ async function prepareOrcaWaveBatch(
         `Dealer: ${mailboxId} pending`,
     );
     const explicitAgent = binding?.agent ?? config.agent ?? options.agent ?? (hasReceiverTarget ? undefined : payload.agent);
+    const autoCreateWorkspace = resolveOrcaManagedAutoCreateWorkspace({
+      explicitAutoCreate: binding?.autoCreateWorkspace,
+      managesWorkspace: Boolean(receiverCwd),
+      hasRepoRoot: Boolean(binding?.repoRoot),
+      runId: receiverRunId,
+      pinnedTerminalHandle: receiverTerminalHandle,
+    });
     const identityPatch = resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
       mailboxId, runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
       configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
@@ -667,9 +675,7 @@ async function prepareOrcaWaveBatch(
         ...identityPatch.driverConfig,
         orcaCommand: command,
         ...(binding?.repoRoot ? { repoRoot: binding.repoRoot } : {}),
-        ...(binding?.autoCreateWorkspace !== undefined
-          ? { autoCreateWorkspace: binding.autoCreateWorkspace }
-          : {}),
+        autoCreateWorkspace,
         ...(runId ? { runId } : {}),
         ...(cwd ? { workspacePath: cwd } : {}),
         ...(worktreeId ? { worktreeId } : {}),

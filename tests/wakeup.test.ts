@@ -932,6 +932,198 @@ test('an empty auto-create slot checks workspace provisioning without creating i
   assert.equal(errors.length, 1);
 });
 
+test('a linked standing workspace defaults to provisioning only when the probe proves it missing', async t => {
+  const root = directory(t);
+  const projectRoot = join(root, 'project');
+  mkdirSync(join(projectRoot, '.dealer'), { recursive: true });
+  writeFileSync(join(projectRoot, '.dealer/project.json'), JSON.stringify({
+    schema: 'the-dealer-project/v1', projectId: 'prod', defaultNetworkId: 'local',
+  }));
+  const workspacePath = join(projectRoot, 'worktrees', 'tools-alert');
+  const calls: CommandRequest[] = [];
+  let provisioned = false;
+  let terminalCount = 0;
+  const handles: string[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    const [surface, action] = request.args;
+    if (surface === 'worktree' && action === 'ps') {
+      return { stdout: JSON.stringify({ ok: true, result: { truncated: false, worktrees: provisioned
+        ? [{
+            path: workspacePath, worktreeId: 'tools-alert', unverifiableTerminalCount: 0,
+            agents: handles.map(handle => ({ state: 'done', paneKey: `${handle}:root` })),
+          }]
+        : [] } }) };
+    }
+    if (surface === 'worktree' && action === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { worktrees: provisioned ? [{ path: workspacePath }] : [] } }) };
+    }
+    if (surface === 'worktree' && action === 'create') {
+      assert.deepEqual(request.args.slice(0, 5), ['worktree', 'create', '--no-parent', '--name', 'tools-alert']);
+      assert.equal(request.args.at(-1), '--json');
+      assert.equal(request.cwd, projectRoot);
+      provisioned = true;
+      return { stdout: JSON.stringify({ ok: true, result: { path: workspacePath } }) };
+    }
+    if (surface === 'terminal' && action === 'list') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: handles.map(handle => ({
+        handle, connected: true, writable: true, tabId: handle, leafId: 'root',
+        agentIdentity: 'antigravity', preview: '',
+      })) } }) };
+    }
+    if (surface === 'terminal' && action === 'create') {
+      terminalCount += 1;
+      const handle = `term-${terminalCount}`;
+      handles.push(handle);
+      return { stdout: JSON.stringify({ ok: true, result: { handle } }) };
+    }
+    if (surface === 'terminal' && action === 'close') {
+      const handle = request.args[request.args.indexOf('--terminal') + 1];
+      const index = handles.indexOf(handle);
+      if (index >= 0) handles.splice(index, 1);
+      return { stdout: '{"ok":true}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const runtime = await makeNode(t, root, 'prodalert', {
+    commandRunner: runner,
+    patch: {
+      executors: ['inbox', 'orca-wave'],
+      projects: [{ projectId: 'prod', rootPath: projectRoot }],
+      topicBindings: {
+        'wave.alert.v1': { executor: 'orca-wave', streamKey: 'tools-alert', workspacePath, projectId: 'prod' },
+      },
+      wave: { flushIntervalMs: 100_000 },
+    },
+  });
+  const mailboxId = 'stream:tools-alert';
+  const bound = runtime.mailbox.getWakeTarget(mailboxId)!;
+  assert.equal(bound.driverConfig?.workspacePath, workspacePath);
+  assert.equal(bound.driverConfig?.repoRoot, projectRoot);
+  assert.equal(bound.driverConfig?.autoCreateWorkspace, true);
+  assert.equal(bound.rotateAfterWaves, 1);
+
+  // The probe confirms provisioning is possible without creating anything.
+  assert.deepEqual(await runtime.probeSlot(mailboxId), { busy: false, ready: true });
+  assert.equal(existsSync(workspacePath), false);
+  assert.equal(calls.some(call => call.args[0] === 'worktree' && call.args[1] === 'create'), false);
+
+  const emit = (id: string) => runtime.emitter.emit({
+    networkId: 'local',
+    routing: { mode: 'unicast', targets: ['member:prodalert'] },
+    kind: 'wave.alert.v1',
+    subject: `Alert ${id}`,
+    body: 'Alert details',
+    payload: { streamKey: 'tools-alert' },
+  });
+  assert.equal((await emit('linked-first')).receipts[0].stage, 'dispatched');
+  assert.equal(provisioned, true);
+  assert.equal(terminalCount, 1);
+  const delivered = runtime.mailbox.getWakeTarget(mailboxId)!;
+  assert.equal(delivered.driverConfig?.workspacePath, workspacePath);
+  assert.equal(delivered.driverConfig?.terminalHandle, 'term-1');
+  assert.equal(delivered.pendingWake, false);
+  const pointers = terminalSends(calls).filter(call =>
+    textOf(call).includes(`dealer inbox check --mailbox ${mailboxId} --json`));
+  assert.equal(pointers.length, 1);
+
+  // A healthy workspace never pays for another `worktree list` inventory.
+  const listCalls = () => calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'list').length;
+  const createCalls = () => calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'create').length;
+  const listsBefore = listCalls();
+  assert.equal(listsBefore, 2, 'only the missing-workspace probe and lazy provisioning list the inventory');
+  assert.equal((await emit('linked-second')).receipts[0].stage, 'dispatched');
+  assert.equal(listCalls(), listsBefore);
+  assert.equal(createCalls(), 1);
+});
+
+test('an explicit autoCreateWorkspace false never provisions a missing standing workspace', async t => {
+  const root = directory(t);
+  const workspacePath = join(root, 'missing-workspace');
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: '{"ok":true,"result":{"truncated":false,"worktrees":[]}}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => service.stop());
+  const binding = { executor: 'orca-wave', streamKey: 'tools-alert', workspacePath, repoRoot: root, autoCreateWorkspace: false };
+  await createOrcaWaveExecutorPlugin({ store, wakeup: service, commandRunner: runner, resolveTopicBinding: () => binding })
+    .execute([alert('explicit-false', { kind: 'wave.alert.v1', payload: { streamKey: 'tools-alert' } })],
+      { networkId: 'team', nodeId: 'receiver', traceId: 'explicit-false' }, {});
+  const target = store.getWakeTarget('stream:tools-alert')!;
+  assert.equal(target.driverConfig?.workspacePath, workspacePath);
+  assert.equal(target.driverConfig?.repoRoot, root);
+  assert.equal(target.driverConfig?.autoCreateWorkspace, false);
+  assert.equal(target.pendingWake, false);
+  assert.equal(calls.some(call => call.args[0] === 'worktree' && call.args[1] === 'list'), false);
+  assert.equal(calls.some(call => call.args[0] === 'worktree' && call.args[1] === 'create'), false);
+});
+
+test('a sender payload workspace can never inherit provisioning without a receiver repo root', async t => {
+  const root = directory(t);
+  const workspacePath = join(root, 'sender-impostor');
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: '{"ok":true,"result":{"truncated":false,"worktrees":[]}}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => service.stop());
+  await createOrcaWaveExecutorPlugin({ store, wakeup: service, commandRunner: runner, resolveTopicBinding: () => undefined })
+    .execute([alert('untrusted-workspace', {
+      kind: 'wave.alert.v1', payload: { streamKey: 'tools-alert', workspacePath },
+    })], { networkId: 'team', nodeId: 'receiver', traceId: 'untrusted-workspace' }, {});
+  const target = store.getWakeTarget('stream:tools-alert')!;
+  assert.equal(target.driverConfig?.workspacePath, workspacePath);
+  assert.equal(target.driverConfig?.repoRoot, undefined);
+  assert.equal(target.driverConfig?.autoCreateWorkspace, undefined);
+  assert.equal(target.pendingWake, false);
+  assert.equal(calls.some(call => call.args[0] === 'worktree' && call.args[1] === 'list'), false);
+  assert.equal(calls.some(call => call.args[0] === 'worktree' && call.args[1] === 'create'), false);
+  assert.equal(store.list({ mailboxId: 'stream:tools-alert' }).queuedCount, 1);
+});
+
+test('an uninitialized secondary slot inherits its base workspace target without persisting it', async t => {
+  const repoRoot = directory(t);
+  const workspacePath = join(repoRoot, 'missing-workspace');
+  const store = new MailboxStore(join(repoRoot, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const { service, errors } = startSlotProbeService(t, store, async request => {
+    calls.push(request);
+    assert.equal(request.args[0], 'worktree');
+    assert.ok(['ps', 'list'].includes(request.args[1]));
+    return { stdout: '{"ok":true,"result":{"worktrees":[]}}' };
+  });
+  store.upsertWakeTarget('stream:tools-alert', {
+    driver: 'orca-terminal',
+    driverConfig: { workspacePath, repoRoot, autoCreateWorkspace: false },
+  });
+  const persisted = structuredClone(store.listWakeTargets());
+  assert.deepEqual(await service.probeSlot('stream:tools-alert:2'), {
+    busy: true, ready: false, reason: 'Workspace not found',
+  });
+  assert.deepEqual(calls.map(call => call.args[1]), ['ps']);
+  assert.equal(store.getWakeTarget('stream:tools-alert:2'), undefined);
+  assert.deepEqual(store.listWakeTargets(), persisted);
+
+  store.upsertWakeTarget('stream:tools-alert', { driverConfig: { autoCreateWorkspace: true } });
+  calls.length = 0;
+  assert.deepEqual(await service.probeSlot('stream:tools-alert:2'), { busy: false, ready: true });
+  assert.deepEqual(calls.map(call => call.args[1]), ['ps', 'list']);
+  assert.equal(calls[1].cwd, repoRoot);
+  assert.equal(store.getWakeTarget('stream:tools-alert:2'), undefined);
+  assert.deepEqual(errors, []);
+});
+
 test('terminal wait timeouts are busy observations and server failures retain their diagnostics', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   const terminalMailbox = `terminal:${probeTerminal.handle}`;
