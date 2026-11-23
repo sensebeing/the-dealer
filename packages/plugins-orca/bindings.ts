@@ -1,6 +1,6 @@
 import type { OrcaTopicBinding } from './executors.ts';
 import { orcaAgent } from './workspace.ts';
-import { pinOrcaTerminalSessionMailbox, resolveConfiguredOrcaWakeTargetPatch, resolveOrcaWaveRotateAfterWaves } from './wakeup.ts';
+import { pinOrcaTerminalSessionMailbox, resolveConfiguredOrcaWakeTargetPatch, resolveOrcaManagedAutoCreateWorkspace, resolveOrcaWaveRotateAfterWaves } from './wakeup.ts';
 import type { MailboxStore, MailboxTopicBinding, WakeTargetState } from '../mailbox/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 
@@ -28,6 +28,10 @@ export function syncOrcaTopicWakeTarget(ctx: {
     mode: effectiveMode, bindingRotateAfterWaves: rotateAfterWaves,
     waveRotateAfterWaves: ctx.wave?.rotateAfterWaves, managesWorkspace: Boolean(workspacePath), runId, pinnedTerminalHandle: terminalHandle,
   });
+  const resolvedAutoCreateWorkspace = resolveOrcaManagedAutoCreateWorkspace({
+    explicitAutoCreate: autoCreateWorkspace, managesWorkspace: Boolean(workspacePath), hasRepoRoot: Boolean(projectRoot),
+    runId, pinnedTerminalHandle: terminalHandle,
+  });
   const identityPatch = resolveConfiguredOrcaWakeTargetPatch(current, {
     mailboxId, runId, workspacePath, configuredTerminalHandle: terminalHandle,
     configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
@@ -41,7 +45,7 @@ export function syncOrcaTopicWakeTarget(ctx: {
     driverConfig: {
       ...identityPatch.driverConfig,
       workspacePath, worktreeId, runId, repoRoot: projectRoot,
-      autoCreateWorkspace, workspaceComment,
+      autoCreateWorkspace: resolvedAutoCreateWorkspace, workspaceComment,
     },
   });
 }

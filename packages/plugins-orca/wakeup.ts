@@ -148,6 +148,34 @@ export function resolveOrcaWaveRotateAfterWaves(input: OrcaWaveRotateAfterWavesI
     : undefined;
 }
 
+export interface OrcaManagedAutoCreateWorkspaceInput {
+  /** A receiver-local binding decision always wins over the managed default. */
+  explicitAutoCreate?: boolean;
+  /** Whether the receiver manages a standing Orca workspace it can provision. */
+  managesWorkspace: boolean;
+  /** Provisioning needs a receiver-local repository root; sender payloads never supply one. */
+  hasRepoRoot: boolean;
+  /** An Orca Run owns its workspace lifecycle. */
+  runId?: string;
+  /** An explicitly pinned terminal must already exist. */
+  pinnedTerminalHandle?: string;
+}
+
+/**
+ * The single owner of the managed standing-workspace provisioning policy. Preset generation,
+ * topic binding refresh, and wave enqueue all resolve their effective default here so a
+ * receiver-managed `fixed`/`wave` workspace can never diverge between entry paths, while a
+ * sender-supplied payload (no receiver repo root) can never trigger workspace creation.
+ */
+export function resolveOrcaManagedAutoCreateWorkspace(
+  input: OrcaManagedAutoCreateWorkspaceInput,
+): boolean | undefined {
+  if (input.explicitAutoCreate !== undefined) return input.explicitAutoCreate;
+  return input.managesWorkspace && input.hasRepoRoot && !input.runId && !input.pinnedTerminalHandle
+    ? true
+    : undefined;
+}
+
 /**
  * A completed wave (or rotation window) without an outstanding lease is the single rotation
  * trigger: the next wakeup must open its own session tab instead of reusing the retained one.
@@ -731,8 +759,18 @@ class OrcaWakeDelivery {
     let activeRevision = context.target.bindingRevision ?? 0;
     try {
       let target = readOrcaWakeTarget(context.target);
+      activeRevision = target.bindingRevision ?? 0;
+      let scoped = this.excludeClaimedTerminal(mailboxId, target);
+      target = scoped.target;
+      let excludedHandles = scoped.excludedHandles;
+      let dedicatedTab = this.needsDedicatedTab(mailboxId, target);
+      let idle = await this.authoritativeIdle(target, preview, dedicatedTab, excludedHandles);
+      // A standing receiver-managed workspace is provisioned only when the authoritative probe
+      // proves it missing; a healthy workspace never pays for an inventory subprocess.
       if (
         !this.idleCheck &&
+        !idle.idle &&
+        idle.reason === 'Workspace not found' &&
         target.driver === 'orca-terminal' &&
         target.workspacePath &&
         target.autoCreateWorkspace === true
@@ -746,14 +784,14 @@ class OrcaWakeDelivery {
           const updated = this.store.updateWakeDriverConfigIfCurrent(mailboxId, target.bindingRevision ?? 0, { workspacePath: workspace.workspacePath });
           if (updated.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
           target = readOrcaWakeTarget(updated.target);
+          activeRevision = target.bindingRevision ?? 0;
+          scoped = this.excludeClaimedTerminal(mailboxId, target);
+          target = scoped.target;
+          excludedHandles = scoped.excludedHandles;
+          dedicatedTab = this.needsDedicatedTab(mailboxId, target);
         }
+        idle = await this.authoritativeIdle(target, preview, dedicatedTab, excludedHandles);
       }
-      activeRevision = target.bindingRevision ?? 0;
-      const scoped = this.excludeClaimedTerminal(mailboxId, target);
-      target = scoped.target;
-      const { excludedHandles } = scoped;
-      const dedicatedTab = this.needsDedicatedTab(mailboxId, target);
-      const idle = await this.authoritativeIdle(target, preview, dedicatedTab, excludedHandles);
       if (!idle.idle) {
         // A workspace whose directory is gone can never become idle again; retrying it forever
         // would only inflate the backoff ledger. The mail stays queued for a human or a rebind.
@@ -1202,6 +1240,44 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
     name: 'orca-terminal',
     deliver: (context) => new OrcaWakeDelivery(context, options).run(context),
     probeSlot: (context) => new OrcaWakeDelivery(context, options).probe(context),
+    /**
+     * An uninitialized secondary slot observes the same standing workspace as its base stream
+     * without persisting a copy. Slot-private conversation identity is stripped so the inherited
+     * projection can never point a probe or a wakeup at a sibling's retained tab.
+     */
+    inheritSlotTarget(mailboxId, baseTarget) {
+      const base = readOrcaWakeTarget(baseTarget);
+      if (
+        baseTarget.driver !== 'orca-terminal' ||
+        !base.workspacePath?.trim() ||
+        base.configuredTerminalHandle?.trim() ||
+        base.runId?.trim()
+      ) {
+        return undefined;
+      }
+      return {
+        mailboxId,
+        driver: 'orca-terminal',
+        coalesceMs: baseTarget.coalesceMs,
+        rotateAfterWaves: baseTarget.rotateAfterWaves,
+        wakeupPrefix: baseTarget.wakeupPrefix,
+        completedWaves: 0,
+        pendingWake: false,
+        earliestWakeAt: 0,
+        attemptCount: 0,
+        bindingRevision: 0,
+        driverConfig: serializeOrcaDriverConfig({
+          orcaCommand: base.orcaCommand,
+          agent: base.agent,
+          workspacePath: base.workspacePath,
+          worktreeId: base.worktreeId,
+          repoRoot: base.repoRoot,
+          autoCreateWorkspace: base.autoCreateWorkspace,
+          interactiveCommand: base.interactiveCommand,
+          resumeCommand: base.resumeCommand,
+        }),
+      };
+    },
     sessionMailboxIdFor(target) {
       const { terminalHandle } = readOrcaDriverConfig(target);
       const handle = terminalHandle?.trim();

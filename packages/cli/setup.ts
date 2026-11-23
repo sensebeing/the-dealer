@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { redactProjectManifest, readProjectManifest, validateTopicBindings } from './config.ts';
 import type { DealerProjectManifest, LarkNotifyConfig, LinkedProjectConfig, TopicBindingConfig } from './config.ts';
 import { CONVERSATION_MODES } from '../mailbox/index.ts';
-import { resolveOrcaWaveRotateAfterWaves } from '../plugins-orca/index.ts';
+import { resolveOrcaManagedAutoCreateWorkspace, resolveOrcaWaveRotateAfterWaves } from '../plugins-orca/index.ts';
 import { findExecutable } from '../subprocess/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
 import type { SupportedAgentHost } from '../plugins-agent-host/index.ts';
@@ -133,6 +133,11 @@ export function buildAgentBindingPreset(options: {
   const managed = entry.managedWorkspace;
   const topic = options.topic ?? 'collab.request.v4';
   const executor = mode === 'inbox-only' ? 'inbox' : resolveHostExecutor(host);
+  const autoCreateWorkspace = resolveOrcaManagedAutoCreateWorkspace({
+    explicitAutoCreate: undefined,
+    managesWorkspace: Boolean(managed && (mode === 'fixed' || mode === 'wave')),
+    hasRepoRoot: true,
+  });
   const binding: TopicBindingConfig = {
     executor, mode,
     agent: entry.acceptsBindingAgent ? options.agent ?? entry.defaultBindingAgent : entry.defaultBindingAgent,
@@ -145,7 +150,7 @@ export function buildAgentBindingPreset(options: {
     ...(options.notifyLark !== undefined ? { notifyLark: options.notifyLark } : {}),
     ...(managed && (mode === 'fixed' || mode === 'wave')
       ? {
-          autoCreateWorkspace: true,
+          ...(autoCreateWorkspace !== undefined ? { autoCreateWorkspace } : {}),
           ...(() => {
             const rotateAfterWaves = resolveOrcaWaveRotateAfterWaves({
               mode: options.mode === 'fixed' ? 'fixed' : 'wave',

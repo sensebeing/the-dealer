@@ -518,6 +518,7 @@ export class DealerNodeRuntime {
         ],
         flushIntervalMs: this.config.wave?.flushIntervalMs ?? 1_000,
         onError: error => { this.lastError = String(error); },
+        canInheritSlotTarget: (mailboxId, baseMailboxId) => this.slotInheritsBaseWakeTarget(mailboxId, baseMailboxId),
       });
       const keyPath = join(this.stateDir, 'identity.json');
       const keyPair = existsSync(keyPath) ? JSON.parse(readFileSync(keyPath, 'utf8')) : generateNodeKeyPair();
@@ -1014,6 +1015,65 @@ export class DealerNodeRuntime {
       if (binding) return result(key, binding, this.config.projects.find(item => item.projectId === binding.projectId)?.rootPath);
     }
     return { address, baseStream, match: undefined };
+  }
+
+  /**
+   * The composition root owns topic-binding precedence, so only it may decide whether an
+   * uninitialized numbered slot actually inherits its base stream's binding. An explicit slot
+   * binding (any executor, including one that never persists a wake target) suppresses
+   * inheritance; otherwise the slot must resolve through `resolveTopicBindingMatch` to the same
+   * effective base binding that owns `baseMailboxId`. A missing wake target is never evidence.
+   */
+  private slotInheritsBaseWakeTarget(mailboxId: string, baseMailboxId: string): boolean {
+    if (!mailboxId.startsWith('stream:')) return false;
+    const slotStreamKey = mailboxId.slice('stream:'.length);
+    const baseStream = baseStreamKeyOf(slotStreamKey);
+    if (!baseStream || baseMailboxId !== `stream:${baseStream}`) return false;
+    const bindings: [string, TopicBindingConfig][] = [];
+    for (const project of this.loadedProjects.values()) {
+      for (const entry of Object.entries(project.userPatch?.topicBindings ?? {})) bindings.push(entry);
+    }
+    for (const entry of Object.entries(this.config.topicBindings ?? {})) bindings.push(entry);
+    for (const [key, binding] of bindings) {
+      if (
+        binding.mailboxId === mailboxId ||
+        binding.streamKey === slotStreamKey ||
+        resolveTopicAddress(key).streamKey === slotStreamKey
+      ) {
+        return false;
+      }
+    }
+    const topics = new Set<string>();
+    for (const [key] of bindings) {
+      const { topic } = resolveTopicAddress(key);
+      const { match } = this.resolveTopicBindingMatch(topic, baseStream);
+      if (
+        match !== undefined &&
+        match.binding.mailboxId === undefined &&
+        resolveBoundMailboxId(
+          match.key,
+          this.registry.toMailboxBinding(match.binding, this.config.executorConfig),
+        ) === baseMailboxId
+      ) {
+        topics.add(topic);
+      }
+    }
+    if (topics.size === 0) return false;
+    for (const topic of topics) {
+      const { address, match } = this.resolveTopicBindingMatch(topic, slotStreamKey);
+      if (
+        match === undefined ||
+        match.key === address.kind ||
+        match.binding.mailboxId !== undefined ||
+        resolveBoundMailboxId(
+          match.key,
+          this.registry.toMailboxBinding(match.binding, this.config.executorConfig),
+        ) !== baseMailboxId
+      ) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private executorTopicBinding = (kind: string, streamKey?: string) => {
