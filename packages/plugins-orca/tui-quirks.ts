@@ -1,24 +1,28 @@
 import { singleLine } from '../subprocess/index.ts';
 export { trustAntigravityWorkspace, defaultAgentLaunchCommand } from '../plugins-agent-host/hosts.ts';
 
+function findOrcaComposerPrompt(lines: string[]): { index: number; firstLine: string } | undefined {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const match = /^\s*>\s*(.*)$/.exec(lines[i]);
+    if (match) return { index: i, firstLine: match[1].trim() };
+  }
+  return undefined;
+}
+
+export function hasOrcaComposerPrompt(preview: string): boolean {
+  return findOrcaComposerPrompt(preview.split(/\r?\n/)) !== undefined;
+}
+
 /** A human draft or unconfirmed Pilot recommendation owns the composer until submitted. */
 export function isOrcaComposerEmpty(preview: string, agentIdentity?: unknown): boolean {
   const lines = preview.split(/\r?\n/);
-  let promptIndex = -1;
-  let firstLine = '';
-  for (let i = 0; i < lines.length; i++) {
-    const match = /^\s*>\s*(.*)$/.exec(lines[i]);
-    if (match) {
-      promptIndex = i;
-      firstLine = match[1].trim();
-    }
-  }
-  if (promptIndex < 0) return true;
-  for (const line of lines.slice(promptIndex + 1)) {
+  const prompt = findOrcaComposerPrompt(lines);
+  if (!prompt) return true;
+  for (const line of lines.slice(prompt.index + 1)) {
     if (/^\s*[─━═\-]{5,}\s*$/.test(line)) break;
     if (line.trim()) return false;
   }
-  return firstLine === '' || isAntigravityModePlaceholder('> ' + firstLine, agentIdentity);
+  return prompt.firstLine === '' || isAntigravityModePlaceholder('> ' + prompt.firstLine, agentIdentity);
 }
 
 /**

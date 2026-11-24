@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { defaultAgentLaunchCommand, trustAntigravityWorkspace } from '../plugins-agent-host/hosts.ts';
-import { isOrcaComposerEmpty } from './tui-quirks.ts';
+import { hasOrcaComposerPrompt, isOrcaComposerEmpty } from './tui-quirks.ts';
 import { beforeExternalEffect } from '../plugins-executor/index.ts';
 import { execFileSync } from 'node:child_process';
 import { randomInt } from 'node:crypto';
@@ -92,13 +92,28 @@ export interface OrcaWorkspaceIdleOptions extends OrcaProbeOptions {
    */
   retiringTerminalHandle?: string;
   retiringPaneKey?: string;
-  /** Preferred target agent when the bound terminal is gone and a rebind picks a replacement. */
+  /** Preferred agent for rebinds and required identity for a live delivery target. */
   agent?: SupportedOrcaAgent;
   excludedHandles?: ReadonlySet<string>;
   /** Delivery must still be addressing the exact, live terminal that it selected. */
   requireTarget?: boolean;
   /** Workspace changes require unscoped activity checks and at most the slot's own tab. */
   exclusiveTerminal?: { handle?: string; paneKey?: string };
+}
+
+function matchesOrcaAgentIdentity(agentIdentity: unknown, expectedAgent: SupportedOrcaAgent): boolean {
+  return agentIdentity === expectedAgent || (expectedAgent === 'claude' && agentIdentity === 'claude-code');
+}
+
+function orcaAgentReadinessFailure(terminal: OrcaTerminalRow, expectedAgent?: SupportedOrcaAgent): OrcaIdleResult | undefined {
+  if (!expectedAgent || typeof terminal.preview !== 'string') return undefined;
+  if (!matchesOrcaAgentIdentity(terminal.agentIdentity, expectedAgent)) {
+    return { idle: false, reason: 'Target agent is not ready in terminal' };
+  }
+  if (expectedAgent === 'antigravity' && !hasOrcaComposerPrompt(terminal.preview)) {
+    return { idle: false, reason: 'Antigravity composer prompt is not ready' };
+  }
+  return undefined;
 }
 
 /** Reuse candidates in the same order terminal resolution falls back through them. */
@@ -109,8 +124,7 @@ function reusableTerminalCandidates(
   const nonOrphaned = terminals.filter((terminal) => terminal.orphaned !== true);
   const pool = nonOrphaned.length > 0 ? nonOrphaned : [...terminals];
   const matchesAgent = (terminal: OrcaTerminalRow): boolean =>
-    agent !== undefined &&
-    (terminal.agentIdentity === agent || (agent === 'claude' && terminal.agentIdentity === 'claude-code'));
+    agent !== undefined && matchesOrcaAgentIdentity(terminal.agentIdentity, agent);
   const tiers = [
     pool.filter(matchesAgent),
     pool.filter(
@@ -126,8 +140,9 @@ function reusableTerminalCandidates(
 
 /**
  * Root terminals eligible for pointer injection must be connected, writable, have an empty
- * composer and pass `tui-idle` when an agent is present or the preview is unavailable. A
- * fresh tab has its own composer, and rotation checks the retiring slot's execution activity.
+ * composer and pass `tui-idle` when an agent is present or the preview is unavailable.
+ * A required live target also verifies its configured agent and Antigravity prompt.
+ * A fresh tab has its own composer, and rotation checks the retiring slot's execution activity.
  * Non-excluded descendant worktrees prove execution quiescence with complete agent and
  * terminal inventories, no unverifiable terminals, done agents and connected terminal coverage.
  */
@@ -348,6 +363,10 @@ export async function checkOrcaWorkspaceIdle(
     if (!terminal.connected || !terminal.writable) {
       return notIdle();
     }
+    if (options?.requireTarget) {
+      const agentUnready = orcaAgentReadinessFailure(terminal, options.agent);
+      if (agentUnready) return agentUnready;
+    }
     if (
       typeof terminal.preview === 'string' &&
       !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
@@ -456,7 +475,9 @@ export async function checkOrcaWorkspaceIdle(
     return notIdle();
   }
   if (options?.requireTarget && runner === runCommand && typeof rootTarget === 'string') {
-    return checkOrcaTerminalComposer(runner, command, rootTarget, cwd, signal, true);
+    return checkOrcaTerminalComposer(runner, command, rootTarget, cwd, signal, {
+      requirePreview: true, expectedAgent: options.agent,
+    });
   }
   return { idle: true, reason: undefined };
 }
@@ -558,15 +579,19 @@ export async function readOrcaTerminal(
 
 async function checkOrcaTerminalComposer(
   runner: CommandRunner, command: string, terminalHandle: string, cwd?: string, signal?: AbortSignal,
-  requirePreview = false,
+  options?: { requirePreview?: boolean; expectedAgent?: SupportedOrcaAgent },
 ): Promise<OrcaIdleResult> {
   const terminal = await readOrcaTerminal(runner, command, terminalHandle, cwd, signal);
   if (terminal && (terminal.connected !== true || terminal.writable === false))
     return { idle: false, reason: 'Terminal is disconnected or not writable' };
-  if (requirePreview && typeof terminal?.preview !== 'string')
+  if (options?.requirePreview && typeof terminal?.preview !== 'string')
     return { idle: false, reason: 'Terminal composer is unverifiable' };
-  if (typeof terminal?.preview === 'string' && !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity))
-    return { idle: false, reason: 'Terminal composer has unsent draft' };
+  if (typeof terminal?.preview === 'string') {
+    const agentUnready = orcaAgentReadinessFailure(terminal, options?.expectedAgent);
+    if (agentUnready) return agentUnready;
+    if (!isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity))
+      return { idle: false, reason: 'Terminal composer has unsent draft' };
+  }
   return { idle: true };
 }
 
@@ -577,14 +602,17 @@ export async function probeOrcaTerminalIdle(
   terminalHandle: string,
   cwd?: string,
   signal?: AbortSignal,
-  options?: OrcaProbeOptions & { verifyComposerLast?: boolean },
+  options?: OrcaProbeOptions & { verifyComposerLast?: boolean; expectedAgent?: SupportedOrcaAgent },
 ): Promise<OrcaIdleResult> {
   try {
-    const composer = await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal);
+    const expectedAgent = options?.verifyComposerLast ? options.expectedAgent : undefined;
+    const composer = await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal, { expectedAgent });
     if (!composer.idle) return composer;
     const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal, options);
     if (result.idle && options?.verifyComposerLast && runner === runCommand) {
-      return await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal, true);
+      return await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal, {
+        requirePreview: true, expectedAgent,
+      });
     }
     return result.idle
       ? result
@@ -901,10 +929,7 @@ export async function planOrcaWorkspaceTerminal(
   const freshest = (rows: OrcaTerminalRow[]) =>
     rows.sort((a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0))[0];
   const preferred = freshest(
-    connected.filter(
-      (t) =>
-        t.agentIdentity === targetAgent || (targetAgent === 'claude' && t.agentIdentity === 'claude-code'),
-    ),
+    connected.filter((t) => matchesOrcaAgentIdentity(t.agentIdentity, targetAgent)),
   );
   if (preferred) return { handle: String(preferred.handle), kind: 'existing' };
   const agent = freshest(
@@ -943,13 +968,16 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   return { handle: spawned.handle, spawned: true };
 }
 
+/** Orca refused the send before writing any bytes to the terminal. */
+export class OrcaTerminalSendRefusedError extends Error {}
+
 /** Send one line (plus Enter) to a terminal; the caller must have proven it idle first. */
 export async function sendOrcaTerminalText(
   runner: CommandRunner,
   command: string,
   terminalHandle: string,
   text: string,
-  options: { cwd?: string; signal?: AbortSignal; waitSubmit?: number } = {},
+  options: { cwd?: string; signal?: AbortSignal; waitSubmit?: number; expectedAgent?: SupportedOrcaAgent } = {},
 ): Promise<void> {
   const args = [
     'terminal',
@@ -963,12 +991,12 @@ export async function sendOrcaTerminalText(
     '--json',
   ];
   let output;
-  const send = orcaMutationRunner(runner, options.cwd);
+  const mutationRunner = orcaMutationRunner(runner, options.cwd);
   try {
-    output = await checkedCommand(send, { command, args, cwd: options.cwd, signal: options.signal });
+    output = await checkedCommand(mutationRunner, { command, args, cwd: options.cwd, signal: options.signal });
   } catch (error) {
     if (!String(error).includes('no_active_sender_terminal')) throw error;
-    output = await checkedCommand(send, {
+    output = await checkedCommand(mutationRunner, {
       command,
       args: [...args, '--allow-self'],
       cwd: options.cwd,
@@ -976,8 +1004,32 @@ export async function sendOrcaTerminalText(
       env: { ...process.env, ORCA_TERMINAL_ID: terminalHandle },
     });
   }
-  if (JSON.parse(output.stdout).ok === false) {
+  const parsed = JSON.parse(output.stdout);
+  if (parsed?.ok === false) {
     throw new Error('Orca terminal send failed');
+  }
+  const send = parsed?.result?.send;
+  if (!isRecord(send)) return;
+  if (send.accepted === false) {
+    const reason = typeof send.refusedReason === 'string' && send.refusedReason;
+    throw new OrcaTerminalSendRefusedError(reason ? `Orca terminal send refused: ${reason}` : 'Orca terminal send refused');
+  }
+  if (options.waitSubmit === undefined && options.expectedAgent === undefined) return;
+  const prompt = send.prompt;
+  if (!isRecord(prompt)) return;
+  const { provider, observation, stages } = prompt;
+  const requestId = prompt.requestId ?? send.requestId ?? 'unknown';
+  if (observation === 'permission' || observation === 'incarnation_replaced') {
+    throw new Error(`Orca prompt delivery unverified: ${observation} (request ${requestId})`);
+  }
+  if (options.expectedAgent && provider === 'unsupported') {
+    throw new Error(`Orca prompt provider unsupported: ${options.expectedAgent} was not the settled foreground prompt receiver (request ${requestId})`);
+  }
+  if (
+    options.waitSubmit !== undefined && typeof provider === 'string' && provider !== 'unsupported' && provider !== 'old-host' &&
+    !(Array.isArray(stages) && stages.includes('turn_started'))
+  ) {
+    throw new Error(`Orca prompt turn not observed (request ${requestId}, provider ${provider}, observation ${observation}, stages ${JSON.stringify(stages)})`);
   }
 }
 

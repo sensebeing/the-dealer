@@ -457,7 +457,7 @@ export interface ExecutorPlugin<C = unknown> {
      外部来源通过 `context.runtime.probeSlot(mailboxId)` 只读查询槽位。`MailboxStore` 从未确认邮件、唤醒围栏、线程账本和持久 outbox 推导当前义务，按网络及消息关联回复，并排除同一消息的回环投递。发送进程若在写入出站线程前中断，槽位探测只读投影存续的 outbox 义务。启动和重驱按原 outbox 创建时间补齐出站线程与回复路由。替换和槽位释放共用一条失败判定。没有待投递、存疑或托管义务时，每个失败目标仍须有绑定该信封的明确未执行回执或本地未发送证据。无目标的失败也须有明确的未尝试记录。本机未确认邮件继续阻塞槽位。`WakeupRedriveService` 发现未结账本义务时直接返回忙碌，包括终端消失后仍未结的远端请求。账本无阻塞义务时，才由注入的 driver 判断宿主是否仍在处理或可以接收新波次。Orca 复用终端、子工作区与轮转空闲检查。`orca-run` 还检查监督 worker 和协调者的活动，无法观测时保持忙碌。允许自动创建的固定槽位通过只读工作区清单确认可创建性，实际创建留在投递路径；投递前只在权威探测返回 `Workspace not found` 时按需创建并重新探测，已存在的工作区不再为每次唤醒支付清单查询。接收方托管的 `fixed` / `wave` 主题工作区在具备本地 `repoRoot`、未绑定 Orca Run 或固定终端时默认允许自动创建，预设生成、主题绑定同步与波次入队共用同一策略函数；发送方 payload 指定的工作区永远不能触发创建。未持久化自身 `wakeTarget` 的 `stream:<base>:<slot>` 二次槽位，仅在组合根的权威主题绑定判定该副槽实际继承基础流时，才由已注册 driver 只读投影基础流的工作区目标，不写入 `MailboxStore`，也不继承兄弟槽位的终端、pane 或会话身份；显式副槽覆盖（即使执行器不预创建 `wakeTarget`）绝不继承，缺失目标本身不构成继承证据。探测故障上报并拒绝接单。
 3. **Ring-2 执行器插件 (`packages/plugins-executor/`、`packages/plugins-orca/`、`packages/plugins-agent-host/`)**：
    - **投递结算与未知结果**：`MailboxStore.beginWakeDelivery` 在外部命令或终端注入前持久化 `deliveryInDoubt`，只有成功回执才由 `completeWakeDelivery` 清除此围栏。进程已启动后的错误、abort 或进程中断保留围栏与原因；命令边界确认该次进程从未启动的失败（`CommandNotStartedError`）以及投递前的准备失败（工作区/终端解析、权威空闲门禁、参数校验）不产生围栏，按 1s → 2s → 5s → 10s 指数退避重试。后续入队、强制 flush 与重启均不能自动重放未知结果，须先核实外部结果再显式修复目标；成功结算只覆盖预览序号水位内的消息，新入队消息保留 `enqueue` 决定的截止时间；会话帧即时唤醒，普通波次仍遵守 coalescing。初始执行器（`orca` + mode、命名宿主或兼容别名 `agent-pty` / `orca-spawn`）与后台重驱共用同一套 `deliverAgentHostWakeTarget` / `deliverSpawnedOrcaTerminalWakeup` 投递原语，不各自复制指针构造与终端注入。
-   - **Orca spawn 持久交接与启动围栏**：工作区创建并完成信任配置后，交互式任务先写入 `task:<id>` 信箱与 wakeTarget，再创建终端或更新备注；命名宿主执行器也在入队后保持成功交接，唤醒失败不撤回信箱义务。初始与后台终端创建、非任务终端的 shell 启动共用 `launchFencedOrcaWorkspaceTerminal`：命令前持久化 `deliveryInDoubt`，仅 OS 确认未启动或 Orca 结构化 `ok:false` 拒绝可退避重试；中断、畸形回执、缺失句柄及持久化失败保留未知结果围栏，禁止重启后盲目重建。成功句柄以 bindingRevision CAS 与围栏清除原子落盘，随后才等待空闲；所有 post-await 延迟与结算同样校验 revision，旧尝试绝不覆盖并发新绑定，新绑定立即重驱。任务专属 Tab 在最终投递检查时仍须存活；消失时只通过 `orca terminal create --command` 创建替代 Tab，绝不借用其他 Agent 或裸 shell。单次 `CommandNotStartedError` 不代表整个执行无副作用；只有尚未交接或发生外部修改的执行器边界才能标注 `beforeExternalEffect` 供 dedup 回滚。
+   - **Orca spawn 持久交接与启动围栏**：工作区创建并完成信任配置后，交互式任务先写入 `task:<id>` 信箱与 wakeTarget，再创建终端或更新备注；命名宿主执行器也在入队后保持成功交接，唤醒失败不撤回信箱义务。初始与后台终端创建、非任务终端的 shell 启动共用 `launchFencedOrcaWorkspaceTerminal`：命令前持久化 `deliveryInDoubt`。OS 确认未启动、Orca 创建终端时返回 `ok:false`，或 shell 启动发送返回 `accepted:false` 时可退避重试；中断、畸形回执、缺失句柄及持久化失败保留未知结果围栏，禁止重启后盲目重建。成功句柄以 bindingRevision CAS 与围栏清除原子落盘，随后才等待空闲；所有 post-await 延迟与结算同样校验 revision，旧尝试绝不覆盖并发新绑定，新绑定立即重驱。任务专属 Tab 在最终投递检查时仍须存活；消失时只通过 `orca terminal create --command` 创建替代 Tab，绝不借用其他 Agent 或裸 shell。单次 `CommandNotStartedError` 不代表整个执行无副作用；只有尚未交接或发生外部修改的执行器边界才能标注 `beforeExternalEffect` 供 dedup 回滚。
    - **宿主会话身份**：`packages/plugins-agent-host` 唯一负责独立 CLI / 桌面 App 宿主身份映射和启动回执解析；Orca TUI Tab 的 sessionId、paneKey、退休来源及 fresh interactiveCommand / 模板 resumeCommand 由 `packages/plugins-orca` 唯一持有，存入 opaque driverConfig，核心不解释这些字段。显式 `sessionId` 原样保留；Claude 缺省名称由信箱 ID 可逆编码，Dot/Grok 使用原始信箱 ID。Codex spawn 仅在启动 JSON 的 `threadId`/`sessionId` 可用时启用 fixed 续接，不能用未传给创建过程的显式 ID 冒充新会话身份；无身份的 Codex 与独立 `agy run` 成功后清除自动宿主唤醒绑定，信箱仍可手动读取。已有 fixed 会话不从任务输出重新推断身份。
    - **`executor-orca`（Orca 工作区执行器）**：以 `mode: spawn | wave | fixed` 选择新建子工作区、波次投递或固定会话；负责协作 Request、告警流与常驻工作区投递。
    - **Desktop App 执行器**：`executor-claude-app`、`executor-chatgpt-app`、`executor-antigravity-app`，以同一 `mode` taxonomy 连接桌面会话。
@@ -632,11 +632,16 @@ depends on it. Retained mailbox items keep their original signed envelope.
 
 A driver persists `beginWakeDelivery` before an external boundary and settles only observed
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;
-mail arriving during delivery remains pending. Proven command non-starts back off, while unknown
-outcomes remain fenced across mail arrivals, forced flushes and restarts. Root target terminals
-verify an empty composer and `tui-idle` readiness before pointer injection, while non-excluded
-descendant worktrees gate parent readiness, rotation and leased-wave quiescence through complete
-inventories, `done` agents and connected terminal coverage. Orca drivers create independent tabs
+mail arriving during delivery remains pending. Proven command non-starts and Orca send receipts
+with `accepted: false` back off. Unknown outcomes remain fenced across mail arrivals, forced
+flushes and restarts. Root target terminals verify `tui-idle` readiness, an empty composer, and
+the configured agent identity before pointer injection. Antigravity also requires a rendered
+composer prompt when it is the configured agent. Orca pointer sends request up to five seconds
+of submission observation. Observable providers must report `turn_started` before the wake
+settles. Permission and terminal incarnation changes leave delivery fenced, as does an
+`unsupported` provider for a configured agent. Legacy `old-host` receipts retain compatibility.
+Non-excluded descendant worktrees gate parent readiness, rotation and leased-wave quiescence
+through complete inventories, `done` agents and connected terminal coverage. Orca drivers create independent tabs
 for rotation only after the retiring slot's own agent and child worktrees are done, then close
 the retired terminal and keep its handle reserved until the close is confirmed. Slot-scoped
 checks first exclude subtrees attributed entirely by explicit sibling parent panes. Every worktree
