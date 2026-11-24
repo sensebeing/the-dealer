@@ -116,26 +116,27 @@ function orcaAgentReadinessFailure(terminal: OrcaTerminalRow, expectedAgent?: Su
   return undefined;
 }
 
-/** Reuse candidates in the same order terminal resolution falls back through them. */
+/** Select the same reuse candidates for workspace readiness and terminal resolution. */
 function reusableTerminalCandidates(
   terminals: readonly OrcaTerminalRow[],
   agent?: SupportedOrcaAgent,
-): OrcaTerminalRow[] {
-  const nonOrphaned = terminals.filter((terminal) => terminal.orphaned !== true);
-  const pool = nonOrphaned.length > 0 ? nonOrphaned : [...terminals];
-  const matchesAgent = (terminal: OrcaTerminalRow): boolean =>
-    agent !== undefined && matchesOrcaAgentIdentity(terminal.agentIdentity, agent);
-  const tiers = [
-    pool.filter(matchesAgent),
-    pool.filter(
-      (terminal) => typeof terminal.agentIdentity === 'string' && terminal.agentIdentity.trim().length > 0,
-    ),
-    pool.filter(
-      (terminal) => typeof terminal.preview !== 'string' && typeof terminal.agentIdentity !== 'string',
-    ),
-    pool.filter((terminal) => typeof terminal.preview === 'string' && !terminal.agentIdentity),
-  ];
-  return tiers.find((tier) => tier.length > 0) ?? pool;
+): { kind: 'existing' | 'shell'; terminals: OrcaTerminalRow[] } | undefined {
+  const hasIdentity = (terminal: OrcaTerminalRow) =>
+    typeof terminal.agentIdentity === 'string' && terminal.agentIdentity.trim().length > 0;
+  const connected = terminals.filter(isUsableTerminal);
+  const eligible = agent === undefined ? connected : connected.filter(terminal =>
+    !hasIdentity(terminal) || matchesOrcaAgentIdentity(terminal.agentIdentity, agent));
+  const nonOrphaned = eligible.filter(terminal => terminal.orphaned !== true);
+  const pool = nonOrphaned.length > 0 ? nonOrphaned : eligible.filter(hasIdentity);
+  const preferred = pool.filter(terminal => matchesOrcaAgentIdentity(terminal.agentIdentity, agent ?? 'antigravity'));
+  if (preferred.length > 0) return { kind: 'existing', terminals: preferred };
+  const recognized = pool.filter(hasIdentity);
+  if (recognized.length > 0) return { kind: 'existing', terminals: recognized };
+  const synthetic = pool.filter(terminal =>
+    typeof terminal.preview !== 'string' && typeof terminal.agentIdentity !== 'string');
+  if (synthetic.length > 0) return { kind: 'existing', terminals: synthetic };
+  const shells = pool.filter(terminal => typeof terminal.preview === 'string' && !terminal.agentIdentity);
+  return shells.length > 0 ? { kind: 'shell', terminals: shells } : undefined;
 }
 
 /**
@@ -290,10 +291,11 @@ export async function checkOrcaWorkspaceIdle(
   const targetPresent =
     typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
   if (options?.requireTarget && !targetPresent) return notIdle();
-  const reuseHandles =
-    typeof rootTarget === 'string' && !targetPresent
-      ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
-      : undefined;
+  const needsReuse = (typeof rootTarget === 'string' && !targetPresent) ||
+    (rootTarget === undefined && options?.agent !== undefined);
+  const reuseHandles = needsReuse
+    ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent)?.terminals.map(t => String(t.handle)))
+    : undefined;
   const siblingTerminals = slotScoped
     ? handles.filter(terminal =>
       isUsableTerminal(terminal) && terminal !== targetTerm &&
@@ -351,10 +353,8 @@ export async function checkOrcaWorkspaceIdle(
   // an unsent human draft there must not keep the replacement tab from opening.
   const gatesWakeup = (terminal: OrcaTerminalRow): boolean => {
     if (rootTarget === null) return false;
-    if (rootTarget === undefined) return true;
-    if (String(terminal.handle) === rootTarget) return true;
-    // The bound terminal was closed: only the terminals a rebind could reuse are inspected.
-    return reuseHandles?.has(String(terminal.handle)) === true;
+    if (reuseHandles) return reuseHandles.has(String(terminal.handle));
+    return rootTarget === undefined || String(terminal.handle) === rootTarget;
   };
   for (const terminal of eligibleObservableHandles) {
     if (!gatesWakeup(terminal)) {
@@ -892,7 +892,6 @@ export async function planOrcaWorkspaceTerminal(
   signal?: AbortSignal,
   options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean; excludedHandles?: ReadonlySet<string> },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
-  const targetAgent = options?.agent ?? 'antigravity';
   const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal));
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
@@ -904,44 +903,18 @@ export async function planOrcaWorkspaceTerminal(
   // workspace registry lost track of it, not that its live TUI stopped accepting wakeups.
   const preferredHandle = options?.preferredHandle;
   if (preferredHandle) {
-    const bound = terminals.find(
-      (t) => t && String(t.handle) === preferredHandle && t.connected && t.writable !== false,
-    );
+    const bound = terminals.find(t => String(t.handle) === preferredHandle && isUsableTerminal(t));
     if (bound) return { handle: String(bound.handle), kind: 'existing' };
   }
   const pane = terminals.find(t => t && matchesPane(t, options?.preferredPaneKey));
   if (pane) return { kind: 'existing', handle: String(pane.handle) };
   if (options?.dedicatedTab || options?.sessionId?.trim() || options?.preferredPaneKey?.trim()) return { kind: 'create' };
-  const nonOrphanConnected = terminals.filter(
-    (t) => t && t.orphaned !== true && t.connected && t.writable !== false,
+  const candidates = reusableTerminalCandidates(terminals, options?.agent);
+  if (!candidates) return { kind: 'create' };
+  const [freshest] = candidates.terminals.sort(
+    (a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0),
   );
-  const connected =
-    nonOrphanConnected.length > 0
-      ? nonOrphanConnected
-      : terminals.filter(
-          (t) =>
-            t &&
-            t.connected &&
-            t.writable !== false &&
-            typeof t.agentIdentity === 'string' &&
-            t.agentIdentity.trim().length > 0,
-        );
-  const freshest = (rows: OrcaTerminalRow[]) =>
-    rows.sort((a, b) => (Number(b.lastOutputAt) || 0) - (Number(a.lastOutputAt) || 0))[0];
-  const preferred = freshest(
-    connected.filter((t) => matchesOrcaAgentIdentity(t.agentIdentity, targetAgent)),
-  );
-  if (preferred) return { handle: String(preferred.handle), kind: 'existing' };
-  const agent = freshest(
-    connected.filter((t) => typeof t.agentIdentity === 'string' && t.agentIdentity.trim()),
-  );
-  if (agent) return { handle: String(agent.handle), kind: 'existing' };
-  const synthetic = freshest(
-    connected.filter((t) => typeof t.preview !== 'string' && typeof t.agentIdentity !== 'string'),
-  );
-  if (synthetic) return { handle: String(synthetic.handle), kind: 'existing' };
-  const bareShell = freshest(connected.filter((t) => typeof t.preview === 'string' && !t.agentIdentity));
-  return bareShell ? { kind: 'shell', handle: String(bareShell.handle) } : { kind: 'create' };
+  return { kind: candidates.kind, handle: String(freshest.handle) };
 }
 
 /** Resolve and launch for callers that do not own a durable mailbox obligation. */
@@ -969,12 +942,18 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
 }
 
 /** Orca refused the send before writing any bytes to the terminal. */
-export class OrcaTerminalSendRefusedError extends Error {}
+export class OrcaTerminalSendRefusedError extends Error {
+  readonly refusedReason?: string;
+
+  constructor(refusedReason?: string) {
+    super(refusedReason ? `Orca terminal send refused: ${refusedReason}` : 'Orca terminal send refused');
+    this.refusedReason = refusedReason;
+  }
+}
 
 function orcaTerminalSendRefusal(send: unknown): OrcaTerminalSendRefusedError | undefined {
   if (!isRecord(send) || send.accepted !== false) return undefined;
-  const reason = typeof send.refusedReason === 'string' && send.refusedReason;
-  return new OrcaTerminalSendRefusedError(reason ? `Orca terminal send refused: ${reason}` : 'Orca terminal send refused');
+  return new OrcaTerminalSendRefusedError(typeof send.refusedReason === 'string' ? send.refusedReason : undefined);
 }
 
 /** Send one line (plus Enter) to a terminal; the caller must have proven it idle first. */
@@ -999,8 +978,9 @@ export async function sendOrcaTerminalText(
   const mutationRunner = orcaMutationRunner(runner, options.cwd);
   const sendOnce = async (request: CommandRequest) => {
     let returned: Awaited<ReturnType<CommandRunner>> | undefined;
+    let output;
     try {
-      return await checkedCommand(async request => {
+      output = await checkedCommand(async request => {
         returned = await mutationRunner(request);
         return returned;
       }, request);
@@ -1020,13 +1000,23 @@ export async function sendOrcaTerminalText(
       }
       throw error;
     }
+    const parsed = JSON.parse(output.stdout);
+    if (parsed?.ok === false) throw new Error('Orca terminal send failed');
+    const send = parsed?.result?.send;
+    const refusal = orcaTerminalSendRefusal(send);
+    if (refusal) throw refusal;
+    return send;
   };
-  let output;
+  let send;
   try {
-    output = await sendOnce({ command, args, cwd: options.cwd, signal: options.signal });
+    send = await sendOnce({ command, args, cwd: options.cwd, signal: options.signal });
   } catch (error) {
-    if (error instanceof OrcaTerminalSendRefusedError || !String(error).includes('no_active_sender_terminal')) throw error;
-    output = await sendOnce({
+    const missingSender = 'no_active_sender_terminal';
+    const canUseSelf = error instanceof OrcaTerminalSendRefusedError
+      ? error.refusedReason === missingSender
+      : String(error).includes(missingSender);
+    if (!canUseSelf) throw error;
+    send = await sendOnce({
       command,
       args: [...args, '--allow-self'],
       cwd: options.cwd,
@@ -1034,13 +1024,6 @@ export async function sendOrcaTerminalText(
       env: { ...process.env, ORCA_TERMINAL_ID: terminalHandle },
     });
   }
-  const parsed = JSON.parse(output.stdout);
-  if (parsed?.ok === false) {
-    throw new Error('Orca terminal send failed');
-  }
-  const send = parsed?.result?.send;
-  const refusal = orcaTerminalSendRefusal(send);
-  if (refusal) throw refusal;
   if (!isRecord(send)) return;
   if (options.waitSubmit === undefined && options.expectedAgent === undefined) return;
   const prompt = send.prompt;
@@ -1050,8 +1033,11 @@ export async function sendOrcaTerminalText(
   if (observation === 'permission' || observation === 'incarnation_replaced') {
     throw new Error(`Orca prompt delivery unverified: ${observation} (request ${requestId})`);
   }
-  if (options.expectedAgent && provider === 'unsupported') {
-    throw new Error(`Orca prompt provider unsupported: ${options.expectedAgent} was not the settled foreground prompt receiver (request ${requestId})`);
+  if (
+    options.expectedAgent && typeof provider === 'string' && provider !== 'old-host' &&
+    !matchesOrcaAgentIdentity(provider, options.expectedAgent)
+  ) {
+    throw new Error(`Orca prompt provider ${provider} did not verify delivery to ${options.expectedAgent} (request ${requestId})`);
   }
   if (
     options.waitSubmit !== undefined && typeof provider === 'string' && provider !== 'unsupported' && provider !== 'old-host' &&

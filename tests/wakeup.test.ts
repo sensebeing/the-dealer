@@ -2705,6 +2705,35 @@ test('a fixed workspace rebind skips claimed tabs and waits for the available ta
   assert.equal(state.created, 0);
 });
 
+test('a fixed workspace resolves only compatible terminals for its configured agent', async t => {
+  const workspacePath = directory(t);
+  for (const terminalHandle of [undefined, 'closed', 'codex-tab']) {
+    const store = new MailboxStore(join(workspacePath, `mailbox-${terminalHandle}.json`));
+    const pinned = terminalHandle === 'codex-tab';
+    const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+      { handle: 'codex-tab', connected: true, writable: true, agentIdentity: 'codex', preview: pinned ? '> ' : '> draft' },
+    ]);
+    const mailboxId = 'stream:claude-fixed';
+    store.enqueue([alert('claude-fixed')], { mailboxId, wakeTarget: {
+      driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle, agent: 'claude' },
+    } });
+    const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+    t.after(() => service.stop());
+    const result = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(result.woke, !pinned, result.reason);
+    assert.equal(sendsTo(state.calls, 'codex-tab').length, 0);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, pinned);
+    if (pinned) {
+      assert.equal(result.reason, 'Target agent is not ready in terminal');
+      assert.equal(state.created, 0);
+    } else {
+      assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, 'term-new-1');
+      assert.equal(state.terminals[1].agentIdentity, 'claude');
+      assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+    }
+  }
+});
+
 test('concurrent alert slots cannot both reclaim the same recorded pane', async t => {
   const workspacePath = directory(t);
   const store = new MailboxStore(join(workspacePath, 'mailbox.json'));
@@ -4693,6 +4722,7 @@ const acceptedOrcaPrompt = {
 const orcaReceiptFailures = [
   { name: 'refused', send: { accepted: false, refusedReason: 'terminal_busy' }, detail: /terminal_busy/, retryable: true },
   { name: 'unsupported', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'unsupported', stages: ['input_accepted'] } }, detail: /unsupported.*antigravity/, retryable: false },
+  { name: 'wrong-provider', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'codex' } }, detail: /codex.*antigravity/, retryable: false },
   { name: 'queued', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, stages: ['input_accepted'] } }, detail: /request-1.*antigravity.*supported.*input_accepted/, retryable: false },
   ...(['permission', 'incarnation_replaced'] as const).map(observation => ({
     name: observation,
@@ -4709,7 +4739,7 @@ function orcaTerminalSendReceipt(send: object) {
 test('Orca terminal sends classify exit 1 refusal receipts on either attempt', async () => {
   for (const rejects of [true, false]) {
     for (const retry of [true, false]) {
-      const refusedReason = retry ? 'terminal_busy' : 'no_active_sender_terminal';
+      const refusedReason = retry ? 'no_active_sender_terminal' : 'terminal_busy';
       const output = { ...orcaTerminalSendReceipt({ accepted: false, refusedReason }), exitCode: 1 };
       const calls: CommandRequest[] = [];
       const runner: CommandRunner = async request => {
@@ -4724,6 +4754,25 @@ test('Orca terminal sends classify exit 1 refusal receipts on either attempt', a
       assert.equal(calls.length, retry ? 2 : 1);
       assert.equal(calls.at(-1)?.args.includes('--allow-self'), retry);
     }
+  }
+});
+
+test('Orca terminal sends recover from a structured missing sender context once', async () => {
+  for (const failure of ['zero', 'exit 1', 'rejection']) {
+    const calls: CommandRequest[] = [];
+    const runner: CommandRunner = async request => {
+      calls.push(request);
+      if (request.args.includes('--allow-self')) return { stdout: '{"ok":true}' };
+      const output = {
+        ...orcaTerminalSendReceipt({ accepted: false, refusedReason: 'no_active_sender_terminal' }),
+        exitCode: failure === 'zero' ? 0 : 1,
+      };
+      if (failure === 'rejection') throw Object.assign(new Error('orca exited 1'), output);
+      return output;
+    };
+    await sendOrcaTerminalText(runner, 'orca', 'tab', 'wake');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].env?.ORCA_TERMINAL_ID, 'tab');
   }
 });
 
@@ -4761,6 +4810,9 @@ test('Orca terminal sends verify observed turns and retain legacy receipt compat
   ]) {
     await sendOrcaTerminalText(async () => output, 'orca', 'tab', 'wake', options);
   }
+  await sendOrcaTerminalText(async () => orcaTerminalSendReceipt({
+    accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'claude-code' },
+  }), 'orca', 'tab', 'wake', { ...options, expectedAgent: 'claude' });
   await sendOrcaTerminalText(async () => orcaTerminalSendReceipt({
     accepted: true, prompt: { provider: 'unsupported', stages: ['input_accepted'] },
   }), 'orca', 'shell', 'agy --dangerously-skip-permissions');

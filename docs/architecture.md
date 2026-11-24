@@ -636,10 +636,13 @@ mail arriving during delivery remains pending. Proven command non-starts and Orc
 with `accepted: false` back off. Unknown outcomes remain fenced across mail arrivals, forced
 flushes and restarts. Root target terminals verify `tui-idle` readiness, an empty composer, and
 the configured agent identity before pointer injection. Antigravity also requires a rendered
-composer prompt when it is the configured agent. Orca pointer sends request up to five seconds
-of submission observation. Observable providers must report `turn_started` before the wake
-settles. Permission and terminal incarnation changes leave delivery fenced, as does an
-`unsupported` provider for a configured agent. Legacy `old-host` receipts retain compatibility.
+composer prompt when it is the configured agent. Workspace terminal selection and readiness use
+the same reuse candidates. An unbound workspace or one whose bound tab has closed can launch
+the configured agent when no compatible tab is available. A live binding retains its composer
+gate. Orca pointer sends request up to five seconds of submission observation. Observable
+providers must report `turn_started` before the wake settles. Permission and terminal
+incarnation changes leave delivery fenced, as does a provider that cannot confirm delivery to
+the configured agent. Legacy `old-host` receipts retain compatibility.
 Non-excluded descendant worktrees gate parent readiness, rotation and leased-wave quiescence
 through complete inventories, `done` agents and connected terminal coverage. Orca drivers create independent tabs
 for rotation only after the retiring slot's own agent and child worktrees are done, then close
