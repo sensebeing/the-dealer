@@ -622,17 +622,16 @@ async function waitForOwnedDaemonReady(
 }
 
 /**
- * Wait for a supervisor (`launchd` `KeepAlive`, `systemd`) to start the replacement after a
- * supervised daemon exits. A real cold respawn leaves a gap where no live lock owner exists;
- * spawning a detached daemon inside that gap would steal the lock the supervisor is about to
- * claim. Wake on state-directory events and adopt the owner as soon as it appears; only a
- * bounded absence means the supervisor did not respawn and the caller must launch instead.
+ * Wait out the ownerless gap a supervised cold respawn leaves behind, so the caller never
+ * spawns a detached daemon that would steal the lock the supervisor is about to claim. A
+ * replacement that already serves is adopted here; once a live lock owner appears (or the
+ * bounded gap elapses) this returns `undefined`, and the single readiness wait in
+ * `ensureDaemonRunning` owns the cold start without stacking a second startup budget.
  */
 async function waitForSupervisorReplacement(
   stateDir: string,
   expectedFingerprint: string,
   supervisorWaitMs: number,
-  startupTimeoutMs: number,
 ): Promise<unknown | undefined> {
   const deadline = Date.now() + supervisorWaitMs;
   while (!liveDaemonOwner(stateDir) && Date.now() < deadline) {
@@ -651,10 +650,7 @@ async function waitForSupervisorReplacement(
     }
     await waitForDaemonStateChange(stateDir, Math.min(1_000, remaining));
   }
-  if (!liveDaemonOwner(stateDir)) {
-    return undefined;
-  }
-  return waitForOwnedDaemonReady(stateDir, expectedFingerprint, startupTimeoutMs);
+  return undefined;
 }
 
 export async function ensureDaemonRunning(
@@ -671,7 +667,6 @@ export async function ensureDaemonRunning(
       stateDir,
       expectedFingerprint,
       options.supervisorWaitMs,
-      startupTimeoutMs,
     );
     if (adopted !== undefined) {
       return adopted;
@@ -1802,6 +1797,11 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
       void runtime.drainForStop().then(drained => {
         if (!drained) {
           restartTriggered = false;
+          // Work that settles right at the deferred-drain edge already emitted its idle event
+          // while the restart flag was set; without this retry the pending reload would strand.
+          if (reloadPending && runtime.isIdleForRestart()) {
+            queueMicrotask(maybeSpawnSelfRestart);
+          }
           return;
         }
         return runtime.stop().then(() => process.exit(0));
