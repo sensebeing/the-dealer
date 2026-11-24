@@ -3623,7 +3623,7 @@ test('thread show fails loudly for an unknown thread', async t => {
   assert.match(JSON.parse(err.join('\n')).error, /Unknown thread: missing/);
 });
 
-test('composer emptiness ignores only exact mode placeholders and status chrome', () => {
+test('composer emptiness ignores Antigravity mode placeholders and status chrome', () => {
   for (const preview of ['', 'history', '>', '>   \n────────\nstatus bar']) assert.equal(isOrcaComposerEmpty(preview), true);
   assert.equal(isOrcaComposerEmpty('> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)', 'antigravity'), true);
   assert.equal(isOrcaComposerEmpty('> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)', 'codex'), false);
@@ -3681,7 +3681,9 @@ test('workspace idle inspection scopes composer checks to the terminal the wakeu
   );
 });
 
-test('only exact Antigravity mode placeholders relax the composer draft guard', () => {
+const narrowAntigravityPlaceholder = '> Auto mode: edits & safe commands auto-approved (shif...';
+
+test('only full or ellipsis-truncated official Antigravity mode placeholders relax the draft guard', () => {
   const placeholders = [
     '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
     '> Plan mode: research & plan only (shift+tab to cycle)',
@@ -3690,19 +3692,28 @@ test('only exact Antigravity mode placeholders relax the composer draft guard', 
   ];
   for (const line of placeholders) {
     assert.equal(isAntigravityModePlaceholder(line, 'antigravity'), true, line);
+    for (const ellipsis of ['...', '…']) {
+      const truncated = line.slice(0, -8) + ellipsis;
+      assert.equal(isAntigravityModePlaceholder(truncated, 'antigravity'), true, truncated);
+      assert.equal(isAntigravityModePlaceholder(line + ellipsis, 'antigravity'), false, line + ellipsis);
+    }
   }
-  assert.equal(
-    isAntigravityModePlaceholder('> Auto mode: edits & safe commands auto-approved', 'antigravity'),
-    false,
-    'a changed or truncated hint is an unsent draft, not a placeholder',
-  );
-  assert.equal(isAntigravityModePlaceholder('> unsent draft', 'antigravity'), false);
-  assert.equal(
-    isAntigravityModePlaceholder(placeholders[0], 'claude'),
-    false,
-    'another agent never inherits the Antigravity placeholder vocabulary',
-  );
-  assert.equal(isAntigravityModePlaceholder(placeholders[0], undefined), false);
+  assert.equal(isAntigravityModePlaceholder(narrowAntigravityPlaceholder, 'antigravity'), true);
+  assert.equal(isAntigravityModePlaceholder('> Auto mode: e…', 'antigravity'), true);
+  for (const draft of [
+    '> Auto mode: edits & safe commands auto-approved',
+    '> Auto mode...',
+    '> Auto mode: ...',
+    '> Auto mode: …',
+    '> Auto mode: fix bug...',
+    '> unsent draft',
+  ]) {
+    assert.equal(isAntigravityModePlaceholder(draft, 'antigravity'), false, draft);
+  }
+  for (const otherAgent of ['claude', 'codex', undefined]) {
+    assert.equal(isAntigravityModePlaceholder(placeholders[0], otherAgent), false, String(otherAgent));
+    assert.equal(isAntigravityModePlaceholder(narrowAntigravityPlaceholder, otherAgent), false, String(otherAgent));
+  }
 });
 
 test('a TUI mode placeholder on an empty composer never wedges a bound wave delivery', async t => {
@@ -4690,6 +4701,40 @@ test('a spawned Orca wake waits for the target agent and rendered composer', asy
       assert.equal(terminalSends(state.calls).length, 1);
     }
   }
+});
+
+test('a fresh narrow Antigravity tab delivers one wake on the first flush', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:narrow-placeholder';
+  const { runner: inventory, state } = fakeOrcaWorkspace(root);
+  const runner: CommandRunner = async request => {
+    const output = await inventory(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      state.terminals.at(-1)!.preview = `${narrowAntigravityPlaceholder}\n${'─'.repeat(58)}`;
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'send') {
+      return { stdout: JSON.stringify({ ok: true, result: { send: { accepted: true, prompt: acceptedOrcaPrompt } } }) };
+    }
+    return output;
+  };
+  store.enqueue([alert('narrow-placeholder')], {
+    mailboxId,
+    wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: { workspacePath: root, agent: 'antigravity' } },
+  });
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => service.stop());
+
+  const delivered = await service.flushMailbox(mailboxId);
+  assert.equal(delivered.woke, true, delivered.reason);
+  assert.equal(state.created, 1);
+  assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
+  assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, undefined);
+  assert.equal((await service.flushMailbox(mailboxId)).woke, false);
+  assert.equal(terminalSends(state.calls).length, 1);
+  const sends = sendsTo(state.calls, 'term-new-1');
+  assert.equal(sends.length, 1);
+  assert.match(textOf(sends[0]), /^You have 1 Dealer message\(s\) in stream:narrow-placeholder/);
 });
 
 test('a fresh redrive tab defers until the expected composer appears', async t => {

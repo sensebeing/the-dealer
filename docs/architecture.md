@@ -636,8 +636,10 @@ mail arriving during delivery remains pending. Proven command non-starts and Orc
 with `accepted: false` back off. Unknown outcomes remain fenced across mail arrivals, forced
 flushes and restarts. Root target terminals verify `tui-idle` readiness, an empty composer, and
 the configured agent identity before pointer injection. Antigravity also requires a rendered
-composer prompt when it is the configured agent. Workspace terminal selection and readiness use
-the same reuse candidates. Bound terminal presence has three outcomes. A connected and
+composer prompt when it is the configured agent. Its official mode placeholders count as an empty
+composer even when truncated with an ellipsis in a narrow terminal.
+Workspace terminal selection and readiness use the same reuse candidates.
+Bound terminal presence has three outcomes. A connected and
 writable terminal is `live` and retains its composer gate. A matching terminal that is
 disconnected or read-only is `unusable` and defers recovery with
 `Terminal is disconnected or not writable`. A complete terminal list with
