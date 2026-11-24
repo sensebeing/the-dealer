@@ -185,6 +185,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
   let lastErrorSummary: string | undefined;
   let lastReportedDelayMs: number | undefined;
   let active: Promise<void> | undefined;
+  let wakeQueued = false;
   let settling: Promise<void> | undefined;
   let pollController: AbortController | undefined;
   let stopped = true;
@@ -202,7 +203,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
     if (stopped || nextDelay === undefined) return;
     timer = setTimeout(() => {
       timer = undefined;
-      run();
+      runScheduledPoll();
     }, nextDelay);
     timer.unref();
   };
@@ -237,6 +238,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       return Promise.reject(new Error('Poll source not started'));
     }
     clearSchedule();
+    wakeQueued = false;
     const target = emitter;
     const runController = pollController;
     const signal = runController.signal;
@@ -312,19 +314,26 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       throw error;
     }).finally(() => {
       if (active === run) active = undefined;
-      if (pollController === runController) schedule();
+      if (pollController !== runController || stopped) return;
+      if (wakeQueued) {
+        wakeQueued = false;
+        runScheduledPoll();
+      } else {
+        schedule();
+      }
     });
     active = run;
     return run;
   };
-  const run = () => {
+  const runScheduledPoll = () => {
     if (!active && !stopped) void pollOnce(true).catch(error => config.onError?.(error));
   };
   const triggerWake = () => {
     if (stopped || !emitter) throw new Error('Poll source not started');
     consecutiveFailures = 0;
     clearSchedule();
-    run();
+    if (active) wakeQueued = true;
+    else runScheduledPoll();
   };
   return {
     name,
@@ -339,6 +348,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       if (config.cursorPath && existsSync(config.cursorPath)) cursor = loadCursor();
       emitter = value;
       stopped = false;
+      wakeQueued = false;
       consecutiveFailures = 0;
       clearFailureStatus();
       pollController = new AbortController();
@@ -394,12 +404,13 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
         // Drain the current watermark immediately instead of waiting one full interval.
         const controller = pollController;
         queueMicrotask(() => {
-          if (pollController === controller) run();
+          if (pollController === controller) runScheduledPoll();
         });
       }
     },
     async stop() {
       stopped = true;
+      wakeQueued = false;
       clearSchedule();
       clearFailureStatus();
       // Abort the read-only fetch phase first: a signal-aware poll cancels immediately, and a

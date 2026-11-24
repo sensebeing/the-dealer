@@ -106,7 +106,7 @@ test('explicit saveCursor and advanceItemCursor retain ownership, including rest
   await source.stop();
 });
 
-test('HTTP wake validates origin and method, coalesces concurrent triggers, reports errors and closes', async t => {
+test('HTTP wake validates origin and method, reports errors and closes', async t => {
   const logs = t.mock.method(console, 'error', (_line: string) => {});
   let polls = 0;
   let release!: () => void;
@@ -135,7 +135,6 @@ test('HTTP wake validates origin and method, coalesces concurrent triggers, repo
   assert.equal(polls, 0);
   const response = await fetch(url, { method: 'POST' });
   assert.deepEqual(await response.json(), { ok: true });
-  await fetch(url, { method: 'POST' });
   assert.equal(polls, 1);
   release();
   await source.pollOnce();
@@ -149,6 +148,68 @@ test('HTTP wake validates origin and method, coalesces concurrent triggers, repo
   await assert.rejects(fetch(url));
   await assert.rejects(source.pollOnce(), /not started/);
 });
+
+for (const wakePath of ['source.wake()', 'HTTP POST /wake']) {
+  test(`${wakePath} coalesces wakes during settlement into one follow-up poll`, async t => {
+    const upstream = [1];
+    const polledCursors: number[] = [];
+    const emitted: number[] = [];
+    const firstEmit = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const source = createPollWatermarkSourcePlugin({
+      initialCursor: 0,
+      intervalMs: 0,
+      wake: wakePath === 'HTTP POST /wake' ? {} : undefined,
+      poll: async cursor => {
+        polledCursors.push(cursor);
+        const items = upstream.filter(item => item > cursor);
+        return { items, cursor: items.at(-1) ?? cursor };
+      },
+      toInput: item => ({ ...input, subject: String(item) }),
+    });
+    t.after(async () => {
+      release.resolve();
+      await source.stop();
+    });
+    await source.start({
+      ...emitter([receipt('settled')]),
+      async emit(item) {
+        emitted.push(Number(item.subject));
+        if (item.subject === '1') {
+          firstEmit.resolve();
+          await release.promise;
+        }
+        return { messageId: 'settled', traceId: 'settled', receipts: [receipt('settled')] };
+      },
+    });
+    const active = source.pollOnce();
+    await firstEmit.promise;
+    upstream.push(2);
+    if (wakePath === 'HTTP POST /wake') {
+      const address = source.wakeAddress();
+      assert.ok(address && typeof address === 'object');
+      const url = `http://127.0.0.1:${address.port}/wake`;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const response = await fetch(url, { method: 'POST' });
+        assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), { ok: true });
+      }
+    } else {
+      source.wake();
+      source.wake();
+      source.wake();
+    }
+    assert.deepEqual(polledCursors, [0]);
+    assert.equal(source.getCursor(), 0);
+
+    release.resolve();
+    await active;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(polledCursors, [0, 1]);
+    assert.deepEqual(emitted, [1, 2]);
+    assert.equal(source.getCursor(), 2);
+  });
+}
 
 test('stopping a poll source aborts the fetch signal and drops a legacy page that ignores it', async t => {
   const path = join(directory(t), 'cursor.json');
@@ -193,8 +254,9 @@ test('stopping a poll source aborts the fetch signal and drops a legacy page tha
   assert.equal(readJsonCursorFile(path, 0), 7);
 });
 
-test('stopping a poll source finishes an already-resolved page settlement before resolving', async t => {
+test('stopping a poll source finishes page settlement and drops queued wakes', async t => {
   const saved: number[] = [];
+  let polls = 0;
   let emitStarted!: () => void;
   const started = new Promise<void>(resolve => {
     emitStarted = resolve;
@@ -205,7 +267,10 @@ test('stopping a poll source finishes an already-resolved page settlement before
   });
   const source = createPollWatermarkSourcePlugin<number, number>({
     initialCursor: 0,
-    poll: async () => ({ items: [1], cursor: 1 }),
+    poll: async () => {
+      polls++;
+      return { items: [1], cursor: 1 };
+    },
     toInput: () => input,
     saveCursor: async cursor => { saved.push(cursor); },
   });
@@ -219,6 +284,7 @@ test('stopping a poll source finishes an already-resolved page settlement before
   });
   const polled = source.pollOnce();
   await started;
+  source.wake();
   let stopResolved = false;
   const stopping = source.stop().then(() => {
     stopResolved = true;
@@ -230,6 +296,7 @@ test('stopping a poll source finishes an already-resolved page settlement before
   await stopping;
   await polled;
   assert.equal(stopResolved, true);
+  assert.equal(polls, 1);
   assert.deepEqual(saved, [1]);
   assert.equal(source.getCursor(), 1);
 });
