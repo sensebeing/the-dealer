@@ -740,7 +740,7 @@ async function ledgersFor(options: DealerCliOptions, stateDir: string) {
   }
   const file = join(stateDir, 'config.json');
   const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-  return openStateLedgers(stateDir, savedConfig.executorConfig?.inbox?.inboxPath);
+  return openStateLedgers(stateDir, savedConfig.executorConfig?.inbox?.inboxPath, () => savedConfig.larkNotify);
 }
 
 function replyTargetOrThrow(

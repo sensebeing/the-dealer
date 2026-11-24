@@ -614,9 +614,13 @@ wake-target keys and non-JSON configuration values are rejected.
 
 Mailbox and outbox reads reuse validated snapshots keyed by device, inode, size and modification
 time. A successful write compacts history in the same atomic commit. The mailbox retains the
-200 newest acknowledged items, 100 inactive inbound-only wave threads and 200 inactive settled
-threads eligible for removal. The outbox retains the 200 newest eligible confirmed or superseded
-terminal items. Active custody and unconfirmed deliveries remain in their ledgers. Both stores
+200 newest acknowledged items eligible for pruning, 100 inactive inbound-only one-way wave
+threads and 200 inactive settled threads eligible for removal. The CLI supplies the notifier's
+durable catch-up watermark when Lark is enabled. The mailbox retains every acknowledgement
+above that watermark and every open question route. The outbox preserves the latest
+non-superseded claim for each network and idempotency key, including its original targets and
+replay receipts. It retains the 200 newest other eligible terminal items. Active custody and
+unconfirmed deliveries remain in their ledgers. Both stores
 read the peer ledger without taking its lock. The mailbox retains a route while the outbox could
 project it again, and the outbox retains supersession evidence while an unsettled outbound route
 still depends on it. Retained mailbox items keep their original signed envelope.
@@ -639,10 +643,12 @@ descendant worktrees. Incomplete lineage inventory blocks readiness when that lo
 required. If the bound pane vanishes, its agents and descendants still gate readiness.
 A replacement tab has its own composer. Rotation never resets or writes into a retained session.
 Standing wave worktrees can fast-forward to `origin/main` before a fresh tab launches. Git
-checks cleanliness and local commits, and the driver rechecks sibling terminal claims before
-merging. Sync failures are reported while delivery proceeds. Real Orca inventory probes share
-in-flight reads and reuse completed worktree and terminal snapshots for up to 1.5 seconds and
-1 second respectively. Orca mutations invalidate the affected inventory immediately.
+checks cleanliness and local commits. The driver verifies the current binding, other workspace
+claims and workspace-wide Orca activity before fetching and again before merging. Sync failures
+are reported while delivery proceeds. Advisory slot probes share in-flight reads and reuse
+completed worktree and terminal snapshots for up to 1.5 seconds and 1 second respectively.
+Pointer delivery and retirement use fresh inventories. Orca mutations invalidate affected
+advisory snapshots immediately.
 An already-absent retired terminal settles the retirement, while a
 deterministic Orca refusal (for example a pinned tab) parks the wake target in `deliveryInDoubt`
 for operator reconciliation instead of retrying forever. Any human draft or unconfirmed Turn Pilot recommendation holds mail

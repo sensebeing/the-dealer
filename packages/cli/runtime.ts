@@ -501,7 +501,7 @@ export class DealerNodeRuntime {
       }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config, { executorOverrides: this.options.executorOverrides, registry: this.registry });
-      const { mailbox, outbox } = openStateLedgers(this.stateDir, this.config.executorConfig.inbox?.inboxPath);
+      const { mailbox, outbox } = openStateLedgers(this.stateDir, this.config.executorConfig.inbox?.inboxPath, () => this.config.larkNotify);
       this.mailbox = mailbox;
       this.outbox = outbox;
       this.outbox.upgradeLegacyStore();

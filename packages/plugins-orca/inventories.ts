@@ -43,9 +43,10 @@ function readInventory(
   request: CommandRequest,
   ttlMs: number,
   workspacePath?: string,
+  advisory = false,
 ): Promise<string> {
   const run = (request: CommandRequest) => checkedCommand(runner, request).then(result => result.stdout);
-  if (runner !== runCommand) return run(request);
+  if (!advisory || runner !== runCommand) return run(request);
 
   const { command, signal } = request;
   if (signal?.aborted) return Promise.reject(new CommandNotStartedError(signal.reason));
@@ -74,18 +75,18 @@ function readInventory(
   return waitForProbe(entry.stdout, signal);
 }
 
-export function readOrcaWorktreePs(runner: CommandRunner, command: string, cwd?: string, signal?: AbortSignal): Promise<string> {
+export function readOrcaWorktreePs(runner: CommandRunner, command: string, cwd?: string, signal?: AbortSignal, advisory = false): Promise<string> {
   return readInventory(runner, {
     command, args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'], cwd, signal,
-  }, 1_500);
+  }, 1_500, undefined, advisory);
 }
 
 export function readOrcaTerminalList(
-  runner: CommandRunner, command: string, workspacePath: string, cwd: string, signal?: AbortSignal,
+  runner: CommandRunner, command: string, workspacePath: string, cwd: string, signal?: AbortSignal, advisory = false,
 ): Promise<string> {
   return readInventory(runner, {
     command, args: ['terminal', 'list', '--worktree', `path:${workspacePath}`, '--json'], cwd, signal,
-  }, 1_000, workspaceKey(workspacePath));
+  }, 1_000, advisory ? workspaceKey(workspacePath) : undefined, advisory);
 }
 
 /** Drop inventory before a write begins and after it settles, including ambiguous failures. */

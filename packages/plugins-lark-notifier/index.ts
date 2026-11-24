@@ -54,6 +54,15 @@ function readState(path: string): NotifyState {
   }
   return state as unknown as NotifyState;
 }
+
+function notifyStatePath(stateDir: string, config: LarkNotifyConfig): string {
+  return config.statePath ?? join(stateDir, 'lark-notify.json');
+}
+
+/** Read the committed cursor used for mailbox catch-up, including when the daemon is offline. */
+export function readLarkConsumedSequence(stateDir: string, config?: LarkNotifyConfig): number | undefined {
+  return config?.enabled ? readState(notifyStatePath(stateDir, config)).cursorSequence : undefined;
+}
 function prune<T>(entries: Record<string, T>, timestamp: (value: T) => string): Record<string, T> {
   return Object.fromEntries(Object.entries(entries).reverse().sort((a, b) => timestamp(b[1]).localeCompare(timestamp(a[1]))).slice(0, 1024));
 }
@@ -78,7 +87,7 @@ export class LarkMailboxNotifier {
   constructor(options: LarkMailboxNotifierOptions) {
     validateLarkNotify(options.config);
     this.options = { ...options, config: structuredClone(options.config) };
-    this.statePath = options.config.statePath ?? join(options.stateDir, 'lark-notify.json');
+    this.statePath = notifyStatePath(options.stateDir, options.config);
     this.state = readState(this.statePath);
     this.boundMailboxes = [...(options.defaultBoundMailboxes ?? [])];
   }

@@ -12,6 +12,7 @@ import {
   validateTopicBindings, validateLarkNotify, initProjectScaffold,
 } from '../packages/index.ts';
 import type { MessageEnvelope, CommandRequest, CommandRunner } from '../packages/index.ts';
+import { openStateLedgers } from '../packages/cli/ledgers.ts';
 
 function directory(t: TestContext): string {
   const path = mkdtempSync(join(tmpdir(), 'dealer-requests-'));
@@ -296,7 +297,9 @@ test('Lark auth, personalized markdown, root threading, deleted root fallback an
 
 test('Lark filtering advances cursor and failed delivery fences later items until retry', async t => {
   const root = directory(t);
-  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const config = { enabled: true, target: { chatId: 'chat' }, excludeKinds: ['excluded'], retryBaseMs: 60000,
+    statePath: join(root, 'mirror-cursor.json') };
+  const { mailbox: store } = openStateLedgers(root, undefined, () => config);
   const calls: CommandRequest[] = [];
   let fail = true;
   let errors = 0;
@@ -307,22 +310,30 @@ test('Lark filtering advances cursor and failed delivery fences later items unti
   };
   store.enqueue([envelope('excluded', { kind: 'excluded' }), envelope('first'), envelope('second')]);
   const options = { store, stateDir: root, localNodeId: 'local', localMember: 'bob', commandRunner: runner,
-    config: { enabled: true, target: { chatId: 'chat' }, excludeKinds: ['excluded'], retryBaseMs: 60000 }, onError: () => { errors++; } };
+    config, onError: () => { errors++; } };
   const notifier = new LarkMailboxNotifier(options);
   notifier.start();
   await notifier.flush();
   assert.equal(errors, 1);
   assert.equal(calls.length, 1);
-  assert.equal(JSON.parse(readFileSync(join(root, 'lark-notify.json'), 'utf8')).cursorSequence, 0);
+  assert.equal(JSON.parse(readFileSync(config.statePath, 'utf8')).cursorSequence, 0);
   const idempotency = argument(calls[0], '--idempotency-key');
   await notifier.stop();
+  const { mailbox: offline } = openStateLedgers(root, undefined, () => config);
+  offline.enqueue(Array.from({ length: 201 }, (_, index) => envelope('later-' + index, { kind: 'excluded' })));
+  const lease = offline.check();
+  offline.ack(lease.deliveryId!);
+  assert.ok(offline.list({ includeAcked: true }).items.some(item => item.id === 'first'));
+
   fail = false;
-  const restarted = new LarkMailboxNotifier(options);
+  const restarted = new LarkMailboxNotifier({ ...options, store: offline });
   restarted.start();
   await restarted.flush();
   assert.equal(argument(calls[1], '--idempotency-key'), idempotency);
   assert.equal(calls.length, 3);
-  assert.equal(JSON.parse(readFileSync(join(root, 'lark-notify.json'), 'utf8')).cursorSequence, 2);
+  assert.equal(JSON.parse(readFileSync(config.statePath, 'utf8')).cursorSequence, 203);
+  offline.upsertWakeTarget('passive', { pendingWake: false });
+  assert.equal(offline.list({ includeAcked: true }).ackedCount, 200);
   await restarted.stop();
 });
 

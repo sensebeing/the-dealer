@@ -48,16 +48,17 @@ export type {
 /** The same lookup governs read-only replay and atomic creation under the store lock. */
 function highestKeyedObligation(items: readonly OutboxItem[], networkId: string, key: string, minVersion: number): OutboxItem | undefined {
   let existing: OutboxItem | undefined;
-  let highestVersion = minVersion;
   for (const item of items) {
     if (item.supersededById !== undefined || item.networkId !== networkId || item.envelope.idempotencyKey !== key) continue;
-    const version = envelopeClaimVersion(item.envelope) ?? 0;
-    if (version >= highestVersion) {
-      existing = item;
-      highestVersion = version;
-    }
+    existing = selectKeyedWinner(existing, item, minVersion);
   }
   return existing;
+}
+
+function selectKeyedWinner(previous: OutboxItem | undefined, candidate: OutboxItem, minVersion = 0): OutboxItem | undefined {
+  const version = envelopeClaimVersion(candidate.envelope) ?? 0;
+  const floor = previous ? envelopeClaimVersion(previous.envelope) ?? 0 : minVersion;
+  return version >= floor ? candidate : previous;
 }
 
 function keyedClaim(input: OutboxClaimInput): { key: string; version: number } {
@@ -328,8 +329,18 @@ function compactOutboxState(
   if (state.items.length <= MAX_RETAINED_TERMINAL_OUTBOX) return [];
   const terminal = state.items.filter(isTerminalHistory);
   if (terminal.length <= MAX_RETAINED_TERMINAL_OUTBOX) return [];
+  const keyedWinners = new Map<string, OutboxItem>();
+  for (const item of state.items) {
+    const key = item.envelope.idempotencyKey;
+    if (!key || item.supersededById !== undefined) continue;
+    const identity = netKey(item.networkId, key);
+    const winner = selectKeyedWinner(keyedWinners.get(identity), item);
+    if (winner) keyedWinners.set(identity, winner);
+  }
+  const retainedClaims = new Set(keyedWinners.values());
   const unsettled = terminal.some(item => item.supersededById !== undefined) ? readUnsettledOutboundKeys?.() : undefined;
   const expired = terminal
+    .filter(item => !retainedClaims.has(item))
     .filter(item => item.supersededById === undefined || !unsettled?.has(netKey(item.networkId, item.id)))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
     .slice(MAX_RETAINED_TERMINAL_OUTBOX);

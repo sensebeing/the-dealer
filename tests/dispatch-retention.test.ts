@@ -113,6 +113,22 @@ test('mailbox acknowledgement caps historical items and one-way threads while pr
   assert.ok(mailbox.getThread(history[105].id));
 });
 
+test('an acknowledged wave question retains its reply route and session after later alerts', t => {
+  const { mailbox } = stores(t);
+  const question = envelope('old-question', {
+    semantic: { type: 'question', threadId: 'old-question', replyMailbox: 'terminal:peer' },
+  });
+  mailbox.enqueue([question], { mailboxId: 'terminal:existing' });
+  mailbox.ack(mailbox.check({ mailboxId: 'terminal:existing' }).deliveryId!, 'terminal:existing');
+  mailbox.enqueue(Array.from({ length: 205 }, (_, index) => envelope('new-wave-' + index)));
+  const disk = JSON.parse(readFileSync(mailbox.path, 'utf8'));
+  disk.threads['inbound:old-question'].updatedAt = old;
+  writeFileAtomically(mailbox.path, JSON.stringify(disk));
+  mailbox.ack(mailbox.check().deliveryId!);
+  assert.equal(mailbox.resolveReplyTarget(question.id)?.targetMailbox, 'terminal:peer');
+  assert.equal(mailbox.resolveReplyTarget(question.id)?.localMailbox, 'terminal:existing');
+});
+
 test('first mailbox write compacts old settled threads as whole routes and preserves active ones', t => {
   const { mailbox } = stores(t);
   mailbox.enqueue([envelope('protected')]);

@@ -170,6 +170,8 @@ export interface MailboxStoreOptions {
   lockDir?: string;
   /** Peer snapshot used to retain thread routes that outbox reconciliation could restore. */
   outbox?: OutboxStore;
+  /** Highest item sequence durably consumed by a catch-up reader, if one is configured. */
+  readConsumedSequence?: () => number | undefined;
 }
 
 export interface MailboxEnqueueOptions {
@@ -952,11 +954,13 @@ function migrateLegacyItem(item: LegacyInboxItem, sequence: number): MailboxItem
   };
 }
 
-function compactMailboxState(state: MailboxFileState, outbox?: OutboxStore): void {
+function compactMailboxState(state: MailboxFileState, retention: Pick<MailboxStoreOptions, 'outbox' | 'readConsumedSequence'>): void {
   if (state.items.length > MAX_RETAINED_ACKED_ITEMS) {
     const acked = state.items.filter(item => item.status === 'acked');
     if (acked.length > MAX_RETAINED_ACKED_ITEMS) {
-      const expired = new Set(acked.sort((a, b) => b.sequence - a.sequence).slice(MAX_RETAINED_ACKED_ITEMS));
+      const consumed = retention.readConsumedSequence?.() ?? Infinity;
+      const expired = new Set(acked.filter(item => item.sequence <= consumed)
+        .sort((a, b) => b.sequence - a.sequence).slice(MAX_RETAINED_ACKED_ITEMS));
       state.items = state.items.filter(item => !expired.has(item));
     }
   }
@@ -993,15 +997,17 @@ function compactMailboxState(state: MailboxFileState, outbox?: OutboxStore): voi
     if (records.every(record => record.state === 'settled')) {
       settled.push(group);
     } else if (records.every(record =>
-      record.direction === 'inbound' && record.state === 'open' && record.kind.startsWith('wave.'))) {
+      record.direction === 'inbound' && record.state === 'open' && record.kind.startsWith('wave.') &&
+      record.envelope && record.envelope.replyToId === undefined &&
+      (record.envelope.semantic === undefined || record.envelope.semantic.type === 'message'))) {
       wave.push(group);
     }
   }
   if (wave.length <= MAX_RETAINED_WAVE_THREADS && settled.length <= MAX_RETAINED_SETTLED_THREADS) return;
   // A surviving outbox projection could recreate an open leg after its settlement was pruned.
   const outboxThreads = new Set<string>();
-  if (outbox) {
-    for (const item of readOutboxThreadOwners(outbox).items) {
+  if (retention.outbox) {
+    for (const item of readOutboxThreadOwners(retention.outbox).items) {
       outboxThreads.add(netKey(item.networkId, envelopeThreadId(item.envelope)));
     }
   }
@@ -1150,6 +1156,7 @@ export class MailboxStore {
   readonly lockDir: string;
   private readonly legacyInboxPath?: string;
   private readonly outbox?: OutboxStore;
+  private readonly readConsumedSequence?: MailboxStoreOptions['readConsumedSequence'];
   private readonly events = new EventEmitter();
   private readonly snapshot = new LedgerSnapshot<MailboxFileState>();
 
@@ -1160,6 +1167,7 @@ export class MailboxStore {
       : undefined;
     this.lockDir = resolve(options.lockDir ?? `${this.path}.lock`);
     this.outbox = options.outbox;
+    this.readConsumedSequence = options.readConsumedSequence;
     this.events.setMaxListeners(0);
     this.migrateLegacyInbox();
   }
@@ -1192,7 +1200,7 @@ export class MailboxStore {
   }
 
   private save(state: MailboxFileState): void {
-    compactMailboxState(state, this.outbox);
+    compactMailboxState(state, { outbox: this.outbox, readConsumedSequence: this.readConsumedSequence });
     this.snapshot.invalidate();
     writeFileAtomically(this.path, JSON.stringify(state));
   }

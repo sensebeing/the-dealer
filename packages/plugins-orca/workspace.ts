@@ -37,18 +37,18 @@ export async function findOrcaWorktreeByName(
 export async function tryFastForwardCleanWorktree(
   runner: CommandRunner,
   workspacePath: string,
-  canMerge?: () => boolean,
+  canMerge: () => Promise<boolean>,
 ): Promise<void> {
   const git = (args: string[], signal?: AbortSignal) => checkedCommand(runner, {
     command: 'git', args: ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], signal,
   });
   const isClean = async () => (await git(['status', '--porcelain', '--untracked-files=all'])).stdout.trim() === '';
-  if (!(await isClean())) return;
+  if (!(await canMerge()) || !(await isClean())) return;
   await git(['fetch', '--quiet', 'origin', 'main'], AbortSignal.timeout(8_000));
   if ((await git(['rev-list', '--count', 'origin/main..HEAD'])).stdout.trim() !== '0') return;
   if ((await git(['rev-list', '--count', 'HEAD..origin/main'])).stdout.trim() === '0') return;
   // Fetch can take seconds, during which another slot or a local edit can appear.
-  if (!(await isClean()) || canMerge?.() === false) return;
+  if (!(await isClean()) || !(await canMerge())) return;
   await git(['merge', '--ff-only', '--quiet', 'origin/main'], AbortSignal.timeout(8_000));
 }
 
@@ -77,6 +77,8 @@ interface OrcaProbeOptions {
 }
 
 export interface OrcaWorkspaceIdleOptions extends OrcaProbeOptions {
+  /** Cached inventories may inform readiness displays only. */
+  advisory?: boolean;
   /**
    * The terminal this wakeup will write into. `null` means delivery creates an independent session
    * tab first, so retained tabs must never gate the wakeup; a handle restricts composer inspection
@@ -93,6 +95,10 @@ export interface OrcaWorkspaceIdleOptions extends OrcaProbeOptions {
   /** Preferred target agent when the bound terminal is gone and a rebind picks a replacement. */
   agent?: SupportedOrcaAgent;
   excludedHandles?: ReadonlySet<string>;
+  /** Delivery must still be addressing the exact, live terminal that it selected. */
+  requireTarget?: boolean;
+  /** Workspace changes require unscoped activity checks and at most the slot's own tab. */
+  exclusiveTerminal?: { handle?: string; paneKey?: string };
 }
 
 /** Reuse candidates in the same order terminal resolution falls back through them. */
@@ -135,7 +141,7 @@ export async function checkOrcaWorkspaceIdle(
   // A removed workspace must be reported as "Workspace not found" from the global
   // inventory before another command can spawn inside it.
   const inventoryCwd = runner === runCommand && !existsSync(cwd) ? undefined : cwd;
-  const raw = JSON.parse(await readOrcaWorktreePs(runner, command, inventoryCwd, signal));
+  const raw = JSON.parse(await readOrcaWorktreePs(runner, command, inventoryCwd, signal, options?.advisory));
   const inventory = raw.result;
   if (raw.ok !== true || !inventory || inventory.truncated || !Array.isArray(inventory.worktrees)) {
     if (options?.throwOnProbeError) throw new Error('Incomplete workspace inventory');
@@ -145,6 +151,7 @@ export async function checkOrcaWorkspaceIdle(
     path: string;
     worktreeId: string;
     childWorktreeIds?: string[];
+    liveTerminalCount?: number;
     unverifiableTerminalCount?: number;
     agents?: { state?: string; paneKey?: string; parentPaneKey?: string | null }[];
   };
@@ -168,7 +175,7 @@ export async function checkOrcaWorkspaceIdle(
   const terminalInventories = new Map<string, Promise<OrcaTerminalRow[] | undefined>>();
   const terminalHandlesByWorktreeId = new Map<string, ReadonlySet<string>>();
   const fetchWorktreeTerminals = async (row: Workspace): Promise<OrcaTerminalRow[] | undefined> => {
-    const terminals = JSON.parse(await readOrcaTerminalList(runner, command, row.path, cwd, signal));
+    const terminals = JSON.parse(await readOrcaTerminalList(runner, command, row.path, cwd, signal, options?.advisory));
     if (terminals.ok !== true || terminals.result?.truncated || !Array.isArray(terminals.result?.terminals)) {
       return undefined;
     }
@@ -251,12 +258,23 @@ export async function checkOrcaWorkspaceIdle(
     ? String(targetTerm.handle)
     : typeof options?.targetTerminalHandle === 'string' ? options.targetTerminalHandle.trim() : undefined;
   const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
+  if (options?.exclusiveTerminal) {
+    const { handle, paneKey } = options.exclusiveTerminal;
+    if (
+      !Array.isArray(root.childWorktreeIds) ||
+      (root.liveTerminalCount !== undefined &&
+        root.liveTerminalCount !== observableHandles.filter(terminal => terminal.connected === true).length) ||
+      observableHandles.length > 1 ||
+      observableHandles.some(terminal => String(terminal.handle) !== handle && !matchesPane(terminal, paneKey))
+    ) return notIdle();
+  }
   const eligibleObservableHandles = observableHandles.filter(canUse);
   const rootTarget = rotating || missingTargetPane
     ? null
     : targetTerm ? String(targetTerm.handle) : options?.targetTerminalHandle;
   const targetPresent =
     typeof rootTarget === 'string' && eligibleObservableHandles.some((t) => String(t.handle) === rootTarget);
+  if (options?.requireTarget && !targetPresent) return notIdle();
   const reuseHandles =
     typeof rootTarget === 'string' && !targetPresent
       ? new Set(reusableTerminalCandidates(eligibleObservableHandles, options?.agent).map((t) => String(t.handle)))
@@ -437,6 +455,9 @@ export async function checkOrcaWorkspaceIdle(
     }
     return notIdle();
   }
+  if (options?.requireTarget && runner === runCommand && typeof rootTarget === 'string') {
+    return checkOrcaTerminalComposer(runner, command, rootTarget, cwd, signal, true);
+  }
   return { idle: true, reason: undefined };
 }
 
@@ -535,6 +556,20 @@ export async function readOrcaTerminal(
   return undefined;
 }
 
+async function checkOrcaTerminalComposer(
+  runner: CommandRunner, command: string, terminalHandle: string, cwd?: string, signal?: AbortSignal,
+  requirePreview = false,
+): Promise<OrcaIdleResult> {
+  const terminal = await readOrcaTerminal(runner, command, terminalHandle, cwd, signal);
+  if (terminal && (terminal.connected !== true || terminal.writable === false))
+    return { idle: false, reason: 'Terminal is disconnected or not writable' };
+  if (requirePreview && typeof terminal?.preview !== 'string')
+    return { idle: false, reason: 'Terminal composer is unverifiable' };
+  if (typeof terminal?.preview === 'string' && !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity))
+    return { idle: false, reason: 'Terminal composer has unsent draft' };
+  return { idle: true };
+}
+
 /** Every terminal-only target receives the same composer protection as workspace targets. */
 export async function probeOrcaTerminalIdle(
   runner: CommandRunner,
@@ -542,21 +577,15 @@ export async function probeOrcaTerminalIdle(
   terminalHandle: string,
   cwd?: string,
   signal?: AbortSignal,
-  options?: OrcaProbeOptions,
+  options?: OrcaProbeOptions & { verifyComposerLast?: boolean },
 ): Promise<OrcaIdleResult> {
   try {
-    const terminal = await readOrcaTerminal(runner, command, terminalHandle, cwd, signal);
-    if (terminal && (terminal.connected !== true || terminal.writable === false))
-      return {
-        idle: false,
-        reason: 'Terminal is disconnected or not writable',
-      };
-    if (
-      typeof terminal?.preview === 'string' &&
-      !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
-    )
-      return { idle: false, reason: 'Terminal composer has unsent draft' };
+    const composer = await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal);
+    if (!composer.idle) return composer;
     const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal, options);
+    if (result.idle && options?.verifyComposerLast && runner === runCommand) {
+      return await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal, true);
+    }
     return result.idle
       ? result
       : {
@@ -798,8 +827,9 @@ export async function inspectOrcaWorkspaceTerminal(
   terminalHandle?: string,
   signal?: AbortSignal,
   preferredPaneKey?: string,
+  advisory = false,
 ): Promise<'live' | 'unusable' | 'absent'> {
-  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal));
+  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal, advisory));
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
@@ -821,8 +851,9 @@ export async function isOrcaWorkspaceTerminalLive(
   terminalHandle?: string,
   signal?: AbortSignal,
   preferredPaneKey?: string,
+  advisory = false,
 ): Promise<boolean> {
-  return (await inspectOrcaWorkspaceTerminal(runner, command, cwd, terminalHandle, signal, preferredPaneKey)) === 'live';
+  return (await inspectOrcaWorkspaceTerminal(runner, command, cwd, terminalHandle, signal, preferredPaneKey, advisory)) === 'live';
 }
 
 /** Read-only terminal selection: callers must fence the returned launch plan before executing it. */
