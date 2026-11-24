@@ -625,7 +625,7 @@ class OrcaWakeDelivery {
     const { mailboxId, hasPendingWave } = context;
     try {
       const preview: MailboxCheckResult = { mailboxId, deliveryId: null, redelivered: false, newerQueuedCount: 0, items: [] };
-      const { target, excludedHandles } = this.excludeClaimedTerminal(
+      const { target, excludedHandles, dedicatedTab } = this.scopeWakeTarget(
         mailboxId, readOrcaWakeTarget(context.target), hasPendingWave ? undefined : preview,
       );
       if (hasPendingWave) {
@@ -648,7 +648,7 @@ class OrcaWakeDelivery {
 
       const idle = !this.idleCheck && target.driver === 'orca-run'
         ? await this.probeOrcaRunActivity(target, command, excludedHandles)
-        : await this.authoritativeIdle(target, preview, this.needsDedicatedTab(mailboxId, target), excludedHandles, true);
+        : await this.authoritativeIdle(target, preview, dedicatedTab, excludedHandles, true);
       if (!idle.idle && idle.reason === 'Workspace not found' && !this.idleCheck &&
         target.driver === 'orca-terminal' && target.autoCreateWorkspace === true) {
         if (!target.repoRoot?.trim()) {
@@ -780,8 +780,9 @@ class OrcaWakeDelivery {
     return true;
   }
 
-  private excludeClaimedTerminal(mailboxId: string, target: OrcaWakeTarget, preview?: MailboxCheckResult) {
-    if (target.driver !== 'orca-terminal') return { target, excludedHandles: new Set<string>() };
+  private scopeWakeTarget(mailboxId: string, target: OrcaWakeTarget, preview?: MailboxCheckResult) {
+    if (target.driver !== 'orca-terminal') return { target, excludedHandles: new Set<string>(), dedicatedTab: false };
+    const dedicatedTab = this.needsDedicatedTab(mailboxId, target);
     const { handles: excludedHandles, paneClaimed } = claimedOrcaTerminals(this.store, mailboxId, target);
     const hasSession = Boolean(target.sessionId?.trim());
     const claimedHandle = target.terminalHandle && excludedHandles.has(target.terminalHandle);
@@ -789,21 +790,17 @@ class OrcaWakeDelivery {
     // Rotation opens a different conversation, and pane-only slots can take an independent tab.
     if ((claimedHandle && (!hasSession || (preview && needsSessionRotation(target, preview)))) ||
       (!target.terminalHandle && !hasSession && paneClaimed)) {
-      return { target: { ...target, terminalHandle: undefined, paneKey: undefined }, excludedHandles };
+      return { target: { ...target, terminalHandle: undefined, paneKey: undefined }, excludedHandles, dedicatedTab };
     }
-    return { target, excludedHandles };
+    return { target, excludedHandles, dedicatedTab };
   }
 
   async run(context: WakeupDriverContext): Promise<WakeupDriverOutcome> {
     const { mailboxId, preview } = context;
     let activeRevision = context.target.bindingRevision ?? 0;
     try {
-      let target = readOrcaWakeTarget(context.target);
+      let { target, excludedHandles, dedicatedTab } = this.scopeWakeTarget(mailboxId, readOrcaWakeTarget(context.target), preview);
       activeRevision = target.bindingRevision ?? 0;
-      let scoped = this.excludeClaimedTerminal(mailboxId, target, preview);
-      target = scoped.target;
-      let excludedHandles = scoped.excludedHandles;
-      let dedicatedTab = this.needsDedicatedTab(mailboxId, target);
       let idle = await this.authoritativeIdle(target, preview, dedicatedTab, excludedHandles);
       // A standing receiver-managed workspace is provisioned only when the authoritative probe
       // proves it missing; a healthy workspace never pays for an inventory subprocess.
@@ -825,10 +822,7 @@ class OrcaWakeDelivery {
           if (updated.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
           target = readOrcaWakeTarget(updated.target);
           activeRevision = target.bindingRevision ?? 0;
-          scoped = this.excludeClaimedTerminal(mailboxId, target, preview);
-          target = scoped.target;
-          excludedHandles = scoped.excludedHandles;
-          dedicatedTab = this.needsDedicatedTab(mailboxId, target);
+          ({ target, excludedHandles, dedicatedTab } = this.scopeWakeTarget(mailboxId, target, preview));
         }
         idle = await this.authoritativeIdle(target, preview, dedicatedTab, excludedHandles);
       }
@@ -860,7 +854,7 @@ class OrcaWakeDelivery {
   }
 
   private needsDedicatedTab(mailboxId: string, target: OrcaWakeTarget): boolean {
-    if (isDedicatedSpawn(target) || target.rotateAfterWaves !== undefined) return true;
+    if (target.paneKey?.trim() || isDedicatedSpawn(target) || target.rotateAfterWaves !== undefined) return true;
     if (!mailboxId.startsWith('stream:')) return false;
     return baseStreamKeyOf(mailboxId.slice('stream:'.length)) !== undefined ||
       this.store.listWakeTargets().some(item => baseStreamKeyOf(item.mailboxId) === mailboxId);
@@ -885,7 +879,7 @@ class OrcaWakeDelivery {
     if (needsSessionRotation(target, preview)) return { kind: 'rotate' };
     if (!workspacePath) return { kind: 'reuse' };
     const { terminalHandle, paneKey } = target;
-    const exclusive = dedicatedTab || Boolean(target.sessionId?.trim() || paneKey?.trim());
+    const exclusive = dedicatedTab || Boolean(target.sessionId?.trim());
     if (!terminalHandle && !paneKey) {
       return exclusive ? { kind: 'spawn-unbound' } : { kind: 'reuse' };
     }

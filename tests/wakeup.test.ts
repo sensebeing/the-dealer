@@ -5376,6 +5376,24 @@ test('a restored pane does not rebind while its claimed Orca terminal reappears'
   assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, restored.handle);
 });
 
+test('a pane-only Orca binding opens its own tab when a sibling owns that pane', async t => {
+  const { store, mailboxId, terminal, driverConfig, runner, state } = orcaSessionRecoveryFixture(t, 'stream:recover');
+  const unrelated = { ...terminal, handle: 'term-unrelated', tabId: 'unrelated' };
+  state.terminals = [terminal, unrelated];
+  store.upsertWakeTarget(mailboxId, { driverConfig: { ...driverConfig, terminalHandle: undefined, sessionId: undefined } });
+  store.upsertWakeTarget('stream:sibling', { driver: 'orca-terminal', driverConfig });
+  const { service } = startSlotProbeService(t, store, runner);
+  store.enqueue([alert('claimed-pane-only')], { mailboxId });
+
+  const delivered = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(delivered.woke, true, delivered.reason);
+  assert.equal(state.created, 1);
+  assert.equal(sendsTo(state.calls, terminal.handle).length, 0);
+  assert.equal(sendsTo(state.calls, unrelated.handle).length, 0);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, 'term-new-1');
+});
+
 for (const [name, availability] of [
   ['disconnected', { connected: false }],
   ['read-only', { writable: false }],
@@ -5430,9 +5448,11 @@ for (const { name, pendingTopology, reason, sessionOnly } of [
     reason: 'Workspace terminal verdict is not settled' },
   { name: 'live terminal count', pendingTopology: { liveTerminalCount: 1 },
     reason: 'Workspace terminals are still reattaching' },
-  { name: 'bound pane', pendingTopology: { agents: [{ state: 'done', paneKey: 'wave:root' }] },
+  { name: 'bound pane', pendingTopology: { agents: [{ state: 'done', paneKey: 'wave:root', hasLivePty: true }] },
     reason: 'Bound terminal agent is still active or reattaching' },
   { name: 'bound address', pendingTopology: { agents: [{ state: 'done', address: 'term-wave', hasLivePty: true }] },
+    reason: 'Bound terminal agent is still active or reattaching' },
+  { name: 'bound active agent', pendingTopology: { agents: [{ state: 'working', address: 'term-wave' }] },
     reason: 'Bound terminal agent is still active or reattaching' },
   { name: 'unmounted agent PTY', pendingTopology: { agents: [{ state: 'done', hasLivePty: true }] },
     reason: 'Workspace terminals are still reattaching' },
@@ -5544,7 +5564,7 @@ for (const [agent, envKey, resumeCommand] of [
     const root = directory(t);
     const workspacePath = join(root, 'sleeping');
     const { runner, state } = fakeOrcaWorkspace(workspacePath);
-    state.agents = [{ state: 'done', paneKey: 'tab:leaf', address: 'term-origin', hasLivePty: false }];
+    state.agents = [{ state: 'done', paneKey: 'tab:leaf', address: 'term-origin' }];
     state.terminalVerdict = 'none';
     state.liveTerminalCount = 0;
     const runtime = await makeNode(t, root, 'self', { commandRunner: runner });

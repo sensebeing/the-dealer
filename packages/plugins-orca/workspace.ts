@@ -289,7 +289,7 @@ export async function checkOrcaWorkspaceIdle(
     const presence = classifyOrcaTerminalPresence(handles, retiringHandle, retiringPaneKey);
     if (presence === 'live') return notIdle('Bound terminal is still live');
     if (presence === 'unusable') return notIdle('Terminal is disconnected or not writable');
-    if (agents.some(agent => agent.hasLivePty !== false &&
+    if (agents.some(agent => (agent.hasLivePty === true || agent.state !== 'done') &&
       ((retiringPaneKey && agent.paneKey === retiringPaneKey) || (retiringHandle && agent.address === retiringHandle)))) {
       return notIdle('Bound terminal agent is still active or reattaching');
     }
