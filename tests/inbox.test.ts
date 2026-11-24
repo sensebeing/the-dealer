@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -292,8 +292,9 @@ test('topic defaults, P2P delivery and thread reverse routes converge end to end
   );
   await assert.rejects(bob.linkProject(conflicting), /Conflicting defaultExecutor for topic: triage/);
   assert.equal(bob.config.projects.length, 1);
+  // Each fixture uses its own swarm even when the same test runs in another process.
   for (const runtime of [alice, bob]) {
-    await runtime.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+    await runtime.mountNetwork({ networkId: 'team', passphrase: root });
   }
   const deadline = Date.now() + 5000;
   while (!alice.node.listPeers().length || !bob.node.listPeers().length) {
@@ -472,22 +473,38 @@ test('dealer help exposes structured usage', async () => {
   assert.match(value.commands.queue, /queue status/);
 });
 
-test('offline node status reports zero queue counts without initializing an empty state directory', async t => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'dealer-node-status-empty-'));
-  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+async function observeOffline(stateDir: string, args: string[]) {
   const stdout: string[] = [];
   const stderr: string[] = [];
-  const code = await runDealerCli(['node', 'status', '--json'], {
+  const code = await runDealerCli([...args, '--json'], {
     stateDir, stdout: line => stdout.push(line), stderr: line => stderr.push(line),
   });
-  assert.equal(code, 0, stderr.join('\n'));
-  assert.deepEqual(JSON.parse(stdout[0]).queues, {
+  return { code, value: JSON.parse((code === 0 ? stdout : stderr)[0]) };
+}
+
+const offlineObservations = [
+  ['queue', 'status'], ['inbox', 'list'], ['inbox', 'check', '--peek'], ['thread', 'list'], ['thread', 'show', 'any-thread'],
+];
+
+test('offline observations return empty results without initializing a state directory', async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'dealer-node-status-empty-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const status = await observeOffline(stateDir, ['node', 'status']);
+  assert.equal(status.code, 0);
+  assert.deepEqual(status.value.queues, {
     activeMailboxes: 0, queuedItems: 0, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
   });
+  const results = [];
+  for (const args of offlineObservations) {
+    const result = await observeOffline(stateDir, args);
+    assert.equal(result.code, 0, args.join(' '));
+    results.push(result.value);
+  }
+  assert.deepEqual([results[0].queues, results[1].items, results[2].items, results[3], results[4]], [[], [], [], [], null]);
   assert.equal(existsSync(join(stateDir, 'mailbox.sqlite')), false);
 });
 
-test('offline node status includes messages from the configured legacy inbox', async t => {
+test('offline observations report migration required without changing the configured legacy inbox', async t => {
   const stateDir = mkdtempSync(join(tmpdir(), 'dealer-node-status-legacy-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const inboxPath = join(stateDir, 'custom-inbox.json');
@@ -497,15 +514,49 @@ test('offline node status includes messages from the configured legacy inbox', a
     items: [{ ...message, topic: message.kind, receivedAt: message.createdAt, status: 'unread' }],
   }));
   writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ executorConfig: { inbox: { inboxPath } } }));
-  const stdout: string[] = [];
-  const stderr: string[] = [];
-  const code = await runDealerCli(['node', 'status', '--json'], {
-    stateDir, stdout: line => stdout.push(line), stderr: line => stderr.push(line),
+  const original = readFileSync(inboxPath);
+  const status = await observeOffline(stateDir, ['node', 'status']);
+  assert.equal(status.code, 0);
+  assert.deepEqual(status.value.queues, {
+    activeMailboxes: 0, queuedItems: 0, leasedItems: 0, pendingWakes: 0, fencedTargets: 0, migrationRequired: true,
   });
-  assert.equal(code, 0, stderr.join('\n'));
-  assert.deepEqual(JSON.parse(stdout[0]).queues, {
-    activeMailboxes: 1, queuedItems: 1, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
-  });
+  for (const args of offlineObservations) {
+    const result = await observeOffline(stateDir, args);
+    assert.equal(result.code, 1, args.join(' '));
+    assert.match(result.value.error, /migration required.*dealer node up/i);
+  }
+  assert.equal(existsSync(join(stateDir, 'mailbox.sqlite')), false);
+  assert.equal(existsSync(`${inboxPath}.migrated`), false);
+  assert.deepEqual(readFileSync(inboxPath), original);
+});
+
+test('offline observations leave an interrupted mailbox archive for a writer to finish', async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'dealer-node-status-pending-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const path = join(stateDir, 'mailbox.json');
+  const backup = `${path}.v2-migrated`;
+  const original = JSON.stringify({ schema: 'the-dealer-mailbox/v2', sequence: 0, items: [] });
+  writeFileSync(path, original);
+  mkdirSync(backup);
+  assert.throws(() => new MailboxStore(path), { code: 'EISDIR' });
+  rmSync(backup, { recursive: true });
+  const database = join(stateDir, 'mailbox.sqlite');
+  const before = readFileSync(database);
+
+  assert.equal((await observeOffline(stateDir, ['node', 'status'])).value.queues.migrationRequired, true);
+  for (const args of offlineObservations) {
+    const result = await observeOffline(stateDir, args);
+    assert.equal(result.code, 1, args.join(' '));
+    assert.match(result.value.error, /migration required/i);
+  }
+  assert.equal(readFileSync(path, 'utf8'), original);
+  assert.equal(existsSync(backup), false);
+  assert.deepEqual(readFileSync(database), before);
+
+  const writer = await observeOffline(stateDir, ['inbox', 'check']);
+  assert.equal(writer.code, 0);
+  assert.equal(existsSync(path), false);
+  assert.equal(existsSync(backup), true);
 });
 
 test('queue status agrees across control and offline CLI and node status includes queue counts', async t => {
@@ -549,6 +600,9 @@ test('queue status agrees across control and offline CLI and node status include
   });
   await runtime.stop();
   assert.throws(() => runtime.mailbox.list(), /not open/i);
+  assert.equal(existsSync(`${runtime.mailbox.path}-wal`), false);
+  assert.equal(existsSync(`${runtime.mailbox.path}-shm`), false);
+  const before = readFileSync(runtime.mailbox.path);
   assert.deepEqual(await read('queue', 'status'), online);
   const idle = await read('queue', 'status', '--mailbox', 'idle', '--all');
   assert.equal(idle.queues[0].mailboxId, 'idle');
@@ -556,6 +610,9 @@ test('queue status agrees across control and offline CLI and node status include
   assert.deepEqual((await read('node', 'status')).queues, {
     activeMailboxes: 1, queuedItems: 1, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
   });
-  assert.equal(existsSync(`${runtime.mailbox.path}-wal`), false);
-  assert.equal(existsSync(`${runtime.mailbox.path}-shm`), false);
+  assert.deepEqual(readFileSync(runtime.mailbox.path), before);
+  for (const suffix of ['-wal', '-shm']) {
+    const sidecar = `${runtime.mailbox.path}${suffix}`;
+    if (existsSync(sidecar)) assert.equal(statSync(sidecar).mode & 0o777, 0o600);
+  }
 });

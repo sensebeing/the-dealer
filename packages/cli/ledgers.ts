@@ -1,16 +1,15 @@
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { MailboxStore, OutboxStore } from '../mailbox/index.ts';
 import { readLarkConsumedSequence } from '../plugins-lark-notifier/index.ts';
 import type { LarkNotifyConfig } from '../plugins-lark-notifier/index.ts';
 
 function stateMailboxPaths(stateDir: string, legacyInboxPath = join(stateDir, 'inbox.json')) {
-  const mailboxBase = join(stateDir, 'mailbox');
-  return { sqlite: `${mailboxBase}.sqlite`, legacyMailbox: `${mailboxBase}.json`, legacyInboxPath };
+  return { sqlite: join(stateDir, 'mailbox.sqlite'), legacyInboxPath };
 }
 
-export function stateMailboxExists(stateDir: string, legacyInboxPath?: string): boolean {
-  return Object.values(stateMailboxPaths(stateDir, legacyInboxPath)).some(path => existsSync(path));
+export function openStateMailboxSnapshot(stateDir: string, legacyInboxPath?: string): MailboxStore | undefined {
+  const paths = stateMailboxPaths(stateDir, legacyInboxPath);
+  return MailboxStore.openReadOnly(paths.sqlite, paths.legacyInboxPath);
 }
 
 /** Wire retention dependencies through lock-free peer snapshots. */

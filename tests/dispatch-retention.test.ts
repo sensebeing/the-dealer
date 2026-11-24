@@ -304,26 +304,61 @@ test('thread writes compact old settled routes and preserve active ones after lo
   assert.equal(mailbox.listThreads({ state: 'settled' }).length, 201);
 });
 
-test('replied history expires as whole routes while an unanswered leg keeps its custody', t => {
-  const { mailbox } = stores(t);
+test('replied history requires confirmed delivery and preserves failed or unproved reply routes', t => {
+  const { mailbox, outbox } = stores(t);
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
   const recordQuestion = (id: string) => mailbox.recordInboundEnvelope(
     envelope(id, { semantic: { type: 'question', threadId: id } }), 'default',
   );
-  const recordReply = (id: string, replyToId = id) => mailbox.recordOutboundEnvelope(
-    envelope(`answer-${id}`, { replyToId, semantic: { type: 'reply', threadId: id } }), ['peer'],
-  );
-  recordQuestion('unanswered');
-  recordReply('unanswered', 'different-message');
+  const recordReply = (id: string, replyToId = id) => {
+    const answer = envelope(`answer-${id}`, { replyToId, semantic: { type: 'reply', threadId: id } });
+    mailbox.recordOutboundEnvelope(answer, ['peer']);
+    return answer;
+  };
+  for (const id of ['failed', 'queued']) {
+    recordQuestion(id);
+    const answer = recordReply(id);
+    assert.equal(outbox.enqueue({ envelope: answer, explicitTargets: [], pendingNodeIds: ['peer'] }).status, 'queued');
+    if (id === 'failed') {
+      const failure = { ...receipt(answer.id, 'dispatched'), stage: 'failed' as const, executionReceipt: { handoff: 'unattempted' } };
+      assert.equal(outbox.markNodeFailed(answer.id, 'peer', 'Pre-effect failure', failure)?.status, 'failed');
+      assert.equal(outbox.readDefinitivelyFailedKeys().size, 1);
+    }
+  }
+  recordQuestion('missing-evidence');
+  recordReply('missing-evidence');
+  recordQuestion('provisional');
+  const provisional = recordReply('provisional');
+  outbox.enqueue({
+    envelope: provisional, explicitTargets: [], pendingNodeIds: [],
+    deliveredReceipts: { peer: receipt(provisional.id, 'queued') },
+  });
+  recordQuestion('uncommitted-loopback');
+  mailbox.recordInboundEnvelope(recordReply('uncommitted-loopback'), 'default', { committed: false });
+
+  recordQuestion('confirmed');
+  const confirmed = recordReply('confirmed');
+  assert.equal(outbox.enqueue({
+    envelope: confirmed, explicitTargets: [], pendingNodeIds: [],
+    deliveredReceipts: { peer: receipt(confirmed.id, 'dispatched') },
+  }).status, 'delivered');
   for (let index = 0; index <= 200; index++) {
     t.mock.timers.tick(1);
-    const id = `answered-${index}`;
+    const id = `loopback-${index}`;
     recordQuestion(id);
-    recordReply(id);
+    mailbox.recordInboundEnvelope(recordReply(id), 'default', { committed: true });
   }
-  assert.deepEqual(mailbox.listThreadRecords('answered-0'), []);
-  assert.equal(mailbox.listThreadRecords('answered-1').length, 2);
-  assert.equal(mailbox.listThreadRecords('unanswered').length, 2);
+
+  assert.deepEqual(mailbox.listThreadRecords('confirmed'), []);
+  assert.deepEqual(mailbox.listThreadRecords('loopback-0'), []);
+  assert.equal(mailbox.listThreadRecords('loopback-1').length, 3);
+  for (const id of ['failed', 'queued', 'missing-evidence', 'provisional', 'uncommitted-loopback']) {
+    const records = mailbox.listThreadRecords(id);
+    assert.ok(records.some(record => record.direction === 'inbound' && record.messageId === id), id);
+    assert.ok(records.some(record => record.direction === 'outbound' && record.messageId === `answer-${id}`), id);
+  }
+  mailbox.reconcileOutboxThreads(outbox);
+  assert.deepEqual(mailbox.listThreadRecords('confirmed'), []);
 });
 
 test('outbox caps terminal history without dropping pending, unconfirmed or unsuperseded work', t => {

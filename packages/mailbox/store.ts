@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
 import {
   canonicalJson,
@@ -12,11 +12,12 @@ import {
 import type { Disposable, MessageEnvelope, OutboxItem, SettlementOutcome } from '../core-types/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
+import { withOwnedLock } from '../fs-atomic/index.ts';
 import { netKey } from './network-key.ts';
 import { isTerminalHistory } from './outbox.ts';
 import type { OutboxStore } from './outbox.ts';
 import { MailboxSqliteBackend } from './sqlite-backend.ts';
-import type { ThreadRetentionRow } from './sqlite-backend.ts';
+import type { MailboxInitialization, ThreadRetentionRow } from './sqlite-backend.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
 export type { AgentConversationMode, ActiveConversationMode } from '../core-types/index.ts';
 export { normalizeConversationModeInput } from '../core-types/index.ts';
@@ -164,8 +165,9 @@ export interface ResolvedReplyTarget {
 export interface MailboxStoreOptions {
   /** Legacy flat inbox file migrated once into the default mailbox when no mailbox exists. */
   legacyInboxPath?: string;
-  /** @deprecated SQLite owns transaction locking. */
+  /** Existing directory lock used only during legacy cutover. */
   lockDir?: string;
+  readOnly?: boolean;
   /** Peer snapshot used to retain thread routes that outbox reconciliation could restore. */
   outbox?: OutboxStore;
   /** Highest item sequence durably consumed by a catch-up reader, if one is configured. */
@@ -808,6 +810,30 @@ function readLegacyFile(path: string): string | undefined {
   }
 }
 
+function mailboxPaths(mailboxPath: string, legacyInboxPath?: string) {
+  const input = resolve(mailboxPath);
+  const extension = extname(input);
+  const base = input.slice(0, input.length - extension.length);
+  const sqlite = extension === '.json' ? `${base}.sqlite` : input;
+  const legacyMailbox = `${base}.json`;
+  const inbox = legacyInboxPath === undefined ? undefined : resolve(legacyInboxPath);
+  return { sqlite, legacyMailbox, legacyInbox: inbox === sqlite ? undefined : inbox };
+}
+
+function pathExists(path: string): boolean {
+  return lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+}
+
+function hasLegacyMailbox(paths: ReturnType<typeof mailboxPaths>): boolean {
+  return pathExists(paths.legacyMailbox) || (paths.legacyInbox !== undefined && pathExists(paths.legacyInbox));
+}
+
+export class MailboxMigrationRequiredError extends Error {
+  constructor() {
+    super('Mailbox migration required. Start the daemon with dealer node up or run a writable inbox command.');
+  }
+}
+
 function loadLegacyMailbox(raw: string): LegacyMailboxState {
   let parsed: unknown;
   try {
@@ -1002,15 +1028,20 @@ function activeMailboxKeys(db: MailboxSqliteBackend): { messages: ReadonlySet<st
   return { messages, threads };
 }
 
-function isAnsweredThread(records: ThreadRetentionRow[]): boolean {
+function isAnsweredThread(records: ThreadRetentionRow[], confirmedReplies?: ReadonlySet<string>): boolean {
+  const delivered = (record: ThreadRetentionRow): boolean =>
+    record.direction === 'inbound'
+      ? record.mailboxCommitted
+      : confirmedReplies?.has(netKey(record.networkId, record.messageId)) === true ||
+        records.some(reply => reply.direction === 'inbound' && reply.semanticType === 'reply' &&
+          reply.mailboxCommitted && reply.messageId === record.messageId && reply.replyToId === record.replyToId);
   return records.every(record => {
-    if (!record.hasEnvelope || record.state !== 'replied') return false;
-    if (record.semanticType === 'reply') return true;
+    if (record.semanticType === 'reply') return delivered(record);
     if (record.direction === 'inbound' && record.semanticType !== 'question') return true;
     // A thread-level replied state can come from a different leg. Require an addressed
     // answer for each leg that could still own an outstanding reply.
     return records.some(reply => reply.direction !== record.direction && reply.semanticType === 'reply' &&
-      reply.mailboxCommitted && reply.replyToId === record.messageId &&
+      delivered(reply) && reply.replyToId === record.messageId &&
       (record.direction === 'inbound' || reply.localMailbox === (record.replyMailbox ?? record.localMailbox)));
   });
 }
@@ -1033,7 +1064,7 @@ function compactThreads(db: MailboxSqliteBackend, outbox?: OutboxStore): void {
     const group = { key, updatedAt, records };
     if (records.every(record => record.state === 'settled')) {
       settled.push(group);
-    } else if (isAnsweredThread(records)) {
+    } else if (records.every(record => record.hasEnvelope && record.state === 'replied')) {
       replied.push(group);
     } else if (records.every(record =>
       (outbox !== undefined || record.direction === 'inbound') && record.state === 'open' &&
@@ -1045,16 +1076,17 @@ function compactThreads(db: MailboxSqliteBackend, outbox?: OutboxStore): void {
     [replied, MAX_RETAINED_REPLIED_THREADS]] as const;
   if (histories.every(([history, limit]) => history.length <= limit)) return;
   const activeKeys = activeMailboxKeys(db);
-  // A surviving outbox projection could recreate an open leg after its settlement was pruned.
+  const owners = outbox && readOutboxThreadOwners(outbox, activeKeys);
+  // Outbox routes that can still be restored keep the corresponding thread alive.
   const outboxThreads = new Set<string>();
-  if (outbox) {
-    for (const item of readOutboxThreadOwners(outbox, activeKeys).items) {
-      outboxThreads.add(netKey(item.networkId, envelopeThreadId(item.envelope)));
-    }
+  for (const item of owners?.items ?? []) {
+    if (owners?.confirmedReplies.has(netKey(item.networkId, item.id))) continue;
+    outboxThreads.add(netKey(item.networkId, envelopeThreadId(item.envelope)));
   }
   for (const [history, limit] of histories) {
     if (history.length <= limit) continue;
-    const eligible = history.filter(group => !activeKeys.threads.has(group.key) && !outboxThreads.has(group.key));
+    const eligible = history.filter(group => !activeKeys.threads.has(group.key) && !outboxThreads.has(group.key) &&
+      (history !== replied || isAnsweredThread(group.records, owners?.confirmedReplies)));
     eligible.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.key.localeCompare(b.key));
     for (const group of eligible.slice(limit)) {
       for (const record of group.records) db.deleteThread(record.key);
@@ -1161,11 +1193,17 @@ function outboxThreadRecord(item: OutboxItem): ThreadRouteRecord {
 function readOutboxThreadOwners(outbox: OutboxStore, activeKeys: ReturnType<typeof activeMailboxKeys>) {
   const items = outbox.list({ status: 'all' });
   const definitivelyFailed = outbox.readDefinitivelyFailedKeys(items);
+  const confirmedReplies = new Set<string>();
   return {
     definitivelyFailed,
+    confirmedReplies,
     items: items.filter(item => {
       const messageKey = netKey(item.networkId, item.id);
       if (item.supersededById !== undefined || definitivelyFailed.has(messageKey)) return false;
+      if (item.envelope.semantic?.type === 'reply' && item.status === 'delivered' && isTerminalHistory(item) &&
+          Object.values(item.deliveredReceipts).some(receipt => receipt.stage !== 'queued')) {
+        confirmedReplies.add(messageKey);
+      }
       if (!isOneWayWaveEnvelope(item.envelope) || !isTerminalHistory(item)) return true;
       const threadKey = netKey(item.networkId, envelopeThreadId(item.envelope));
       return activeKeys.messages.has(messageKey) || activeKeys.threads.has(threadKey);
@@ -1193,31 +1231,56 @@ function normalizeWaitTimeout(timeoutMs: number): number {
  */
 export class MailboxStore {
   readonly path: string;
-  /** @deprecated No directory lock is used. */
   readonly lockDir: string;
   private readonly outbox?: OutboxStore;
   private readonly readConsumedSequence?: MailboxStoreOptions['readConsumedSequence'];
   private readonly events = new EventEmitter();
   private readonly db: MailboxSqliteBackend;
 
+  /** Open a durable snapshot without creating state for an unused mailbox. */
+  static openReadOnly(mailboxPath: string, legacyInboxPath?: string): MailboxStore | undefined {
+    const paths = mailboxPaths(mailboxPath, legacyInboxPath);
+    if (pathExists(paths.sqlite)) {
+      return new MailboxStore(mailboxPath, { readOnly: true, legacyInboxPath });
+    }
+    if (hasLegacyMailbox(paths)) throw new MailboxMigrationRequiredError();
+    return undefined;
+  }
+
   constructor(mailboxPath: string, options: MailboxStoreOptions = {}) {
-    const input = resolve(mailboxPath);
-    const extension = extname(input);
-    const legacyMailbox = extension === '.json' ? input : input.slice(0, input.length - extension.length) + '.json';
-    this.path = extension === '.json' ? input.slice(0, -extension.length) + '.sqlite' : input;
-    this.lockDir = resolve(options.lockDir ?? `${input}.lock`);
+    const paths = mailboxPaths(mailboxPath, options.legacyInboxPath);
+    this.path = paths.sqlite;
+    this.lockDir = resolve(options.lockDir ?? `${paths.legacyMailbox}.lock`);
     this.outbox = options.outbox;
     this.readConsumedSequence = options.readConsumedSequence;
     this.events.setMaxListeners(0);
     this.db = new MailboxSqliteBackend(this.path, {
       item: validateItem, mailbox: validateMailboxRecord, wakeTarget: validateWakeTarget, thread: validateThreadRecord,
-    });
+    }, options.readOnly);
     try {
-      this.db.initialize(MAILBOX_SCHEMA, () => this.importLegacy(legacyMailbox, options.legacyInboxPath));
+      const state = this.db.initializationState(MAILBOX_SCHEMA);
+      if (state !== 'ready') {
+        if (options.readOnly) throw new MailboxMigrationRequiredError();
+        this.initializeWritable(paths, state);
+      }
+      if (pathExists(paths.legacyMailbox)) {
+        throw new Error(`Legacy mailbox ledger reappeared after SQLite cutover: ${paths.legacyMailbox}`);
+      }
     } catch (error) {
       this.db.close();
       throw error;
     }
+  }
+
+  private initializeWritable(paths: ReturnType<typeof mailboxPaths>, state: MailboxInitialization): void {
+    if (state === 'uninitialized' && !hasLegacyMailbox(paths)) {
+      this.db.initialize(MAILBOX_SCHEMA);
+      if (this.db.initializationState(MAILBOX_SCHEMA) === 'ready') return;
+    }
+    withOwnedLock(this.lockDir, 'Mailbox store', () => {
+      this.db.initialize(MAILBOX_SCHEMA, () => this.importLegacy(paths.legacyMailbox, paths.legacyInbox));
+      if (this.db.initializationState(MAILBOX_SCHEMA) === 'archive-pending') this.db.finishArchive();
+    });
   }
 
   private importLegacy(mailboxPath: string, legacyInboxPath?: string): { source: string; backup: string } | undefined {
@@ -1231,15 +1294,13 @@ export class MailboxStore {
       this.db.setSequence(state.sequence);
       return { source: mailboxPath, backup: `${mailboxPath}.v2-migrated` };
     }
-    const inboxPath = legacyInboxPath === undefined ? undefined : resolve(legacyInboxPath);
-    const rawInbox = inboxPath && inboxPath !== this.path ? readLegacyFile(inboxPath) : undefined;
-    if (rawInbox !== undefined && inboxPath) {
+    const rawInbox = legacyInboxPath === undefined ? undefined : readLegacyFile(legacyInboxPath);
+    if (rawInbox !== undefined && legacyInboxPath !== undefined) {
       const items = loadLegacyInbox(rawInbox);
       for (const [sequence, item] of items.entries()) this.db.insertItem(migrateLegacyItem(item, sequence));
       this.db.setSequence(items.length);
-      return { source: inboxPath, backup: `${inboxPath}.migrated` };
+      return { source: legacyInboxPath, backup: `${legacyInboxPath}.migrated` };
     }
-    this.db.setSequence(0);
     return undefined;
   }
 
@@ -1548,6 +1609,12 @@ export class MailboxStore {
   }
 
   async waitForMail(options: MailboxWaitOptions = {}): Promise<MailboxWaitResult> {
+    return MailboxStore.waitForMail(this, options);
+  }
+
+  /** Wait against a current snapshot, including an absent, uninitialized mailbox. */
+  static async waitForMail(store: MailboxStore | undefined, options: MailboxWaitOptions = {}): Promise<MailboxWaitResult> {
+    const events = store?.events;
     const mailboxId = normalizeMailboxId(options.mailboxId ?? 'default');
     const timeoutMs =
       options.timeoutMs === undefined
@@ -1565,8 +1632,8 @@ export class MailboxStore {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const cleanup = () => {
-        this.events.off('mail', onMail);
-        this.events.off('close', onAbort);
+        events?.off('mail', onMail);
+        events?.off('close', onAbort);
         if (timer !== undefined) {
           clearTimeout(timer);
         }
@@ -1582,8 +1649,8 @@ export class MailboxStore {
       };
       const attempt = () => {
         try {
-          const result = this.check(checkOptions);
-          if (result.items.length > 0) {
+          const result = store?.check(checkOptions);
+          if (result && result.items.length > 0) {
             finish(() => resolve({ ...result, timedOut: false }));
           }
         } catch (error) {
@@ -1597,8 +1664,8 @@ export class MailboxStore {
       };
       const onAbort = () => finish(() => reject(createAbortError()));
       // Subscribe before the first check: mail arriving mid-check must not be lost.
-      this.events.on('mail', onMail);
-      this.events.once('close', onAbort);
+      events?.on('mail', onMail);
+      events?.once('close', onAbort);
       options.signal?.addEventListener('abort', onAbort, { once: true });
       if (options.signal?.aborted) {
         onAbort();
@@ -2101,8 +2168,18 @@ export class MailboxStore {
 
   reconcileOutboxThreads(outbox: OutboxStore): void {
     this.restoreOutboundThreads(() => {
-      const { items } = readOutboxThreadOwners(outbox, activeMailboxKeys(this.db));
-      return items.map(outboxThreadRecord);
+      const active = activeMailboxKeys(this.db);
+      const { items, confirmedReplies } = readOutboxThreadOwners(outbox, active);
+      return items.filter(item => {
+        const key = netKey(item.networkId, item.id);
+        const threadId = envelopeThreadId(item.envelope);
+        if (!confirmedReplies.has(key) || active.messages.has(key) || active.threads.has(netKey(item.networkId, threadId))) return true;
+        // A terminal reply can complete an existing route, but cannot recreate expired history.
+        const replyToId = item.envelope.replyToId;
+        if (!replyToId) return false;
+        const root = this.db.thread(threadKey({ direction: 'inbound', messageId: replyToId }));
+        return root?.networkId === item.networkId && root.threadId === threadId;
+      }).map(outboxThreadRecord);
     }, true);
   }
 

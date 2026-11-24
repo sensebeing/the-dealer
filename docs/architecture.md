@@ -605,15 +605,19 @@ existing local thread can notify from a dynamically addressed mailbox. See
 | `packages/plugins-lark-notifier` | Lark configuration type/validation and notification delivery | CLI re-exports its configuration; the plugin never imports CLI |
 | `packages/cli` | `HostPluginRegistry` assembly root and receiver configuration translation | Registers all wakeup drivers and supplies mode-only mailbox addressing |
 
-`MailboxStore` first-open migration imports v1 or v2 `mailbox.json` into `mailbox.sqlite` in
-one transaction, preserving sequences, existing leases, threads, rotation counters and
-unknown-outcome fences. Earlier `inbox.json` is a fallback migration source when a mailbox
-ledger is absent. After a durable import, the store moves the source to a read-only
-`mailbox.json.v2-migrated` or `inbox.json.migrated` backup. Configured passive v1 bindings migrate
-to the `agent-host` driver with their original fields in `driverConfig`. The v2 store treats
-driver IDs as opaque and accepts JSON configuration.
+`MailboxStore` imports v1 or v2 `mailbox.json` on the first writable open. The old
+`mailbox.json.lock` serializes source reads, the SQLite import transaction and the archive.
+The import preserves sequences, leases, threads, rotation counters and unknown-outcome fences.
+Earlier `inbox.json` is a fallback migration source. After the commit, the store moves the
+source to a `0400` `mailbox.json.v2-migrated` or `inbox.json.migrated` backup and syncs its
+parent directory. A later writable open resumes an interrupted archive under the same lock.
+Once cutover completes, either open mode rejects a recreated `mailbox.json`. Stop all
+old-version binaries that can write the shared ledger before cutover. `dealer self-update`
+drains the old daemon before launching its replacement. Configured passive v1 bindings
+migrate to the `agent-host` driver with their original fields in opaque `driverConfig`.
 
-SQLite WAL readers use snapshots. Writers use immediate transactions and update affected rows.
+SQLite WAL readers use snapshots. Writers use immediate transactions with
+`synchronous=FULL` and update affected rows. Steady-state ledger operations use SQLite locking.
 Message IDs are unique within a mailbox. The database and its WAL and shared-memory files have
 `0600` permissions. The daemon and offline CLI close their owned connections on teardown.
 Outbox reads continue to reuse validated file snapshots keyed by device, inode, size and
@@ -623,6 +627,10 @@ Acknowledgements compact consumed history in the write transaction. Thread histo
 when custody ends or thread routes are maintained. The mailbox retains the 200 newest eligible
 acknowledged items, 100 newest eligible inactive open one-way `wave.*` thread groups,
 and up to 200 eligible inactive groups each for settled and confirmed replied threads.
+An outbound reply requires its committed inbound loopback leg or a confirmed, terminal
+outbox delivery for the same envelope. Failed, queued, provisional or missing evidence keeps
+the route. Startup reconciliation can complete an existing route from a terminal reply
+receipt and preserves the expiry of a compacted route.
 The wave limit covers inbound-only groups and, when an outbox is available, outbound and same-node
 loopback groups whose outbox records show confirmed terminal delivery or have already been
 pruned. Compaction removes all directional records in a group together. Startup reconciliation
@@ -639,8 +647,14 @@ depends on it. Retained mailbox items keep their original signed envelope.
 
 `dealer queue status [--mailbox <id>] [--all] [--json]` reads queue counts, active leases, wake
 retry timing and fences through the daemon or directly from the same ledger. The default view
-includes active mailboxes. `dealer node status` includes compact queue counts. Wake transition
-events report deferral reason changes, recovery, fences and disarm as single JSON lines on stderr.
+includes active mailboxes. `dealer node status` includes compact queue counts. Offline
+`node status`, `queue status`, `inbox list`, `inbox check --peek`, and `thread list/show` open
+SQLite read-only and skip scheduling a background update. When migration or archive recovery
+is pending, `node status` sets `queues.migrationRequired` and the other commands direct the operator to start the daemon or
+run a writable inbox command. An unused directory reports empty results. SQLite can create
+WAL coordination files for a read-only connection to a checkpointed database.
+Wake transition events report deferral reason changes, recovery, fences and disarm as single
+JSON lines on stderr.
 
 A driver persists `beginWakeDelivery` before an external boundary and settles only observed
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;

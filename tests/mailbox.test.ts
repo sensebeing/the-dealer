@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
+import { withOwnedLock } from '../packages/fs-atomic/index.ts';
 import {
   MailboxStore,
   DEDUP_CAS_DUPLICATE_DETAIL,
@@ -87,7 +88,6 @@ test('SQLite migrates mailbox-scoped identities once and wake writes leave other
   assert.deepEqual(store.list().items.map(item => item.mailboxId).sort(), ['default', 'task:other']);
   store.enqueue([envelope('after')]);
   assert.equal(store.listItemsAfterSequence(7)[0].sequence, 8);
-  writeFileSync(path, 'stale legacy content');
   const reopened = new MailboxStore(databasePath);
   t.after(() => reopened.close());
   assert.equal(reopened.list().totalCount, 3);
@@ -120,6 +120,48 @@ test('SQLite migrates mailbox-scoped identities once and wake writes leave other
   assert.equal(store.getWakeTarget('task:other')?.attemptCount, 0);
 });
 
+test('new and reopened mailbox writers use FULL synchronization', t => {
+  const { path } = workspace(t);
+  const exec = t.mock.method(DatabaseSync.prototype, 'exec');
+  const first = new MailboxStore(path);
+  t.after(() => first.close());
+  const second = new MailboxStore(first.path);
+  t.after(() => second.close());
+
+  const connections = new Set(exec.mock.calls.map(call => call.this as DatabaseSync));
+  assert.equal(connections.size, 2);
+  for (const db of connections) assert.equal(db.prepare('PRAGMA synchronous').get()?.synchronous, 2);
+});
+
+test('mailbox migration waits for the existing legacy writer lock', t => {
+  const { path, root } = workspace(t);
+  const sqlite = join(root, 'mailbox.sqlite');
+  writeLegacyMailbox(path, { items: [legacyItem(envelope('before-legacy-write'), 0)] });
+  withOwnedLock(`${path}.lock`, 'Test legacy writer', () => {
+    assert.throws(() => new MailboxStore(sqlite), /Mailbox store is locked/);
+    assert.equal(existsSync(path), true);
+    assert.equal(existsSync(`${path}.v2-migrated`), false);
+    writeLegacyMailbox(path, { items: [legacyItem(envelope('final-legacy-write'), 0)] });
+  });
+
+  const store = new MailboxStore(sqlite);
+  t.after(() => store.close());
+  assert.equal(store.list().items[0].id, 'final-legacy-write');
+  assert.equal(statSync(`${path}.v2-migrated`).mode & 0o777, 0o400);
+});
+
+test('both open modes reject a legacy ledger recreated after cutover', t => {
+  const { path } = workspace(t);
+  writeLegacyMailbox(path, { items: [legacyItem(envelope('imported'), 0)] });
+  const store = new MailboxStore(path);
+  store.close();
+  const recreated = 'unexpected stale ledger';
+  writeFileSync(path, recreated);
+  assert.throws(() => new MailboxStore(store.path), /Legacy mailbox.*reappeared/);
+  assert.throws(() => MailboxStore.openReadOnly(store.path), /Legacy mailbox.*reappeared/);
+  assert.equal(readFileSync(path, 'utf8'), recreated);
+});
+
 test('an interrupted legacy archive is retried after the import transaction commits', t => {
   const { path } = workspace(t);
   const backup = `${path}.v2-migrated`;
@@ -128,6 +170,11 @@ test('an interrupted legacy archive is retried after the import transaction comm
   assert.throws(() => new MailboxStore(path), { code: 'EISDIR' });
   assert.equal(existsSync(path), true);
   rmSync(backup, { recursive: true });
+  withOwnedLock(`${path}.lock`, 'Test legacy writer', () => {
+    assert.throws(() => new MailboxStore(path), /Mailbox store is locked/);
+    assert.equal(existsSync(path), true);
+    assert.equal(existsSync(backup), false);
+  });
   const reopened = new MailboxStore(path);
   t.after(() => reopened.close());
   assert.equal(reopened.list().items[0].id, 'imported');

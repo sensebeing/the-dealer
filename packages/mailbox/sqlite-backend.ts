@@ -56,6 +56,8 @@ interface MigrationArchive {
   backup: string;
 }
 
+export type MailboxInitialization = 'uninitialized' | 'archive-pending' | 'ready';
+
 export interface QueueRow {
   mailboxId: string;
   queuedCount: number;
@@ -117,24 +119,28 @@ export class MailboxSqliteBackend {
   private readonly statements = new Map<string, StatementSync>();
   private readonly validation: RowValidation;
 
-  constructor(path: string, validation: RowValidation) {
+  constructor(path: string, validation: RowValidation, readOnly = false) {
     this.validation = validation;
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const fd = openSync(path, 'a', 0o600);
-    try {
-      fchmodSync(fd, 0o600);
-    } finally {
-      closeSync(fd);
+    if (!readOnly) {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      const fd = openSync(path, 'a', 0o600);
+      try {
+        fchmodSync(fd, 0o600);
+      } finally {
+        closeSync(fd);
+      }
     }
 
-    this.db = new DatabaseSync(path);
+    this.db = new DatabaseSync(path, { readOnly });
     try {
       this.db.exec('PRAGMA busy_timeout = 5000');
-      this.enableWal();
-      this.db.exec('PRAGMA synchronous = NORMAL');
-      // SQLite creates new sidecars with the database's mode. Fix any preexisting sidecars.
-      chmodIfPresent(`${path}-wal`, 0o600);
-      chmodIfPresent(`${path}-shm`, 0o600);
+      if (!readOnly) {
+        this.db.exec('PRAGMA synchronous = FULL');
+        this.enableWal();
+        // SQLite creates new sidecars with the database's mode. Fix any preexisting sidecars.
+        chmodIfPresent(`${path}-wal`, 0o600);
+        chmodIfPresent(`${path}-shm`, 0o600);
+      }
     } catch (error) {
       this.close();
       throw error;
@@ -159,40 +165,41 @@ export class MailboxSqliteBackend {
     }
   }
 
-  initialize(schema: string, importLegacy: () => MigrationArchive | undefined): void {
-    if (!this.hasSchema()) {
-      // The legacy file may be archived after commit only when that commit survives a crash.
-      this.db.exec('PRAGMA synchronous = FULL');
-      try {
-        this.write(() => {
-          if (this.hasSchema()) return;
-          this.db.exec(SCHEMA);
-          const archive = importLegacy();
-          this.statement('INSERT INTO meta VALUES (?, ?)').run('schema_version', schema);
-          if (archive) this.statement('INSERT INTO meta VALUES (?, ?)').run('pending_archive', JSON.stringify(archive));
-        });
-      } finally {
-        this.db.exec('PRAGMA synchronous = NORMAL');
-      }
-    }
-    if (this.meta('schema_version') !== schema) throw invalidStore();
-    this.sequence();
+  initializationState(schema: string): MailboxInitialization {
+    return this.read(() => {
+      if (!this.hasSchema()) return 'uninitialized';
+      if (this.meta('schema_version') !== schema) throw invalidStore();
+      this.sequence();
+      return this.meta('pending_archive') === undefined ? 'ready' : 'archive-pending';
+    });
+  }
 
-    // Finish an interrupted archive without ever reading the legacy contents again.
-    if (this.meta('pending_archive') !== undefined) {
-      this.write(() => {
-        const pending = this.meta('pending_archive');
-        if (pending === undefined) return;
-        const { source, backup } = decodeJson(pending) as MigrationArchive;
-        try {
-          renameSync(source, backup);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        }
-        if (chmodIfPresent(backup, 0o400)) syncDirectory(dirname(backup));
-        this.statement("DELETE FROM meta WHERE key = 'pending_archive'").run();
-      });
-    }
+  initialize(schema: string, importLegacy?: () => MigrationArchive | undefined): void {
+    if (this.hasSchema()) return;
+    this.write(() => {
+      if (this.hasSchema()) return;
+      this.db.exec(SCHEMA);
+      const archive = importLegacy?.();
+      if (!archive) this.setSequence(0);
+      this.statement('INSERT INTO meta VALUES (?, ?)').run('schema_version', schema);
+      if (archive) this.statement('INSERT INTO meta VALUES (?, ?)').run('pending_archive', JSON.stringify(archive));
+    });
+  }
+
+  // The store holds the legacy lock from the import through this durable archive.
+  finishArchive(): void {
+    this.write(() => {
+      const pending = this.meta('pending_archive');
+      if (pending === undefined) return;
+      const { source, backup } = decodeJson(pending) as MigrationArchive;
+      try {
+        renameSync(source, backup);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (chmodIfPresent(backup, 0o400)) syncDirectory(dirname(backup));
+      this.statement("DELETE FROM meta WHERE key = 'pending_archive'").run();
+    });
   }
 
   close(): void {
@@ -483,7 +490,7 @@ export class MailboxSqliteBackend {
         json_extract(record_json, '$.envelope.semantic.type') AS semantic_type,
         json_extract(record_json, '$.envelope.replyToId') AS reply_to_id,
         json_extract(record_json, '$.envelope.semantic.replyMailbox') AS reply_mailbox,
-        coalesce(json_extract(record_json, '$.mailboxCommitted'), 1) AS mailbox_committed
+        json_extract(record_json, '$.mailboxCommitted') AS mailbox_committed
       FROM threads`).all().map(row => ({
       key: row.record_key, threadId: row.thread_id, networkId: row.network_id, messageId: row.message_id,
       direction: row.direction, state: row.state, updatedAt: row.updated_at, kind: row.kind,
