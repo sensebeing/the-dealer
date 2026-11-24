@@ -9,7 +9,7 @@ import { homedir, hostname } from 'node:os';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server } from 'node:http';
 import { generateNodeKeyPair, canonicalJson } from '../core-types/index.ts';
-import type { AdmissionMode, Disposable, ExecutorPlugin, MessageEnvelope, NetworkMountConfig, SourcePlugin } from '../core-types/index.ts';
+import type { AdmissionMode, Disposable, ExecutorPlugin, MessageEnvelope, NetworkMountConfig, SourceDescriptor, SourcePlugin } from '../core-types/index.ts';
 import { Kernel } from '../kernel/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 import { createTransportPlugin, P2PTransportService } from '../transport/index.ts';
@@ -41,7 +41,7 @@ import { compactQueueSummary, openStateLedgers } from './ledgers.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
-import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin } from '../plugins-source/index.ts';
+import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin, formatSingleLineError } from '../plugins-source/index.ts';
 import {
   composeRuntimeFingerprint,
   dealerCodeFingerprintEntries,
@@ -83,6 +83,7 @@ export interface ExternalPluginContext {
     everyReceiptSettled: typeof everyReceiptSettled;
     createWebhookSourcePlugin: typeof createWebhookSourcePlugin;
     createPollWatermarkSourcePlugin: typeof createPollWatermarkSourcePlugin;
+    formatSingleLineError: typeof formatSingleLineError;
     createScriptSourcePlugin: typeof createScriptSourcePlugin;
     createDedupCasPolicyPlugin: typeof createDedupCasPolicyPlugin;
     DEDUP_CAS_DUPLICATE_DETAIL: typeof DEDUP_CAS_DUPLICATE_DETAIL;
@@ -721,6 +722,7 @@ export class DealerNodeRuntime {
         everyReceiptSettled,
         createWebhookSourcePlugin,
         createPollWatermarkSourcePlugin,
+        formatSingleLineError,
         createScriptSourcePlugin,
         createDedupCasPolicyPlugin,
         DEDUP_CAS_DUPLICATE_DETAIL,
@@ -1522,6 +1524,14 @@ export class DealerNodeRuntime {
     return registration;
   }
 
+  listSources(): SourceDescriptor[] {
+    return this.emitter.listSources!();
+  }
+
+  wakeSource(name: string): Promise<{ name: string; woken: boolean }> {
+    return this.emitter.wakeSource!(name);
+  }
+
   async installSource(spec: PluginSpec): Promise<Disposable> {
     let source: SourcePlugin;
     if (spec.type === 'webhook') {
@@ -1537,6 +1547,7 @@ export class DealerNodeRuntime {
       }
       const cursorPath = join(this.stateDir, `cursor-${encodeURIComponent(spec.config.name ?? spec.config.url)}.json`);
       source = createPollWatermarkSourcePlugin({
+        name: spec.config.name,
         initialCursor: existsSync(cursorPath)
           ? JSON.parse(readFileSync(cursorPath, 'utf8'))
           : spec.config.initialCursor ?? null,
@@ -1558,6 +1569,9 @@ export class DealerNodeRuntime {
         saveCursor: async cursor => saveJson(cursorPath, cursor),
         onError: error => {
           this.lastError = String(error);
+        },
+        onPollStatus: event => {
+          console.error(`[dealer:source] ${JSON.stringify(event)}`);
         },
       });
     } else {

@@ -830,6 +830,18 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             }
           } };
         },
+        listSources() {
+          return [...sources.keys()].map(source => ({ name: source.name, wakeable: typeof source.wake === 'function' }));
+        },
+        async wakeSource(name) {
+          if (!name.trim()) throw new Error('Invalid source name');
+          const matches = [...sources.keys()].filter(source => source.name === name);
+          if (matches.length === 0) throw new Error(`Unknown source: ${name}`);
+          const wakeable = matches.filter(source => typeof source.wake === 'function');
+          if (wakeable.length === 0) throw new Error(`Source does not support wake: ${name}`);
+          await Promise.all(wakeable.map(async source => source.wake!()));
+          return { name, woken: true };
+        },
         registerSource(source) {
           if (sources.has(source)) throw new Error('Source already registered');
           let disposed = false;

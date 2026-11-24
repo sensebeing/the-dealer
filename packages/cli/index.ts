@@ -1214,6 +1214,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           queue: 'dealer queue status [--mailbox <id>] [--all] [--json]',
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
+          source: 'dealer source <add|list|wake> [<name>] [--json]',
         },
       }, null, v.json ? undefined : 2));
       return 0;
@@ -1307,6 +1308,12 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       result.stdout.forEach(line => stdout(line));
       result.stderr.forEach(line => stderr(line));
       return result.code;
+    }
+    if (!options.runtime && group === 'source' && (action === 'list' || action === 'wake')) {
+      updateStateDir = undefined;
+      throw new Error(action === 'list'
+        ? 'Start dealer node up before listing live sources'
+        : 'Start dealer node up before waking a live source');
     }
     if (group === 'setup' && action !== 'apply-preset') {
       let result: unknown;
@@ -1734,6 +1741,10 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       } else {
         throw new Error('Unknown outbox command; use list, flush or requeue');
       }
+    } else if (group === 'source' && action === 'list') {
+      result = { sources: runtime.listSources() };
+    } else if (group === 'source' && action === 'wake') {
+      result = { ok: true, ...await runtime.wakeSource(required(p[2], '<name>')) };
     } else if ((group === 'route' || group === 'source') && action === 'add') {
       if (owned && group === 'source') {
         throw new Error('Start dealer node up before adding a live source');

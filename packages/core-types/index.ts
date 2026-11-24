@@ -780,16 +780,25 @@ export interface OutboxStoreLike {
   markFailed(id: string, lastError: string, attemptToken?: string): OutboxItem | undefined;
 }
 
+export interface SourceDescriptor {
+  readonly name: string;
+  readonly wakeable: boolean;
+}
+
 export interface SourcePlugin {
   name: string;
   start(emitter: EmitterService): void | Promise<void>;
   stop(): void | Promise<void>;
+  /** Trigger an immediate poll or refresh, resetting backoff when supported. */
+  wake?(): void | Promise<void>;
 }
 
 export interface EmitterService {
   holdSources?(): { release(options?: { start?: boolean }): void };
   emit<T>(input: EmitMessageInput<T>): Promise<EmitResult>;
   registerSource(source: SourcePlugin): SourceRegistration;
+  listSources?(): SourceDescriptor[];
+  wakeSource?(name: string): Promise<{ name: string; woken: boolean }>;
   /** Emitter-owned outbound preparation, routing, send and receipt validation for redrive. */
   redriveOutboxItem?(
     item: OutboxItem,

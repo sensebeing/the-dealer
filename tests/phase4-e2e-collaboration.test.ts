@@ -718,7 +718,7 @@ export default (_config: any, context: any) => {
   const factories = [
     'writeAtomicCursorFile', 'readJsonCursorFile', 'everyReceiptSettled',
     'parseYaml', 'parseMarkdownFrontmatter', 'parseTeamRegistry', 'resolveTeamRegistryMembers', 'createTeamRegistryRouterPlugin',
-    'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin',
+    'createWebhookSourcePlugin', 'createPollWatermarkSourcePlugin', 'createScriptSourcePlugin', 'formatSingleLineError',
     'createDedupCasPolicyPlugin', 'isConfirmedHandoffReceipt', 'isDedupCasDuplicateReceipt', 'isDurableQueuedReceipt',
     'isRetryablePreEffectReceipt', 'isUnattemptedOutboxItem', 'createOrcaSpawnExecutorPlugin',
     'createOrcaWaveExecutorPlugin', 'createAgentPtyExecutorPlugin', 'createNotifyExecutorPlugin',
