@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import {
   OrcaTerminalCloseRejectedError,
   OrcaTerminalLaunchRejectedError,
+  OrcaTerminalSendRefusedError,
   readOrcaTerminal,
   checkOrcaWorkspaceIdle,
   closeOrcaWorkspaceTerminal,
@@ -271,7 +272,28 @@ function checkOrcaPointerIdle(
     ? checkOrcaWorkspaceIdle(runner, command, target.workspacePath, signal, {
         targetTerminalHandle: terminalHandle, requireTarget: true, agent: target.agent, excludedHandles,
       })
-    : probeOrcaTerminalIdle(runner, command, terminalHandle, undefined, signal, { verifyComposerLast: true });
+    : probeOrcaTerminalIdle(runner, command, terminalHandle, undefined, signal, {
+        verifyComposerLast: true, expectedAgent: target.agent,
+      });
+}
+
+async function waitFreshOrcaTabIdle(
+  runner: CommandRunner, command: string, target: OrcaWakeTarget, terminalHandle: string,
+  excludedHandles?: ReadonlySet<string>, signal?: AbortSignal,
+): Promise<OrcaIdleResult> {
+  const ready = await waitOrcaTerminalIdle(runner, command, terminalHandle, target.workspacePath, 5000, signal);
+  return ready.idle
+    ? checkOrcaPointerIdle(runner, command, target, terminalHandle, excludedHandles, signal)
+    : ready;
+}
+
+function settleOrcaWakeDeliveryFailure(
+  store: MailboxStore, mailboxId: string, error: unknown, now: number, expectedRevision: number,
+): boolean {
+  if (error instanceof OrcaTerminalSendRefusedError) {
+    return store.deferWakeAttempt(mailboxId, expectedRevision, error, now).superseded;
+  }
+  return settleWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
 }
 
 function callerOwnsExplicitOrcaWakeTarget(
@@ -464,7 +486,11 @@ export async function launchFencedOrcaWorkspaceTerminal(
       buildLaunchedOrcaWakeTargetPatch(mailboxId, current, { handle: launched.handle, resetCompletedWaves: options.resetCompletedWaves }));
     return { ...launched, ...settled, target: readOrcaWakeTarget(settled.target) };
   } catch (error) {
-    if (error instanceof CommandNotStartedError || error instanceof OrcaTerminalLaunchRejectedError) {
+    if (
+      error instanceof CommandNotStartedError ||
+      error instanceof OrcaTerminalLaunchRejectedError ||
+      error instanceof OrcaTerminalSendRefusedError
+    ) {
       const deferred = store.deferWakeAttempt(mailboxId, expectedRevision, error, options.now);
       if (deferred.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     } else {
@@ -495,17 +521,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
     if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
     const command = target.orcaCommand ?? 'orca';
     const preview = store.check({ mailboxId, peek: true });
-    const ready = await waitOrcaTerminalIdle(
-      runner,
-      command,
-      target.terminalHandle,
-      target.workspacePath,
-      5000,
-      options.signal,
-    );
-    const idle = ready.idle
-      ? await checkOrcaPointerIdle(runner, command, target, target.terminalHandle, undefined, options.signal)
-      : ready;
+    const idle = await waitFreshOrcaTabIdle(runner, command, target, target.terminalHandle, undefined, options.signal);
     if (!idle.idle) {
       store.retainPendingWakeIfCurrent(mailboxId, expectedRevision);
       return { terminalHandle: target.terminalHandle, sent: false };
@@ -522,6 +538,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
       cwd: target.workspacePath,
       signal: options.signal,
       waitSubmit: 5,
+      expectedAgent: target.agent,
     });
     const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, expectedRevision);
     if (completed.superseded) return { pointer, terminalHandle: target.terminalHandle, sent: false };
@@ -531,7 +548,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
     if (fenced) {
       // A pre-existing fence refuses the attempt before the boundary; it keeps the original
       // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
-      if (deliveryBegun) settleWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
+      if (deliveryBegun) settleOrcaWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
     } else {
       store.deferWakeAttempt(mailboxId, expectedRevision, error, now);
     }
@@ -821,7 +838,7 @@ class OrcaWakeDelivery {
     } catch (error) {
       if (error instanceof SettledWakeLaunchError) throw error;
       if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
-        const superseded = settleWakeDeliveryFailure(this.store, mailboxId, error, this.now(), activeRevision);
+        const superseded = settleOrcaWakeDeliveryFailure(this.store, mailboxId, error, this.now(), activeRevision);
         return { kind: 'noop', reason: superseded ? 'Wake launch superseded by a newer binding' : String(error) };
       }
       return { kind: 'defer', reason: String(error), expectedRevision: activeRevision };
@@ -931,7 +948,7 @@ class OrcaWakeDelivery {
    * workspace probe ignores retained tabs (including an unsent human draft) and confirms the new
    * tab itself is idle before the pointer is written.
    */
-  private async waitFreshTabIdle(
+  private waitFreshTabIdle(
     target: OrcaWakeTarget,
     terminalHandle: string,
     command: string,
@@ -940,17 +957,7 @@ class OrcaWakeDelivery {
     if (this.idleCheck) {
       return this.idleCheck();
     }
-    const terminal = await waitOrcaTerminalIdle(
-      this.runner,
-      command,
-      terminalHandle,
-      target.workspacePath,
-      5000,
-    );
-    if (!terminal.idle) {
-      return terminal;
-    }
-    return checkOrcaPointerIdle(this.runner, command, target, terminalHandle, excludedHandles);
+    return waitFreshOrcaTabIdle(this.runner, command, target, terminalHandle, excludedHandles);
   }
 
   /**
@@ -1138,9 +1145,9 @@ class OrcaWakeDelivery {
         const deferred = this.defer(
           mailboxId,
           target,
-          needsRotation
+          idle.reason ?? (needsRotation
             ? 'Session rotated; waiting for tui-idle before wakeup'
-            : 'Terminal spawned; waiting for tui-idle before wakeup',
+            : 'Terminal spawned; waiting for tui-idle before wakeup'),
         );
         return needsRotation ? { ...deferred, rotated: true } : deferred;
       }
@@ -1191,11 +1198,9 @@ class OrcaWakeDelivery {
         if (plan.kind === 'shell') {
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
         }
-        const idle = this.idleCheck
-          ? await this.idleCheck()
-          : await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles);
+        const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles);
         if (!idle.idle)
-          return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
+          return this.defer(mailboxId, target, idle.reason ?? 'Terminal spawned; waiting for tui-idle before wakeup');
         checkedTerminal = true;
       }
     }
@@ -1259,6 +1264,8 @@ class OrcaWakeDelivery {
     } else {
       await sendOrcaTerminalText(this.runner, command, terminalHandle!, pointer, {
         cwd: target.workspacePath,
+        waitSubmit: 5,
+        expectedAgent: target.agent,
       });
     }
 

@@ -648,7 +648,7 @@ for (const agent of ['antigravity', 'claude', 'codex'] as SupportedOrcaAgent[]) 
   });
 }
 
-test('Orca terminal resolution prefers target host then other agents, boots shells and creates with chosen command', async () => {
+test('Orca terminal resolution reuses the configured agent, boots shells and creates with the chosen command', async () => {
   let terminals: object[] = [
     { handle: 'agy', connected: true, agentIdentity: 'antigravity', lastOutputAt: 9 },
     { handle: 'claude', connected: true, agentIdentity: 'claude-code', lastOutputAt: 1 },
@@ -659,7 +659,9 @@ test('Orca terminal resolution prefers target host then other agents, boots shel
     return { stdout: JSON.stringify({ ok: true, result: request.args[1] === 'list' ? { terminals } : { handle: 'created' } }) };
   };
   assert.equal((await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, { agent: 'claude' })).handle, 'claude');
-  assert.equal((await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, { agent: 'codex' })).handle, 'agy');
+  assert.deepEqual(await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, { agent: 'codex' }), {
+    handle: 'created', spawned: true,
+  });
   terminals = [{ handle: 'shell', connected: true, preview: '$' }];
   assert.equal((await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, { agent: 'codex' })).shellBootstrapped, true);
   assert.ok(calls.at(-1)!.args.includes(defaultAgentLaunchCommand('codex')));

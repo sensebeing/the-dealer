@@ -4,7 +4,7 @@ import { Kernel } from '../packages/kernel/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import type { NodeService } from '../packages/core-types/index.ts';
-import { buildOrcaAgentLaunchCommand, spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isOrcaComposerEmpty, sendOrcaTerminalText } from '../packages/plugins-orca/index.ts';
+import { buildOrcaAgentLaunchCommand, spawnOrcaWorkspaceTerminal, OrcaTerminalLaunchRejectedError, OrcaTerminalSendRefusedError, checkOrcaWorkspaceIdle, defaultAgentLaunchCommand, findOrcaWorktreeByName, isAntigravityModePlaceholder, isOrcaComposerEmpty, sendOrcaTerminalText } from '../packages/plugins-orca/index.ts';
 import { CommandNotStartedError, runCommand } from '../packages/subprocess/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -108,7 +108,7 @@ interface FakeOrcaChild {
 }
 
 /** Minimal Orca inventory: one fixed workspace whose `terminal create` adds a live tab. */
-function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = []) {
+function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [], wrapperAgent = 'antigravity') {
   const state = {
     calls: [] as CommandRequest[],
     terminals: [...initial],
@@ -151,8 +151,11 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
     if (request.args[0] === 'terminal' && request.args[1] === 'create') {
       state.created += 1;
       const handle = `term-new-${state.created}`;
+      const executable = request.args[request.args.indexOf('--command') + 1]?.split(' ')[0];
+      const agentIdentity = executable === 'agy' ? 'antigravity'
+        : executable === 'claude' || executable === 'codex' ? executable : wrapperAgent;
       state.agents?.push({ state: 'done', paneKey: `${handle}:root` });
-      state.terminals.push({ handle, connected: true, writable: true, agentIdentity: 'antigravity', preview: '', tabId: handle, leafId: 'root' });
+      state.terminals.push({ handle, connected: true, writable: true, agentIdentity, preview: '> ', tabId: handle, leafId: 'root' });
       return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle } } }) };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'close') {
@@ -1031,7 +1034,7 @@ test('a linked standing workspace defaults to provisioning only when the probe p
     if (surface === 'terminal' && action === 'list') {
       return { stdout: JSON.stringify({ ok: true, result: { terminals: handles.map(handle => ({
         handle, connected: true, writable: true, tabId: handle, leafId: 'root',
-        agentIdentity: 'antigravity', preview: '',
+        agentIdentity: 'antigravity', preview: '> ',
       })) } }) };
     }
     if (surface === 'terminal' && action === 'create') {
@@ -1689,7 +1692,7 @@ test('rotation persists the new session tab before tui-idle and the next tick re
   const first = await service.flushMailbox('stream:rotate');
   assert.equal(first.woke, false);
   assert.equal(first.rotated, true);
-  assert.equal(first.reason, 'Session rotated; waiting for tui-idle before wakeup');
+  assert.equal(first.reason, 'Terminal is busy');
   assert.equal(state.created, 1);
   assert.equal(store.getWakeTarget('stream:rotate')!.driverConfig?.terminalHandle, 'term-new-1');
   assert.equal(store.getWakeTarget('stream:rotate')!.completedWaves, 0);
@@ -2700,6 +2703,35 @@ test('a fixed workspace rebind skips claimed tabs and waits for the available ta
   assert.equal(sendsTo(state.calls, 'other-stream').length, 0);
   assert.equal(sendsTo(state.calls, 'available').length, 1);
   assert.equal(state.created, 0);
+});
+
+test('a fixed workspace resolves only compatible terminals for its configured agent', async t => {
+  const workspacePath = directory(t);
+  for (const terminalHandle of [undefined, 'closed', 'codex-tab']) {
+    const store = new MailboxStore(join(workspacePath, `mailbox-${terminalHandle}.json`));
+    const pinned = terminalHandle === 'codex-tab';
+    const { runner, state } = fakeOrcaWorkspace(workspacePath, [
+      { handle: 'codex-tab', connected: true, writable: true, agentIdentity: 'codex', preview: pinned ? '> ' : '> draft' },
+    ]);
+    const mailboxId = 'stream:claude-fixed';
+    store.enqueue([alert('claude-fixed')], { mailboxId, wakeTarget: {
+      driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle, agent: 'claude' },
+    } });
+    const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+    t.after(() => service.stop());
+    const result = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(result.woke, !pinned, result.reason);
+    assert.equal(sendsTo(state.calls, 'codex-tab').length, 0);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, pinned);
+    if (pinned) {
+      assert.equal(result.reason, 'Target agent is not ready in terminal');
+      assert.equal(state.created, 0);
+    } else {
+      assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, 'term-new-1');
+      assert.equal(state.terminals[1].agentIdentity, 'claude');
+      assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+    }
+  }
 });
 
 test('concurrent alert slots cannot both reclaim the same recorded pane', async t => {
@@ -4623,6 +4655,226 @@ test('Orca sender retry preserves delivery fences', async t => {
   assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
 });
 
+test('a spawned Orca wake waits for the target agent and rendered composer', async t => {
+  const root = directory(t);
+  const unreadyTerminals = [
+    { preview: 'login shell', agentIdentity: undefined },
+    { preview: '> ', agentIdentity: 'codex' },
+    { preview: 'Starting Antigravity…', agentIdentity: 'antigravity' },
+  ];
+  for (const workspacePath of [root, undefined]) {
+    for (const [index, unready] of unreadyTerminals.entries()) {
+      const mailboxId = 'task:starting';
+      const store = new MailboxStore(join(root, `starting-${Boolean(workspacePath)}-${index}.json`));
+      const terminal = { handle: 'starting', connected: true, writable: true, ...unready };
+      const { runner: inventory, state } = fakeOrcaWorkspace(root, [terminal]);
+      const runner: CommandRunner = async request => request.args[1] === 'show'
+        ? { stdout: JSON.stringify({ ok: true, result: { terminal: state.terminals[0] } }) }
+        : inventory(request);
+      store.enqueue([alert('starting')], {
+        mailboxId,
+        wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: terminal.handle, agent: 'antigravity' } },
+      });
+      const initial = await deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId);
+      assert.equal(initial.sent, false, JSON.stringify(unready));
+      assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, true);
+      assert.equal(terminalSends(state.calls).length, 0);
+      state.terminals[0] = { ...terminal, agentIdentity: 'antigravity', preview: '> ' };
+      assert.equal((await deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId)).sent, true);
+      assert.equal(terminalSends(state.calls).length, 1);
+    }
+  }
+});
+
+test('a fresh redrive tab defers until the expected composer appears', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'task:fresh-composer';
+  const { runner: inventory, state } = fakeOrcaWorkspace(root);
+  const runner: CommandRunner = async request => {
+    const output = await inventory(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      state.terminals.at(-1)!.preview = 'Starting Antigravity…';
+    }
+    return output;
+  };
+  store.enqueue([alert('fresh-composer')], {
+    mailboxId,
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: root, agent: 'antigravity' } },
+  });
+  const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+  t.after(() => service.stop());
+  const first = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(first.woke, false);
+  assert.match(first.reason!, /Antigravity composer prompt is not ready/);
+  assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, true);
+  assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, undefined);
+  assert.equal(terminalSends(state.calls).length, 0);
+  state.terminals[0].preview = '> ';
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+  assert.equal(state.created, 1);
+  assert.equal(terminalSends(state.calls).length, 1);
+});
+
+const acceptedOrcaPrompt = {
+  provider: 'antigravity', observation: 'supported', stages: ['input_accepted', 'turn_started'], requestId: 'request-1',
+};
+const orcaReceiptFailures = [
+  { name: 'refused', send: { accepted: false, refusedReason: 'terminal_busy' }, detail: /terminal_busy/, retryable: true },
+  { name: 'missing-acceptance', send: { prompt: acceptedOrcaPrompt }, detail: /did not verify input acceptance/, retryable: false },
+  { name: 'missing-prompt', send: { accepted: true }, detail: /missing prompt receipt/, retryable: false },
+  { name: 'malformed-prompt', send: { accepted: true, prompt: [] }, detail: /missing prompt receipt/, retryable: false },
+  { name: 'missing-provider', send: { accepted: true, prompt: { observation: 'supported', stages: ['input_accepted'] } }, detail: /missing provider/, retryable: false },
+  { name: 'missing-observation', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, observation: undefined } }, detail: /invalid observation/, retryable: false },
+  { name: 'malformed-stages', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, stages: 'turn_started' } }, detail: /invalid stages/, retryable: false },
+  { name: 'unsupported', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'unsupported', stages: ['input_accepted'] } }, detail: /unsupported.*antigravity/, retryable: false },
+  { name: 'wrong-provider', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'codex' } }, detail: /codex.*antigravity/, retryable: false },
+  { name: 'queued', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, stages: ['input_accepted'] } }, detail: /request-1.*antigravity.*supported.*input_accepted/, retryable: false },
+  ...(['permission', 'incarnation_replaced'] as const).map(observation => ({
+    name: observation,
+    send: { accepted: true, prompt: { ...acceptedOrcaPrompt, observation } },
+    detail: new RegExp(`${observation}.*request-1`),
+    retryable: false,
+  })),
+];
+
+function orcaTerminalSendReceipt(send: object) {
+  return { stdout: JSON.stringify({ ok: true, result: { send } }) };
+}
+
+test('Orca terminal sends classify exit 1 refusal receipts on either attempt', async () => {
+  for (const rejects of [true, false]) {
+    for (const retry of [true, false]) {
+      const refusedReason = retry ? 'no_active_sender_terminal' : 'terminal_busy';
+      const output = { ...orcaTerminalSendReceipt({ accepted: false, refusedReason }), exitCode: 1 };
+      const calls: CommandRequest[] = [];
+      const runner: CommandRunner = async request => {
+        calls.push(request);
+        if (retry && calls.length === 1) throw new Error('no_active_sender_terminal');
+        if (rejects) throw Object.assign(new Error('orca exited 1'), output);
+        return output;
+      };
+      await assert.rejects(sendOrcaTerminalText(runner, 'orca', 'tab', 'wake'), {
+        constructor: OrcaTerminalSendRefusedError, message: `Orca terminal send refused: ${refusedReason}`,
+      });
+      assert.equal(calls.length, retry ? 2 : 1);
+      assert.equal(calls.at(-1)?.args.includes('--allow-self'), retry);
+    }
+  }
+});
+
+test('Orca terminal sends recover from a structured missing sender context once', async () => {
+  for (const failure of ['zero', 'exit 1', 'rejection']) {
+    const calls: CommandRequest[] = [];
+    const runner: CommandRunner = async request => {
+      calls.push(request);
+      if (request.args.includes('--allow-self')) return { stdout: '{"ok":true}' };
+      const output = {
+        ...orcaTerminalSendReceipt({ accepted: false, refusedReason: 'no_active_sender_terminal' }),
+        exitCode: failure === 'zero' ? 0 : 1,
+      };
+      if (failure === 'rejection') throw Object.assign(new Error('orca exited 1'), output);
+      return output;
+    };
+    await sendOrcaTerminalText(runner, 'orca', 'tab', 'wake');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].env?.ORCA_TERMINAL_ID, 'tab');
+  }
+});
+
+test('Orca terminal send keeps unverified command failures intact', async () => {
+  const signalFailure = Object.assign(new Error('process interrupted'), {
+    ...orcaTerminalSendReceipt({ accepted: false, refusedReason: 'terminal_busy' }), exitCode: null,
+  });
+  const otherFailure = Object.assign(new Error('orca exited 1: transport disconnected'), {
+    stdout: '{"ok":false}', exitCode: 1,
+  });
+  for (const failure of [signalFailure, otherFailure]) {
+    await assert.rejects(sendOrcaTerminalText(async () => { throw failure; }, 'orca', 'tab', 'wake'),
+      (error: unknown) => error === failure);
+  }
+  await assert.rejects(sendOrcaTerminalText(async () => ({
+    stdout: 'incomplete JSON', stderr: 'transport disconnected', exitCode: 1,
+  }), 'orca', 'tab', 'wake'), { message: 'orca exited 1: transport disconnected' });
+});
+
+test('Orca terminal sends verify observed turns and retain legacy receipt compatibility', async () => {
+  const options = { waitSubmit: 5, expectedAgent: 'antigravity' } as const;
+  for (const { send, detail, retryable } of orcaReceiptFailures) {
+    await assert.rejects(sendOrcaTerminalText(async () => orcaTerminalSendReceipt(send), 'orca', 'tab', 'wake', options),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, detail);
+        assert.equal(error instanceof OrcaTerminalSendRefusedError, retryable);
+        return true;
+      });
+  }
+  for (const output of [
+    orcaTerminalSendReceipt({ accepted: true, prompt: acceptedOrcaPrompt }),
+    orcaTerminalSendReceipt({ accepted: true, prompt: { provider: 'old-host', stages: ['input_accepted'] } }),
+    { stdout: '{"ok":true}' },
+  ]) {
+    await sendOrcaTerminalText(async () => output, 'orca', 'tab', 'wake', options);
+  }
+  await sendOrcaTerminalText(async () => orcaTerminalSendReceipt({
+    accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'claude-code' },
+  }), 'orca', 'tab', 'wake', { ...options, expectedAgent: 'claude' });
+  await sendOrcaTerminalText(async () => orcaTerminalSendReceipt({
+    accepted: true, prompt: { provider: 'unsupported', stages: ['input_accepted'] },
+  }), 'orca', 'shell', 'agy --dangerously-skip-permissions');
+});
+
+for (const delivery of ['spawned', 'redrive'] as const) {
+  test(`Orca ${delivery} wake retries a refusal and fences each unverified pointer receipt`, async t => {
+    const root = directory(t);
+    for (const { name, send, detail, retryable } of orcaReceiptFailures) {
+      const store = new MailboxStore(join(root, `${name}.json`));
+      const mailboxId = 'task:receipt';
+      const { runner: inventory, state } = fakeOrcaWorkspace(root, [
+        { handle: 'tab', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> ' },
+      ]);
+      store.enqueue([alert(name)], {
+        mailboxId,
+        wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: 'tab', agent: 'antigravity' } },
+      });
+      let output = { ...orcaTerminalSendReceipt(send), exitCode: retryable ? 1 : 0 };
+      const runner: CommandRunner = async request => {
+        if (request.args[0] !== 'terminal' || request.args[1] !== 'send') return inventory(request);
+        state.calls.push(request);
+        return output;
+      };
+      const service = () => new WakeupRedriveService({
+        store: new MailboxStore(store.path),
+        drivers: createTestWakeupDrivers({ commandRunner: runner }),
+      });
+      if (delivery === 'spawned') {
+        await assert.rejects(deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId), detail);
+      } else {
+        const initial = service();
+        t.after(() => initial.stop());
+        const first = await initial.flushMailbox(mailboxId, { force: true });
+        assert.equal(first.woke, false, name);
+        assert.match(first.reason!, detail);
+        await initial.stop();
+      }
+      const [attempt] = terminalSends(state.calls);
+      assert.ok(attempt.args.includes('--wait-submit'));
+      assert.equal(attempt.args[attempt.args.indexOf('--wait-submit') + 1], '5');
+      const target = new MailboxStore(store.path).getWakeTarget(mailboxId)!;
+      assert.equal(target.pendingWake, retryable, name);
+      assert.equal(target.deliveryInDoubt, retryable ? undefined : true, name);
+      assert.equal(target.attemptCount, 1);
+      if (retryable) assert.ok(target.earliestWakeAt > Date.now());
+      output = { ...orcaTerminalSendReceipt({ accepted: true, prompt: acceptedOrcaPrompt }), exitCode: 0 };
+      const restarted = service();
+      t.after(() => restarted.stop());
+      assert.equal((await restarted.flushMailbox(mailboxId, { force: true })).woke, retryable, name);
+      assert.equal(terminalSends(state.calls).length, retryable ? 2 : 1, name);
+      await restarted.stop();
+    }
+  });
+}
+
 test('rotating inbound delivery preserves terminal thread affinity across call order', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
   store.upsertWakeTarget('stream:inbox', {
@@ -4815,7 +5067,7 @@ test('spawn keeps durable custody through launch, comment and pointer failures',
       if (operation === 'worktree set' && failure === 'comment') throw new Error('comment unavailable');
       if (operation === 'terminal send' && failure === 'send') throw new Error('send outcome unknown');
       if (operation === 'worktree ps') return { stdout: JSON.stringify({ ok: true, result: { worktrees: [{ path: join(root, failure), worktreeId: failure, unverifiableTerminalCount: 0, agents: [{ state: 'done' }] }] } }) };
-      if (operation === 'terminal list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'task-tab', connected: true, writable: true, preview: '>' }] } }) };
+      if (operation === 'terminal list') return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: 'task-tab', connected: true, writable: true, preview: '>', agentIdentity: 'antigravity' }] } }) };
       return { stdout: '{"ok":true}' };
     };
     const receipt = await createOrcaSpawnExecutorPlugin({ store, commandRunner: runner, cwd: root, interactive: true })
@@ -5363,7 +5615,7 @@ for (const [agent, command, suffix] of [
     const root = directory(t);
     const workspacePath = join(root, 'custom');
     const store = new MailboxStore(join(root, 'mailbox.json'));
-    const { runner, state } = fakeOrcaWorkspace(workspacePath);
+    const { runner, state } = fakeOrcaWorkspace(workspacePath, [], agent);
     const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner })});
     t.after(() => service.stop());
     store.enqueue([alert('custom')], { mailboxId: 'worktree:custom', wakeTarget: {
@@ -5573,7 +5825,7 @@ test('wrapper continuation rotates and recovers with its receiver-owned fresh co
   const root = directory(t);
   const workspacePath = join(root, 'wrapper');
   const store = new MailboxStore(join(root, 'mailbox.json'));
-  const { runner, state } = fakeOrcaWorkspace(workspacePath);
+  const { runner, state } = fakeOrcaWorkspace(workspacePath, [], 'claude');
   const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner })});
   t.after(() => service.stop());
   const mailboxId = 'stream:wrapper';
