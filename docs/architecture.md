@@ -614,16 +614,21 @@ wake-target keys and non-JSON configuration values are rejected.
 
 Mailbox and outbox reads reuse validated snapshots keyed by device, inode, size and modification
 time. A successful write compacts history in the same atomic commit. The mailbox retains the
-200 newest acknowledged items eligible for pruning, 100 inactive inbound-only one-way wave
-threads and 200 inactive settled threads eligible for removal. The CLI supplies the notifier's
-durable catch-up watermark when Lark is enabled. The mailbox retains every acknowledgement
-above that watermark and every open question route. The outbox preserves the latest
-non-superseded claim for each network and idempotency key, including its original targets and
-replay receipts. It retains the 200 newest other eligible terminal items. Active custody and
-unconfirmed deliveries remain in their ledgers. Both stores
-read the peer ledger without taking its lock. The mailbox retains a route while the outbox could
-project it again, and the outbox retains supersession evidence while an unsettled outbound route
-still depends on it. Retained mailbox items keep their original signed envelope.
+200 newest acknowledged items eligible for pruning, the 100 newest inactive, open one-way
+`wave.*` thread groups eligible for pruning and the 200 newest eligible inactive settled threads.
+The wave limit covers inbound-only groups and, when an outbox is available, outbound and same-node
+loopback groups whose outbox records show confirmed terminal delivery or have already been
+pruned. Compaction removes all directional records in a group together. Startup reconciliation
+skips confirmed terminal one-way `wave.*` outbox history when no unacknowledged local mailbox
+items remain, so it cannot recreate expired routes.
+The CLI supplies the notifier's durable catch-up watermark when Lark is enabled. The mailbox
+retains every acknowledgement above that watermark and every open question route. The outbox
+preserves the latest non-superseded claim for each network and idempotency key, including its
+original targets and replay receipts. It retains the 200 newest other eligible terminal items.
+Active custody and unconfirmed deliveries remain in their ledgers. Both stores read the peer
+ledger without taking its lock. The mailbox retains a route while the outbox could project it
+again, and the outbox retains supersession evidence while an unsettled outbound route still
+depends on it. Retained mailbox items keep their original signed envelope.
 
 A driver persists `beginWakeDelivery` before an external boundary and settles only observed
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;

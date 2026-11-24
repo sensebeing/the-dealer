@@ -129,6 +129,145 @@ test('an acknowledged wave question retains its reply route and session after la
   assert.equal(mailbox.resolveReplyTarget(question.id)?.localMailbox, 'terminal:existing');
 });
 
+test('mailbox trims whole delivered loopback wave groups and keeps their outbox CAS winners across restart', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
+  const { mailbox, outbox } = stores(t);
+  const offline = new MailboxStore(mailbox.path);
+  const question = envelope('protected-question', { semantic: { type: 'question', threadId: 'protected-question' } });
+  const replied = envelope('protected-replied');
+  const unacked = envelope('protected-unacked');
+  for (const message of [question, replied, unacked]) offline.recordOutboundEnvelope(message, [keys.nodeId]);
+  offline.recordInboundEnvelope(question, 'default');
+  offline.recordInboundEnvelope(envelope('wave-reply', {
+    replyToId: replied.id, semantic: { type: 'reply', threadId: replied.id },
+  }), 'default');
+  offline.enqueue([unacked]);
+
+  const history = Array.from({ length: 102 }, (_, index) => envelope(`loopback-${index}`, {
+    idempotencyKey: `wave-key-${index}`,
+    ...(index === 0 ? { semantic: { type: 'message', threadId: 'loopback-0' } } : {}),
+  }));
+  for (const [index, message] of history.entries()) {
+    t.mock.timers.tick(1);
+    offline.recordOutboundEnvelope(message, [keys.nodeId]);
+    if (index !== 1) offline.recordInboundEnvelope(message, 'default');
+    outbox.enqueue({ envelope: message, explicitTargets: [], pendingNodeIds: [],
+      deliveredReceipts: { [keys.nodeId]: receipt(message.id, 'dispatched') } });
+  }
+  assert.equal(mailbox.listThreadRecords(history[0].id).length, 2);
+  assert.equal(mailbox.listThreadRecords(history[1].id).length, 1);
+  const oldest = history[0];
+  const winner = outbox.findKeyedObligation(oldest.networkId, oldest.idempotencyKey!, 0);
+  assert.equal(winner?.status, 'delivered');
+  const outboxBefore = readFileSync(outbox.path, 'utf8');
+
+  mailbox.upsertWakeTarget('stream:alerts', { pendingWake: false });
+
+  // Reconcile without write-time outbox retention so any restored outbound leg stays visible.
+  const restarted = new MailboxStore(mailbox.path);
+  for (const message of history.slice(0, 2)) assert.equal(restarted.listThreadRecords(message.id).length, 0, message.id);
+  restarted.reconcileOutboxThreads(outbox);
+  for (const message of history.slice(0, 2)) assert.equal(restarted.listThreadRecords(message.id).length, 0, message.id);
+  for (const message of history.slice(2)) {
+    assert.deepEqual(restarted.listThreadRecords(message.id).map(record => record.direction).sort(), ['inbound', 'outbound']);
+  }
+  assert.equal(restarted.listThreadRecords(question.id).length, 2);
+  assert.deepEqual(restarted.listThreadRecords(replied.id).map(record => record.state), ['replied', 'replied']);
+  assert.equal(restarted.listThreadRecords(unacked.id).length, 2);
+  assert.equal(readFileSync(outbox.path, 'utf8'), outboxBefore);
+  assert.deepEqual(outbox.findKeyedObligation(oldest.networkId, oldest.idempotencyKey!, 0), winner);
+});
+
+test('outbox restores and projects in-flight waves while excluding confirmed one-way history', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
+  const { mailbox, outbox } = stores(t);
+  const cases: { id: string; patch: Partial<OutboxItem>; projects?: boolean; kind?: string }[] = [
+    { id: 'queued', patch: { status: 'queued' } },
+    { id: 'pending', patch: { pendingNodeIds: ['other'] } },
+    { id: 'in-doubt', patch: { inDoubtNodeIds: ['other'] } },
+    { id: 'relay-spooled', patch: { relaySpooledNodeIds: ['other'] } },
+    { id: 'uncommitted', patch: { sentCommitted: false } },
+    { id: 'active-attempt', patch: { activeAttempt: { token: 'active', expiresAt: '2025-01-02T00:00:00.000Z' } } },
+    { id: 'queued-receipt', patch: { deliveredReceipts: { peer: receipt('queued-receipt', 'queued') } } },
+    { id: 'confirmed', patch: {}, projects: false },
+    { id: 'release', patch: {}, kind: 'release.prod.v1' },
+  ];
+  const base = outbox.enqueue({ envelope: envelope('base'), explicitTargets: [], pendingNodeIds: [] });
+  for (const { id } of cases) mailbox.enqueue([envelope(`active-${id}`)], { mailboxId: `stream:${id}` });
+  writeFileAtomically(outbox.path, JSON.stringify({
+    schema: 'the-dealer-outbox/v2',
+    items: cases.map(({ id, patch, kind }) => ({
+      ...base, id, status: 'delivered', deliveredReceipts: { peer: receipt(id, 'dispatched') },
+      envelope: envelope(id, { kind: kind ?? base.envelope.kind,
+        semantic: { type: 'message', threadId: id, replyMailbox: `stream:${id}` } }),
+      ...patch,
+    })),
+  }));
+
+  t.mock.timers.tick(1);
+  mailbox.enqueue(Array.from({ length: 100 }, (_, index) => envelope(`history-${index}`)));
+  mailbox.ack(mailbox.check().deliveryId!);
+  for (const { id, projects = true } of cases) {
+    assert.equal(mailbox.getThread(id), undefined, id);
+    assert.equal(mailbox.inspectSlotObligations(`stream:${id}`, { outbox }).immediateBusyReason,
+      projects ? 'outbound_thread_open' : undefined, id);
+  }
+
+  mailbox.reconcileOutboxThreads(outbox);
+
+  for (const { id, projects = true } of cases) {
+    assert.equal(mailbox.getThread(id)?.direction, projects ? 'outbound' : undefined, id);
+    assert.equal(mailbox.inspectSlotObligations(`stream:${id}`, { outbox }).immediateBusyReason,
+      projects ? 'outbound_thread_open' : undefined, id);
+  }
+  assert.ok(mailbox.getThread('history-0'));
+});
+
+test('a delivered loopback wave keeps its originating slot busy until downstream acknowledgement', t => {
+  const { mailbox, outbox } = stores(t);
+  const origin = 'stream:origin';
+  const downstream = 'stream:downstream';
+  const wave = envelope('interrupted-loopback', {
+    idempotencyKey: 'interrupted-loopback',
+    semantic: { type: 'message', threadId: 'interrupted-loopback', replyMailbox: origin, targetMailbox: downstream },
+  });
+  const claim = outbox.claimIdempotency({ envelope: wave, explicitTargets: [], plannedTargetNodeIds: [keys.nodeId] });
+  mailbox.enqueue([wave], { mailboxId: downstream });
+  const delivered = outbox.enqueue({ envelope: wave, explicitTargets: [], pendingNodeIds: [],
+    attemptToken: claim.attemptToken, deliveredReceipts: { [keys.nodeId]: receipt(wave.id, 'dispatched') } });
+  assert.equal(delivered.status, 'delivered');
+
+  const restarted = new MailboxStore(mailbox.path, { outbox });
+  const inspect = () => restarted.inspectSlotObligations(origin, { outbox }).immediateBusyReason;
+  assert.deepEqual(restarted.listThreadRecords(wave.id).map(record => record.direction), ['inbound']);
+  assert.equal(inspect(), 'local_outbound_pending');
+
+  restarted.reconcileOutboxThreads(outbox);
+
+  assert.deepEqual(restarted.listThreadRecords(wave.id).map(record => record.direction).sort(), ['inbound', 'outbound']);
+  const downstreamLease = restarted.check({ mailboxId: downstream });
+  assert.equal(inspect(), 'local_outbound_pending');
+  restarted.ack(downstreamLease.deliveryId!, downstream);
+  assert.equal(inspect(), undefined);
+});
+
+test('mailbox without an outbox trims inbound wave history while keeping loopback groups', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
+  const { mailbox } = stores(t);
+  const offline = new MailboxStore(mailbox.path);
+  const loopback = envelope('offline-loopback');
+  offline.recordOutboundEnvelope(loopback, [keys.nodeId]);
+  offline.recordInboundEnvelope(loopback, 'default');
+  offline.recordInboundEnvelope(envelope('old-inbound'), 'default');
+  t.mock.timers.tick(1);
+  offline.enqueue(Array.from({ length: 100 }, (_, index) => envelope(`inbound-${index}`)));
+  offline.ack(offline.check().deliveryId!);
+
+  assert.equal(offline.getThread('old-inbound'), undefined);
+  assert.equal(offline.listThreadRecords(loopback.id).length, 2);
+  assert.equal(offline.listThreads({ kind: loopback.kind }).length, 101);
+});
+
 test('first mailbox write compacts old settled threads as whole routes and preserves active ones', t => {
   const { mailbox } = stores(t);
   mailbox.enqueue([envelope('protected')]);

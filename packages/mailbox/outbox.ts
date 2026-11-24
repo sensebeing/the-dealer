@@ -308,7 +308,7 @@ function loadOutboxState(raw: string): OutboxSnapshot {
   };
 }
 
-function isTerminalHistory(item: OutboxItem): boolean {
+export function isTerminalHistory(item: OutboxItem): boolean {
   if (item.status === 'queued') return false;
   if (item.supersededById !== undefined && item.status === 'failed') return true;
   return item.status === 'delivered' && item.pendingNodeIds.length === 0 &&
