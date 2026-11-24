@@ -5326,6 +5326,7 @@ test('a claimed Orca terminal still guards its bound conversation until an indep
 
   const blocked = await service.flushMailbox(mailboxId, { force: true });
   assert.equal(blocked.woke, false);
+  assert.equal(blocked.reason, 'Bound terminal is still live');
   assert.equal(state.created, 0);
   assert.equal(terminalSends(state.calls).length, 0);
   assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, terminal.handle);
@@ -5438,22 +5439,27 @@ for (const { name, pendingTopology, reason, sessionOnly } of [
   });
 }
 
-test('Orca session recovery defers when a bound terminal row returns while reading workspace topology', async t => {
-  const { store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);
-  const { service } = startSlotProbeService(t, store, async request => {
-    const result = await runner(request);
-    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
-      state.terminals = [{ ...terminal, handle: 'reattached-handle', connected: false }];
-    }
-    return result;
+for (const [connected, reason] of [
+  [false, 'Terminal is disconnected or not writable'],
+  [true, 'Bound terminal is still live'],
+] as const) {
+  test(`Orca session recovery defers when a ${connected ? 'live' : 'disconnected'} bound terminal row returns during the workspace census`, async t => {
+    const { store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);
+    const { service } = startSlotProbeService(t, store, async request => {
+      const result = await runner(request);
+      if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+        state.terminals = [{ ...terminal, handle: 'reattached-handle', connected }];
+      }
+      return result;
+    });
+    store.enqueue([alert('bound-pane-reattaching')], { mailboxId });
+    const blocked = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(blocked.woke, false);
+    assert.equal(blocked.reason, reason);
+    assert.equal(state.created, 0);
+    assert.equal(terminalSends(state.calls).length, 0);
   });
-  store.enqueue([alert('bound-pane-reattaching')], { mailboxId });
-  const blocked = await service.flushMailbox(mailboxId, { force: true });
-  assert.equal(blocked.woke, false);
-  assert.equal(blocked.reason, 'Terminal is disconnected or not writable');
-  assert.equal(state.created, 0);
-  assert.equal(terminalSends(state.calls).length, 0);
-});
+}
 
 test('Orca session recovery defers if the original tab reattaches during descendant inspection', async t => {
   const { workspacePath, store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);

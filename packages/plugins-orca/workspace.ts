@@ -286,9 +286,9 @@ export async function checkOrcaWorkspaceIdle(
     if (typeof root.terminalVerdict === 'string' && root.terminalVerdict !== 'live' && root.terminalVerdict !== 'none') {
       return notIdle('Workspace terminal verdict is not settled');
     }
-    if (handles.some(terminal => matchesTerminalBinding(terminal, retiringHandle, retiringPaneKey))) {
-      return notIdle('Terminal is disconnected or not writable');
-    }
+    const presence = classifyOrcaTerminalPresence(handles, retiringHandle, retiringPaneKey);
+    if (presence === 'live') return notIdle('Bound terminal is still live');
+    if (presence === 'unusable') return notIdle('Terminal is disconnected or not writable');
     if (agents.some(agent => agent.hasLivePty !== false &&
       ((retiringPaneKey && agent.paneKey === retiringPaneKey) || (retiringHandle && agent.address === retiringHandle)))) {
       return notIdle('Bound terminal agent is still active or reattaching');
@@ -877,6 +877,20 @@ function matchesTerminalBinding(terminal: OrcaTerminalRow, handle?: string, pane
 
 export type OrcaTerminalPresence = 'live' | 'unusable' | 'absent';
 
+function classifyOrcaTerminalPresence(
+  terminals: readonly OrcaTerminalRow[],
+  terminalHandle?: string,
+  preferredPaneKey?: string,
+): OrcaTerminalPresence {
+  let presence: 'unusable' | 'absent' = 'absent';
+  for (const row of terminals) {
+    if (!row || !matchesTerminalBinding(row, terminalHandle, preferredPaneKey)) continue;
+    if (isUsableTerminal(row)) return 'live';
+    presence = 'unusable';
+  }
+  return presence;
+}
+
 export async function inspectOrcaWorkspaceTerminal(
   runner: CommandRunner,
   command: string,
@@ -890,13 +904,7 @@ export async function inspectOrcaWorkspaceTerminal(
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
-  let presence: 'unusable' | 'absent' = 'absent';
-  for (const row of inventory.result.terminals as OrcaTerminalRow[]) {
-    if (!row || !matchesTerminalBinding(row, terminalHandle, preferredPaneKey)) continue;
-    if (isUsableTerminal(row)) return 'live';
-    presence = 'unusable';
-  }
-  return presence;
+  return classifyOrcaTerminalPresence(inventory.result.terminals, terminalHandle, preferredPaneKey);
 }
 
 /** Read-only terminal selection: callers must fence the returned launch plan before executing it. */
