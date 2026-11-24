@@ -643,8 +643,10 @@ disconnected or read-only is `unusable` and defers recovery with
 `Terminal is disconnected or not writable`. A complete terminal list with
 no matching handle or pane reports `absent`. Before recovering an absent binding or
 resuming a session ID without a terminal binding, the driver requires settled workspace
-inventories with no unverifiable terminals, no matching agent still attached or
-reattaching, and enough connected terminals to account for live PTYs. Recovery defers
+inventories with no unverifiable terminals, no matching agent reporting `hasLivePty: true`,
+and enough connected terminals to account for live PTYs. Once the census confirms these
+conditions, a matching agent's stale activity state does not block recovery. Unattributed
+active agents and descendant worktrees still gate recovery. Recovery defers
 with `Bound terminal is still live` if the census finds a usable matching tab, including
 a tab owned by another wake target. After checking
 descendant worktrees, the driver checks the bound handle and pane again immediately before

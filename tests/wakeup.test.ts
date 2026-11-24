@@ -5450,9 +5450,7 @@ for (const { name, pendingTopology, reason, sessionOnly } of [
     reason: 'Workspace terminals are still reattaching' },
   { name: 'bound pane', pendingTopology: { agents: [{ state: 'done', paneKey: 'wave:root', hasLivePty: true }] },
     reason: 'Bound terminal agent is still active or reattaching' },
-  { name: 'bound address', pendingTopology: { agents: [{ state: 'done', address: 'term-wave', hasLivePty: true }] },
-    reason: 'Bound terminal agent is still active or reattaching' },
-  { name: 'bound active agent', pendingTopology: { agents: [{ state: 'working', address: 'term-wave' }] },
+  { name: 'bound address', pendingTopology: { agents: [{ state: 'working', paneKey: 'old:leaf', address: 'term-wave', hasLivePty: true }] },
     reason: 'Bound terminal agent is still active or reattaching' },
   { name: 'unmounted agent PTY', pendingTopology: { agents: [{ state: 'done', hasLivePty: true }] },
     reason: 'Workspace terminals are still reattaching' },
@@ -5489,6 +5487,36 @@ for (const { name, pendingTopology, reason, sessionOnly } of [
       assert.equal(state.created, 0);
       assert.equal(sendsTo(state.calls, terminal.handle).length, 1);
     }
+  });
+}
+
+for (const key of ['pane', 'handle'] as const) {
+  test(`Orca session recovery ignores stale activity on a matching ${key} without a live PTY`, async t => {
+    const { store, mailboxId, terminal, runner, state, driverConfig } = orcaSessionRecoveryFixture(t);
+    const staleAgent = key === 'pane'
+      ? { state: 'working', paneKey: driverConfig.paneKey }
+      : { state: 'working', paneKey: 'old:leaf', address: terminal.handle };
+    if (key === 'handle') {
+      store.upsertWakeTarget(mailboxId, { driverConfig: { ...driverConfig, paneKey: undefined } });
+    }
+    state.terminalVerdict = 'none';
+    state.liveTerminalCount = 0;
+    state.agents = [staleAgent];
+    const { service } = startSlotProbeService(t, store, runner);
+    assert.deepEqual(await service.probeSlot(mailboxId), { busy: false, ready: true });
+
+    state.agents.push({ state: 'working' });
+    store.enqueue([alert('stale-bound-agent')], { mailboxId });
+    const blocked = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(blocked.woke, false);
+    assert.equal(state.created, 0);
+
+    state.agents = [staleAgent];
+    const resumed = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(resumed.woke, true, resumed.reason);
+    assert.equal(state.created, 1);
+    assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+    assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, driverConfig.sessionId);
   });
 }
 

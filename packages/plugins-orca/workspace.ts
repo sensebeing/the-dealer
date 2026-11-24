@@ -182,7 +182,8 @@ export async function checkOrcaWorkspaceIdle(
   }
   // A fresh session tab has its own empty composer, so nothing retained can block it. Replacing a
   // bound terminal is the exception: the retiring slot must be quiescent before its tab is closed.
-  if (options?.targetTerminalHandle === null && !options.verifyAbsentForRecovery) {
+  const verifyAbsentForRecovery = options?.verifyAbsentForRecovery === true;
+  if (options?.targetTerminalHandle === null && !verifyAbsentForRecovery) {
     if (!options.retiringTerminalHandle?.trim() && !options.retiringPaneKey?.trim()) {
       return { idle: true, reason: undefined };
     }
@@ -279,7 +280,10 @@ export async function checkOrcaWorkspaceIdle(
   const observableHandles = handles.filter((t) => t.orphaned !== true || t.connected);
   const agents = root.agents;
   if (!Array.isArray(agents)) return notIdle();
-  if (options?.verifyAbsentForRecovery) {
+  const matchesRetiringAgent = (agent: (typeof agents)[number]): boolean => Boolean(
+    (retiringPaneKey && agent.paneKey === retiringPaneKey) || (retiringHandle && agent.address === retiringHandle),
+  );
+  if (verifyAbsentForRecovery) {
     if (root.unverifiableTerminalCount !== 0) {
       return notIdle('Workspace has unverifiable terminals before session recovery');
     }
@@ -289,8 +293,7 @@ export async function checkOrcaWorkspaceIdle(
     const presence = classifyOrcaTerminalPresence(handles, retiringHandle, retiringPaneKey);
     if (presence === 'live') return notIdle('Bound terminal is still live');
     if (presence === 'unusable') return notIdle('Terminal is disconnected or not writable');
-    if (agents.some(agent => (agent.hasLivePty === true || agent.state !== 'done') &&
-      ((retiringPaneKey && agent.paneKey === retiringPaneKey) || (retiringHandle && agent.address === retiringHandle)))) {
+    if (agents.some(agent => agent.hasLivePty === true && matchesRetiringAgent(agent))) {
       return notIdle('Bound terminal agent is still active or reattaching');
     }
     const connectedCount = observableHandles.filter(terminal => terminal.connected === true).length;
@@ -335,29 +338,28 @@ export async function checkOrcaWorkspaceIdle(
     Boolean(handle && handle !== ownHandle && handle !== retiringHandle && !reuseHandles?.has(handle));
   const canExcludeByLineage = siblingHandles.size > 0 ||
     [...(options?.excludedHandles ?? [])].some(allowedSiblingHandle);
+  // The recovery census already checks live PTYs for agents matching the retiring binding.
+  const busyAgents = agents.filter(agent =>
+    agent.state !== 'done' && !(verifyAbsentForRecovery && matchesRetiringAgent(agent)),
+  );
   const ownedAgentsBusy = (): boolean =>
-    agents
-      .filter((agent) =>
-        (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) ||
-        // A new tab still has to wait for work that cannot be attributed to a sibling.
-        (!agent.paneKey?.trim() && (opensTab || missingTargetPane || handles.length <= 1)),
-      )
-      .some((agent) => agent.state !== 'done');
-  const allAgentsBusy = (): boolean => agents.some((agent) => agent.state !== 'done');
+    busyAgents.some(agent =>
+      (typeof agent.paneKey === 'string' && targetPaneKeys.has(agent.paneKey)) ||
+      // A new tab still has to wait for work that cannot be attributed to a sibling.
+      (!agent.paneKey?.trim() && (opensTab || missingTargetPane || handles.length <= 1)),
+    );
   if (targetPaneKeys.size > 0) {
     if (ownedAgentsBusy()) return notIdle();
   } else if (opensTab) {
     // Creating a tab waits for agents that cannot be attributed to a sibling. A retiring
     // terminal without a pane fails closed, and its child worktrees are inspected below.
     if (targetTerm
-      ? allAgentsBusy()
-      : agents.some(agent =>
-        agent.state !== 'done' && !(typeof agent.paneKey === 'string' && knownSiblingPaneKeys.has(agent.paneKey)),
-      )
+      ? busyAgents.length > 0
+      : busyAgents.some(agent => !(typeof agent.paneKey === 'string' && knownSiblingPaneKeys.has(agent.paneKey)))
     ) {
       return notIdle();
     }
-  } else if (root.unverifiableTerminalCount !== 0 || allAgentsBusy()) {
+  } else if (root.unverifiableTerminalCount !== 0 || busyAgents.length > 0) {
     return notIdle();
   }
   // A chat-only or otherwise unobservable agent needs an injected authoritative idleCheck.
