@@ -7,21 +7,32 @@
 //
 // The optional third argument delays `serveControl()` after the lock is claimed, reproducing a
 // real cold start whose plugin loading and network mounting take seconds before `control.sock`
-// appears.
+// appears. The optional fourth argument delays the claim itself: a real supervisor spawns a
+// fresh process, so the state directory has a visible ownerless gap before the replacement
+// holds `runtime.lock`.
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const [repoRoot, stateDir, serveDelayMsRaw] = process.argv.slice(2);
+const [repoRoot, stateDir, serveDelayMsRaw, lockDelayMsRaw] = process.argv.slice(2);
 const serveDelayMs = Number(serveDelayMsRaw ?? 0);
+const lockDelayMs = Number(lockDelayMsRaw ?? 0);
 const ownerPath = join(stateDir, 'runtime.lock', 'owner.json');
 const { DealerNodeRuntime, runDealerCli } = await import(pathToFileURL(join(repoRoot, 'packages/cli/index.ts')).href);
 
+// Synchronous waits: an event-loop turn here would let the CLI probe see an absent daemon
+// instead of the supervisor-started replacement.
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const sleepSync = ms => Atomics.wait(sleeper, 0, 0, ms);
+
 process.stdout.write('armed\n');
-// Spin synchronously on the lock owner record: any timer delay would let the CLI probe see
-// an absent daemon instead of the supervisor-started replacement.
 while (existsSync(ownerPath)) {
   // The supervised daemon still owns the state directory.
+  sleepSync(5);
+}
+if (lockDelayMs > 0) {
+  // The supervised daemon has exited and the replacement has not claimed the lock yet.
+  sleepSync(lockDelayMs);
 }
 
 const runtime = new DealerNodeRuntime({ stateDir });

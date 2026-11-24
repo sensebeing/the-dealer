@@ -13,7 +13,33 @@ export type FingerprintRecord = {
   instanceId: string;
   fingerprint: string;
   startedAt: string;
+  /** True when a system service manager, not a detached CLI launch, owns respawning. */
+  supervised?: boolean;
 };
+
+/** Marks a CLI-spawned detached daemon so it never inherits supervisor custody. */
+export const DEALER_DETACHED_LAUNCH_ENV = 'DEALER_DETACHED_LAUNCH';
+
+/**
+ * Whether a system service manager owns this process: macOS `launchd` jobs set
+ * `XPC_SERVICE_NAME` (GUI `application.*` jobs are excluded), `systemd` services set
+ * `INVOCATION_ID`, and both can be overridden explicitly with `DEALER_SUPERVISED`.
+ * A detached CLI launch is never supervised: its replacement is spawned by the CLI
+ * itself, so waiting for a supervisor would only postpone the restart.
+ */
+export function isSupervisedDaemonEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env[DEALER_DETACHED_LAUNCH_ENV] === '1' || env.DEALER_SUPERVISED === '0') {
+    return false;
+  }
+  if (env.DEALER_SUPERVISED === '1') {
+    return true;
+  }
+  const launchdJob = typeof env.XPC_SERVICE_NAME === 'string' ? env.XPC_SERVICE_NAME.trim() : '';
+  if (launchdJob !== '' && launchdJob !== '0' && !launchdJob.startsWith('application.')) {
+    return true;
+  }
+  return typeof env.INVOCATION_ID === 'string' && env.INVOCATION_ID.trim() !== '';
+}
 
 function sha256Hex(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
