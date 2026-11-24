@@ -519,7 +519,7 @@ export async function waitOrcaTerminalIdle(
   timeoutMs = 5000,
   signal?: AbortSignal,
   options?: OrcaProbeOptions,
-): Promise<OrcaIdleResult> {
+): Promise<OrcaIdleResult & { timedOut?: true }> {
   try {
     const waited = await runner({
       command,
@@ -567,7 +567,7 @@ export async function waitOrcaTerminalIdle(
     const detail = isRecord(response.error) ? response.error : undefined;
     const code = typeof detail?.code === 'string' ? detail.code : undefined;
     const isBoundedTimeout = response.error === undefined ? successfulExit : code === 'timeout';
-    if (isBoundedTimeout) return { idle: false, reason: 'Terminal is busy' };
+    if (isBoundedTimeout) return { idle: false, reason: 'Terminal is busy', timedOut: true };
     const diagnostic = (typeof detail?.message === 'string' && detail.message.trim()) || stderr;
     throw new Error([code, diagnostic].filter(Boolean).join(': ') || `Orca terminal wait failed (exit ${waited.exitCode ?? 'unknown'})`);
   } catch (error) {

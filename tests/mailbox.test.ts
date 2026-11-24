@@ -838,6 +838,40 @@ test('ack is idempotent and rejects unknown or mismatched leases', t => {
   assert.equal(store.ack(taskLease.deliveryId!, 'task:x').alreadyAcknowledged, true);
 });
 
+test('ack resets next-wave backoff atomically and preserves an unknown delivery fence', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
+  const notifications: [string, number, number, number][] = [];
+  const subscription = store.onWakeTarget(mailboxId => {
+    const target = store.getWakeTarget(mailboxId)!;
+    notifications.push([mailboxId, target.completedWaves, target.earliestWakeAt, target.attemptCount]);
+  });
+  t.after(() => subscription.dispose());
+
+  for (const mailboxId of ['queued', 'pending', 'fenced']) {
+    store.enqueue([envelope(`${mailboxId}-first`)], { mailboxId });
+    const lease = store.check({ mailboxId });
+    if (mailboxId !== 'pending') store.enqueue([envelope(`${mailboxId}-next`)], { mailboxId });
+    const target = store.upsertWakeTarget(mailboxId, {
+      pendingWake: mailboxId === 'pending',
+      earliestWakeAt: 30_000,
+      attemptCount: 4,
+      ...(mailboxId === 'fenced' ? { deliveryInDoubt: true, lastWakeError: 'unconfirmed send' } : {}),
+    });
+    notifications.length = 0;
+    store.ack(lease.deliveryId!, mailboxId);
+    const next = store.getWakeTarget(mailboxId);
+    if (mailboxId === 'fenced') {
+      assert.deepEqual(next, { ...target, completedWaves: 1 });
+      assert.deepEqual(notifications, []);
+    } else {
+      assert.deepEqual(next, { ...target, completedWaves: 1, pendingWake: true, earliestWakeAt: 0, attemptCount: 0 });
+      assert.deepEqual(notifications, [[mailboxId, 1, 0, 0]]);
+    }
+  }
+});
+
 test('peek never mints a lease or mutates item state', t => {
   const { path } = workspace(t);
   const store = new MailboxStore(path);

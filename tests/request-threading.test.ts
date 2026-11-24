@@ -428,7 +428,7 @@ test('native bootstrap stores canonical path and blocks newborn TUI until author
   });
   await service.flushMailbox('default');
   assert.equal(store.getWakeTarget('default')?.driverConfig?.workspacePath, path);
-  assert.ok(calls.some(call => call.args.includes('5000')));
+  assert.ok(calls.some(call => call.args.includes('25000')));
   assert.equal(calls.some(call => call.args[1] === 'send'), false);
   ready = true;
   await service.flushMailbox('default', { force: true });
