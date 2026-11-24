@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -75,15 +76,20 @@ test('a same-PID lock recorded by another container is never reclaimed', async t
   assert.equal(existsSync(join(lockDir, 'owner.json')), true, 'a live foreign container keeps its lock');
 });
 
-test('a mailbox lock left by the previous same-PID incarnation is reclaimed', async t => {
+test('mailbox recovers a committed batch after its writer is killed', t => {
   const root = directory(t);
-  const store = new MailboxStore(join(root, 'mailbox.json'));
-  mkdirSync(store.lockDir, { recursive: true, mode: 0o700 });
-  writeFileSync(join(store.lockDir, 'owner.json'), previousIncarnation());
-
-  // A SIGKILL during a mailbox operation leaves the same-PID owner behind; the first
-  // operation after the restart must reclaim it instead of waiting for the lock forever.
-  const result = store.enqueue([envelope('after-restart')]);
-  assert.deepEqual(result.inserted, ['after-restart']);
-  assert.equal(existsSync(store.lockDir), false, 'the reclaimed mailbox lock is released');
+  const path = join(root, 'mailbox.json');
+  const moduleUrl = new URL('../packages/mailbox/store.ts', import.meta.url).href;
+  const script = `import { MailboxStore } from ${JSON.stringify(moduleUrl)};
+    const store = new MailboxStore(${JSON.stringify(path)});
+    store.enqueue([${JSON.stringify(envelope('before-crash'))}]);
+    process.kill(process.pid, 'SIGKILL');`;
+  const writer = spawnSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script]);
+  assert.equal(writer.signal, 'SIGKILL', writer.stderr.toString());
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
+  const batch = store.check();
+  assert.deepEqual(batch.items.map(item => item.id), ['before-crash']);
+  assert.deepEqual(store.ack(batch.deliveryId!).itemIds, ['before-crash']);
+  assert.deepEqual(store.enqueue([envelope('after-restart')]).inserted, ['after-restart']);
 });

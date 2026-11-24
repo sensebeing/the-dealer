@@ -37,7 +37,7 @@ import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 import { baseStreamKeyOf, OutboxRedriveService, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
 import type { MailboxStore, OutboxStore, SlotProbeResult } from '../mailbox/index.ts';
-import { openStateLedgers } from './ledgers.ts';
+import { compactQueueSummary, openStateLedgers } from './ledgers.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -552,6 +552,7 @@ export class DealerNodeRuntime {
         ],
         flushIntervalMs: this.config.wave?.flushIntervalMs ?? 1_000,
         onError: error => { this.lastError = String(error); },
+        onTransition: event => { console.error(`[dealer:wakeup] ${JSON.stringify(event)}`); },
         canInheritSlotTarget: (mailboxId, baseMailboxId) => this.slotInheritsBaseWakeTarget(mailboxId, baseMailboxId),
       });
       const keyPath = join(this.stateDir, 'identity.json');
@@ -1589,6 +1590,7 @@ export class DealerNodeRuntime {
       gateMode: this.gate.getMode(),
       lastError: this.lastError,
       outbox: { queuedCount: this.outbox ? this.outbox.list({ status: 'queued' }).length : 0 },
+      queues: compactQueueSummary(this.mailbox),
       runtimeFingerprint: this.currentDaemonFingerprint(),
       autoUpdate: readAutoUpdateStatus(this.stateDir),
     };
@@ -1860,15 +1862,18 @@ export class DealerNodeRuntime {
     const hadServer = this.server !== undefined;
     try {
       // Stop redrive first: it must not start new sends while transport and kernel unwind.
-      await this.outboxRedrive?.stop();
-      await this.wakeups?.stop();
+      try {
+        await this.outboxRedrive?.stop();
+      } finally {
+        await this.wakeups?.stop();
+      }
     } finally {
       try {
         await this.kernel.stop();
       } finally {
-        if (this.ownsLock) {
+        try {
           // Only the instance that created the control server may remove its socket.
-          if (hadServer) {
+          if (this.ownsLock && hadServer) {
             this.server?.closeAllConnections?.();
             if (this.server?.listening) {
               await new Promise<void>((resolve, reject) => {
@@ -1878,14 +1883,21 @@ export class DealerNodeRuntime {
             this.server = undefined;
             rmSync(this.socketPath, { force: true });
           }
-          this.releaseLock(join(this.stateDir, 'runtime.lock'));
-          if (this.daemonInstanceId) removeDaemonFingerprint(this.stateDir, this.daemonInstanceId);
-          this.ownsLock = false;
-          releaseOwnedDirectory(this.stateDir);
+        } finally {
+          try {
+            this.mailbox?.close();
+          } finally {
+            if (this.ownsLock) {
+              this.releaseLock(join(this.stateDir, 'runtime.lock'));
+              if (this.daemonInstanceId) removeDaemonFingerprint(this.stateDir, this.daemonInstanceId);
+              this.ownsLock = false;
+              releaseOwnedDirectory(this.stateDir);
+            }
+            this.started = false;
+            // Only once the control socket is gone may a stopped in-process runtime admit work again.
+            this.draining = false;
+          }
         }
-        this.started = false;
-        // Only once the control socket is gone may a stopped in-process runtime admit work again.
-        this.draining = false;
       }
     }
   }

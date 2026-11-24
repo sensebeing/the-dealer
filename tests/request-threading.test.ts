@@ -62,10 +62,16 @@ test('thread envelopes survive settlement and reload; summaries and sequence sca
   assert.deepEqual(items.map(item => item.sequence), [1, 2]);
   assert.throws(() => reloaded.listThreads({ state: 'bad' as 'open' }));
   assert.throws(() => reloaded.listItemsAfterSequence(-2));
-  const old = JSON.parse(readFileSync(store.path, 'utf8'));
-  for (const record of Object.values(old.threads) as any[]) delete record.envelope;
-  writeFileSync(store.path, JSON.stringify(old));
-  assert.equal(new MailboxStore(store.path).listThreads()[0].rootEnvelope, undefined);
+  const legacyPath = join(root, 'legacy-mailbox.json');
+  writeFileSync(legacyPath, JSON.stringify({
+    schema: 'the-dealer-mailbox/v2', sequence: 3, items: reloaded.listItemsAfterSequence(-1),
+    threads: Object.fromEntries(records.map(record => [
+      `${record.direction}:${record.messageId}`, { ...record, envelope: undefined },
+    ])),
+  }));
+  const migrated = new MailboxStore(legacyPath);
+  t.after(() => { store.close(); reloaded.close(); migrated.close(); });
+  assert.equal(migrated.listThreads()[0].rootEnvelope, undefined);
 });
 
 test('topic binding routes signed messages and control frames consistently with CLI threads', async t => {
@@ -332,7 +338,9 @@ test('Lark filtering advances cursor and failed delivery fences later items unti
   assert.equal(argument(calls[1], '--idempotency-key'), idempotency);
   assert.equal(calls.length, 3);
   assert.equal(JSON.parse(readFileSync(config.statePath, 'utf8')).cursorSequence, 203);
-  offline.upsertWakeTarget('passive', { pendingWake: false });
+  offline.enqueue([envelope('next-batch', { kind: 'excluded' })]);
+  await restarted.flush();
+  offline.ack(offline.check().deliveryId!);
   assert.equal(offline.list({ includeAcked: true }).ackedCount, 200);
   await restarted.stop();
 });

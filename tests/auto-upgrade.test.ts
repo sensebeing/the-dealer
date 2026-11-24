@@ -1735,7 +1735,7 @@ test('background auto-update bypasses cooldown for disk or live daemon drift wit
 
 test('offline CLI commands and daemon startup trigger background auto-update', async t => {
   const calls = captureBackgroundUpdates(t);
-  for (const args of [['inbox', 'check'], ['node', 'status'], ['setup', 'probe'], ['project', 'init']]) {
+  for (const args of [['inbox', 'check'], ['setup', 'probe'], ['project', 'init']]) {
     const { root, stateDir } = isolatedState();
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const result = await runDealerCli([...args, '--root', join(root, 'project'), '--json'], {
@@ -1755,8 +1755,24 @@ test('offline CLI commands and daemon startup trigger background auto-update', a
     rmSync(root, { recursive: true, force: true });
   });
   runtime = await runDealerDaemon(['--profile', 'headless-relay', '--member', 'test-node']);
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 4);
   assert.equal(calls.at(-1), stateDir);
+});
+
+test('offline mailbox observations do not schedule a background update', async t => {
+  const calls = captureBackgroundUpdates(t);
+  const { root, stateDir } = isolatedState();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const args of [
+    ['node', 'status'], ['queue', 'status'], ['inbox', 'list'], ['inbox', 'check', '--peek'],
+    ['thread', 'list'], ['thread', 'show', 'missing'],
+  ]) {
+    const result = await runDealerCli([...args, '--json'], {
+      stateDir, stdout: () => {}, stderr: message => assert.fail(message),
+    });
+    assert.equal(result, 0, args.join(' '));
+  }
+  assert.deepEqual(calls, []);
 });
 
 function updateCheckoutFixture(t: { after: (fn: () => void) => void }, checkoutName = 'checkout') {

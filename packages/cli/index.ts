@@ -13,9 +13,9 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
-import { openStateLedgers } from './ledgers.ts';
-import type { MailboxStore, OutboxStore, OutboxItemStatus } from '../mailbox/index.ts';
+import { MailboxMigrationRequiredError, MailboxStore, resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
+import { compactQueueSummary, openStateLedgers, openStateMailboxSnapshot } from './ledgers.ts';
+import type { OutboxStore, OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, Disposable, SettlementOutcome } from '../core-types/index.ts';
 import {
@@ -27,6 +27,7 @@ import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './
 import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
+import type { RuntimeConfig } from './config.ts';
 import { processOwnerRecord } from '../process-lock/index.ts';
 
 export * from './runtime.ts';
@@ -734,7 +735,7 @@ function positiveInteger(value: unknown, flag: string): number | undefined {
 }
 
 async function runInboxCommand(
-  store: MailboxStore,
+  store: MailboxStore | undefined,
   action: string | undefined,
   target: string | undefined,
   v: Record<string, any>,
@@ -746,10 +747,11 @@ async function runInboxCommand(
   const checkOnlyFlags =
     v.ack !== undefined || v.peek === true || v.wait === true || v['timeout-ms'] !== undefined;
   if (command === 'check') {
+    if (v.peek === true && v.ack !== undefined) throw new Error('--peek cannot be combined with --ack');
     const timeoutMs = positiveInteger(v['timeout-ms'], '--timeout-ms');
     if (timeoutMs !== undefined && v.wait !== true) throw new Error('--timeout-ms requires --wait');
     const targetMailbox = normalizeMailboxId(mailboxId ?? 'default');
-    if (v.peek !== true && (v.ack === undefined || store.resolveLeaseMailbox(String(v.ack)) === targetMailbox)) {
+    if (store && v.peek !== true && (v.ack === undefined || store.resolveLeaseMailbox(String(v.ack)) === targetMailbox)) {
       reconcileCallerOrcaWakeTarget(store, targetMailbox, caller, { requireBoundOwner: true });
     }
     const checkOptions = {
@@ -758,15 +760,18 @@ async function runInboxCommand(
       ...(v.peek === true ? { peek: true } : {}),
     };
     if (v.wait === true) {
-      return store.waitForMail({
+      return MailboxStore.waitForMail(store, {
         ...checkOptions,
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(signal !== undefined ? { signal } : {}),
       });
     }
-    return store.check(checkOptions);
+    return store?.check(checkOptions) ?? {
+      mailboxId: targetMailbox, deliveryId: null, redelivered: false, newerQueuedCount: 0, items: [],
+    };
   }
   if (command === 'ack') {
+    if (!store) throw new Error('Mailbox is unavailable for acknowledgement');
     if (checkOnlyFlags) {
       throw new Error('--ack, --peek, --wait and --timeout-ms are only valid with inbox check');
     }
@@ -787,11 +792,14 @@ async function runInboxCommand(
       throw new Error('--ack, --peek, --wait and --timeout-ms are only valid with inbox check');
     }
     const limit = positiveInteger(v.limit, '--limit');
-    return store.list({
+    return store?.list({
       ...(mailboxId !== undefined ? { mailboxId } : {}),
       ...(v.all === true || v['include-acked'] === true ? { includeAcked: true } : {}),
       ...(limit !== undefined ? { limit } : {}),
-    });
+    }) ?? {
+      ...(mailboxId !== undefined ? { mailboxId: normalizeMailboxId(mailboxId) } : {}),
+      totalCount: 0, queuedCount: 0, leasedCount: 0, ackedCount: 0, items: [],
+    };
   }
   throw new Error(`Unknown inbox command: ${String(action)}`);
 }
@@ -807,14 +815,21 @@ function payloadFromBody(body: string): Record<string, unknown> {
   }
 }
 
-async function ledgersFor(options: DealerCliOptions, stateDir: string) {
+function readSavedConfig(stateDir: string): Partial<RuntimeConfig> {
+  const file = join(stateDir, 'config.json');
+  return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+}
+
+async function ledgersFor(options: DealerCliOptions, stateDir: string, readOnly: boolean, config?: Partial<RuntimeConfig>) {
   if (options.runtime) {
     await options.runtime.start();
     return { mailbox: options.runtime.mailbox, outbox: options.runtime.outbox };
   }
-  const file = join(stateDir, 'config.json');
-  const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-  return openStateLedgers(stateDir, savedConfig.executorConfig?.inbox?.inboxPath, () => savedConfig.larkNotify);
+  const savedConfig = config ?? readSavedConfig(stateDir);
+  const legacyInboxPath = savedConfig.executorConfig?.inbox?.inboxPath;
+  return readOnly
+    ? { mailbox: openStateMailboxSnapshot(stateDir, legacyInboxPath), outbox: undefined }
+    : openStateLedgers(stateDir, legacyInboxPath, () => savedConfig.larkNotify);
 }
 
 function replyTargetOrThrow(
@@ -867,14 +882,14 @@ function settlementOutcome(value: unknown): SettlementOutcome {
 }
 
 function runThreadCommand(
-  store: MailboxStore,
+  store: MailboxStore | undefined,
   action: string | undefined,
   target: string | undefined,
   v: Record<string, any>,
   outbox?: OutboxStore,
 ) {
   if (action === 'list') {
-    return store.listThreads({ kind: v.topic, state: v.state, limit: v.limit === undefined ? undefined : Number(v.limit) });
+    return store?.listThreads({ kind: v.topic, state: v.state, limit: v.limit === undefined ? undefined : Number(v.limit) }) ?? [];
   }
   if (action === 'prune') {
     const id = required(target, 'message-id');
@@ -890,7 +905,7 @@ function runThreadCommand(
         `Refusing to prune outbound thread record ${id} while outbox status is ${existingOutbox.status}; pass --force to override`,
       );
     }
-    const pruned = store.pruneOutboundThreadRecord(id);
+    const pruned = store?.pruneOutboundThreadRecord(id);
     if (!pruned) {
       throw new Error(`Outbound thread record not found: ${id}`);
     }
@@ -900,6 +915,7 @@ function runThreadCommand(
     throw new Error('Unknown thread command; use thread show|list|prune');
   }
   const id = required(target, 'thread-id');
+  if (!store) return null;
   const records = store.listThreadRecords(id);
   if (!records.length) {
     throw new Error(`Unknown thread: ${id}`);
@@ -1177,6 +1193,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
   let owned: DealerNodeRuntime | undefined;
+  let offlineMailbox: MailboxStore | undefined;
   let updateStateDir: string | undefined;
   // An ephemeral CLI runtime exits with this command; queued mail needs the daemon's
   // background redrive to survive that exit.
@@ -1187,13 +1204,14 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (v.help === true || group === 'help') {
       stdout(JSON.stringify({
         ok: true,
-        usage: 'dealer <send|reply|ask|settle|inbox|thread|outbox|worktree|node|project|setup|route|source> [options]',
+        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|worktree|node|project|setup|route|source> [options]',
         commands: {
           send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--idempotency-key <key>] [--attach <path>] [--json]',
           reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
           ask: 'dealer ask <messageId> --body <text> [--ack <leaseId>] [--json]',
           settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
           inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
+          queue: 'dealer queue status [--mailbox <id>] [--all] [--json]',
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
         },
@@ -1201,7 +1219,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
-    if (!options.runtime && group !== 'self-update' && !(group === 'node' && action === 'down')) {
+    const readOnlyInbox = group === 'inbox' && (action === undefined || action === 'list' || (action === 'check' && v.peek === true));
+    const readOnlyThread = group === 'thread' && (action === 'list' || action === 'show');
+    const observesMailbox = readOnlyInbox || readOnlyThread || group === 'queue' || (group === 'node' && action === 'status');
+    const openLedgers = async (config?: Partial<RuntimeConfig>) => {
+      const ledgers = await ledgersFor(options, stateDir, observesMailbox, config);
+      if (!options.runtime) offlineMailbox = ledgers.mailbox;
+      return ledgers;
+    };
+    if (!options.runtime && !observesMailbox && group !== 'self-update' && !(group === 'node' && action === 'down')) {
       updateStateDir = stateDir;
     }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
@@ -1334,14 +1360,26 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     if (group === 'inbox') {
-      // Offline access is serialized by the mailbox file lock, so it stays coherent even if
-      // the daemon owns the state directory.
-      const { mailbox } = await ledgersFor(options, stateDir);
+      const { mailbox } = await openLedgers();
       stdout(JSON.stringify(await runInboxCommand(mailbox, action, target, v, options.signal), null, v.json ? undefined : 2));
       return 0;
     }
+    if (group === 'queue') {
+      if (action !== 'status' || target !== undefined) throw new Error('Use dealer queue status [--mailbox <id>] [--all] [--json]');
+      const { mailbox } = await openLedgers();
+      if (!mailbox && v.mailbox !== undefined) normalizeMailboxId(v.mailbox);
+      const { summary, queues } = mailbox?.summarizeQueues({ mailboxId: v.mailbox, includeIdle: v.all }) ??
+        { summary: { ...compactQueueSummary(), totalMailboxes: 0 }, queues: [] };
+      const projected = queues.map(({ driverConfig, ...queue }) => ({
+        ...queue,
+        workspacePath: typeof driverConfig?.workspacePath === 'string' ? driverConfig.workspacePath : undefined,
+        terminalHandle: typeof driverConfig?.terminalHandle === 'string' ? driverConfig.terminalHandle : undefined,
+      }));
+      stdout(JSON.stringify({ summary, queues: projected }, null, v.json ? undefined : 2));
+      return 0;
+    }
     if (group === 'thread') {
-      const { mailbox, outbox } = await ledgersFor(options, stateDir);
+      const { mailbox, outbox } = await openLedgers();
       stdout(JSON.stringify(runThreadCommand(mailbox, action, target, v, outbox), null, v.json ? undefined : 2));
       return 0;
     }
@@ -1350,14 +1388,21 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'status') {
-      const file = join(stateDir, 'config.json');
-      const config = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+      const config = readSavedConfig(stateDir);
+      let queues: ReturnType<typeof compactQueueSummary> & { migrationRequired?: true };
+      try {
+        queues = compactQueueSummary((await openLedgers(config)).mailbox);
+      } catch (error) {
+        if (!(error instanceof MailboxMigrationRequiredError)) throw error;
+        queues = { ...compactQueueSummary(), migrationRequired: true };
+      }
       stdout(
         JSON.stringify({
           running: false,
           profile: config.profile,
           member: config.member,
           networks: (config.networks ?? []).map((n: { networkId: string }) => n.networkId),
+          queues,
         }),
       );
       return 0;
@@ -1739,6 +1784,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     stderr(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
     return 1;
   } finally {
+    offlineMailbox?.close();
     if (owned) {
       const stateDirForDaemon = owned.stateDir;
       let pending = false;

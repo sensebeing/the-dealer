@@ -9,11 +9,16 @@ import type { DeliveryReceipt, MessageEnvelope, OutboxItem } from '../packages/c
 import { writeFileAtomically } from '../packages/fs-atomic/index.ts';
 import { openStateLedgers } from '../packages/cli/ledgers.ts';
 import { MailboxStore } from '../packages/mailbox/store.ts';
+import type { ThreadRouteRecord } from '../packages/mailbox/store.ts';
 
 function stores(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'dealer-retention-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  return openStateLedgers(root);
+  const ledgers = openStateLedgers(root);
+  t.after(() => {
+    ledgers.mailbox.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  return ledgers;
 }
 
 const keys = generateNodeKeyPair();
@@ -45,10 +50,9 @@ function terminalHistory(base: OutboxItem, count: number): OutboxItem[] {
   });
 }
 
-test('ledger snapshots reuse validation and detect offline atomic replacement and deletion', t => {
-  const { mailbox, outbox } = stores(t);
+test('outbox snapshots reuse validation and detect offline atomic replacement and deletion', t => {
+  const { outbox } = stores(t);
   const message = envelope('original');
-  mailbox.enqueue([message]);
   outbox.enqueue({ envelope: message, explicitTargets: [], pendingNodeIds: [] });
   const parse = JSON.parse;
   const parsed: string[] = [];
@@ -58,31 +62,32 @@ test('ledger snapshots reuse validation and detect offline atomic replacement an
     return value;
   });
 
-  for (const store of [mailbox, outbox]) {
-    const list = () => store instanceof MailboxStore ? store.list().items : store.list();
-    const before = list();
-    before[0].envelope.subject = 'caller mutation';
-    const ledgerReads = parsed.length;
-    assert.equal(list()[0].envelope.subject, 'original');
-    assert.equal(parsed.length, ledgerReads);
+  const before = outbox.list();
+  before[0].envelope.subject = 'caller mutation';
+  const ledgerReads = parsed.length;
+  assert.equal(outbox.list()[0].envelope.subject, 'original');
+  assert.equal(parsed.length, ledgerReads);
 
-    const replacement = parse(readFileSync(store.path, 'utf8'));
-    replacement.items[0].envelope.subject = 'offline!';
-    writeFileAtomically(store.path, JSON.stringify(replacement));
-    assert.equal(list()[0].envelope.subject, 'offline!');
-    assert.equal(parsed.length, ledgerReads + 1);
+  const replacement = parse(readFileSync(outbox.path, 'utf8'));
+  replacement.items[0].envelope.subject = 'offline!';
+  writeFileAtomically(outbox.path, JSON.stringify(replacement));
+  assert.equal(outbox.list()[0].envelope.subject, 'offline!');
+  assert.equal(parsed.length, ledgerReads + 1);
 
-    rmSync(store.path);
-    assert.deepEqual(list(), []);
-  }
+  rmSync(outbox.path);
+  assert.deepEqual(outbox.list(), []);
 });
 
 test('mailbox acknowledgement caps historical items and one-way threads while preserving active custody', t => {
   const { mailbox } = stores(t);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
   const history = Array.from({ length: 205 }, (_, index) => envelope(`wave-${String(index).padStart(3, '0')}`));
   const signed = signEnvelope(history.at(-1)!, keys.privateKeyPem);
   history[history.length - 1] = { ...signed, subject: 'local projection' };
-  mailbox.enqueue(history, { mailboxId: 'history', signedEnvelopes: { [signed.id]: signed } });
+  for (const message of history) {
+    t.mock.timers.tick(1);
+    mailbox.enqueue([message], { mailboxId: 'history', signedEnvelopes: { [signed.id]: signed } });
+  }
   const leased = envelope('leased', { semantic: { threadId: history[0].id, type: 'message', targetMailbox: 'active' } });
   mailbox.enqueue([leased], { mailboxId: 'active' });
   // Give the independent active mailbox a lease and keep a second item behind it.
@@ -91,12 +96,6 @@ test('mailbox acknowledgement caps historical items and one-way threads while pr
   mailbox.recordInboundEnvelope(envelope('collaboration', { kind: 'collab.question' }), 'default');
   const reply = envelope('reply', { replyToId: history[1].id, semantic: { threadId: history[1].id, type: 'reply' } });
   mailbox.recordOutboundEnvelope(reply, ['peer']);
-  // Give the bulk historical fixture a deterministic order distinct from the protected records.
-  const disk = JSON.parse(readFileSync(mailbox.path, 'utf8'));
-  for (const [index, message] of history.entries()) {
-    disk.threads[`inbound:${message.id}`].updatedAt = new Date(Date.parse(old) + index).toISOString();
-  }
-  writeFileAtomically(mailbox.path, JSON.stringify(disk));
   mailbox.ack(mailbox.check({ mailboxId: 'history' }).deliveryId!, 'history');
 
   const view = mailbox.list({ includeAcked: true });
@@ -115,15 +114,14 @@ test('mailbox acknowledgement caps historical items and one-way threads while pr
 
 test('an acknowledged wave question retains its reply route and session after later alerts', t => {
   const { mailbox } = stores(t);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
   const question = envelope('old-question', {
     semantic: { type: 'question', threadId: 'old-question', replyMailbox: 'terminal:peer' },
   });
   mailbox.enqueue([question], { mailboxId: 'terminal:existing' });
   mailbox.ack(mailbox.check({ mailboxId: 'terminal:existing' }).deliveryId!, 'terminal:existing');
+  t.mock.timers.tick(1);
   mailbox.enqueue(Array.from({ length: 205 }, (_, index) => envelope('new-wave-' + index)));
-  const disk = JSON.parse(readFileSync(mailbox.path, 'utf8'));
-  disk.threads['inbound:old-question'].updatedAt = old;
-  writeFileAtomically(mailbox.path, JSON.stringify(disk));
   mailbox.ack(mailbox.check().deliveryId!);
   assert.equal(mailbox.resolveReplyTarget(question.id)?.targetMailbox, 'terminal:peer');
   assert.equal(mailbox.resolveReplyTarget(question.id)?.localMailbox, 'terminal:existing');
@@ -161,7 +159,7 @@ test('mailbox trims whole delivered loopback wave groups and keeps their outbox 
   assert.equal(winner?.status, 'delivered');
   const outboxBefore = readFileSync(outbox.path, 'utf8');
 
-  mailbox.upsertWakeTarget('stream:alerts', { pendingWake: false });
+  mailbox.reconcileOutboxThreads(outbox);
 
   // Reconcile without write-time outbox retention so any restored outbound leg stays visible.
   const restarted = new MailboxStore(mailbox.path);
@@ -268,34 +266,99 @@ test('mailbox without an outbox trims inbound wave history while keeping loopbac
   assert.equal(offline.listThreads({ kind: loopback.kind }).length, 101);
 });
 
-test('first mailbox write compacts old settled threads as whole routes and preserves active ones', t => {
-  const { mailbox } = stores(t);
-  mailbox.enqueue([envelope('protected')]);
-  mailbox.recordInboundEnvelope(envelope('settle', {
+test('thread writes compact old settled routes and preserve active ones after lossless import', t => {
+  const { mailbox: seed } = stores(t);
+  seed.enqueue([envelope('protected')]);
+  seed.recordInboundEnvelope(envelope('settle', {
     replyToId: 'protected',
     semantic: { threadId: 'protected', type: 'settle', outcome: 'succeeded' },
   }), 'default');
-  const state = JSON.parse(readFileSync(mailbox.path, 'utf8'));
-  const root = state.threads['inbound:protected'];
-  const settle = state.threads['inbound:settle'];
+  const root = seed.getInboundThreadRecord('protected', 'team')!;
+  const settle = seed.getInboundThreadRecord('settle', 'team')!;
+  const threads: Record<string, ThreadRouteRecord> = { 'inbound:protected': root, 'inbound:settle': settle };
   for (let index = 0; index < 201; index++) {
     const threadId = `settled-${index}`;
     const updatedAt = new Date(Date.parse(old) + index).toISOString();
     const settleMessageId = `${threadId}-final`;
-    state.threads[`inbound:${threadId}`] = { ...root, envelope: undefined, threadId, messageId: threadId, updatedAt };
-    state.threads[`outbound:${settleMessageId}`] = {
+    threads[`inbound:${threadId}`] = { ...root, envelope: undefined, threadId, messageId: threadId, updatedAt };
+    threads[`outbound:${settleMessageId}`] = {
       ...settle, direction: 'outbound', envelope: undefined, threadId, messageId: settleMessageId, updatedAt,
     };
   }
-  writeFileAtomically(mailbox.path, JSON.stringify(state));
-
-  mailbox.upsertWakeTarget('another-slot', { pendingWake: false });
+  const legacyPath = join(seed.path, '..', 'legacy-mailbox.json');
+  writeFileAtomically(legacyPath, JSON.stringify({
+    schema: 'the-dealer-mailbox/v2', sequence: 1, items: seed.list().items, threads,
+  }));
+  const mailbox = new MailboxStore(legacyPath);
+  seed.close();
+  t.after(() => mailbox.close());
+  assert.equal(mailbox.listThreadRecords('settled-0').length, 2);
+  mailbox.recordInboundEnvelope(envelope('settle', {
+    replyToId: 'protected', semantic: { threadId: 'protected', type: 'settle', outcome: 'succeeded' },
+  }), 'default');
 
   assert.equal(mailbox.getThread('settled-0'), undefined);
   assert.equal(mailbox.getThread('settled-0-final'), undefined);
   assert.equal(mailbox.listThreadRecords('settled-1').length, 2);
   assert.equal(mailbox.listThreadRecords('protected').length, 2);
   assert.equal(mailbox.listThreads({ state: 'settled' }).length, 201);
+});
+
+test('replied history requires confirmed delivery and preserves failed or unproved reply routes', t => {
+  const { mailbox, outbox } = stores(t);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
+  const recordQuestion = (id: string) => mailbox.recordInboundEnvelope(
+    envelope(id, { semantic: { type: 'question', threadId: id } }), 'default',
+  );
+  const recordReply = (id: string, replyToId = id) => {
+    const answer = envelope(`answer-${id}`, { replyToId, semantic: { type: 'reply', threadId: id } });
+    mailbox.recordOutboundEnvelope(answer, ['peer']);
+    return answer;
+  };
+  for (const id of ['failed', 'queued']) {
+    recordQuestion(id);
+    const answer = recordReply(id);
+    assert.equal(outbox.enqueue({ envelope: answer, explicitTargets: [], pendingNodeIds: ['peer'] }).status, 'queued');
+    if (id === 'failed') {
+      const failure = { ...receipt(answer.id, 'dispatched'), stage: 'failed' as const, executionReceipt: { handoff: 'unattempted' } };
+      assert.equal(outbox.markNodeFailed(answer.id, 'peer', 'Pre-effect failure', failure)?.status, 'failed');
+      assert.equal(outbox.readDefinitivelyFailedKeys().size, 1);
+    }
+  }
+  recordQuestion('missing-evidence');
+  recordReply('missing-evidence');
+  recordQuestion('provisional');
+  const provisional = recordReply('provisional');
+  outbox.enqueue({
+    envelope: provisional, explicitTargets: [], pendingNodeIds: [],
+    deliveredReceipts: { peer: receipt(provisional.id, 'queued') },
+  });
+  recordQuestion('uncommitted-loopback');
+  mailbox.recordInboundEnvelope(recordReply('uncommitted-loopback'), 'default', { committed: false });
+
+  recordQuestion('confirmed');
+  const confirmed = recordReply('confirmed');
+  assert.equal(outbox.enqueue({
+    envelope: confirmed, explicitTargets: [], pendingNodeIds: [],
+    deliveredReceipts: { peer: receipt(confirmed.id, 'dispatched') },
+  }).status, 'delivered');
+  for (let index = 0; index <= 200; index++) {
+    t.mock.timers.tick(1);
+    const id = `loopback-${index}`;
+    recordQuestion(id);
+    mailbox.recordInboundEnvelope(recordReply(id), 'default', { committed: true });
+  }
+
+  assert.deepEqual(mailbox.listThreadRecords('confirmed'), []);
+  assert.deepEqual(mailbox.listThreadRecords('loopback-0'), []);
+  assert.equal(mailbox.listThreadRecords('loopback-1').length, 3);
+  for (const id of ['failed', 'queued', 'missing-evidence', 'provisional', 'uncommitted-loopback']) {
+    const records = mailbox.listThreadRecords(id);
+    assert.ok(records.some(record => record.direction === 'inbound' && record.messageId === id), id);
+    assert.ok(records.some(record => record.direction === 'outbound' && record.messageId === `answer-${id}`), id);
+  }
+  mailbox.reconcileOutboxThreads(outbox);
+  assert.deepEqual(mailbox.listThreadRecords('confirmed'), []);
 });
 
 test('outbox caps terminal history without dropping pending, unconfirmed or unsuperseded work', t => {
@@ -351,6 +414,7 @@ test('expiring superseded outbox history cannot revive a failed outbound questio
 
 test('outbox reconciliation cannot reopen a compacted settled question', t => {
   const { mailbox, outbox } = stores(t);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
   const slot = 'stream:alerts';
   const question = envelope('settled-question', {
     semantic: { type: 'question', threadId: 'settled-question', replyMailbox: slot },
@@ -362,22 +426,16 @@ test('outbox reconciliation cannot reopen a compacted settled question', t => {
   mailbox.recordInboundEnvelope(envelope('settle-question', {
     replyToId: question.id, semantic: { type: 'settle', threadId: question.id, outcome: 'succeeded' },
   }), slot);
-  const state = JSON.parse(readFileSync(mailbox.path, 'utf8'));
-  const settle = state.threads['inbound:settle-question'];
-  state.threads['outbound:settled-question'].updatedAt = old;
-  settle.updatedAt = old;
   for (let index = 0; index < 200; index++) {
     const threadId = `settled-${index}`;
-    state.threads[`inbound:${threadId}`] = {
-      ...settle, envelope: undefined, threadId, messageId: threadId,
-      updatedAt: new Date(Date.parse(old) + index + 1).toISOString(),
-    };
+    t.mock.timers.tick(1);
+    mailbox.recordInboundEnvelope(envelope(threadId, {
+      semantic: { threadId, type: 'settle', outcome: 'succeeded' },
+    }), slot);
   }
-  writeFileAtomically(mailbox.path, JSON.stringify(state));
 
   const inspect = () => mailbox.inspectSlotObligations(slot, { outbox }).immediateBusyReason;
   assert.equal(inspect(), undefined);
-  mailbox.upsertWakeTarget(slot, { pendingWake: false });
   mailbox.reconcileOutboxThreads(outbox);
 
   assert.equal(inspect(), undefined);
@@ -389,7 +447,6 @@ test('outbox reconciliation cannot reopen a compacted settled question', t => {
   }));
   outbox.enqueue({ envelope: envelope('next'), explicitTargets: [], pendingNodeIds: ['peer'] });
   assert.equal(outbox.get(question.id), undefined);
-  mailbox.upsertWakeTarget(slot, { pendingWake: false });
   mailbox.reconcileOutboxThreads(outbox);
   assert.equal(mailbox.getThread(question.id), undefined);
   assert.equal(inspect(), undefined);

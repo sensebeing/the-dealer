@@ -1,11 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import {
-  existsSync,
-  readFileSync,
-  renameSync,
-} from 'node:fs';
-import { resolve } from 'node:path';
+import { lstatSync, readFileSync } from 'node:fs';
+import { extname, resolve } from 'node:path';
 import {
   canonicalJson,
   committedOutboxTargets,
@@ -14,13 +10,14 @@ import {
   verifyEnvelope,
 } from '../core-types/index.ts';
 import type { Disposable, MessageEnvelope, OutboxItem, SettlementOutcome } from '../core-types/index.ts';
-import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
-import { LedgerSnapshot } from './ledger-snapshot.ts';
+import { withOwnedLock } from '../fs-atomic/index.ts';
 import { netKey } from './network-key.ts';
 import { isTerminalHistory } from './outbox.ts';
 import type { OutboxStore } from './outbox.ts';
+import { MailboxSqliteBackend } from './sqlite-backend.ts';
+import type { MailboxInitialization, ThreadRetentionRow } from './sqlite-backend.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
 export type { AgentConversationMode, ActiveConversationMode } from '../core-types/index.ts';
 export { normalizeConversationModeInput } from '../core-types/index.ts';
@@ -32,6 +29,7 @@ const MAX_ACKED_LEASE_HISTORY = 256;
 export const MAX_RETAINED_ACKED_ITEMS = 200;
 export const MAX_RETAINED_WAVE_THREADS = 100;
 export const MAX_RETAINED_SETTLED_THREADS = 200;
+const MAX_RETAINED_REPLIED_THREADS = 200;
 const MAX_WAKEUP_HINT_LENGTH = 120;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 3_600_000;
@@ -167,8 +165,9 @@ export interface ResolvedReplyTarget {
 export interface MailboxStoreOptions {
   /** Legacy flat inbox file migrated once into the default mailbox when no mailbox exists. */
   legacyInboxPath?: string;
-  /** Defaults to `${mailboxPath}.lock`. */
+  /** Existing directory lock used only during legacy cutover. */
   lockDir?: string;
+  readOnly?: boolean;
   /** Peer snapshot used to retain thread routes that outbox reconciliation could restore. */
   outbox?: OutboxStore;
   /** Highest item sequence durably consumed by a catch-up reader, if one is configured. */
@@ -244,8 +243,36 @@ export interface MailboxListResult {
   items: MailboxItem[];
 }
 
-interface MailboxFileState {
-  schema: typeof MAILBOX_SCHEMA;
+export interface QueueStatusOptions {
+  mailboxId?: string;
+  includeIdle?: boolean;
+  now?: number;
+}
+
+export interface QueueSummary {
+  activeMailboxes: number;
+  totalMailboxes: number;
+  queuedItems: number;
+  leasedItems: number;
+  pendingWakes: number;
+  fencedTargets: number;
+}
+
+export interface QueueStatus {
+  mailboxId: string;
+  queuedCount: number;
+  leasedCount: number;
+  activeLease?: { leaseId: string; itemCount: number; createdAt: string; ageMs: number };
+  pendingWake: boolean;
+  deliveryInDoubt: boolean;
+  attemptCount: number;
+  lastWakeError?: string;
+  nextWakeInMs: number | null;
+  driver: string | null;
+  driverConfig?: WakeTargetState['driverConfig'];
+}
+
+interface LegacyMailboxState {
   sequence: number;
   items: MailboxItem[];
   mailboxes: Record<string, MailboxStateRecord>;
@@ -556,16 +583,16 @@ export interface SessionMailboxPatch {
   driverConfig?: Record<string, unknown>;
 }
 
-function pinSessionTargetInState(state: MailboxFileState, id: string, sessionMailboxId: string, patch: SessionMailboxPatch = {}): string {
-  const current = state.wakeTargets[id];
+function pinSessionTarget(db: MailboxSqliteBackend, id: string, sessionMailboxId: string, patch: SessionMailboxPatch = {}): string {
+  const current = db.wakeTarget(id);
   if (current?.rotateAfterWaves === undefined) return id;
   const sessionMailbox = normalizeMailboxId(sessionMailboxId);
   if (sessionMailbox === id) throw new Error('Session mailbox must differ from rotating mailbox');
-  const existing = state.wakeTargets[sessionMailbox];
+  const existing = db.wakeTarget(sessionMailbox);
   const nextDriver = patch.driver ?? existing?.driver ?? current.driver;
-  const hasQueued = state.items.some(item => item.mailboxId === sessionMailbox && item.status === 'queued');
+  const hasQueued = db.hasQueuedItems(sessionMailbox);
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${sessionMailbox}`);
-  state.wakeTargets[sessionMailbox] = validateWakeTarget(mergeWakeTarget(existing ?? defaultWakeTarget(sessionMailbox), {
+  const next = validateWakeTarget(mergeWakeTarget(existing ?? defaultWakeTarget(sessionMailbox), {
     ...current, ...(existing ?? {}), mailboxId: sessionMailbox,
     driver: nextDriver,
     driverConfig: {
@@ -580,6 +607,7 @@ function pinSessionTargetInState(state: MailboxFileState, id: string, sessionMai
     lastWakeError: existing?.deliveryInDoubt ? existing.lastWakeError : (current.deliveryInDoubt ? current.lastWakeError : existing?.lastWakeError),
     deliveryInDoubt: Boolean(existing?.deliveryInDoubt || current.deliveryInDoubt) ? true : undefined,
   }));
+  db.writeWakeTarget(next, existing);
   return sessionMailbox;
 }
 
@@ -773,18 +801,40 @@ function validateMailboxRecord(key: string, value: unknown): MailboxStateRecord 
   return record;
 }
 
-function emptyState(): MailboxFileState {
-  return {
-    schema: MAILBOX_SCHEMA,
-    sequence: 0,
-    items: [],
-    mailboxes: {},
-    wakeTargets: {},
-    threads: {},
-  };
+function readLegacyFile(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return undefined;
+  }
 }
 
-function loadState(raw: string): MailboxFileState {
+function mailboxPaths(mailboxPath: string, legacyInboxPath?: string) {
+  const input = resolve(mailboxPath);
+  const extension = extname(input);
+  const base = input.slice(0, input.length - extension.length);
+  const sqlite = extension === '.json' ? `${base}.sqlite` : input;
+  const legacyMailbox = `${base}.json`;
+  const inbox = legacyInboxPath === undefined ? undefined : resolve(legacyInboxPath);
+  return { sqlite, legacyMailbox, legacyInbox: inbox === sqlite ? undefined : inbox };
+}
+
+function pathExists(path: string): boolean {
+  return lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+}
+
+function hasLegacyMailbox(paths: ReturnType<typeof mailboxPaths>): boolean {
+  return pathExists(paths.legacyMailbox) || (paths.legacyInbox !== undefined && pathExists(paths.legacyInbox));
+}
+
+export class MailboxMigrationRequiredError extends Error {
+  constructor() {
+    super('Mailbox migration required. Start the daemon with dealer node up or run a writable inbox command.');
+  }
+}
+
+function loadLegacyMailbox(raw: string): LegacyMailboxState {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -860,12 +910,9 @@ function loadState(raw: string): MailboxFileState {
       normalizedThreads[expected] = record;
     }
   }
-  const sequence = Math.max(
-    parsed.sequence,
-    ...items.map(item => item.sequence + 1),
-  );
+  const sequence = items.reduce((next, item) => Math.max(next, item.sequence + 1), parsed.sequence);
+  if (!isNonNegativeInteger(sequence)) throw invalidStore();
   return {
-    schema: MAILBOX_SCHEMA,
     sequence,
     items,
     mailboxes: mailboxes as Record<string, MailboxStateRecord>,
@@ -874,10 +921,10 @@ function loadState(raw: string): MailboxFileState {
   };
 }
 
-function loadLegacyInbox(path: string): LegacyInboxItem[] {
+function loadLegacyInbox(raw: string): LegacyInboxItem[] {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, 'utf8'));
+    parsed = JSON.parse(raw);
   } catch {
     throw new Error('Invalid inbox store');
   }
@@ -956,22 +1003,24 @@ function migrateLegacyItem(item: LegacyInboxItem, sequence: number): MailboxItem
 }
 
 function isOneWayWaveEnvelope(envelope: MessageEnvelope | undefined): boolean {
-  return Boolean(envelope && envelope.kind.startsWith('wave.') && envelope.replyToId === undefined &&
-    (envelope.semantic === undefined || envelope.semantic.type === 'message'));
+  return envelope !== undefined && isOneWayWave(envelope.kind, envelope.replyToId, envelope.semantic?.type);
 }
 
-function activeMailboxKeys(state: MailboxFileState): { messages: ReadonlySet<string>; threads: ReadonlySet<string> } {
+function isOneWayWave(kind: string, replyToId?: string, semanticType?: string): boolean {
+  return kind.startsWith('wave.') && replyToId === undefined && (semanticType === undefined || semanticType === 'message');
+}
+
+function activeMailboxKeys(db: MailboxSqliteBackend): { messages: ReadonlySet<string>; threads: ReadonlySet<string> } {
   const messages = new Set<string>();
   const threads = new Set<string>();
-  for (const item of state.items) {
-    if (item.status === 'acked') continue;
+  for (const item of db.items({ unacked: true })) {
     const envelope = item.signedEnvelope ?? item.envelope;
     threads.add(netKey(envelope.networkId, envelopeThreadId(envelope)));
     for (const id of [item.id, envelope.replyToId]) {
       if (id === undefined) continue;
       messages.add(netKey(envelope.networkId, id));
       for (const direction of ['inbound', 'outbound']) {
-        const record = state.threads[`${direction}:${id}`];
+        const record = db.thread(`${direction}:${id}`);
         if (record?.networkId === envelope.networkId) threads.add(netKey(record.networkId, record.threadId));
       }
     }
@@ -979,55 +1028,68 @@ function activeMailboxKeys(state: MailboxFileState): { messages: ReadonlySet<str
   return { messages, threads };
 }
 
-function compactMailboxState(state: MailboxFileState, retention: Pick<MailboxStoreOptions, 'outbox' | 'readConsumedSequence'>): void {
-  if (state.items.length > MAX_RETAINED_ACKED_ITEMS) {
-    const acked = state.items.filter(item => item.status === 'acked');
-    if (acked.length > MAX_RETAINED_ACKED_ITEMS) {
-      const consumed = retention.readConsumedSequence?.() ?? Infinity;
-      const expired = new Set(acked.filter(item => item.sequence <= consumed)
-        .sort((a, b) => b.sequence - a.sequence).slice(MAX_RETAINED_ACKED_ITEMS));
-      state.items = state.items.filter(item => !expired.has(item));
-    }
-  }
+function isAnsweredThread(records: ThreadRetentionRow[], confirmedReplies?: ReadonlySet<string>): boolean {
+  const delivered = (record: ThreadRetentionRow): boolean =>
+    record.direction === 'inbound'
+      ? record.mailboxCommitted
+      : confirmedReplies?.has(netKey(record.networkId, record.messageId)) === true ||
+        records.some(reply => reply.direction === 'inbound' && reply.semanticType === 'reply' &&
+          reply.mailboxCommitted && reply.messageId === record.messageId && reply.replyToId === record.replyToId);
+  return records.every(record => {
+    if (record.semanticType === 'reply') return delivered(record);
+    if (record.direction === 'inbound' && record.semanticType !== 'question') return true;
+    // A thread-level replied state can come from a different leg. Require an addressed
+    // answer for each leg that could still own an outstanding reply.
+    return records.some(reply => reply.direction !== record.direction && reply.semanticType === 'reply' &&
+      delivered(reply) && reply.replyToId === record.messageId &&
+      (record.direction === 'inbound' || reply.localMailbox === (record.replyMailbox ?? record.localMailbox)));
+  });
+}
 
-  const records = Object.values(state.threads);
-  if (records.length <= MAX_RETAINED_WAVE_THREADS) return;
-  const activeKeys = activeMailboxKeys(state);
-  const groups = new Map<string, ThreadRouteRecord[]>();
+function compactThreads(db: MailboxSqliteBackend, outbox?: OutboxStore): void {
+  const records = db.threadRetentionRows(MAX_RETAINED_WAVE_THREADS);
+  if (records.length === 0) return;
+  const groups = new Map<string, ThreadRetentionRow[]>();
   for (const record of records) {
     const key = netKey(record.networkId, record.threadId);
-    if (activeKeys.threads.has(key)) continue;
     const group = groups.get(key);
     if (group) group.push(record);
     else groups.set(key, [record]);
   }
-  const wave: { key: string; updatedAt: string; records: ThreadRouteRecord[] }[] = [];
+  const wave: { key: string; updatedAt: string; records: ThreadRetentionRow[] }[] = [];
   const settled: typeof wave = [];
+  const replied: typeof wave = [];
   for (const [key, records] of groups) {
     const updatedAt = records.reduce((latest, record) => record.updatedAt > latest ? record.updatedAt : latest, '');
     const group = { key, updatedAt, records };
     if (records.every(record => record.state === 'settled')) {
       settled.push(group);
+    } else if (records.every(record => record.hasEnvelope && record.state === 'replied')) {
+      replied.push(group);
     } else if (records.every(record =>
-      (retention.outbox !== undefined || record.direction === 'inbound') &&
-      record.state === 'open' && record.kind.startsWith('wave.') && isOneWayWaveEnvelope(record.envelope))) {
+      (outbox !== undefined || record.direction === 'inbound') && record.state === 'open' &&
+      record.hasEnvelope && isOneWayWave(record.kind, record.replyToId, record.semanticType))) {
       wave.push(group);
     }
   }
-  if (wave.length <= MAX_RETAINED_WAVE_THREADS && settled.length <= MAX_RETAINED_SETTLED_THREADS) return;
-  // A surviving outbox projection could recreate an open leg after its settlement was pruned.
+  const histories = [[wave, MAX_RETAINED_WAVE_THREADS], [settled, MAX_RETAINED_SETTLED_THREADS],
+    [replied, MAX_RETAINED_REPLIED_THREADS]] as const;
+  if (histories.every(([history, limit]) => history.length <= limit)) return;
+  const activeKeys = activeMailboxKeys(db);
+  const owners = outbox && readOutboxThreadOwners(outbox, activeKeys);
+  // Outbox routes that can still be restored keep the corresponding thread alive.
   const outboxThreads = new Set<string>();
-  if (retention.outbox) {
-    for (const item of readOutboxThreadOwners(retention.outbox, activeKeys).items) {
-      outboxThreads.add(netKey(item.networkId, envelopeThreadId(item.envelope)));
-    }
+  for (const item of owners?.items ?? []) {
+    if (owners?.confirmedReplies.has(netKey(item.networkId, item.id))) continue;
+    outboxThreads.add(netKey(item.networkId, envelopeThreadId(item.envelope)));
   }
-  for (const [history, limit] of [[wave, MAX_RETAINED_WAVE_THREADS], [settled, MAX_RETAINED_SETTLED_THREADS]] as const) {
+  for (const [history, limit] of histories) {
     if (history.length <= limit) continue;
-    const eligible = history.filter(group => !outboxThreads.has(group.key));
+    const eligible = history.filter(group => !activeKeys.threads.has(group.key) && !outboxThreads.has(group.key) &&
+      (history !== replied || isAnsweredThread(group.records, owners?.confirmedReplies)));
     eligible.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.key.localeCompare(b.key));
     for (const group of eligible.slice(limit)) {
-      for (const record of group.records) delete state.threads[threadKey(record)];
+      for (const record of group.records) db.deleteThread(record.key);
     }
   }
 }
@@ -1045,37 +1107,31 @@ function compareNewestFirst(a: MailboxItem, b: MailboxItem): number {
   return receivedInstant(b) - receivedInstant(a) || b.sequence - a.sequence;
 }
 
-function cloneItem(item: MailboxItem): MailboxItem {
-  return structuredClone(item);
-}
-
 function exactThreadRecord(
-  state: MailboxFileState,
+  db: MailboxSqliteBackend,
   messageId: string,
 ): ThreadRouteRecord | undefined {
-  return state.threads[`inbound:${messageId}`] ?? state.threads[`outbound:${messageId}`];
+  return db.thread(`inbound:${messageId}`) ?? db.thread(`outbound:${messageId}`);
 }
 
 function threadRecordsFor(
-  state: MailboxFileState,
+  db: MailboxSqliteBackend,
   threadId: string,
 ): ThreadRouteRecord[] {
-  return Object.values(state.threads)
-    .filter(record => record.threadId === threadId)
-    .sort(compareThreadRecords);
+  return db.threads({ threadId }).sort(compareThreadRecords);
 }
 
 function lookupThread(
-  state: MailboxFileState,
+  db: MailboxSqliteBackend,
   messageOrThreadId: string,
 ): ThreadRouteRecord | undefined {
   // A message id can exist on both loopback legs. Prefer the inbound leg because ask/reply/
   // settle address a message the caller received; fall back to its outbound leg otherwise.
-  const exact = exactThreadRecord(state, messageOrThreadId);
+  const exact = exactThreadRecord(db, messageOrThreadId);
   if (exact) {
     return exact;
   }
-  return threadRecordsFor(state, messageOrThreadId).at(-1);
+  return threadRecordsFor(db, messageOrThreadId).at(-1);
 }
 
 function settlementOf(
@@ -1137,11 +1193,17 @@ function outboxThreadRecord(item: OutboxItem): ThreadRouteRecord {
 function readOutboxThreadOwners(outbox: OutboxStore, activeKeys: ReturnType<typeof activeMailboxKeys>) {
   const items = outbox.list({ status: 'all' });
   const definitivelyFailed = outbox.readDefinitivelyFailedKeys(items);
+  const confirmedReplies = new Set<string>();
   return {
     definitivelyFailed,
+    confirmedReplies,
     items: items.filter(item => {
       const messageKey = netKey(item.networkId, item.id);
       if (item.supersededById !== undefined || definitivelyFailed.has(messageKey)) return false;
+      if (item.envelope.semantic?.type === 'reply' && item.status === 'delivered' && isTerminalHistory(item) &&
+          Object.values(item.deliveredReceipts).some(receipt => receipt.stage !== 'queued')) {
+        confirmedReplies.add(messageKey);
+      }
       if (!isOneWayWaveEnvelope(item.envelope) || !isTerminalHistory(item)) return true;
       const threadKey = netKey(item.networkId, envelopeThreadId(item.envelope));
       return activeKeys.messages.has(messageKey) || activeKeys.threads.has(threadKey);
@@ -1164,71 +1226,92 @@ function normalizeWaitTimeout(timeoutMs: number): number {
 
 /**
  * Single durable source of truth for logical mailboxes, single-outstanding delivery leases,
- * wake targets and thread reverse routes. Every mutation is a crash-safe fsync + rename under
- * an exclusive `${mailboxPath}.lock` directory, so the daemon and offline CLI cannot clobber
- * each other. In-process waiters are woken by events, never by polling.
+ * wake targets and thread reverse routes. Writers use SQLite row transactions and readers
+ * use WAL snapshots. In-process waiters are woken by events.
  */
 export class MailboxStore {
   readonly path: string;
   readonly lockDir: string;
-  private readonly legacyInboxPath?: string;
   private readonly outbox?: OutboxStore;
   private readonly readConsumedSequence?: MailboxStoreOptions['readConsumedSequence'];
   private readonly events = new EventEmitter();
-  private readonly snapshot = new LedgerSnapshot<MailboxFileState>();
+  private readonly db: MailboxSqliteBackend;
+
+  /** Open a durable snapshot without creating state for an unused mailbox. */
+  static openReadOnly(mailboxPath: string, legacyInboxPath?: string): MailboxStore | undefined {
+    const paths = mailboxPaths(mailboxPath, legacyInboxPath);
+    if (pathExists(paths.sqlite)) {
+      return new MailboxStore(mailboxPath, { readOnly: true, legacyInboxPath });
+    }
+    if (hasLegacyMailbox(paths)) throw new MailboxMigrationRequiredError();
+    return undefined;
+  }
 
   constructor(mailboxPath: string, options: MailboxStoreOptions = {}) {
-    this.path = resolve(mailboxPath);
-    this.legacyInboxPath = options.legacyInboxPath
-      ? resolve(options.legacyInboxPath)
-      : undefined;
-    this.lockDir = resolve(options.lockDir ?? `${this.path}.lock`);
+    const paths = mailboxPaths(mailboxPath, options.legacyInboxPath);
+    this.path = paths.sqlite;
+    this.lockDir = resolve(options.lockDir ?? `${paths.legacyMailbox}.lock`);
     this.outbox = options.outbox;
     this.readConsumedSequence = options.readConsumedSequence;
     this.events.setMaxListeners(0);
-    this.migrateLegacyInbox();
-  }
-
-  private migrateLegacyInbox(): void {
-    const legacy = this.legacyInboxPath;
-    if (!legacy || legacy === this.path || existsSync(this.path) || !existsSync(legacy)) {
-      return;
+    this.db = new MailboxSqliteBackend(this.path, {
+      item: validateItem, mailbox: validateMailboxRecord, wakeTarget: validateWakeTarget, thread: validateThreadRecord,
+    }, options.readOnly);
+    try {
+      const state = this.db.initializationState(MAILBOX_SCHEMA);
+      if (state !== 'ready') {
+        if (options.readOnly) throw new MailboxMigrationRequiredError();
+        this.initializeWritable(paths, state);
+      }
+      if (pathExists(paths.legacyMailbox)) {
+        throw new Error(`Legacy mailbox ledger reappeared after SQLite cutover: ${paths.legacyMailbox}`);
+      }
+    } catch (error) {
+      this.db.close();
+      throw error;
     }
-    this.withFileLock(() => {
-      if (existsSync(this.path) || !existsSync(legacy)) {
-        return;
-      }
-      const state = emptyState();
-      for (const legacyItem of loadLegacyInbox(legacy)) {
-        state.items.push(migrateLegacyItem(legacyItem, state.sequence));
-        state.sequence += 1;
-      }
-      this.save(state);
-      renameSync(legacy, `${legacy}.migrated`);
+  }
+
+  private initializeWritable(paths: ReturnType<typeof mailboxPaths>, state: MailboxInitialization): void {
+    if (state === 'uninitialized' && !hasLegacyMailbox(paths)) {
+      this.db.initialize(MAILBOX_SCHEMA);
+      if (this.db.initializationState(MAILBOX_SCHEMA) === 'ready') return;
+    }
+    withOwnedLock(this.lockDir, 'Mailbox store', () => {
+      this.db.initialize(MAILBOX_SCHEMA, () => this.importLegacy(paths.legacyMailbox, paths.legacyInbox));
+      if (this.db.initializationState(MAILBOX_SCHEMA) === 'archive-pending') this.db.finishArchive();
     });
   }
 
-  private withFileLock<T>(operation: () => T): T {
-    return withOwnedLock(this.lockDir, 'Mailbox store', operation);
+  private importLegacy(mailboxPath: string, legacyInboxPath?: string): { source: string; backup: string } | undefined {
+    const rawMailbox = readLegacyFile(mailboxPath);
+    if (rawMailbox !== undefined) {
+      const state = loadLegacyMailbox(rawMailbox);
+      for (const item of state.items) this.db.insertItem(item);
+      for (const record of Object.values(state.mailboxes)) this.db.writeMailbox(record);
+      for (const target of Object.values(state.wakeTargets)) this.db.writeWakeTarget(target);
+      for (const [key, record] of Object.entries(state.threads)) this.db.writeThread(key, record);
+      this.db.setSequence(state.sequence);
+      return { source: mailboxPath, backup: `${mailboxPath}.v2-migrated` };
+    }
+    const rawInbox = legacyInboxPath === undefined ? undefined : readLegacyFile(legacyInboxPath);
+    if (rawInbox !== undefined && legacyInboxPath !== undefined) {
+      const items = loadLegacyInbox(rawInbox);
+      for (const [sequence, item] of items.entries()) this.db.insertItem(migrateLegacyItem(item, sequence));
+      this.db.setSequence(items.length);
+      return { source: legacyInboxPath, backup: `${legacyInboxPath}.migrated` };
+    }
+    return undefined;
   }
 
-  private read(): MailboxFileState {
-    return this.snapshot.read(this.path, loadState, emptyState);
+  close(): void {
+    this.db.close();
+    this.events.emit('close');
+    this.events.removeAllListeners();
   }
 
-  private save(state: MailboxFileState): void {
-    compactMailboxState(state, { outbox: this.outbox, readConsumedSequence: this.readConsumedSequence });
-    this.snapshot.invalidate();
-    writeFileAtomically(this.path, JSON.stringify(state));
-  }
-
-  private mutate<T>(operation: (state: MailboxFileState) => T): T {
-    return this.withFileLock(() => {
-      const state = structuredClone(this.read());
-      const result = operation(state);
-      this.save(state);
-      return result;
-    });
+  [Symbol.dispose](): void {
+    this.close();
   }
 
   enqueue(
@@ -1245,32 +1328,33 @@ export class MailboxStore {
     const nowMs = Date.now();
     const insertedByMailbox = new Map<string, number>();
     const conversationalByMailbox = new Map<string, boolean>();
-    const result = this.mutate(state => {
+    const result = this.db.write(() => {
       const inserted: string[] = [];
       const duplicateIds: string[] = [];
       const mailboxIds = new Set<string>();
       const configureWakeTargets = new Set<string>();
       const envelopeMailboxes = new Map<string, string>();
       let claimedSpawn = false;
+      let sequence: number | undefined;
       for (const envelope of batch) {
         if (!isRecord(envelope) || !isNonEmptyString(envelope.id)) {
           throw new Error('Invalid envelope: missing id');
         }
         const owner = canInheritThreadMailbox(envelope)
-          ? this.threadLocalMailboxFromState(state, envelopeThreadId(envelope), envelope.networkId, envelope.id)
+          ? this.threadLocalMailbox(envelopeThreadId(envelope), envelope.networkId, envelope.id)
           : undefined;
         const mailboxId = owner ?? explicitMailbox ?? resolveMailboxId(envelope);
         mailboxIds.add(mailboxId);
         envelopeMailboxes.set(envelope.id, mailboxId);
-        const duplicate = state.items.find(item => item.mailboxId === mailboxId && item.id === envelope.id);
+        const duplicate = this.db.item(mailboxId, envelope.id);
         const mayConfigureWakeTarget = options.proposedSpawn
           ? owner === undefined && !duplicate
           : owner === undefined || owner === explicitMailbox;
         if (mayConfigureWakeTarget) configureWakeTargets.add(mailboxId);
         if (duplicate) {
-          const inbound = state.threads[threadKey({ direction: 'inbound', messageId: envelope.id })];
+          const inbound = this.db.thread(threadKey({ direction: 'inbound', messageId: envelope.id }));
           if (!inbound || inbound.mailboxCommitted === false) {
-            this.upsertInboundThread(state, duplicate.signedEnvelope ?? duplicate.envelope, mailboxId, now, true);
+            this.upsertInboundThread(duplicate.signedEnvelope ?? duplicate.envelope, mailboxId, now, true);
           }
           duplicateIds.push(envelope.id);
           continue;
@@ -1286,51 +1370,51 @@ export class MailboxStore {
         const hint = sanitizeWakeupHint(
           options.wakeupHint ?? payload.wakeupHint ?? cloned.subject,
         );
-        state.items.push({
+        sequence ??= this.db.sequence();
+        this.db.insertItem(validateItem({
           id: cloned.id,
           mailboxId,
           status: 'queued',
           receivedAt: now,
           ...(hint ? { wakeupHint: hint } : {}),
-          sequence: state.sequence,
+          sequence,
           envelope: cloned,
           ...(signedEnvelope ? { signedEnvelope } : {}),
-        });
-        state.sequence += 1;
+        }));
+        sequence += 1;
         conversationalByMailbox.set(mailboxId,
           (conversationalByMailbox.get(mailboxId) ?? true) &&
           (['question', 'reply', 'settle'].includes(envelope.semantic?.type ?? '') ||
             Boolean(envelope.semantic?.threadId &&
-              threadRecordsFor(state, envelope.semantic.threadId)
+              threadRecordsFor(this.db, envelope.semantic.threadId)
                 .some(record => record.networkId === envelope.networkId))),
         );
-        this.upsertInboundThread(state, signedEnvelope ?? cloned, mailboxId, now, true);
+        this.upsertInboundThread(signedEnvelope ?? cloned, mailboxId, now, true);
         claimedSpawn ||= options.proposedSpawn === true && owner === undefined;
         inserted.push(cloned.id);
         insertedByMailbox.set(mailboxId, (insertedByMailbox.get(mailboxId) ?? 0) + 1);
       }
+      if (sequence !== undefined) this.db.setSequence(sequence);
       for (const mailboxId of mailboxIds) {
-        const previous = state.wakeTargets[mailboxId];
-        const current = previous ?? defaultWakeTarget(mailboxId);
+        const previous = this.db.wakeTarget(mailboxId);
+        let target = previous;
         if (options.wakeTarget && configureWakeTargets.has(mailboxId)) {
-          state.wakeTargets[mailboxId] = validateWakeTarget(
-            mergeWakeTarget(current, options.wakeTarget),
+          target = validateWakeTarget(
+            mergeWakeTarget(previous ?? defaultWakeTarget(mailboxId), options.wakeTarget),
           );
         }
-        if ((insertedByMailbox.get(mailboxId) ?? 0) > 0) {
-          const target = state.wakeTargets[mailboxId];
-          if (target) {
-            state.wakeTargets[mailboxId] = validateWakeTarget({
-              ...target,
-              pendingWake: true,
-              earliestWakeAt: conversationalByMailbox.get(mailboxId) && target.attemptCount === 0
-                ? nowMs
-                : target.attemptCount > 0
-                  ? Math.max(previous?.earliestWakeAt ?? 0, nowMs + target.coalesceMs)
-                  : nowMs + target.coalesceMs,
-            });
-          }
+        if (target && (insertedByMailbox.get(mailboxId) ?? 0) > 0) {
+          target = validateWakeTarget({
+            ...target,
+            pendingWake: true,
+            earliestWakeAt: conversationalByMailbox.get(mailboxId) && target.attemptCount === 0
+              ? nowMs
+              : target.attemptCount > 0
+                ? Math.max(previous?.earliestWakeAt ?? 0, nowMs + target.coalesceMs)
+                : nowMs + target.coalesceMs,
+          });
         }
+        if (target && target !== previous) this.db.writeWakeTarget(target, previous);
       }
       return {
         inserted, duplicateIds, mailboxIds: [...mailboxIds], envelopeMailboxes: Object.fromEntries(envelopeMailboxes),
@@ -1350,134 +1434,52 @@ export class MailboxStore {
     if (options.ackLeaseId !== undefined) {
       this.ack(options.ackLeaseId, mailboxId);
     }
-    if (options.peek === true) {
-      return this.peek(mailboxId);
-    }
-    return this.mutate(state => {
-      const record = state.mailboxes[mailboxId];
-      if (record?.outstanding) {
-        const queued = state.items
-          .filter(item => item.mailboxId === mailboxId && item.status === 'queued')
-          .sort(compareOldestFirst);
-        const lease: DeliveryLease = {
-          ...record.outstanding,
-          wakeCount: record.outstanding.wakeCount + 1,
-        };
-        state.mailboxes[mailboxId] = { ...record, outstanding: lease };
-        const items = state.items
-          .filter(
-            item =>
-              item.mailboxId === mailboxId &&
-              item.status === 'leased' &&
-              item.leaseId === lease.leaseId,
-          )
-          .sort(compareOldestFirst);
-        return {
-          mailboxId,
-          deliveryId: lease.leaseId,
-          redelivered: true,
-          newerQueuedCount: queued.length,
-          maxQueuedSequence: queued.reduce((max, item) => Math.max(max, item.sequence), -1),
-          ...(queued.length ? { latestQueued: cloneItem(queued.at(-1)!) } : {}),
-          items: items.map(cloneItem),
-        };
-      }
-      const queued = state.items
-        .filter(item => item.mailboxId === mailboxId && item.status === 'queued')
-        .sort(compareOldestFirst);
-      if (!queued.length) {
-        return {
-          mailboxId,
-          deliveryId: null,
-          redelivered: false,
-          newerQueuedCount: 0,
-          items: [],
-        };
-      }
-      const leaseId = mintLeaseId(state);
-      const leasedAt = new Date().toISOString();
-      const leasedIds = new Set(queued.map(item => item.id));
-      state.items = state.items.map(item =>
-        item.mailboxId === mailboxId && item.status === 'queued' && leasedIds.has(item.id)
-          ? { ...item, status: 'leased', leaseId, leasedAt }
-          : item,
-      );
-      state.mailboxes[mailboxId] = {
-        mailboxId,
-        ackedLeaseIds: record?.ackedLeaseIds ?? [],
-        outstanding: {
-          leaseId,
-          mailboxId,
-          itemIds: queued.map(item => item.id),
-          createdAt: leasedAt,
-          wakeCount: 0,
-        },
-      };
-      const target = state.wakeTargets[mailboxId];
-      if (target) {
-        state.wakeTargets[mailboxId] = { ...target, pendingWake: false };
-      }
-      return {
-        mailboxId,
-        deliveryId: leaseId,
-        redelivered: false,
-        newerQueuedCount: 0,
-        items: state.items
-          .filter(
-            item =>
-              item.mailboxId === mailboxId &&
-              item.status === 'leased' &&
-              item.leaseId === leaseId,
-          )
-          .sort(compareOldestFirst)
-          .map(cloneItem),
-      };
-    });
+    return options.peek
+      ? this.db.read(() => this.checkMailbox(mailboxId, false))
+      : this.db.write(() => this.checkMailbox(mailboxId, true));
   }
 
-  private peek(mailboxId: string): MailboxCheckResult {
-    const state = this.read();
-    const record = state.mailboxes[mailboxId];
+  private checkMailbox(mailboxId: string, claim: boolean): MailboxCheckResult {
+    const record = this.db.mailbox(mailboxId);
+    const queued = this.db.items({ mailboxId, status: 'queued' }).sort(compareOldestFirst);
     if (record?.outstanding) {
-      const queued = state.items
-        .filter(item => item.mailboxId === mailboxId && item.status === 'queued')
-        .sort(compareOldestFirst);
+      const lease = record.outstanding;
+      if (claim) this.db.writeMailbox({ ...record, outstanding: { ...lease, wakeCount: lease.wakeCount + 1 } });
       return {
         mailboxId,
-        deliveryId: record.outstanding.leaseId,
+        deliveryId: lease.leaseId,
         redelivered: true,
         newerQueuedCount: queued.length,
         maxQueuedSequence: queued.reduce((max, item) => Math.max(max, item.sequence), -1),
-        ...(queued.length ? { latestQueued: cloneItem(queued.at(-1)!) } : {}),
-        items: state.items
-          .filter(
-            item =>
-              item.mailboxId === mailboxId &&
-              item.status === 'leased' &&
-              item.leaseId === record.outstanding!.leaseId,
-          )
-          .sort(compareOldestFirst)
-          .map(cloneItem),
+        ...(queued.length ? { latestQueued: queued.at(-1)! } : {}),
+        items: this.db.items({ mailboxId, status: 'leased' })
+          .filter(item => item.leaseId === lease.leaseId).sort(compareOldestFirst),
       };
     }
+    if (!claim || queued.length === 0) {
+      return { mailboxId, deliveryId: null, redelivered: false, newerQueuedCount: 0, items: queued };
+    }
+    const leaseId = mintLeaseId(this.db);
+    const leasedAt = new Date().toISOString();
+    this.db.leaseItems(mailboxId, leaseId, leasedAt);
+    this.db.writeMailbox({
+      mailboxId,
+      ackedLeaseIds: record?.ackedLeaseIds ?? [],
+      outstanding: { leaseId, mailboxId, itemIds: queued.map(item => item.id), createdAt: leasedAt, wakeCount: 0 },
+    });
+    const target = this.db.wakeTarget(mailboxId);
+    if (target) this.db.writeWakeTarget({ ...target, pendingWake: false }, target);
     return {
       mailboxId,
-      deliveryId: null,
+      deliveryId: leaseId,
       redelivered: false,
       newerQueuedCount: 0,
-      items: state.items
-        .filter(item => item.mailboxId === mailboxId && item.status === 'queued')
-        .sort(compareOldestFirst)
-        .map(cloneItem),
+      items: queued.map(item => ({ ...item, status: 'leased', leaseId, leasedAt })),
     };
   }
 
   resolveLeaseMailbox(leaseId: string): string | undefined {
-    const state = this.read();
-    for (const [candidate, record] of Object.entries(state.mailboxes)) {
-      if (record?.outstanding?.leaseId === leaseId || record?.ackedLeaseIds.includes(leaseId)) return candidate;
-    }
-    return undefined;
+    return this.db.leaseMailbox(leaseId)?.mailboxId;
   }
 
   /**
@@ -1488,20 +1490,8 @@ export class MailboxStore {
   assertAckableLease(leaseId: string, mailboxId?: string): void {
     const requestedMailbox =
       mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
-    const state = this.read();
-    const candidates = requestedMailbox ? [requestedMailbox] : Object.keys(state.mailboxes);
-    for (const candidate of candidates) {
-      const record = state.mailboxes[candidate];
-      if (!record) {
-        continue;
-      }
-      if (
-        record.outstanding?.leaseId === leaseId ||
-        record.ackedLeaseIds.includes(leaseId)
-      ) {
-        return;
-      }
-    }
+    const record = requestedMailbox === undefined ? this.db.leaseMailbox(leaseId) : this.db.mailbox(requestedMailbox);
+    if (record?.outstanding?.leaseId === leaseId || record?.ackedLeaseIds.includes(leaseId)) return;
     throw new Error(`Unknown or mismatched delivery lease: ${leaseId}`);
   }
 
@@ -1509,63 +1499,38 @@ export class MailboxStore {
     const requestedMailbox =
       mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
     let wakeMailbox: string | undefined;
-    const result = this.mutate(state => {
-      const candidates = requestedMailbox ? [requestedMailbox] : Object.keys(state.mailboxes);
-      for (const candidate of candidates) {
-        const record = state.mailboxes[candidate];
-        if (!record) {
-          continue;
-        }
-        if (record.outstanding?.leaseId === leaseId) {
-          const ackedAt = new Date().toISOString();
-          const itemIds = new Set(record.outstanding.itemIds);
-          state.items = state.items.map(item =>
-            item.mailboxId === candidate && item.status === 'leased' && itemIds.has(item.id)
-              ? { ...item, status: 'acked', ackedAt }
-              : item,
-          );
-          state.mailboxes[candidate] = {
-            mailboxId: candidate,
-            ackedLeaseIds: [...record.ackedLeaseIds, leaseId].slice(
-              -MAX_ACKED_LEASE_HISTORY,
-            ),
-          };
-          const target = state.wakeTargets[candidate];
-          if (target) {
-            // A completed wave with mail already queued behind it is exactly the safe boundary
-            // for session rotation: re-arm the target so the wakeup service can open the next
-            // wave's session tab and point at it.
-            const hasQueued = state.items.some(
-              item => item.mailboxId === candidate && item.status === 'queued',
-            );
-            state.wakeTargets[candidate] = {
-              ...target,
-              completedWaves: target.completedWaves + 1,
-              ...(hasQueued
-                ? { pendingWake: true, earliestWakeAt: 0 }
-                : {}),
-            };
-            if (hasQueued) {
-              wakeMailbox = candidate;
-            }
-          }
-          return {
-            mailboxId: candidate,
-            leaseId,
-            itemIds: [...itemIds],
-            alreadyAcknowledged: false,
-          };
-        }
-        if (record.ackedLeaseIds.includes(leaseId)) {
-          return {
-            mailboxId: candidate,
-            leaseId,
-            itemIds: [],
-            alreadyAcknowledged: true,
-          };
-        }
+    const result = this.db.write(() => {
+      const record = requestedMailbox === undefined ? this.db.leaseMailbox(leaseId) : this.db.mailbox(requestedMailbox);
+      if (!record || (record.outstanding?.leaseId !== leaseId && !record.ackedLeaseIds.includes(leaseId))) {
+        throw new Error(`Unknown or mismatched delivery lease: ${leaseId}`);
       }
-      throw new Error(`Unknown or mismatched delivery lease: ${leaseId}`);
+      const id = record.mailboxId;
+      if (record.outstanding?.leaseId !== leaseId) {
+        return { mailboxId: id, leaseId, itemIds: [], alreadyAcknowledged: true };
+      }
+      const ackedAt = new Date().toISOString();
+      const itemIds = [...new Set(record.outstanding.itemIds)];
+      for (const itemId of itemIds) this.db.ackItem(id, itemId, ackedAt);
+      this.db.writeMailbox({
+        mailboxId: id,
+        ackedLeaseIds: [...record.ackedLeaseIds, leaseId].slice(-MAX_ACKED_LEASE_HISTORY),
+      });
+      const target = this.db.wakeTarget(id);
+      if (target) {
+        // Queued mail behind the completed wave may now rotate to a fresh session.
+        const hasQueued = this.db.hasQueuedItems(id);
+        this.db.writeWakeTarget({
+          ...target, completedWaves: target.completedWaves + 1,
+          ...(hasQueued ? { pendingWake: true, earliestWakeAt: 0 } : {}),
+        }, target);
+        if (hasQueued) wakeMailbox = id;
+      }
+      if (this.db.hasAckedHistoryBeyond(MAX_RETAINED_ACKED_ITEMS)) {
+        const consumed = this.readConsumedSequence?.() ?? Number.MAX_SAFE_INTEGER;
+        this.db.trimAckedItems(consumed, MAX_RETAINED_ACKED_ITEMS);
+      }
+      compactThreads(this.db, this.outbox);
+      return { mailboxId: id, leaseId, itemIds, alreadyAcknowledged: false };
     });
     if (wakeMailbox !== undefined) {
       this.events.emit('target', wakeMailbox);
@@ -1574,7 +1539,7 @@ export class MailboxStore {
   }
 
   hasConfirmedEnvelope(networkId: string, senderNodeId: string, entityId: string, minRevision: number): boolean {
-    return this.read().items.some(item => {
+    return this.db.items().some(item => {
       const authenticated = item.signedEnvelope ?? item.envelope;
       const revision = authenticated.payload?.claimVersion ?? authenticated.payload?.revision ?? 0;
       return authenticated.id === item.id && verifyEnvelope(authenticated) &&
@@ -1593,27 +1558,63 @@ export class MailboxStore {
     ) {
       throw new Error('Limit must be a positive integer');
     }
-    const state = this.read();
-    const scoped = state.items.filter(
-      item => mailboxId === undefined || item.mailboxId === mailboxId,
-    );
-    const visible = options.includeAcked === true
-      ? scoped
-      : scoped.filter(item => item.status !== 'acked');
-    const ordered = [...visible].sort(compareNewestFirst);
-    return {
-      ...(mailboxId !== undefined ? { mailboxId } : {}),
-      totalCount: scoped.length,
-      queuedCount: scoped.filter(item => item.status === 'queued').length,
-      leasedCount: scoped.filter(item => item.status === 'leased').length,
-      ackedCount: scoped.filter(item => item.status === 'acked').length,
-      items: (options.limit === undefined ? ordered : ordered.slice(0, options.limit)).map(
-        cloneItem,
-      ),
-    };
+    return this.db.read(() => {
+      const counts = this.db.countItems(mailboxId);
+      const ordered = this.db.items({ mailboxId, unacked: options.includeAcked !== true }).sort(compareNewestFirst);
+      return {
+        ...(mailboxId !== undefined ? { mailboxId } : {}),
+        totalCount: counts.queued + counts.leased + counts.acked,
+        queuedCount: counts.queued,
+        leasedCount: counts.leased,
+        ackedCount: counts.acked,
+        items: options.limit === undefined ? ordered : ordered.slice(0, options.limit),
+      };
+    });
+  }
+
+  summarizeQueues(options: QueueStatusOptions = {}): { summary: QueueSummary; queues: QueueStatus[] } {
+    const filter = options.mailboxId === undefined ? undefined : normalizeMailboxId(options.mailboxId);
+    const now = options.now ?? Date.now();
+    if (!Number.isFinite(now)) throw new Error('Invalid queue status instant');
+    return this.db.read(() => {
+      const summary: QueueSummary = {
+        activeMailboxes: 0, totalMailboxes: 0, queuedItems: 0, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
+      };
+      const queues: QueueStatus[] = [];
+      for (const { mailboxId, queuedCount, leasedCount, lease, wakeTarget } of this.db.queueRows(filter)) {
+        const pendingWake = wakeTarget?.pendingWake ?? false;
+        const deliveryInDoubt = wakeTarget?.deliveryInDoubt ?? false;
+        const active = queuedCount > 0 || leasedCount > 0 || lease !== undefined || pendingWake || deliveryInDoubt;
+        summary.totalMailboxes++;
+        summary.activeMailboxes += Number(active);
+        summary.queuedItems += queuedCount;
+        summary.leasedItems += leasedCount;
+        summary.pendingWakes += Number(pendingWake);
+        summary.fencedTargets += Number(deliveryInDoubt);
+        if (!active && options.includeIdle !== true) continue;
+        const activeLease = lease && {
+          leaseId: lease.leaseId, itemCount: lease.itemIds.length, createdAt: lease.createdAt,
+          ageMs: Math.max(0, now - Date.parse(lease.createdAt)) || 0,
+        };
+        queues.push({
+          mailboxId, queuedCount, leasedCount, ...(activeLease ? { activeLease } : {}),
+          pendingWake, deliveryInDoubt, attemptCount: wakeTarget?.attemptCount ?? 0,
+          lastWakeError: wakeTarget?.lastWakeError,
+          nextWakeInMs: wakeTarget?.pendingWake && !deliveryInDoubt ? Math.max(0, wakeTarget.earliestWakeAt - now) : null,
+          driver: wakeTarget?.driver ?? null, driverConfig: wakeTarget?.driverConfig,
+        });
+      }
+      return { summary, queues };
+    });
   }
 
   async waitForMail(options: MailboxWaitOptions = {}): Promise<MailboxWaitResult> {
+    return MailboxStore.waitForMail(this, options);
+  }
+
+  /** Wait against a current snapshot, including an absent, uninitialized mailbox. */
+  static async waitForMail(store: MailboxStore | undefined, options: MailboxWaitOptions = {}): Promise<MailboxWaitResult> {
+    const events = store?.events;
     const mailboxId = normalizeMailboxId(options.mailboxId ?? 'default');
     const timeoutMs =
       options.timeoutMs === undefined
@@ -1631,7 +1632,8 @@ export class MailboxStore {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const cleanup = () => {
-        this.events.off('mail', onMail);
+        events?.off('mail', onMail);
+        events?.off('close', onAbort);
         if (timer !== undefined) {
           clearTimeout(timer);
         }
@@ -1647,8 +1649,8 @@ export class MailboxStore {
       };
       const attempt = () => {
         try {
-          const result = this.check(checkOptions);
-          if (result.items.length > 0) {
+          const result = store?.check(checkOptions);
+          if (result && result.items.length > 0) {
             finish(() => resolve({ ...result, timedOut: false }));
           }
         } catch (error) {
@@ -1662,7 +1664,8 @@ export class MailboxStore {
       };
       const onAbort = () => finish(() => reject(createAbortError()));
       // Subscribe before the first check: mail arriving mid-check must not be lost.
-      this.events.on('mail', onMail);
+      events?.on('mail', onMail);
+      events?.once('close', onAbort);
       options.signal?.addEventListener('abort', onAbort, { once: true });
       if (options.signal?.aborted) {
         onAbort();
@@ -1691,13 +1694,16 @@ export class MailboxStore {
     patch: Partial<WakeTargetState> = {},
   ): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
-    const merged = this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    let fenceChanged = false;
+    const merged = this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
       const next = validateWakeTarget(mergeWakeTarget(current, patch));
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
+      fenceChanged = Boolean(current.deliveryInDoubt) !== Boolean(next.deliveryInDoubt);
       return structuredClone(next);
     });
-    if (merged.pendingWake) {
+    if (merged.pendingWake || fenceChanged) {
       this.events.emit('target', id);
     }
     return merged;
@@ -1709,8 +1715,9 @@ export class MailboxStore {
    */
   beginWakeDelivery(mailboxId: string, expectedRevision?: number): WakeTargetState | undefined {
     const id = normalizeMailboxId(mailboxId);
-    return this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    return this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
       if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) return undefined;
       if (current.deliveryInDoubt) {
         throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
@@ -1719,7 +1726,7 @@ export class MailboxStore {
         deliveryInDoubt: true, pendingWake: false,
         lastWakeError: 'External wake delivery outcome is not yet confirmed',
       }));
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
       return structuredClone(next);
     });
   }
@@ -1731,15 +1738,16 @@ export class MailboxStore {
     buildPatch: (lockedCurrent: WakeTargetState) => Partial<WakeTargetState>,
   ): { committed: boolean; target: WakeTargetState } {
     const id = normalizeMailboxId(mailboxId);
-    const result = this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    const result = this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
       const committed = (current.bindingRevision ?? 0) === expectedRevision;
       const patch = committed ? buildPatch(structuredClone(current)) : { attemptCount: 0, earliestWakeAt: 0 };
       let next = validateWakeTarget(mergeWakeTarget(current, {
         ...patch, deliveryInDoubt: undefined, pendingWake: true, lastWakeError: undefined,
       }));
       if (committed) next = { ...next, bindingRevision: Math.max(next.bindingRevision ?? 0, expectedRevision + 1) };
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
       return { committed, target: structuredClone(next) };
     });
     if (!result.committed) this.events.emit('target', id);
@@ -1747,33 +1755,35 @@ export class MailboxStore {
   }
 
   /** Settle a retryable attempt only against the binding that authorized it. */
-  deferWakeAttempt(mailboxId: string, expectedRevision: number, error: unknown, now = Date.now(), patch: Partial<WakeTargetState> = {}): { superseded: boolean; target: WakeTargetState } {
+  deferWakeAttempt(mailboxId: string, expectedRevision: number | undefined, error: unknown, now = Date.now(), patch: Partial<WakeTargetState> = {}): { superseded: boolean; target: WakeTargetState } {
     const id = normalizeMailboxId(mailboxId);
-    const result = this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
-      const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
+    const result = this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
+      const superseded = expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision;
       const attemptCount = superseded ? 0 : current.attemptCount + 1;
       const next = validateWakeTarget(mergeWakeTarget(current, {
         ...(superseded ? {} : patch), pendingWake: true, deliveryInDoubt: undefined, attemptCount,
         earliestWakeAt: superseded ? 0 : now + wakeupBackoffDelay(attemptCount),
         lastWakeError: superseded ? undefined : String(error),
       }));
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
       return { superseded, target: structuredClone(next) };
     });
-    if (result.superseded) this.events.emit('target', id);
+    if (result.superseded || expectedRevision === undefined) this.events.emit('target', id);
     return result;
   }
 
   retainPendingWakeIfCurrent(mailboxId: string, expectedRevision: number): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
-    const next = this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    const next = this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
       const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
       const target = validateWakeTarget(mergeWakeTarget(current, {
         pendingWake: true, ...(superseded ? { attemptCount: 0, earliestWakeAt: 0 } : {}),
       }));
-      state.wakeTargets[id] = target;
+      this.db.writeWakeTarget(target, previous);
       return structuredClone(target);
     });
     this.events.emit('target', id);
@@ -1782,13 +1792,14 @@ export class MailboxStore {
 
   disarmWakeTargetIfCurrent(mailboxId: string, expectedRevision: number): { superseded: boolean; target: WakeTargetState } {
     const id = normalizeMailboxId(mailboxId);
-    const result = this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    const result = this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
       const superseded = (current.bindingRevision ?? 0) !== expectedRevision;
       const next = validateWakeTarget(mergeWakeTarget(current, superseded ? { pendingWake: true } : {
         pendingWake: false, attemptCount: 0, earliestWakeAt: 0, lastWakeError: undefined,
       }));
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
       return { superseded, target: structuredClone(next) };
     });
     if (result.superseded) this.events.emit('target', id);
@@ -1797,11 +1808,12 @@ export class MailboxStore {
 
   updateWakeDriverConfigIfCurrent(mailboxId: string, expectedRevision: number, driverConfig: Record<string, unknown>): { superseded: boolean; target: WakeTargetState } {
     const id = normalizeMailboxId(mailboxId);
-    return this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    return this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
       if ((current.bindingRevision ?? 0) !== expectedRevision) return { superseded: true, target: structuredClone(current) };
       const next = validateWakeTarget(mergeWakeTarget(current, { driverConfig }));
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
       return { superseded: false, target: structuredClone(next) };
     });
   }
@@ -1809,15 +1821,18 @@ export class MailboxStore {
   /** Keep an unconfirmed external outcome fenced; later mail, forced flushes and restarts never replay it. */
   parkWakeDelivery(mailboxId: string, error: unknown): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
-    return this.mutate(state => {
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    const parked = this.db.write(() => {
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
       const next = validateWakeTarget(mergeWakeTarget(current, {
         deliveryInDoubt: true, pendingWake: false, earliestWakeAt: 0,
         attemptCount: current.attemptCount + 1, lastWakeError: String(error),
       }));
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
       return structuredClone(next);
     });
+    this.events.emit('target', id);
+    return parked;
   }
 
   /** Settle only the observed wave; messages arriving during delivery retain their wake. */
@@ -1830,18 +1845,19 @@ export class MailboxStore {
   ): WakeTargetState & { superseded?: boolean } {
     const id = normalizeMailboxId(mailboxId);
     let pinnedWakeMailbox: string | undefined;
-    const completed = this.mutate(state => {
-      const pendingWake = state.items.some(item =>
-        item.mailboxId === id && item.status === 'queued' && item.sequence > deliveredSequence,
-      );
-      const current = state.wakeTargets[id] ?? defaultWakeTarget(id);
+    let clearedFence = false;
+    const completed = this.db.write(() => {
+      const pendingWake = this.db.hasQueuedItems(id, deliveredSequence);
+      const previous = this.db.wakeTarget(id);
+      const current = previous ?? defaultWakeTarget(id);
+      clearedFence = Boolean(current.deliveryInDoubt);
       if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) {
-        const hasQueued = state.items.some(item => item.mailboxId === id && item.status === 'queued');
+        const hasQueued = this.db.hasQueuedItems(id);
         const next = validateWakeTarget(mergeWakeTarget(current, {
           deliveryInDoubt: undefined, lastWakeError: undefined,
           pendingWake: Boolean(current.pendingWake || hasQueued), attemptCount: 0, earliestWakeAt: 0,
         }));
-        state.wakeTargets[id] = next;
+        this.db.writeWakeTarget(next, previous);
         return Object.assign(structuredClone(next), { superseded: true });
       }
 
@@ -1850,26 +1866,28 @@ export class MailboxStore {
         earliestWakeAt: pendingWake ? current.earliestWakeAt : 0, lastWakeError: undefined,
         deliveryInDoubt: undefined,
       }));
-      state.wakeTargets[id] = next;
+      this.db.writeWakeTarget(next, previous);
       if (pinnedSession && current.rotateAfterWaves !== undefined) {
-        const termMailbox = pinSessionTargetInState(state, id, pinnedSession.sessionMailboxId, pinnedSession);
-        if (state.wakeTargets[termMailbox]?.pendingWake && !state.wakeTargets[termMailbox]?.deliveryInDoubt) pinnedWakeMailbox = termMailbox;
-        const delivered = state.items.filter(item => item.mailboxId === id && item.sequence <= deliveredSequence);
+        const termMailbox = pinSessionTarget(this.db, id, pinnedSession.sessionMailboxId, pinnedSession);
+        const pinned = this.db.wakeTarget(termMailbox);
+        if (pinned?.pendingWake && !pinned.deliveryInDoubt) pinnedWakeMailbox = termMailbox;
+        const delivered = this.db.items({ mailboxId: id, throughSequence: deliveredSequence });
         const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
         const updatedAt = new Date().toISOString();
-        for (const [key, record] of Object.entries(state.threads)) {
-          if (record.mailboxCommitted !== false && record.localMailbox === id &&
+        for (const record of this.db.threads({ localMailbox: id })) {
+          const key = threadKey(record);
+          if (record.mailboxCommitted !== false &&
               (keys.has(key) || keys.has(record.threadId) || keys.has(record.messageId))) {
-            state.threads[key] = {
+            this.db.writeThread(key, {
               ...record, localMailbox: termMailbox, updatedAt,
               ...(record.direction === 'inbound' ? { mailboxCommitted: true } : {}),
-            };
+            });
           }
         }
       }
       return structuredClone(next);
     });
-    if (completed.pendingWake) this.events.emit('target', id);
+    if (completed.pendingWake || clearedFence) this.events.emit('target', id);
     if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return completed;
   }
@@ -1877,9 +1895,10 @@ export class MailboxStore {
   pinSessionMailbox(mailboxId: string, sessionMailboxId: string, sessionPatch?: SessionMailboxPatch): string {
     const id = normalizeMailboxId(mailboxId);
     let notify = false;
-    const pinned = this.mutate(state => {
-      const mailbox = pinSessionTargetInState(state, id, sessionMailboxId, sessionPatch);
-      notify = Boolean(state.wakeTargets[mailbox]?.pendingWake && !state.wakeTargets[mailbox]?.deliveryInDoubt);
+    const pinned = this.db.write(() => {
+      const mailbox = pinSessionTarget(this.db, id, sessionMailboxId, sessionPatch);
+      const target = this.db.wakeTarget(mailbox);
+      notify = Boolean(target?.pendingWake && !target.deliveryInDoubt);
       return mailbox;
     });
     if (notify) this.events.emit('target', pinned);
@@ -1888,8 +1907,7 @@ export class MailboxStore {
 
   getWakeTarget(mailboxId: string): WakeTargetState | undefined {
     const id = normalizeMailboxId(mailboxId);
-    const target = this.read().wakeTargets[id];
-    return target ? structuredClone(target) : undefined;
+    return this.db.wakeTarget(id);
   }
 
   inspectSlotObligations(
@@ -1898,24 +1916,30 @@ export class MailboxStore {
   ): SlotObligationSnapshot {
     const id = normalizeMailboxId(mailboxId);
     const sessionId = options?.sessionMailboxId ? normalizeMailboxId(options.sessionMailboxId) : undefined;
-    const state = this.read();
+    return this.db.read(() => this.readSlotObligations(id, sessionId, options?.outbox));
+  }
+
+  private readSlotObligations(id: string, sessionId?: string, outboxStore?: OutboxStore): SlotObligationSnapshot {
+    const target = this.db.wakeTarget(id);
+    const sessionTarget = sessionId && sessionId !== id ? this.db.wakeTarget(sessionId) : undefined;
+    if (target?.pendingWake || target?.deliveryInDoubt) {
+      return { hasPendingWave: this.db.hasUnackedItems(id), immediateBusyReason: 'wakeup_pending' };
+    }
+    if (sessionTarget?.pendingWake || sessionTarget?.deliveryInDoubt || (sessionId && sessionId !== id && this.db.hasUnackedItems(sessionId))) {
+      return { hasPendingWave: this.db.hasUnackedItems(id), immediateBusyReason: 'session_reply_pending' };
+    }
     const ownedMailboxes = new Set(sessionId ? [id, sessionId] : [id]);
     const selfInboundMessages = new Set<string>();
     const localUnackedMessages = new Set<string>();
     const localUnackedThreads = new Set<string>();
     let activeSince: string | undefined;
-    let sessionUnacked = false;
-    for (const item of state.items) {
+    for (const item of this.db.items()) {
       const { networkId, semantic } = item.envelope;
       const messageKey = netKey(networkId, item.id);
       if (ownedMailboxes.has(item.mailboxId)) {
         selfInboundMessages.add(messageKey);
         if (item.status === 'acked') continue;
-        if (item.mailboxId === id) {
-          if (activeSince === undefined || item.receivedAt < activeSince) activeSince = item.receivedAt;
-        } else {
-          sessionUnacked = true;
-        }
+        if (item.mailboxId === id && (activeSince === undefined || item.receivedAt < activeSince)) activeSince = item.receivedAt;
       } else if (item.status !== 'acked') {
         localUnackedMessages.add(messageKey);
         localUnackedThreads.add(netKey(networkId, semantic?.threadId ?? item.envelope.id));
@@ -1923,19 +1947,11 @@ export class MailboxStore {
     }
 
     const hasPendingWave = activeSince !== undefined;
-    const target = state.wakeTargets[id];
-    const sessionTarget = sessionId && sessionId !== id ? state.wakeTargets[sessionId] : undefined;
-    if (target?.pendingWake || target?.deliveryInDoubt) {
-      return { hasPendingWave, immediateBusyReason: 'wakeup_pending' };
-    }
-    if (sessionUnacked || sessionTarget?.pendingWake || sessionTarget?.deliveryInDoubt) {
-      return { hasPendingWave, immediateBusyReason: 'session_reply_pending' };
-    }
-
-    const records = Object.values(state.threads);
-    const outbox = options?.outbox && readOutboxThreadOwners(options.outbox, activeMailboxKeys(state));
+    const records = this.db.threads();
+    const outbox = outboxStore && readOutboxThreadOwners(outboxStore, activeMailboxKeys(this.db));
+    const recordKeys = new Set(records.map(threadKey));
     for (const item of outbox?.items ?? []) {
-      if (!state.threads[threadKey({ direction: 'outbound', messageId: item.id })]) records.push(outboxThreadRecord(item));
+      if (!recordKeys.has(threadKey({ direction: 'outbound', messageId: item.id }))) records.push(outboxThreadRecord(item));
     }
     const settledThreads = new Set<string>();
     const ownedOutboundMessages = new Set<string>();
@@ -2006,7 +2022,7 @@ export class MailboxStore {
   }
 
   listWakeTargets(): WakeTargetState[] {
-    return Object.values(this.read().wakeTargets).map(target => structuredClone(target));
+    return this.db.wakeTargets();
   }
 
   /** Arrival notification for one mailbox; never emitted by read-only operations. */
@@ -2015,7 +2031,7 @@ export class MailboxStore {
     return { dispose: () => this.events.off('mail', listener) };
   }
 
-  /** Notification that a wake target became pending (for example after a spawn). */
+  /** Notification that a wake target became pending or its stable fence changed. */
   onWakeTarget(listener: (mailboxId: string) => void): Disposable {
     this.events.on('target', listener);
     return { dispose: () => this.events.off('target', listener) };
@@ -2025,36 +2041,34 @@ export class MailboxStore {
     if (typeof nowMs !== 'number' || !Number.isFinite(nowMs)) {
       throw new Error('Invalid wake target instant');
     }
-    return Object.values(this.read().wakeTargets)
-      .filter(target => target.pendingWake && !target.deliveryInDoubt && target.earliestWakeAt <= nowMs)
-      .sort(
-        (a, b) =>
-          a.earliestWakeAt - b.earliestWakeAt || a.mailboxId.localeCompare(b.mailboxId),
-      )
-      .map(target => structuredClone(target));
+    return this.db.wakeTargets(nowMs).sort(
+      (a, b) => a.earliestWakeAt - b.earliestWakeAt || a.mailboxId.localeCompare(b.mailboxId),
+    );
   }
 
   private upsertThreadRecord(
-    state: MailboxFileState,
     record: ThreadRouteRecord,
   ): ThreadRouteRecord {
     const key = threadKey(record);
-    const existing = state.threads[key];
+    const existing = this.db.thread(key);
     if (record.mailboxCommitted === false && existing && existing.networkId === record.networkId &&
       existing.mailboxCommitted !== false) return existing;
     const now = record.updatedAt;
     let threadState = mergeThreadState(existing?.state ?? 'open', record.state);
     let threadSettlement = record.settlement ?? existing?.settlement;
-    for (const [currentKey, current] of Object.entries(state.threads)) {
-      if (current.threadId !== record.threadId || current.networkId !== record.networkId) continue;
+    for (const current of this.db.threads({ threadId: record.threadId })) {
+      if (current.networkId !== record.networkId) continue;
       const nextSettlement = record.settlement ?? current.settlement;
       const nextState = mergeThreadState(current.state, record.state);
-      state.threads[currentKey] = {
-        ...current,
-        state: nextState,
-        ...(nextSettlement !== undefined ? { settlement: nextSettlement } : {}),
-        updatedAt: now,
-      };
+      const currentKey = threadKey(current);
+      if (currentKey !== key) {
+        this.db.writeThread(currentKey, {
+          ...current,
+          state: nextState,
+          ...(nextSettlement !== undefined ? { settlement: nextSettlement } : {}),
+          updatedAt: now,
+        });
+      }
       threadState = mergeThreadState(threadState, nextState);
       if (nextSettlement !== undefined) {
         threadSettlement = nextSettlement;
@@ -2066,12 +2080,11 @@ export class MailboxStore {
       ...(threadSettlement !== undefined ? { settlement: threadSettlement } : {}),
       createdAt: existing?.createdAt ?? record.createdAt,
     };
-    state.threads[key] = stored;
+    this.db.writeThread(key, stored);
     return stored;
   }
 
   private upsertInboundThread(
-    state: MailboxFileState,
     envelope: MessageEnvelope,
     localMailbox: string,
     now: string,
@@ -2083,7 +2096,7 @@ export class MailboxStore {
       'peer reply mailbox',
     );
     const settlement = settlementOf(envelope, now);
-    return this.upsertThreadRecord(state, {
+    return this.upsertThreadRecord({
       threadId: envelope.semantic?.threadId ?? envelope.id,
       messageId: envelope.id,
       envelope: structuredClone(envelope),
@@ -2111,9 +2124,11 @@ export class MailboxStore {
   ): ThreadRouteRecord {
     const mailboxId = normalizeMailboxId(localMailbox, 'local mailbox');
     const now = new Date().toISOString();
-    return this.mutate(state => structuredClone(
-      this.upsertInboundThread(state, envelope, mailboxId, now, options.committed ?? true),
-    ));
+    return this.db.write(() => {
+      const record = this.upsertInboundThread(envelope, mailboxId, now, options.committed ?? true);
+      compactThreads(this.db, this.outbox);
+      return structuredClone(record);
+    });
   }
 
   recordOutboundEnvelope(
@@ -2135,41 +2150,49 @@ export class MailboxStore {
     const now = new Date().toISOString();
     const record = outboundThreadRecord(envelope, [...new Set(peerNodeIds)], local, options?.createdAt ?? now, now);
     if (options?.restore) return this.restoreOutboundThreads(() => [record])[0];
-    return this.mutate(state => structuredClone(this.upsertThreadRecord(state, record)));
+    return this.db.write(() => {
+      const stored = this.upsertThreadRecord(record);
+      compactThreads(this.db, this.outbox);
+      return structuredClone(stored);
+    });
   }
 
   /** Lock-free references whose slot obligations still consult outbox failure evidence. */
   readUnsettledOutboundKeys(): ReadonlySet<string> {
     const keys = new Set<string>();
-    for (const record of Object.values(this.read().threads)) {
-      if (record.direction === 'outbound' && record.state !== 'settled') {
-        keys.add(netKey(record.networkId, record.messageId));
-      }
+    for (const record of this.db.threads({ unsettledOutbound: true })) {
+      keys.add(netKey(record.networkId, record.messageId));
     }
     return keys;
   }
 
   reconcileOutboxThreads(outbox: OutboxStore): void {
-    this.restoreOutboundThreads(state => {
-      const { items } = readOutboxThreadOwners(outbox, activeMailboxKeys(state));
-      return items.map(outboxThreadRecord);
-    });
+    this.restoreOutboundThreads(() => {
+      const active = activeMailboxKeys(this.db);
+      const { items, confirmedReplies } = readOutboxThreadOwners(outbox, active);
+      return items.filter(item => {
+        const key = netKey(item.networkId, item.id);
+        const threadId = envelopeThreadId(item.envelope);
+        if (!confirmedReplies.has(key) || active.messages.has(key) || active.threads.has(netKey(item.networkId, threadId))) return true;
+        // A terminal reply can complete an existing route, but cannot recreate expired history.
+        const replyToId = item.envelope.replyToId;
+        if (!replyToId) return false;
+        const root = this.db.thread(threadKey({ direction: 'inbound', messageId: replyToId }));
+        return root?.networkId === item.networkId && root.threadId === threadId;
+      }).map(outboxThreadRecord);
+    }, true);
   }
 
-  private restoreOutboundThreads(readRecords: (state: MailboxFileState) => readonly ThreadRouteRecord[]): ThreadRouteRecord[] {
-    return this.withFileLock(() => {
-      const current = this.read();
-      const records = readRecords(current);
-      if (records.length === 0) return [];
-      const state = structuredClone(current);
+  private restoreOutboundThreads(readRecords: () => readonly ThreadRouteRecord[], compact = false): ThreadRouteRecord[] {
+    return this.db.write(() => {
       let changed = false;
-      const restored = records.map(record => {
-        const existing = state.threads[threadKey(record)];
+      const restored = readRecords().map(record => {
+        const existing = this.db.thread(threadKey(record));
         if (existing && (existing.peerNodeIds.length > 0 || record.peerNodeIds.length === 0)) return existing;
         changed = true;
-        return this.upsertThreadRecord(state, existing ? { ...record, localMailbox: existing.localMailbox } : record);
+        return this.upsertThreadRecord(existing ? { ...record, localMailbox: existing.localMailbox } : record);
       });
-      if (changed) this.save(state);
+      if (changed || compact) compactThreads(this.db, this.outbox);
       return structuredClone(restored);
     });
   }
@@ -2183,17 +2206,17 @@ export class MailboxStore {
     if (!isNonEmptyString(messageId)) {
       throw new Error('Invalid message id');
     }
-    return this.mutate(state => {
+    return this.db.write(() => {
       const key = `outbound:${messageId}`;
-      const removed = state.threads[key];
+      const removed = this.db.thread(key);
       if (removed === undefined) {
-        if (state.threads[`inbound:${messageId}`] !== undefined) {
+        if (this.db.thread(`inbound:${messageId}`) !== undefined) {
           throw new Error(`Cannot prune inbound thread record: ${messageId}`);
         }
         return undefined;
       }
-      delete state.threads[key];
-      const remaining = threadRecordsFor(state, removed.threadId);
+      this.db.deleteThread(key);
+      const remaining = threadRecordsFor(this.db, removed.threadId);
       let nextState: ThreadRouteRecord['state'] = 'open';
       let nextSettlement: ThreadRouteRecord['settlement'] | undefined;
       for (const record of remaining) {
@@ -2211,13 +2234,14 @@ export class MailboxStore {
         // Drop any stale settlement first: the recomputed value is the only one that may
         // remain, and a thread with no settle envelope must not keep an old one.
         const { settlement: _discardedSettlement, ...rest } = record;
-        state.threads[threadKey(record)] = {
+        this.db.writeThread(threadKey(record), {
           ...rest,
           state: nextState,
           updatedAt: now,
           ...(nextSettlement !== undefined ? { settlement: nextSettlement } : {}),
-        };
+        });
       }
+      compactThreads(this.db, this.outbox);
       return {
         pruned: structuredClone(removed),
         threadId: removed.threadId,
@@ -2232,8 +2256,7 @@ export class MailboxStore {
     if (!Number.isSafeInteger(afterSequence) || afterSequence < -1) {
       throw new Error('Invalid sequence');
     }
-    return this.read().items.filter(item => item.sequence > afterSequence)
-      .sort((a, b) => a.sequence - b.sequence).map(cloneItem);
+    return this.db.items({ afterSequence });
   }
 
   listThreads(options: { kind?: string; state?: ThreadRouteRecord['state']; limit?: number } = {}): ThreadSummaryRecord[] {
@@ -2244,7 +2267,7 @@ export class MailboxStore {
       throw new Error('Invalid thread limit');
     }
     const groups = new Map<string, ThreadRouteRecord[]>();
-    for (const record of Object.values(this.read().threads)) {
+    for (const record of this.db.threads()) {
       const group = groups.get(record.threadId) ?? [];
       group.push(record);
       groups.set(record.threadId, group);
@@ -2274,13 +2297,12 @@ export class MailboxStore {
     if (!isNonEmptyString(messageOrThreadId)) {
       throw new Error('Invalid thread reference');
     }
-    const found = lookupThread(this.read(), messageOrThreadId);
-    return found ? structuredClone(found) : undefined;
+    return this.db.read(() => lookupThread(this.db, messageOrThreadId));
   }
 
   getInboundThreadRecord(messageId: string, networkId: string): ThreadRouteRecord | undefined {
-    const record = this.read().threads[threadKey({ direction: 'inbound', messageId })];
-    return record?.networkId === networkId ? structuredClone(record) : undefined;
+    const record = this.db.thread(threadKey({ direction: 'inbound', messageId }));
+    return record?.networkId === networkId ? record : undefined;
   }
 
   /** All directional records of a thread, oldest first; accepts a message id or thread id. */
@@ -2288,10 +2310,10 @@ export class MailboxStore {
     if (!isNonEmptyString(messageOrThreadId)) {
       throw new Error('Invalid thread reference');
     }
-    const state = this.read();
-    const exact = exactThreadRecord(state, messageOrThreadId);
-    const threadId = exact?.threadId ?? messageOrThreadId;
-    return threadRecordsFor(state, threadId).map(record => structuredClone(record));
+    return this.db.read(() => {
+      const exact = exactThreadRecord(this.db, messageOrThreadId);
+      return threadRecordsFor(this.db, exact?.threadId ?? messageOrThreadId);
+    });
   }
 
   /**
@@ -2307,11 +2329,10 @@ export class MailboxStore {
     options?: { excludeInboundMessageId?: string },
   ): string | undefined {
     if (!threadId) return undefined;
-    return this.threadLocalMailboxFromState(this.read(), threadId, networkId, options?.excludeInboundMessageId);
+    return this.threadLocalMailbox(threadId, networkId, options?.excludeInboundMessageId);
   }
 
-  private threadLocalMailboxFromState(
-    state: MailboxFileState,
+  private threadLocalMailbox(
     threadId?: string,
     networkId?: string,
     excludeInboundMessageId?: string,
@@ -2319,7 +2340,7 @@ export class MailboxStore {
     if (typeof threadId !== 'string' || threadId.length === 0) {
       return undefined;
     }
-    const records = threadRecordsFor(state, threadId)
+    const records = threadRecordsFor(this.db, threadId)
       .filter(record => networkId === undefined || record.networkId === networkId);
     for (let index = records.length - 1; index >= 0; index -= 1) {
       const { direction, messageId, localMailbox, mailboxCommitted } = records[index];
@@ -2343,12 +2364,15 @@ export class MailboxStore {
     if (!isNonEmptyString(messageOrThreadId)) {
       throw new Error('Invalid thread reference');
     }
+    return this.db.read(() => this.readReplyTarget(messageOrThreadId, networkId));
+  }
+
+  private readReplyTarget(messageOrThreadId: string, networkId?: string): ResolvedReplyTarget | undefined {
     const onNetwork = (candidate: ThreadRouteRecord): boolean =>
       networkId === undefined || candidate.networkId === networkId;
-    const state = this.read();
-    const exactRecord = exactThreadRecord(state, messageOrThreadId);
+    const exactRecord = exactThreadRecord(this.db, messageOrThreadId);
     const exact = exactRecord !== undefined && onNetwork(exactRecord) ? exactRecord : undefined;
-    const record = exact ?? threadRecordsFor(state, messageOrThreadId).filter(onNetwork).at(-1);
+    const record = exact ?? threadRecordsFor(this.db, messageOrThreadId).filter(onNetwork).at(-1);
     if (!record) {
       return undefined;
     }
@@ -2360,7 +2384,7 @@ export class MailboxStore {
         !(exact.direction === 'outbound' && exact.messageId === exact.threadId)
       ? exact
       : undefined;
-    const records = threadRecordsFor(state, exact?.threadId ?? messageOrThreadId)
+    const records = threadRecordsFor(this.db, exact?.threadId ?? messageOrThreadId)
       .filter(candidate => candidate.networkId === record.networkId);
     const targetRecord = exactLeg !== undefined && recordedPeerMailbox(exactLeg) !== 'default'
       ? exactLeg
@@ -2371,7 +2395,7 @@ export class MailboxStore {
         record);
     const localMailbox = exactLeg !== undefined && exactLeg.mailboxCommitted !== false && exactLeg.localMailbox !== 'default'
       ? exactLeg.localMailbox
-      : this.threadLocalMailboxFromState(state, record.threadId, record.networkId) ?? 'default';
+      : this.threadLocalMailbox(record.threadId, record.networkId) ?? 'default';
     return {
       threadId: record.threadId,
       messageId: record.messageId,
@@ -2386,16 +2410,10 @@ export class MailboxStore {
   }
 }
 
-function mintLeaseId(state: MailboxFileState): string {
-  const known = new Set(
-    Object.values(state.mailboxes).flatMap(record => [
-      ...(record.outstanding ? [record.outstanding.leaseId] : []),
-      ...record.ackedLeaseIds,
-    ]),
-  );
+function mintLeaseId(db: MailboxSqliteBackend): string {
   let leaseId: string;
   do {
     leaseId = `dlv_${randomBytes(6).toString('hex')}`;
-  } while (known.has(leaseId));
+  } while (db.leaseMailbox(leaseId) !== undefined);
   return leaseId;
 }

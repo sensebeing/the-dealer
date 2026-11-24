@@ -2461,20 +2461,13 @@ test('an unresolved selector queues durably while its network is unmounted', asy
   assert.deepEqual(item.explicitTargets, ['member:not-yet-known']);
 });
 
-test('mailbox and outbox reclaim the shared lock owner after a dead incarnation', t => {
+test('outbox reclaims its lock after a dead incarnation', t => {
   const dir = directory(t);
   const deadOwner = {
     pid: 2_147_483_646,
     instanceId: 'dead-incarnation',
     host: hostname(),
   };
-  const mailboxPath = join(dir, 'mailbox.json');
-  mkdirSync(`${mailboxPath}.lock`, { recursive: true });
-  writeFileSync(join(`${mailboxPath}.lock`, 'owner.json'), JSON.stringify(deadOwner));
-  const mailbox = new MailboxStore(mailboxPath);
-  assert.equal(mailbox.upsertWakeTarget('default').mailboxId, 'default');
-  assert.equal(existsSync(`${mailboxPath}.lock`), false, 'the dead mailbox lock is reclaimed');
-
   const outboxPath = join(dir, 'outbox.json');
   mkdirSync(`${outboxPath}.lock`, { recursive: true });
   writeFileSync(join(`${outboxPath}.lock`, 'owner.json'), JSON.stringify(deadOwner));

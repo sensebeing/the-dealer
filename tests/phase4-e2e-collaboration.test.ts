@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import {
   DealerNodeRuntime,
+  MailboxStore,
   DEDUP_CAS_DUPLICATE_DETAIL,
   DEDUP_CAS_AMBIGUOUS_DETAIL,
   generateNodeKeyPair,
@@ -1571,8 +1572,13 @@ test('external project executors and policies share configuration, attachments a
   const persisted = bob.mailbox.listItemsAfterSequence(-1).find(item => item.id === inboxForged.messageId)!;
   assert.ok(persisted);
   assert.deepEqual(persisted.envelope.payload.localAttachments, []);
-  const savedMailbox = JSON.parse(readFileSync(join(bob.stateDir, 'mailbox.json'), 'utf8'));
-  assert.deepEqual(savedMailbox.items.find(item => item.id === inboxForged.messageId).envelope.payload.localAttachments, []);
+  const savedMailbox = new MailboxStore(bob.mailbox.path);
+  try {
+    assert.deepEqual(savedMailbox.listItemsAfterSequence(-1).find(item => item.id === inboxForged.messageId)?.envelope.payload.localAttachments, []);
+    assert.equal(statSync(savedMailbox.path).mode & 0o777, 0o600);
+  } finally {
+    savedMailbox.close();
+  }
   const dispatcher = bob.kernel.getService('dispatcher');
   assert.equal(dispatcher.hasExecutor('custom-exec'), true);
   assert.equal(dispatcher.hasPolicy('custom-policy'), true);

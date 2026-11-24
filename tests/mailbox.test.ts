@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -11,6 +12,9 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import type { StatementSync } from 'node:sqlite';
+import { withOwnedLock } from '../packages/fs-atomic/index.ts';
 import {
   MailboxStore,
   DEDUP_CAS_DUPLICATE_DETAIL,
@@ -22,7 +26,7 @@ import {
   resolveMailboxId,
   resolveBoundMailboxId,
 } from '../packages/index.ts';
-import type { DeliveryReceipt, MessageEnvelope } from '../packages/index.ts';
+import type { DeliveryReceipt, MailboxItem, MessageEnvelope } from '../packages/index.ts';
 import { netKey } from '../packages/mailbox/network-key.ts';
 
 function envelope(id: string, patch: Partial<MessageEnvelope> = {}): MessageEnvelope {
@@ -50,8 +54,212 @@ function workspace(t: { after: (fn: () => void) => void }) {
   return { root, path: join(root, 'mailbox.json') };
 }
 
+function writeLegacyMailbox(path: string, state: Record<string, unknown>): void {
+  writeFileSync(path, JSON.stringify({ schema: 'the-dealer-mailbox/v2', sequence: 0, items: [], ...state }));
+}
+
+function legacyItem(message: MessageEnvelope, sequence: number, mailboxId = 'default', patch: Partial<MailboxItem> = {}): MailboxItem {
+  return { id: message.id, sequence, mailboxId, status: 'queued', envelope: message, receivedAt: message.createdAt, ...patch };
+}
+
 const waveSlot = 'stream:alert-wave:1';
 const slotSession = 'terminal:term-wave';
+
+test('SQLite migrates mailbox-scoped identities once and wake writes leave other rows alone', t => {
+  const { path, root } = workspace(t);
+  const message = envelope('shared-id');
+  const source = JSON.stringify({
+    schema: 'the-dealer-mailbox/v2',
+    sequence: 8,
+    items: ['default', 'task:other'].map((mailboxId, sequence) => ({
+      id: message.id, mailboxId, sequence, status: 'queued', receivedAt: message.createdAt, envelope: message,
+    })),
+  });
+  writeFileSync(path, source, { mode: 0o600 });
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
+  const databasePath = join(root, 'mailbox.sqlite');
+  assert.equal(store.path, databasePath);
+  assert.equal(existsSync(path), false);
+  assert.equal(readFileSync(`${path}.v2-migrated`, 'utf8'), source);
+  for (const suffix of ['', '-wal', '-shm']) {
+    assert.equal(statSync(databasePath + suffix).mode & 0o777, 0o600);
+  }
+  assert.deepEqual(store.list().items.map(item => item.mailboxId).sort(), ['default', 'task:other']);
+  store.enqueue([envelope('after')]);
+  assert.equal(store.listItemsAfterSequence(7)[0].sequence, 8);
+  const reopened = new MailboxStore(databasePath);
+  t.after(() => reopened.close());
+  assert.equal(reopened.list().totalCount, 3);
+
+  const target = store.upsertWakeTarget('default', { driver: 'test', pendingWake: true });
+  store.upsertWakeTarget('task:other', { pendingWake: true });
+  const db = new DatabaseSync(databasePath);
+  t.after(() => db.close());
+  assert.equal(db.prepare('PRAGMA journal_mode').get()?.journal_mode, 'wal');
+  assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(row => row.name),
+    ['items', 'mailboxes', 'meta', 'threads', 'wake_targets']);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    assert.equal(reopened.list().totalCount, 3, 'a WAL reader can proceed while a writer holds its transaction');
+  } finally {
+    db.exec('ROLLBACK');
+  }
+  for (const table of ['meta', 'mailboxes', 'items', 'threads', 'wake_targets']) {
+    for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
+      if (table === 'wake_targets' && operation !== 'DELETE') continue;
+      db.exec(`CREATE TRIGGER block_${table}_${operation} BEFORE ${operation} ON ${table}
+        BEGIN SELECT RAISE(ABORT, 'unrelated write'); END`);
+    }
+  }
+  db.exec(`CREATE TRIGGER block_other_targets BEFORE UPDATE ON wake_targets WHEN OLD.mailbox_id <> 'default'
+    BEGIN SELECT RAISE(ABORT, 'unrelated wake target'); END`);
+  assert.equal(store.deferWakeAttempt('default', target.bindingRevision!, 'busy', 100).target.earliestWakeAt, 1100);
+  assert.equal(reopened.beginWakeDelivery('default', target.bindingRevision!)?.deliveryInDoubt, true);
+  assert.equal(store.completeWakeDelivery('default', 8, {}, undefined, target.bindingRevision!).deliveryInDoubt, undefined);
+  assert.equal(store.getWakeTarget('task:other')?.attemptCount, 0);
+});
+
+test('new and reopened mailbox writers use FULL synchronization', t => {
+  const { path } = workspace(t);
+  const exec = t.mock.method(DatabaseSync.prototype, 'exec');
+  const first = new MailboxStore(path);
+  t.after(() => first.close());
+  const second = new MailboxStore(first.path);
+  t.after(() => second.close());
+
+  const connections = new Set(exec.mock.calls.map(call => call.this as DatabaseSync));
+  assert.equal(connections.size, 2);
+  for (const db of connections) assert.equal(db.prepare('PRAGMA synchronous').get()?.synchronous, 2);
+});
+
+test('mailbox migration waits for the existing legacy writer lock', t => {
+  const { path, root } = workspace(t);
+  const sqlite = join(root, 'mailbox.sqlite');
+  writeLegacyMailbox(path, { items: [legacyItem(envelope('before-legacy-write'), 0)] });
+  withOwnedLock(`${path}.lock`, 'Test legacy writer', () => {
+    assert.throws(() => new MailboxStore(sqlite), /Mailbox store is locked/);
+    assert.equal(existsSync(path), true);
+    assert.equal(existsSync(`${path}.v2-migrated`), false);
+    writeLegacyMailbox(path, { items: [legacyItem(envelope('final-legacy-write'), 0)] });
+  });
+
+  const store = new MailboxStore(sqlite);
+  t.after(() => store.close());
+  assert.equal(store.list().items[0].id, 'final-legacy-write');
+  assert.equal(statSync(`${path}.v2-migrated`).mode & 0o777, 0o400);
+});
+
+test('both open modes reject a legacy ledger recreated after cutover', t => {
+  const { path } = workspace(t);
+  writeLegacyMailbox(path, { items: [legacyItem(envelope('imported'), 0)] });
+  const store = new MailboxStore(path);
+  store.close();
+  const recreated = 'unexpected stale ledger';
+  writeFileSync(path, recreated);
+  assert.throws(() => new MailboxStore(store.path), /Legacy mailbox.*reappeared/);
+  assert.throws(() => MailboxStore.openReadOnly(store.path), /Legacy mailbox.*reappeared/);
+  assert.equal(readFileSync(path, 'utf8'), recreated);
+});
+
+test('an interrupted legacy archive is retried after the import transaction commits', t => {
+  const { path } = workspace(t);
+  const backup = `${path}.v2-migrated`;
+  writeLegacyMailbox(path, { items: [legacyItem(envelope('imported'), 0)] });
+  mkdirSync(backup);
+  assert.throws(() => new MailboxStore(path), { code: 'EISDIR' });
+  assert.equal(existsSync(path), true);
+  rmSync(backup, { recursive: true });
+  withOwnedLock(`${path}.lock`, 'Test legacy writer', () => {
+    assert.throws(() => new MailboxStore(path), /Mailbox store is locked/);
+    assert.equal(existsSync(path), true);
+    assert.equal(existsSync(backup), false);
+  });
+  const reopened = new MailboxStore(path);
+  t.after(() => reopened.close());
+  assert.equal(reopened.list().items[0].id, 'imported');
+  assert.equal(existsSync(path), false);
+  assert.equal(existsSync(backup), true);
+});
+
+test('an interrupted archive can recover when both legacy files are gone', t => {
+  const { path } = workspace(t);
+  const backup = `${path}.v2-migrated`;
+  writeLegacyMailbox(path, { items: [legacyItem(envelope('imported'), 0)] });
+  mkdirSync(backup);
+  assert.throws(() => new MailboxStore(path), { code: 'EISDIR' });
+  rmSync(path);
+  rmSync(backup, { recursive: true });
+
+  const reopened = new MailboxStore(path);
+  t.after(() => reopened.close());
+  assert.equal(reopened.list().items[0].id, 'imported');
+});
+
+test('an interrupted inbox archive can recover when its directory is gone', t => {
+  const { path, root } = workspace(t);
+  const legacyRoot = join(root, 'legacy');
+  const legacyInboxPath = join(legacyRoot, 'inbox.json');
+  mkdirSync(legacyRoot);
+  writeFileSync(legacyInboxPath, JSON.stringify({ schema: 'the-dealer-inbox/v1', items: [] }));
+  mkdirSync(`${legacyInboxPath}.migrated`);
+  assert.throws(() => new MailboxStore(path, { legacyInboxPath }), { code: 'EISDIR' });
+  rmSync(legacyRoot, { recursive: true });
+
+  const reopened = new MailboxStore(path, { legacyInboxPath });
+  t.after(() => reopened.close());
+  assert.equal(reopened.list().totalCount, 0);
+});
+
+test('queue status uses a fixed query budget across mailboxes', t => {
+  const { path } = workspace(t);
+  writeLegacyMailbox(path, {
+    items: [legacyItem(envelope('queued'), 0, 'items-only')],
+    mailboxes: { 'lease-history': { mailboxId: 'lease-history', ackedLeaseIds: [] } },
+  });
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
+  for (const id of ['wake-c', 'wake-a', 'wake-b']) store.upsertWakeTarget(id);
+
+  const db = new DatabaseSync(':memory:');
+  const statementPrototype = Object.getPrototypeOf(db.prepare('SELECT 1')) as StatementSync;
+  db.close();
+  const all = t.mock.method(statementPrototype, 'all');
+  const get = t.mock.method(statementPrototype, 'get');
+
+  const { queues } = store.summarizeQueues({ includeIdle: true });
+  assert.deepEqual(queues.map(queue => queue.mailboxId), ['items-only', 'lease-history', 'wake-a', 'wake-b', 'wake-c']);
+  assert.equal(queues[0].queuedCount, 1);
+  const queries = all.mock.callCount() + get.mock.callCount();
+  assert.ok(queries <= 3, `expected at most 3 queries, ran ${queries}`);
+});
+
+test('queue status projects active leases, pending wake backoff and fences without taking custody', t => {
+  const store = new MailboxStore(workspace(t).path);
+  t.after(() => store.close());
+  store.enqueue([envelope('leased')]);
+  const checked = store.check();
+  store.enqueue([envelope('queued')]);
+  const target = store.upsertWakeTarget('default', { driver: 'test' });
+  store.deferWakeAttempt('default', target.bindingRevision!, 'busy', 100);
+  store.parkWakeDelivery('fenced', 'unknown outcome');
+  store.upsertWakeTarget('idle');
+  const now = Date.now();
+  const { summary, queues } = store.summarizeQueues({ now });
+  assert.deepEqual(summary, {
+    activeMailboxes: 2, totalMailboxes: 3, queuedItems: 1, leasedItems: 1, pendingWakes: 1, fencedTargets: 1,
+  });
+  assert.deepEqual(queues.map(queue => queue.mailboxId), ['default', 'fenced']);
+  assert.equal(queues[0].activeLease?.leaseId, checked.deliveryId);
+  assert.equal(queues[0].activeLease?.itemCount, 1);
+  assert.equal(queues[0].activeLease?.ageMs, now - Date.parse(queues[0].activeLease!.createdAt));
+  assert.equal(queues[0].attemptCount, 1);
+  assert.equal(queues[0].lastWakeError, 'busy');
+  assert.equal(store.summarizeQueues({ now: 500, mailboxId: 'default' }).queues[0].nextWakeInMs, 600);
+  assert.equal(queues[1].deliveryInDoubt, true);
+  assert.equal(store.summarizeQueues({ includeIdle: true, mailboxId: 'idle' }).queues.length, 1);
+  assert.equal(store.check({ peek: true }).deliveryId, checked.deliveryId);
+});
 
 test('slot obligations prioritize fenced wakeups and then session replies', t => {
   const store = new MailboxStore(workspace(t).path);
@@ -640,9 +848,10 @@ test('peek never mints a lease or mutates item state', t => {
   assert.equal(peek.newerQueuedCount, 0);
   assert.deepEqual(peek.items.map(item => item.id), ['a']);
   assert.equal(peek.items[0].status, 'queued');
-  const persisted = JSON.parse(readFileSync(path, 'utf8'));
-  assert.deepEqual(persisted.mailboxes, {});
-  assert.equal(persisted.items[0].status, 'queued');
+  const reopened = new MailboxStore(path);
+  t.after(() => reopened.close());
+  assert.equal(reopened.summarizeQueues().queues[0].activeLease, undefined);
+  assert.equal(reopened.list().items[0].status, 'queued');
 
   const leased = store.check();
   const behind = store.check({ peek: true });
@@ -785,13 +994,15 @@ test('enqueue deduplicates per mailbox and sanitizes one-line wakeup hints', t =
 
 test('check orders queued items by instant then insertion sequence', t => {
   const { path } = workspace(t);
+  writeLegacyMailbox(path, {
+    items: [
+      legacyItem(envelope('older'), 0, 'default', { receivedAt: '2026-11-10T09:00:00+08:00' }),
+      legacyItem(envelope('newer'), 1, 'default', { receivedAt: '2026-11-10T02:00:00Z' }),
+      legacyItem(envelope('tie'), 2, 'default', { receivedAt: '2026-11-10T01:00:00Z' }),
+    ],
+  });
   const store = new MailboxStore(path);
-  store.enqueue([envelope('older'), envelope('newer'), envelope('tie')]);
-  const saved = JSON.parse(readFileSync(path, 'utf8'));
-  saved.items[0].receivedAt = '2026-11-10T09:00:00+08:00';
-  saved.items[1].receivedAt = '2026-11-10T02:00:00Z';
-  saved.items[2].receivedAt = '2026-11-10T01:00:00Z';
-  writeFileSync(path, JSON.stringify(saved));
+  t.after(() => store.close());
   assert.deepEqual(
     store.check().items.map(item => item.id),
     ['older', 'tie', 'newer'],
@@ -868,10 +1079,7 @@ test('wake targets coalesce, survive restarts, clear on lease and count complete
   assert.deepEqual(reopened.listPendingWakeTargets(Date.now() + 1_000), []);
   reopened.ack(lease.deliveryId!);
   assert.equal(reopened.upsertWakeTarget('default').completedWaves, 1);
-  assert.equal(
-    JSON.parse(readFileSync(path, 'utf8')).wakeTargets.default.completedWaves,
-    1,
-  );
+  assert.equal(store.getWakeTarget('default')?.completedWaves, 1);
 });
 
 test('lowering coalescing releases pending wakes without shortening retry backoff', t => {
@@ -1095,44 +1303,48 @@ test('legacy inbox migrates once into the default mailbox without data loss', t 
   const acked = all.items.find(item => item.id === 'read')!;
   assert.equal(acked.status, 'acked');
   assert.equal(acked.ackedAt, readAt);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(statSync(store.path).mode & 0o777, 0o600);
 
   const second = new MailboxStore(path, { legacyInboxPath: legacyPath });
   assert.equal(second.list({ includeAcked: true }).totalCount, 2);
   assert.equal(existsSync(`${legacyPath}.migrated`), true);
 });
 
-test('invalid mailbox or legacy files fail loudly and locks are released', t => {
+test('invalid legacy and persisted provenance fails closed and a repaired import can be retried', t => {
   const { root, path } = workspace(t);
-  const store = new MailboxStore(path);
-  store.enqueue([envelope('a')]);
-  assert.equal(existsSync(`${path}.lock`), false);
   for (const invalid of ['{', '{}', '{"schema":"the-dealer-mailbox/v1","items":[{}]}']) {
     writeFileSync(path, invalid);
-    assert.throws(() => store.list(), /Invalid mailbox store/);
-    assert.throws(() => store.check(), /Invalid mailbox store/);
+    assert.throws(() => new MailboxStore(path), /Invalid mailbox store/);
+    assert.equal(readFileSync(path, 'utf8'), invalid);
   }
-  writeFileSync(path, '{"schema":"the-dealer-mailbox/v1","sequence":0,"items":[]}');
-  assert.equal(store.list().totalCount, 0);
-
   const original = envelope('signed');
   const projected = { ...original, body: 'execution projection' };
+  for (const invalid of [{ ...envelope('signed'), payload: null }, envelope('wrong-id')]) {
+    writeLegacyMailbox(path, { items: [legacyItem(projected, 0, 'default', { signedEnvelope: invalid })] });
+    assert.throws(() => new MailboxStore(path), /Invalid mailbox store/);
+  }
+  writeLegacyMailbox(path, { schema: 'the-dealer-mailbox/v1' });
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
+  assert.equal(store.list().totalCount, 0);
+
   store.enqueue([projected], { signedEnvelopes: { signed: original } });
   original.body = 'changed after enqueue';
-  assert.equal(new MailboxStore(path).list().items[0].signedEnvelope?.body, 'body');
-  const valid = readFileSync(path, 'utf8');
-  for (const signedEnvelope of [{ ...envelope('signed'), payload: null }, envelope('wrong-id')]) {
-    const saved = JSON.parse(valid);
-    saved.items[0].signedEnvelope = signedEnvelope;
-    writeFileSync(path, JSON.stringify(saved));
-    assert.throws(() => new MailboxStore(path).list(), /Invalid mailbox store/);
-  }
-  writeFileSync(path, valid);
+  const reopened = new MailboxStore(path);
+  t.after(() => reopened.close());
+  const valid = reopened.list();
+  assert.equal(valid.items[0].signedEnvelope?.body, 'body');
   assert.throws(() => store.enqueue([envelope('other')], {
     signedEnvelopes: { other: envelope('mismatched') },
   }), /Invalid mailbox store/);
-  assert.equal(readFileSync(path, 'utf8'), valid, 'invalid provenance must not mutate the ledger');
-  assert.equal(existsSync(`${path}.lock`), false);
+  assert.deepEqual(reopened.list(), valid, 'invalid provenance must not mutate the ledger');
+  const db = new DatabaseSync(store.path);
+  try {
+    db.prepare('UPDATE items SET signed_envelope_json = ? WHERE id = ?').run('{', 'signed');
+    assert.throws(() => store.list(), /Invalid mailbox store/);
+  } finally {
+    db.close();
+  }
 
   const badLegacy = join(root, 'bad-inbox.json');
   writeFileSync(badLegacy, '{');
@@ -1155,8 +1367,8 @@ test('spawn bindings resolve inbound task identity without changing outbound bou
   }
 });
 
-test('v1 wake targets upgrade losslessly to strict v2 on the next mutation', async t => {
-  const { path } = workspace(t);
+test('v1 wake targets, leases and threads migrate losslessly on first open', async t => {
+  const { path, root } = workspace(t);
   const base = { coalesceMs: 12, completedWaves: 3, pendingWake: true, earliestWakeAt: 1234, attemptCount: 2, wakeupPrefix: 'prefix', lastWakeError: 'unconfirmed' };
   const legacy = {
     passive: { ...base, mailboxId: 'passive', mode: 'passive' },
@@ -1165,13 +1377,27 @@ test('v1 wake targets upgrade losslessly to strict v2 on the next mutation', asy
     terminal: { ...base, mailboxId: 'terminal', mode: 'orca-terminal', terminalHandle: 'h', workspacePath: '/workspace', agent: 'codex', rotateAfterWaves: 4, deliveryInDoubt: true },
     run: { ...base, mailboxId: 'run', mode: 'orca-run', runId: 'r', worktreeId: 'w', futureOption: { values: [1, null, true] } },
   };
-  const seed = new MailboxStore(path);
+  const seed = new MailboxStore(join(root, 'seed.db'));
   const message = envelope('preserved');
   seed.enqueue([message]);
   seed.recordInboundEnvelope(message, 'default');
   const lease = seed.check();
-  const original = JSON.parse(readFileSync(path, 'utf8'));
-  writeFileSync(path, JSON.stringify({ ...original, schema: 'the-dealer-mailbox/v1', wakeTargets: legacy }));
+  const original = {
+    items: lease.items,
+    mailboxes: {
+      default: {
+        mailboxId: 'default', ackedLeaseIds: [],
+        outstanding: {
+          leaseId: lease.deliveryId, mailboxId: 'default', itemIds: [message.id],
+          createdAt: lease.items[0].leasedAt, wakeCount: 0,
+        },
+      },
+    },
+    threads: { 'inbound:preserved': seed.getThread(message.id) },
+  };
+  seed.close();
+  writeLegacyMailbox(path, { ...original, schema: 'the-dealer-mailbox/v1', wakeTargets: legacy });
+  const source = readFileSync(path, 'utf8');
   const store = new MailboxStore(path);
   assert.equal(store.getWakeTarget('passive')?.driver, 'passive');
   assert.equal(store.getWakeTarget('passive')?.driverConfig, undefined);
@@ -1179,29 +1405,31 @@ test('v1 wake targets upgrade losslessly to strict v2 on the next mutation', asy
   assert.deepEqual(store.getWakeTarget('host')?.driverConfig, { hostAgent: 'claude-code', sessionId: 's', conversationMode: 'fixed' });
   assert.deepEqual(store.getWakeTarget('terminal'), { ...base, mailboxId: 'terminal', driver: 'orca-terminal', rotateAfterWaves: 4, deliveryInDoubt: true, driverConfig: { terminalHandle: 'h', workspacePath: '/workspace', agent: 'codex' } });
   assert.deepEqual(store.getWakeTarget('run')?.driverConfig, { runId: 'r', worktreeId: 'w', futureOption: { values: [1, null, true] } });
-  assert.equal(JSON.parse(readFileSync(path, 'utf8')).schema, 'the-dealer-mailbox/v1');
+  assert.equal(existsSync(path), false);
+  assert.equal(readFileSync(`${path}.v2-migrated`, 'utf8'), source);
+  assert.equal(statSync(`${path}.v2-migrated`).mode & 0o777, 0o400);
+  assert.deepEqual(store.list().items, original.items);
+  assert.equal(store.resolveLeaseMailbox(lease.deliveryId!), 'default');
+  assert.deepEqual(store.getThread(message.id), original.threads['inbound:preserved']);
   assert.equal(store.getWakeTarget('residual')?.driver, 'passive');
   assert.deepEqual(store.getWakeTarget('residual')?.driverConfig, { workspacePath: '/tmp/ws', interactiveCommand: 'codex' });
   const wakeups = new WakeupRedriveService({ store, drivers: [{
     name: 'mock-session', deliver: async () => ({ kind: 'noop', reason: 'unused' }),
     resolveSessionTarget: id => id === 'residual' ? { driver: 'mock-session' } : undefined,
   }] });
-  t.after(() => wakeups.stop());
+  t.after(async () => { await wakeups.stop(); store.close(); });
   assert.equal((await wakeups.resolveSessionWakeTarget('residual'))?.driver, 'mock-session');
   assert.equal((await wakeups.flushMailbox('residual', { force: true })).woke, true);
   assert.equal(store.getWakeTarget('residual')?.pendingWake, false);
   store.upsertWakeTarget('passive', { pendingWake: false });
-  const persisted = JSON.parse(readFileSync(path, 'utf8'));
-  assert.equal(persisted.schema, 'the-dealer-mailbox/v2');
-  assert.deepEqual(persisted.items, original.items);
-  assert.deepEqual(persisted.mailboxes, original.mailboxes);
-  assert.deepEqual(persisted.threads, original.threads);
-  assert.equal(new MailboxStore(path).check({ peek: true }).deliveryId, lease.deliveryId);
-  assert.deepEqual(new MailboxStore(path).getWakeTarget('terminal'), store.getWakeTarget('terminal'));
-  assert.deepEqual(new MailboxStore(path).getWakeTarget('host'), store.getWakeTarget('host'));
-  persisted.wakeTargets.run.unknown = 'reject';
-  writeFileSync(path, JSON.stringify(persisted));
-  assert.throws(() => new MailboxStore(path).getWakeTarget('run'), /Invalid mailbox store/);
+  const reopened = new MailboxStore(path);
+  t.after(() => reopened.close());
+  assert.equal(reopened.check({ peek: true }).deliveryId, lease.deliveryId);
+  assert.deepEqual(reopened.getWakeTarget('terminal'), store.getWakeTarget('terminal'));
+  assert.deepEqual(reopened.getWakeTarget('host'), store.getWakeTarget('host'));
+  const badV2 = join(root, 'invalid-v2.json');
+  writeLegacyMailbox(badV2, { wakeTargets: { run: { ...store.getWakeTarget('run'), unknown: 'reject' } } });
+  assert.throws(() => new MailboxStore(badV2), /Invalid mailbox store/);
 });
 
 test('opaque driver configuration merges deletions, clears on driver switch, and rejects non-JSON values', t => {
@@ -1283,20 +1511,25 @@ test('a proposed spawn reuses a committed thread without changing its wake targe
 });
 
 test('legacy v2 inbound routes follow the stored delivery despite an unrelated wake target', t => {
-  const { path } = workspace(t);
-  const store = new MailboxStore(path);
+  const { path, root } = workspace(t);
+  const seed = new MailboxStore(join(root, 'seed.db'));
   const stale = envelope('stale');
   const history = envelope('history');
-  store.enqueue([stale], { mailboxId: 'task:root' });
-  store.ack(store.check({ mailboxId: 'task:root' }).deliveryId!, 'task:root');
-  store.upsertWakeTarget('stream:requests', { driver: 'local' });
-  store.recordInboundEnvelope(stale, 'stream:requests');
-  store.recordInboundEnvelope(history, 'history-hint');
-  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
-  for (const record of Object.values(snapshot.threads) as Array<{ mailboxCommitted?: boolean }>) delete record.mailboxCommitted;
-  writeFileSync(path, JSON.stringify(snapshot));
+  const target = seed.upsertWakeTarget('stream:requests', { driver: 'local' });
+  const oldLeg = seed.recordInboundEnvelope(stale, 'stream:requests');
+  const historyLeg = seed.recordInboundEnvelope(history, 'history-hint');
+  seed.close();
+  writeLegacyMailbox(path, {
+    items: [legacyItem(stale, 0, 'task:root', { status: 'acked' })],
+    wakeTargets: { [target.mailboxId]: target },
+    threads: {
+      'inbound:stale': { ...oldLeg, mailboxCommitted: undefined },
+      'inbound:history': { ...historyLeg, mailboxCommitted: undefined },
+    },
+  });
 
   const reloaded = new MailboxStore(path);
+  t.after(() => reloaded.close());
   assert.equal(reloaded.resolveThreadLocalMailbox(stale.id, stale.networkId), 'task:root');
   assert.equal(reloaded.resolveThreadLocalMailbox(history.id, history.networkId), undefined);
   assert.equal(reloaded.getThread(history.id)?.localMailbox, 'history-hint');
@@ -1304,19 +1537,23 @@ test('legacy v2 inbound routes follow the stored delivery despite an unrelated w
 });
 
 for (const early of ['terminal:early', 'session:one']) test(`an upgraded legacy rotating thread retains ${early} through subsequent rotation`, t => {
-  const { path } = workspace(t);
-  const store = new MailboxStore(path);
+  const { path, root } = workspace(t);
+  const store = new MailboxStore(join(root, 'seed.db'));
   const stream = 'stream:requests';
   const first = envelope('first');
   store.enqueue([first], { mailboxId: stream, wakeTarget: { driver: 'orca-terminal', rotateAfterWaves: 1 } });
   const firstDelivery = store.check({ mailboxId: stream });
   store.completeWakeDelivery(stream, firstDelivery.items[0].sequence, {}, { sessionMailboxId: early });
   store.ack(firstDelivery.deliveryId!, stream);
-  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
-  delete snapshot.threads['inbound:first'].mailboxCommitted;
-  writeFileSync(path, JSON.stringify(snapshot));
+  writeLegacyMailbox(path, {
+    items: store.list({ includeAcked: true }).items,
+    wakeTargets: Object.fromEntries(store.listWakeTargets().map(target => [target.mailboxId, target])),
+    threads: { 'inbound:first': { ...store.getThread(first.id), mailboxCommitted: undefined } },
+  });
+  store.close();
 
   const upgraded = new MailboxStore(path);
+  t.after(() => upgraded.close());
   assert.equal(upgraded.resolveThreadLocalMailbox(first.id, first.networkId), early);
   const next = envelope('next');
   upgraded.enqueue([next], { mailboxId: stream });
@@ -1327,17 +1564,21 @@ for (const early of ['terminal:early', 'session:one']) test(`an upgraded legacy 
 });
 
 test('reply lookup trusts a stored outbound semantic address over a legacy mailbox hint', t => {
-  const { path } = workspace(t);
-  const store = new MailboxStore(path);
+  const { path, root } = workspace(t);
+  const seed = new MailboxStore(join(root, 'seed.db'));
   const explicit = envelope('explicit', { semantic: { type: 'message', threadId: 'explicit', targetMailbox: 'task:peer' } });
   const hint = envelope('hint', { payload: { mailbox: 'wrong-hint' } });
-  store.recordOutboundEnvelope(explicit, [explicit.from.nodeId]);
-  store.recordOutboundEnvelope(hint, [hint.from.nodeId]);
-  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
-  snapshot.threads['outbound:explicit'].peerReplyMailbox = 'wrong-hint';
-  snapshot.threads['outbound:hint'].peerReplyMailbox = 'wrong-hint';
-  writeFileSync(path, JSON.stringify(snapshot));
-
+  const first = seed.recordOutboundEnvelope(explicit, [explicit.from.nodeId]);
+  const second = seed.recordOutboundEnvelope(hint, [hint.from.nodeId]);
+  seed.close();
+  writeLegacyMailbox(path, {
+    threads: {
+      'outbound:explicit': { ...first, peerReplyMailbox: 'wrong-hint' },
+      'outbound:hint': { ...second, peerReplyMailbox: 'wrong-hint' },
+    },
+  });
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
   assert.equal(store.resolveReplyTarget(explicit.id, explicit.networkId)?.targetMailbox, 'task:peer');
   assert.equal(store.resolveReplyTarget(hint.id, hint.networkId)?.targetMailbox, 'default');
 });

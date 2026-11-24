@@ -1,6 +1,6 @@
 import { CommandNotStartedError, singleLine } from '../subprocess/index.ts';
 import type { Disposable } from '../core-types/index.ts';
-import { normalizeMailboxId, wakeupBackoffDelay, baseStreamKeyOf } from './store.ts';
+import { normalizeMailboxId, baseStreamKeyOf } from './store.ts';
 import type { MailboxCheckResult, MailboxItem, MailboxStore, WakeTargetState } from './store.ts';
 import type { OutboxStore } from './outbox.ts';
 
@@ -64,12 +64,26 @@ export interface WakeupRedriveOptions {
   flushIntervalMs?: number;
   now?: () => number;
   onError?: (error: unknown) => void;
+  onTransition?: (event: WakeupTransitionEvent) => void;
   /**
    * Composition-root decision that an uninitialized slot really inherits its base stream's
    * topic binding. Core never infers inheritance from mailbox naming alone.
    */
   canInheritSlotTarget?: (mailboxId: string, baseMailboxId: string) => boolean;
 }
+
+export interface WakeupTransitionEvent {
+  mailboxId: string;
+  driver: string;
+  state: 'deferred' | 'delivered' | 'fenced' | 'unfenced' | 'disarmed';
+  reason?: string;
+  attemptCount: number;
+  waitMs?: number;
+}
+
+type ReportedWakeBlock =
+  | { state: 'deferred'; reason?: string; since: number; attemptCount: number }
+  | { state: 'fenced' };
 
 export interface WakeupFlushResult {
   mailboxId: string;
@@ -170,15 +184,7 @@ export function recordWakeFailure(
   now = Date.now(),
   patch: Partial<WakeTargetState> = {},
 ): void {
-  const attemptCount = (store.getWakeTarget(mailboxId)?.attemptCount ?? 0) + 1;
-  store.upsertWakeTarget(mailboxId, {
-    ...patch,
-    deliveryInDoubt: undefined,
-    pendingWake: true,
-    attemptCount,
-    earliestWakeAt: now + wakeupBackoffDelay(attemptCount),
-    lastWakeError: String(error),
-  });
+  store.deferWakeAttempt(mailboxId, undefined, error, now, patch);
 }
 
 /** This attempt already settled its launch fence; the redrive loop must not settle it twice. */
@@ -231,6 +237,8 @@ export class WakeupRedriveService {
   private readonly drivers = new Map<string, WakeupDriver>();
   private readonly now: () => number;
   private readonly onError?: (error: unknown) => void;
+  private readonly onTransition?: (event: WakeupTransitionEvent) => void;
+  private readonly reportedBlocks = new Map<string, ReportedWakeBlock>();
   private readonly canInheritSlotTarget?: (mailboxId: string, baseMailboxId: string) => boolean;
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly subscriptions: Disposable[] = [];
@@ -251,7 +259,11 @@ export class WakeupRedriveService {
     for (const driver of options.drivers ?? []) this.registerDriver(driver);
     this.now = options.now ?? Date.now;
     this.onError = options.onError;
+    this.onTransition = options.onTransition;
     this.canInheritSlotTarget = options.canInheritSlotTarget;
+    if (this.onTransition) {
+      for (const target of this.store.listWakeTargets()) this.observeTarget(target, { initial: true });
+    }
     // Zero-latency redrive for coalesceMs === 0 targets; the timer only handles delayed work.
     this.subscriptions.push(
       this.store.onMail((mailboxId) => this.notifyMailbox(mailboxId)),
@@ -335,6 +347,7 @@ export class WakeupRedriveService {
         const remaining = (this.claims.get(id) ?? 1) - 1;
         if (remaining <= 0) {
           this.claims.delete(id);
+          if (!this.stopped && !this.inFlight.has(id)) this.observeMailbox(id);
         } else {
           this.claims.set(id, remaining);
         }
@@ -354,6 +367,7 @@ export class WakeupRedriveService {
       return;
     }
     const target = this.store.getWakeTarget(id);
+    if (target && !this.inFlight.has(id) && !this.claims.has(id)) this.observeTarget(target);
     if (!target?.pendingWake || target.deliveryInDoubt || target.earliestWakeAt > this.now()) {
       return;
     }
@@ -381,6 +395,7 @@ export class WakeupRedriveService {
       .then(() => this.flushInternal(id, options.force === true))
       .then((result) => {
         delivered = result.woke || result.reason === 'Wake launch superseded by a newer binding';
+        this.observeMailbox(id, result.woke);
         return result;
       })
       .finally(() => {
@@ -530,6 +545,8 @@ export class WakeupRedriveService {
       if (outcome.kind === 'disarm') {
         const result = this.store.disarmWakeTargetIfCurrent(mailboxId, outcome.expectedRevision ?? initialRevision);
         if (result.superseded) return noWake(mailboxId, target.driver, 'Wake launch superseded by a newer binding');
+        this.reportedBlocks.delete(mailboxId);
+        this.emitTransition(result.target, { state: 'disarmed', reason: outcome.reason, attemptCount: target.attemptCount });
       }
       return noWake(mailboxId, target.driver, outcome.reason);
     } catch (error) {
@@ -562,6 +579,56 @@ export class WakeupRedriveService {
   private defer(mailboxId: string, expectedRevision: number, reason: string, patch?: Partial<WakeTargetState>): WakeupFlushResult {
     const result = this.store.deferWakeAttempt(mailboxId, expectedRevision, reason, this.now(), patch);
     return noWake(mailboxId, result.target.driver, result.superseded ? 'Wake launch superseded by a newer binding' : reason);
+  }
+
+  private observeTarget(target: WakeTargetState, { delivered = false, initial = false } = {}): void {
+    if (!this.onTransition) return;
+    const id = target.mailboxId;
+    const previous = this.reportedBlocks.get(id);
+    if (target.deliveryInDoubt) {
+      if (previous?.state !== 'fenced') {
+        this.reportedBlocks.set(id, { state: 'fenced' });
+        if (!initial) this.emitTransition(target, { state: 'fenced', reason: target.lastWakeError, attemptCount: target.attemptCount });
+      }
+      return;
+    }
+    if (!delivered && target.pendingWake && target.attemptCount > 0) {
+      const reason = target.lastWakeError;
+      const since = previous?.state === 'deferred' ? previous.since : this.now();
+      this.reportedBlocks.set(id, { state: 'deferred', reason, since, attemptCount: target.attemptCount });
+      if (!initial && (previous?.state !== 'deferred' || previous.reason !== reason)) {
+        this.emitTransition(target, { state: 'deferred', reason, attemptCount: target.attemptCount });
+      }
+      return;
+    }
+    this.reportedBlocks.delete(id);
+    if (delivered && previous?.state === 'deferred') {
+      this.emitTransition(target, {
+        state: 'delivered', attemptCount: previous.attemptCount, waitMs: Math.max(0, this.now() - previous.since),
+      });
+    } else if (previous?.state === 'fenced') {
+      this.emitTransition(target, { state: 'unfenced', attemptCount: target.attemptCount });
+    }
+  }
+
+  private observeMailbox(mailboxId: string, delivered = false): void {
+    if (!this.onTransition) return;
+    try {
+      const target = this.store.getWakeTarget(mailboxId);
+      if (target) this.observeTarget(target, { delivered });
+    } catch (error) {
+      this.report(error);
+    }
+  }
+
+  private emitTransition(
+    target: WakeTargetState, transition: Omit<WakeupTransitionEvent, 'mailboxId' | 'driver'>,
+  ): void {
+    try {
+      this.onTransition?.({ mailboxId: target.mailboxId, driver: target.driver, ...transition });
+    } catch (error) {
+      this.report(error);
+    }
   }
 
   private report(error: unknown): void {
