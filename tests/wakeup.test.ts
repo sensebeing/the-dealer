@@ -94,6 +94,8 @@ interface FakeOrcaAgent {
   state: string;
   paneKey?: string;
   parentPaneKey?: string | null;
+  address?: string;
+  hasLivePty?: boolean;
 }
 
 interface FakeOrcaChild {
@@ -115,6 +117,9 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
     waitOk: true,
     created: 0,
     agents: undefined as FakeOrcaAgent[] | undefined,
+    unverifiableTerminalCount: 0,
+    terminalVerdict: undefined as string | undefined,
+    liveTerminalCount: undefined as number | undefined,
     children: [] as FakeOrcaChild[],
     childWorktreeIds: undefined as string[] | undefined,
   };
@@ -130,7 +135,9 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
               path: workspacePath,
               worktreeId: 'fake-worktree',
               childWorktreeIds: state.childWorktreeIds ?? state.children.map(child => child.worktreeId),
-              unverifiableTerminalCount: 0,
+              unverifiableTerminalCount: state.unverifiableTerminalCount,
+              terminalVerdict: state.terminalVerdict,
+              liveTerminalCount: state.liveTerminalCount,
               agents: state.agents ?? state.terminals.filter(t => t.connected).map(t => ({ state: 'done', ...(t.tabId && t.leafId ? { paneKey: `${t.tabId}:${t.leafId}` } : {}) })),
             }, ...state.children.map(({ path, worktreeId, childWorktreeIds, unverifiableTerminalCount, agents }) =>
               ({ path, worktreeId, childWorktreeIds, unverifiableTerminalCount, agents }))],
@@ -4335,11 +4342,9 @@ test('a closed persisted terminal is rebound to the live one before the pointer 
   assert.equal(sends.length, 1);
   assert.equal(sends[0].args[sends[0].args.indexOf('--terminal') + 1], 'term-live');
   assert.match(textOf(sends[0]), /^You have 1 Dealer message\(s\) in box/);
-  assert.equal(
-    calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list').length,
-    3,
-    'the resolved terminal receives a fresh idle check before send',
-  );
+  const lastList = calls.findLastIndex(call => call.args[0] === 'terminal' && call.args[1] === 'list');
+  const lastWait = calls.findLastIndex(call => call.args[0] === 'terminal' && call.args[1] === 'wait' && call.args.includes('term-live'));
+  assert.ok(lastList < lastWait && lastWait < calls.indexOf(sends[0]), 'the resolved terminal receives a fresh idle check before send');
   assert.equal(
     calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'create').length,
     0,
@@ -5299,6 +5304,198 @@ test('terminal session inference enriches workspace and terminal probes fail clo
 });
 
 function sessionBinding(target) { return target?.driverConfig ?? {}; }
+
+function orcaSessionRecoveryFixture(t: TestContext, mailboxId = 'worktree:recover') {
+  const workspacePath = directory(t);
+  const store = new MailboxStore(join(workspacePath, 'mailbox.json'));
+  const terminal: FakeTerminalRow = { ...probeTerminal, preview: '> ' };
+  const driverConfig = {
+    workspacePath, agent: 'antigravity', sessionId: 'original-session',
+    terminalHandle: terminal.handle, paneKey: 'wave:root',
+  };
+  store.upsertWakeTarget(mailboxId, { driver: 'orca-terminal', coalesceMs: 0, driverConfig });
+  return { workspacePath, store, mailboxId, terminal, driverConfig, ...fakeOrcaWorkspace(workspacePath) };
+}
+
+test('a claimed Orca terminal still guards its bound conversation until an independent wave rotates', async t => {
+  const { store, mailboxId, terminal, driverConfig, runner, state } = orcaSessionRecoveryFixture(t, 'stream:recover');
+  state.terminals = [terminal];
+  store.upsertWakeTarget('stream:sibling', { driver: 'orca-terminal', driverConfig });
+  const { service } = startSlotProbeService(t, store, runner);
+  store.enqueue([alert('shared-conversation')], { mailboxId });
+
+  const blocked = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(blocked.woke, false);
+  assert.equal(state.created, 0);
+  assert.equal(terminalSends(state.calls).length, 0);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, terminal.handle);
+
+  store.upsertWakeTarget(mailboxId, { rotateAfterWaves: 1, completedWaves: 1 });
+  const rotated = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(state.created, 1);
+  const create = state.calls.find(call => call.args[0] === 'terminal' && call.args[1] === 'create')!;
+  assert.equal(create.args[create.args.indexOf('--command') + 1], 'agy --dangerously-skip-permissions');
+  assert.equal(sendsTo(state.calls, terminal.handle).length, 0);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+  assert.ok(state.terminals.some(row => row.handle === terminal.handle));
+});
+
+for (const [name, availability] of [
+  ['disconnected', { connected: false }],
+  ['read-only', { writable: false }],
+] as const) {
+  test(`a ${name} bound Orca tab defers wakeup until the original tab is usable`, async t => {
+    const { store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);
+    state.terminals = [{ ...terminal, ...availability }];
+    const { service } = startSlotProbeService(t, store, runner);
+    const reason = 'Terminal is disconnected or not writable';
+    assert.deepEqual(await service.probeSlot(mailboxId), { busy: true, ready: false, reason });
+    store.enqueue([alert(name)], { mailboxId });
+    const blocked = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(blocked.woke, false);
+    assert.equal(blocked.reason, reason);
+    assert.equal(state.created, 0);
+    assert.equal(terminalSends(state.calls).length, 0);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, true);
+
+    state.terminals = [terminal];
+    const resumed = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(resumed.woke, true, resumed.reason);
+    assert.equal(state.created, 0);
+    assert.equal(sendsTo(state.calls, terminal.handle).length, 1);
+  });
+}
+
+test('a handle-only Orca binding defers if its tab becomes unusable during terminal selection', async t => {
+  const { store, mailboxId, terminal, driverConfig, runner, state } = orcaSessionRecoveryFixture(t);
+  store.upsertWakeTarget(mailboxId, { driverConfig: { ...driverConfig, sessionId: undefined, paneKey: undefined } });
+  const sibling = { ...terminal, handle: 'sibling', tabId: 'sibling' };
+  state.terminals = [terminal, sibling];
+  const { service } = startSlotProbeService(t, store, async request => {
+    const result = await runner(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'wait' && request.args.includes(terminal.handle)) {
+      state.terminals = [{ ...terminal, writable: false }, sibling];
+    }
+    return result;
+  });
+  store.enqueue([alert('bound-tab-became-read-only')], { mailboxId });
+  const blocked = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(blocked.woke, false);
+  assert.equal(blocked.reason, 'Terminal is disconnected or not writable');
+  assert.equal(state.created, 0);
+  assert.equal(terminalSends(state.calls).length, 0);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, terminal.handle);
+});
+
+for (const { name, pendingTopology, reason, sessionOnly } of [
+  { name: 'unverifiable terminal count', pendingTopology: { unverifiableTerminalCount: 1 },
+    reason: 'Workspace has unverifiable terminals before session recovery' },
+  { name: 'unsettled terminal verdict', pendingTopology: { terminalVerdict: 'unverifiable' },
+    reason: 'Workspace terminal verdict is not settled' },
+  { name: 'live terminal count', pendingTopology: { liveTerminalCount: 1 },
+    reason: 'Workspace terminals are still reattaching' },
+  { name: 'bound pane', pendingTopology: { agents: [{ state: 'done', paneKey: 'wave:root' }] },
+    reason: 'Bound terminal agent is still active or reattaching' },
+  { name: 'bound address', pendingTopology: { agents: [{ state: 'done', address: 'term-wave', hasLivePty: true }] },
+    reason: 'Bound terminal agent is still active or reattaching' },
+  { name: 'unmounted agent PTY', pendingTopology: { agents: [{ state: 'done', hasLivePty: true }] },
+    reason: 'Workspace terminals are still reattaching' },
+  { name: 'session-only binding with an unsettled terminal verdict', sessionOnly: true,
+    pendingTopology: { terminalVerdict: 'unverifiable' }, reason: 'Workspace terminal verdict is not settled' },
+]) {
+  test(`Orca session recovery waits for ${name}`, async t => {
+    const { store, mailboxId, terminal, runner, state, driverConfig } = orcaSessionRecoveryFixture(t);
+    if (sessionOnly) {
+      store.upsertWakeTarget(mailboxId, { driverConfig: { ...driverConfig, terminalHandle: undefined, paneKey: undefined } });
+    }
+    const { service } = startSlotProbeService(t, store, runner);
+    Object.assign(state, pendingTopology);
+    assert.deepEqual(await service.probeSlot(mailboxId), { busy: true, ready: false, reason });
+    store.enqueue([alert(name)], { mailboxId });
+    const blocked = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(blocked.woke, false);
+    assert.equal(blocked.reason, reason);
+    assert.equal(state.created, 0);
+    assert.equal(terminalSends(state.calls).length, 0);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, true);
+
+    Object.assign(state, { unverifiableTerminalCount: 0, agents: undefined });
+    state.terminalVerdict = sessionOnly ? 'none' : 'live';
+    state.liveTerminalCount = sessionOnly ? 0 : 1;
+    state.terminals = sessionOnly ? [] : [terminal];
+    const resumed = await service.flushMailbox(mailboxId, { force: true });
+    assert.equal(resumed.woke, true, resumed.reason);
+    if (sessionOnly) {
+      assert.equal(state.created, 1);
+      assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+      assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, driverConfig.sessionId);
+    } else {
+      assert.equal(state.created, 0);
+      assert.equal(sendsTo(state.calls, terminal.handle).length, 1);
+    }
+  });
+}
+
+test('Orca session recovery defers when a bound terminal row returns while reading workspace topology', async t => {
+  const { store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);
+  const { service } = startSlotProbeService(t, store, async request => {
+    const result = await runner(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      state.terminals = [{ ...terminal, handle: 'reattached-handle', connected: false }];
+    }
+    return result;
+  });
+  store.enqueue([alert('bound-pane-reattaching')], { mailboxId });
+  const blocked = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(blocked.woke, false);
+  assert.equal(blocked.reason, 'Terminal is disconnected or not writable');
+  assert.equal(state.created, 0);
+  assert.equal(terminalSends(state.calls).length, 0);
+});
+
+test('Orca session recovery defers if the original tab reattaches during descendant inspection', async t => {
+  const { workspacePath, store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);
+  const childPath = join(workspacePath, 'child');
+  state.children = [{ path: childPath, worktreeId: 'child', unverifiableTerminalCount: 0, agents: [] }];
+  const { service } = startSlotProbeService(t, store, async request => {
+    const result = await runner(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'list' && request.args.includes(`path:${childPath}`)) {
+      state.terminals = [terminal];
+    }
+    return result;
+  });
+  store.enqueue([alert('reattaching')], { mailboxId });
+  const blocked = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(blocked.woke, false);
+  assert.equal(blocked.reason, 'Bound Orca terminal reappeared before replacement launch');
+  assert.equal(state.created, 0);
+  assert.equal(terminalSends(state.calls).length, 0);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, terminal.handle);
+
+  const resumed = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(resumed.woke, true, resumed.reason);
+  assert.equal(state.created, 0);
+  assert.equal(sendsTo(state.calls, terminal.handle).length, 1);
+});
+
+test('Orca wave rotation opens a fresh conversation when the retiring tab is read-only', async t => {
+  const { store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);
+  state.terminals = [{ ...terminal, writable: false }];
+  store.upsertWakeTarget(mailboxId, { rotateAfterWaves: 1, completedWaves: 1 });
+  const { service } = startSlotProbeService(t, store, runner);
+  store.enqueue([alert('new-wave')], { mailboxId });
+  const rotated = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  const create = state.calls.find(call => call.args[0] === 'terminal' && call.args[1] === 'create')!;
+  assert.equal(create.args[create.args.indexOf('--command') + 1], 'agy --dangerously-skip-permissions');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.retiredSessionId, 'original-session');
+  assert.equal(state.terminals.some(row => row.handle === terminal.handle), false);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+});
+
 for (const [agent, envKey, resumeCommand] of [
   ['antigravity', 'ANTIGRAVITY_CONVERSATION_ID', "agy --dangerously-skip-permissions --conversation 'original-session'"],
   ['claude', 'CLAUDE_CODE_SESSION_ID', "claude --dangerously-skip-permissions --resume 'original-session'"],
@@ -5308,6 +5505,9 @@ for (const [agent, envKey, resumeCommand] of [
     const root = directory(t);
     const workspacePath = join(root, 'sleeping');
     const { runner, state } = fakeOrcaWorkspace(workspacePath);
+    state.agents = [{ state: 'done', paneKey: 'tab:leaf', address: 'term-origin', hasLivePty: false }];
+    state.terminalVerdict = 'none';
+    state.liveTerminalCount = 0;
     const runtime = await makeNode(t, root, 'self', { commandRunner: runner });
     await runtime.serveControl(async (argv, context) => {
       const stdout: string[] = [];
@@ -5461,14 +5661,13 @@ for (const siblingAgent of ['antigravity', undefined]) {
       { handle: 'term-task', connected: true, writable: true, agentIdentity: 'antigravity', preview: '' },
       { handle: 'term-sibling', connected: true, writable: true, agentIdentity: siblingAgent, preview: '' },
     ]);
-    let lists = 0;
     const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: async request => {
-      // Initial liveness, authoritative idle, and replacement check see the task tab;
-      // it exits just before the final read-only selection inventory.
-      if (request.args[0] === 'terminal' && request.args[1] === 'list' && ++lists === 4) {
+      const result = await runner(request);
+      // The pane exits after its TUI reports idle, before terminal selection.
+      if (request.args[0] === 'terminal' && request.args[1] === 'wait' && request.args.includes('term-task')) {
         state.terminals = state.terminals.filter(terminal => terminal.handle !== 'term-task');
       }
-      return runner(request);
+      return result;
     } })});
     t.after(() => service.stop());
     store.enqueue([alert('task-race')], { mailboxId: 'task:isolated', wakeTarget: {

@@ -637,16 +637,24 @@ with `accepted: false` back off. Unknown outcomes remain fenced across mail arri
 flushes and restarts. Root target terminals verify `tui-idle` readiness, an empty composer, and
 the configured agent identity before pointer injection. Antigravity also requires a rendered
 composer prompt when it is the configured agent. Workspace terminal selection and readiness use
-the same reuse candidates. An unbound workspace or one whose bound tab has closed can launch
-the configured agent when no compatible tab is available. A live binding retains its composer
-gate. Orca pointer sends request up to five seconds of submission observation. Observable
+the same reuse candidates. Bound terminal presence has three outcomes. A connected and
+writable terminal is `live` and retains its composer gate. A matching terminal that is
+disconnected or read-only is `unusable` and defers recovery. A complete terminal list with
+no matching handle or pane reports `absent`. Before recovering an absent binding or
+resuming a session ID without a terminal binding, the driver requires settled workspace
+inventories with no unverifiable terminals, no matching agent still attached or
+reattaching, and enough connected terminals to account for live PTYs. After checking
+descendant worktrees, the driver checks the bound handle and pane again immediately before
+creating a replacement. A reappearing tab defers creation and can receive the next wakeup
+once it is writable. Orca pointer sends request up to five seconds of submission observation. Observable
 providers must report `turn_started` before the wake settles. Permission and terminal
 incarnation changes leave delivery fenced, as does a provider that cannot confirm delivery to
 the configured agent. Legacy `old-host` receipts retain compatibility.
 Non-excluded descendant worktrees gate parent readiness, rotation and leased-wave quiescence
 through complete inventories, `done` agents and connected terminal coverage. Orca drivers create independent tabs
-for rotation only after the retiring slot's own agent and child worktrees are done, then close
-the retired terminal and keep its handle reserved until the close is confirmed. Slot-scoped
+for rotation only after the retiring slot's own agent and child worktrees are done. The
+new wave starts a fresh conversation even if the retiring tab is read-only. The driver
+then closes the retired terminal and keeps its handle reserved until the close is confirmed. Slot-scoped
 checks first exclude subtrees attributed entirely by explicit sibling parent panes. Every worktree
 in an excluded subtree must have a complete agent inventory and meet the terminal verifiability
 check. When a subtree cannot prove its own quiescence and a sibling slot could own it, the probe
