@@ -19,6 +19,7 @@ import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
 import { LedgerSnapshot } from './ledger-snapshot.ts';
 import { netKey } from './network-key.ts';
+import { isTerminalHistory } from './outbox.ts';
 import type { OutboxStore } from './outbox.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
 export type { AgentConversationMode, ActiveConversationMode } from '../core-types/index.ts';
@@ -954,6 +955,11 @@ function migrateLegacyItem(item: LegacyInboxItem, sequence: number): MailboxItem
   };
 }
 
+function isOneWayWaveEnvelope(envelope: MessageEnvelope | undefined): boolean {
+  return Boolean(envelope && envelope.kind.startsWith('wave.') && envelope.replyToId === undefined &&
+    (envelope.semantic === undefined || envelope.semantic.type === 'message'));
+}
+
 function compactMailboxState(state: MailboxFileState, retention: Pick<MailboxStoreOptions, 'outbox' | 'readConsumedSequence'>): void {
   if (state.items.length > MAX_RETAINED_ACKED_ITEMS) {
     const acked = state.items.filter(item => item.status === 'acked');
@@ -997,9 +1003,8 @@ function compactMailboxState(state: MailboxFileState, retention: Pick<MailboxSto
     if (records.every(record => record.state === 'settled')) {
       settled.push(group);
     } else if (records.every(record =>
-      record.direction === 'inbound' && record.state === 'open' && record.kind.startsWith('wave.') &&
-      record.envelope && record.envelope.replyToId === undefined &&
-      (record.envelope.semantic === undefined || record.envelope.semantic.type === 'message'))) {
+      (retention.outbox !== undefined || record.direction === 'inbound') &&
+      record.state === 'open' && record.kind.startsWith('wave.') && isOneWayWaveEnvelope(record.envelope))) {
       wave.push(group);
     }
   }
@@ -1128,7 +1133,9 @@ function readOutboxThreadOwners(outbox: OutboxStore) {
   const definitivelyFailed = outbox.readDefinitivelyFailedKeys(items);
   return {
     definitivelyFailed,
-    items: items.filter(item => item.supersededById === undefined && !definitivelyFailed.has(netKey(item.networkId, item.id))),
+    items: items.filter(item => item.supersededById === undefined &&
+      !definitivelyFailed.has(netKey(item.networkId, item.id)) &&
+      !(isTerminalHistory(item) && isOneWayWaveEnvelope(item.envelope))),
   };
 }
 
