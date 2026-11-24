@@ -1,6 +1,7 @@
 import { toMailboxTopicBinding } from '../packages/cli/config.ts';
 import { readAgentHostDriverConfig } from '../packages/plugins-agent-host/index.ts';
 import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { planOrcaWorkspaceTerminal } from '../packages/plugins-orca/workspace.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import { runCommand, CommandNotStartedError } from '../packages/subprocess/index.ts';
 import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/plugins-agent-host/index.ts';
@@ -797,6 +798,31 @@ test('preferred terminal handle reuses a connected orphan over a fresher live te
   ];
   assert.deepEqual(await resolve('bound'), { handle: 'live', spawned: false });
   assert.equal((await resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, {})).handle, 'live');
+});
+
+test('an unusable bound Orca terminal cannot launch a replacement or take a sibling tab for an exclusive session', async () => {
+  const bound = { handle: 'bound', connected: false, writable: true, tabId: 'tab', leafId: 'leaf' };
+  const sibling = { handle: 'sibling', connected: true, writable: true, agentIdentity: 'antigravity' };
+  let terminals = [bound, sibling];
+  const runner: CommandRunner = async request => {
+    assert.deepEqual(request.args.slice(0, 2), ['terminal', 'list']);
+    return { stdout: JSON.stringify({ ok: true, result: { terminals } }) };
+  };
+  for (const { options, hasSibling } of [
+    { options: { preferredHandle: 'bound', sessionId: 'session' }, hasSibling: true },
+    { options: { preferredHandle: 'bound', dedicatedTab: true }, hasSibling: true },
+    { options: { preferredPaneKey: 'tab:leaf' }, hasSibling: true },
+    { options: { preferredHandle: 'bound' }, hasSibling: false },
+  ]) {
+    terminals = hasSibling ? [bound, sibling] : [bound];
+    assert.deepEqual(await planOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, options), {
+      kind: 'unusable', handle: 'bound',
+    });
+    await assert.rejects(
+      resolveOrSpawnOrcaWorkspaceTerminal(runner, 'orca', '/repo', undefined, options),
+      { message: 'Terminal is disconnected or not writable' },
+    );
+  }
 });
 
 test('runtime uses a generated fixed binding, persists mailbox and supports setup while running', async t => {
