@@ -1010,6 +1010,104 @@ test('an external node down during a slow stop neither crashes the daemon nor le
   assert.equal(existsSync(join(stateDir, 'control.sock')), false);
 });
 
+test('a deferred detached restart re-arms the pending reload when idle precedes its exit', { timeout: 60_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  const savedEnv = {
+    stateDir: process.env.DEALER_STATE_DIR,
+    detached: process.env.DEALER_DETACHED_LAUNCH,
+    autoUpdate: process.env.DEALER_AUTO_UPDATE,
+    autoRestart: process.env.DEALER_AUTO_RESTART,
+  };
+  process.env.DEALER_STATE_DIR = stateDir;
+  process.env.DEALER_DETACHED_LAUNCH = '1';
+  process.env.DEALER_AUTO_UPDATE = '0';
+  delete process.env.DEALER_AUTO_RESTART;
+  const restartSpawns: string[][] = [];
+  let restartExit: (() => void) | undefined;
+  const originalSpawn = childProcess.spawn;
+  const mocked = t.mock.method(childProcess, 'spawn', (command: string, args: string[], options: childProcess.SpawnOptions) => {
+    if (args?.[3] === 'node' && args?.[4] === 'restart') {
+      restartSpawns.push(args);
+      return {
+        once(event: string, listener: () => void) {
+          if (event === 'exit') restartExit = listener;
+        },
+        unref() {},
+      };
+    }
+    return originalSpawn(command, args, options);
+  });
+  syncBuiltinESMExports();
+  let runtime: DealerNodeRuntime | undefined;
+  t.after(async () => {
+    await runtime?.stop().catch(() => {});
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+    for (const [key, value] of [
+      ['DEALER_STATE_DIR', savedEnv.stateDir],
+      ['DEALER_DETACHED_LAUNCH', savedEnv.detached],
+      ['DEALER_AUTO_UPDATE', savedEnv.autoUpdate],
+      ['DEALER_AUTO_RESTART', savedEnv.autoRestart],
+    ] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await stopDaemonIfRunning(stateDir, { force: true }).catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  });
+  runtime = await runDealerDaemon(['--profile', 'headless-relay', '--member', 'test-node']);
+  const projectRoot = join(root, 'reload-project');
+  mkdirSync(projectRoot, { recursive: true });
+  assert.equal((await dealer(['project', 'init', '--root', projectRoot, '--id', 'reload'], stateDir)).projectId, 'reload');
+  await runtime.linkProject(projectRoot);
+  await until(() => {
+    const record = readDaemonFingerprint(stateDir);
+    return record && record.fingerprint === computeRuntimeFingerprint(stateDir) ? record : undefined;
+  }, 'daemon fingerprint to settle after linking the reload project');
+  editManifest(projectRoot, 'edited to arm the pending reload');
+  await until(() => restartSpawns.length === 1, 'self-restart to spawn for the pending reload');
+  // The final dispatch finishes while the restart child is still running, so its idle event is
+  // swallowed by the restart flag; only the child's exit can re-arm the reload.
+  const dispatcher = (runtime.kernel.ctx.services as any).dispatcher;
+  let release!: () => void;
+  const holding = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  dispatcher.registerExecutor({
+    name: 'deferred-restart-test',
+    async execute() {
+      await holding;
+      return { executor: 'deferred-restart-test', executionId: 'deferred-restart-test:receipt' };
+    },
+  }, {});
+  const settled = dispatcher.dispatch({
+    id: 'deferred-restart-dispatch',
+    networkId: 'local',
+    traceId: 'deferred-restart-dispatch',
+    from: { nodeId: `ed25519:${'a'.repeat(64)}`, member: 'tester', nodeName: 'test-node' },
+    routing: { mode: 'unicast' },
+    kind: 'collab.request.v1',
+    priority: 'normal',
+    subject: 'deferred restart dispatch',
+    body: 'hold until the restart child is about to exit',
+    payload: { executor: 'deferred-restart-test' },
+    attachments: [],
+    createdAt: new Date().toISOString(),
+    signature: '',
+  });
+  await until(() => dispatcher.activeCount() === 1, 'dispatch to become active');
+  release();
+  await settled;
+  await until(() => dispatcher.activeCount() === 0, 'dispatch to settle');
+  // Drain every watcher debounce the dispatch's state-directory writes armed: a late one must
+  // not spawn the second restart and hide whether the child's exit actually re-armed the reload.
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(restartSpawns.length, 1);
+  assert.equal(typeof restartExit, 'function');
+  restartExit!();
+  await until(() => restartSpawns.length === 2, 'reload to be re-armed after the deferred restart exited');
+});
+
 test('supervisor custody is decided from the process environment and frozen on the runtime', async t => {
   assert.equal(isSupervisedDaemonEnv({ XPC_SERVICE_NAME: 'ai.sensebeing.the-dealer' }), true);
   assert.equal(isSupervisedDaemonEnv({ XPC_SERVICE_NAME: '  ai.sensebeing.the-dealer  ' }), true);
@@ -1160,6 +1258,150 @@ test('self-update still surfaces a non-draining control status as a failure', as
   const report = JSON.parse(readFileSync(join(stateDir, 'auto-update.json'), 'utf8'));
   assert.equal(report.status, 'failed');
   assert.equal(report.error, error);
+});
+
+test('self-update verifies a supervised replacement across an ownerless respawn gap', { timeout: 60_000 }, async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture(t);
+  const lock = join(stateDir, 'runtime.lock');
+  mkdirSync(lock);
+  const draining = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { stdio: 'ignore' });
+  const replacement = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { stdio: 'ignore' });
+  t.after(() => {
+    for (const witness of [draining.pid, replacement.pid]) {
+      try {
+        process.kill(witness!, 'SIGKILL');
+      } catch { /* exited */ }
+    }
+  });
+  const expectedFingerprint = computeRuntimeFingerprint(stateDir, checkout);
+  writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: draining.pid, instanceId: 'draining-incarnation', host: 'supervisor-host' }));
+  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({
+    pid: draining.pid,
+    instanceId: 'draining-incarnation',
+    fingerprint: 'previous-code',
+    startedAt: new Date().toISOString(),
+    supervised: true,
+  }));
+  let serving = false;
+  let readyProbes = 0;
+  let firstRequestAt = 0;
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      if (!firstRequestAt) {
+        firstRequestAt = Date.now();
+        // The witnessed supervised owner exits early; its cold replacement claims the lock only
+        // after an ownerless gap that outlives the first startup budget.
+        setTimeout(() => {
+          try {
+            process.kill(draining.pid!, 'SIGKILL');
+          } catch { /* exited */ }
+        }, 200);
+        setTimeout(() => {
+          serving = true;
+          const staged = join(lock, 'owner.json.next');
+          writeFileSync(staged, JSON.stringify({ pid: replacement.pid, instanceId: 'replacement-incarnation', host: 'supervisor-host' }));
+          renameSync(staged, join(lock, 'owner.json'));
+          writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({
+            pid: replacement.pid,
+            instanceId: 'replacement-incarnation',
+            fingerprint: expectedFingerprint,
+            startedAt: new Date().toISOString(),
+            supervised: true,
+          }));
+        }, 1_400);
+      }
+      if (!serving) {
+        response.writeHead(503, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Daemon is draining' }));
+        return;
+      }
+      readyProbes++;
+      const status = { running: true, runtimeFingerprint: expectedFingerprint };
+      response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      response.end(`${JSON.stringify({ type: 'result', result: { code: 0, stdout: [JSON.stringify(status)], stderr: [] } })}\n`);
+    });
+  });
+  server.listen(join(stateDir, 'control.sock'));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  await once(server, 'listening');
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const began = Date.now();
+  const code = await runDealerCli(['self-update', '--checkout-dir', checkout, '--home-dir', root, '--json'], {
+    stateDir,
+    daemonStartupTimeoutMs: 400,
+    daemonSupervisorWaitMs: 8_000,
+    stdout: line => stdout.push(line),
+    stderr: line => stderr.push(line),
+  });
+  const elapsed = Date.now() - began;
+  assert.equal(code, 0, stderr.join('\n'));
+  const report = JSON.parse(stdout.join(''));
+  assert.equal(report.status, 'complete');
+  assert.equal(report.sourceStatus, 'up_to_date');
+  assert.equal(report.restartedDaemon, false);
+  assert.equal(Object.hasOwn(report, 'error'), false);
+  assert.ok(readyProbes >= 1, 'self-update reported success without verifying the replacement');
+  assert.ok(elapsed >= 1_000, `self-update returned after ${elapsed}ms without waiting for the respawn gap`);
+});
+
+test('self-update reports a bounded failure when a supervised replacement never becomes ready', { timeout: 60_000 }, async t => {
+  const { root, stateDir, checkout } = updateCheckoutFixture(t);
+  const lock = join(stateDir, 'runtime.lock');
+  mkdirSync(lock);
+  const draining = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { stdio: 'ignore' });
+  t.after(() => {
+    try {
+      process.kill(draining.pid!, 'SIGKILL');
+    } catch { /* exited */ }
+  });
+  writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: draining.pid, instanceId: 'draining-incarnation', host: 'supervisor-host' }));
+  writeFileSync(join(stateDir, 'runtime-fingerprint.json'), JSON.stringify({
+    pid: draining.pid,
+    instanceId: 'draining-incarnation',
+    fingerprint: 'previous-code',
+    startedAt: new Date().toISOString(),
+    supervised: true,
+  }));
+  let firstRequestAt = 0;
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      if (!firstRequestAt) {
+        firstRequestAt = Date.now();
+        setTimeout(() => {
+          try {
+            process.kill(draining.pid!, 'SIGKILL');
+          } catch { /* exited */ }
+        }, 100);
+      }
+      response.writeHead(503, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Daemon is draining' }));
+    });
+  });
+  server.listen(join(stateDir, 'control.sock'));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  await once(server, 'listening');
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const began = Date.now();
+  const code = await runDealerCli(['self-update', '--checkout-dir', checkout, '--home-dir', root, '--json'], {
+    stateDir,
+    daemonStartupTimeoutMs: 200,
+    daemonSupervisorWaitMs: 300,
+    stdout: line => stdout.push(line),
+    stderr: line => stderr.push(line),
+  });
+  const elapsed = Date.now() - began;
+  assert.equal(code, 1);
+  const error = `Timed out waiting for a supervisor replacement in ${stateDir}`;
+  assert.deepEqual(stdout, []);
+  assert.deepEqual(stderr.map(message => JSON.parse(message)), [{ error }]);
+  assert.ok(elapsed >= 300, `self-update failed after ${elapsed}ms without honoring the supervisor wait budget`);
+  const report = JSON.parse(readFileSync(join(stateDir, 'auto-update.json'), 'utf8'));
+  assert.equal(report.status, 'failed');
+  assert.equal(report.sourceStatus, 'up_to_date');
+  assert.equal(report.error, error);
+  assert.equal(report.restartedDaemon, false);
 });
 
 test('node restart reports the daemon\'s drain deferral and --force ends that verified incarnation', { timeout: 180_000 }, async t => {

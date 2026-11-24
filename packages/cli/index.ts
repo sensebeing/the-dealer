@@ -153,6 +153,8 @@ export interface DealerCliOptions {
   runtime?: DealerNodeRuntime;
   /** Startup budget when self-update finds a live daemon without a ready listener. */
   daemonStartupTimeoutMs?: number;
+  /** Supervisor respawn budget when self-update witnesses a supervised predecessor exit. */
+  daemonSupervisorWaitMs?: number;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   /** Aborted when the calling control request disconnects, so long waits release listeners. */
@@ -1381,6 +1383,17 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         { stateDir, checkoutDir: v['checkout-dir'], homeDir: v['home-dir'], geminiDir: v['gemini-dir'] },
         async (runtimeFingerprint, checkoutDir) => {
           if (!existsSync(join(stateDir, 'control.sock')) && !liveDaemonOwner(stateDir)) return false;
+          // Custody of the incarnation this reconciliation may have to wait on, proven by its
+          // own fingerprint record. Capture it before the drain can release the lock.
+          const witnessedOwner = liveDaemonOwner(stateDir);
+          const witnessedRecord = readDaemonFingerprint(stateDir);
+          const supervised = Boolean(
+            witnessedOwner &&
+            witnessedRecord &&
+            witnessedRecord.instanceId === witnessedOwner.instanceId &&
+            witnessedRecord.pid === witnessedOwner.pid &&
+            witnessedRecord.supervised,
+          );
           let probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
           if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
             const ready = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint, options.daemonStartupTimeoutMs);
@@ -1388,6 +1401,23 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
             probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
             if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
               throw new Error(`Timed out waiting for daemon in ${stateDir} to become ready`);
+            }
+          }
+          if (supervised && probe.state === 'not-ready') {
+            // The witnessed supervised owner is gone without a ready socket: wait out the
+            // ownerless respawn gap and verify its replacement instead of reporting success for
+            // a daemon that may never come back on the updated fingerprint.
+            const adopted = await waitForSupervisorReplacement(
+              stateDir,
+              runtimeFingerprint,
+              options.daemonSupervisorWaitMs ?? SUPERVISOR_RESPAWN_TIMEOUT_MS,
+            );
+            if (adopted !== undefined) return false;
+            const replacement = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint, options.daemonStartupTimeoutMs);
+            if (replacement) return false;
+            probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
+            if (probe.state === 'not-ready') {
+              throw new Error(`Timed out waiting for a supervisor replacement in ${stateDir}`);
             }
           }
           if (probe.state !== 'mismatch') return false;
@@ -1788,6 +1818,14 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   let idleSubscription: Disposable | undefined;
   const watchers: Array<{ close(): void }> = [];
   const watchedPaths = new Set<string>();
+  // A deferred restart attempt consumed its idle events while restartTriggered was set; once the
+  // attempt ends, re-evaluate the pending reload so it cannot strand the daemon on stale code.
+  const retryDeferredReload = () => {
+    restartTriggered = false;
+    if (!runtime.isStoppingOrDraining() && reloadPending && runtime.isIdleForRestart()) {
+      queueMicrotask(maybeSpawnSelfRestart);
+    }
+  };
   const maybeSpawnSelfRestart = () => {
     if (!reloadPending || restartTriggered || process.env.DEALER_AUTO_RESTART === '0' || !runtime.isIdleForRestart()) return;
     restartTriggered = true;
@@ -1796,12 +1834,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
       // Spawning a detached daemon here would steal the lock the supervisor is about to claim.
       void runtime.drainForStop().then(drained => {
         if (!drained) {
-          restartTriggered = false;
-          // Work that settles right at the deferred-drain edge already emitted its idle event
-          // while the restart flag was set; without this retry the pending reload would strand.
-          if (reloadPending && runtime.isIdleForRestart()) {
-            queueMicrotask(maybeSpawnSelfRestart);
-          }
+          retryDeferredReload();
           return;
         }
         return runtime.stop().then(() => process.exit(0));
@@ -1813,10 +1846,8 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     }
     const bin = fileURLToPath(new URL('../../bin/dealer.js', import.meta.url));
     const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, 'node', 'restart', '--json'], { detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: runtime.stateDir } });
-    // A deferred restart leaves this instance serving; its exit must not wedge later reloads.
-    child.once('exit', () => {
-      if (!runtime.isStoppingOrDraining()) restartTriggered = false;
-    });
+    // A deferred restart leaves this instance serving: its exit must re-arm the pending reload.
+    child.once('exit', retryDeferredReload);
     child.unref();
   };
   const schedule = () => {
