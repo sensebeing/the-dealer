@@ -19,6 +19,7 @@ import {
 import type { MailboxStore, MailboxEnqueueResult, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import { setOrcaWorkspaceComment, orcaAgent, pickSeaCreatureName } from './workspace.ts';
 import type { SupportedOrcaAgent } from './workspace.ts';
+import { orcaMutationRunner } from './inventories.ts';
 import {
   trustAntigravityWorkspace,
   defaultAgentLaunchCommand,
@@ -264,7 +265,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
       const createArgs = parentWorktree
         ? ['worktree', 'create', '--parent-worktree', parentWorktree, '--name', name, '--json']
         : ['worktree', 'create', '--no-parent', '--name', name, '--json'];
-      const created = await checkedCommand(runner, {
+      const created = await checkedCommand(orcaMutationRunner(runner), {
         command,
         args: createArgs,
         cwd: worktreeCwd,
@@ -415,7 +416,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
       ]
         .map(shellQuote)
         .join(' ');
-      const launched = await checkedCommand(runner, {
+      const launched = await checkedCommand(orcaMutationRunner(runner, path), {
         command,
         args: ['terminal', 'create', '--worktree', `path:${path}`, '--command', agentCommand, '--json'],
         cwd: path,

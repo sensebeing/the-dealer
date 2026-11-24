@@ -35,8 +35,9 @@ import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
 import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
-import { baseStreamKeyOf, MailboxStore, OutboxRedriveService, OutboxStore, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
-import type { SlotProbeResult } from '../mailbox/index.ts';
+import { baseStreamKeyOf, OutboxRedriveService, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
+import type { MailboxStore, OutboxStore, SlotProbeResult } from '../mailbox/index.ts';
+import { openStateLedgers } from './ledgers.ts';
 import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
@@ -500,14 +501,9 @@ export class DealerNodeRuntime {
       }
       // validateConfig also strips a pre-Phase-2 saved 'wave-coalescer' policy in place.
       validateConfig(this.config, { executorOverrides: this.options.executorOverrides, registry: this.registry });
-      this.mailbox = new MailboxStore(join(this.stateDir, 'mailbox.json'), {
-        legacyInboxPath:
-          this.config.executorConfig.inbox?.inboxPath ?? join(this.stateDir, 'inbox.json'),
-      });
-      this.outbox = new OutboxStore(
-        join(this.stateDir, 'outbox.json'),
-        join(this.stateDir, 'outbox-blobs'),
-      );
+      const { mailbox, outbox } = openStateLedgers(this.stateDir, this.config.executorConfig.inbox?.inboxPath, () => this.config.larkNotify);
+      this.mailbox = mailbox;
+      this.outbox = outbox;
       this.outbox.upgradeLegacyStore();
       this.mailbox.reconcileOutboxThreads(this.outbox);
       this.wakeups = new WakeupRedriveService({

@@ -9,6 +9,8 @@ import { CommandNotStartedError, runCommand } from '../packages/subprocess/index
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { inspectOrcaWorkspaceTerminal } from '../packages/plugins-orca/workspace.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -602,7 +604,7 @@ test('durable lineage lets an idle slot rotate and wake while sibling follow-ups
   const wake = await service.flushMailbox(probeMailbox, { force: true });
   assert.equal(wake.woke, true, wake.reason);
   assert.equal(wake.rotated, true);
-  assert.equal(worktreeListCalls(state.calls), 2, 'rotation and the fresh tab each prove readiness');
+  assert.equal(worktreeListCalls(state.calls), 3, 'rotation, retirement and pointer delivery each prove readiness');
   assert.deepEqual(state.terminals.map(terminal => terminal.handle), [sibling.handle, 'term-new-1']);
   assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
   assert.equal(sendsTo(state.calls, sibling.handle).length, 0);
@@ -683,7 +685,58 @@ test('slot probes consult invalid lineage inventory only for a busy subtree with
   assert.equal(errors.length, 3);
 });
 
+for (const change of ['draft', 'descendant activity', 'draft during final idle wait'] as const) {
+  test(`a cached slot probe cannot authorize delivery after new ${change}`, async t => {
+    t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
+    const root = directory(t);
+    const command = join(root, 'fake-orca');
+    const fixture = join(root, 'inventory.json');
+    const sends = join(root, 'sends.log');
+    const childPath = join(root, 'child');
+    const lastWait = join(root, 'last-wait');
+    writeFileSync(command, [
+      `#!${process.execPath}`,
+      'const { readFileSync, appendFileSync, existsSync } = require("node:fs");',
+      'const command = process.argv.slice(2, 4).join(" ");',
+      `const { worktrees, terminals } = JSON.parse(readFileSync(${JSON.stringify(fixture)}, "utf8"));`,
+      `const lastWait = ${JSON.stringify(lastWait)};`,
+      `if (${change === 'draft during final idle wait'} && existsSync(lastWait)) {
+        if (command === 'terminal wait') appendFileSync(lastWait, 'wait');
+        if (command === 'terminal show' && readFileSync(lastWait, 'utf8') === 'waitwait') terminals[0].preview = '> late draft';
+      }`,
+      `const child = process.argv.includes(${JSON.stringify('path:' + childPath)});`,
+      'const result = command === "worktree ps" ? { worktrees } : command === "terminal list" ? { terminals: child ? [] : terminals } : { terminal: terminals[0] };',
+      `if (command === "terminal send") appendFileSync(${JSON.stringify(sends)}, "send\\n");`,
+      'process.stdout.write(JSON.stringify({ ok: true, result }));',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const setInventory = (changed: boolean) => writeFileSync(fixture, JSON.stringify({
+      worktrees: [
+        { path: root, worktreeId: 'root', childWorktreeIds: ['child'], agents: [], unverifiableTerminalCount: 0 },
+        { path: childPath, worktreeId: 'child', agents: changed && change === 'descendant activity'
+          ? [{ state: 'working', parentPaneKey: 'wave:root' }] : [], unverifiableTerminalCount: 0 },
+      ],
+      terminals: [{ ...probeTerminal, preview: changed && change === 'draft' ? '> approval draft' : '' }],
+    }));
+    setInventory(false);
+    writeFileSync(sends, '');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    store.upsertWakeTarget(probeMailbox, {
+      driver: 'orca-terminal', coalesceMs: 0,
+      driverConfig: { orcaCommand: command, workspacePath: root, terminalHandle: probeTerminal.handle },
+    });
+    const { service } = startSlotProbeService(t, store, runCommand);
+    assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+    setInventory(true);
+    writeFileSync(lastWait, '');
+    store.enqueue([alert('pending')], { mailboxId: probeMailbox });
+    assert.equal((await service.flushMailbox(probeMailbox, { force: true })).woke, false);
+    assert.equal(readFileSync(sends, 'utf8'), '');
+  });
+}
+
 test('the real Orca command runner only requires lineage inventory when it can exclude busy work', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   const root = directory(t);
   const fakeOrca = join(root, 'fake-orca');
   const fixture = join(root, 'inventory.json');
@@ -707,6 +760,10 @@ test('the real Orca command runner only requires lineage inventory when it can e
     'process.stdout.write(JSON.stringify(command === "worktree list" ? lineage : { ok: true, result }));',
     '',
   ].join('\n'), { mode: 0o755 });
+  const setInventory = (value: unknown) => {
+    writeFileSync(fixture, JSON.stringify(value));
+    t.mock.timers.tick(1_500);
+  };
   const check = (throwOnProbeError = true) => checkOrcaWorkspaceIdle(runCommand, fakeOrca, root, undefined, {
     targetTerminalHandle: probeTerminal.handle, throwOnProbeError,
   });
@@ -715,15 +772,15 @@ test('the real Orca command runner only requires lineage inventory when it can e
   ]) {
     writeFileSync(calls, '');
     for (const terminals of [[probeTerminal], [probeTerminal, sibling]]) {
-      writeFileSync(fixture, JSON.stringify({ agents: [], terminals, lineage }));
+      setInventory({ agents: [], terminals, lineage });
       assert.equal((await check()).idle, true);
     }
     const agents = [{ state: 'working' }];
-    writeFileSync(fixture, JSON.stringify({ agents, terminals: [probeTerminal], lineage }));
+    setInventory({ agents, terminals: [probeTerminal], lineage });
     assert.equal((await check()).idle, false);
     assert.equal(readFileSync(calls, 'utf8'), '');
 
-    writeFileSync(fixture, JSON.stringify({ agents, terminals: [probeTerminal, sibling], lineage }));
+    setInventory({ agents, terminals: [probeTerminal, sibling], lineage });
     assert.equal((await check(false)).idle, false);
     await assert.rejects(check(), /Orca worktree list/);
     assert.equal(readFileSync(calls, 'utf8'), 'list\nlist\n');
@@ -1893,6 +1950,40 @@ test('a terminal awaiting retirement close is excluded from sibling selection', 
   );
 });
 
+test('retirement rechecks activity after launch and on later attempts', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const fake = fakeOrcaWorkspace(root, [{ ...probeTerminal }]);
+  fake.state.agents = [{ state: 'done', paneKey: 'wave:root' }];
+  const { service } = startSlotProbeService(t, store, async request => {
+    const result = await fake.runner(request);
+    if (request.args[0] === 'terminal' && request.args[1] === 'create') {
+      fake.state.agents![0].state = 'working';
+    }
+    return result;
+  });
+  store.upsertWakeTarget(probeMailbox, {
+    driver: 'orca-terminal', rotateAfterWaves: 1, completedWaves: 1,
+    driverConfig: { workspacePath: root, terminalHandle: probeTerminal.handle, paneKey: 'wave:root' },
+  });
+  store.enqueue([alert('next-wave')], { mailboxId: probeMailbox });
+  const rotated = await service.flushMailbox(probeMailbox, { force: true });
+  assert.equal(rotated.woke, true, rotated.reason);
+  assert.equal(rotated.rotated, true);
+  assert.equal(store.getWakeTarget(probeMailbox)?.driverConfig?.retiredTerminalHandle, probeTerminal.handle);
+  assert.equal(fake.state.calls.some(call => call.args[1] === 'close'), false);
+
+  store.enqueue([alert('another-item')], { mailboxId: probeMailbox });
+  assert.equal((await service.flushMailbox(probeMailbox, { force: true })).woke, true);
+  assert.equal(fake.state.calls.some(call => call.args[1] === 'close'), false);
+
+  fake.state.agents[0].state = 'done';
+  store.enqueue([alert('after-retired-finished')], { mailboxId: probeMailbox });
+  assert.equal((await service.flushMailbox(probeMailbox, { force: true })).woke, true);
+  assert.equal(fake.state.calls.filter(call => call.args[1] === 'close').length, 1);
+  assert.equal(store.getWakeTarget(probeMailbox)?.driverConfig?.retiredTerminalHandle, undefined);
+});
+
 test('a retired terminal claimed by another mailbox before the close boundary is left alone', async t => {
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
@@ -2249,14 +2340,15 @@ test('a truncated terminal inventory never proves the retired tab absent', async
   });
 
   const delivered = await service.flushMailbox('stream:truncated');
-  assert.equal(delivered.woke, true, delivered.reason);
-  assert.match(String(delivered.warning), /Retired terminal close failed \(term-old\)/);
+  assert.equal(delivered.woke, false, delivered.reason);
+  assert.match(String(delivered.reason), /busy or unverifiable/);
+  assert.equal(closeAttempted, true);
   assert.equal(
     store.getWakeTarget('stream:truncated')!.driverConfig?.retiredTerminalHandle,
     'term-old',
     'a truncated inventory never clears the durable retirement',
   );
-  assert.equal(sendsTo(state.calls, 'term-live').length, 1);
+  assert.equal(sendsTo(state.calls, 'term-live').length, 0);
 });
 
 test('rotation fails closed on a working agent that has no pane key', async t => {
@@ -3618,9 +3710,10 @@ test('a TUI mode placeholder on an empty composer never wedges a bound wave deli
   const delivered = await service.flushMailbox('stream:placeholder');
   assert.equal(delivered.woke, true, delivered.reason);
   // The exact placeholder and Orca's readiness verdict must both agree before delivery.
-  assert.deepEqual(waits.map(call => call.args), [[
-    'terminal', 'wait', '--terminal', 'term-agy', '--for', 'tui-idle', '--timeout-ms', '1', '--json',
-  ]]);
+  assert.equal(waits.length, 2);
+  for (const wait of waits) {
+    assert.deepEqual(wait.args, ['terminal', 'wait', '--terminal', 'term-agy', '--for', 'tui-idle', '--timeout-ms', '1', '--json']);
+  }
   const sends = sendsTo(calls, 'term-agy');
   assert.equal(sends.length, 1);
   assert.match(textOf(sends[0]), /^You have 1 Dealer message\(s\) in stream:placeholder/);
@@ -4212,8 +4305,8 @@ test('a closed persisted terminal is rebound to the live one before the pointer 
   assert.match(textOf(sends[0]), /^You have 1 Dealer message\(s\) in box/);
   assert.equal(
     calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list').length,
-    2,
-    'idle proof plus pre-send terminal resolution',
+    3,
+    'the resolved terminal receives a fresh idle check before send',
   );
   assert.equal(
     calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'create').length,
@@ -5929,5 +6022,133 @@ for (const kind of ['task', 'stream'] as const) {
     await invoke(promptCommand(recoveryMailbox), { ...env, ORCA_TERMINAL_HANDLE: resumedHandle, ORCA_PANE_KEY: 'resumed:pane' });
     assert.equal(store.getWakeTarget(recoveryMailbox)!.driverConfig!.paneKey, 'resumed:pane');
     await runtime.stop();
+  });
+}
+
+test('real Orca probes share short-lived workspace and terminal inventories and refresh after a send', async t => {
+  const root = directory(t);
+  const executable = join(root, 'orca-stub');
+  const log = join(root, 'commands.log');
+  t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
+  writeFileSync(executable, `#!${process.execPath}
+const fs = require('node:fs');
+const action = process.argv.slice(2, 4).join(' ');
+fs.appendFileSync(${JSON.stringify(log)}, action + '\\n');
+const result = action === 'worktree ps'
+  ? { worktrees: [{ path: ${JSON.stringify(root)}, worktreeId: 'root' }] }
+  : { terminals: [{ handle: 'tab-1', connected: true, writable: true }] };
+console.log(JSON.stringify({ ok: true, result }));
+`, { mode: 0o700 });
+  const worktree = () => checkOrcaWorkspaceIdle(runCommand, executable, root, undefined, { targetTerminalHandle: null, advisory: true });
+  const terminal = () => inspectOrcaWorkspaceTerminal(runCommand, executable, root, 'tab-1', undefined, undefined, true);
+  const calls = (action: string) => readFileSync(log, 'utf8').split('\n').filter(line => line === action).length;
+
+  const probes = await Promise.all([worktree(), worktree(), terminal(), terminal()]);
+  assert.deepEqual(probes, [{ idle: true, reason: undefined }, { idle: true, reason: undefined }, 'live', 'live']);
+  await Promise.all([worktree(), terminal()]);
+  assert.equal(calls('worktree ps'), 1);
+  assert.equal(calls('terminal list'), 1);
+
+  t.mock.timers.tick(1_000);
+  await Promise.all([worktree(), terminal()]);
+  assert.equal(calls('worktree ps'), 1);
+  assert.equal(calls('terminal list'), 2);
+  t.mock.timers.tick(500);
+  await Promise.all([worktree(), terminal()]);
+  assert.equal(calls('worktree ps'), 2);
+  assert.equal(calls('terminal list'), 2);
+
+  await sendOrcaTerminalText(runCommand, executable, 'tab-1', 'wake', { cwd: root });
+  await Promise.all([worktree(), terminal()]);
+  assert.equal(calls('worktree ps'), 3);
+  assert.equal(calls('terminal list'), 3);
+});
+
+for (const scenario of ['behind', 'dirty', 'ahead', 'sibling', 'unrelated sibling', 'dirty after fetch', 'sibling after fetch', 'fetch failure', 'terminal alias', 'orca run', 'other driver', 'active unclaimed tab', 'activity after fetch'] as const) {
+  test(`standing worktree rotation preserves custody and checks Git safety when ${scenario}`, async t => {
+    const root = directory(t);
+    const upstream = join(root, 'upstream');
+    const workspacePath = join(root, 'standing');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', ['-C', cwd, '-c', 'core.fsmonitor=false', ...args], { encoding: 'utf8' }).trim();
+    git(root, 'init', '--quiet', '--initial-branch=main', upstream);
+    const commit = (cwd: string, message: string) =>
+      git(cwd, '-c', 'user.name=Dealer Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false',
+        'commit', '--quiet', '--allow-empty', '-m', message);
+    commit(upstream, 'base');
+    git(root, 'clone', '--quiet', upstream, workspacePath);
+    commit(upstream, 'new main');
+    if (scenario === 'dirty') writeFileSync(join(workspacePath, 'untracked'), 'keep');
+    if (scenario === 'ahead') commit(workspacePath, 'local change');
+    if (scenario === 'fetch failure') git(workspacePath, 'remote', 'set-url', 'origin', join(root, 'missing'));
+    const originalHead = git(workspacePath, 'rev-parse', 'HEAD');
+    const newHead = git(upstream, 'rev-parse', 'HEAD');
+
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const fake = fakeOrcaWorkspace(workspacePath);
+    const gitCalls: CommandRequest[] = [];
+    const bindSibling = (path: string) => store.upsertWakeTarget('stream:alert-wave:2', {
+      driver: 'orca-terminal', driverConfig: { workspacePath: path, terminalHandle: 'sibling' },
+    });
+    const { service, errors } = startSlotProbeService(t, store, async request => {
+      if (request.command !== 'git') return fake.runner(request);
+      gitCalls.push(request);
+      const result = await runCommand(request);
+      if (request.args[4] === 'fetch') {
+        if (scenario === 'dirty after fetch') writeFileSync(join(workspacePath, 'untracked'), 'keep');
+        if (scenario === 'sibling after fetch') bindSibling(workspacePath);
+        if (scenario === 'activity after fetch') {
+          fake.state.terminals.push({ ...probeTerminal, handle: 'new-activity' });
+          fake.state.agents = [{ state: 'working' }];
+        }
+      }
+      return result;
+    });
+    store.upsertWakeTarget(probeMailbox, {
+      driver: 'orca-terminal', rotateAfterWaves: 1, completedWaves: 1,
+      driverConfig: { workspacePath },
+    });
+    if (scenario === 'sibling' || scenario === 'unrelated sibling') {
+      bindSibling(scenario === 'sibling' ? workspacePath : upstream);
+    }
+    if (scenario === 'terminal alias') {
+      fake.state.terminals.push({ ...probeTerminal, handle: 'independent' });
+      store.upsertWakeTarget('terminal:independent', {
+        driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'independent' },
+      });
+    }
+    if (scenario === 'orca run' || scenario === 'other driver') {
+      store.upsertWakeTarget('separate-run', {
+        driver: scenario === 'orca run' ? 'orca-run' : 'agent-host',
+        driverConfig: { workspacePath, runId: 'run' },
+      });
+    }
+    if (scenario === 'active unclaimed tab') {
+      fake.state.terminals.push({ ...probeTerminal, handle: 'unclaimed' });
+      fake.state.agents = [{ state: 'working', paneKey: 'wave:root' }];
+    }
+    store.enqueue([alert('next-wave')], { mailboxId: probeMailbox });
+    const result = await service.flushMailbox(probeMailbox, { force: true });
+    assert.equal(result.woke, true, JSON.stringify(result));
+    assert.equal(result.rotated, true);
+    const shouldUpdate = scenario === 'behind' || scenario === 'unrelated sibling';
+    assert.equal(git(workspacePath, 'rev-parse', 'HEAD'), shouldUpdate ? newHead : originalHead);
+
+    const actions = gitCalls.map(call => call.args[4]);
+    if (shouldUpdate) assert.deepEqual(actions, ['status', 'fetch', 'rev-list', 'rev-list', 'status', 'merge']);
+    if (scenario === 'dirty after fetch' || scenario === 'sibling after fetch' || scenario === 'activity after fetch') {
+      assert.deepEqual(actions, ['status', 'fetch', 'rev-list', 'rev-list', 'status']);
+    }
+    if (scenario === 'dirty') assert.deepEqual(actions, ['status']);
+    if (scenario === 'ahead') assert.deepEqual(actions, ['status', 'fetch', 'rev-list']);
+    if (['sibling', 'terminal alias', 'orca run', 'other driver', 'active unclaimed tab'].includes(scenario)) {
+      assert.deepEqual(actions, []);
+    }
+    if (scenario === 'fetch failure') {
+      assert.deepEqual(actions, ['status', 'fetch']);
+      assert.match(String(errors[0]), /git exited/);
+    } else {
+      assert.deepEqual(errors, []);
+    }
   });
 }

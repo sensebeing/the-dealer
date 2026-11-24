@@ -24,7 +24,7 @@ import { Kernel } from '../packages/kernel/index.ts';
 import { createEmitterPlugin } from '../packages/emitter/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
 import { createRouterPlugin } from '../packages/router/index.ts';
-import { withOwnedLock } from '../packages/fs-atomic/index.ts';
+import { withOwnedLock, writeFileAtomically } from '../packages/fs-atomic/index.ts';
 import { OutboxRedriveService, OutboxStore } from '../packages/mailbox/outbox.ts';
 import { MailboxStore } from '../packages/mailbox/store.ts';
 import { netKey } from '../packages/mailbox/network-key.ts';
@@ -3219,7 +3219,10 @@ test('a lost relay spool acknowledgment preserves uncertainty through later dire
   await returning.mountNetwork(network);
   await until(() => alice.node.resolveTarget('member:bob', NETWORK)[0]?.endpointAddr === returning.transport.endpointAddr,
     'sender learns the returning target endpoint');
-  const failed = (await alice.outboxRedrive.flush({ id: first.messageId, force: true })).items[0];
+  await alice.outboxRedrive.flush({ id: first.messageId, force: true });
+  // The reachability event can settle the rejection before the manual flush runs.
+  const failed = alice.outbox.get(first.messageId);
+  assert.ok(failed);
   assert.equal(isRetryablePreEffectReceipt(failed.failedReceipts[target]), true);
   assert.deepEqual(failed.inDoubtNodeIds, [target]);
   assert.equal(isUnattemptedOutboxItem(failed), false);
@@ -5042,11 +5045,28 @@ test('terminal keyed delivery replays its signed receipt before auto-routing can
   const input: EmitMessageInput = { networkId: harness.networkId, routing: { mode: 'auto' },
     kind: 'task', subject: 'keyed auto', body: 'execute once', payload: {}, idempotencyKey: 'stable-auto' };
   const first = await harness.emitter.emit(input);
+  const confirmed = harness.outbox.list({ status: 'delivered' })[0];
+  const history = Array.from({ length: 201 }, () => {
+    const envelope = envelopeFor(harness.sender, harness.networkId, 'member:diz');
+    const receipt = signReceipt({ ...first.receipts[0], messageId: envelope.id }, harness.receiver.privateKeyPem);
+    return {
+      ...confirmed, id: envelope.id, envelope, updatedAt: '2099-01-01T00:00:00.000Z',
+      deliveredReceipts: { [receipt.fromNodeId]: receipt },
+    };
+  });
+  writeFileAtomically(harness.outbox.path, JSON.stringify({
+    schema: 'the-dealer-outbox/v2', items: [confirmed, ...history.slice(0, 200)],
+  }));
+  const { envelope, explicitTargets } = history[200];
+  const receipt = history[200].deliveredReceipts[harness.targetCard.nodeId];
+  harness.outbox.enqueue({ envelope, explicitTargets, pendingNodeIds: [harness.targetCard.nodeId] });
+  harness.outbox.markNodeDelivered(envelope.id, harness.targetCard.nodeId, receipt);
   selected = harness.targetByMember.get('aya')!.nodeId;
   const second = await harness.emitter.emit(input);
   assert.equal(routes, 1);
   assert.equal(harness.sendCalls.length, 1);
   assert.deepEqual(second, first);
+  assert.equal(harness.outbox.list({ status: 'delivered' }).length, 201);
   assert.equal(second.receipts[0].stage, 'dispatched');
   assert.equal(second.receipts[0].fromNodeId, harness.targetCard.nodeId);
 });

@@ -133,6 +133,7 @@ export interface PollWatermarkSourceConfig<T, Cursor> {
     receipts: readonly DeliveryReceipt[],
   ) => Cursor | undefined;
   intervalMs?: number;
+  maxBackoffMs?: number;
   saveCursor?: (cursor: Cursor) => Promise<void>;
   onError?: (error: unknown) => void;
 }
@@ -154,11 +155,29 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
   let wakeServer: Server | undefined;
   let wakeStarting: Promise<void> | undefined;
   let emitter: EmitterService | undefined;
-  let timer: ReturnType<typeof setInterval> | undefined;
+  const intervalMs = config.intervalMs ?? 0;
+  const maxBackoffMs = config.maxBackoffMs ?? Math.max(intervalMs * 8, 10 * 60_000);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let consecutiveFailures = 0;
   let active: Promise<void> | undefined;
   let settling: Promise<void> | undefined;
   let pollController: AbortController | undefined;
   let stopped = true;
+  const clearSchedule = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  const schedule = () => {
+    if (stopped || !(intervalMs > 0)) return;
+    const nextDelay = consecutiveFailures === 0 ? intervalMs
+      : Math.min(intervalMs * 2 ** Math.min(consecutiveFailures, 4), maxBackoffMs);
+    timer = setTimeout(() => {
+      timer = undefined;
+      run();
+    }, nextDelay);
+    timer.unref();
+  };
+
   const pollOnce = (): Promise<void> => {
     if (active) {
       return active;
@@ -166,6 +185,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
     if (!emitter || stopped || !pollController) {
       return Promise.reject(new Error('Poll source not started'));
     }
+    clearSchedule();
     const target = emitter;
     const runController = pollController;
     const signal = runController.signal;
@@ -225,14 +245,20 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       });
       settling = settlePromise;
       await settlePromise;
-    })().finally(() => {
+    })().then(() => {
+      if (pollController === runController) consecutiveFailures = 0;
+    }, error => {
+      if (pollController === runController) consecutiveFailures++;
+      throw error;
+    }).finally(() => {
       if (active === run) active = undefined;
+      if (pollController === runController) schedule();
     });
     active = run;
     return run;
   };
   const run = () => {
-    void pollOnce().catch(error => config.onError?.(error));
+    if (!active && !stopped) void pollOnce().catch(error => config.onError?.(error));
   };
   return {
     name: 'poll-watermark',
@@ -246,6 +272,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       if (config.cursorPath && existsSync(config.cursorPath)) cursor = loadCursor();
       emitter = value;
       stopped = false;
+      consecutiveFailures = 0;
       pollController = new AbortController();
       if (config.wake) {
         const wake = config.wake;
@@ -268,6 +295,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
           if (request.method === 'OPTIONS') {
             response.writeHead(204).end();
           } else if (request.method === 'POST') {
+            consecutiveFailures = 0;
             run();
             response.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
           } else {
@@ -295,27 +323,17 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
           wakeStarting = undefined;
         }
       }
-      if (stopped) return;
-      if (config.intervalMs !== undefined && config.intervalMs > 0) {
+      if (intervalMs > 0 && !stopped) {
         // Drain the current watermark immediately instead of waiting one full interval.
+        const controller = pollController;
         queueMicrotask(() => {
-          if (!stopped) {
-            run();
-          }
+          if (pollController === controller) run();
         });
-        timer = setInterval(() => {
-          if (!stopped) {
-            run();
-          }
-        }, config.intervalMs);
-        timer.unref();
       }
     },
     async stop() {
       stopped = true;
-      if (timer) {
-        clearInterval(timer);
-      }
+      clearSchedule();
       // Abort the read-only fetch phase first: a signal-aware poll cancels immediately, and a
       // legacy poll that ignores it must not hold shutdown open before any external effect.
       pollController?.abort();
