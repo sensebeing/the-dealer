@@ -101,11 +101,13 @@ function encodeOptional(value: unknown): string | null {
   return value === undefined ? null : JSON.stringify(value);
 }
 
-function chmodIfPresent(path: string, mode: number): void {
+function chmodIfPresent(path: string, mode: number): boolean {
   try {
     chmodSync(path, mode);
+    return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return false;
   }
 }
 
@@ -187,8 +189,7 @@ export class MailboxSqliteBackend {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         }
-        chmodSync(backup, 0o400);
-        syncDirectory(dirname(backup));
+        if (chmodIfPresent(backup, 0o400)) syncDirectory(dirname(backup));
         this.statement("DELETE FROM meta WHERE key = 'pending_archive'").run();
       });
     }
@@ -493,22 +494,34 @@ export class MailboxSqliteBackend {
   }
 
   queueRows(mailboxId?: string): QueueRow[] {
-    const ids = mailboxId === undefined
-      ? this.statement(`SELECT mailbox_id FROM mailboxes UNION SELECT mailbox_id FROM wake_targets
-          UNION SELECT mailbox_id FROM items ORDER BY mailbox_id`).all()
-      : this.statement(`SELECT ? AS mailbox_id WHERE EXISTS (SELECT 1 FROM mailboxes WHERE mailbox_id = ?)
-          OR EXISTS (SELECT 1 FROM wake_targets WHERE mailbox_id = ?)
-          OR EXISTS (SELECT 1 FROM items WHERE mailbox_id = ?)`).all(mailboxId, mailboxId, mailboxId, mailboxId);
-    return ids.map(({ mailbox_id: id }) => {
-      const mailboxId = id as string;
-      const counts = this.countItems(mailboxId);
-      return {
-        mailboxId,
-        queuedCount: counts.queued,
-        leasedCount: counts.leased,
-        lease: this.mailbox(mailboxId)?.outstanding,
-        wakeTarget: this.wakeTarget(mailboxId),
-      };
-    });
+    const where = mailboxId === undefined ? '' : 'WHERE mailbox_id = ?';
+    const parameters = mailboxId === undefined ? [] : [mailboxId];
+    const queues = new Map<string, QueueRow>();
+    const queueFor = (id: string): QueueRow => {
+      let queue = queues.get(id);
+      if (!queue) {
+        queue = { mailboxId: id, queuedCount: 0, leasedCount: 0 };
+        queues.set(id, queue);
+      }
+      return queue;
+    };
+
+    const counts = this.statement(`SELECT mailbox_id, status, count(*) AS count FROM items
+      ${where} GROUP BY mailbox_id, status`).all(...parameters);
+    for (const { mailbox_id: id, status, count } of counts) {
+      const queue = queueFor(id as string);
+      if (status === 'queued') queue.queuedCount = count as number;
+      else if (status === 'leased') queue.leasedCount = count as number;
+      else if (status !== 'acked') throw invalidStore();
+    }
+    for (const row of this.statement(`SELECT * FROM mailboxes ${where}`).all(...parameters)) {
+      const mailbox = this.decodeMailbox(row);
+      queueFor(mailbox.mailboxId).lease = mailbox.outstanding;
+    }
+    for (const row of this.statement(`SELECT * FROM wake_targets ${where}`).all(...parameters)) {
+      const target = this.decodeWakeTarget(row);
+      queueFor(target.mailboxId).wakeTarget = target;
+    }
+    return [...queues.keys()].sort().map(id => queues.get(id)!);
   }
 }

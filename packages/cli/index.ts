@@ -14,7 +14,7 @@ import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
-import { compactQueueSummary, openStateLedgers } from './ledgers.ts';
+import { compactQueueSummary, openStateLedgers, stateMailboxExists } from './ledgers.ts';
 import type { MailboxStore, OutboxStore, OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, Disposable, SettlementOutcome } from '../core-types/index.ts';
@@ -27,6 +27,7 @@ import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './
 import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
+import type { RuntimeConfig } from './config.ts';
 import { processOwnerRecord } from '../process-lock/index.ts';
 
 export * from './runtime.ts';
@@ -807,13 +808,17 @@ function payloadFromBody(body: string): Record<string, unknown> {
   }
 }
 
-async function ledgersFor(options: DealerCliOptions, stateDir: string) {
+function readSavedConfig(stateDir: string): Partial<RuntimeConfig> {
+  const file = join(stateDir, 'config.json');
+  return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+}
+
+async function ledgersFor(options: DealerCliOptions, stateDir: string, config?: Partial<RuntimeConfig>) {
   if (options.runtime) {
     await options.runtime.start();
     return { mailbox: options.runtime.mailbox, outbox: options.runtime.outbox };
   }
-  const file = join(stateDir, 'config.json');
-  const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+  const savedConfig = config ?? readSavedConfig(stateDir);
   return openStateLedgers(stateDir, savedConfig.executorConfig?.inbox?.inboxPath, () => savedConfig.larkNotify);
 }
 
@@ -1203,8 +1208,8 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
-    const openLedgers = async () => {
-      const ledgers = await ledgersFor(options, stateDir);
+    const openLedgers = async (config?: Partial<RuntimeConfig>) => {
+      const ledgers = await ledgersFor(options, stateDir, config);
       if (!options.runtime) offlineMailbox = ledgers.mailbox;
       return ledgers;
     };
@@ -1367,9 +1372,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'status') {
-      const file = join(stateDir, 'config.json');
-      const config = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-      const queues = compactQueueSummary(existsSync(stateDir) ? (await openLedgers()).mailbox : undefined);
+      const config = readSavedConfig(stateDir);
+      const hasMailbox = stateMailboxExists(stateDir, config.executorConfig?.inbox?.inboxPath);
+      const queues = compactQueueSummary(hasMailbox ? (await openLedgers(config)).mailbox : undefined);
       stdout(
         JSON.stringify({
           running: false,

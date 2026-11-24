@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import type { StatementSync } from 'node:sqlite';
 import {
   MailboxStore,
   DEDUP_CAS_DUPLICATE_DETAIL,
@@ -132,6 +133,58 @@ test('an interrupted legacy archive is retried after the import transaction comm
   assert.equal(reopened.list().items[0].id, 'imported');
   assert.equal(existsSync(path), false);
   assert.equal(existsSync(backup), true);
+});
+
+test('an interrupted archive can recover when both legacy files are gone', t => {
+  const { path } = workspace(t);
+  const backup = `${path}.v2-migrated`;
+  writeLegacyMailbox(path, { items: [legacyItem(envelope('imported'), 0)] });
+  mkdirSync(backup);
+  assert.throws(() => new MailboxStore(path), { code: 'EISDIR' });
+  rmSync(path);
+  rmSync(backup, { recursive: true });
+
+  const reopened = new MailboxStore(path);
+  t.after(() => reopened.close());
+  assert.equal(reopened.list().items[0].id, 'imported');
+});
+
+test('an interrupted inbox archive can recover when its directory is gone', t => {
+  const { path, root } = workspace(t);
+  const legacyRoot = join(root, 'legacy');
+  const legacyInboxPath = join(legacyRoot, 'inbox.json');
+  mkdirSync(legacyRoot);
+  writeFileSync(legacyInboxPath, JSON.stringify({ schema: 'the-dealer-inbox/v1', items: [] }));
+  mkdirSync(`${legacyInboxPath}.migrated`);
+  assert.throws(() => new MailboxStore(path, { legacyInboxPath }), { code: 'EISDIR' });
+  rmSync(legacyRoot, { recursive: true });
+
+  const reopened = new MailboxStore(path, { legacyInboxPath });
+  t.after(() => reopened.close());
+  assert.equal(reopened.list().totalCount, 0);
+});
+
+test('queue status uses a fixed query budget across mailboxes', t => {
+  const { path } = workspace(t);
+  writeLegacyMailbox(path, {
+    items: [legacyItem(envelope('queued'), 0, 'items-only')],
+    mailboxes: { 'lease-history': { mailboxId: 'lease-history', ackedLeaseIds: [] } },
+  });
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
+  for (const id of ['wake-c', 'wake-a', 'wake-b']) store.upsertWakeTarget(id);
+
+  const db = new DatabaseSync(':memory:');
+  const statementPrototype = Object.getPrototypeOf(db.prepare('SELECT 1')) as StatementSync;
+  db.close();
+  const all = t.mock.method(statementPrototype, 'all');
+  const get = t.mock.method(statementPrototype, 'get');
+
+  const { queues } = store.summarizeQueues({ includeIdle: true });
+  assert.deepEqual(queues.map(queue => queue.mailboxId), ['items-only', 'lease-history', 'wake-a', 'wake-b', 'wake-c']);
+  assert.equal(queues[0].queuedCount, 1);
+  const queries = all.mock.callCount() + get.mock.callCount();
+  assert.ok(queries <= 3, `expected at most 3 queries, ran ${queries}`);
 });
 
 test('queue status projects active leases, pending wake backoff and fences without taking custody', t => {

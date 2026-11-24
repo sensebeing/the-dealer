@@ -472,6 +472,42 @@ test('dealer help exposes structured usage', async () => {
   assert.match(value.commands.queue, /queue status/);
 });
 
+test('offline node status reports zero queue counts without initializing an empty state directory', async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'dealer-node-status-empty-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const code = await runDealerCli(['node', 'status', '--json'], {
+    stateDir, stdout: line => stdout.push(line), stderr: line => stderr.push(line),
+  });
+  assert.equal(code, 0, stderr.join('\n'));
+  assert.deepEqual(JSON.parse(stdout[0]).queues, {
+    activeMailboxes: 0, queuedItems: 0, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
+  });
+  assert.equal(existsSync(join(stateDir, 'mailbox.sqlite')), false);
+});
+
+test('offline node status includes messages from the configured legacy inbox', async t => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'dealer-node-status-legacy-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const inboxPath = join(stateDir, 'custom-inbox.json');
+  const message = envelope('legacy-status');
+  writeFileSync(inboxPath, JSON.stringify({
+    schema: 'the-dealer-inbox/v1',
+    items: [{ ...message, topic: message.kind, receivedAt: message.createdAt, status: 'unread' }],
+  }));
+  writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ executorConfig: { inbox: { inboxPath } } }));
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const code = await runDealerCli(['node', 'status', '--json'], {
+    stateDir, stdout: line => stdout.push(line), stderr: line => stderr.push(line),
+  });
+  assert.equal(code, 0, stderr.join('\n'));
+  assert.deepEqual(JSON.parse(stdout[0]).queues, {
+    activeMailboxes: 1, queuedItems: 1, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
+  });
+});
+
 test('queue status agrees across control and offline CLI and node status includes queue counts', async t => {
   const root = mkdtempSync(join(tmpdir(), 'dealer-queue-cli-'));
   const runtime = new DealerNodeRuntime({
