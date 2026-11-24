@@ -142,11 +142,12 @@ test('inbox CLI supports live, control socket and offline check/ack/list', async
   // Offline direct MailboxStore path.
   runtime.persist();
   await runtime.stop();
-  const mailboxPath = join(runtime.stateDir, 'mailbox.json');
+  const mailboxPath = join(runtime.stateDir, 'mailbox.sqlite');
   assert.equal(statSync(mailboxPath).mode & 0o777, 0o600);
   assert.equal((await cli(runtime.stateDir, 'list', '--all')).value.ackedCount, 3);
   const offlineStore = new MailboxStore(mailboxPath);
   offlineStore.enqueue([envelope('offline-a')]);
+  offlineStore.close();
   const offlineCheck = await cli(runtime.stateDir, 'check');
   assert.equal(offlineCheck.code, 0);
   assert.deepEqual(offlineCheck.value.items.map((item: any) => item.id), ['offline-a']);
@@ -237,7 +238,7 @@ test('inbox executor routes logical mailboxes, deduplicates and preserves attach
   assert.equal(store.list({ mailboxId: 'default' }).totalCount, 1);
   await plugin.execute([first], {} as ExecutionContext);
   assert.equal(store.list({ mailboxId: 'default' }).totalCount, 1);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(statSync(store.path).mode & 0o777, 0o600);
 });
 
 test('topic defaults, P2P delivery and thread reverse routes converge end to end', async t => {
@@ -324,7 +325,7 @@ test('topic defaults, P2P delivery and thread reverse routes converge end to end
     'verified inbox attachment',
   );
   assert.equal(Object.hasOwn(item.envelope.payload, 'localAttachments'), true);
-  assert.equal(statSync(join(bob.stateDir, 'mailbox.json')).mode & 0o777, 0o600);
+  assert.equal(statSync(bob.mailbox.path).mode & 0o777, 0o600);
   assert.equal(bob.mailbox.list({ mailboxId: 'task:one' }).totalCount, 1);
   assert.equal(bob.mailbox.list({ mailboxId: 'default' }).totalCount, 0);
 
@@ -468,4 +469,57 @@ test('dealer help exposes structured usage', async () => {
   const value = JSON.parse(out.join('\n'));
   assert.equal(value.ok, true);
   assert.match(value.commands.inbox, /inbox/);
+  assert.match(value.commands.queue, /queue status/);
+});
+
+test('queue status agrees across control and offline CLI and node status includes queue counts', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'dealer-queue-cli-'));
+  const runtime = new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+  });
+  t.after(async () => { await runtime.stop(); rmSync(root, { recursive: true, force: true }); });
+  await runtime.start();
+  await runtime.serveControl(async argv => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+  const read = async (...argv: string[]) => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli([...argv, '--json'], {
+      stateDir: runtime.stateDir, stdout: line => stdout.push(line), stderr: line => stderr.push(line),
+    });
+    assert.equal(code, 0, stderr.join('\n'));
+    return JSON.parse(stdout.join('\n'));
+  };
+  runtime.mailbox.enqueue([envelope('queue-cli')]);
+  runtime.mailbox.upsertWakeTarget('default', {
+    driver: 'orca-terminal', driverConfig: { workspacePath: '/work', terminalHandle: 'term-1', privateField: 'opaque' },
+  });
+  runtime.mailbox.upsertWakeTarget('idle');
+  const online = await read('queue', 'status');
+  assert.equal(online.summary.activeMailboxes, 1);
+  assert.equal(online.summary.totalMailboxes, 2);
+  assert.deepEqual(online.queues.map((queue: { mailboxId: string }) => queue.mailboxId), ['default']);
+  assert.equal(online.queues[0].workspacePath, '/work');
+  assert.equal(online.queues[0].terminalHandle, 'term-1');
+  assert.equal(online.queues[0].driverConfig, undefined);
+  assert.deepEqual((await read('node', 'status')).queues, {
+    activeMailboxes: 1, queuedItems: 1, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
+  });
+  await runtime.stop();
+  assert.throws(() => runtime.mailbox.list(), /not open/i);
+  assert.deepEqual(await read('queue', 'status'), online);
+  const idle = await read('queue', 'status', '--mailbox', 'idle', '--all');
+  assert.equal(idle.queues[0].mailboxId, 'idle');
+  assert.equal(idle.summary.queuedItems, 0);
+  assert.deepEqual((await read('node', 'status')).queues, {
+    activeMailboxes: 1, queuedItems: 1, leasedItems: 0, pendingWakes: 0, fencedTargets: 0,
+  });
+  assert.equal(existsSync(`${runtime.mailbox.path}-wal`), false);
+  assert.equal(existsSync(`${runtime.mailbox.path}-shm`), false);
 });

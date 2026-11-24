@@ -1622,6 +1622,8 @@ test('sea-creature spawn ignores workspace history and disabled trust settings',
   const dir = await mkdtemp(join(tmpdir(), 'dealer-history-isolation-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const mailboxPath = join(dir, 'mailbox.json');
+  const store = new MailboxStore(mailboxPath);
+  store.close();
   const deliveriesPath = join(dir, 'deliveries.json');
   const settingsPath = join(dir, 'settings.json');
   for (const path of [mailboxPath, deliveriesPath, settingsPath]) {
@@ -1630,7 +1632,7 @@ test('sea-creature spawn ignores workspace history and disabled trust settings',
   const names: string[] = [];
   const executor = createOrcaSpawnExecutorPlugin({
     commandRunner: cleanedWorktreeRunner(names), command: 'codex', seaCreatureNaming: true,
-    store: new MailboxStore(mailboxPath), agySettingsPath: settingsPath,
+    store, agySettingsPath: settingsPath,
   });
   await executor.execute([envelope({ payload: { trustAntigravity: false } })], spawnContext, {});
   assert.equal(names.length, 1);
@@ -1640,28 +1642,32 @@ test('sea-creature spawn ignores workspace history and disabled trust settings',
   }
 });
 
-test('mailbox loads legacy workspace history without losing mailbox obligations and omits it on save', async t => {
+test('mailbox imports obligations beside retired workspace history', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dealer-legacy-history-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, 'mailbox.json');
-  const store = new MailboxStore(path);
+  const store = new MailboxStore(join(dir, 'seed.db'));
   const message = envelope();
   store.enqueue([message], { mailboxId: 'historical' });
   store.recordInboundEnvelope(message, 'historical');
   store.upsertWakeTarget('historical', { driverConfig: { workspacePath: '/old/nautilus' } });
-  const original = JSON.parse(await readFile(path, 'utf8'));
-  await writeFile(path, JSON.stringify({ ...original, retiredWorkspacePaths: ['/old/nautilus'] }));
+  const route = store.getThread(message.id);
+  const target = store.getWakeTarget('historical');
+  const original = JSON.stringify({
+    schema: 'the-dealer-mailbox/v2', sequence: 1, items: store.list().items,
+    threads: { [`inbound:${message.id}`]: route }, wakeTargets: { historical: target },
+    retiredWorkspacePaths: ['/old/nautilus'],
+  });
+  const items = store.listItemsAfterSequence(-1);
+  store.close();
+  await writeFile(path, original);
   const loaded = new MailboxStore(path);
-  assert.equal(loaded.listItemsAfterSequence(-1).length, 1);
-  assert.deepEqual(loaded.getThread(message.id), store.getThread(message.id));
-  assert.deepEqual(loaded.getWakeTarget('historical'), original.wakeTargets.historical);
+  t.after(() => loaded.close());
   loaded.upsertWakeTarget('new', {});
-  const saved = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal('retiredWorkspacePaths' in saved, false);
-  assert.deepEqual(saved.items, original.items);
-  assert.deepEqual(saved.threads, original.threads);
-  assert.deepEqual(saved.mailboxes, original.mailboxes);
-  assert.deepEqual(saved.wakeTargets.historical, original.wakeTargets.historical);
+  assert.deepEqual(loaded.listItemsAfterSequence(-1), items);
+  assert.deepEqual(loaded.getThread(message.id), route);
+  assert.deepEqual(loaded.getWakeTarget('historical'), target);
+  assert.equal(await readFile(`${path}.v2-migrated`, 'utf8'), original);
 });
 
 test('mock interactive Orca never reads or changes default host trust settings', async t => {
@@ -1681,6 +1687,7 @@ test('mock interactive Orca never reads or changes default host trust settings',
   await writeFile(deliveriesPath, 'not JSON');
   const mailboxPath = join(dir, 'mailbox.json');
   const store = new MailboxStore(mailboxPath);
+  t.after(() => store.close());
   const names: string[] = [];
   const baseRunner = cleanedWorktreeRunner(names);
   const commandRunner: CommandRunner = async request => {
@@ -1692,12 +1699,13 @@ test('mock interactive Orca never reads or changes default host trust settings',
   const executor = createOrcaSpawnExecutorPlugin({
     commandRunner, store, seaCreatureNaming: true, agent: 'antigravity',
   });
-  await executor.execute([envelope({ payload: { interactive: true } })], spawnContext, {});
+  const message = envelope({ payload: { interactive: true } });
+  await executor.execute([message], spawnContext, {});
   assert.equal(names.length, 1);
   assertSeaCreatureName(names[0]);
   assert.equal(await readFile(settingsPath, 'utf8'), 'not JSON');
   assert.equal(await readFile(deliveriesPath, 'utf8'), 'not JSON');
-  assert.equal('retiredWorkspacePaths' in JSON.parse(await readFile(mailboxPath, 'utf8')), false);
+  assert.deepEqual(store.list().items.map(item => item.id), [message.id]);
 });
 
 test('executor preparation failures restore CAS so repaired configuration can retry the same revision', async t => {

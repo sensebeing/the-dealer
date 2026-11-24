@@ -14,7 +14,7 @@ import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
-import { openStateLedgers } from './ledgers.ts';
+import { compactQueueSummary, openStateLedgers } from './ledgers.ts';
 import type { MailboxStore, OutboxStore, OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, Disposable, SettlementOutcome } from '../core-types/index.ts';
@@ -1177,6 +1177,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
   const stdout = options.stdout ?? console.log;
   const stderr = options.stderr ?? console.error;
   let owned: DealerNodeRuntime | undefined;
+  let offlineMailbox: MailboxStore | undefined;
   let updateStateDir: string | undefined;
   // An ephemeral CLI runtime exits with this command; queued mail needs the daemon's
   // background redrive to survive that exit.
@@ -1187,13 +1188,14 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (v.help === true || group === 'help') {
       stdout(JSON.stringify({
         ok: true,
-        usage: 'dealer <send|reply|ask|settle|inbox|thread|outbox|worktree|node|project|setup|route|source> [options]',
+        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|worktree|node|project|setup|route|source> [options]',
         commands: {
           send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--idempotency-key <key>] [--attach <path>] [--json]',
           reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
           ask: 'dealer ask <messageId> --body <text> [--ack <leaseId>] [--json]',
           settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
           inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
+          queue: 'dealer queue status [--mailbox <id>] [--all] [--json]',
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
         },
@@ -1201,6 +1203,11 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
+    const openLedgers = async () => {
+      const ledgers = await ledgersFor(options, stateDir);
+      if (!options.runtime) offlineMailbox = ledgers.mailbox;
+      return ledgers;
+    };
     if (!options.runtime && group !== 'self-update' && !(group === 'node' && action === 'down')) {
       updateStateDir = stateDir;
     }
@@ -1334,14 +1341,24 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     if (group === 'inbox') {
-      // Offline access is serialized by the mailbox file lock, so it stays coherent even if
-      // the daemon owns the state directory.
-      const { mailbox } = await ledgersFor(options, stateDir);
+      const { mailbox } = await openLedgers();
       stdout(JSON.stringify(await runInboxCommand(mailbox, action, target, v, options.signal), null, v.json ? undefined : 2));
       return 0;
     }
+    if (group === 'queue') {
+      if (action !== 'status' || target !== undefined) throw new Error('Use dealer queue status [--mailbox <id>] [--all] [--json]');
+      const { mailbox } = await openLedgers();
+      const { summary, queues } = mailbox.summarizeQueues({ mailboxId: v.mailbox, includeIdle: v.all });
+      const projected = queues.map(({ driverConfig, ...queue }) => ({
+        ...queue,
+        workspacePath: typeof driverConfig?.workspacePath === 'string' ? driverConfig.workspacePath : undefined,
+        terminalHandle: typeof driverConfig?.terminalHandle === 'string' ? driverConfig.terminalHandle : undefined,
+      }));
+      stdout(JSON.stringify({ summary, queues: projected }, null, v.json ? undefined : 2));
+      return 0;
+    }
     if (group === 'thread') {
-      const { mailbox, outbox } = await ledgersFor(options, stateDir);
+      const { mailbox, outbox } = await openLedgers();
       stdout(JSON.stringify(runThreadCommand(mailbox, action, target, v, outbox), null, v.json ? undefined : 2));
       return 0;
     }
@@ -1352,12 +1369,14 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (!options.runtime && group === 'node' && action === 'status') {
       const file = join(stateDir, 'config.json');
       const config = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+      const queues = compactQueueSummary(existsSync(stateDir) ? (await openLedgers()).mailbox : undefined);
       stdout(
         JSON.stringify({
           running: false,
           profile: config.profile,
           member: config.member,
           networks: (config.networks ?? []).map((n: { networkId: string }) => n.networkId),
+          queues,
         }),
       );
       return 0;
@@ -1739,6 +1758,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     stderr(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
     return 1;
   } finally {
+    offlineMailbox?.close();
     if (owned) {
       const stateDirForDaemon = owned.stateDir;
       let pending = false;

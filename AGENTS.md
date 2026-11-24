@@ -11,7 +11,7 @@
 | 模块路径 | 唯一语义职责（Owner） | 非职责禁区（Forbidden） |
 | :--- | :--- | :--- |
 | [`packages/core-types/index.ts`](packages/core-types/index.ts) | 全部跨层接口契约、确定性 `canonicalJson`、`HKDF-SHA256` 网络密钥派生（`deriveNetworkKeys`）、`AES-256-GCM` 帧加解密（`sealNetworkFrame` / `unsealNetworkFrame`）与 Ed25519 签名验签 | 不持有任何运行时状态、I/O 或插件生命周期 |
-| [`packages/process-lock/index.ts`](packages/process-lock/index.ts) | 崩溃可恢复 owner 文件（`runtime.lock` / `mailbox.json.lock`）的唯一记录格式与存活判定：进程实例 token、容器身份，以及本进程当前持有的目录集（按 realpath 归一） | 不获取或释放具体锁，不决定锁粒度、重试与回收流程 |
+| [`packages/process-lock/index.ts`](packages/process-lock/index.ts) | 崩溃可恢复 owner 文件（`runtime.lock` / `outbox.json.lock`）的唯一记录格式与存活判定：进程实例 token、容器身份，以及本进程当前持有的目录集（按 realpath 归一） | 不获取或释放具体锁，不决定锁粒度、重试与回收流程 |
 | [`packages/fs-atomic/index.ts`](packages/fs-atomic/index.ts) | 文件持久化与互斥的唯一 owner：`tmp + fsync + rename + 父目录 fsync` 原子写入/复制、append-only 持久日志，以及持久化 store 和自动更新共用的崩溃可恢复目录锁获取与 stale-owner 回收 | 不持有业务状态、不解析消息、不决定何时写入或锁的语义粒度 |
 | [`packages/kernel/index.ts`](packages/kernel/index.ts) | Cordis 风格微内核与生命周期引擎：依赖注入拓扑激活（`inject`）、逆序先停消费者再停提供者、LIFO `unwind()`、五种事件派发语义（`emit / parallel / serial / bail / waterfall`）与 `composeProfile` / `applyPatch` | 不包含任何 P2P 网络、路由、门禁或执行器业务逻辑 |
 | [`packages/transport/index.ts`](packages/transport/index.ts) & [`native/dealer-iroh-engine`](native/dealer-iroh-engine/src/lib.rs) | 多网络并发挂载（`mountNetwork`）、基于 `swarmTopicId` 的加密发现信标、带 `requestNonce` 绑定的单播/多播/广播帧收发、流式 `BLAKE3` 校验的大文件分片传输（`shareFile` / `fetchBlobToPath`） | 不解析业务信封语义，不决定路由、门禁或执行 |
@@ -20,7 +20,7 @@
 | [`packages/gate/index.ts`](packages/gate/index.ts) | 入站四态门禁（`open` / `approval_required` / `dnd` / `closed`）、按网络覆盖模式、优先级 `GateRulePlugin`、`approve(--trust-sender)` 发送方信任放行与 `drainDnd()` 排空 | 不越过 `dispatcher` 直接调用外部执行器 |
 | [`packages/dispatcher/index.ts`](packages/dispatcher/index.ts) & [`packages/plugins-policy/index.ts`](packages/plugins-policy/index.ts) | 持久化 DeliveryLedger、dedup CAS 策略、统一 dispatcher/inbound 事件与 idle/drain 门控，通过注册的 ExecutorPlugin 投递并签发 DeliveryReceipt | 不静默吞掉错误；未知外部副作用不盲目自动重放；宿主操作归对应 Ring-2 插件 |
 | [`packages/plugins-agent-host/`](packages/plugins-agent-host/index.ts) | Ring-2 宿主插件唯一 owner：声明式 `AGENT_HOST_DESCRIPTORS`、CLI/App 调用参数、别名与会话续接、workspace trust、`agent-host` WakeupDriver 及命名宿主 executor；共享 raw pipe 执行委托给 `plugins-executor` | 不决定核心 mailbox 状态，不依赖 CLI 或 Orca 插件 |
-| [`packages/mailbox/store.ts`](packages/mailbox/store.ts) | 唯一持久化信箱账本（`the-dealer-mailbox/v2`）：mode/stream 寻址、租约、opaque `driver/driverConfig`、`bindingRevision` CAS 启动/延迟/结算围栏、按方向区分的 threads、只读槽位义务快照、原子 `pinSessionMailbox` / `completeWakeDelivery`、v1 无损迁移、锁与原子写入、事件唤醒 | 不解释 driver 配置、不选择宿主或执行器；唯一历史词汇例外为 v1 迁移中的一个 `agent-host` driver id |
+| [`packages/mailbox/store.ts`](packages/mailbox/store.ts) | 唯一持久化信箱账本（`the-dealer-mailbox/v2`，`mailbox.sqlite` WAL）：mode/stream 寻址、租约、opaque `driver/driverConfig`、`bindingRevision` CAS 启动/延迟/结算围栏、按方向区分的 threads、只读队列和槽位义务快照、原子 `pinSessionMailbox` / `completeWakeDelivery`、v1/v2 JSON 一次性迁移、事件唤醒 | 不解释 driver 配置、不选择宿主或执行器；唯一历史词汇例外为 v1 迁移中的一个 `agent-host` driver id |
 | [`packages/mailbox/wakeup.ts`](packages/mailbox/wakeup.ts) | 宿主无关 `WakeupRedriveService`：WakeupDriver 注册/注销、事件与定时重驱、指针生成、coalescing/backoff、未知外部副作用 fence 与 revision 校验重驱；汇总槽位活动与就绪状态，通过 driver 探测宿主与调用外部投递 | 不包含宿主或 Orca 词汇，不探测终端，不启动外部命令；driver 由 CLI 组合根注入 |
 | [`packages/plugins-executor/`](packages/plugins-executor/index.ts) & [`packages/plugins-lark-notifier/`](packages/plugins-lark-notifier/index.ts) | 宿主无关 inbox/notify/raw agent-pty、共享外部副作用工具；Lark 插件持有 `LarkNotifyConfig` 与验证器（CLI 仅重导出） | 不反向依赖 CLI；通用 executor 不依赖宿主插件 |
 | [`packages/subprocess/index.ts`](packages/subprocess/index.ts) | 零内部依赖的 OS 子进程与 PATH 工具唯一 owner：`CommandRequest` / `CommandRunner`、`CommandNotStartedError`、`runCommand`（`shell: false`）、`checkedCommand`、`findExecutable` 与 `singleLine` | 不持有业务状态、不决定执行策略、不依赖任何其他内部包 |
@@ -130,6 +130,7 @@ rules:
 - **CLI 本地运行**：
   ```bash
   ./bin/dealer.js node status --json
+  ./bin/dealer.js queue status --all --json
   ```
 - **核心设计文档与扩展指南**：
   - 架构设计真源：[`docs/architecture.md`](docs/architecture.md)

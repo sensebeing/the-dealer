@@ -12,8 +12,14 @@ export function openStateLedgers(
   const outbox = new OutboxStore(join(stateDir, 'outbox.json'), join(stateDir, 'outbox-blobs'), {
     readUnsettledOutboundKeys: () => mailbox.readUnsettledOutboundKeys(),
   });
-  const mailbox = new MailboxStore(join(stateDir, 'mailbox.json'), {
+  const mailbox = new MailboxStore(join(stateDir, 'mailbox.sqlite'), {
     legacyInboxPath, outbox, readConsumedSequence: () => readLarkConsumedSequence(stateDir, readLarkConfig?.()),
   });
   return { mailbox, outbox };
+}
+
+export function compactQueueSummary(mailbox?: MailboxStore) {
+  const { activeMailboxes = 0, queuedItems = 0, leasedItems = 0, pendingWakes = 0, fencedTargets = 0 } =
+    mailbox?.summarizeQueues().summary ?? {};
+  return { activeMailboxes, queuedItems, leasedItems, pendingWakes, fencedTargets };
 }

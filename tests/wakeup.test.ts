@@ -33,6 +33,7 @@ import type {
   CommandRunner,
   ExecutionContext,
   MessageEnvelope,
+  WakeupTransitionEvent,
 } from '../packages/index.ts';
 
 function directory(t: TestContext): string {
@@ -61,6 +62,63 @@ function alert(id: string, patch: Partial<MessageEnvelope> = {}): MessageEnvelop
     ...patch,
   };
 }
+
+test('wake transitions log changing defer reasons, recovery and fences once per edge', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.parkWakeDelivery('already-fenced', 'previous outcome unknown');
+  const events: WakeupTransitionEvent[] = [];
+  let now = Date.now();
+  let action = 'busy';
+  const service = new WakeupRedriveService({
+    store, now: () => now, flushIntervalMs: 100_000, onTransition: event => events.push(event),
+    drivers: [{
+      name: 'test',
+      async deliver({ target, mailboxId, preview }) {
+        if (action === 'gone') return { kind: 'disarm', reason: action };
+        if (action === 'unknown') {
+          store.beginWakeDelivery(mailboxId, target.bindingRevision);
+          store.parkWakeDelivery(mailboxId, 'receipt missing');
+          return { kind: 'noop', reason: 'receipt missing' };
+        }
+        if (action !== 'ready') return { kind: 'defer', reason: action };
+        store.completeWakeDelivery(mailboxId, preview.items.at(-1)!.sequence);
+        return { kind: 'delivered', pointer: 'pointer' };
+      },
+    }],
+  });
+  t.after(async () => { await service.stop(); store.close(); });
+  const force = { force: true };
+  await service.flushMailbox('already-fenced', force);
+  assert.deepEqual(events, [], 'reloading an existing fence does not create a new transition');
+  store.enqueue([alert('log-edge')], { wakeTarget: { driver: 'test', coalesceMs: 60_000 } });
+  await service.flushMailbox('default', force);
+  now += 100;
+  await service.flushMailbox('default', force);
+  now += 100;
+  action = 'draft';
+  await service.flushMailbox('default', force);
+  now += 100;
+  action = 'ready';
+  await service.flushMailbox('default', force);
+  assert.deepEqual(events.map(({ state }) => state), ['deferred', 'deferred', 'delivered']);
+  assert.equal(events[0].reason, 'busy');
+  assert.equal(events[1].reason, 'draft');
+  assert.equal(events[2].attemptCount, 3);
+  assert.equal(events[2].waitMs, 300);
+
+  store.enqueue([alert('log-fence')]);
+  action = 'unknown';
+  await service.flushMailbox('default', force);
+  await service.flushMailbox('default', force);
+  store.upsertWakeTarget('default', { deliveryInDoubt: undefined, attemptCount: 0, lastWakeError: undefined });
+  store.enqueue([alert('log-disarm')]);
+  action = 'gone';
+  await service.flushMailbox('default', force);
+  await service.flushMailbox('default', force);
+  assert.deepEqual(events.slice(3).map(({ state }) => state), ['fenced', 'unfenced', 'disarmed']);
+  assert.equal(events[3].reason, 'receipt missing');
+  assert.equal(events[5].reason, 'gone');
+});
 
 function textOf(call: CommandRequest): string {
   return String(call.args[call.args.indexOf('--text') + 1]);
@@ -4472,13 +4530,10 @@ test('a removed non-auto-created workspace disarms wake retries but keeps the qu
 test('a persisted unknown-effect fence survives reload and blocks delivery', async t => {
   const root = directory(t);
   const path = join(root, 'mailbox.json');
-  new MailboxStore(path).enqueue([alert('legacy')], { mailboxId: 'box', wakeTarget: { driver: 'orca-run', driverConfig: { runId: 'run-legacy' } } });
-  // Reproduce the persisted shape of a send whose external outcome was never confirmed.
-  const raw = JSON.parse(readFileSync(path, 'utf8'));
-  raw.wakeTargets.box = {
-    ...raw.wakeTargets.box, deliveryInDoubt: true, pendingWake: false, earliestWakeAt: 0,
-  };
-  writeFileSync(path, JSON.stringify(raw));
+  const seed = new MailboxStore(path);
+  seed.enqueue([alert('legacy')], { mailboxId: 'box', wakeTarget: { driver: 'orca-run', driverConfig: { runId: 'run-legacy' } } });
+  seed.beginWakeDelivery('box');
+  seed.close();
 
   const store = new MailboxStore(path);
   const loaded = store.getWakeTarget('box')!;
@@ -4500,7 +4555,7 @@ test('a persisted unknown-effect fence survives reload and blocks delivery', asy
   assert.deepEqual(await service.flushReady(), []);
   const forced = await service.flushMailbox('box', { force: true });
   assert.equal(forced.woke, false);
-  assert.match(forced.reason!, /reconciliation/);
+  assert.match(forced.reason!, /outcome is not yet confirmed/);
   assert.equal(calls.length, 0, 'an unknown external outcome must never be replayed');
   assert.equal(store.getWakeTarget('box')!.deliveryInDoubt, true);
 });
