@@ -74,6 +74,8 @@ export interface OrcaTerminalRow {
 interface OrcaProbeOptions {
   /** Slot probes report invalid observations through their caller. */
   throwOnProbeError?: boolean;
+  /** Injected runners opt in when they implement the rendered-screen command. */
+  readScreen?: boolean;
 }
 
 export interface OrcaWorkspaceIdleOptions extends OrcaProbeOptions {
@@ -105,17 +107,6 @@ export interface OrcaWorkspaceIdleOptions extends OrcaProbeOptions {
 
 function matchesOrcaAgentIdentity(agentIdentity: unknown, expectedAgent: SupportedOrcaAgent): boolean {
   return agentIdentity === expectedAgent || (expectedAgent === 'claude' && agentIdentity === 'claude-code');
-}
-
-function orcaAgentReadinessFailure(terminal: OrcaTerminalRow, expectedAgent?: SupportedOrcaAgent): OrcaIdleResult | undefined {
-  if (!expectedAgent || typeof terminal.preview !== 'string') return undefined;
-  if (!matchesOrcaAgentIdentity(terminal.agentIdentity, expectedAgent)) {
-    return { idle: false, reason: 'Target agent is not ready in terminal' };
-  }
-  if (expectedAgent === 'antigravity' && !hasOrcaComposerPrompt(terminal.preview)) {
-    return { idle: false, reason: 'Antigravity composer prompt is not ready' };
-  }
-  return undefined;
 }
 
 /** Select the same reuse candidates for workspace readiness and terminal resolution. */
@@ -384,18 +375,11 @@ export async function checkOrcaWorkspaceIdle(
     if (!gatesWakeup(terminal)) {
       continue;
     }
-    if (!terminal.connected || !terminal.writable) {
-      return notIdle();
-    }
-    if (options?.requireTarget) {
-      const agentUnready = orcaAgentReadinessFailure(terminal, options.agent);
-      if (agentUnready) return agentUnready;
-    }
-    if (
-      typeof terminal.preview === 'string' &&
-      !isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity)
-    )
-      return notIdle();
+    const composer = await verifyOrcaTerminalComposerSurface(runner, command, terminal, cwd, signal, {
+      expectedAgent: options?.requireTarget ? options.agent : undefined,
+      readScreen: options?.readScreen,
+    });
+    if (!composer.idle) return options?.requireTarget ? composer : notIdle();
     // A recognized agent (or inventory without preview metadata) needs authoritative TUI readiness.
     // A bare shell has no agent TUI yet; its workspace proof permits only the bootstrap path.
     if (
@@ -498,9 +482,9 @@ export async function checkOrcaWorkspaceIdle(
     }
     return notIdle();
   }
-  if (options?.requireTarget && runner === runCommand && typeof rootTarget === 'string') {
+  if (options?.requireTarget && (runner === runCommand || options.readScreen === true) && typeof rootTarget === 'string') {
     return checkOrcaTerminalComposer(runner, command, rootTarget, cwd, signal, {
-      requirePreview: true, expectedAgent: options.agent,
+      requirePreview: true, expectedAgent: options.agent, readScreen: options.readScreen,
     });
   }
   return { idle: true, reason: undefined };
@@ -601,22 +585,101 @@ export async function readOrcaTerminal(
   return undefined;
 }
 
+export interface OrcaTerminalScreen {
+  readonly source: 'screen' | 'stream' | 'screen-unavailable' | undefined;
+  readonly text?: string;
+  readonly draft?: string;
+}
+
+function isUnsupportedOrcaScreenFlag(parsed: unknown): boolean {
+  return isRecord(parsed) && parsed.ok === false && isRecord(parsed.error) &&
+    parsed.error.code === 'invalid_argument' && typeof parsed.error.message === 'string' &&
+    /\bunknown flag\s+['"`]?--screen(?![\w-])/i.test(parsed.error.message);
+}
+
+export async function readOrcaTerminalScreen(
+  runner: CommandRunner, command: string, terminalHandle: string, cwd?: string, signal?: AbortSignal,
+): Promise<OrcaTerminalScreen> {
+  let result;
+  try {
+    result = await runner({ command, args: ['terminal', 'read', '--terminal', terminalHandle, '--screen', '--json'], cwd, signal });
+  } catch (error) {
+    // The subprocess runner rejects nonzero exits but preserves Orca's structured stdout.
+    if (isRecord(error) && typeof error.exitCode === 'number' && typeof error.stdout === 'string') {
+      let parsed;
+      try {
+        parsed = JSON.parse(error.stdout);
+      } catch {
+        throw error;
+      }
+      if (isUnsupportedOrcaScreenFlag(parsed)) return { source: undefined };
+    }
+    throw error;
+  }
+  const parsed = JSON.parse(result.stdout);
+  if (isUnsupportedOrcaScreenFlag(parsed)) return { source: undefined };
+  if ((result.exitCode !== undefined && result.exitCode !== 0) || parsed?.ok !== true) {
+    throw new Error(`Orca terminal read failed: ${(result.stderr || result.stdout).trim()}`);
+  }
+  const terminal = parsed.result?.terminal;
+  if (!isRecord(terminal)) throw new Error('Orca terminal read returned no terminal');
+  const draft = typeof terminal.draft === 'string' ? terminal.draft : undefined;
+  const source = terminal.source as OrcaTerminalScreen['source'];
+  if (source !== 'screen') return { source, draft };
+  if (!Array.isArray(terminal.tail)) throw new Error('Orca terminal read returned no screen tail');
+  return { source, text: terminal.tail.join('\n'), draft };
+}
+
+interface OrcaComposerOptions {
+  requirePreview?: boolean;
+  expectedAgent?: SupportedOrcaAgent;
+  readScreen?: boolean;
+}
+
+async function verifyOrcaTerminalComposerSurface(
+  runner: CommandRunner, command: string, terminal: OrcaTerminalRow, cwd: string | undefined,
+  signal: AbortSignal | undefined, options: OrcaComposerOptions & { alwaysReadScreen?: boolean },
+): Promise<OrcaIdleResult> {
+  if (!isUsableTerminal(terminal))
+    return { idle: false, reason: 'Terminal is disconnected or not writable' };
+  const { expectedAgent, requirePreview } = options;
+  if (expectedAgent && (typeof terminal.preview === 'string' || terminal.agentIdentity != null) &&
+      !matchesOrcaAgentIdentity(terminal.agentIdentity, expectedAgent)) {
+    return { idle: false, reason: 'Target agent is not ready in terminal' };
+  }
+
+  const evaluateSurface = (surface: unknown): OrcaIdleResult => {
+    if (typeof surface !== 'string') {
+      return requirePreview ? { idle: false, reason: 'Terminal composer is unverifiable' } : { idle: true };
+    }
+    if (expectedAgent === 'antigravity' && !hasOrcaComposerPrompt(surface))
+      return { idle: false, reason: 'Antigravity composer prompt is not ready' };
+    if (!isOrcaComposerEmpty(surface, terminal.agentIdentity))
+      return { idle: false, reason: 'Terminal composer has unsent draft' };
+    return { idle: true };
+  };
+
+  const useScreen = options.readScreen ?? (runner === runCommand);
+  if (!useScreen || !options.alwaysReadScreen) {
+    const preview = evaluateSurface(terminal.preview);
+    if (preview.idle || !useScreen) return preview;
+  }
+  const screen = await readOrcaTerminalScreen(runner, command, terminal.handle, cwd, signal);
+  if (screen.draft?.trim()) return { idle: false, reason: 'Terminal composer has unsent draft' };
+  return evaluateSurface(screen.source === 'screen' ? screen.text : terminal.preview);
+}
+
 async function checkOrcaTerminalComposer(
   runner: CommandRunner, command: string, terminalHandle: string, cwd?: string, signal?: AbortSignal,
-  options?: { requirePreview?: boolean; expectedAgent?: SupportedOrcaAgent },
+  options?: OrcaComposerOptions,
 ): Promise<OrcaIdleResult> {
   const terminal = await readOrcaTerminal(runner, command, terminalHandle, cwd, signal);
-  if (terminal && (terminal.connected !== true || terminal.writable === false))
-    return { idle: false, reason: 'Terminal is disconnected or not writable' };
-  if (options?.requirePreview && typeof terminal?.preview !== 'string')
-    return { idle: false, reason: 'Terminal composer is unverifiable' };
-  if (typeof terminal?.preview === 'string') {
-    const agentUnready = orcaAgentReadinessFailure(terminal, options?.expectedAgent);
-    if (agentUnready) return agentUnready;
-    if (!isOrcaComposerEmpty(terminal.preview, terminal.agentIdentity))
-      return { idle: false, reason: 'Terminal composer has unsent draft' };
+  if (!terminal) {
+    return options?.requirePreview ? { idle: false, reason: 'Terminal composer is unverifiable' } : { idle: true };
   }
-  return { idle: true };
+  return verifyOrcaTerminalComposerSurface(runner, command, terminal, cwd, signal, {
+    ...options, alwaysReadScreen: options?.requirePreview,
+  });
 }
 
 /** Every terminal-only target receives the same composer protection as workspace targets. */
@@ -630,12 +693,13 @@ export async function probeOrcaTerminalIdle(
 ): Promise<OrcaIdleResult> {
   try {
     const expectedAgent = options?.verifyComposerLast ? options.expectedAgent : undefined;
-    const composer = await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal, { expectedAgent });
+    const readScreen = options?.readScreen;
+    const composer = await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal, { expectedAgent, readScreen });
     if (!composer.idle) return composer;
     const result = await waitOrcaTerminalIdle(runner, command, terminalHandle, cwd, 1, signal, options);
-    if (result.idle && options?.verifyComposerLast && runner === runCommand) {
+    if (result.idle && options?.verifyComposerLast && (runner === runCommand || readScreen === true)) {
       return await checkOrcaTerminalComposer(runner, command, terminalHandle, cwd, signal, {
-        requirePreview: true, expectedAgent,
+        requirePreview: true, expectedAgent, readScreen,
       });
     }
     return result.idle

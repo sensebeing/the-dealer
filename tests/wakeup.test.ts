@@ -5130,6 +5130,107 @@ test('a fresh redrive tab defers until the expected composer appears', async t =
 const acceptedOrcaPrompt = {
   provider: 'antigravity', observation: 'supported', stages: ['input_accepted', 'turn_started'], requestId: 'request-1',
 };
+
+const antigravityScreenTail = ['─'.repeat(58), narrowAntigravityPlaceholder, '─'.repeat(58), '? for shortcuts'];
+const antigravitySplash = 'Antigravity Ready\nWelcome to Antigravity';
+
+function orcaScreenResult(terminal: { source?: string; tail: string[]; draft?: string }) {
+  return {
+    stdout: JSON.stringify({ ok: true, result: { terminal: { handle: probeTerminal.handle, status: 'running', ...terminal } } }),
+  };
+}
+
+test('Orca wake verifies the rendered composer and UI draft before sending', async t => {
+  const unsupportedScreen = {
+    stdout: JSON.stringify({ ok: false, error: {
+      code: 'invalid_argument', message: 'Unknown flag --screen for command: terminal read',
+    } }),
+    exitCode: 1,
+  };
+  const ready = orcaScreenResult({ source: 'screen', tail: antigravityScreenTail });
+  const unavailable = orcaScreenResult({ source: 'screen-unavailable', tail: antigravityScreenTail });
+  const cases = [
+    { name: 'background preview omits prompt', preview: antigravitySplash, result: ready, reads: 2 },
+    { name: 'stale preview appears to contain a draft', preview: '> already submitted', result: ready },
+    { name: 'ready preview takes one screen read', result: ready, reads: 1 },
+    { name: 'screen fallback to ready preview', result: unavailable, reads: 1 },
+    { name: 'legacy response without a source falls back to ready preview',
+      result: orcaScreenResult({ tail: ['stream history'] }), reads: 1 },
+    { name: 'legacy flag rejection falls back to ready preview', result: unsupportedScreen, rejected: true, reads: 1 },
+    { name: 'screen still loading', result: orcaScreenResult({ source: 'screen', tail: ['Starting Antigravity…'] }),
+      reason: /Antigravity composer prompt is not ready/ },
+    { name: 'native draft with empty prompt', result: orcaScreenResult({ source: 'screen', tail: antigravityScreenTail, draft: ' human input ' }),
+      reason: /Terminal composer has unsent draft/ },
+    { name: 'native draft with stream fallback', result: orcaScreenResult({ source: 'stream', tail: [], draft: ' human input ' }),
+      reason: /Terminal composer has unsent draft/ },
+    { name: 'multiline rendered draft', result: orcaScreenResult({ source: 'screen', tail: ['─────', '> ', 'draft continuation', '─────', 'esc to cancel'] }),
+      reason: /Terminal composer has unsent draft/ },
+    { name: 'screen unavailable and preview missing prompt', preview: antigravitySplash, result: unavailable,
+      reason: /Antigravity composer prompt is not ready/ },
+    { name: 'legacy flag rejection and preview missing prompt', preview: antigravitySplash, result: unsupportedScreen,
+      reason: /Antigravity composer prompt is not ready/ },
+    { name: 'runtime error', result: { stdout: '{"ok":false,"error":{"code":"runtime_unavailable","message":"Orca daemon disconnected"}}', exitCode: 1 },
+      reason: /Orca daemon disconnected/ },
+    { name: 'unrelated flag rejection', result: { stdout: '{"ok":false,"error":{"code":"invalid_argument","message":"Unknown flag --terminal; valid flags include --screen"}}' },
+      reason: /Unknown flag --terminal/ },
+    { name: 'timeout', result: { stdout: '' }, rejected: true, reason: /Screen read timed out/ },
+    { name: 'malformed JSON', result: { stdout: '{' }, reason: /JSON/ },
+  ];
+  for (const target of ['workspace', 'terminal'] as const) {
+    for (const { name, preview = '> ', result, rejected, reason, reads } of cases) {
+      await t.test(`${target}: ${name}`, async t => {
+        const root = directory(t);
+        const workspacePath = target === 'workspace' ? root : undefined;
+        const store = new MailboxStore(join(root, 'mailbox.json'));
+        const mailboxId = 'stream:screen-composer';
+        const terminal = { ...probeTerminal, preview };
+        const { runner: inventory, state } = fakeOrcaWorkspace(root, [terminal]);
+        const screenReads: CommandRequest[] = [];
+        const runner: CommandRunner = async request => {
+          const { args } = request;
+          if (args[1] === 'show') return { stdout: JSON.stringify({ ok: true, result: { terminal } }) };
+          if (args[1] === 'read') {
+            state.calls.push(request);
+            screenReads.push(request);
+            assert.deepEqual(args, ['terminal', 'read', '--terminal', terminal.handle, '--screen', '--json']);
+            assert.equal(request.cwd, workspacePath);
+            if (rejected) throw Object.assign(new Error(result.stdout || 'Screen read timed out'), result);
+            return result;
+          }
+          const output = await inventory(request);
+          return args[1] === 'send' ? orcaTerminalSendReceipt({ accepted: true, prompt: acceptedOrcaPrompt }) : output;
+        };
+        store.enqueue([alert('screen-composer')], {
+          mailboxId,
+          wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: { workspacePath, terminalHandle: terminal.handle, agent: 'antigravity' } },
+        });
+        const service = new WakeupRedriveService({
+          store,
+          drivers: createTestWakeupDrivers({ commandRunner: runner, readScreen: true }),
+        });
+        t.after(async () => { await service.stop(); store.close(); });
+
+        assert.equal(store.getWakeTarget(mailboxId)?.attemptCount, 0);
+        const delivery = await service.flushMailbox(mailboxId, { force: true });
+        assert.equal(delivery.woke, !reason, delivery.reason);
+        assert.equal(sendsTo(state.calls, terminal.handle).length, reason ? 0 : 1);
+        assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, Boolean(reason));
+        assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, undefined);
+        if (reason) {
+          assert.match(delivery.reason ?? '', reason);
+        } else {
+          const sent = sendsTo(state.calls, terminal.handle)[0];
+          const finalRead = screenReads.at(-1)!;
+          assert.ok(state.calls.lastIndexOf(finalRead) > state.calls.findLastIndex(call => call.args[1] === 'wait'));
+          assert.equal(state.calls[state.calls.indexOf(sent) - 1], finalRead);
+        }
+        if (reads !== undefined) assert.equal(screenReads.length, reads);
+        else assert.ok(screenReads.length >= 1);
+      });
+    }
+  }
+});
+
 const orcaReceiptFailures = [
   { name: 'refused', send: { accepted: false, refusedReason: 'terminal_busy' }, detail: /terminal_busy/, retryable: true },
   { name: 'missing-acceptance', send: { prompt: acceptedOrcaPrompt }, detail: /did not verify input acceptance/, retryable: false },

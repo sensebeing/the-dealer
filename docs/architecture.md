@@ -669,6 +669,8 @@ flushes and restarts. Root target terminals verify `tui-idle` readiness, an empt
 the configured agent identity before pointer injection. Antigravity also requires a rendered
 composer prompt when it is the configured agent. Its official mode placeholders count as an empty
 composer even when truncated with an ellipsis in a narrow terminal.
+Preflight checks consult `orca terminal read --screen` when the stream preview would block delivery.
+The final check uses the rendered screen and Orca's UI-only `draft` field, falling back to the stream preview only when the rendered screen is unavailable or unsupported.
 Workspace terminal selection and readiness use the same reuse candidates.
 Bound terminal presence has three outcomes. A connected and
 writable terminal is `live` and retains its composer gate. A matching terminal that is
