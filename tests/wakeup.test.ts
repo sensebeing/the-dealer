@@ -4356,6 +4356,64 @@ test('Orca readiness waits on the bound terminal and ignores timeout and cancell
   }
 });
 
+test('an Orca readiness wait renews after a timeout and wakes on the next idle event', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const mailboxId = 'terminal:term-wave';
+  const waits: { signal?: AbortSignal; finish: (output: Awaited<ReturnType<CommandRunner>>) => void }[] = [];
+  let now = Date.now();
+  let idle = false;
+  let probes = 0;
+  let sends = 0;
+  const runner: CommandRunner = async ({ args, signal }) => {
+    if (args[1] === 'show') {
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: probeTerminal } }) };
+    }
+    if (args[1] === 'wait') {
+      if (args[7] === '60000') return new Promise(resolve => waits.push({ signal, finish: resolve }));
+      assert.equal(args[7], '1');
+      probes++;
+      return { stdout: JSON.stringify({ ok: idle }) };
+    }
+    assert.equal(args[1], 'send');
+    sends++;
+    return orcaTerminalSendReceipt({ accepted: true, prompt: acceptedOrcaPrompt });
+  };
+  store.enqueue([alert('waiting')], {
+    mailboxId,
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { terminalHandle: probeTerminal.handle } },
+  });
+  const service = new WakeupRedriveService({
+    store, now: () => now, flushIntervalMs: 100_000,
+    drivers: createOrcaWakeupDrivers({ commandRunner: runner, enableReadinessSubscription: true }),
+  });
+  t.after(async () => { await service.stop(); store.close(); });
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false);
+  assert.equal(waits.length, 1);
+
+  now += 59_999;
+  assert.equal((await service.flushReady())[0]?.woke, false);
+  assert.equal(waits.length, 1, 'reconciliation retains the current wait until it ends');
+  assert.equal(probes, 2);
+  now += 1;
+  waits[0].finish({ stdout: '{"ok":false,"error":{"code":"timeout"}}', exitCode: 1 });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(probes, 2, 'timeout does not trigger a wake attempt');
+  assert.equal(waits.length, 1, 'timeout leaves renewal to reconciliation');
+
+  now = store.getWakeTarget(mailboxId)!.earliestWakeAt;
+  assert.equal((await service.flushReady())[0]?.woke, false);
+  assert.equal(waits.length, 2, 'the next deferred reconciliation renews the wait');
+  assert.equal(waits[0].signal?.aborted, true);
+
+  now += 250;
+  assert.ok(now < store.getWakeTarget(mailboxId)!.earliestWakeAt);
+  idle = true;
+  waits[1].finish({ stdout: '{"ok":true}' });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(sends, 1, 'idle wakes the mailbox before the backoff expires');
+  assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
+});
+
 test('only newly inserted conversational frames bypass coalescing and never reset retry backoff', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));

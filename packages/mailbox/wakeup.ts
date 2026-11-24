@@ -32,6 +32,8 @@ export interface WakeupReadinessContext {
   readonly mailboxId: string;
   readonly target: WakeTargetState;
   readonly reason?: string;
+  /** Ends a wait without requesting an immediate wake attempt. */
+  readonly onSettled?: () => void;
 }
 export type WakeupDriverOutcome =
   | {
@@ -700,10 +702,16 @@ export class WakeupRedriveService {
     const startedAt = this.now();
     const wait: ReadinessWait = { revision, startedAt, reconciledAt: startedAt };
     this.readinessSubscriptions.set(mailboxId, wait);
+    const finishWait = (): boolean => {
+      if (this.stopped || this.readinessSubscriptions.get(mailboxId) !== wait) return false;
+      this.clearReadiness(mailboxId);
+      return true;
+    };
     try {
-      const subscription = driver.subscribeReadiness({ mailboxId, target, reason: target.lastWakeError }, () => {
-        if (this.stopped || this.readinessSubscriptions.get(mailboxId) !== wait) return;
-        this.clearReadiness(mailboxId);
+      const subscription = driver.subscribeReadiness({
+        mailboxId, target, reason: target.lastWakeError, onSettled: finishWait,
+      }, () => {
+        if (!finishWait()) return;
         const latest = this.store.getWakeTarget(mailboxId);
         if (!latest?.pendingWake || latest.deliveryInDoubt || latest.attemptCount === 0 ||
             (latest.bindingRevision ?? 0) !== revision) return;

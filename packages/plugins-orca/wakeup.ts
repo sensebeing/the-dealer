@@ -116,14 +116,15 @@ function orcaReadinessSubscription(options: OrcaWakeupDriverOptions): WakeupDriv
   const enabled = options.enableReadinessSubscription ?? runner === runCommand;
   if (options.idleCheck || !enabled) return undefined;
 
-  return ({ target }, onReady) => {
+  return ({ target, onSettled }, onReady) => {
     const { terminalHandle, workspacePath, orcaCommand } = readOrcaDriverConfig(target);
     if (!terminalHandle) return undefined;
     const controller = new AbortController();
     void waitOrcaTerminalIdle(runner, orcaCommand ?? options.orcaCommand ?? 'orca', terminalHandle,
       workspacePath, 60_000, controller.signal).then(result => {
-      // Idle and non-timeout exits prompt the authoritative delivery checks to reconcile.
-      if (!controller.signal.aborted && !result.timedOut) onReady();
+      if (controller.signal.aborted) return;
+      if (result.timedOut) onSettled?.();
+      else onReady();
     });
     return { dispose: () => controller.abort() };
   };
