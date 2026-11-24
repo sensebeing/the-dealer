@@ -976,7 +976,7 @@ export async function sendOrcaTerminalText(
     '--json',
   ];
   const mutationRunner = orcaMutationRunner(runner, options.cwd);
-  const sendOnce = async (request: CommandRequest) => {
+  const sendOnce = async (request: CommandRequest): Promise<unknown> => {
     let returned: Awaited<ReturnType<CommandRunner>> | undefined;
     let output;
     try {
@@ -1005,18 +1005,18 @@ export async function sendOrcaTerminalText(
     const send = parsed?.result?.send;
     const refusal = orcaTerminalSendRefusal(send);
     if (refusal) throw refusal;
-    return send;
+    return parsed;
   };
-  let send;
+  let parsed: unknown;
   try {
-    send = await sendOnce({ command, args, cwd: options.cwd, signal: options.signal });
+    parsed = await sendOnce({ command, args, cwd: options.cwd, signal: options.signal });
   } catch (error) {
     const missingSender = 'no_active_sender_terminal';
     const canUseSelf = error instanceof OrcaTerminalSendRefusedError
       ? error.refusedReason === missingSender
-      : String(error).includes(missingSender);
+      : !(error instanceof SyntaxError) && String(error).includes(missingSender);
     if (!canUseSelf) throw error;
-    send = await sendOnce({
+    parsed = await sendOnce({
       command,
       args: [...args, '--allow-self'],
       cwd: options.cwd,
@@ -1024,25 +1024,33 @@ export async function sendOrcaTerminalText(
       env: { ...process.env, ORCA_TERMINAL_ID: terminalHandle },
     });
   }
-  if (!isRecord(send)) return;
   if (options.waitSubmit === undefined && options.expectedAgent === undefined) return;
+  if (!isRecord(parsed) || parsed.ok !== true) throw new Error('Orca terminal send receipt did not verify input acceptance');
+  // Older injected runners can acknowledge a send with only an OK envelope.
+  if (!Object.hasOwn(parsed, 'result')) return;
+  const send = isRecord(parsed.result) ? parsed.result.send : undefined;
+  if (!isRecord(send) || send.accepted !== true) throw new Error('Orca terminal send receipt did not verify input acceptance');
   const prompt = send.prompt;
-  if (!isRecord(prompt)) return;
+  if (!isRecord(prompt)) throw new Error('Orca terminal send is missing prompt receipt');
   const { provider, observation, stages } = prompt;
   const requestId = prompt.requestId ?? send.requestId ?? 'unknown';
   if (observation === 'permission' || observation === 'incarnation_replaced') {
     throw new Error(`Orca prompt delivery unverified: ${observation} (request ${requestId})`);
   }
-  if (
-    options.expectedAgent && typeof provider === 'string' && provider !== 'old-host' &&
-    !matchesOrcaAgentIdentity(provider, options.expectedAgent)
-  ) {
+  if (provider === 'old-host') return;
+  if (typeof provider !== 'string' || !provider.trim()) {
+    throw new Error(`Orca prompt receipt is missing provider (request ${requestId})`);
+  }
+  if (options.expectedAgent && !matchesOrcaAgentIdentity(provider, options.expectedAgent)) {
     throw new Error(`Orca prompt provider ${provider} did not verify delivery to ${options.expectedAgent} (request ${requestId})`);
   }
-  if (
-    options.waitSubmit !== undefined && typeof provider === 'string' && provider !== 'unsupported' && provider !== 'old-host' &&
-    !(Array.isArray(stages) && stages.includes('turn_started'))
-  ) {
+  if (observation !== (provider === 'unsupported' ? 'unsupported' : 'supported')) {
+    throw new Error(`Orca prompt receipt has invalid observation (request ${requestId}, provider ${provider}, observation ${observation})`);
+  }
+  if (!Array.isArray(stages) || stages.some(stage => typeof stage !== 'string')) {
+    throw new Error(`Orca prompt receipt has invalid stages (request ${requestId}, provider ${provider}, stages ${JSON.stringify(stages)})`);
+  }
+  if (options.waitSubmit !== undefined && provider !== 'unsupported' && !stages.includes('turn_started')) {
     throw new Error(`Orca prompt turn not observed (request ${requestId}, provider ${provider}, observation ${observation}, stages ${JSON.stringify(stages)})`);
   }
 }

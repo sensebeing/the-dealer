@@ -4721,6 +4721,12 @@ const acceptedOrcaPrompt = {
 };
 const orcaReceiptFailures = [
   { name: 'refused', send: { accepted: false, refusedReason: 'terminal_busy' }, detail: /terminal_busy/, retryable: true },
+  { name: 'missing-acceptance', send: { prompt: acceptedOrcaPrompt }, detail: /did not verify input acceptance/, retryable: false },
+  { name: 'missing-prompt', send: { accepted: true }, detail: /missing prompt receipt/, retryable: false },
+  { name: 'malformed-prompt', send: { accepted: true, prompt: [] }, detail: /missing prompt receipt/, retryable: false },
+  { name: 'missing-provider', send: { accepted: true, prompt: { observation: 'supported', stages: ['input_accepted'] } }, detail: /missing provider/, retryable: false },
+  { name: 'missing-observation', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, observation: undefined } }, detail: /invalid observation/, retryable: false },
+  { name: 'malformed-stages', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, stages: 'turn_started' } }, detail: /invalid stages/, retryable: false },
   { name: 'unsupported', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'unsupported', stages: ['input_accepted'] } }, detail: /unsupported.*antigravity/, retryable: false },
   { name: 'wrong-provider', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, provider: 'codex' } }, detail: /codex.*antigravity/, retryable: false },
   { name: 'queued', send: { accepted: true, prompt: { ...acceptedOrcaPrompt, stages: ['input_accepted'] } }, detail: /request-1.*antigravity.*supported.*input_accepted/, retryable: false },
