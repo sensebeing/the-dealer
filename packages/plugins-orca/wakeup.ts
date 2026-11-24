@@ -871,6 +871,7 @@ class OrcaWakeDelivery {
     preview: MailboxCheckResult,
     command: string,
     dedicatedTab: boolean,
+    excludedHandles: ReadonlySet<string>,
     advisory: boolean,
   ): Promise<OrcaWakePlan> {
     if (target.driver !== 'orca-terminal') return { kind: 'reuse' };
@@ -883,14 +884,21 @@ class OrcaWakeDelivery {
     }
     if (needsSessionRotation(target, preview)) return { kind: 'rotate' };
     if (!workspacePath) return { kind: 'reuse' };
-    const exclusive = dedicatedTab || Boolean(target.sessionId?.trim() || target.paneKey?.trim());
-    if (!target.terminalHandle && !target.paneKey) {
+    const { terminalHandle, paneKey } = target;
+    const exclusive = dedicatedTab || Boolean(target.sessionId?.trim() || paneKey?.trim());
+    if (!terminalHandle && !paneKey) {
       return exclusive ? { kind: 'spawn-unbound' } : { kind: 'reuse' };
     }
+    const claimedHandle = terminalHandle && excludedHandles.has(terminalHandle) ? terminalHandle : undefined;
+    if (claimedHandle) {
+      const reason = await this.retainedHandleBlockReason(command, workspacePath, claimedHandle, advisory);
+      if (reason) return { kind: 'defer', reason };
+    }
     if (this.idleCheck) return { kind: 'reuse' };
-    const presence = await inspectOrcaWorkspaceTerminal(
-      this.runner, command, workspacePath, target.terminalHandle, undefined, target.paneKey, advisory,
-    );
+    const unclaimedHandle = claimedHandle ? undefined : terminalHandle;
+    const presence = unclaimedHandle || paneKey
+      ? await inspectOrcaWorkspaceTerminal(this.runner, command, workspacePath, unclaimedHandle, undefined, paneKey, advisory)
+      : 'absent';
     if (presence === 'unusable') {
       return { kind: 'defer', reason: 'Terminal is disconnected or not writable' };
     }
@@ -907,7 +915,7 @@ class OrcaWakeDelivery {
     const command = target.orcaCommand ?? this.command;
     let plan: OrcaWakePlan;
     try {
-      plan = await this.resolveSessionPlan(target, preview, command, dedicatedTab, advisory);
+      plan = await this.resolveSessionPlan(target, preview, command, dedicatedTab, excludedHandles, advisory);
     } catch (error) {
       if (!target.workspacePath) throw error;
       // The workspace census can still prove absence when the terminal inventory fails.
@@ -1076,6 +1084,21 @@ class OrcaWakeDelivery {
     })).idle && ownsWorkspace();
   }
 
+  /** A restored pane can move to a new handle only after its original handle disappears. */
+  private async retainedHandleBlockReason(
+    command: string,
+    workspacePath: string,
+    terminalHandle: string,
+    advisory = false,
+  ): Promise<string | undefined> {
+    const presence = await inspectOrcaWorkspaceTerminal(
+      this.runner, command, workspacePath, terminalHandle, undefined, undefined, advisory,
+    );
+    if (presence === 'live') return 'Bound terminal is still live';
+    if (presence === 'unusable') return 'Terminal is disconnected or not writable';
+    return undefined;
+  }
+
   private async boundTerminalReappeared(
     target: OrcaWakeTarget,
     command: string,
@@ -1203,13 +1226,9 @@ class OrcaWakeDelivery {
       )) {
         return this.defer(mailboxId, target, 'Orca terminal ownership changed during selection');
       }
-      if (plan.kind !== 'create' && target.terminalHandle && plan.handle !== target.terminalHandle &&
-        !options.dedicatedTab && !target.sessionId?.trim() && !target.paneKey) {
-        const presence = await inspectOrcaWorkspaceTerminal(
-          this.runner, command, target.workspacePath, target.terminalHandle,
-        );
-        if (presence === 'unusable') return this.defer(mailboxId, target, 'Terminal is disconnected or not writable');
-        if (presence === 'live') return this.defer(mailboxId, target, 'Bound Orca terminal reappeared during selection');
+      if (plan.kind !== 'create' && target.terminalHandle && plan.handle !== target.terminalHandle) {
+        const reason = await this.retainedHandleBlockReason(command, target.workspacePath, target.terminalHandle);
+        if (reason) return this.defer(mailboxId, target, reason);
       }
       if (plan.kind === 'existing') {
         terminalHandle = plan.handle;

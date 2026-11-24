@@ -88,6 +88,7 @@ interface FakeTerminalRow {
   preview?: string;
   tabId?: string;
   leafId?: string;
+  recordedPaneKey?: string;
 }
 
 interface FakeOrcaAgent {
@@ -5322,6 +5323,7 @@ test('a claimed Orca terminal still guards its bound conversation until an indep
   state.terminals = [terminal];
   store.upsertWakeTarget('stream:sibling', { driver: 'orca-terminal', driverConfig });
   const { service } = startSlotProbeService(t, store, runner);
+  assert.deepEqual(await service.probeSlot(mailboxId), { busy: true, ready: false, reason: 'Bound terminal is still live' });
   store.enqueue([alert('shared-conversation')], { mailboxId });
 
   const blocked = await service.flushMailbox(mailboxId, { force: true });
@@ -5341,6 +5343,37 @@ test('a claimed Orca terminal still guards its bound conversation until an indep
   assert.equal(sendsTo(state.calls, terminal.handle).length, 0);
   assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
   assert.ok(state.terminals.some(row => row.handle === terminal.handle));
+});
+
+test('a restored pane does not rebind while its claimed Orca terminal reappears', async t => {
+  const { store, mailboxId, terminal, driverConfig, runner, state } = orcaSessionRecoveryFixture(t, 'stream:recover');
+  const restored = { ...terminal, handle: 'term-restored', tabId: 'restored', recordedPaneKey: driverConfig.paneKey };
+  state.terminals = [restored];
+  store.upsertWakeTarget('stream:sibling', { driver: 'orca-terminal', driverConfig });
+  let reattach = true;
+  const { service } = startSlotProbeService(t, store, async request => {
+    const result = await runner(request);
+    if (reattach && request.args[0] === 'terminal' && request.args[1] === 'wait' && request.args.includes(restored.handle)) {
+      state.terminals = [terminal, restored];
+    }
+    return result;
+  });
+  store.enqueue([alert('claimed-tab-reattached')], { mailboxId });
+
+  const blocked = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(blocked.woke, false);
+  assert.equal(blocked.reason, 'Bound terminal is still live');
+  assert.equal(state.created, 0);
+  assert.equal(terminalSends(state.calls).length, 0);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, terminal.handle);
+
+  reattach = false;
+  state.terminals = [restored];
+  const recovered = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(recovered.woke, true, recovered.reason);
+  assert.equal(state.created, 0);
+  assert.equal(sendsTo(state.calls, restored.handle).length, 1);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.terminalHandle, restored.handle);
 });
 
 for (const [name, availability] of [
