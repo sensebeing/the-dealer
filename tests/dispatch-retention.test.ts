@@ -223,6 +223,34 @@ test('outbox restores and projects in-flight waves while excluding confirmed one
   assert.ok(mailbox.getThread('history-0'));
 });
 
+test('a delivered loopback wave keeps its originating slot busy until downstream acknowledgement', t => {
+  const { mailbox, outbox } = stores(t);
+  const origin = 'stream:origin';
+  const downstream = 'stream:downstream';
+  const wave = envelope('interrupted-loopback', {
+    idempotencyKey: 'interrupted-loopback',
+    semantic: { type: 'message', threadId: 'interrupted-loopback', replyMailbox: origin, targetMailbox: downstream },
+  });
+  const claim = outbox.claimIdempotency({ envelope: wave, explicitTargets: [], plannedTargetNodeIds: [keys.nodeId] });
+  mailbox.enqueue([wave], { mailboxId: downstream });
+  const delivered = outbox.enqueue({ envelope: wave, explicitTargets: [], pendingNodeIds: [],
+    attemptToken: claim.attemptToken, deliveredReceipts: { [keys.nodeId]: receipt(wave.id, 'dispatched') } });
+  assert.equal(delivered.status, 'delivered');
+
+  const restarted = new MailboxStore(mailbox.path, { outbox });
+  const inspect = () => restarted.inspectSlotObligations(origin, { outbox }).immediateBusyReason;
+  assert.deepEqual(restarted.listThreadRecords(wave.id).map(record => record.direction), ['inbound']);
+  assert.equal(inspect(), 'local_outbound_pending');
+
+  restarted.reconcileOutboxThreads(outbox);
+
+  assert.deepEqual(restarted.listThreadRecords(wave.id).map(record => record.direction).sort(), ['inbound', 'outbound']);
+  const downstreamLease = restarted.check({ mailboxId: downstream });
+  assert.equal(inspect(), 'local_outbound_pending');
+  restarted.ack(downstreamLease.deliveryId!, downstream);
+  assert.equal(inspect(), undefined);
+});
+
 test('mailbox without an outbox trims inbound wave history while keeping loopback groups', t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse(old) });
   const { mailbox } = stores(t);

@@ -619,7 +619,8 @@ time. A successful write compacts history in the same atomic commit. The mailbox
 The wave limit covers inbound-only groups and, when an outbox is available, outbound and same-node
 loopback groups whose outbox records show confirmed terminal delivery or have already been
 pruned. Compaction removes all directional records in a group together. Startup reconciliation
-skips confirmed terminal one-way `wave.*` outbox history, so it cannot recreate expired routes.
+skips confirmed terminal one-way `wave.*` outbox history when no unacknowledged local mailbox
+items remain, so it cannot recreate expired routes.
 The CLI supplies the notifier's durable catch-up watermark when Lark is enabled. The mailbox
 retains every acknowledgement above that watermark and every open question route. The outbox
 preserves the latest non-superseded claim for each network and idempotency key, including its
