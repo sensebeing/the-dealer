@@ -2,7 +2,7 @@ import { toMailboxTopicBinding } from '../packages/cli/config.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,7 @@ import {
   DealerNodeRuntime, resolveBoundMailboxId, resolveMailboxId, validateTopicBindings,
   createOrcaSpawnExecutorPlugin, initProjectScaffold, runDealerCli, rpc,
 } from '../packages/index.ts';
-import type { DeliveryReceipt, EmitterService, MessageEnvelope, NodeCard, CommandRequest } from '../packages/index.ts';
+import type { DeliveryReceipt, EmitterService, MessageEnvelope, NodeCard, CommandRequest, PollSourceStatusEvent } from '../packages/index.ts';
 import * as subprocess from '../packages/subprocess/index.ts';
 import * as publicApi from '../packages/index.ts';
 import { dealerCodeFingerprintEntries } from '../packages/cli/auto-update.ts';
@@ -107,6 +107,7 @@ test('explicit saveCursor and advanceItemCursor retain ownership, including rest
 });
 
 test('HTTP wake validates origin and method, coalesces concurrent triggers, reports errors and closes', async t => {
+  const logs = t.mock.method(console, 'error', (_line: string) => {});
   let polls = 0;
   let release!: () => void;
   let fail = false;
@@ -142,6 +143,7 @@ test('HTTP wake validates origin and method, coalesces concurrent triggers, repo
   fail = true;
   await fetch(url, { method: 'POST' });
   assert.match(String(errors[0]), /poll failure/);
+  assert.ok(logs.mock.calls.every(call => !String(call.arguments[0]).startsWith('[dealer:source] ')));
   await source.stop();
   assert.equal(source.wakeAddress(), null);
   await assert.rejects(fetch(url));
@@ -591,13 +593,14 @@ test('drain waiters holding no control slot never widen the allowance', async t 
   assert.equal(await runtime.drainForStop({ drainTimeoutMs: 2_000 }), true);
 });
 
-test('watermark scheduling backs off failures and resets on success and HTTP wake', async t => {
+test('watermark scheduling backs off failures and resets on success and both wake paths', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const errors: unknown[] = [];
+  const statuses: PollSourceStatusEvent[] = [];
   let polls = 0;
   let fail = true;
   const source = createPollWatermarkSourcePlugin({
-    initialCursor: 0, wake: {}, intervalMs: 10, maxBackoffMs: 50,
+    name: ' alerts ', initialCursor: 0, wake: {}, intervalMs: 10, maxBackoffMs: 50,
     poll: async cursor => {
       polls++;
       if (fail) throw new Error('poll failed');
@@ -605,10 +608,13 @@ test('watermark scheduling backs off failures and resets on success and HTTP wak
     },
     toInput: () => input,
     onError: error => errors.push(error),
+    onPollStatus: event => statuses.push(event),
   });
   t.after(() => source.stop());
   const flush = () => new Promise<void>(resolve => setImmediate(resolve));
   const tick = async (ms: number) => { t.mock.timers.tick(ms); await flush(); };
+  assert.equal(source.name, 'alerts');
+  assert.throws(() => source.wake(), /Poll source not started/);
   await source.start(emitter([]));
   await flush();
   assert.equal(polls, 1);
@@ -653,7 +659,138 @@ test('watermark scheduling backs off failures and resets on success and HTTP wak
   await tick(1);
   assert.equal(polls, 8);
   assert.equal(errors.length, 7);
+  source.wake();
+  await flush();
+  assert.equal(polls, 9);
+  await tick(19);
+  assert.equal(polls, 9);
+  await tick(1);
+  assert.equal(polls, 10);
+  assert.equal(errors.length, 9);
+  assert.deepEqual(statuses.slice(0, 4), [
+    { source: 'alerts', state: 'failed', failures: 1, nextDelayMs: 20, error: 'poll failed' },
+    { source: 'alerts', state: 'backoff', failures: 2, nextDelayMs: 40, error: 'poll failed' },
+    { source: 'alerts', state: 'backoff', failures: 3, nextDelayMs: 50, error: 'poll failed' },
+    { source: 'alerts', state: 'recovered', failures: 3 },
+  ]);
   await source.stop();
+  assert.throws(() => source.wake(), /Poll source not started/);
   await tick(100);
-  assert.equal(polls, 8);
+  assert.equal(polls, 10);
+});
+
+test('poll logs single-line failure, backoff and recovery edges and suppresses repeated capped failures', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const log = t.mock.method(console, 'error', (_line: string) => {});
+  const error = Object.assign(new Error('command failed\n    at poll (source.ts:1:1)'), {
+    stderr: '\n  upstream HTTP 503\r\n    at poll (source.ts:1:1)\n',
+  });
+  let failure: Error | undefined = error;
+  const source = createPollWatermarkSourcePlugin({
+    initialCursor: 0, intervalMs: 10, maxBackoffMs: 40,
+    poll: async cursor => {
+      if (failure) throw failure;
+      return { items: [], cursor };
+    },
+    toInput: () => input,
+  });
+  t.after(() => source.stop());
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+  const tick = async (ms: number) => { t.mock.timers.tick(ms); await flush(); };
+  await source.start(emitter([]));
+  await flush();
+  await tick(20);
+  await tick(40);
+  assert.equal(log.mock.callCount(), 2);
+  failure = new Error('upstream HTTP 429\n    at poll (source.ts:1:1)');
+  await tick(40);
+  failure = undefined;
+  await source.pollOnce();
+
+  const prefix = '[dealer:source] ';
+  const events = log.mock.calls.map(({ arguments: args }) => {
+    assert.equal(args.length, 1);
+    assert.ok(args[0].startsWith(prefix));
+    assert.doesNotMatch(args[0], /[\r\n]|source\.ts/);
+    return JSON.parse(args[0].slice(prefix.length));
+  });
+  assert.deepEqual(events, [
+    { source: 'poll-watermark', state: 'failed', failures: 1, nextDelayMs: 20, error: 'upstream HTTP 503' },
+    { source: 'poll-watermark', state: 'backoff', failures: 2, nextDelayMs: 40, error: 'upstream HTTP 503' },
+    { source: 'poll-watermark', state: 'failed', failures: 4, nextDelayMs: 40, error: 'upstream HTTP 429' },
+    { source: 'poll-watermark', state: 'recovered', failures: 4 },
+  ]);
+  assert.equal(publicApi.formatSingleLineError(error, 8), 'upstream');
+});
+
+test('source CLI discovers registered sources and wakes matching sources over control.sock', { timeout: 10_000 }, async t => {
+  const stateDir = join(directory(t), 'state');
+  const invoke = async (args: string[], runtime?: DealerNodeRuntime) => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(args, {
+      stateDir, runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line),
+    });
+    return { code, stdout, stderr };
+  };
+  const command = (args: string[]) => invoke(['source', ...args, '--json']);
+  for (const [args, message] of [
+    [['list'], 'Start dealer node up before listing live sources'],
+    [['wake', 'alerts'], 'Start dealer node up before waking a live source'],
+  ] as const) {
+    const offline = await command([...args]);
+    assert.equal(offline.code, 1);
+    assert.deepEqual(offline.stderr.map(line => JSON.parse(line)), [{ error: message }]);
+    assert.equal(existsSync(stateDir), false);
+  }
+
+  const runtime = await new DealerNodeRuntime({ stateDir, profile: 'headless-relay' }).start();
+  t.after(() => runtime.stop());
+  await runtime.serveControl(args => invoke(args, runtime));
+  const passive = runtime.emitter.registerSource({ name: 'passive', start() {}, stop() {} });
+  const builtIn = await runtime.installSource({ type: 'poll-watermark', config: {
+    name: 'alerts', url: 'data:application/json,{"items":[],"cursor":null}', intervalMs: 0,
+  } });
+  let polls = 0;
+  const source = createPollWatermarkSourcePlugin({
+    name: 'alerts', initialCursor: 0,
+    poll: async (_cursor, signal) => {
+      polls++;
+      // The RPC must return even though the poll remains in flight.
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+      return { items: [], cursor: 1 };
+    },
+    toInput: () => input,
+  });
+  const registration = runtime.emitter.registerSource(source);
+  await registration.started;
+
+  const listed = await command(['list']);
+  assert.equal(listed.code, 0);
+  assert.deepEqual(JSON.parse(listed.stdout[0]), { sources: [
+    { name: 'passive', wakeable: false },
+    { name: 'alerts', wakeable: true },
+    { name: 'alerts', wakeable: true },
+  ] });
+  const woken = await command(['wake', 'alerts']);
+  assert.equal(woken.code, 0);
+  assert.deepEqual(JSON.parse(woken.stdout[0]), { ok: true, name: 'alerts', woken: true });
+  assert.equal(polls, 1);
+  assert.equal((await command(['wake', 'alerts'])).code, 0);
+  assert.equal(polls, 1);
+  for (const [args, message] of [
+    [['wake', 'passive'], 'Source does not support wake: passive'],
+    [['wake', 'missing'], 'Unknown source: missing'],
+    [['wake', ' '], 'Invalid source name'],
+    [['wake'], 'Required: <name>'],
+  ] as const) {
+    const rejected = await command([...args]);
+    assert.equal(rejected.code, 1);
+    assert.deepEqual(rejected.stderr.map(line => JSON.parse(line)), [{ error: message }]);
+  }
+  assert.equal(readFileSync(join(stateDir, 'cursor-alerts.json'), 'utf8').trim(), 'null');
+  await passive.dispose();
+  await builtIn.dispose();
+  await registration.dispose();
+  assert.deepEqual(runtime.listSources(), []);
 });

@@ -9,7 +9,7 @@ import type {
   EmitterService,
   SourcePlugin,
 } from '../core-types/index.ts';
-import { checkedCommand, runCommand } from '../subprocess/index.ts';
+import { checkedCommand, runCommand, singleLine } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 
 export interface WebhookSourceConfig {
@@ -119,7 +119,27 @@ export function everyReceiptSettled(
   return receipts.length > 0 && receipts.every(predicate);
 }
 
+export function formatSingleLineError(error: unknown, maxLength = 240): string {
+  const detail = error as { stderr?: unknown; message?: unknown } | null | undefined;
+  const stderr = detail?.stderr;
+  const firstLine = (value: string) => value.split(/[\r\n\u2028\u2029]/u)
+    .map(singleLine).find(line => line && !line.startsWith('at '));
+  const summary = firstLine(typeof stderr === 'string' ? stderr : Buffer.isBuffer(stderr) ? stderr.toString() : '')
+    ?? firstLine(typeof detail?.message === 'string' ? detail.message : String(error))
+    ?? 'Unknown error';
+  return summary.slice(0, Math.max(0, maxLength));
+}
+
+export interface PollSourceStatusEvent {
+  readonly source: string;
+  readonly state: 'failed' | 'backoff' | 'recovered';
+  readonly failures: number;
+  readonly nextDelayMs?: number;
+  readonly error?: string;
+}
+
 export interface PollWatermarkSourceConfig<T, Cursor> {
+  name?: string;
   initialCursor: Cursor;
   cursorPath?: string;
   settlementMode?: 'settled' | 'queued-or-settled';
@@ -136,9 +156,11 @@ export interface PollWatermarkSourceConfig<T, Cursor> {
   maxBackoffMs?: number;
   saveCursor?: (cursor: Cursor) => Promise<void>;
   onError?: (error: unknown) => void;
+  onPollStatus?: (event: PollSourceStatusEvent) => void;
 }
 
 export interface PollWatermarkSource<Cursor> extends SourcePlugin {
+  wake(): void;
   pollOnce(): Promise<void>;
   getCursor(): Cursor;
   wakeAddress(): ReturnType<Server['address']>;
@@ -147,6 +169,7 @@ export interface PollWatermarkSource<Cursor> extends SourcePlugin {
 export function createPollWatermarkSourcePlugin<T, Cursor>(
   config: PollWatermarkSourceConfig<T, Cursor>,
 ): PollWatermarkSource<Cursor> {
+  const name = config.name?.trim() || 'poll-watermark';
   const loadCursor = () => config.cursorPath && existsSync(config.cursorPath)
     ? readJsonCursorFile(config.cursorPath, config.initialCursor) : config.initialCursor;
   let cursor = loadCursor();
@@ -159,6 +182,8 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
   const maxBackoffMs = config.maxBackoffMs ?? Math.max(intervalMs * 8, 10 * 60_000);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let consecutiveFailures = 0;
+  let lastErrorSummary: string | undefined;
+  let lastReportedDelayMs: number | undefined;
   let active: Promise<void> | undefined;
   let settling: Promise<void> | undefined;
   let pollController: AbortController | undefined;
@@ -167,18 +192,44 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
     if (timer !== undefined) clearTimeout(timer);
     timer = undefined;
   };
-  const schedule = () => {
-    if (stopped || !(intervalMs > 0)) return;
-    const nextDelay = consecutiveFailures === 0 ? intervalMs
+  const nextPollDelay = () => {
+    if (!(intervalMs > 0)) return undefined;
+    return consecutiveFailures === 0 ? intervalMs
       : Math.min(intervalMs * 2 ** Math.min(consecutiveFailures, 4), maxBackoffMs);
+  };
+  const schedule = () => {
+    const nextDelay = nextPollDelay();
+    if (stopped || nextDelay === undefined) return;
     timer = setTimeout(() => {
       timer = undefined;
       run();
     }, nextDelay);
     timer.unref();
   };
+  const clearFailureStatus = () => {
+    lastErrorSummary = undefined;
+    lastReportedDelayMs = undefined;
+  };
+  const reportStatus = config.onPollStatus ?? (config.onError ? undefined : (event: PollSourceStatusEvent) => {
+    console.error(`[dealer:source] ${JSON.stringify(event)}`);
+  });
+  const reportFailure = (error: unknown) => {
+    const summary = formatSingleLineError(error);
+    const nextDelayMs = nextPollDelay();
+    const changed = summary !== lastErrorSummary;
+    if (!changed && nextDelayMs === lastReportedDelayMs) return;
+    lastErrorSummary = summary;
+    lastReportedDelayMs = nextDelayMs;
+    reportStatus?.({
+      source: name,
+      state: changed ? 'failed' : 'backoff',
+      failures: consecutiveFailures,
+      ...(nextDelayMs !== undefined ? { nextDelayMs } : {}),
+      error: summary,
+    });
+  };
 
-  const pollOnce = (): Promise<void> => {
+  const pollOnce = (background = false): Promise<void> => {
     if (active) {
       return active;
     }
@@ -246,9 +297,18 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       settling = settlePromise;
       await settlePromise;
     })().then(() => {
-      if (pollController === runController) consecutiveFailures = 0;
+      if (pollController !== runController) return;
+      const previousFailures = consecutiveFailures;
+      consecutiveFailures = 0;
+      if (lastErrorSummary !== undefined) {
+        clearFailureStatus();
+        reportStatus?.({ source: name, state: 'recovered', failures: previousFailures });
+      }
     }, error => {
-      if (pollController === runController) consecutiveFailures++;
+      if (pollController === runController) {
+        consecutiveFailures++;
+        if (background) reportFailure(error);
+      }
       throw error;
     }).finally(() => {
       if (active === run) active = undefined;
@@ -258,13 +318,20 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
     return run;
   };
   const run = () => {
-    if (!active && !stopped) void pollOnce().catch(error => config.onError?.(error));
+    if (!active && !stopped) void pollOnce(true).catch(error => config.onError?.(error));
+  };
+  const triggerWake = () => {
+    if (stopped || !emitter) throw new Error('Poll source not started');
+    consecutiveFailures = 0;
+    clearSchedule();
+    run();
   };
   return {
-    name: 'poll-watermark',
+    name,
     getCursor: () => cursor,
     wakeAddress: () => wakeServer?.address() ?? null,
-    pollOnce,
+    pollOnce: () => pollOnce(),
+    wake: triggerWake,
     async start(value) {
       if (!stopped || wakeStarting) {
         throw new Error('Poll source already started');
@@ -273,6 +340,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
       emitter = value;
       stopped = false;
       consecutiveFailures = 0;
+      clearFailureStatus();
       pollController = new AbortController();
       if (config.wake) {
         const wake = config.wake;
@@ -295,8 +363,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
           if (request.method === 'OPTIONS') {
             response.writeHead(204).end();
           } else if (request.method === 'POST') {
-            consecutiveFailures = 0;
-            run();
+            if (!stopped) triggerWake();
             response.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}');
           } else {
             response.writeHead(405, { allow: 'POST, OPTIONS' }).end();
@@ -334,6 +401,7 @@ export function createPollWatermarkSourcePlugin<T, Cursor>(
     async stop() {
       stopped = true;
       clearSchedule();
+      clearFailureStatus();
       // Abort the read-only fetch phase first: a signal-aware poll cancels immediately, and a
       // legacy poll that ignores it must not hold shutdown open before any external effect.
       pollController?.abort();
