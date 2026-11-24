@@ -17,14 +17,14 @@ import { resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '
 import { openStateLedgers } from './ledgers.ts';
 import type { MailboxStore, OutboxStore, OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
-import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
+import type { DeliveryReceipt, Disposable, SettlementOutcome } from '../core-types/index.ts';
 import {
   isConfirmedHandoffReceipt,
   isDurableOutboxReceipt,
   isTerminalDeliveryFailure,
 } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
-import { computeRuntimeFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
+import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 import { processOwnerRecord } from '../process-lock/index.ts';
@@ -153,6 +153,8 @@ export interface DealerCliOptions {
   runtime?: DealerNodeRuntime;
   /** Startup budget when self-update finds a live daemon without a ready listener. */
   daemonStartupTimeoutMs?: number;
+  /** Supervisor respawn budget when self-update witnesses a supervised predecessor exit. */
+  daemonSupervisorWaitMs?: number;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   /** Aborted when the calling control request disconnects, so long waits release listeners. */
@@ -252,7 +254,10 @@ export async function rpc(
             body += chunk;
           });
           res.on('end', () =>
-            finish(new Error(body || `Daemon control HTTP ${res.statusCode}`)),
+            finish(Object.assign(
+              new Error(body || `Daemon control HTTP ${res.statusCode}`),
+              { statusCode: res.statusCode },
+            )),
           );
           return;
         }
@@ -330,7 +335,7 @@ async function launchDaemon(argv: string[], stateDir: string, checkoutDir?: stri
       {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, DEALER_STATE_DIR: stateDir },
+        env: { ...process.env, DEALER_STATE_DIR: stateDir, [DEALER_DETACHED_LAUNCH_ENV]: '1' },
       },
     );
     let output = '';
@@ -429,7 +434,7 @@ async function waitForDaemonStopped(
 export async function stopDaemonIfRunning(
   stateDir: string,
   options: { force?: boolean } = {},
-): Promise<{ running: boolean; stopped: boolean; pid?: number; respawned?: boolean; deferred?: boolean }> {
+): Promise<{ running: boolean; stopped: boolean; pid?: number; respawned?: boolean; deferred?: boolean; supervised?: boolean }> {
   const probe = await probeDaemonState(stateDir);
   if (probe === 'absent') {
     return { running: false, stopped: false };
@@ -442,6 +447,10 @@ export async function stopDaemonIfRunning(
   const targetOwner = liveDaemonOwner(stateDir);
   const targetInstanceId = targetOwner?.instanceId;
   let pid: number | undefined = targetOwner?.pid;
+  // Custody only counts when the fingerprint record belongs to the same incarnation as the
+  // lock owner; a stale record must never route the restart to a supervisor that is not there.
+  const targetRecord = liveDaemonFingerprint(stateDir);
+  let supervised = targetRecord?.supervised === true;
   let targetAlreadyStopped = false;
   let drainDeferred = false;
   try {
@@ -457,6 +466,9 @@ export async function stopDaemonIfRunning(
       // and the replacement must never honor this shutdown.
       targetAlreadyStopped = true;
     } else {
+      if (typeof parsed.supervised === 'boolean') {
+        supervised = parsed.supervised;
+      }
       if (parsed.deferred === true) {
         drainDeferred = true;
       }
@@ -496,6 +508,7 @@ export async function stopDaemonIfRunning(
     stopped,
     ...(pid ? { pid } : {}),
     ...(stopped && stillRunning ? { respawned: true } : {}),
+    ...(supervised ? { supervised: true } : {}),
   };
 }
 
@@ -527,8 +540,10 @@ async function probeMatchingDaemonStatus(
   try {
     result = await rpc(socket, ['node', 'status', '--json'], { inactivityMs: 2_000 });
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (typeof code === 'string' && TRANSIENT_CONTROL_SOCKET_CODES.has(code)) {
+    const { code, statusCode } = error as NodeJS.ErrnoException & { statusCode?: number };
+    // A draining predecessor answers 503 (`Daemon is draining`) until it exits; that is a
+    // readiness signal, not a failure. Every other daemon-reported status still surfaces.
+    if ((typeof code === 'string' && TRANSIENT_CONTROL_SOCKET_CODES.has(code)) || statusCode === 503) {
       return { state: 'not-ready' };
     }
     throw error;
@@ -602,11 +617,58 @@ async function waitForOwnedDaemonReady(
   return final.state === 'ready' ? final.status : undefined;
 }
 
-export async function ensureDaemonRunning(stateDir: string, checkoutDir?: string): Promise<unknown> {
+/**
+ * Wait out the ownerless gap a supervised cold respawn leaves behind, so the caller never
+ * spawns a detached daemon that would steal the lock the supervisor is about to claim. A
+ * replacement that already serves is adopted here; once a live lock owner appears (or the
+ * bounded gap elapses) this returns `undefined`, and the single readiness wait in
+ * `ensureDaemonRunning` owns the cold start without stacking a second startup budget.
+ */
+async function waitForSupervisorReplacement(
+  stateDir: string,
+  expectedFingerprint: string,
+  supervisorWaitMs: number,
+): Promise<unknown | undefined> {
+  const deadline = Date.now() + supervisorWaitMs;
+  while (!liveDaemonOwner(stateDir) && Date.now() < deadline) {
+    // A replacement can serve before its lock record is visible; adopt a matching socket too.
+    const probe = await probeMatchingDaemonStatus(stateDir, expectedFingerprint);
+    if (probe.state === 'ready') {
+      return probe.status;
+    }
+    if (probe.state === 'mismatch') {
+      // Another runtime serves this socket; no supervisor replacement can turn it into ours.
+      return undefined;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    await waitForDaemonStateChange(stateDir, Math.min(1_000, remaining));
+  }
+  return undefined;
+}
+
+export async function ensureDaemonRunning(
+  stateDir: string,
+  checkoutDir?: string,
+  options: { supervisorWaitMs?: number; startupTimeoutMs?: number } = {},
+): Promise<unknown> {
   // The fingerprint hashes the whole code tree; compute it once so the readiness wait never
   // re-reads it while a cold start is still loading plugins and mounting networks.
   const expectedFingerprint = computeRuntimeFingerprint(stateDir, checkoutDir);
-  const ready = await waitForOwnedDaemonReady(stateDir, expectedFingerprint);
+  const startupTimeoutMs = options.startupTimeoutMs ?? DAEMON_STARTUP_TIMEOUT_MS;
+  if (options.supervisorWaitMs !== undefined && options.supervisorWaitMs > 0) {
+    const adopted = await waitForSupervisorReplacement(
+      stateDir,
+      expectedFingerprint,
+      options.supervisorWaitMs,
+    );
+    if (adopted !== undefined) {
+      return adopted;
+    }
+  }
+  const ready = await waitForOwnedDaemonReady(stateDir, expectedFingerprint, startupTimeoutMs);
   if (ready) {
     return ready;
   }
@@ -616,7 +678,7 @@ export async function ensureDaemonRunning(stateDir: string, checkoutDir?: string
     // A supervisor such as launchd may have claimed the lock between the readiness check and
     // the spawn; wait for that live owner to finish serving instead of failing on the
     // duplicate process's `State directory already owned`.
-    const concurrent = await waitForOwnedDaemonReady(stateDir, expectedFingerprint);
+    const concurrent = await waitForOwnedDaemonReady(stateDir, expectedFingerprint, startupTimeoutMs);
     if (concurrent) {
       return concurrent;
     }
@@ -624,7 +686,13 @@ export async function ensureDaemonRunning(stateDir: string, checkoutDir?: string
   }
 }
 
-export async function restartDaemon(stateDir: string, options: { force?: boolean; checkoutDir?: string } = {}): Promise<unknown> {
+/** Covers `launchd`'s default 10s `ThrottleInterval` between a job's exit and its respawn. */
+const SUPERVISOR_RESPAWN_TIMEOUT_MS = 12_000;
+
+export async function restartDaemon(
+  stateDir: string,
+  options: { force?: boolean; checkoutDir?: string; supervisorWaitMs?: number; startupTimeoutMs?: number } = {},
+): Promise<unknown> {
   if (options.checkoutDir !== undefined && !existsSync(daemonEntryPoint(options.checkoutDir))) {
     throw new Error(`Cannot restart daemon: missing ${daemonEntryPoint(options.checkoutDir)}`);
   }
@@ -642,7 +710,13 @@ export async function restartDaemon(stateDir: string, options: { force?: boolean
   }
   // A supervisor that already started a replacement counts as a completed stop, so confirm
   // that live instance instead of reporting a false deferral for the incarnation that exited.
-  return ensureDaemonRunning(stateDir, options.checkoutDir);
+  const supervisorWaitMs = stopped.supervised === true
+    ? options.supervisorWaitMs ?? SUPERVISOR_RESPAWN_TIMEOUT_MS
+    : 0;
+  return ensureDaemonRunning(stateDir, options.checkoutDir, {
+    supervisorWaitMs,
+    ...(options.startupTimeoutMs !== undefined ? { startupTimeoutMs: options.startupTimeoutMs } : {}),
+  });
 }
 
 function positiveInteger(value: unknown, flag: string): number | undefined {
@@ -1303,6 +1377,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         { stateDir, checkoutDir: v['checkout-dir'], homeDir: v['home-dir'], geminiDir: v['gemini-dir'] },
         async (runtimeFingerprint, checkoutDir) => {
           if (!existsSync(join(stateDir, 'control.sock')) && !liveDaemonOwner(stateDir)) return false;
+          // Custody of the incarnation this reconciliation may have to wait on, proven by its
+          // own fingerprint record. Capture it before the drain can release the lock.
+          const supervised = liveDaemonFingerprint(stateDir)?.supervised === true;
           let probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
           if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
             const ready = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint, options.daemonStartupTimeoutMs);
@@ -1310,6 +1387,23 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
             probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
             if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
               throw new Error(`Timed out waiting for daemon in ${stateDir} to become ready`);
+            }
+          }
+          if (supervised && probe.state === 'not-ready') {
+            // The witnessed supervised owner is gone without a ready socket: wait out the
+            // ownerless respawn gap and verify its replacement instead of reporting success for
+            // a daemon that may never come back on the updated fingerprint.
+            const adopted = await waitForSupervisorReplacement(
+              stateDir,
+              runtimeFingerprint,
+              options.daemonSupervisorWaitMs ?? SUPERVISOR_RESPAWN_TIMEOUT_MS,
+            );
+            if (adopted !== undefined) return false;
+            const replacement = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint, options.daemonStartupTimeoutMs);
+            if (replacement) return false;
+            probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
+            if (probe.state === 'not-ready') {
+              throw new Error(`Timed out waiting for a supervisor replacement in ${stateDir}`);
             }
           }
           if (probe.state !== 'mismatch') return false;
@@ -1374,7 +1468,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         const instanceId = processOwnerRecord().instanceId;
         if (options.expectedInstance !== undefined && options.expectedInstance !== instanceId) {
           // A replacement daemon must never honor a shutdown addressed to an earlier incarnation.
-          result = { ok: false, instanceMismatch: true, pid: process.pid, instanceId };
+          result = { ok: false, instanceMismatch: true, pid: process.pid, instanceId, supervised: runtime.supervised };
         } else {
           // The daemon owns the drain decision: only a drain it actually completed commits it
           // to stopping. A deferred drain answers while the daemon keeps serving.
@@ -1382,7 +1476,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           if (!drained) {
             result = { ok: false, stopping: false, deferred: true, pid: process.pid, instanceId };
           } else {
-            result = { ok: true, stopping: true, pid: process.pid, instanceId };
+            result = { ok: true, stopping: true, pid: process.pid, instanceId, supervised: runtime.supervised };
             setImmediate(() => {
               void runtime.stop().then(() => process.exit(0)).catch(error => {
                 runtime.lastError = String(error);
@@ -1706,14 +1800,56 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   let reloadPending = false;
   let restartTriggered = false;
   let debounce: ReturnType<typeof setTimeout> | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let idleSubscription: Disposable | undefined;
   const watchers: Array<{ close(): void }> = [];
   const watchedPaths = new Set<string>();
+  // A deferred restart attempt consumed its idle events while restartTriggered was set; once the
+  // attempt ends, re-evaluate the pending reload so it cannot strand the daemon on stale code.
+  const retryDeferredReload = () => {
+    restartTriggered = false;
+    if (!runtime.isStoppingOrDraining() && reloadPending && runtime.isIdleForRestart()) {
+      queueMicrotask(maybeSpawnSelfRestart);
+    }
+  };
   const maybeSpawnSelfRestart = () => {
     if (!reloadPending || restartTriggered || process.env.DEALER_AUTO_RESTART === '0' || !runtime.isIdleForRestart()) return;
     restartTriggered = true;
-    for (const item of watchers) item.close();
+    if (runtime.supervised) {
+      // The supervisor owns custody: drain in process and exit so it starts the replacement.
+      // Spawning a detached daemon here would steal the lock the supervisor is about to claim.
+      void runtime.drainForStop().then(
+        drained => {
+          if (!drained) {
+            retryDeferredReload();
+            return;
+          }
+          // Once the drain commits the control server closes and only an exited process is
+          // replaced: a stop failure must exit too, not linger unreadable while the node is down.
+          return runtime.stop().then(
+            () => process.exit(0),
+            error => {
+              runtime.lastError = String(error);
+              process.exit(1);
+            },
+          );
+        },
+        error => {
+          runtime.lastError = String(error);
+          // A drain rejection after the commit leaves the daemon draining with no stop scheduled.
+          if (runtime.isStoppingOrDraining()) {
+            process.exit(1);
+            return;
+          }
+          retryDeferredReload();
+        },
+      );
+      return;
+    }
     const bin = fileURLToPath(new URL('../../bin/dealer.js', import.meta.url));
     const child = spawn(process.execPath, ['--no-warnings', '--experimental-strip-types', bin, 'node', 'restart', '--json'], { detached: true, stdio: 'ignore', env: { ...process.env, DEALER_STATE_DIR: runtime.stateDir } });
+    // A deferred restart leaves this instance serving: its exit must re-arm the pending reload.
+    child.once('exit', retryDeferredReload);
     child.unref();
   };
   const schedule = () => {
@@ -1731,6 +1867,24 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     try { watchers.push(watch(path, { recursive, persistent: false }, schedule)); }
     catch { try { watchers.push(watch(path, { persistent: false }, schedule)); } catch { /* missing optional paths */ } }
   };
+  // One teardown owner for every watcher and timer: they must be gone before the services the
+  // debounce and idle callbacks touch are unloaded, and a drain commit is the first such moment.
+  runtime.onStopping(() => {
+    if (debounce) {
+      clearTimeout(debounce);
+      debounce = undefined;
+    }
+    if (timer) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+    for (const item of watchers) item.close();
+    watchers.length = 0;
+    idleSubscription?.dispose();
+    idleSubscription = undefined;
+    runtime.onConfigPersisted = undefined;
+    runtime.onControlIdle = undefined;
+  });
   const dealerRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
   addWatch(join(dealerRoot, 'bin'));
   addWatch(join(dealerRoot, 'packages'));
@@ -1738,7 +1892,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   addWatch(runtime.stateDir);
   for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
   const dispatcher = runtime.kernel.ctx.services.dispatcher;
-  dispatcher.onIdle(maybeSpawnSelfRestart);
+  idleSubscription = dispatcher.onIdle(maybeSpawnSelfRestart);
   runtime.onConfigPersisted = () => {
     for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
     schedule();
@@ -1747,7 +1901,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   // Remote Git updates cannot emit local filesystem events, so check upstream every six hours.
   const checkForUpdate = () => checkForBackgroundUpdate(runtime.stateDir, console.error);
   checkForUpdate();
-  const timer = setInterval(checkForUpdate, 6 * 3600_000);
+  timer = setInterval(checkForUpdate, 6 * 3600_000);
   timer.unref();
   return runtime;
 }

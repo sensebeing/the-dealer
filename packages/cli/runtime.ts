@@ -45,6 +45,7 @@ import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createW
 import {
   composeRuntimeFingerprint,
   dealerCodeFingerprintEntries,
+  isSupervisedDaemonEnv,
   projectFingerprintEntries,
   userPluginFingerprintEntries,
   writeDaemonFingerprint,
@@ -126,6 +127,8 @@ export interface DealerRuntimeOptions {
   transport?: TransportPluginOptions;
   commandRunner?: CommandRunner;
   executorOverrides?: ExecutorPlugin[];
+  /** System-manager custody; defaults to probing this process's environment. */
+  supervised?: boolean;
   /** Authoritative idle probe for wakeup redrive; defaults to the recursive Orca inventory. */
   wakeupIdleCheck?: () => Promise<{ idle: boolean; reason?: string }>;
 }
@@ -172,6 +175,7 @@ export function defaultStateDir(): string {
 
 export class DealerNodeRuntime {
   readonly stateDir: string;
+  readonly supervised: boolean;
   readonly kernel = new Kernel();
   readonly options: DealerRuntimeOptions;
   config!: RuntimeConfig;
@@ -201,6 +205,8 @@ export class DealerNodeRuntime {
   private shutdownControlSlots = 0;
   /** One teardown owner: concurrent stop callers await the same stop. */
   private stopPromise?: Promise<void>;
+  /** One-shot hooks run before any service the daemon serves is torn down. */
+  private readonly stoppingListeners = new Set<() => void>();
   private daemonInstanceId?: string;
   private daemonFingerprint?: string;
   private daemonStartedAt?: string;
@@ -219,6 +225,37 @@ export class DealerNodeRuntime {
   constructor(options: DealerRuntimeOptions = {}) {
     this.options = options;
     this.stateDir = resolve(options.stateDir ?? defaultStateDir());
+    this.supervised = options.supervised ?? isSupervisedDaemonEnv(process.env);
+  }
+
+  isStoppingOrDraining(): boolean {
+    return this.draining || this.stopPromise !== undefined;
+  }
+
+  /**
+   * Run `listener` once when the daemon commits to stopping: at the drain commit, before any
+   * service is torn down, and also at the entry of a direct `stop()`. Late timers and idle
+   * callbacks must be unsubscribed before the services they would touch disappear, so a
+   * listener registered after that point runs immediately and its disposable is inert.
+   */
+  onStopping(listener: () => void): Disposable {
+    if (this.isStoppingOrDraining()) {
+      listener();
+      return { dispose() {} };
+    }
+    this.stoppingListeners.add(listener);
+    return { dispose: () => { this.stoppingListeners.delete(listener); } };
+  }
+
+  private fireStoppingListeners(): void {
+    if (this.stoppingListeners.size === 0) {
+      return;
+    }
+    const listeners = [...this.stoppingListeners];
+    this.stoppingListeners.clear();
+    for (const listener of listeners) {
+      listener();
+    }
   }
 
   get transport(): P2PTransportService {
@@ -286,6 +323,7 @@ export class DealerNodeRuntime {
       instanceId: this.daemonInstanceId,
       fingerprint,
       startedAt: this.daemonStartedAt ?? new Date().toISOString(),
+      supervised: this.supervised,
     });
   }
 
@@ -1541,6 +1579,7 @@ export class DealerNodeRuntime {
   status() {
     return {
       running: this.started,
+      supervised: this.supervised,
       nodeId: this.transport.localNodeId,
       profile: this.config.profile,
       member: this.config.member,
@@ -1556,6 +1595,9 @@ export class DealerNodeRuntime {
   }
 
   isIdleForRestart(): boolean {
+    if (!this.started || this.isStoppingOrDraining() || !this.kernel.hasService('dispatcher')) {
+      return false;
+    }
     return this.kernel.ctx.services.dispatcher.activeCount() === 0 && this.activeMutatingControlRequests === 0;
   }
 
@@ -1593,6 +1635,7 @@ export class DealerNodeRuntime {
               // Node.js runs this turn to completion before a new request can be admitted, so
               // the fence opens exactly at the commit point, never during a drain that may defer.
               this.draining = true;
+              this.fireStoppingListeners();
             } else {
               // A deferred drain leaves no decision behind: a later shutdown may try again.
               this.drainDecision = undefined;
@@ -1660,7 +1703,7 @@ export class DealerNodeRuntime {
   private controlRequestSettled(): void {
     this.activeMutatingControlRequests--;
     this.wakeDrainWaiters();
-    if (this.activeMutatingControlRequests === 0) {
+    if (this.activeMutatingControlRequests === 0 && !this.isStoppingOrDraining()) {
       this.onControlIdle?.();
     }
   }
@@ -1811,6 +1854,9 @@ export class DealerNodeRuntime {
   }
 
   private async finishStop(): Promise<void> {
+    // A direct stop() skips drainForStop(), so this is the only place its listeners can learn
+    // that the services they call are about to disappear.
+    this.fireStoppingListeners();
     const hadServer = this.server !== undefined;
     try {
       // Stop redrive first: it must not start new sends while transport and kernel unwind.
