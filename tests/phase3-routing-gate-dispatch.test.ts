@@ -600,7 +600,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
   ]);
   assert.equal(flagValue(requests[1].args, '--command'), 'agy --dangerously-skip-permissions');
   assert.equal(flagValue(requests[2].args, '--comment'), 'dealer: antigravity');
-  assert.equal(flagValue(requests[3].args, '--timeout-ms'), '5000');
+  assert.equal(flagValue(requests[3].args, '--timeout-ms'), '25000');
   assert.equal(flagValue(requests[7].args, '--terminal'), 'term-agy');
   assert.equal(
     flagValue(requests[7].args, '--text'),

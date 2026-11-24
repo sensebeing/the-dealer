@@ -24,6 +24,8 @@ import {
   settleWakeDeliveryFailure,
   launchFencedOrcaWorkspaceTerminal,
   createOrcaWaveExecutorPlugin,
+  createOrcaWakeupDrivers,
+  maxPreviewSequence,
   resolveConfiguredOrcaWakeTargetPatch, resolveCallerOrcaWakeTargetPatch,
   resolveBoundMailboxId,
   deliverSpawnedOrcaTerminalWakeup, deliverAgentHostWakeTarget,
@@ -34,6 +36,7 @@ import type {
   ExecutionContext,
   MessageEnvelope,
   WakeupTransitionEvent,
+  WakeupDriver,
 } from '../packages/index.ts';
 
 function directory(t: TestContext): string {
@@ -4143,6 +4146,216 @@ test('inline wakeup previews include bounded latest body, semantic sender and th
   }
 });
 
+function readinessFixture(t: TestContext) {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const mailboxId = 'readiness';
+  const watches: { ready: () => void; disposed: boolean; destination: unknown }[] = [];
+  let now = Date.now();
+  let idle = false;
+  let attempts = 0;
+  const driver: WakeupDriver = {
+    name: 'mock-readiness',
+    subscribeReadiness({ target }, ready) {
+      const watch = { ready, disposed: false, destination: target.driverConfig?.destination };
+      assert.ok(watches.every(previous => previous.disposed));
+      watches.push(watch);
+      return { dispose: () => { assert.equal(watch.disposed, false); watch.disposed = true; } };
+    },
+    async deliver({ preview }) {
+      attempts++;
+      if (!idle) return { kind: 'defer', reason: 'busy' };
+      store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview));
+      return { kind: 'delivered', pointer: 'wake' };
+    },
+  };
+  store.enqueue([alert('first')], { mailboxId, wakeTarget: { driver: driver.name } });
+  store.upsertWakeTarget(mailboxId, { earliestWakeAt: 0 });
+  const service = new WakeupRedriveService({ store, drivers: [driver], now: () => now, flushIntervalMs: 100_000 });
+  t.after(async () => { await service.stop(); store.close(); });
+  return {
+    store, service, mailboxId, watches,
+    advance: (ms: number) => { now += ms; },
+    markIdle: () => { idle = true; },
+    now: () => now,
+    attempts: () => attempts,
+  };
+}
+
+test('readiness bypasses backoff and background reconciliation runs at most every 30 seconds', async t => {
+  const { service, store, mailboxId, watches, advance, markIdle, attempts } = readinessFixture(t);
+  assert.equal((await service.flushReady())[0]?.woke, false);
+  assert.equal(watches.length, 1);
+  advance(29_999);
+  assert.deepEqual(await service.flushReady(), []);
+  assert.equal(attempts(), 1);
+  advance(1);
+  assert.equal((await service.flushReady()).length, 1);
+  assert.equal(watches.length, 1);
+  advance(2_000);
+  assert.deepEqual(await service.flushReady(), []);
+  assert.equal((await service.flushWakeups()).length, 1);
+  assert.equal(attempts(), 3);
+
+  assert.equal((await service.flushMailbox(mailboxId)).reason, 'Coalescing');
+  markIdle();
+  watches[0].ready();
+  await until(() => !store.getWakeTarget(mailboxId)?.pendingWake, 'readiness sends before the deadline');
+  assert.equal(watches[0].disposed, true);
+  assert.equal(attempts(), 4);
+});
+
+test('early readiness suppresses subscriptions for the same backoff cycle, then normal retries resume', async t => {
+  const { service, store, mailboxId, watches, advance, attempts } = readinessFixture(t);
+  await service.flushMailbox(mailboxId);
+  advance(249);
+  watches[0].ready();
+  assert.equal(watches[0].disposed, true);
+  store.enqueue([alert('more')], { mailboxId });
+  assert.deepEqual(await service.flushReady(), []);
+  assert.equal(watches.length, 1);
+  assert.equal(attempts(), 1);
+  advance(751);
+  await service.flushReady();
+  assert.equal(watches.length, 2);
+  assert.equal(attempts(), 2);
+});
+
+test('readiness ownership follows binding revisions, claims, fences, disarm and shutdown', async t => {
+  const { service, store, mailboxId, watches, advance, markIdle, now, attempts } = readinessFixture(t);
+  await service.flushMailbox(mailboxId);
+  store.upsertWakeTarget(mailboxId, { driverConfig: { destination: 'replacement' } });
+  assert.equal(watches[0].disposed, true);
+  assert.equal(watches[1].destination, 'replacement');
+  advance(250);
+  watches[0].ready();
+  const claim = service.claim(mailboxId);
+  assert.equal(watches[1].disposed, true);
+  watches[1].ready();
+  claim.dispose();
+  assert.equal(watches.length, 3);
+  assert.equal(attempts(), 1);
+
+  store.beginWakeDelivery(mailboxId);
+  assert.equal(watches[2].disposed, true);
+  store.upsertWakeTarget(mailboxId, { deliveryInDoubt: undefined, pendingWake: true });
+  store.disarmWakeTargetIfCurrent(mailboxId, store.getWakeTarget(mailboxId)!.bindingRevision!);
+  assert.equal(watches[3].disposed, true);
+
+  await service.flushMailbox(mailboxId, { force: true });
+  // Re-arm by recording a deferral, then force a successful delivery without a readiness event.
+  store.deferWakeAttempt(mailboxId, undefined, 'still busy', now());
+  markIdle();
+  assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+  assert.equal(watches[4].disposed, true);
+
+  store.deferWakeAttempt(mailboxId, undefined, 'busy again', now());
+  await service.stop();
+  assert.equal(watches[5].disposed, true);
+  watches[5].ready();
+  assert.equal(attempts(), 2);
+});
+
+test('ack wakes a queued wave before the backoff deadline and cancels the readiness wait', async t => {
+  const { service, store, mailboxId, watches, markIdle, attempts } = readinessFixture(t);
+  const lease = store.check({ mailboxId });
+  store.enqueue([alert('next')], { mailboxId });
+  await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(watches.length, 1);
+  assert.ok(store.getWakeTarget(mailboxId)!.earliestWakeAt > 0);
+  markIdle();
+  store.ack(lease.deliveryId!);
+  assert.equal(watches[0].disposed, true);
+  await until(() => attempts() === 2 && !store.getWakeTarget(mailboxId)?.pendingWake, 'ack redrives without the clock advancing');
+});
+
+test('ack supersedes a deferral that began against the previous lease', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  const now = Date.now();
+  const mailboxId = 'ack-race';
+  store.enqueue([alert('first')], { mailboxId });
+  const lease = store.check({ mailboxId });
+  store.enqueue([alert('second')], { mailboxId, wakeTarget: { driver: 'mock-readiness' } });
+  let finishProbe!: () => void;
+  const held = new Promise<void>(resolve => { finishProbe = resolve; });
+  const previews: (string | null)[] = [];
+  const service = new WakeupRedriveService({ store, now: () => now, flushIntervalMs: 100_000, drivers: [{
+    name: 'mock-readiness',
+    async deliver({ preview }) {
+      previews.push(preview.deliveryId);
+      if (preview.deliveryId) {
+        await held;
+        return { kind: 'defer', reason: 'previous session was busy' };
+      }
+      store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview));
+      return { kind: 'delivered', pointer: 'new wave' };
+    },
+  }] });
+  t.after(async () => { finishProbe(); await service.stop(); store.close(); });
+  const first = service.flushMailbox(mailboxId, { force: true });
+  await until(() => previews.length === 1, 'first wake probes the outstanding lease');
+  store.ack(lease.deliveryId!);
+  finishProbe();
+  await first;
+  await until(() => previews.length === 2, 'ack triggers a fresh attempt after the old probe');
+  assert.deepEqual(previews, [lease.deliveryId, null]);
+  assert.equal(store.getWakeTarget(mailboxId)?.attemptCount, 0);
+});
+
+test('persisted deferrals subscribe when redrive starts', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  store.enqueue([alert('pending')], { wakeTarget: { driver: 'mock-readiness' } });
+  store.deferWakeAttempt('default', undefined, 'busy', 0);
+  const destinations: string[] = [];
+  const service = new WakeupRedriveService({ store, now: () => 0, drivers: [{
+    name: 'mock-readiness',
+    deliver: async () => ({ kind: 'defer', reason: 'busy' }),
+    subscribeReadiness({ mailboxId }) {
+      destinations.push(mailboxId);
+      return { dispose() {} };
+    },
+  }] });
+  t.after(async () => { await service.stop(); store.close(); });
+  assert.deepEqual(destinations, ['default']);
+  assert.deepEqual(await service.flushReady(), []);
+});
+
+test('Orca readiness waits on the bound terminal and ignores timeout and cancellation', async t => {
+  const store = new MailboxStore(join(directory(t), 'mailbox.json'));
+  t.after(() => store.close());
+  const requests: CommandRequest[] = [];
+  let complete!: (output: Awaited<ReturnType<CommandRunner>>) => void;
+  const runner: CommandRunner = request => {
+    requests.push(request);
+    return new Promise(resolve => { complete = resolve; });
+  };
+  assert.ok(createOrcaWakeupDrivers().every(driver => driver.subscribeReadiness));
+  for (const options of [{ commandRunner: runner }, { enableReadinessSubscription: false },
+    { commandRunner: runner, enableReadinessSubscription: true, idleCheck: async () => ({ idle: true }) }]) {
+    assert.ok(createOrcaWakeupDrivers(options).every(driver => !driver.subscribeReadiness));
+  }
+  for (const driver of createOrcaWakeupDrivers({ commandRunner: runner, enableReadinessSubscription: true })) {
+    const mailboxId = 'bound';
+    const unbound = store.upsertWakeTarget(mailboxId, { driver: driver.name });
+    assert.equal(driver.subscribeReadiness!({ mailboxId, target: unbound }, () => assert.fail('unbound terminal')), undefined);
+    const target = store.upsertWakeTarget(mailboxId, { driverConfig: { terminalHandle: 'tab', workspacePath: '/workspace' } });
+    for (const outcome of ['idle', 'gone', 'timeout', 'disposed']) {
+      let callbacks = 0;
+      const subscription = driver.subscribeReadiness!({ target, mailboxId }, () => { callbacks++; })!;
+      const request = requests.at(-1)!;
+      assert.deepEqual(request.args, ['terminal', 'wait', '--terminal', 'tab', '--for', 'tui-idle', '--timeout-ms', '60000', '--json']);
+      assert.equal(request.cwd, '/workspace');
+      assert.equal(request.signal?.aborted, false);
+      if (outcome === 'disposed') subscription.dispose();
+      const code = outcome === 'gone' ? 'terminal_handle_stale' : outcome === 'timeout' ? 'timeout' : undefined;
+      complete(code ? { stdout: JSON.stringify({ ok: false, error: { code } }), exitCode: 1 } : { stdout: '{"ok":true}' });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(callbacks, Number(outcome === 'idle' || outcome === 'gone'));
+      subscription.dispose();
+      assert.equal(request.signal?.aborted, true);
+    }
+  }
+});
+
 test('only newly inserted conversational frames bypass coalescing and never reset retry backoff', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: 10_000 });
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));
@@ -4755,6 +4968,40 @@ test('a spawned Orca wake waits for the target agent and rendered composer', asy
       assert.equal((await deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId)).sent, true);
       assert.equal(terminalSends(state.calls).length, 1);
     }
+  }
+});
+
+test('fresh Orca tab wait has a 25-second budget and stops with redrive', async t => {
+  for (const timeout of [undefined, 1234]) {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const mailboxId = 'task:cold-start';
+    const { runner: inventory, state } = fakeOrcaWorkspace(root);
+    let waiting: CommandRequest | undefined;
+    const runner: CommandRunner = async request => {
+      if (request.args[1] !== 'wait' || !request.args.includes('term-new-1')) return inventory(request);
+      waiting = request;
+      if (!request.signal) return { stdout: '{"ok":false}' };
+      return new Promise((_, reject) => {
+        request.signal!.addEventListener('abort', () => reject(request.signal!.reason), { once: true });
+      });
+    };
+    store.enqueue([alert('cold-start')], {
+      mailboxId,
+      wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: { workspacePath: root, agent: 'antigravity' } },
+    });
+    const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner, freshTabIdleTimeoutMs: timeout }) });
+    t.after(async () => { await service.stop(); store.close(); });
+    const attempt = service.flushMailbox(mailboxId);
+    await until(() => waiting !== undefined, 'fresh tab wait starts');
+    assert.equal(waiting!.args[7], String(timeout ?? 25_000));
+    assert.equal(waiting!.signal?.aborted, false);
+    await service.stop();
+    assert.equal(waiting!.signal?.aborted, true);
+    assert.equal((await attempt).woke, false);
+    assert.equal(terminalSends(state.calls).length, 0);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, true);
+    assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, undefined);
   }
 });
 

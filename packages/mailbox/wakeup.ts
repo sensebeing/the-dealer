@@ -26,6 +26,12 @@ export interface WakeupDriverContext {
   readonly preview: MailboxCheckResult;
   readonly now: () => number;
   readonly reportError: (error: unknown) => void;
+  readonly signal?: AbortSignal;
+}
+export interface WakeupReadinessContext {
+  readonly mailboxId: string;
+  readonly target: WakeTargetState;
+  readonly reason?: string;
 }
 export type WakeupDriverOutcome =
   | {
@@ -46,6 +52,7 @@ export type WakeupDriverOutcome =
 export interface WakeupDriver {
   readonly name: string;
   deliver(context: WakeupDriverContext): Promise<WakeupDriverOutcome>;
+  subscribeReadiness?(context: WakeupReadinessContext, onReady: () => void): Disposable | undefined;
   sessionMailboxIdFor?(target: WakeTargetState): string | undefined;
   probeSlot?(context: WakeupProbeContext): Promise<SlotProbeResult>;
   /**
@@ -85,6 +92,18 @@ type ReportedWakeBlock =
   | { state: 'deferred'; reason?: string; since: number; attemptCount: number }
   | { state: 'fenced' };
 
+type ReadinessWait = {
+  revision: number;
+  startedAt: number;
+  reconciledAt: number;
+  subscription?: Disposable;
+};
+
+type ReadinessState = ReadinessWait | {
+  revision: number;
+  suppressedAttempt: number;
+};
+
 export interface WakeupFlushResult {
   mailboxId: string;
   driver: string;
@@ -104,7 +123,10 @@ export interface WakeupMailboxOptions {
 }
 
 const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
+const READINESS_FALLBACK_RECONCILE_MS = 30_000;
+const MIN_READINESS_WAIT_MS = 250;
 const MAX_INLINE_BODY_CHARS = 400;
+const ACK_SUPERSEDED_WAKE = 'Wake superseded by acknowledgement of the previous wave';
 
 export function maxPreviewSequence(preview: MailboxCheckResult): number {
   return preview.items.reduce(
@@ -242,6 +264,8 @@ export class WakeupRedriveService {
   private readonly canInheritSlotTarget?: (mailboxId: string, baseMailboxId: string) => boolean;
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly subscriptions: Disposable[] = [];
+  private readonly readinessSubscriptions = new Map<string, ReadinessState>();
+  private readonly stopController = new AbortController();
   private readonly inFlight = new Map<string, Promise<WakeupFlushResult>>();
   private readonly claims = new Map<string, number>();
   private stopped = false;
@@ -261,9 +285,6 @@ export class WakeupRedriveService {
     this.onError = options.onError;
     this.onTransition = options.onTransition;
     this.canInheritSlotTarget = options.canInheritSlotTarget;
-    if (this.onTransition) {
-      for (const target of this.store.listWakeTargets()) this.observeTarget(target, { initial: true });
-    }
     // Zero-latency redrive for coalesceMs === 0 targets; the timer only handles delayed work.
     this.subscriptions.push(
       this.store.onMail((mailboxId) => this.notifyMailbox(mailboxId)),
@@ -273,6 +294,12 @@ export class WakeupRedriveService {
       void this.flushReady().catch((error) => this.report(error));
     }, flushIntervalMs);
     this.timer.unref();
+    if (this.onTransition || [...this.drivers.values()].some(driver => driver.subscribeReadiness)) {
+      for (const target of this.store.listWakeTargets()) {
+        this.observeTarget(target, { initial: true });
+        this.syncReadiness(target);
+      }
+    }
   }
 
   getLastError(): string | undefined {
@@ -337,6 +364,8 @@ export class WakeupRedriveService {
   claim(mailboxId: string): Disposable {
     const id = normalizeMailboxId(mailboxId);
     this.claims.set(id, (this.claims.get(id) ?? 0) + 1);
+    const readiness = this.readinessSubscriptions.get(id);
+    if (readiness && 'startedAt' in readiness) this.clearReadiness(id);
     let released = false;
     return {
       dispose: () => {
@@ -367,6 +396,7 @@ export class WakeupRedriveService {
       return;
     }
     const target = this.store.getWakeTarget(id);
+    if (target) this.syncReadiness(target);
     if (target && !this.inFlight.has(id) && !this.claims.has(id)) this.observeTarget(target);
     if (!target?.pendingWake || target.deliveryInDoubt || target.earliestWakeAt > this.now()) {
       return;
@@ -389,21 +419,20 @@ export class WakeupRedriveService {
     if (ongoing) {
       return ongoing;
     }
-    let delivered = false;
     // Install the in-flight guard before a driver can synchronously emit mailbox events.
-    const operation = Promise.resolve()
-      .then(() => this.flushInternal(id, options.force === true))
-      .then((result) => {
-        delivered = result.woke || result.reason === 'Wake launch superseded by a newer binding';
-        this.observeMailbox(id, result.woke);
-        return result;
-      })
-      .finally(() => {
-        if (this.inFlight.get(id) === operation) {
-          this.inFlight.delete(id);
-          if (delivered) this.notifyMailbox(id);
-        }
-      });
+    const operation = Promise.resolve().then(async () => {
+      let result: WakeupFlushResult;
+      try {
+        result = await this.flushInternal(id, options.force === true);
+      } finally {
+        this.inFlight.delete(id);
+      }
+      this.observeMailbox(id, result.woke);
+      if (result.woke || result.reason === 'Wake launch superseded by a newer binding' || result.reason === ACK_SUPERSEDED_WAKE) {
+        this.notifyMailbox(id);
+      }
+      return result;
+    });
     this.inFlight.set(id, operation);
     return operation;
   }
@@ -423,6 +452,12 @@ export class WakeupRedriveService {
     const targets = this.store.listPendingWakeTargets(this.now());
     const results: WakeupFlushResult[] = [];
     for (const target of targets) {
+      const wait = this.readinessSubscriptions.get(target.mailboxId);
+      if (wait && 'startedAt' in wait && wait.revision === (target.bindingRevision ?? 0)) {
+        const now = this.now();
+        if (now - wait.reconciledAt < READINESS_FALLBACK_RECONCILE_MS) continue;
+        if (!this.inFlight.has(target.mailboxId)) wait.reconciledAt = now;
+      }
       results.push(await this.flushMailbox(target.mailboxId));
     }
     return results;
@@ -434,6 +469,8 @@ export class WakeupRedriveService {
     }
     this.stopped = true;
     clearInterval(this.timer);
+    this.stopController.abort();
+    for (const mailboxId of this.readinessSubscriptions.keys()) this.clearReadiness(mailboxId);
     for (const subscription of this.subscriptions.splice(0)) {
       subscription.dispose();
     }
@@ -450,7 +487,13 @@ export class WakeupRedriveService {
       dispose: () => {
         if (disposed) return;
         disposed = true;
-        if (this.drivers.get(driver.name) === driver) this.drivers.delete(driver.name);
+        if (this.drivers.get(driver.name) !== driver) return;
+        this.drivers.delete(driver.name);
+        if (driver.subscribeReadiness && !this.stopped) {
+          for (const target of this.store.listWakeTargets()) {
+            if (target.driver === driver.name) this.clearReadiness(target.mailboxId);
+          }
+        }
       },
     };
   }
@@ -470,6 +513,7 @@ export class WakeupRedriveService {
     let target: WakeTargetState | undefined;
     let initialRevision = 0;
     try {
+      if (this.stopped) return noWake(mailboxId, 'passive', 'Wakeup service stopped');
       target = this.store.getWakeTarget(mailboxId);
       if (!target) {
         return noWake(mailboxId, 'passive', 'No wake target');
@@ -525,6 +569,7 @@ export class WakeupRedriveService {
         preview,
         now: this.now,
         reportError: (error) => this.report(error),
+        signal: this.stopController.signal,
       });
       if (outcome.kind === 'delivered') {
         return {
@@ -539,7 +584,9 @@ export class WakeupRedriveService {
         };
       }
       if (outcome.kind === 'defer') {
-        const result = this.defer(mailboxId, outcome.expectedRevision ?? initialRevision, outcome.reason, outcome.patch);
+        const revision = outcome.expectedRevision ?? initialRevision;
+        const completedWaves = revision === initialRevision ? target.completedWaves : undefined;
+        const result = this.defer(mailboxId, revision, outcome.reason, outcome.patch, completedWaves);
         return result.reason === 'Wake launch superseded by a newer binding' ? result : { ...result, ...(outcome.rotated !== undefined ? { rotated: outcome.rotated } : {}) };
       }
       if (outcome.kind === 'disarm') {
@@ -564,7 +611,7 @@ export class WakeupRedriveService {
           if (superseded) return noWake(mailboxId, target.driver, 'Wake launch superseded by a newer binding');
           return noWake(mailboxId, target.driver, String(error));
         }
-        return this.defer(mailboxId, initialRevision, String(error));
+        return this.defer(mailboxId, initialRevision, String(error), undefined, target.completedWaves);
       } catch (settleError) {
         this.report(settleError);
         return noWake(mailboxId, target.driver, String(error));
@@ -576,8 +623,11 @@ export class WakeupRedriveService {
     return preview.deliveryId ? preview.newerQueuedCount > 0 : preview.items.length > 0;
   }
 
-  private defer(mailboxId: string, expectedRevision: number, reason: string, patch?: Partial<WakeTargetState>): WakeupFlushResult {
-    const result = this.store.deferWakeAttempt(mailboxId, expectedRevision, reason, this.now(), patch);
+  private defer(
+    mailboxId: string, expectedRevision: number, reason: string, patch?: Partial<WakeTargetState>, expectedCompletedWaves?: number,
+  ): WakeupFlushResult {
+    const result = this.store.deferWakeAttempt(mailboxId, expectedRevision, reason, this.now(), patch, expectedCompletedWaves);
+    if (result.acknowledged) return noWake(mailboxId, result.target.driver, ACK_SUPERSEDED_WAKE);
     return noWake(mailboxId, result.target.driver, result.superseded ? 'Wake launch superseded by a newer binding' : reason);
   }
 
@@ -612,11 +662,64 @@ export class WakeupRedriveService {
   }
 
   private observeMailbox(mailboxId: string, delivered = false): void {
-    if (!this.onTransition) return;
     try {
       const target = this.store.getWakeTarget(mailboxId);
-      if (target) this.observeTarget(target, { delivered });
+      if (delivered || !target) this.clearReadiness(mailboxId);
+      if (target) {
+        this.observeTarget(target, { delivered });
+        if (!delivered) this.syncReadiness(target);
+      }
     } catch (error) {
+      this.report(error);
+    }
+  }
+
+  private clearReadiness(mailboxId: string): void {
+    const state = this.readinessSubscriptions.get(mailboxId);
+    this.readinessSubscriptions.delete(mailboxId);
+    try {
+      if (state && 'startedAt' in state) state.subscription?.dispose();
+    } catch (error) {
+      this.report(error);
+    }
+  }
+
+  private syncReadiness(target: WakeTargetState): void {
+    const { mailboxId, attemptCount } = target;
+    const driver = this.drivers.get(target.driver);
+    if (this.stopped || !target.pendingWake || target.deliveryInDoubt || attemptCount === 0 || !driver?.subscribeReadiness) {
+      this.clearReadiness(mailboxId);
+      return;
+    }
+    const revision = target.bindingRevision ?? 0;
+    const current = this.readinessSubscriptions.get(mailboxId);
+    if (current?.revision === revision && ('startedAt' in current || current.suppressedAttempt === attemptCount)) return;
+    this.clearReadiness(mailboxId);
+    if (this.claims.has(mailboxId) || this.inFlight.has(mailboxId)) return;
+
+    const startedAt = this.now();
+    const wait: ReadinessWait = { revision, startedAt, reconciledAt: startedAt };
+    this.readinessSubscriptions.set(mailboxId, wait);
+    try {
+      const subscription = driver.subscribeReadiness({ mailboxId, target, reason: target.lastWakeError }, () => {
+        if (this.stopped || this.readinessSubscriptions.get(mailboxId) !== wait) return;
+        this.clearReadiness(mailboxId);
+        const latest = this.store.getWakeTarget(mailboxId);
+        if (!latest?.pendingWake || latest.deliveryInDoubt || latest.attemptCount === 0 ||
+            (latest.bindingRevision ?? 0) !== revision) return;
+        const elapsedMs = Math.max(0, this.now() - wait.startedAt);
+        if (elapsedMs < MIN_READINESS_WAIT_MS) {
+          // An already-idle host can still fail the delivery gate for this backoff cycle.
+          this.readinessSubscriptions.set(mailboxId, { revision, suppressedAttempt: latest.attemptCount });
+          return;
+        }
+        void this.flushMailbox(mailboxId, { force: true }).catch(error => this.report(error));
+      });
+      if (this.readinessSubscriptions.get(mailboxId) !== wait) subscription?.dispose();
+      else if (!subscription) this.clearReadiness(mailboxId);
+      else wait.subscription = subscription;
+    } catch (error) {
+      if (this.readinessSubscriptions.get(mailboxId) === wait) this.clearReadiness(mailboxId);
       this.report(error);
     }
   }

@@ -1434,9 +1434,21 @@ export class MailboxStore {
     if (options.ackLeaseId !== undefined) {
       this.ack(options.ackLeaseId, mailboxId);
     }
-    return options.peek
-      ? this.db.read(() => this.checkMailbox(mailboxId, false))
-      : this.db.write(() => this.checkMailbox(mailboxId, true));
+    if (options.peek) return this.db.read(() => this.checkMailbox(mailboxId, false));
+    let wakeDisarmed = false;
+    const result = this.db.write(() => {
+      const checked = this.checkMailbox(mailboxId, true);
+      if (checked.deliveryId && !checked.redelivered) {
+        const target = this.db.wakeTarget(mailboxId);
+        if (target?.pendingWake) {
+          this.db.writeWakeTarget({ ...target, pendingWake: false }, target);
+          wakeDisarmed = true;
+        }
+      }
+      return checked;
+    });
+    if (wakeDisarmed) this.events.emit('target', mailboxId);
+    return result;
   }
 
   private checkMailbox(mailboxId: string, claim: boolean): MailboxCheckResult {
@@ -1467,8 +1479,6 @@ export class MailboxStore {
       ackedLeaseIds: record?.ackedLeaseIds ?? [],
       outstanding: { leaseId, mailboxId, itemIds: queued.map(item => item.id), createdAt: leasedAt, wakeCount: 0 },
     });
-    const target = this.db.wakeTarget(mailboxId);
-    if (target) this.db.writeWakeTarget({ ...target, pendingWake: false }, target);
     return {
       mailboxId,
       deliveryId: leaseId,
@@ -1518,12 +1528,12 @@ export class MailboxStore {
       const target = this.db.wakeTarget(id);
       if (target) {
         // Queued mail behind the completed wave may now rotate to a fresh session.
-        const hasQueued = this.db.hasQueuedItems(id);
+        const wakeNext = !target.deliveryInDoubt && (target.pendingWake || this.db.hasQueuedItems(id));
         this.db.writeWakeTarget({
           ...target, completedWaves: target.completedWaves + 1,
-          ...(hasQueued ? { pendingWake: true, earliestWakeAt: 0 } : {}),
+          ...(wakeNext ? { pendingWake: true, earliestWakeAt: 0, attemptCount: 0 } : {}),
         }, target);
-        if (hasQueued) wakeMailbox = id;
+        if (wakeNext) wakeMailbox = id;
       }
       if (this.db.hasAckedHistoryBeyond(MAX_RETAINED_ACKED_ITEMS)) {
         const consumed = this.readConsumedSequence?.() ?? Number.MAX_SAFE_INTEGER;
@@ -1694,16 +1704,16 @@ export class MailboxStore {
     patch: Partial<WakeTargetState> = {},
   ): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
-    let fenceChanged = false;
+    let notify = false;
     const merged = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
       const next = validateWakeTarget(mergeWakeTarget(current, patch));
       this.db.writeWakeTarget(next, previous);
-      fenceChanged = Boolean(current.deliveryInDoubt) !== Boolean(next.deliveryInDoubt);
+      notify = current.pendingWake || next.pendingWake || Boolean(current.deliveryInDoubt) !== Boolean(next.deliveryInDoubt);
       return structuredClone(next);
     });
-    if (merged.pendingWake || fenceChanged) {
+    if (notify) {
       this.events.emit('target', id);
     }
     return merged;
@@ -1715,7 +1725,7 @@ export class MailboxStore {
    */
   beginWakeDelivery(mailboxId: string, expectedRevision?: number): WakeTargetState | undefined {
     const id = normalizeMailboxId(mailboxId);
-    return this.db.write(() => {
+    const fenced = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
       if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) return undefined;
@@ -1729,6 +1739,8 @@ export class MailboxStore {
       this.db.writeWakeTarget(next, previous);
       return structuredClone(next);
     });
+    if (fenced) this.events.emit('target', id);
+    return fenced;
   }
 
   /** Commit only against the binding that authorized this launch. */
@@ -1754,13 +1766,20 @@ export class MailboxStore {
     return result;
   }
 
-  /** Settle a retryable attempt only against the binding that authorized it. */
-  deferWakeAttempt(mailboxId: string, expectedRevision: number | undefined, error: unknown, now = Date.now(), patch: Partial<WakeTargetState> = {}): { superseded: boolean; target: WakeTargetState } {
+  /** Settle a retryable attempt only against its binding and, if supplied, its completed wave count. */
+  deferWakeAttempt(
+    mailboxId: string, expectedRevision: number | undefined, error: unknown, now = Date.now(),
+    patch: Partial<WakeTargetState> = {}, expectedCompletedWaves?: number,
+  ): { superseded: boolean; acknowledged?: true; target: WakeTargetState } {
     const id = normalizeMailboxId(mailboxId);
     const result = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
       const superseded = expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision;
+      if (!superseded && !current.deliveryInDoubt && expectedCompletedWaves !== undefined &&
+          current.completedWaves > expectedCompletedWaves) {
+        return { superseded: false, acknowledged: true as const, target: structuredClone(current) };
+      }
       const attemptCount = superseded ? 0 : current.attemptCount + 1;
       const next = validateWakeTarget(mergeWakeTarget(current, {
         ...(superseded ? {} : patch), pendingWake: true, deliveryInDoubt: undefined, attemptCount,
@@ -1802,13 +1821,13 @@ export class MailboxStore {
       this.db.writeWakeTarget(next, previous);
       return { superseded, target: structuredClone(next) };
     });
-    if (result.superseded) this.events.emit('target', id);
+    this.events.emit('target', id);
     return result;
   }
 
   updateWakeDriverConfigIfCurrent(mailboxId: string, expectedRevision: number, driverConfig: Record<string, unknown>): { superseded: boolean; target: WakeTargetState } {
     const id = normalizeMailboxId(mailboxId);
-    return this.db.write(() => {
+    const result = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
       if ((current.bindingRevision ?? 0) !== expectedRevision) return { superseded: true, target: structuredClone(current) };
@@ -1816,6 +1835,10 @@ export class MailboxStore {
       this.db.writeWakeTarget(next, previous);
       return { superseded: false, target: structuredClone(next) };
     });
+    if (!result.superseded && result.target.pendingWake && result.target.bindingRevision !== expectedRevision) {
+      this.events.emit('target', id);
+    }
+    return result;
   }
 
   /** Keep an unconfirmed external outcome fenced; later mail, forced flushes and restarts never replay it. */
@@ -1845,12 +1868,12 @@ export class MailboxStore {
   ): WakeTargetState & { superseded?: boolean } {
     const id = normalizeMailboxId(mailboxId);
     let pinnedWakeMailbox: string | undefined;
-    let clearedFence = false;
+    let notify = false;
     const completed = this.db.write(() => {
       const pendingWake = this.db.hasQueuedItems(id, deliveredSequence);
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
-      clearedFence = Boolean(current.deliveryInDoubt);
+      notify = current.pendingWake || Boolean(current.deliveryInDoubt);
       if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) {
         const hasQueued = this.db.hasQueuedItems(id);
         const next = validateWakeTarget(mergeWakeTarget(current, {
@@ -1887,7 +1910,7 @@ export class MailboxStore {
       }
       return structuredClone(next);
     });
-    if (completed.pendingWake || clearedFence) this.events.emit('target', id);
+    if (completed.pendingWake || notify) this.events.emit('target', id);
     if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return completed;
   }
@@ -2031,7 +2054,7 @@ export class MailboxStore {
     return { dispose: () => this.events.off('mail', listener) };
   }
 
-  /** Notification that a wake target became pending or its stable fence changed. */
+  /** Notification of committed changes affecting wake scheduling or readiness. */
   onWakeTarget(listener: (mailboxId: string) => void): Disposable {
     this.events.on('target', listener);
     return { dispose: () => this.events.off('target', listener) };

@@ -107,6 +107,26 @@ export interface OrcaWakeupDriverOptions {
   orcaCommand?: string;
   /** Authoritative probe supplied by an embedded host or test harness. */
   idleCheck?: () => Promise<OrcaIdleResult>;
+  enableReadinessSubscription?: boolean;
+  freshTabIdleTimeoutMs?: number;
+}
+
+function orcaReadinessSubscription(options: OrcaWakeupDriverOptions): WakeupDriver['subscribeReadiness'] {
+  const runner = options.commandRunner ?? runCommand;
+  const enabled = options.enableReadinessSubscription ?? runner === runCommand;
+  if (options.idleCheck || !enabled) return undefined;
+
+  return ({ target }, onReady) => {
+    const { terminalHandle, workspacePath, orcaCommand } = readOrcaDriverConfig(target);
+    if (!terminalHandle) return undefined;
+    const controller = new AbortController();
+    void waitOrcaTerminalIdle(runner, orcaCommand ?? options.orcaCommand ?? 'orca', terminalHandle,
+      workspacePath, 60_000, controller.signal).then(result => {
+      // Idle and non-timeout exits prompt the authoritative delivery checks to reconcile.
+      if (!controller.signal.aborted && !result.timedOut) onReady();
+    });
+    return { dispose: () => controller.abort() };
+  };
 }
 
 type OrcaWakePlan =
@@ -285,9 +305,10 @@ function checkOrcaPointerIdle(
 
 async function waitFreshOrcaTabIdle(
   runner: CommandRunner, command: string, target: OrcaWakeTarget, terminalHandle: string,
-  excludedHandles?: ReadonlySet<string>, signal?: AbortSignal,
+  options: { excludedHandles?: ReadonlySet<string>; signal?: AbortSignal; timeoutMs?: number },
 ): Promise<OrcaIdleResult> {
-  const ready = await waitOrcaTerminalIdle(runner, command, terminalHandle, target.workspacePath, 5000, signal);
+  const { excludedHandles, signal, timeoutMs = 25_000 } = options;
+  const ready = await waitOrcaTerminalIdle(runner, command, terminalHandle, target.workspacePath, timeoutMs, signal);
   return ready.idle
     ? checkOrcaPointerIdle(runner, command, target, terminalHandle, excludedHandles, signal)
     : ready;
@@ -527,7 +548,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
     if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
     const command = target.orcaCommand ?? 'orca';
     const preview = store.check({ mailboxId, peek: true });
-    const idle = await waitFreshOrcaTabIdle(runner, command, target, target.terminalHandle, undefined, options.signal);
+    const idle = await waitFreshOrcaTabIdle(runner, command, target, target.terminalHandle, options);
     if (!idle.idle) {
       store.retainPendingWakeIfCurrent(mailboxId, expectedRevision);
       return { terminalHandle: target.terminalHandle, sent: false };
@@ -609,6 +630,7 @@ class OrcaWakeDelivery {
   private readonly runner: CommandRunner;
   private readonly command: string;
   private readonly idleCheck?: () => Promise<OrcaIdleResult>;
+  private readonly freshTabIdleTimeoutMs?: number;
   private readonly now: () => number;
   private readonly report: (error: unknown) => void;
 
@@ -619,6 +641,7 @@ class OrcaWakeDelivery {
     this.runner = options.commandRunner ?? runCommand;
     this.command = options.orcaCommand ?? 'orca';
     this.idleCheck = options.idleCheck;
+    this.freshTabIdleTimeoutMs = options.freshTabIdleTimeoutMs;
   }
 
   async probe(context: WakeupProbeContext): Promise<SlotProbeResult> {
@@ -841,7 +864,7 @@ class OrcaWakeDelivery {
         return this.defer(mailboxId, target, idle.reason ?? 'Workspace is busy');
       }
       return await this.deliver(mailboxId, target, preview, {
-        plan: idle.plan, dedicatedTab, excludedHandles,
+        plan: idle.plan, dedicatedTab, excludedHandles, signal: context.signal,
       }, revision => { activeRevision = revision; });
     } catch (error) {
       if (error instanceof SettledWakeLaunchError) throw error;
@@ -980,11 +1003,14 @@ class OrcaWakeDelivery {
     terminalHandle: string,
     command: string,
     excludedHandles: ReadonlySet<string>,
+    signal?: AbortSignal,
   ): Promise<OrcaIdleResult> {
     if (this.idleCheck) {
       return this.idleCheck();
     }
-    return waitFreshOrcaTabIdle(this.runner, command, target, terminalHandle, excludedHandles);
+    return waitFreshOrcaTabIdle(this.runner, command, target, terminalHandle, {
+      excludedHandles, signal, timeoutMs: this.freshTabIdleTimeoutMs,
+    });
   }
 
   /**
@@ -1108,7 +1134,7 @@ class OrcaWakeDelivery {
     mailboxId: string,
     target: OrcaWakeTarget,
     preview: MailboxCheckResult,
-    options: { plan: Exclude<OrcaWakePlan, { kind: 'defer' }>; dedicatedTab: boolean; excludedHandles: ReadonlySet<string> },
+    options: { plan: Exclude<OrcaWakePlan, { kind: 'defer' }>; dedicatedTab: boolean; excludedHandles: ReadonlySet<string>; signal?: AbortSignal },
     setActiveRevision: (revision: number) => void,
   ): Promise<WakeupDriverOutcome> {
     const command = target.orcaCommand ?? this.command;
@@ -1185,7 +1211,7 @@ class OrcaWakeDelivery {
       // tab is closed before the pointer is written. A deterministic refusal parks the target.
       const retirement = await attemptRetirement();
       if (retirement.parked) return { kind: 'noop', reason: retirement.parked.message };
-      const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles);
+      const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles, options.signal);
       if (!idle.idle) {
         const deferred = this.defer(
           mailboxId,
@@ -1262,7 +1288,7 @@ class OrcaWakeDelivery {
         if (plan.kind === 'shell') {
           return this.defer(mailboxId, target, 'Terminal spawned; waiting for tui-idle before wakeup');
         }
-        const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles);
+        const idle = await this.waitFreshTabIdle(target, terminalHandle, command, options.excludedHandles, options.signal);
         if (!idle.idle)
           return this.defer(mailboxId, target, idle.reason ?? 'Terminal spawned; waiting for tui-idle before wakeup');
         checkedTerminal = true;
@@ -1372,6 +1398,7 @@ class OrcaWakeDelivery {
 export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions = {}): WakeupDriver {
   return {
     name: 'orca-terminal',
+    subscribeReadiness: orcaReadinessSubscription(options),
     deliver: (context) => new OrcaWakeDelivery(context, options).run(context),
     probeSlot: (context) => new OrcaWakeDelivery(context, options).probe(context),
     /**
@@ -1463,6 +1490,7 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
 export function createOrcaRunWakeupDriver(options: OrcaWakeupDriverOptions = {}): WakeupDriver {
   return {
     name: 'orca-run',
+    subscribeReadiness: orcaReadinessSubscription(options),
     deliver: (context) => new OrcaWakeDelivery(context, options).run(context),
     probeSlot: (context) => new OrcaWakeDelivery(context, options).probe(context),
   };
