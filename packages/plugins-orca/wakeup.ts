@@ -17,7 +17,9 @@ import {
   spawnOrcaWorkspaceTerminal,
   waitOrcaTerminalIdle,
   findOrcaWorktreeByName,
+  tryFastForwardCleanWorktree,
 } from './workspace.ts';
+import { orcaMutationRunner } from './inventories.ts';
 import type { OrcaIdleResult, SupportedOrcaAgent } from './workspace.ts';
 import { buildOrcaAgentLaunchCommand, isOrcaLaunchConfigCompatible } from './workspace.ts';
 import { checkedCommand, CommandNotStartedError, runCommand } from '../subprocess/index.ts';
@@ -241,13 +243,14 @@ function claimedOrcaTerminalHandles(
   store: MailboxStore,
   mailboxId: string,
   bound: OrcaTerminalDriverConfig,
-  options: { includeRetired?: boolean } = {},
+  options: { includeRetired?: boolean; sameWorkspaceOnly?: boolean } = {},
 ): Set<string> {
   const includeRetired = options.includeRetired !== false;
   const handles = new Set<string>();
   for (const item of store.listWakeTargets()) {
     if (item.mailboxId === mailboxId || item.mailboxId.startsWith('terminal:') || item.driver !== 'orca-terminal') continue;
     const { terminalHandle, retiredTerminalHandle, workspacePath, paneKey } = readOrcaDriverConfig(item);
+    if (options.sameWorkspaceOnly && (!workspacePath || !sameCallerWorkspace(bound.workspacePath, workspacePath))) continue;
     if (includeRetired && retiredTerminalHandle) handles.add(retiredTerminalHandle);
     if (!terminalHandle) continue;
     const isSessionAlias = mailboxId.startsWith('terminal:') ||
@@ -1059,6 +1062,15 @@ class OrcaWakeDelivery {
           return this.defer(mailboxId, target, prior.warning ?? 'Retired terminal close pending before next rotation');
         }
       }
+      if ((needsRotation || spawnFreshSession) && target.rotateAfterWaves !== undefined && !this.idleCheck) {
+        try {
+          const canSync = () => (this.store.getWakeTarget(mailboxId)?.bindingRevision ?? 0) === activeRevision &&
+            claimedOrcaTerminalHandles(this.store, mailboxId, target, { includeRetired: false, sameWorkspaceOnly: true }).size === 0;
+          if (canSync()) await tryFastForwardCleanWorktree(this.runner, workspacePath, canSync);
+        } catch (error) {
+          this.report(error);
+        }
+      }
       const spawned = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
         command,
         workspacePath,
@@ -1172,7 +1184,7 @@ class OrcaWakeDelivery {
     // stays parked instead of being replayed by the next tick or restart.
     if (!this.store.beginWakeDelivery(mailboxId, activeRevision)) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
     if (target.driver === 'orca-run') {
-      const output = await this.runner({
+      const output = await orcaMutationRunner(this.runner)({
         command,
         args: [
           'orchestration',

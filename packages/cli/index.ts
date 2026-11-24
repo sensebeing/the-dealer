@@ -13,8 +13,9 @@ import { request } from 'node:http';
 import type { ClientRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { MailboxStore, OutboxStore, resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
-import type { OutboxItemStatus } from '../mailbox/index.ts';
+import { resolveBoundMailboxId, normalizeMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
+import { openStateLedgers } from './ledgers.ts';
+import type { MailboxStore, OutboxStore, OutboxItemStatus } from '../mailbox/index.ts';
 import type { ResolvedReplyTarget } from '../mailbox/index.ts';
 import type { DeliveryReceipt, SettlementOutcome } from '../core-types/index.ts';
 import {
@@ -732,24 +733,14 @@ function payloadFromBody(body: string): Record<string, unknown> {
   }
 }
 
-function offlineMailboxStore(stateDir: string): MailboxStore {
-  const file = join(stateDir, 'config.json');
-  const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-  return new MailboxStore(join(stateDir, 'mailbox.json'), {
-    legacyInboxPath:
-      savedConfig.executorConfig?.inbox?.inboxPath ?? join(stateDir, 'inbox.json'),
-  });
-}
-
-async function mailboxStoreFor(
-  options: DealerCliOptions,
-  stateDir: string,
-): Promise<MailboxStore> {
+async function ledgersFor(options: DealerCliOptions, stateDir: string) {
   if (options.runtime) {
     await options.runtime.start();
-    return options.runtime.mailbox;
+    return { mailbox: options.runtime.mailbox, outbox: options.runtime.outbox };
   }
-  return offlineMailboxStore(stateDir);
+  const file = join(stateDir, 'config.json');
+  const savedConfig = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+  return openStateLedgers(stateDir, savedConfig.executorConfig?.inbox?.inboxPath);
 }
 
 function replyTargetOrThrow(
@@ -1271,15 +1262,13 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'inbox') {
       // Offline access is serialized by the mailbox file lock, so it stays coherent even if
       // the daemon owns the state directory.
-      const store = await mailboxStoreFor(options, stateDir);
-      stdout(JSON.stringify(await runInboxCommand(store, action, target, v, options.signal), null, v.json ? undefined : 2));
+      const { mailbox } = await ledgersFor(options, stateDir);
+      stdout(JSON.stringify(await runInboxCommand(mailbox, action, target, v, options.signal), null, v.json ? undefined : 2));
       return 0;
     }
     if (group === 'thread') {
-      const store = await mailboxStoreFor(options, stateDir);
-      const outbox = options.runtime?.outbox ??
-        new OutboxStore(join(stateDir, 'outbox.json'), join(stateDir, 'outbox-blobs'));
-      stdout(JSON.stringify(runThreadCommand(store, action, target, v, outbox), null, v.json ? undefined : 2));
+      const { mailbox, outbox } = await ledgersFor(options, stateDir);
+      stdout(JSON.stringify(runThreadCommand(mailbox, action, target, v, outbox), null, v.json ? undefined : 2));
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'up') {

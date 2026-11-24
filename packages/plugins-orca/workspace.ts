@@ -8,6 +8,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { CommandNotStartedError, runCommand, checkedCommand, singleLine } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
+import { orcaMutationRunner, readOrcaTerminalList, readOrcaWorktreePs } from './inventories.ts';
 
 export async function findOrcaWorktreeByName(
   runner: CommandRunner,
@@ -15,12 +16,7 @@ export async function findOrcaWorktreeByName(
   name: string,
   cwd?: string,
 ): Promise<{ workspacePath: string; worktreeId: string } | undefined> {
-  const result = await checkedCommand(runner, {
-    command,
-    args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'],
-    ...(cwd ? { cwd } : {}),
-  });
-  const raw = JSON.parse(result.stdout);
+  const raw = JSON.parse(await readOrcaWorktreePs(runner, command, cwd || undefined));
   if (raw?.ok !== true) throw new Error('Orca worktree ps failed');
   if (!raw.result || raw.result.truncated || !Array.isArray(raw.result.worktrees)) {
     throw new Error('Incomplete Orca workspace inventory');
@@ -35,6 +31,25 @@ export async function findOrcaWorktreeByName(
   );
   if (!row || typeof row.path !== 'string' || typeof row.worktreeId !== 'string') return undefined;
   return { workspacePath: row.path, worktreeId: row.worktreeId };
+}
+
+/** Synchronize a standing workspace only when its local history can fast-forward. */
+export async function tryFastForwardCleanWorktree(
+  runner: CommandRunner,
+  workspacePath: string,
+  canMerge?: () => boolean,
+): Promise<void> {
+  const git = (args: string[], signal?: AbortSignal) => checkedCommand(runner, {
+    command: 'git', args: ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], signal,
+  });
+  const isClean = async () => (await git(['status', '--porcelain', '--untracked-files=all'])).stdout.trim() === '';
+  if (!(await isClean())) return;
+  await git(['fetch', '--quiet', 'origin', 'main'], AbortSignal.timeout(8_000));
+  if ((await git(['rev-list', '--count', 'origin/main..HEAD'])).stdout.trim() !== '0') return;
+  if ((await git(['rev-list', '--count', 'HEAD..origin/main'])).stdout.trim() === '0') return;
+  // Fetch can take seconds, during which another slot or a local edit can appear.
+  if (!(await isClean()) || canMerge?.() === false) return;
+  await git(['merge', '--ff-only', '--quiet', 'origin/main'], AbortSignal.timeout(8_000));
 }
 
 export interface OrcaIdleResult {
@@ -117,16 +132,10 @@ export async function checkOrcaWorkspaceIdle(
   signal?: AbortSignal,
   options?: OrcaWorkspaceIdleOptions,
 ): Promise<OrcaIdleResult> {
-  const output = await checkedCommand(runner, {
-    command,
-    args: ['worktree', 'ps', '--agent-wait', '--limit', '10000', '--json'],
-    // Only this read-only inventory probe narrows a removed workspace directory to the daemon's
-    // cwd: the gone path must be reported as "Workspace not found" before anything is spawned
-    // inside it, while the shared runner keeps strict cwd semantics for every other caller.
-    cwd: runner === runCommand && !existsSync(cwd) ? undefined : cwd,
-    signal,
-  });
-  const raw = JSON.parse(output.stdout);
+  // A removed workspace must be reported as "Workspace not found" from the global
+  // inventory before another command can spawn inside it.
+  const inventoryCwd = runner === runCommand && !existsSync(cwd) ? undefined : cwd;
+  const raw = JSON.parse(await readOrcaWorktreePs(runner, command, inventoryCwd, signal));
   const inventory = raw.result;
   if (raw.ok !== true || !inventory || inventory.truncated || !Array.isArray(inventory.worktrees)) {
     if (options?.throwOnProbeError) throw new Error('Incomplete workspace inventory');
@@ -159,13 +168,7 @@ export async function checkOrcaWorkspaceIdle(
   const terminalInventories = new Map<string, Promise<OrcaTerminalRow[] | undefined>>();
   const terminalHandlesByWorktreeId = new Map<string, ReadonlySet<string>>();
   const fetchWorktreeTerminals = async (row: Workspace): Promise<OrcaTerminalRow[] | undefined> => {
-    const listed = await checkedCommand(runner, {
-      command,
-      args: ['terminal', 'list', '--worktree', `path:${row.path}`, '--json'],
-      cwd,
-      signal,
-    });
-    const terminals = JSON.parse(listed.stdout);
+    const terminals = JSON.parse(await readOrcaTerminalList(runner, command, row.path, cwd, signal));
     if (terminals.ok !== true || terminals.result?.truncated || !Array.isArray(terminals.result?.terminals)) {
       return undefined;
     }
@@ -724,7 +727,7 @@ export async function spawnOrcaWorkspaceTerminal(
   const launchCommand = buildOrcaAgentLaunchCommand(options);
   let spawned;
   try {
-    spawned = await runner({
+    spawned = await orcaMutationRunner(runner, cwd)({
       command,
       args: ['terminal', 'create', '--worktree', `path:${cwd}`, '--command', launchCommand, '--json'],
       cwd,
@@ -796,13 +799,7 @@ export async function inspectOrcaWorkspaceTerminal(
   signal?: AbortSignal,
   preferredPaneKey?: string,
 ): Promise<'live' | 'unusable' | 'absent'> {
-  const listed = await checkedCommand(runner, {
-    command,
-    args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
-    cwd,
-    signal,
-  });
-  const inventory = JSON.parse(listed.stdout);
+  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal));
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
@@ -837,13 +834,7 @@ export async function planOrcaWorkspaceTerminal(
   options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean; excludedHandles?: ReadonlySet<string> },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' }> {
   const targetAgent = options?.agent ?? 'antigravity';
-  const listed = await checkedCommand(runner, {
-    command,
-    args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
-    cwd,
-    signal,
-  });
-  const inventory = JSON.parse(listed.stdout);
+  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal));
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
@@ -941,11 +932,12 @@ export async function sendOrcaTerminalText(
     '--json',
   ];
   let output;
+  const send = orcaMutationRunner(runner, options.cwd);
   try {
-    output = await checkedCommand(runner, { command, args, cwd: options.cwd, signal: options.signal });
+    output = await checkedCommand(send, { command, args, cwd: options.cwd, signal: options.signal });
   } catch (error) {
     if (!String(error).includes('no_active_sender_terminal')) throw error;
-    output = await checkedCommand(runner, {
+    output = await checkedCommand(send, {
       command,
       args: [...args, '--allow-self'],
       cwd: options.cwd,
@@ -978,7 +970,7 @@ export async function closeOrcaWorkspaceTerminal(
   let result: { stdout: string; stderr?: string; exitCode?: number } | undefined;
   let failure: unknown;
   try {
-    result = await runner({
+    result = await orcaMutationRunner(runner, cwd)({
       command,
       args: ['terminal', 'close', '--terminal', handle, '--json'],
       cwd,
@@ -1014,13 +1006,7 @@ export async function closeOrcaWorkspaceTerminal(
   // the one-live-terminal invariant, so only a still-present terminal keeps the retirement open.
   let inventory: unknown;
   try {
-    const listed = await checkedCommand(runner, {
-      command,
-      args: ['terminal', 'list', '--worktree', `path:${cwd}`, '--json'],
-      cwd,
-      signal,
-    });
-    inventory = JSON.parse(listed.stdout);
+    inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal));
   } catch {
     throw closeError;
   }
@@ -1051,7 +1037,7 @@ export async function setOrcaWorkspaceComment(
   comment: string,
   options: { cwd?: string; signal?: AbortSignal } = {},
 ): Promise<void> {
-  const output = await checkedCommand(runner, {
+  const output = await checkedCommand(orcaMutationRunner(runner, workspacePath), {
     command,
     args: [
       'worktree',
@@ -1151,7 +1137,7 @@ export async function ensureOrcaWorkspace(
   if (found) return { workspacePath: found.path, created: false };
   if (!options.repoRoot)
     throw new Error('Creating a fixed Orca workspace requires a receiver-local repoRoot');
-  const created = await checkedCommand(runner, {
+  const created = await checkedCommand(orcaMutationRunner(runner), {
     command,
     args: [
       'worktree',

@@ -336,7 +336,7 @@ export interface EmitterService {
 - **内置与可扩展的 `SourcePlugin`（把 `alter-service` 触发源彻底插件化）**：
   - `plugin-source-cli-mcp`：供节点内正在运行的 Agent（AGY / Claude Code / Codex）通过 CLI 或 MCP 直接发消息。
   - `plugin-source-webhook`：本地安全 HTTP 端点（如承接 Source Hub `/feedback/wake` 或 GitLab/GitHub 事件）。
-  - `plugin-source-poll-watermark`：通用水位轮询触发器基类，直接承载你的飞书多维表格告警源、Source Hub 反馈认领源、Runtime Monitor 低质会话源。
+  - `plugin-source-poll-watermark`：通用水位轮询触发器基类，直接承载你的飞书多维表格告警源、Source Hub 反馈认领源、Runtime Monitor 低质会话源。 轮询失败按配置的间隔指数退避，可用 `maxBackoffMs` 限制最长延迟。轮询成功或收到 `/wake` POST 后重置退避。
 - **离线出站（Durable Outbox）**：`sendUnicast` 只有遇到可重试的连接类失败（允许列表内的 `ECONNREFUSED/RESET/TIMEDOUT/EHOSTUNREACH/ENETUNREACH/EHOSTDOWN/ENETDOWN/ENONET/ESHUTDOWN/DNS/截断流/超时`，或被种子 `spoolIfOffline` 接收后的 `OfflinePeerSpooledError`）才作为离线重驱交给 outbox；其中 `EHOSTDOWN`/`ENETDOWN`/`ENONET`/`ESHUTDOWN` 覆盖 Darwin/BSD 同网段 ARP 失败与本地接口切换，Node Happy Eyeballs 抛出的 `AggregateError` 仅当全部成员都是连接类失败时才整体归类为离线。签名不符、回执伪造、密码学校验失败、缺失/损坏附件、畸形中继响应、中继 `networkId` 不匹配与帧超限等确定性本地/协议错误仍然直接抛给调用方，绝不伪装成“已排队”。网络被卸载是瞬时运行态：该网络上的义务保持 `queued` 并在重新挂载后继续重驱，而不是逐目标标记 failures。首次发送与后续重驱共用 emitter 内同一个逐目标发送/分类通道：`dispatched` / `settled` / 持久 `queued` / dedup 重复回执才是 delivered；`rejected` / `failed` 是该目标的终态签名证据；`pending_approval`、内存态 `queued`、`received` 等非终态仍属于待重驱义务。某个目标失败不会中断或丢弃同批其他目标；若确定性错误与其他目标的离线义务同批出现，emitter 先把离线目标及其 queued 回执原子写入 outbox，再把该确定性错误抛给调用方。TCP 三次握手未完成时的 socket 超时（零应用字节可能离开本机）按 `ETIMEDOUT` 连接失败处理，不会标记 in-doubt；只有已建连并写出帧后等待响应超时才使用 `DeliveryTimeoutError` 并记入 `inDoubtNodeIds`。中继链路上的超时按信标证据归因：目标没有新鲜信标时，连接种子或僵尸隧道的超时只是离线可达性失败（`ETIMEDOUT`），绝不能伪装成目标执行超时。in-doubt 目标在普通定时器上仍保持暂停，只有 `transport/peer-reachable` 的真实可达脉冲、直连 peer 脉冲、`transport.isPeerReachable` 证明目标在线后的常规退避重试，或显式 `--force` 才会用同一稳定 envelope id 重发；接收端 `DeliveryLedger` / `dedup-cas` 对重复信封幂等裁决，不会重复执行。
   - `emitter/sent` 通知成功广播、目标的真实交接回执或持久 outbox 义务。签名回执无法证明执行结果，或发送后未能验证回执时，即使没有幂等键也要持久化失败义务并保留出站线程。确定未尝试的失败不会创建新的出站线程。同键重放可补发一次中断前未发出的通知。
   - 配置 `outbox` 时，`emitter` 是唯一的出站发送、路由与回执校验 owner：首次发送和后续重驱都经过同一个 `redriveOutboxItem` 通道；`mailbox/outbox` 只持久化义务、退避调度与解析后的目标，不构造线协议帧、不路由、不解析回执。它把已签名信封与附件副本原子写入 `outbox.json`，并返回一张本机签名的 `stage: "queued"` 回执，`executionReceipt` 标记 `executor: "outbox"`、`queuedOffline: true`，若种子已暂存另带 `relaySpooled: true`。
@@ -612,6 +612,15 @@ the explicitly approved one-line legacy migration from configured passive target
 `agent-host` driver; normal v2 operation treats all driver ids as opaque strings. Unknown v2
 wake-target keys and non-JSON configuration values are rejected.
 
+Mailbox and outbox reads reuse validated snapshots keyed by device, inode, size and modification
+time. A successful write compacts history in the same atomic commit. The mailbox retains the
+200 newest acknowledged items, 100 inactive inbound-only wave threads and 200 inactive settled
+threads eligible for removal. The outbox retains the 200 newest eligible confirmed or superseded
+terminal items. Active custody and unconfirmed deliveries remain in their ledgers. Both stores
+read the peer ledger without taking its lock. The mailbox retains a route while the outbox could
+project it again, and the outbox retains supersession evidence while an unsettled outbound route
+still depends on it. Retained mailbox items keep their original signed envelope.
+
 A driver persists `beginWakeDelivery` before an external boundary and settles only observed
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;
 mail arriving during delivery remains pending. Proven command non-starts back off, while unknown
@@ -629,6 +638,11 @@ panes or agentless worktrees through root sibling terminals or terminals in prov
 descendant worktrees. Incomplete lineage inventory blocks readiness when that lookup is
 required. If the bound pane vanishes, its agents and descendants still gate readiness.
 A replacement tab has its own composer. Rotation never resets or writes into a retained session.
+Standing wave worktrees can fast-forward to `origin/main` before a fresh tab launches. Git
+checks cleanliness and local commits, and the driver rechecks sibling terminal claims before
+merging. Sync failures are reported while delivery proceeds. Real Orca inventory probes share
+in-flight reads and reuse completed worktree and terminal snapshots for up to 1.5 seconds and
+1 second respectively. Orca mutations invalidate the affected inventory immediately.
 An already-absent retired terminal settles the retirement, while a
 deterministic Orca refusal (for example a pinned tab) parks the wake target in `deliveryInDoubt`
 for operator reconciliation instead of retrying forever. Any human draft or unconfirmed Turn Pilot recommendation holds mail

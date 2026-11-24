@@ -17,6 +17,7 @@ import type { Disposable, MessageEnvelope, OutboxItem, SettlementOutcome } from 
 import { withOwnedLock, writeFileAtomically } from '../fs-atomic/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
+import { LedgerSnapshot } from './ledger-snapshot.ts';
 import { netKey } from './network-key.ts';
 import type { OutboxStore } from './outbox.ts';
 export { CONVERSATION_MODES, ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
@@ -27,6 +28,9 @@ export const MAILBOX_SCHEMA = 'the-dealer-mailbox/v2';
 export const LEGACY_MAILBOX_V1_SCHEMA = 'the-dealer-mailbox/v1';
 const LEGACY_INBOX_SCHEMA = 'the-dealer-inbox/v1';
 const MAX_ACKED_LEASE_HISTORY = 256;
+export const MAX_RETAINED_ACKED_ITEMS = 200;
+export const MAX_RETAINED_WAVE_THREADS = 100;
+export const MAX_RETAINED_SETTLED_THREADS = 200;
 const MAX_WAKEUP_HINT_LENGTH = 120;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 3_600_000;
@@ -164,6 +168,8 @@ export interface MailboxStoreOptions {
   legacyInboxPath?: string;
   /** Defaults to `${mailboxPath}.lock`. */
   lockDir?: string;
+  /** Peer snapshot used to retain thread routes that outbox reconciliation could restore. */
+  outbox?: OutboxStore;
 }
 
 export interface MailboxEnqueueOptions {
@@ -946,6 +952,69 @@ function migrateLegacyItem(item: LegacyInboxItem, sequence: number): MailboxItem
   };
 }
 
+function compactMailboxState(state: MailboxFileState, outbox?: OutboxStore): void {
+  if (state.items.length > MAX_RETAINED_ACKED_ITEMS) {
+    const acked = state.items.filter(item => item.status === 'acked');
+    if (acked.length > MAX_RETAINED_ACKED_ITEMS) {
+      const expired = new Set(acked.sort((a, b) => b.sequence - a.sequence).slice(MAX_RETAINED_ACKED_ITEMS));
+      state.items = state.items.filter(item => !expired.has(item));
+    }
+  }
+
+  const records = Object.values(state.threads);
+  if (records.length <= MAX_RETAINED_WAVE_THREADS) return;
+  const activeThreads = new Set<string>();
+  for (const item of state.items) {
+    if (item.status === 'acked') continue;
+    const envelope = item.signedEnvelope ?? item.envelope;
+    activeThreads.add(netKey(envelope.networkId, envelopeThreadId(envelope)));
+    for (const id of [item.id, envelope.replyToId]) {
+      if (id === undefined) continue;
+      for (const direction of ['inbound', 'outbound']) {
+        const record = state.threads[`${direction}:${id}`];
+        if (record?.networkId === envelope.networkId) activeThreads.add(netKey(record.networkId, record.threadId));
+      }
+    }
+  }
+
+  const groups = new Map<string, ThreadRouteRecord[]>();
+  for (const record of records) {
+    const key = netKey(record.networkId, record.threadId);
+    if (activeThreads.has(key)) continue;
+    const group = groups.get(key);
+    if (group) group.push(record);
+    else groups.set(key, [record]);
+  }
+  const wave: { key: string; updatedAt: string; records: ThreadRouteRecord[] }[] = [];
+  const settled: typeof wave = [];
+  for (const [key, records] of groups) {
+    const updatedAt = records.reduce((latest, record) => record.updatedAt > latest ? record.updatedAt : latest, '');
+    const group = { key, updatedAt, records };
+    if (records.every(record => record.state === 'settled')) {
+      settled.push(group);
+    } else if (records.every(record =>
+      record.direction === 'inbound' && record.state === 'open' && record.kind.startsWith('wave.'))) {
+      wave.push(group);
+    }
+  }
+  if (wave.length <= MAX_RETAINED_WAVE_THREADS && settled.length <= MAX_RETAINED_SETTLED_THREADS) return;
+  // A surviving outbox projection could recreate an open leg after its settlement was pruned.
+  const outboxThreads = new Set<string>();
+  if (outbox) {
+    for (const item of readOutboxThreadOwners(outbox).items) {
+      outboxThreads.add(netKey(item.networkId, envelopeThreadId(item.envelope)));
+    }
+  }
+  for (const [history, limit] of [[wave, MAX_RETAINED_WAVE_THREADS], [settled, MAX_RETAINED_SETTLED_THREADS]] as const) {
+    if (history.length <= limit) continue;
+    const eligible = history.filter(group => !outboxThreads.has(group.key));
+    eligible.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.key.localeCompare(b.key));
+    for (const group of eligible.slice(limit)) {
+      for (const record of group.records) delete state.threads[threadKey(record)];
+    }
+  }
+}
+
 function receivedInstant(item: MailboxItem): number {
   const parsed = Date.parse(item.receivedAt);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -1080,7 +1149,9 @@ export class MailboxStore {
   readonly path: string;
   readonly lockDir: string;
   private readonly legacyInboxPath?: string;
+  private readonly outbox?: OutboxStore;
   private readonly events = new EventEmitter();
+  private readonly snapshot = new LedgerSnapshot<MailboxFileState>();
 
   constructor(mailboxPath: string, options: MailboxStoreOptions = {}) {
     this.path = resolve(mailboxPath);
@@ -1088,6 +1159,7 @@ export class MailboxStore {
       ? resolve(options.legacyInboxPath)
       : undefined;
     this.lockDir = resolve(options.lockDir ?? `${this.path}.lock`);
+    this.outbox = options.outbox;
     this.events.setMaxListeners(0);
     this.migrateLegacyInbox();
   }
@@ -1116,25 +1188,18 @@ export class MailboxStore {
   }
 
   private read(): MailboxFileState {
-    let raw: string;
-    try {
-      raw = readFileSync(this.path, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return emptyState();
-      }
-      throw error;
-    }
-    return loadState(raw);
+    return this.snapshot.read(this.path, loadState, emptyState);
   }
 
   private save(state: MailboxFileState): void {
+    compactMailboxState(state, this.outbox);
+    this.snapshot.invalidate();
     writeFileAtomically(this.path, JSON.stringify(state));
   }
 
   private mutate<T>(operation: (state: MailboxFileState) => T): T {
     return this.withFileLock(() => {
-      const state = this.read();
+      const state = structuredClone(this.read());
       const result = operation(state);
       this.save(state);
       return result;
@@ -2048,6 +2113,17 @@ export class MailboxStore {
     return this.mutate(state => structuredClone(this.upsertThreadRecord(state, record)));
   }
 
+  /** Lock-free references whose slot obligations still consult outbox failure evidence. */
+  readUnsettledOutboundKeys(): ReadonlySet<string> {
+    const keys = new Set<string>();
+    for (const record of Object.values(this.read().threads)) {
+      if (record.direction === 'outbound' && record.state !== 'settled') {
+        keys.add(netKey(record.networkId, record.messageId));
+      }
+    }
+    return keys;
+  }
+
   reconcileOutboxThreads(outbox: OutboxStore): void {
     const { items } = readOutboxThreadOwners(outbox);
     if (items.length > 0) this.restoreOutboundThreads(items.map(outboxThreadRecord));
@@ -2055,7 +2131,7 @@ export class MailboxStore {
 
   private restoreOutboundThreads(records: readonly ThreadRouteRecord[]): ThreadRouteRecord[] {
     return this.withFileLock(() => {
-      const state = this.read();
+      const state = structuredClone(this.read());
       let changed = false;
       const restored = records.map(record => {
         const existing = state.threads[threadKey(record)];

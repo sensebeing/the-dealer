@@ -590,3 +590,70 @@ test('drain waiters holding no control slot never widen the allowance', async t 
   assert.deepEqual((await probe).stdout, ['probed']);
   assert.equal(await runtime.drainForStop({ drainTimeoutMs: 2_000 }), true);
 });
+
+test('watermark scheduling backs off failures and resets on success and HTTP wake', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const errors: unknown[] = [];
+  let polls = 0;
+  let fail = true;
+  const source = createPollWatermarkSourcePlugin({
+    initialCursor: 0, wake: {}, intervalMs: 10, maxBackoffMs: 50,
+    poll: async cursor => {
+      polls++;
+      if (fail) throw new Error('poll failed');
+      return { items: [], cursor };
+    },
+    toInput: () => input,
+    onError: error => errors.push(error),
+  });
+  t.after(() => source.stop());
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+  const tick = async (ms: number) => { t.mock.timers.tick(ms); await flush(); };
+  await source.start(emitter([]));
+  await flush();
+  assert.equal(polls, 1);
+  await tick(19);
+  assert.equal(polls, 1);
+  await tick(1);
+  assert.equal(polls, 2);
+  await tick(39);
+  assert.equal(polls, 2);
+  await tick(1);
+  assert.equal(polls, 3);
+  await tick(49);
+  assert.equal(polls, 3);
+  fail = false;
+  await tick(1);
+  assert.equal(polls, 4);
+  fail = true;
+  await tick(9);
+  assert.equal(polls, 4);
+  await tick(1);
+  assert.equal(polls, 5);
+  await tick(20);
+  assert.equal(polls, 6);
+
+  const address = source.wakeAddress();
+  assert.ok(address && typeof address === 'object');
+  // Use node:http so the mock clock controls only the source's poll scheduler.
+  const { request } = await import('node:http');
+  await new Promise<void>((resolve, reject) => {
+    const req = request({ host: '127.0.0.1', port: address.port, path: '/wake', method: 'POST' }, response => {
+      assert.equal(response.statusCode, 200);
+      response.resume();
+      response.on('end', resolve);
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  await flush();
+  assert.equal(polls, 7);
+  await tick(19);
+  assert.equal(polls, 7);
+  await tick(1);
+  assert.equal(polls, 8);
+  assert.equal(errors.length, 7);
+  await source.stop();
+  await tick(100);
+  assert.equal(polls, 8);
+});
