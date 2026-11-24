@@ -7,7 +7,7 @@ import { randomInt } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { CommandNotStartedError, runCommand, checkedCommand, singleLine } from '../subprocess/index.ts';
-import type { CommandRunner } from '../subprocess/index.ts';
+import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import { orcaMutationRunner, readOrcaTerminalList, readOrcaWorktreePs } from './inventories.ts';
 
 export async function findOrcaWorktreeByName(
@@ -971,6 +971,12 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
 /** Orca refused the send before writing any bytes to the terminal. */
 export class OrcaTerminalSendRefusedError extends Error {}
 
+function orcaTerminalSendRefusal(send: unknown): OrcaTerminalSendRefusedError | undefined {
+  if (!isRecord(send) || send.accepted !== false) return undefined;
+  const reason = typeof send.refusedReason === 'string' && send.refusedReason;
+  return new OrcaTerminalSendRefusedError(reason ? `Orca terminal send refused: ${reason}` : 'Orca terminal send refused');
+}
+
 /** Send one line (plus Enter) to a terminal; the caller must have proven it idle first. */
 export async function sendOrcaTerminalText(
   runner: CommandRunner,
@@ -990,13 +996,37 @@ export async function sendOrcaTerminalText(
     ...(options.waitSubmit !== undefined ? ['--wait-submit', String(options.waitSubmit)] : []),
     '--json',
   ];
-  let output;
   const mutationRunner = orcaMutationRunner(runner, options.cwd);
+  const sendOnce = async (request: CommandRequest) => {
+    let returned: Awaited<ReturnType<CommandRunner>> | undefined;
+    try {
+      return await checkedCommand(async request => {
+        returned = await mutationRunner(request);
+        return returned;
+      }, request);
+    } catch (error) {
+      // Orca emits its refusal receipt before exiting 1. Preserve stdout whether the runner
+      // returned the non-zero status or attached it to a rejection.
+      const failed = returned ?? (error as { stdout?: unknown; exitCode?: unknown } | null);
+      if (typeof failed?.exitCode === 'number' && failed.exitCode !== 0 && typeof failed.stdout === 'string') {
+        let parsed;
+        try {
+          parsed = JSON.parse(failed.stdout);
+        } catch {
+          throw error;
+        }
+        const refusal = orcaTerminalSendRefusal(parsed?.result?.send);
+        if (refusal) throw refusal;
+      }
+      throw error;
+    }
+  };
+  let output;
   try {
-    output = await checkedCommand(mutationRunner, { command, args, cwd: options.cwd, signal: options.signal });
+    output = await sendOnce({ command, args, cwd: options.cwd, signal: options.signal });
   } catch (error) {
-    if (!String(error).includes('no_active_sender_terminal')) throw error;
-    output = await checkedCommand(mutationRunner, {
+    if (error instanceof OrcaTerminalSendRefusedError || !String(error).includes('no_active_sender_terminal')) throw error;
+    output = await sendOnce({
       command,
       args: [...args, '--allow-self'],
       cwd: options.cwd,
@@ -1009,11 +1039,9 @@ export async function sendOrcaTerminalText(
     throw new Error('Orca terminal send failed');
   }
   const send = parsed?.result?.send;
+  const refusal = orcaTerminalSendRefusal(send);
+  if (refusal) throw refusal;
   if (!isRecord(send)) return;
-  if (send.accepted === false) {
-    const reason = typeof send.refusedReason === 'string' && send.refusedReason;
-    throw new OrcaTerminalSendRefusedError(reason ? `Orca terminal send refused: ${reason}` : 'Orca terminal send refused');
-  }
   if (options.waitSubmit === undefined && options.expectedAgent === undefined) return;
   const prompt = send.prompt;
   if (!isRecord(prompt)) return;

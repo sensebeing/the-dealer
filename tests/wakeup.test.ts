@@ -4706,6 +4706,43 @@ function orcaTerminalSendReceipt(send: object) {
   return { stdout: JSON.stringify({ ok: true, result: { send } }) };
 }
 
+test('Orca terminal sends classify exit 1 refusal receipts on either attempt', async () => {
+  for (const rejects of [true, false]) {
+    for (const retry of [true, false]) {
+      const refusedReason = retry ? 'terminal_busy' : 'no_active_sender_terminal';
+      const output = { ...orcaTerminalSendReceipt({ accepted: false, refusedReason }), exitCode: 1 };
+      const calls: CommandRequest[] = [];
+      const runner: CommandRunner = async request => {
+        calls.push(request);
+        if (retry && calls.length === 1) throw new Error('no_active_sender_terminal');
+        if (rejects) throw Object.assign(new Error('orca exited 1'), output);
+        return output;
+      };
+      await assert.rejects(sendOrcaTerminalText(runner, 'orca', 'tab', 'wake'), {
+        constructor: OrcaTerminalSendRefusedError, message: `Orca terminal send refused: ${refusedReason}`,
+      });
+      assert.equal(calls.length, retry ? 2 : 1);
+      assert.equal(calls.at(-1)?.args.includes('--allow-self'), retry);
+    }
+  }
+});
+
+test('Orca terminal send keeps unverified command failures intact', async () => {
+  const signalFailure = Object.assign(new Error('process interrupted'), {
+    ...orcaTerminalSendReceipt({ accepted: false, refusedReason: 'terminal_busy' }), exitCode: null,
+  });
+  const otherFailure = Object.assign(new Error('orca exited 1: transport disconnected'), {
+    stdout: '{"ok":false}', exitCode: 1,
+  });
+  for (const failure of [signalFailure, otherFailure]) {
+    await assert.rejects(sendOrcaTerminalText(async () => { throw failure; }, 'orca', 'tab', 'wake'),
+      (error: unknown) => error === failure);
+  }
+  await assert.rejects(sendOrcaTerminalText(async () => ({
+    stdout: 'incomplete JSON', stderr: 'transport disconnected', exitCode: 1,
+  }), 'orca', 'tab', 'wake'), { message: 'orca exited 1: transport disconnected' });
+});
+
 test('Orca terminal sends verify observed turns and retain legacy receipt compatibility', async () => {
   const options = { waitSubmit: 5, expectedAgent: 'antigravity' } as const;
   for (const { send, detail, retryable } of orcaReceiptFailures) {
@@ -4742,11 +4779,11 @@ for (const delivery of ['spawned', 'redrive'] as const) {
         mailboxId,
         wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: 'tab', agent: 'antigravity' } },
       });
-      let receipt: object = send;
+      let output = { ...orcaTerminalSendReceipt(send), exitCode: retryable ? 1 : 0 };
       const runner: CommandRunner = async request => {
         if (request.args[0] !== 'terminal' || request.args[1] !== 'send') return inventory(request);
         state.calls.push(request);
-        return orcaTerminalSendReceipt(receipt);
+        return output;
       };
       const service = () => new WakeupRedriveService({
         store: new MailboxStore(store.path),
@@ -4770,7 +4807,7 @@ for (const delivery of ['spawned', 'redrive'] as const) {
       assert.equal(target.deliveryInDoubt, retryable ? undefined : true, name);
       assert.equal(target.attemptCount, 1);
       if (retryable) assert.ok(target.earliestWakeAt > Date.now());
-      receipt = { accepted: true, prompt: acceptedOrcaPrompt };
+      output = { ...orcaTerminalSendReceipt({ accepted: true, prompt: acceptedOrcaPrompt }), exitCode: 0 };
       const restarted = service();
       t.after(() => restarted.stop());
       assert.equal((await restarted.flushMailbox(mailboxId, { force: true })).woke, retryable, name);
