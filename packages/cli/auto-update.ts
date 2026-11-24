@@ -226,6 +226,19 @@ export function liveDaemonOwner(stateDir: string) {
   }
 }
 
+/**
+ * The fingerprint record of the daemon incarnation that currently owns the state directory.
+ * Only a record written by that same lock owner counts; a leftover record from an earlier
+ * incarnation must never be mistaken for the live daemon's custody.
+ */
+export function liveDaemonFingerprint(stateDir: string): FingerprintRecord | undefined {
+  const owner = liveDaemonOwner(stateDir);
+  const record = owner ? readDaemonFingerprint(stateDir) : undefined;
+  return owner && record && record.instanceId === owner.instanceId && record.pid === owner.pid
+    ? record
+    : undefined;
+}
+
 export function removeDaemonFingerprint(stateDir: string, instanceId: string): void {
   const path = join(stateDir, 'runtime-fingerprint.json');
   if (readDaemonFingerprint(stateDir)?.instanceId === instanceId) {
@@ -572,10 +585,8 @@ export function maybeTriggerBackgroundAutoUpdate(options: SelfUpdateOptions): vo
     return;
   }
   const currentFingerprint = computeRuntimeFingerprint(options.stateDir, updateCheckoutFor(options));
-  const daemonOwner = existsSync(join(options.stateDir, 'control.sock')) ? liveDaemonOwner(options.stateDir) : undefined;
-  const daemonRecord = daemonOwner ? readDaemonFingerprint(options.stateDir) : undefined;
-  const daemonFingerprint = daemonOwner && daemonRecord?.pid === daemonOwner.pid && daemonRecord.instanceId === daemonOwner.instanceId
-    ? daemonRecord.fingerprint
+  const daemonFingerprint = existsSync(join(options.stateDir, 'control.sock'))
+    ? liveDaemonFingerprint(options.stateDir)?.fingerprint
     : undefined;
   const localSyncNeeded = state?.runtimeFingerprint !== currentFingerprint ||
     (daemonFingerprint !== undefined && daemonFingerprint !== currentFingerprint);

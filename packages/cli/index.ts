@@ -24,7 +24,7 @@ import {
   isTerminalDeliveryFailure,
 } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
-import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonOwner, readDaemonFingerprint, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
+import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
 import { processOwnerRecord } from '../process-lock/index.ts';
@@ -449,14 +449,8 @@ export async function stopDaemonIfRunning(
   let pid: number | undefined = targetOwner?.pid;
   // Custody only counts when the fingerprint record belongs to the same incarnation as the
   // lock owner; a stale record must never route the restart to a supervisor that is not there.
-  const targetRecord = readDaemonFingerprint(stateDir);
-  let supervised = Boolean(
-    targetOwner &&
-    targetRecord &&
-    targetRecord.instanceId === targetOwner.instanceId &&
-    targetRecord.pid === targetOwner.pid &&
-    targetRecord.supervised,
-  );
+  const targetRecord = liveDaemonFingerprint(stateDir);
+  let supervised = targetRecord?.supervised === true;
   let targetAlreadyStopped = false;
   let drainDeferred = false;
   try {
@@ -1385,15 +1379,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           if (!existsSync(join(stateDir, 'control.sock')) && !liveDaemonOwner(stateDir)) return false;
           // Custody of the incarnation this reconciliation may have to wait on, proven by its
           // own fingerprint record. Capture it before the drain can release the lock.
-          const witnessedOwner = liveDaemonOwner(stateDir);
-          const witnessedRecord = readDaemonFingerprint(stateDir);
-          const supervised = Boolean(
-            witnessedOwner &&
-            witnessedRecord &&
-            witnessedRecord.instanceId === witnessedOwner.instanceId &&
-            witnessedRecord.pid === witnessedOwner.pid &&
-            witnessedRecord.supervised,
-          );
+          const supervised = liveDaemonFingerprint(stateDir)?.supervised === true;
           let probe = await probeMatchingDaemonStatus(stateDir, runtimeFingerprint);
           if (probe.state === 'not-ready' && liveDaemonOwner(stateDir)) {
             const ready = await waitForOwnedDaemonReady(stateDir, runtimeFingerprint, options.daemonStartupTimeoutMs);
@@ -1832,16 +1818,32 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     if (runtime.supervised) {
       // The supervisor owns custody: drain in process and exit so it starts the replacement.
       // Spawning a detached daemon here would steal the lock the supervisor is about to claim.
-      void runtime.drainForStop().then(drained => {
-        if (!drained) {
+      void runtime.drainForStop().then(
+        drained => {
+          if (!drained) {
+            retryDeferredReload();
+            return;
+          }
+          // Once the drain commits the control server closes and only an exited process is
+          // replaced: a stop failure must exit too, not linger unreadable while the node is down.
+          return runtime.stop().then(
+            () => process.exit(0),
+            error => {
+              runtime.lastError = String(error);
+              process.exit(1);
+            },
+          );
+        },
+        error => {
+          runtime.lastError = String(error);
+          // A drain rejection after the commit leaves the daemon draining with no stop scheduled.
+          if (runtime.isStoppingOrDraining()) {
+            process.exit(1);
+            return;
+          }
           retryDeferredReload();
-          return;
-        }
-        return runtime.stop().then(() => process.exit(0));
-      }).catch(error => {
-        restartTriggered = false;
-        runtime.lastError = String(error);
-      });
+        },
+      );
       return;
     }
     const bin = fileURLToPath(new URL('../../bin/dealer.js', import.meta.url));

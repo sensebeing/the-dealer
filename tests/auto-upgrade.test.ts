@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess, { execFileSync, spawn } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, watch, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -39,6 +39,43 @@ async function until<T>(check: () => T | false | undefined, description: string,
     }
     await new Promise(resolve => setTimeout(resolve, 25));
   }
+}
+
+/**
+ * Resolve once the state directory has produced no event for `quietMs`, bounded by `maxMs`.
+ * Absence assertions wait for the daemon's own filesystem activity to settle instead of a
+ * guessed wall-clock window; a restarted incarnation claiming the lock re-arms the quiet timer.
+ */
+function waitForQuietStateDir(stateDir: string, quietMs = 500, maxMs = 10_000): Promise<void> {
+  return new Promise(resolve => {
+    let quiet: ReturnType<typeof setTimeout> | undefined;
+    let cap: ReturnType<typeof setTimeout> | undefined;
+    let watcher: ReturnType<typeof watch> | undefined;
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (quiet) clearTimeout(quiet);
+      if (cap) clearTimeout(cap);
+      watcher?.close();
+      resolve();
+    };
+    const arm = () => {
+      if (quiet) clearTimeout(quiet);
+      quiet = setTimeout(finish, quietMs);
+    };
+    try {
+      watcher = watch(stateDir, { persistent: false }, arm);
+      watcher.on('error', finish);
+      watcher.unref();
+    } catch {
+      // Watching is unavailable; the bounded cap still settles the wait.
+    }
+    cap = setTimeout(finish, maxMs);
+    arm();
+  });
 }
 
 async function runDealer(
@@ -809,6 +846,20 @@ export default function createPlugin() {
 }
 `;
 
+/** A project plugin whose cleanup fails the daemon's teardown after the drain commits. */
+const throwingStopPlugin = `
+export default function createPlugin() {
+  return {
+    name: 'throwing-stop',
+    apply(ctx) {
+      ctx.effect(() => async () => {
+        throw new Error('plugin teardown failed');
+      });
+    },
+  };
+}
+`;
+
 async function linkProjectPlugin(
   stateDir: string,
   projectRoot: string,
@@ -841,11 +892,17 @@ test('a slow stop tears down watchers and idle callbacks before the dispatcher u
   delete process.env.DEALER_AUTO_RESTART;
   // Observe self-restart spawns without letting the test spawn a competing daemon.
   const restartSpawns: string[][] = [];
+  let restartExit: (() => void) | undefined;
   const originalSpawn = childProcess.spawn;
   const mocked = t.mock.method(childProcess, 'spawn', (command: string, args: string[], options: childProcess.SpawnOptions) => {
     if (args?.[3] === 'node' && args?.[4] === 'restart') {
       restartSpawns.push(args);
-      return { once() {}, unref() {} };
+      return {
+        once(event: string, listener: () => void) {
+          if (event === 'exit') restartExit = listener;
+        },
+        unref() {},
+      };
     }
     return originalSpawn(command, args, options);
   });
@@ -890,24 +947,32 @@ test('a slow stop tears down watchers and idle callbacks before the dispatcher u
   assert.equal(typeof lateControlIdle, 'function');
   let stoppingListenerRuns = 0;
   runtime.onStopping(() => { stoppingListenerRuns++; });
-  // Arm the 400ms watch debounce and commit the stop before it fires; the slow plugin keeps the
-  // kernel and dispatcher alive long enough that a leftover timer would call into them.
+  // Arm the real watcher debounce; its restart attempt is the observable proof that the pending
+  // reload is set when the stop begins. The spawn is mocked, so no competing daemon exists.
   editManifest(projectRoot, 'edited while the daemon is about to stop');
-  await new Promise(resolve => setTimeout(resolve, 150));
+  await until(() => restartSpawns.length === 1, 'self-restart attempt for the pending reload');
   const stopping = runtime.stop();
-  await new Promise(resolve => setTimeout(resolve, 700));
-  assert.deepEqual(restartSpawns, []);
+  await until(() => runtime.isStoppingOrDraining(), 'stop to begin teardown');
+  // The deferred restart child exits while the daemon is already stopping: it must clear the
+  // attempt without queueing work into the tearing-down kernel. The slow plugin keeps the
+  // dispatcher loaded for seconds after this point, so an unguarded wake would reach it.
+  assert.equal(typeof restartExit, 'function');
+  restartExit!();
   await stopping;
   assert.equal(stoppingListenerRuns, 1);
+  assert.equal(restartSpawns.length, 1);
   assert.equal(runtime.isIdleForRestart(), false);
+  // reloadPending is still armed: the late hook must be refused by the stopped runtime instead
+  // of reaching the unloaded dispatcher, which would throw `Service unavailable: dispatcher`.
   assert.doesNotThrow(() => lateControlIdle());
+  assert.equal(restartSpawns.length, 1);
   assert.equal(runtime.onControlIdle, undefined);
   assert.equal(runtime.onConfigPersisted, undefined);
   // A listener registered after the commit runs immediately, exactly once.
   let lateListenerRuns = 0;
   runtime.onStopping(() => { lateListenerRuns++; });
   assert.equal(lateListenerRuns, 1);
-  await new Promise(resolve => setTimeout(resolve, 100));
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(lateListenerRuns, 1);
 });
 
@@ -976,6 +1041,121 @@ test('a supervised daemon drains in process for its supervisor instead of spawni
   assert.equal(runtime.isIdleForRestart(), false);
 });
 
+test('a supervised reload exits for its supervisor even when daemon teardown fails', { timeout: 60_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  const savedEnv = {
+    stateDir: process.env.DEALER_STATE_DIR,
+    detached: process.env.DEALER_DETACHED_LAUNCH,
+    supervised: process.env.DEALER_SUPERVISED,
+    autoUpdate: process.env.DEALER_AUTO_UPDATE,
+  };
+  process.env.DEALER_STATE_DIR = stateDir;
+  delete process.env.DEALER_DETACHED_LAUNCH;
+  process.env.DEALER_SUPERVISED = '1';
+  process.env.DEALER_AUTO_UPDATE = '0';
+  const realExit = process.exit;
+  let exitCode: number | undefined;
+  process.exit = ((code?: number) => {
+    exitCode = code ?? 0;
+    return undefined as never;
+  }) as typeof process.exit;
+  let runtime: DealerNodeRuntime | undefined;
+  t.after(async () => {
+    process.exit = realExit;
+    await runtime?.stop().catch(() => {});
+    for (const [key, value] of [
+      ['DEALER_STATE_DIR', savedEnv.stateDir],
+      ['DEALER_DETACHED_LAUNCH', savedEnv.detached],
+      ['DEALER_SUPERVISED', savedEnv.supervised],
+      ['DEALER_AUTO_UPDATE', savedEnv.autoUpdate],
+    ] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await stopDaemonIfRunning(stateDir, { force: true }).catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  });
+  runtime = await runDealerDaemon(['--profile', 'headless-relay', '--member', 'test-node']);
+  assert.equal(runtime.supervised, true);
+  const projectRoot = join(root, 'throwing-project');
+  mkdirSync(projectRoot, { recursive: true });
+  assert.equal((await dealer(['project', 'init', '--root', projectRoot, '--id', 'throwing'], stateDir)).projectId, 'throwing');
+  writeFileSync(join(projectRoot, '.dealer', 'plugins', 'throwing-stop.ts'), throwingStopPlugin);
+  const manifestPath = join(projectRoot, '.dealer', 'project.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  writeFileSync(manifestPath, `${JSON.stringify({
+    ...manifest,
+    plugins: [{ name: 'throwing-stop', module: './.dealer/plugins/throwing-stop.ts', config: {} }],
+  }, null, 2)}\n`);
+  await runtime.linkProject(projectRoot);
+  await until(() => {
+    const record = readDaemonFingerprint(stateDir);
+    return record && record.fingerprint === computeRuntimeFingerprint(stateDir) ? record : undefined;
+  }, 'daemon fingerprint to settle after linking the throwing-stop project');
+  editManifest(projectRoot, 'edited to trigger the supervised reload');
+  // The drain commits, then kernel teardown rejects. A process that keeps running cannot be
+  // replaced by its supervisor and no CLI can read its error, so it must exit nonzero.
+  await until(() => exitCode !== undefined, 'supervised daemon to exit after a failed teardown', 10_000);
+  assert.equal(exitCode, 1);
+  assert.match(runtime.lastError ?? '', /Kernel cleanup failed/);
+});
+
+test('a supervised reload exits when the drain commit itself rejects', { timeout: 60_000 }, async t => {
+  const { root, stateDir } = isolatedState();
+  const savedEnv = {
+    stateDir: process.env.DEALER_STATE_DIR,
+    detached: process.env.DEALER_DETACHED_LAUNCH,
+    supervised: process.env.DEALER_SUPERVISED,
+    autoUpdate: process.env.DEALER_AUTO_UPDATE,
+  };
+  process.env.DEALER_STATE_DIR = stateDir;
+  delete process.env.DEALER_DETACHED_LAUNCH;
+  process.env.DEALER_SUPERVISED = '1';
+  process.env.DEALER_AUTO_UPDATE = '0';
+  const realExit = process.exit;
+  let exitCode: number | undefined;
+  process.exit = ((code?: number) => {
+    exitCode = code ?? 0;
+    return undefined as never;
+  }) as typeof process.exit;
+  let runtime: DealerNodeRuntime | undefined;
+  t.after(async () => {
+    process.exit = realExit;
+    await runtime?.stop().catch(() => {});
+    for (const [key, value] of [
+      ['DEALER_STATE_DIR', savedEnv.stateDir],
+      ['DEALER_DETACHED_LAUNCH', savedEnv.detached],
+      ['DEALER_SUPERVISED', savedEnv.supervised],
+      ['DEALER_AUTO_UPDATE', savedEnv.autoUpdate],
+    ] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await stopDaemonIfRunning(stateDir, { force: true }).catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  });
+  runtime = await runDealerDaemon(['--profile', 'headless-relay', '--member', 'test-node']);
+  assert.equal(runtime.supervised, true);
+  const projectRoot = join(root, 'reject-project');
+  mkdirSync(projectRoot, { recursive: true });
+  assert.equal((await dealer(['project', 'init', '--root', projectRoot, '--id', 'reject'], stateDir)).projectId, 'reject');
+  await runtime.linkProject(projectRoot);
+  await until(() => {
+    const record = readDaemonFingerprint(stateDir);
+    return record && record.fingerprint === computeRuntimeFingerprint(stateDir) ? record : undefined;
+  }, 'daemon fingerprint to settle after linking the reject project');
+  // A listener that throws at the commit leaves the daemon draining with no stop scheduled; the
+  // supervisor only replaces an exited process, so the reload must exit instead of serving 503s.
+  runtime.onStopping(() => {
+    throw new Error('stopping listener failed');
+  });
+  editManifest(projectRoot, 'edited to trigger the supervised reload');
+  await until(() => exitCode !== undefined, 'supervised daemon to exit after a rejected drain commit', 10_000);
+  assert.equal(exitCode, 1);
+  assert.equal(runtime.isStoppingOrDraining(), true);
+  assert.match(runtime.lastError ?? '', /stopping listener failed/);
+});
+
 test('an external node down during a slow stop neither crashes the daemon nor leaves a duplicate restart', { timeout: 120_000 }, async t => {
   const { root, stateDir } = isolatedState();
   let daemon: DaemonChild | undefined;
@@ -1003,9 +1183,10 @@ test('an external node down during a slow stop neither crashes the daemon nor le
   const exit = await daemon.exited;
   assert.equal(exit.code, 0, exit.stderr);
   assert.doesNotMatch(exit.stderr, /Service unavailable/);
-  // A restart spawned by the settling control request would claim the freed lock right after
-  // the slow stop ends; none may exist once that window has passed.
-  await new Promise(resolve => setTimeout(resolve, 2_000));
+  // A restart spawned by the settling control request would claim the freed lock during the
+  // daemon's shutdown activity; wait for that activity to settle instead of a guessed window,
+  // then assert no incarnation remains.
+  await waitForQuietStateDir(stateDir);
   assert.equal(liveDaemonOwner(stateDir), undefined);
   assert.equal(existsSync(join(stateDir, 'control.sock')), false);
 });
