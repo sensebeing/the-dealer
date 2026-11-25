@@ -5336,6 +5336,24 @@ test('Orca terminal sends verify observed turns and retain legacy receipt compat
   }), 'orca', 'shell', 'agy --dangerously-skip-permissions');
 });
 
+async function receiptInboxCli(stateDir: string, workspacePath: string, terminalHandle: string, ...args: string[]) {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const code = await runDealerCli(['inbox', ...args, '--json'], {
+    stateDir,
+    env: {
+      ORCA_TERMINAL_HANDLE: terminalHandle,
+      ORCA_WORKTREE_ID: `repo::${workspacePath}`,
+      ORCA_PANE_KEY: `${terminalHandle}:pane`,
+      ANTIGRAVITY_CONVERSATION_ID: `${terminalHandle}-session`,
+    },
+    stdout: line => stdout.push(line),
+    stderr: line => stderr.push(line),
+  });
+  assert.equal(code, 0, stderr.join('\n'));
+  return JSON.parse(stdout.join('\n'));
+}
+
 for (const delivery of ['spawned', 'redrive'] as const) {
   test(`Orca ${delivery} wake retries a refusal and fences each unverified pointer receipt`, async t => {
     const root = directory(t);
@@ -5449,7 +5467,167 @@ for (const delivery of ['spawned', 'redrive'] as const) {
     assert.equal(target.attemptCount, 0);
     assert.equal(target.earliestWakeAt, 0);
   });
+
+  for (const claimTiming of ['during send', 'after timeout'] as const) {
+    test(`Orca ${delivery} wake reconciles a CLI claim ${claimTiming} with caller identity`, async t => {
+      const root = directory(t);
+      const runtime = delivery === 'redrive' && claimTiming === 'after timeout' ? await makeNode(t, root, 'receiver') : undefined;
+      const stateDir = runtime?.stateDir ?? root;
+      const store = runtime?.mailbox ?? new MailboxStore(join(stateDir, 'mailbox.json'));
+      const forwardedCommands: string[] = [];
+      if (runtime) {
+        await runtime.wakeups.stop();
+        await runtime.serveControl(async (argv, context) => {
+          forwardedCommands.push(argv[1]);
+          const stdout: string[] = [];
+          const stderr: string[] = [];
+          const code = await runDealerCli(argv, {
+            runtime, signal: context.signal, stdout: line => stdout.push(line), stderr: line => stderr.push(line),
+          });
+          return { code, stdout, stderr };
+        });
+      } else {
+        t.after(() => store.close());
+      }
+      const mailboxId = 'stream:receipt-caller';
+      const { runner: inventory, state } = fakeOrcaWorkspace(root, [
+        { handle: 'tab', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> ' },
+      ]);
+      store.enqueue([alert('first-wave', { semantic: { type: 'message', threadId: 'first-wave' } })], {
+        mailboxId,
+        wakeTarget: { driver: 'orca-terminal', rotateAfterWaves: 3, driverConfig: { workspacePath: root, terminalHandle: 'tab', agent: 'antigravity' } },
+      });
+      let firstLease: string | undefined;
+      const claim = async () => {
+        const result = await receiptInboxCli(stateDir, root, 'tab', 'check', '--mailbox', mailboxId);
+        assert.deepEqual(result.items.map((item: { id: string }) => item.id), ['first-wave']);
+        firstLease = result.deliveryId;
+      };
+      const runner: CommandRunner = async request => {
+        if (request.args[0] !== 'terminal' || request.args[1] !== 'send') return inventory(request);
+        state.calls.push(request);
+        if (terminalSends(state.calls).length > 1) return orcaTerminalSendReceipt({ accepted: true, prompt: acceptedOrcaPrompt });
+        if (claimTiming === 'during send') await claim();
+        return orcaTerminalSendReceipt({ accepted: true, prompt: { ...acceptedOrcaPrompt, stages: ['input_accepted'] } });
+      };
+      const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+      t.after(() => service.stop());
+      if (delivery === 'spawned') {
+        const attempted = deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId);
+        if (claimTiming === 'after timeout') await assert.rejects(attempted, /input_accepted/);
+        else assert.deepEqual(await attempted, { terminalHandle: 'tab', sent: true });
+      } else {
+        assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, false);
+      }
+      if (claimTiming === 'after timeout') {
+        assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, true);
+        await claim();
+      }
+      const checked = store.getWakeTarget(mailboxId)!;
+      assert.equal(checked.driverConfig?.sessionId, 'tab-session');
+      assert.equal(checked.driverConfig?.paneKey, 'tab:pane');
+      assert.equal(checked.deliveryInDoubt, undefined);
+      assert.equal(checked.attemptCount, 0);
+      assert.equal(store.resolveThreadLocalMailbox('first-wave'), 'terminal:tab');
+      const pinned = store.getWakeTarget('terminal:tab')!;
+      assert.equal(pinned.driverConfig?.sessionId, 'tab-session');
+      assert.equal(pinned.driverConfig?.paneKey, 'tab:pane');
+      assert.ok(firstLease);
+      const holdRedrive = service.claim(mailboxId);
+      try {
+        store.enqueue([alert('next-wave')], { mailboxId });
+        const ack = await receiptInboxCli(stateDir, root, 'tab', 'ack', firstLease, '--mailbox', mailboxId);
+        assert.deepEqual(ack.itemIds, ['first-wave']);
+      } finally {
+        holdRedrive.dispose();
+      }
+      if (runtime) assert.deepEqual(forwardedCommands, ['check', 'ack']);
+      assert.equal((await service.flushMailbox(mailboxId, { force: true })).woke, true);
+      assert.equal(terminalSends(state.calls).length, 2);
+      assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, undefined);
+    });
+  }
+
+  for (const receiptState of ['destination enriched', 'both bindings enriched', 'consumer confirmed'] as const) {
+    test(`Orca ${delivery} wake preserves destination identity on a delayed receipt with ${receiptState}`, async t => {
+      const root = directory(t);
+      const store = new MailboxStore(join(root, 'mailbox.json'));
+      t.after(() => store.close());
+      const mailboxId = 'stream:delayed-receipt';
+      const sessionMailbox = 'terminal:tab';
+      const { runner: inventory } = fakeOrcaWorkspace(root, [
+        { handle: 'tab', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> ' },
+      ]);
+      const frame = alert('delayed-frame', { semantic: { type: 'message', threadId: 'delayed-thread' } });
+      store.enqueue([frame], {
+        mailboxId,
+        wakeTarget: { driver: 'orca-terminal', rotateAfterWaves: 2, driverConfig: { workspacePath: root, terminalHandle: 'tab', agent: 'antigravity' } },
+      });
+      let confirmedTarget: ReturnType<MailboxStore['getWakeTarget']>;
+      let confirmedSession: ReturnType<MailboxStore['getWakeTarget']>;
+      const runner: CommandRunner = async request => {
+        if (request.args[0] !== 'terminal' || request.args[1] !== 'send') return inventory(request);
+        const caller = { mailboxId: sessionMailbox, workspacePath: root, terminalHandle: 'tab', sessionId: 'new-session', paneKey: 'tab:pane' };
+        if (receiptState !== 'destination enriched') reconcileCallerOrcaWakeTarget(store, mailboxId, caller);
+        reconcileCallerOrcaWakeTarget(store, sessionMailbox, { ...caller, sessionId: 'destination-session' });
+        if (receiptState === 'consumer confirmed') {
+          assert.ok(store.check({ mailboxId }).deliveryId);
+          assert.equal(store.resolveThreadLocalMailbox('delayed-thread'), sessionMailbox);
+          confirmedTarget = store.getWakeTarget(mailboxId);
+          confirmedSession = store.getWakeTarget(sessionMailbox);
+        }
+        return orcaTerminalSendReceipt({ accepted: true, prompt: acceptedOrcaPrompt });
+      };
+      const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+      t.after(() => service.stop());
+      if (delivery === 'spawned') {
+        const result = await deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId);
+        if (receiptState !== 'consumer confirmed') assert.equal(result.sent, true);
+      } else {
+        const result = await service.flushMailbox(mailboxId, { force: true });
+        if (receiptState !== 'consumer confirmed') assert.equal(result.woke, true, result.reason);
+      }
+      const target = store.getWakeTarget(mailboxId);
+      const session = store.getWakeTarget(sessionMailbox);
+      assert.equal(target?.deliveryInDoubt, undefined);
+      assert.equal(store.resolveThreadLocalMailbox('delayed-thread'), sessionMailbox);
+      assert.equal(session?.driverConfig?.sessionId, 'destination-session');
+      assert.equal(session?.driverConfig?.paneKey, 'tab:pane');
+      if (receiptState === 'consumer confirmed') {
+        assert.deepEqual(target, confirmedTarget);
+        assert.deepEqual(session, confirmedSession);
+      }
+    });
+  }
 }
+
+test('a real Orca caller switch leaves the previous delivery fenced and cannot confirm the new binding', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  t.after(() => store.close());
+  const workspacePath = join(root, 'worker');
+  const mailboxId = 'worktree:worker';
+  store.enqueue([alert('previous-binding')], {
+    mailboxId,
+    wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'old-tab', sessionId: 'old-session' } },
+  });
+  const previous = store.getWakeTarget(mailboxId)!;
+  store.beginWakeDelivery(mailboxId, previous.bindingRevision, { deliveredSequence: maxPreviewSequence(store.check({ mailboxId, peek: true })) });
+  const check = await receiptInboxCli(root, workspacePath, 'new-tab', 'check');
+  await receiptInboxCli(root, workspacePath, 'new-tab', 'ack', check.deliveryId);
+  const switched = store.getWakeTarget(mailboxId)!;
+  assert.equal(switched.driverConfig?.terminalHandle, 'new-tab');
+  assert.equal(switched.deliveryInDoubt, true);
+  assert.equal(switched.pendingDelivery?.bindingRevision, previous.bindingRevision);
+  assert.notEqual(switched.bindingRevision, previous.bindingRevision);
+
+  store.clearWakeFence({ mailboxId });
+  store.enqueue([alert('new-binding')], { mailboxId });
+  const started = store.beginWakeDelivery(mailboxId, switched.bindingRevision, { deliveredSequence: maxPreviewSequence(store.check({ mailboxId, peek: true })) });
+  assert.ok(started);
+  assert.equal(store.completeWakeDelivery(mailboxId, 0, {}, undefined, previous.bindingRevision).superseded, true);
+  assert.deepEqual(store.getWakeTarget(mailboxId), started);
+});
 
 test('rotating inbound delivery preserves terminal thread affinity across call order', async t => {
   const store = new MailboxStore(join(directory(t), 'mailbox.json'));

@@ -105,6 +105,7 @@ type PinnedSessionMailbox = SessionMailboxPatch & { sessionMailboxId: string };
 
 export interface PendingWakeDelivery {
   readonly bindingRevision: number;
+  readonly originRevision?: number;
   readonly deliveredSequence: number;
   readonly queuedItemIds: readonly string[];
   readonly pinnedSession?: PinnedSessionMailbox;
@@ -581,8 +582,10 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
   const pending = target.pendingDelivery;
   if (pending !== undefined && (!target.deliveryInDoubt || !isPlainRecord(pending) ||
-      Object.keys(pending).some(key => !['bindingRevision', 'deliveredSequence', 'queuedItemIds', 'pinnedSession'].includes(key)) ||
+      Object.keys(pending).some(key => !['bindingRevision', 'originRevision', 'deliveredSequence', 'queuedItemIds', 'pinnedSession'].includes(key)) ||
       !isNonNegativeInteger(pending.bindingRevision) || !Number.isSafeInteger(pending.deliveredSequence) ||
+      (pending.originRevision !== undefined &&
+        (!isNonNegativeInteger(pending.originRevision) || pending.originRevision > pending.bindingRevision)) ||
       pending.deliveredSequence < -1 || !Array.isArray(pending.queuedItemIds) ||
       !Array.from(pending.queuedItemIds).every(isNonEmptyString) ||
       (pending.pinnedSession !== undefined && !validPinnedSession(pending.pinnedSession, target.mailboxId)))) throw invalidStore();
@@ -600,17 +603,19 @@ function validateWakeTarget(value: unknown): WakeTargetState {
 export interface SessionMailboxPatch {
   driver?: string;
   driverConfig?: Record<string, unknown>;
+  /** Exclude source-only values while preserving the destination's own configuration. */
+  omitSourceDriverConfig?: readonly string[];
   /** Keep key deletions explicit when the patch is persisted as JSON before delivery. */
   unsetDriverConfig?: readonly string[];
 }
 
 function validPinnedSession(session: PinnedSessionMailbox, mailboxId: string): boolean {
   return isPlainRecord(session) && isValidMailboxId(session.sessionMailboxId) && session.sessionMailboxId !== mailboxId &&
-    Object.keys(session).every(key => ['sessionMailboxId', 'driver', 'driverConfig', 'unsetDriverConfig'].includes(key)) &&
+    Object.keys(session).every(key => ['sessionMailboxId', 'driver', 'driverConfig', 'omitSourceDriverConfig', 'unsetDriverConfig'].includes(key)) &&
     (session.driver === undefined || (typeof session.driver === 'string' && WAKE_DRIVER_ID_PATTERN.test(session.driver))) &&
     (session.driverConfig === undefined || (isPlainRecord(session.driverConfig) && isJsonValue(session.driverConfig))) &&
-    (session.unsetDriverConfig === undefined ||
-      (Array.isArray(session.unsetDriverConfig) && Array.from(session.unsetDriverConfig).every(isNonEmptyString)));
+    [session.omitSourceDriverConfig, session.unsetDriverConfig].every(keys =>
+      keys === undefined || (Array.isArray(keys) && Array.from(keys).every(isNonEmptyString)));
 }
 
 function pinSessionTarget(db: MailboxSqliteBackend, id: string, sessionMailboxId: string, patch: SessionMailboxPatch = {}): string {
@@ -620,13 +625,15 @@ function pinSessionTarget(db: MailboxSqliteBackend, id: string, sessionMailboxId
   if (sessionMailbox === id) throw new Error('Session mailbox must differ from rotating mailbox');
   const existing = db.wakeTarget(sessionMailbox);
   const nextDriver = patch.driver ?? existing?.driver ?? current.driver;
+  const inherited = nextDriver === current.driver ? { ...current.driverConfig } : {};
+  for (const key of patch.omitSourceDriverConfig ?? []) delete inherited[key];
   const hasQueued = db.hasQueuedItems(sessionMailbox);
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${sessionMailbox}`);
   const next = validateWakeTarget(mergeWakeTarget(existing ?? defaultWakeTarget(sessionMailbox), {
     ...current, ...(existing ?? {}), mailboxId: sessionMailbox,
     driver: nextDriver,
     driverConfig: {
-      ...(nextDriver === current.driver ? current.driverConfig : undefined),
+      ...inherited,
       ...(existing?.driver === nextDriver ? existing.driverConfig : undefined),
       ...patch.driverConfig,
       ...Object.fromEntries((patch.unsetDriverConfig ?? []).map(key => [key, undefined])),
@@ -1763,13 +1770,25 @@ export class MailboxStore {
   upsertWakeTarget(
     mailboxId: string,
     patch: Partial<WakeTargetState> = {},
+    options?: { preservePendingDeliveryFromRevision?: number },
   ): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
     let notify = false;
     const merged = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
-      const next = validateWakeTarget(mergeWakeTarget(current, patch));
+      let next = validateWakeTarget(mergeWakeTarget(current, patch));
+      const fromRevision = options?.preservePendingDeliveryFromRevision;
+      const pending = current.pendingDelivery;
+      if (fromRevision !== undefined && fromRevision === (current.bindingRevision ?? 0) &&
+          current.deliveryInDoubt && pending?.bindingRevision === fromRevision && next.deliveryInDoubt) {
+        next = {
+          ...next,
+          pendingDelivery: {
+            ...pending, originRevision: pending.originRevision ?? fromRevision, bindingRevision: next.bindingRevision ?? 0,
+          },
+        };
+      }
       this.db.writeWakeTarget(next, previous);
       notify = current.pendingWake || next.pendingWake || Boolean(current.deliveryInDoubt) !== Boolean(next.deliveryInDoubt);
       return structuredClone(next);
@@ -1791,12 +1810,13 @@ export class MailboxStore {
     const fenced = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
-      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) return undefined;
+      const revision = current.bindingRevision ?? 0;
+      if (expectedRevision !== undefined && revision !== expectedRevision) return undefined;
       if (current.deliveryInDoubt) {
         throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
       }
       const pendingDelivery = pointer && {
-        ...pointer, bindingRevision: current.bindingRevision ?? 0,
+        ...pointer, bindingRevision: revision, originRevision: revision,
         queuedItemIds: this.db.items({ mailboxId: id, status: 'queued', throughSequence: pointer.deliveredSequence }).map(item => item.id),
       };
       const next = validateWakeTarget(mergeWakeTarget(current, {
@@ -1966,22 +1986,28 @@ export class MailboxStore {
     const completed = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
-      notify = current.pendingWake || Boolean(current.deliveryInDoubt);
-      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) {
+      const revision = current.bindingRevision ?? 0;
+      const pending = current.pendingDelivery;
+      const currentOrigin = current.deliveryInDoubt && pending?.bindingRevision === revision
+        ? pending.originRevision ?? pending.bindingRevision : undefined;
+      if (expectedRevision !== undefined && revision !== expectedRevision && currentOrigin !== expectedRevision) {
+        if (currentOrigin !== undefined) return { ...structuredClone(current), superseded: true };
         const hasQueued = this.db.hasQueuedItems(id);
         const next = validateWakeTarget(mergeWakeTarget(current, {
           deliveryInDoubt: undefined, lastWakeError: undefined,
           pendingWake: Boolean(current.pendingWake || hasQueued), attemptCount: 0, earliestWakeAt: 0,
         }));
         this.db.writeWakeTarget(next, previous);
+        notify = next.pendingWake || Boolean(current.deliveryInDoubt);
         return Object.assign(structuredClone(next), { superseded: true });
       }
 
       const settled = this.settleWakeDeliveryInTx(current, previous, deliveredSequence, patch, pinnedSession);
       pinnedWakeMailbox = settled.pinnedWakeMailbox;
+      notify = current.pendingWake || settled.target.pendingWake || Boolean(current.deliveryInDoubt);
       return structuredClone(settled.target);
     });
-    if (completed.pendingWake || notify) this.events.emit('target', id);
+    if (notify) this.events.emit('target', id);
     if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return completed;
   }

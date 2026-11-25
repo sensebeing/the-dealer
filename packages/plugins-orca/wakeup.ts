@@ -351,26 +351,38 @@ export function reconcileCallerOrcaWakeTarget(
   const existing = store.getWakeTarget(id);
   if (existing?.driver === 'orca-run' || existing?.driver === 'agent-host') return undefined;
   if (options.requireBoundOwner && !callerOwnsExplicitOrcaWakeTarget(id, existing, caller, store)) return undefined;
-  const updated = store.upsertWakeTarget(id, resolveCallerOrcaWakeTargetPatch(existing, caller));
+  const bound = existing?.driver === 'orca-terminal' ? readOrcaDriverConfig(existing) : undefined;
+  const preserveDelivery = bound && !isCallerOrcaIdentitySwitch(bound, caller) &&
+    sameCallerWorkspace(bound.workspacePath, caller.workspacePath) &&
+    Boolean((caller.terminalHandle && bound.terminalHandle === caller.terminalHandle) || (caller.paneKey && bound.paneKey === caller.paneKey));
+  const updated = store.upsertWakeTarget(id, resolveCallerOrcaWakeTargetPatch(existing, caller),
+    preserveDelivery ? { preservePendingDeliveryFromRevision: existing?.bindingRevision ?? 0 } : undefined);
   const handle = readOrcaDriverConfig(updated).terminalHandle;
   if (updated.rotateAfterWaves !== undefined && handle) pinOrcaTerminalSessionMailbox(store, id, handle);
   return updated;
 }
 
-/** Single owner of caller-driven Orca conversation identity transitions. */
-export function resolveCallerOrcaWakeTargetPatch(
-  snapshot: WakeTargetState | undefined,
-  caller: { workspacePath?: string; worktreeId?: string; terminalHandle?: string; paneKey?: string; agent?: SupportedOrcaAgent; sessionId?: string },
-): Partial<WakeTargetState> {
-  const existing = snapshot && readOrcaWakeTarget(snapshot);
-  const switchedIdentity =
+function isCallerOrcaIdentitySwitch(
+  existing: OrcaTerminalDriverConfig | undefined, caller: Omit<CallerOrcaIdentity, 'mailboxId'>,
+): boolean {
+  return Boolean(
     (caller.workspacePath && existing?.workspacePath && caller.workspacePath !== existing.workspacePath) ||
     (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
     (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
     (caller.agent && existing?.agent && caller.agent !== existing.agent) ||
     (caller.terminalHandle && existing?.terminalHandle && caller.terminalHandle !== existing.terminalHandle &&
       (!caller.paneKey || !existing.paneKey || caller.paneKey !== existing.paneKey) &&
-      (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId));
+      (!caller.sessionId || !existing.sessionId || caller.sessionId !== existing.sessionId)),
+  );
+}
+
+/** Single owner of caller-driven Orca conversation identity transitions. */
+export function resolveCallerOrcaWakeTargetPatch(
+  snapshot: WakeTargetState | undefined,
+  caller: Omit<CallerOrcaIdentity, 'mailboxId'>,
+): Partial<WakeTargetState> {
+  const existing = snapshot && readOrcaWakeTarget(snapshot);
+  const switchedIdentity = isCallerOrcaIdentitySwitch(existing, caller);
   const nextAgent = switchedIdentity ? caller.agent : (caller.agent ?? existing?.agent);
   const clearLaunchConfig = (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
     !isOrcaLaunchConfigCompatible({ agent: nextAgent, previousAgent: existing?.agent,
@@ -565,7 +577,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
       return { terminalHandle: target.terminalHandle, sent: false };
     }
     const deliveredSequence = maxPreviewSequence(preview);
-    const pinnedSession = pinnedOrcaDeliverySession(store, target, terminalHandle);
+    const pinnedSession = pinnedOrcaDeliverySession(target, terminalHandle);
     const fenced = store.beginWakeDelivery(mailboxId, expectedRevision, { deliveredSequence, pinnedSession });
     if (!fenced) return { terminalHandle: target.terminalHandle, sent: false };
     deliveryBegun = true;
@@ -580,7 +592,10 @@ export async function deliverSpawnedOrcaTerminalWakeup(
     return { pointer, terminalHandle: target.terminalHandle, sent: true };
   } catch (error) {
     const current = store.getWakeTarget(mailboxId);
-    if (deliveryBegun && !current?.deliveryInDoubt) return { terminalHandle, sent: current?.bindingRevision === expectedRevision };
+    if (deliveryBegun && !current?.deliveryInDoubt) {
+      const sameTerminal = current?.driver === 'orca-terminal' && readOrcaDriverConfig(current).terminalHandle === terminalHandle;
+      return { terminalHandle, sent: current?.bindingRevision === expectedRevision || sameTerminal };
+    }
     if (deliveryBegun) {
       settleOrcaWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
     } else if (!current?.deliveryInDoubt) {
@@ -590,27 +605,15 @@ export async function deliverSpawnedOrcaTerminalWakeup(
   }
 }
 
-function pinnedOrcaDeliverySession(store: MailboxStore, target: OrcaWakeTarget, terminalHandle?: string) {
+function pinnedOrcaDeliverySession(target: OrcaWakeTarget, terminalHandle?: string) {
   if (target.rotateAfterWaves === undefined || !terminalHandle) return undefined;
-  const sessionMailboxId = `terminal:${terminalHandle}`;
-  const existingSession = store.getWakeTarget(sessionMailboxId);
-  const existing = existingSession?.driver === 'orca-terminal' ? readOrcaDriverConfig(existingSession) : undefined;
   const sameHandle = !target.terminalHandle || target.terminalHandle === terminalHandle;
-  const sessionId = existing?.sessionId ?? (sameHandle ? target.sessionId : undefined);
-  const paneKey = existing?.paneKey ?? (sameHandle ? target.paneKey : undefined);
   return {
-    sessionMailboxId,
+    sessionMailboxId: `terminal:${terminalHandle}`,
     driver: 'orca-terminal',
-    driverConfig: {
-      terminalHandle,
-      ...(sessionId !== undefined && { sessionId }),
-      ...(paneKey !== undefined && { paneKey }),
-    },
-    unsetDriverConfig: [
-      'configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId', 'retiredTerminalHandle',
-      ...(sessionId === undefined ? ['sessionId'] : []),
-      ...(paneKey === undefined ? ['paneKey'] : []),
-    ],
+    driverConfig: { terminalHandle },
+    ...(!sameHandle && { omitSourceDriverConfig: ['sessionId', 'paneKey'] }),
+    unsetDriverConfig: ['configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId', 'retiredTerminalHandle'],
   };
 }
 
@@ -629,7 +632,7 @@ export function pinOrcaTerminalSessionMailbox(
     rotatingOwner = store.listWakeTargets().find(item => item.driver === 'orca-terminal' && item.rotateAfterWaves !== undefined
       && readOrcaDriverConfig(item).terminalHandle === handle);
   }
-  const pinnedSession = rotatingOwner && pinnedOrcaDeliverySession(store, readOrcaWakeTarget(rotatingOwner), handle);
+  const pinnedSession = rotatingOwner && pinnedOrcaDeliverySession(readOrcaWakeTarget(rotatingOwner), handle);
   if (!pinnedSession || !rotatingOwner) return id;
   // The live target can be advertised as a reply address. Wake completion pins committed routes.
   return store.pinSessionMailbox(rotatingOwner.mailboxId, pinnedSession.sessionMailboxId, pinnedSession);
@@ -1359,7 +1362,7 @@ class OrcaWakeDelivery {
     // The pointer is the only external effect left; fence it so a crash or an unconfirmed send
     // stays parked instead of being replayed by the next tick or restart.
     const deliveredSequence = maxPreviewSequence(preview);
-    const pinnedSession = pinnedOrcaDeliverySession(this.store, target, terminalHandle);
+    const pinnedSession = pinnedOrcaDeliverySession(target, terminalHandle);
     const fenced = this.store.beginWakeDelivery(mailboxId, activeRevision, { deliveredSequence, pinnedSession });
     if (!fenced) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
     options.onDeliveryBegun();
