@@ -838,11 +838,12 @@ test('ack is idempotent and rejects unknown or mismatched leases', t => {
   assert.equal(store.ack(taskLease.deliveryId!, 'task:x').alreadyAcknowledged, true);
 });
 
-test('check clears a wake fence only when consuming a lease and preserves wakes behind an active lease', t => {
+test('check clears a pointer fence only when the lease contains the observed batch', t => {
   const store = new MailboxStore(workspace(t).path);
   t.after(() => store.close());
   store.enqueue([envelope('first')]);
-  store.parkWakeDelivery('default', 'unconfirmed send');
+  const [item] = store.check({ peek: true }).items;
+  store.beginWakeDelivery('default', undefined, { deliveredSequence: item.sequence });
   store.parkWakeDelivery('empty', 'terminal_tab_pinned');
   const notifications: WakeTargetState[] = [];
   const subscription = store.onWakeTarget(id => notifications.push(store.getWakeTarget(id)!));
@@ -866,9 +867,10 @@ test('check clears a wake fence only when consuming a lease and preserves wakes 
   assert.equal(notifications[0].earliestWakeAt, 0);
 
   store.enqueue([envelope('next')]);
-  store.upsertWakeTarget('default', {
-    deliveryInDoubt: true, pendingWake: true, lastWakeError: 'unconfirmed send', attemptCount: 2, earliestWakeAt: 100,
-  });
+  const newer = store.list().items.find(item => item.id === 'next')!;
+  const rebound = store.upsertWakeTarget('default', { driverConfig: { destination: 'new' } });
+  store.beginWakeDelivery('default', rebound.bindingRevision, { deliveredSequence: newer.sequence });
+  const fenced = store.getWakeTarget('default');
   notifications.length = 0;
   assert.equal(store.check({ peek: true }).deliveryId, lease.deliveryId);
   assert.equal(store.getWakeTarget('default')?.deliveryInDoubt, true);
@@ -878,15 +880,59 @@ test('check clears a wake fence only when consuming a lease and preserves wakes 
   assert.equal(redelivered.deliveryId, lease.deliveryId);
   assert.equal(redelivered.redelivered, true);
   assert.equal(redelivered.newerQueuedCount, 1);
+  assert.deepEqual(store.getWakeTarget('default'), fenced);
+  assert.deepEqual(notifications, []);
+  store.ack(lease.deliveryId!);
+  assert.equal(store.getWakeTarget('default')?.deliveryInDoubt, true);
+  assert.equal(store.getWakeTarget('default')?.pendingWake, false);
+  assert.deepEqual(notifications, []);
+  assert.deepEqual(store.check().items.map(item => item.id), ['next']);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].deliveryInDoubt, undefined);
-  assert.equal(notifications[0].lastWakeError, undefined);
-  assert.equal(notifications[0].pendingWake, true);
-  assert.equal(notifications[0].attemptCount, 0);
-  assert.equal(notifications[0].earliestWakeAt, 0);
 });
 
-test('ack clears an unknown delivery fence and resets next-wave backoff atomically', t => {
+test('launch and retirement fences require operator reconciliation even after lease settlement', t => {
+  const store = new MailboxStore(workspace(t).path);
+  t.after(() => store.close());
+  for (const mailboxId of ['launch', 'retirement']) {
+    if (mailboxId === 'launch') store.beginWakeDelivery(mailboxId);
+    else store.parkWakeDelivery(mailboxId, 'terminal_tab_pinned');
+    store.enqueue([envelope(mailboxId)], { mailboxId });
+    const lease = store.check({ mailboxId });
+    assert.ok(lease.deliveryId);
+    assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, true);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingDelivery, undefined);
+    store.ack(lease.deliveryId, mailboxId);
+    assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, true);
+    assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
+    assert.deepEqual(store.clearWakeFence({ mailboxId }), { cleared: [mailboxId], woke: [] });
+  }
+});
+
+test('SQLite v2 opens read-only without pending delivery metadata and upgrades on a writable open', t => {
+  const initial = new MailboxStore(workspace(t).path);
+  initial.enqueue([envelope('legacy')]);
+  initial.parkWakeDelivery('default', 'legacy receipt unknown');
+  initial.close();
+  const raw = new DatabaseSync(initial.path);
+  t.after(() => raw.close());
+  raw.exec('ALTER TABLE wake_targets DROP COLUMN pending_delivery_json');
+  const snapshot = MailboxStore.openReadOnly(initial.path)!;
+  t.after(() => snapshot.close());
+  assert.equal(snapshot.getWakeTarget('default')?.deliveryInDoubt, true);
+  assert.equal(snapshot.getWakeTarget('default')?.pendingDelivery, undefined);
+  const columns = () => raw.prepare("SELECT name FROM pragma_table_info('wake_targets')").all().map(row => row.name);
+  assert.ok(!columns().includes('pending_delivery_json'));
+  const store = new MailboxStore(initial.path);
+  t.after(() => store.close());
+  assert.ok(columns().includes('pending_delivery_json'));
+  const checked = store.check();
+  store.ack(checked.deliveryId!);
+  assert.equal(store.getWakeTarget('default')?.lastWakeError, 'legacy receipt unknown');
+  assert.deepEqual(store.clearWakeFence({ all: true }), { cleared: ['default'], woke: [] });
+});
+
+test('ack resets next-wave backoff and preserves fences unrelated to the acknowledged lease', t => {
   const { path } = workspace(t);
   const store = new MailboxStore(path);
   t.after(() => store.close());
@@ -901,7 +947,7 @@ test('ack clears an unknown delivery fence and resets next-wave backoff atomical
     store.enqueue([envelope(`${mailboxId}-first`)], { mailboxId });
     const lease = store.check({ mailboxId });
     if (mailboxId === 'queued' || mailboxId === 'fenced') store.enqueue([envelope(`${mailboxId}-next`)], { mailboxId });
-    store.upsertWakeTarget(mailboxId, {
+    const before = store.upsertWakeTarget(mailboxId, {
       pendingWake: mailboxId === 'pending',
       earliestWakeAt: 30_000,
       attemptCount: 4,
@@ -910,11 +956,14 @@ test('ack clears an unknown delivery fence and resets next-wave backoff atomical
     notifications.length = 0;
     store.ack(lease.deliveryId!, mailboxId);
     const next = store.getWakeTarget(mailboxId)!;
-    assert.equal(next.completedWaves, 1);
-    assert.equal(next.pendingWake, mailboxId !== 'fenced-empty');
-    assert.equal(next.deliveryInDoubt, undefined);
-    assert.equal(next.lastWakeError, undefined);
-    assert.deepEqual(notifications, [[mailboxId, 1, 0, 0]]);
+    if (before.deliveryInDoubt) {
+      assert.deepEqual(next, { ...before, completedWaves: 1, pendingWake: false });
+      assert.deepEqual(notifications, []);
+    } else {
+      assert.equal(next.completedWaves, 1);
+      assert.equal(next.pendingWake, true);
+      assert.deepEqual(notifications, [[mailboxId, 1, 0, 0]]);
+    }
 
     if (mailboxId !== 'fenced') continue;
     const nextLease = store.check({ mailboxId });

@@ -5390,18 +5390,23 @@ for (const delivery of ['spawned', 'redrive'] as const) {
     const root = directory(t);
     const store = new MailboxStore(join(root, 'mailbox.json'));
     t.after(() => store.close());
-    const mailboxId = 'task:receipt';
+    const mailboxId = delivery === 'redrive' ? 'stream:receipt' : 'task:receipt';
     const { runner: inventory, state } = fakeOrcaWorkspace(root, [
       { handle: 'tab', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> ' },
     ]);
-    store.enqueue([alert('consumer-confirmed')], {
+    store.enqueue([alert('consumer-confirmed', { semantic: { type: 'message', threadId: 'first' } })], {
       mailboxId,
-      wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: 'tab', agent: 'antigravity' } },
+      wakeTarget: {
+        driver: 'orca-terminal',
+        ...(delivery === 'redrive' ? { rotateAfterWaves: 1 } : {}),
+        driverConfig: { workspacePath: root, terminalHandle: 'tab', agent: 'antigravity' },
+      },
     });
     let fencedAtSend: boolean | undefined;
     let claimedLease: string | null = null;
     const runner: CommandRunner = async request => {
       if (request.args[0] !== 'terminal' || request.args[1] !== 'send') return inventory(request);
+      if (claimedLease !== null) return inventory(request);
       state.calls.push(request);
       fencedAtSend = store.getWakeTarget(mailboxId)?.deliveryInDoubt;
       claimedLease = store.check({ mailboxId }).deliveryId;
@@ -5416,6 +5421,18 @@ for (const delivery of ['spawned', 'redrive'] as const) {
       try {
         const result = await service.flushMailbox(mailboxId, { force: true });
         assert.equal(result.reason, 'Wake delivery already confirmed by consumer');
+        assert.equal(store.resolveThreadLocalMailbox('first'), 'terminal:tab');
+        assert.ok(claimedLease);
+        store.ack(claimedLease, mailboxId);
+        store.enqueue([alert('next-wave')], { mailboxId });
+        assert.equal((await service.flushMailbox(mailboxId, { force: true })).rotated, true);
+        assert.equal(state.created, 1);
+        const wave = createOrcaWaveExecutorPlugin({
+          store, commandRunner: runner,
+          resolveTopicBinding: () => ({ executor: 'orca-wave', mailboxId, workspacePath: root }),
+        });
+        await wave.execute([alert('thread-follow-up', { semantic: { type: 'message', threadId: 'first' } })], {} as ExecutionContext);
+        assert.deepEqual(store.list({ mailboxId: 'terminal:tab' }).items.map(item => item.id), ['thread-follow-up']);
       } finally {
         await service.stop();
       }
@@ -5424,7 +5441,7 @@ for (const delivery of ['spawned', 'redrive'] as const) {
     assert.equal(attempt.args[attempt.args.indexOf('--wait-submit') + 1], '15');
     assert.equal(fencedAtSend, true);
     assert.ok(claimedLease);
-    assert.equal(store.check({ mailboxId, peek: true }).deliveryId, claimedLease);
+    if (delivery === 'spawned') assert.equal(store.check({ mailboxId, peek: true }).deliveryId, claimedLease);
     const target = store.getWakeTarget(mailboxId)!;
     assert.equal(target.deliveryInDoubt, undefined);
     assert.equal(target.pendingWake, false);

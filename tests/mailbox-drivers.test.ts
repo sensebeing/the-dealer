@@ -129,7 +129,7 @@ test('generic driver outcomes preserve scheduling and settled failure classifica
   assert.equal(store.getWakeTarget('box')?.pendingWake, false);
 });
 
-test('generic drivers retry proven non-starts and resume fenced queues after consumer settlement', async (t) => {
+test('generic drivers retry proven non-starts and resume pointer fences after matching consumption', async (t) => {
   const store = fixture(t);
   let starts = 0;
   const service = new WakeupRedriveService({
@@ -140,7 +140,7 @@ test('generic drivers retry proven non-starts and resume fenced queues after con
         name: 'mock',
         async deliver({ store, mailboxId, preview }) {
           starts++;
-          store.beginWakeDelivery(mailboxId);
+          store.beginWakeDelivery(mailboxId, undefined, { deliveredSequence: preview.items[0].sequence });
           if (starts === 1) throw new CommandNotStartedError('missing binary');
           if (starts === 2) throw new Error('lost receipt');
           store.completeWakeDelivery(mailboxId, preview.items[0].sequence);
@@ -161,9 +161,6 @@ test('generic drivers retry proven non-starts and resume fenced queues after con
   const lease = store.check({ mailboxId: 'box' });
   const [original] = lease.items;
   store.enqueue([{ ...original.envelope, id: 'next' }], { mailboxId: 'box' });
-  store.parkWakeDelivery('box', 'lost receipt during lease');
-  await service.flushMailbox('box', { force: true });
-  assert.equal(starts, 2);
   store.ack(lease.deliveryId!, 'box');
   assert.equal((await service.flushMailbox('box')).woke, true);
   assert.equal(starts, 3);

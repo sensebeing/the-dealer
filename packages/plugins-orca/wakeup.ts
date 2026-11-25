@@ -564,7 +564,9 @@ export async function deliverSpawnedOrcaTerminalWakeup(
       store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, expectedRevision);
       return { terminalHandle: target.terminalHandle, sent: false };
     }
-    const fenced = store.beginWakeDelivery(mailboxId, expectedRevision);
+    const deliveredSequence = maxPreviewSequence(preview);
+    const pinnedSession = pinnedOrcaDeliverySession(store, target, terminalHandle);
+    const fenced = store.beginWakeDelivery(mailboxId, expectedRevision, { deliveredSequence, pinnedSession });
     if (!fenced) return { terminalHandle: target.terminalHandle, sent: false };
     deliveryBegun = true;
     await sendOrcaTerminalText(runner, command, target.terminalHandle, pointer, {
@@ -573,38 +575,42 @@ export async function deliverSpawnedOrcaTerminalWakeup(
       waitSubmit: DEFAULT_ORCA_WAIT_SUBMIT_SECONDS,
       expectedAgent: target.agent,
     });
-    const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, expectedRevision);
+    const completed = store.completeWakeDelivery(mailboxId, deliveredSequence, {}, pinnedSession, expectedRevision);
     if (completed.superseded) return { pointer, terminalHandle: target.terminalHandle, sent: false };
     return { pointer, terminalHandle: target.terminalHandle, sent: true };
   } catch (error) {
-    const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
-    if (deliveryBegun && !fenced) return { terminalHandle, sent: true };
-    if (fenced) {
-      // A pre-existing fence refuses the attempt before the boundary; it keeps the original
-      // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
-      if (deliveryBegun) settleOrcaWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
-    } else {
+    const current = store.getWakeTarget(mailboxId);
+    if (deliveryBegun && !current?.deliveryInDoubt) return { terminalHandle, sent: current?.bindingRevision === expectedRevision };
+    if (deliveryBegun) {
+      settleOrcaWakeDeliveryFailure(store, mailboxId, error, now, expectedRevision);
+    } else if (!current?.deliveryInDoubt) {
       store.deferWakeAttempt(mailboxId, expectedRevision, error, now);
     }
     throw error;
   }
 }
 
-function buildPinnedOrcaSessionDriverConfig(
-  target: OrcaWakeTarget,
-  existingSession: WakeTargetState | undefined,
-  terminalHandle: string,
-): Record<string, unknown> {
+function pinnedOrcaDeliverySession(store: MailboxStore, target: OrcaWakeTarget, terminalHandle?: string) {
+  if (target.rotateAfterWaves === undefined || !terminalHandle) return undefined;
+  const sessionMailboxId = `terminal:${terminalHandle}`;
+  const existingSession = store.getWakeTarget(sessionMailboxId);
   const existing = existingSession?.driver === 'orca-terminal' ? readOrcaDriverConfig(existingSession) : undefined;
   const sameHandle = !target.terminalHandle || target.terminalHandle === terminalHandle;
+  const sessionId = existing?.sessionId ?? (sameHandle ? target.sessionId : undefined);
+  const paneKey = existing?.paneKey ?? (sameHandle ? target.paneKey : undefined);
   return {
-    terminalHandle,
-    sessionId: existing?.sessionId ?? (sameHandle ? target.sessionId : undefined),
-    paneKey: existing?.paneKey ?? (sameHandle ? target.paneKey : undefined),
-    configuredSessionId: undefined,
-    configuredTerminalHandle: undefined,
-    retiredSessionId: undefined,
-    retiredTerminalHandle: undefined,
+    sessionMailboxId,
+    driver: 'orca-terminal',
+    driverConfig: {
+      terminalHandle,
+      ...(sessionId !== undefined && { sessionId }),
+      ...(paneKey !== undefined && { paneKey }),
+    },
+    unsetDriverConfig: [
+      'configuredSessionId', 'configuredTerminalHandle', 'retiredSessionId', 'retiredTerminalHandle',
+      ...(sessionId === undefined ? ['sessionId'] : []),
+      ...(paneKey === undefined ? ['paneKey'] : []),
+    ],
   };
 }
 
@@ -623,13 +629,10 @@ export function pinOrcaTerminalSessionMailbox(
     rotatingOwner = store.listWakeTargets().find(item => item.driver === 'orca-terminal' && item.rotateAfterWaves !== undefined
       && readOrcaDriverConfig(item).terminalHandle === handle);
   }
-  if (!rotatingOwner) return id;
-  const sessionMailboxId = `terminal:${handle}`;
+  const pinnedSession = rotatingOwner && pinnedOrcaDeliverySession(store, readOrcaWakeTarget(rotatingOwner), handle);
+  if (!pinnedSession || !rotatingOwner) return id;
   // The live target can be advertised as a reply address. Wake completion pins committed routes.
-  return store.pinSessionMailbox(rotatingOwner.mailboxId, sessionMailboxId, {
-    driver: 'orca-terminal',
-    driverConfig: buildPinnedOrcaSessionDriverConfig(readOrcaWakeTarget(rotatingOwner), store.getWakeTarget(sessionMailboxId), handle),
-  });
+  return store.pinSessionMailbox(rotatingOwner.mailboxId, pinnedSession.sessionMailboxId, pinnedSession);
 }
 
 class OrcaWakeDelivery {
@@ -879,8 +882,12 @@ class OrcaWakeDelivery {
       }, revision => { activeRevision = revision; });
     } catch (error) {
       if (error instanceof SettledWakeLaunchError) throw error;
-      const fenced = this.store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
-      if (deliveryBegun && !fenced) return { kind: 'noop', reason: 'Wake delivery already confirmed by consumer' };
+      const current = this.store.getWakeTarget(mailboxId);
+      const fenced = current?.deliveryInDoubt === true;
+      if (deliveryBegun && !fenced) {
+        return { kind: 'noop', reason: current?.bindingRevision === activeRevision
+          ? 'Wake delivery already confirmed by consumer' : 'Wake launch superseded by a newer binding' };
+      }
       if (fenced) {
         const superseded = deliveryBegun && settleOrcaWakeDeliveryFailure(this.store, mailboxId, error, this.now(), activeRevision);
         return { kind: 'noop', reason: superseded ? 'Wake launch superseded by a newer binding' : String(error) };
@@ -1351,7 +1358,10 @@ class OrcaWakeDelivery {
     }
     // The pointer is the only external effect left; fence it so a crash or an unconfirmed send
     // stays parked instead of being replayed by the next tick or restart.
-    if (!this.store.beginWakeDelivery(mailboxId, activeRevision)) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
+    const deliveredSequence = maxPreviewSequence(preview);
+    const pinnedSession = pinnedOrcaDeliverySession(this.store, target, terminalHandle);
+    const fenced = this.store.beginWakeDelivery(mailboxId, activeRevision, { deliveredSequence, pinnedSession });
+    if (!fenced) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
     options.onDeliveryBegun();
     if (target.driver === 'orca-run') {
       const output = await orcaMutationRunner(this.runner)({
@@ -1398,15 +1408,9 @@ class OrcaWakeDelivery {
 
     const completed = this.store.completeWakeDelivery(
       mailboxId,
-      maxPreviewSequence(preview),
+      deliveredSequence,
       {},
-      terminalHandle && target.rotateAfterWaves !== undefined
-        ? {
-            sessionMailboxId: `terminal:${terminalHandle}`,
-            driver: 'orca-terminal',
-            driverConfig: buildPinnedOrcaSessionDriverConfig(target, this.store.getWakeTarget(`terminal:${terminalHandle}`), terminalHandle),
-          }
-        : undefined,
+      pinnedSession,
       activeRevision,
     );
     if (completed.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };

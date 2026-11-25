@@ -670,8 +670,12 @@ A driver persists `beginWakeDelivery` before an external boundary and settles on
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;
 mail arriving during delivery remains pending. Proven command non-starts and Orca send receipts
 with `accepted: false` back off. Unknown outcomes remain fenced across mail arrivals, forced
-flushes and restarts. A consumer claim, reread, or acknowledgement of an active lease can clear
-that mailbox's wake fence. Pinning a session mailbox preserves its own fence and retry state.
+flushes and restarts. An Orca pointer fence records the queued batch and binding that authorized
+the send. A fresh claim or acknowledgement can clear it when the lease includes a recorded item
+and the binding revision still matches. The same transaction pins any delivered session and its
+threads. Launch and retirement fences and legacy fences without batch evidence require their own
+settlement or explicit reconciliation. Pinning a session mailbox preserves its own fence and
+retry state.
 Root target terminals verify `tui-idle` readiness, an empty composer, and
 the configured agent identity before pointer injection. Antigravity also requires a rendered
 composer prompt when it is the configured agent. Its official mode placeholders count as an empty
