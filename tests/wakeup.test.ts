@@ -5311,7 +5311,7 @@ test('Orca terminal send keeps unverified command failures intact', async () => 
 });
 
 test('Orca terminal sends verify observed turns and retain legacy receipt compatibility', async () => {
-  const options = { waitSubmit: 5, expectedAgent: 'antigravity' } as const;
+  const options = { waitSubmit: 15, expectedAgent: 'antigravity' } as const;
   for (const { send, detail, retryable } of orcaReceiptFailures) {
     await assert.rejects(sendOrcaTerminalText(async () => orcaTerminalSendReceipt(send), 'orca', 'tab', 'wake', options),
       (error: unknown) => {
@@ -5371,7 +5371,7 @@ for (const delivery of ['spawned', 'redrive'] as const) {
       }
       const [attempt] = terminalSends(state.calls);
       assert.ok(attempt.args.includes('--wait-submit'));
-      assert.equal(attempt.args[attempt.args.indexOf('--wait-submit') + 1], '5');
+      assert.equal(attempt.args[attempt.args.indexOf('--wait-submit') + 1], '15');
       const target = new MailboxStore(store.path).getWakeTarget(mailboxId)!;
       assert.equal(target.pendingWake, retryable, name);
       assert.equal(target.deliveryInDoubt, retryable ? undefined : true, name);
@@ -5384,6 +5384,53 @@ for (const delivery of ['spawned', 'redrive'] as const) {
       assert.equal(terminalSends(state.calls).length, retryable ? 2 : 1, name);
       await restarted.stop();
     }
+  });
+
+  test(`Orca ${delivery} wake leaves a consumer-confirmed lease alone when turn observation times out`, async t => {
+    const root = directory(t);
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    t.after(() => store.close());
+    const mailboxId = 'task:receipt';
+    const { runner: inventory, state } = fakeOrcaWorkspace(root, [
+      { handle: 'tab', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> ' },
+    ]);
+    store.enqueue([alert('consumer-confirmed')], {
+      mailboxId,
+      wakeTarget: { driver: 'orca-terminal', driverConfig: { workspacePath: root, terminalHandle: 'tab', agent: 'antigravity' } },
+    });
+    let fencedAtSend: boolean | undefined;
+    let claimedLease: string | null = null;
+    const runner: CommandRunner = async request => {
+      if (request.args[0] !== 'terminal' || request.args[1] !== 'send') return inventory(request);
+      state.calls.push(request);
+      fencedAtSend = store.getWakeTarget(mailboxId)?.deliveryInDoubt;
+      claimedLease = store.check({ mailboxId }).deliveryId;
+      return orcaTerminalSendReceipt({
+        accepted: true, prompt: { ...acceptedOrcaPrompt, stages: ['input_accepted'] },
+      });
+    };
+    if (delivery === 'spawned') {
+      assert.deepEqual(await deliverSpawnedOrcaTerminalWakeup(store, runner, mailboxId), { terminalHandle: 'tab', sent: true });
+    } else {
+      const service = new WakeupRedriveService({ store, drivers: createTestWakeupDrivers({ commandRunner: runner }) });
+      try {
+        const result = await service.flushMailbox(mailboxId, { force: true });
+        assert.equal(result.reason, 'Wake delivery already confirmed by consumer');
+      } finally {
+        await service.stop();
+      }
+    }
+    const [attempt] = terminalSends(state.calls);
+    assert.equal(attempt.args[attempt.args.indexOf('--wait-submit') + 1], '15');
+    assert.equal(fencedAtSend, true);
+    assert.ok(claimedLease);
+    assert.equal(store.check({ mailboxId, peek: true }).deliveryId, claimedLease);
+    const target = store.getWakeTarget(mailboxId)!;
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.equal(target.pendingWake, false);
+    assert.equal(target.lastWakeError, undefined);
+    assert.equal(target.attemptCount, 0);
+    assert.equal(target.earliestWakeAt, 0);
   });
 }
 
@@ -5414,9 +5461,14 @@ test('pinning a rotating session preserves existing terminal wake fences', async
   const target = store.getWakeTarget('terminal:term-1');
   assert.equal(target?.pendingWake, true);
   assert.ok(notifications.includes('terminal:term-1'));
-  store.upsertWakeTarget('stream:inbox', { deliveryInDoubt: true, lastWakeError: 'fenced' });
+  store.parkWakeDelivery('stream:inbox', 'unknown stream send');
+  store.parkWakeDelivery('terminal:term-1', 'unknown terminal send');
+  assert.equal(pinOrcaTerminalSessionMailbox(store, 'stream:inbox', 'term-1'), 'terminal:term-1');
+  assert.equal(store.getWakeTarget('terminal:term-1')?.deliveryInDoubt, true);
+  assert.equal(store.getWakeTarget('terminal:term-1')?.lastWakeError, 'unknown terminal send');
   assert.equal(pinOrcaTerminalSessionMailbox(store, 'stream:inbox', 'term-2'), 'terminal:term-2');
-  assert.equal(store.getWakeTarget('terminal:term-2')?.deliveryInDoubt, true);
+  assert.equal(store.getWakeTarget('terminal:term-2')?.deliveryInDoubt, undefined);
+  assert.equal(store.getWakeTarget('terminal:term-2')?.lastWakeError, undefined);
 });
 
 test('durable spawn survives the account gate and redrives into one dedicated agent tab', async t => {

@@ -604,8 +604,8 @@ function pinSessionTarget(db: MailboxSqliteBackend, id: string, sessionMailboxId
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
     earliestWakeAt: existing?.earliestWakeAt ?? 0,
-    lastWakeError: existing?.deliveryInDoubt ? existing.lastWakeError : (current.deliveryInDoubt ? current.lastWakeError : existing?.lastWakeError),
-    deliveryInDoubt: Boolean(existing?.deliveryInDoubt || current.deliveryInDoubt) ? true : undefined,
+    lastWakeError: existing?.lastWakeError,
+    deliveryInDoubt: existing?.deliveryInDoubt ? true : undefined,
   }));
   db.writeWakeTarget(next, existing);
   return sessionMailbox;
@@ -1435,19 +1435,21 @@ export class MailboxStore {
       this.ack(options.ackLeaseId, mailboxId);
     }
     if (options.peek) return this.db.read(() => this.checkMailbox(mailboxId, false));
-    let wakeDisarmed = false;
+    let wakeChanged = false;
     const result = this.db.write(() => {
       const checked = this.checkMailbox(mailboxId, true);
-      if (checked.deliveryId && !checked.redelivered) {
-        const target = this.db.wakeTarget(mailboxId);
-        if (target?.pendingWake) {
-          this.db.writeWakeTarget({ ...target, pendingWake: false }, target);
-          wakeDisarmed = true;
-        }
+      if (checked.deliveryId === null) return checked;
+      const target = this.db.wakeTarget(mailboxId);
+      if (target && (target.deliveryInDoubt === true || (!checked.redelivered && target.pendingWake))) {
+        this.db.writeWakeTarget({
+          ...target, deliveryInDoubt: undefined, lastWakeError: undefined,
+          attemptCount: 0, earliestWakeAt: 0, pendingWake: checked.redelivered && target.pendingWake,
+        }, target);
+        wakeChanged = true;
       }
       return checked;
     });
-    if (wakeDisarmed) this.events.emit('target', mailboxId);
+    if (wakeChanged) this.events.emit('target', mailboxId);
     return result;
   }
 
@@ -1528,12 +1530,13 @@ export class MailboxStore {
       const target = this.db.wakeTarget(id);
       if (target) {
         // Queued mail behind the completed wave may now rotate to a fresh session.
-        const wakeNext = !target.deliveryInDoubt && (target.pendingWake || this.db.hasQueuedItems(id));
+        const wakeNext = target.pendingWake || this.db.hasQueuedItems(id);
         this.db.writeWakeTarget({
           ...target, completedWaves: target.completedWaves + 1,
-          ...(wakeNext ? { pendingWake: true, earliestWakeAt: 0, attemptCount: 0 } : {}),
+          deliveryInDoubt: undefined, lastWakeError: undefined,
+          pendingWake: wakeNext, attemptCount: 0, earliestWakeAt: 0,
         }, target);
-        if (wakeNext) wakeMailbox = id;
+        if (wakeNext || target.deliveryInDoubt) wakeMailbox = id;
       }
       if (this.db.hasAckedHistoryBeyond(MAX_RETAINED_ACKED_ITEMS)) {
         const consumed = this.readConsumedSequence?.() ?? Number.MAX_SAFE_INTEGER;
@@ -1721,7 +1724,7 @@ export class MailboxStore {
 
   /**
    * Fence before an external delivery so a crash or an unknown outcome cannot silently replay it.
-   * Only `completeWakeDelivery` (confirmed receipt) or an explicit listener patch clears the fence.
+   * A confirmed receipt, consumer lease activity, or explicit reconciliation can clear the fence.
    */
   beginWakeDelivery(mailboxId: string, expectedRevision?: number): WakeTargetState | undefined {
     const id = normalizeMailboxId(mailboxId);
@@ -1856,6 +1859,30 @@ export class MailboxStore {
     });
     this.events.emit('target', id);
     return parked;
+  }
+
+  clearWakeFence(options: { mailboxId?: string; all?: boolean }): { cleared: string[]; woke: string[] } {
+    if (Boolean(options.mailboxId) === Boolean(options.all)) throw new Error('Choose either a mailbox id or all wake fences');
+    const mailboxId = options.mailboxId === undefined ? undefined : normalizeMailboxId(options.mailboxId);
+    const result = this.db.write(() => {
+      const cleared: string[] = [];
+      const woke: string[] = [];
+      const targets = mailboxId === undefined ? this.db.wakeTargets() : [this.db.wakeTarget(mailboxId)];
+      for (const target of targets) {
+        if (target?.deliveryInDoubt !== true) continue;
+        const id = target.mailboxId;
+        const pendingWake = this.db.hasQueuedItems(id) && !this.db.mailbox(id)?.outstanding;
+        this.db.writeWakeTarget({
+          ...target, deliveryInDoubt: undefined, lastWakeError: undefined,
+          pendingWake, attemptCount: 0, earliestWakeAt: 0,
+        }, target);
+        cleared.push(id);
+        if (pendingWake) woke.push(id);
+      }
+      return { cleared, woke };
+    });
+    for (const id of result.cleared) this.events.emit('target', id);
+    return result;
   }
 
   /** Settle only the observed wave; messages arriving during delivery retain their wake. */

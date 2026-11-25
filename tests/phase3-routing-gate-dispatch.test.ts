@@ -608,7 +608,7 @@ test('orca-spawn launches an interactive antigravity terminal and injects the ta
   );
   assert.ok(flagValue(requests[7].args, '--text').startsWith('Details — Dealer Task dispatched to mailbox '));
   assert.ok(requests[7].args.includes('--enter'));
-  assert.equal(flagValue(requests[7].args, '--wait-submit'), '5');
+  assert.equal(flagValue(requests[7].args, '--wait-submit'), '15');
   const trusted = JSON.parse(await readFile(settingsPath, 'utf8')).trustedWorkspaces;
   assert.ok(trusted.includes(dir));
 

@@ -470,7 +470,7 @@ test('dealer help exposes structured usage', async () => {
   const value = JSON.parse(out.join('\n'));
   assert.equal(value.ok, true);
   assert.match(value.commands.inbox, /inbox/);
-  assert.match(value.commands.queue, /queue status/);
+  assert.match(value.commands.queue, /queue <status\|unfence>/);
 });
 
 async function observeOffline(stateDir: string, args: string[]) {
@@ -615,4 +615,82 @@ test('queue status agrees across control and offline CLI and node status include
     const sidecar = `${runtime.mailbox.path}${suffix}`;
     if (existsSync(sidecar)) assert.equal(statSync(sidecar).mode & 0o777, 0o600);
   }
+});
+
+test('queue unfence writes through live control and offline ledgers, rearming only unleased queues', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'dealer-unfence-'));
+  const runtime = new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    profile: 'headless-relay',
+    transport: { discoveryDir: join(root, 'mesh') },
+  });
+  t.after(async () => { await runtime.stop(); rmSync(root, { recursive: true, force: true }); });
+  await runtime.start();
+  const forwarded: string[][] = [];
+  await runtime.serveControl(async argv => {
+    forwarded.push(argv);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+  const unfence = (...flags: string[]) => observeOffline(runtime.stateDir, ['queue', 'unfence', ...flags]);
+
+  const store = runtime.mailbox;
+  store.enqueue([envelope('online')], { mailboxId: 'online' });
+  store.enqueue([envelope('offline')], { mailboxId: 'offline' });
+  store.enqueue([envelope('leased')], { mailboxId: 'leased' });
+  const lease = store.check({ mailboxId: 'leased' });
+  store.enqueue([envelope('queued-after-lease')], { mailboxId: 'leased' });
+  for (const id of ['online', 'offline', 'empty', 'leased']) store.parkWakeDelivery(id, 'unverified');
+  store.upsertWakeTarget('untouched', { pendingWake: true, earliestWakeAt: Date.now() + 60_000, attemptCount: 1, lastWakeError: 'deferred' });
+  const untouched = store.getWakeTarget('untouched');
+  const claim = runtime.wakeups.claim('online');
+  const rearmed: string[] = [];
+  const subscription = store.onWakeTarget(id => {
+    if (store.getWakeTarget(id)?.pendingWake) rearmed.push(id);
+  });
+  t.after(() => subscription.dispose());
+
+  assert.deepEqual(await unfence('--mailbox', 'online'), {
+    code: 0,
+    value: {
+      cleared: ['online'], woke: ['online'],
+      summary: { activeMailboxes: 5, queuedItems: 3, leasedItems: 1, pendingWakes: 2, fencedTargets: 3 },
+    },
+  });
+  assert.deepEqual(forwarded, [['queue', 'unfence', '--mailbox', 'online', '--json']]);
+  assert.deepEqual(rearmed, ['online']);
+  assert.equal(store.getWakeTarget('online')?.pendingWake, true);
+  await runtime.stop();
+  claim.dispose();
+
+  for (const flags of [[], ['--all', '--mailbox', 'offline'], ['--all', 'extra'], ['--all', '--force'], ['--mailbox', '']]) {
+    const result = await unfence(...flags);
+    assert.equal(result.code, 1);
+    assert.match(result.value.error, /unfence|--mailbox/);
+  }
+  assert.deepEqual(await unfence('--all'), {
+    code: 0,
+    value: {
+      cleared: ['offline', 'empty', 'leased'], woke: ['offline'],
+      summary: { activeMailboxes: 4, queuedItems: 3, leasedItems: 1, pendingWakes: 3, fencedTargets: 0 },
+    },
+  });
+  const repeated = await unfence('--all');
+  assert.equal(repeated.code, 0);
+  assert.deepEqual(repeated.value.cleared, []);
+  assert.deepEqual(repeated.value.woke, []);
+  const reopened = MailboxStore.openReadOnly(store.path)!;
+  t.after(() => reopened.close());
+  for (const id of ['online', 'offline', 'empty', 'leased']) {
+    const target = reopened.getWakeTarget(id)!;
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.equal(target.lastWakeError, undefined);
+    assert.equal(target.attemptCount, 0);
+    assert.equal(target.earliestWakeAt, 0);
+    assert.equal(target.pendingWake, id === 'online' || id === 'offline');
+  }
+  assert.equal(reopened.check({ mailboxId: 'leased', peek: true }).deliveryId, lease.deliveryId);
+  assert.deepEqual(reopened.getWakeTarget('untouched'), untouched);
 });

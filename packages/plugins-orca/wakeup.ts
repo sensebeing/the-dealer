@@ -37,6 +37,8 @@ import {
 } from '../mailbox/wakeup.ts';
 import type { SlotProbeResult, WakeupDriver, WakeupDriverContext, WakeupDriverOutcome, WakeupProbeContext } from '../mailbox/wakeup.ts';
 
+export const DEFAULT_ORCA_WAIT_SUBMIT_SECONDS = 15;
+
 export interface OrcaTerminalDriverConfig {
   orcaCommand?: string;
   agent?: SupportedOrcaAgent;
@@ -543,11 +545,13 @@ export async function deliverSpawnedOrcaTerminalWakeup(
   const now = options.now ?? Date.now();
   let deliveryBegun = false;
   let expectedRevision = 0;
+  let terminalHandle: string | undefined;
   try {
     const state = store.getWakeTarget(mailboxId);
     expectedRevision = state?.bindingRevision ?? 0;
     const target = state ? readOrcaWakeTarget(state) : undefined;
     if (!target?.terminalHandle) throw new Error(`Orca terminal wake target missing handle: ${mailboxId}`);
+    terminalHandle = target.terminalHandle;
     const command = target.orcaCommand ?? 'orca';
     const preview = store.check({ mailboxId, peek: true });
     const idle = await waitFreshOrcaTabIdle(runner, command, target, target.terminalHandle, options);
@@ -566,7 +570,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
     await sendOrcaTerminalText(runner, command, target.terminalHandle, pointer, {
       cwd: target.workspacePath,
       signal: options.signal,
-      waitSubmit: 5,
+      waitSubmit: DEFAULT_ORCA_WAIT_SUBMIT_SECONDS,
       expectedAgent: target.agent,
     });
     const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, expectedRevision);
@@ -574,6 +578,7 @@ export async function deliverSpawnedOrcaTerminalWakeup(
     return { pointer, terminalHandle: target.terminalHandle, sent: true };
   } catch (error) {
     const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
+    if (deliveryBegun && !fenced) return { terminalHandle, sent: true };
     if (fenced) {
       // A pre-existing fence refuses the attempt before the boundary; it keeps the original
       // unknown-outcome reason. Only this attempt's own post-boundary failure may settle it.
@@ -825,6 +830,7 @@ class OrcaWakeDelivery {
   async run(context: WakeupDriverContext): Promise<WakeupDriverOutcome> {
     const { mailboxId, preview } = context;
     let activeRevision = context.target.bindingRevision ?? 0;
+    let deliveryBegun = false;
     try {
       let { target, excludedHandles, dedicatedTab } = this.scopeWakeTarget(mailboxId, readOrcaWakeTarget(context.target), preview);
       activeRevision = target.bindingRevision ?? 0;
@@ -869,11 +875,14 @@ class OrcaWakeDelivery {
       }
       return await this.deliver(mailboxId, target, preview, {
         plan: idle.plan, dedicatedTab, excludedHandles, signal: context.signal,
+        onDeliveryBegun: () => { deliveryBegun = true; },
       }, revision => { activeRevision = revision; });
     } catch (error) {
       if (error instanceof SettledWakeLaunchError) throw error;
-      if (this.store.getWakeTarget(mailboxId)?.deliveryInDoubt) {
-        const superseded = settleOrcaWakeDeliveryFailure(this.store, mailboxId, error, this.now(), activeRevision);
+      const fenced = this.store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
+      if (deliveryBegun && !fenced) return { kind: 'noop', reason: 'Wake delivery already confirmed by consumer' };
+      if (fenced) {
+        const superseded = deliveryBegun && settleOrcaWakeDeliveryFailure(this.store, mailboxId, error, this.now(), activeRevision);
         return { kind: 'noop', reason: superseded ? 'Wake launch superseded by a newer binding' : String(error) };
       }
       return { kind: 'defer', reason: String(error), expectedRevision: activeRevision };
@@ -1140,7 +1149,13 @@ class OrcaWakeDelivery {
     mailboxId: string,
     target: OrcaWakeTarget,
     preview: MailboxCheckResult,
-    options: { plan: Exclude<OrcaWakePlan, { kind: 'defer' }>; dedicatedTab: boolean; excludedHandles: ReadonlySet<string>; signal?: AbortSignal },
+    options: {
+      plan: Exclude<OrcaWakePlan, { kind: 'defer' }>;
+      dedicatedTab: boolean;
+      excludedHandles: ReadonlySet<string>;
+      signal?: AbortSignal;
+      onDeliveryBegun: () => void;
+    },
     setActiveRevision: (revision: number) => void,
   ): Promise<WakeupDriverOutcome> {
     const command = target.orcaCommand ?? this.command;
@@ -1337,6 +1352,7 @@ class OrcaWakeDelivery {
     // The pointer is the only external effect left; fence it so a crash or an unconfirmed send
     // stays parked instead of being replayed by the next tick or restart.
     if (!this.store.beginWakeDelivery(mailboxId, activeRevision)) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
+    options.onDeliveryBegun();
     if (target.driver === 'orca-run') {
       const output = await orcaMutationRunner(this.runner)({
         command,
@@ -1362,7 +1378,7 @@ class OrcaWakeDelivery {
     } else {
       await sendOrcaTerminalText(this.runner, command, terminalHandle!, pointer, {
         cwd: target.workspacePath,
-        waitSubmit: 5,
+        waitSubmit: DEFAULT_ORCA_WAIT_SUBMIT_SECONDS,
         expectedAgent: target.agent,
       });
     }
