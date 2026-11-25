@@ -203,6 +203,7 @@ See [the-dealer-extend](skills/the-dealer-extend/SKILL.md) and the [plugin guide
 | `dealer send --network local --to member:alice --topic collab.request.v4 --body 'Review this change' --json` | Send a routed task or message. |
 | `dealer inbox check --mailbox <id> --json` | Claim pending messages as a delivery lease. |
 | `dealer inbox ack <dlv-id> --mailbox <id> --json` | Acknowledge and settle a delivery lease. |
+| `dealer queue unfence --mailbox <id> --json` | Clear a wake fence and rearm queued mail when there is no active lease. Use `--all` to reconcile all fenced mailboxes. |
 | `dealer thread show <message-id> --json` | Inspect thread history and reverse-routing state. |
 | `dealer ask` / `dealer reply` / `dealer settle` | Continue or settle a bi-directional agent thread. |
 

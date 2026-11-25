@@ -22,7 +22,7 @@ const SCHEMA = `
     wakeup_prefix TEXT, coalesce_ms INTEGER NOT NULL, rotate_after_waves INTEGER,
     completed_waves INTEGER NOT NULL, pending_wake INTEGER NOT NULL,
     earliest_wake_at INTEGER NOT NULL, attempt_count INTEGER NOT NULL, last_wake_error TEXT,
-    delivery_in_doubt INTEGER NOT NULL, binding_revision INTEGER NOT NULL
+    delivery_in_doubt INTEGER NOT NULL, binding_revision INTEGER NOT NULL, pending_delivery_json TEXT
   );
   CREATE INDEX idx_wake_targets_pending ON wake_targets(pending_wake, delivery_in_doubt, earliest_wake_at);
   CREATE TABLE threads(
@@ -140,11 +140,20 @@ export class MailboxSqliteBackend {
         // SQLite creates new sidecars with the database's mode. Fix any preexisting sidecars.
         chmodIfPresent(`${path}-wal`, 0o600);
         chmodIfPresent(`${path}-shm`, 0o600);
+        if (this.hasSchema() && !this.hasPendingDeliveryColumn()) {
+          this.write(() => {
+            if (!this.hasPendingDeliveryColumn()) this.db.exec('ALTER TABLE wake_targets ADD COLUMN pending_delivery_json TEXT');
+          });
+        }
       }
     } catch (error) {
       this.close();
       throw error;
     }
+  }
+
+  private hasPendingDeliveryColumn(): boolean {
+    return this.db.prepare("SELECT 1 FROM pragma_table_info('wake_targets') WHERE name = 'pending_delivery_json'").get() !== undefined;
   }
 
   private enableWal(): void {
@@ -403,15 +412,19 @@ export class MailboxSqliteBackend {
       target.coalesceMs, target.rotateAfterWaves ?? null, target.completedWaves, Number(target.pendingWake),
       target.earliestWakeAt, target.attemptCount, target.lastWakeError ?? null,
       target.deliveryInDoubt === undefined ? ABSENT : Number(target.deliveryInDoubt), target.bindingRevision ?? ABSENT,
+      encodeOptional(target.pendingDelivery),
     ];
     if (previous === undefined) {
-      this.statement('INSERT INTO wake_targets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      this.statement(`INSERT INTO wake_targets (
+        mailbox_id, driver, driver_config_json, wakeup_prefix, coalesce_ms, rotate_after_waves, completed_waves,
+        pending_wake, earliest_wake_at, attempt_count, last_wake_error, delivery_in_doubt, binding_revision, pending_delivery_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(target.mailboxId, ...values);
       return;
     }
     const { changes } = this.statement(`UPDATE wake_targets SET driver = ?, driver_config_json = ?,
       wakeup_prefix = ?, coalesce_ms = ?, rotate_after_waves = ?, completed_waves = ?, pending_wake = ?,
-      earliest_wake_at = ?, attempt_count = ?, last_wake_error = ?, delivery_in_doubt = ?, binding_revision = ?
+      earliest_wake_at = ?, attempt_count = ?, last_wake_error = ?, delivery_in_doubt = ?, binding_revision = ?, pending_delivery_json = ?
       WHERE mailbox_id = ? AND binding_revision = ?`)
       .run(...values, target.mailboxId, previous.bindingRevision ?? ABSENT);
     if (changes !== 1) throw new Error(`Mailbox wake target changed inside the write transaction: ${target.mailboxId}`);
@@ -436,6 +449,7 @@ export class MailboxSqliteBackend {
       ...(row.last_wake_error === null ? {} : { lastWakeError: row.last_wake_error }),
       ...(row.delivery_in_doubt === ABSENT ? {} : { deliveryInDoubt: row.delivery_in_doubt === 1 }),
       ...(row.binding_revision === ABSENT ? {} : { bindingRevision: row.binding_revision }),
+      ...(row.pending_delivery_json == null ? {} : { pendingDelivery: decodeJson(row.pending_delivery_json) }),
     });
   }
 

@@ -34,6 +34,7 @@ const MAX_WAKEUP_HINT_LENGTH = 120;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 3_600_000;
 const LEASE_ID_PATTERN = /^dlv_[0-9a-f]{12}$/;
+const WAKE_DRIVER_ID_PATTERN = /^[a-z0-9][a-z0-9:_-]{0,63}$/i;
 
 export type MailboxItemStatus = 'queued' | 'leased' | 'acked';
 
@@ -97,6 +98,17 @@ export interface WakeTargetState {
   readonly lastWakeError?: string;
   /** Persisted before an external delivery; remains fenced while its outcome is unknown. */
   readonly deliveryInDoubt?: boolean;
+  readonly pendingDelivery?: PendingWakeDelivery;
+}
+
+type PinnedSessionMailbox = SessionMailboxPatch & { sessionMailboxId: string };
+
+export interface PendingWakeDelivery {
+  readonly bindingRevision: number;
+  readonly originRevision?: number;
+  readonly deliveredSequence: number;
+  readonly queuedItemIds: readonly string[];
+  readonly pinnedSession?: PinnedSessionMailbox;
 }
 
 export interface ThreadRouteRecord {
@@ -518,7 +530,7 @@ function defaultWakeTarget(mailboxId: string): WakeTargetState {
 
 const WAKE_TARGET_KEYS = new Set([
   'bindingRevision', 'mailboxId', 'driver', 'driverConfig', 'wakeupPrefix', 'coalesceMs', 'rotateAfterWaves',
-  'completedWaves', 'pendingWake', 'earliestWakeAt', 'attemptCount', 'lastWakeError', 'deliveryInDoubt',
+  'completedWaves', 'pendingWake', 'earliestWakeAt', 'attemptCount', 'lastWakeError', 'deliveryInDoubt', 'pendingDelivery',
 ]);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -536,6 +548,7 @@ function mergeWakeTarget(current: WakeTargetState, patch?: Partial<WakeTargetSta
   if (!patch) return current;
   if (Object.keys(patch).some(key => !WAKE_TARGET_KEYS.has(key))) throw invalidStore();
   const next = { ...current, ...patch, mailboxId: current.mailboxId };
+  if (!next.deliveryInDoubt) delete next.pendingDelivery;
   // A driver change cannot inherit another driver's opaque configuration.
   const sameDriver = patch.driver === undefined || patch.driver === current.driver;
   if (Object.hasOwn(patch, 'driverConfig')) {
@@ -564,9 +577,18 @@ function validateWakeTarget(value: unknown): WakeTargetState {
   const target = value as unknown as WakeTargetState;
   if (target.bindingRevision !== undefined && !isNonNegativeInteger(target.bindingRevision)) throw invalidStore();
   if (!isValidMailboxId(target.mailboxId) || typeof target.driver !== 'string' ||
-      !/^[a-z0-9][a-z0-9:_-]{0,63}$/i.test(target.driver)) throw invalidStore();
+      !WAKE_DRIVER_ID_PATTERN.test(target.driver)) throw invalidStore();
   if (target.driverConfig !== undefined && (!isPlainRecord(target.driverConfig) || !isJsonValue(target.driverConfig))) throw invalidStore();
   if (target.deliveryInDoubt !== undefined && typeof target.deliveryInDoubt !== 'boolean') throw invalidStore();
+  const pending = target.pendingDelivery;
+  if (pending !== undefined && (!target.deliveryInDoubt || !isPlainRecord(pending) ||
+      Object.keys(pending).some(key => !['bindingRevision', 'originRevision', 'deliveredSequence', 'queuedItemIds', 'pinnedSession'].includes(key)) ||
+      !isNonNegativeInteger(pending.bindingRevision) || !Number.isSafeInteger(pending.deliveredSequence) ||
+      (pending.originRevision !== undefined &&
+        (!isNonNegativeInteger(pending.originRevision) || pending.originRevision > pending.bindingRevision)) ||
+      pending.deliveredSequence < -1 || !Array.isArray(pending.queuedItemIds) ||
+      !Array.from(pending.queuedItemIds).every(isNonEmptyString) ||
+      (pending.pinnedSession !== undefined && !validPinnedSession(pending.pinnedSession, target.mailboxId)))) throw invalidStore();
   if (typeof target.coalesceMs !== 'number' || !Number.isFinite(target.coalesceMs) || target.coalesceMs < 0) throw invalidStore();
   if (!isNonNegativeInteger(target.completedWaves) || !isNonNegativeInteger(target.attemptCount)) throw invalidStore();
   if (typeof target.pendingWake !== 'boolean') throw invalidStore();
@@ -581,6 +603,19 @@ function validateWakeTarget(value: unknown): WakeTargetState {
 export interface SessionMailboxPatch {
   driver?: string;
   driverConfig?: Record<string, unknown>;
+  /** Exclude source-only values while preserving the destination's own configuration. */
+  omitSourceDriverConfig?: readonly string[];
+  /** Keep key deletions explicit when the patch is persisted as JSON before delivery. */
+  unsetDriverConfig?: readonly string[];
+}
+
+function validPinnedSession(session: PinnedSessionMailbox, mailboxId: string): boolean {
+  return isPlainRecord(session) && isValidMailboxId(session.sessionMailboxId) && session.sessionMailboxId !== mailboxId &&
+    Object.keys(session).every(key => ['sessionMailboxId', 'driver', 'driverConfig', 'omitSourceDriverConfig', 'unsetDriverConfig'].includes(key)) &&
+    (session.driver === undefined || (typeof session.driver === 'string' && WAKE_DRIVER_ID_PATTERN.test(session.driver))) &&
+    (session.driverConfig === undefined || (isPlainRecord(session.driverConfig) && isJsonValue(session.driverConfig))) &&
+    [session.omitSourceDriverConfig, session.unsetDriverConfig].every(keys =>
+      keys === undefined || (Array.isArray(keys) && Array.from(keys).every(isNonEmptyString)));
 }
 
 function pinSessionTarget(db: MailboxSqliteBackend, id: string, sessionMailboxId: string, patch: SessionMailboxPatch = {}): string {
@@ -590,22 +625,26 @@ function pinSessionTarget(db: MailboxSqliteBackend, id: string, sessionMailboxId
   if (sessionMailbox === id) throw new Error('Session mailbox must differ from rotating mailbox');
   const existing = db.wakeTarget(sessionMailbox);
   const nextDriver = patch.driver ?? existing?.driver ?? current.driver;
+  const inherited = nextDriver === current.driver ? { ...current.driverConfig } : {};
+  for (const key of patch.omitSourceDriverConfig ?? []) delete inherited[key];
   const hasQueued = db.hasQueuedItems(sessionMailbox);
   const prefix = current.wakeupPrefix?.replace(new RegExp(`(--mailbox\\s+)${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`), `$1${sessionMailbox}`);
   const next = validateWakeTarget(mergeWakeTarget(existing ?? defaultWakeTarget(sessionMailbox), {
     ...current, ...(existing ?? {}), mailboxId: sessionMailbox,
     driver: nextDriver,
     driverConfig: {
-      ...(nextDriver === current.driver ? current.driverConfig : undefined),
+      ...inherited,
       ...(existing?.driver === nextDriver ? existing.driverConfig : undefined),
       ...patch.driverConfig,
+      ...Object.fromEntries((patch.unsetDriverConfig ?? []).map(key => [key, undefined])),
     },
     rotateAfterWaves: undefined, completedWaves: existing?.completedWaves ?? 0,
     wakeupPrefix: prefix ?? existing?.wakeupPrefix ?? current.wakeupPrefix,
     pendingWake: Boolean(existing?.pendingWake || hasQueued), attemptCount: existing?.attemptCount ?? 0,
     earliestWakeAt: existing?.earliestWakeAt ?? 0,
-    lastWakeError: existing?.deliveryInDoubt ? existing.lastWakeError : (current.deliveryInDoubt ? current.lastWakeError : existing?.lastWakeError),
-    deliveryInDoubt: Boolean(existing?.deliveryInDoubt || current.deliveryInDoubt) ? true : undefined,
+    lastWakeError: existing?.lastWakeError,
+    deliveryInDoubt: existing?.deliveryInDoubt ? true : undefined,
+    pendingDelivery: existing?.deliveryInDoubt ? existing.pendingDelivery : undefined,
   }));
   db.writeWakeTarget(next, existing);
   return sessionMailbox;
@@ -1435,20 +1474,37 @@ export class MailboxStore {
       this.ack(options.ackLeaseId, mailboxId);
     }
     if (options.peek) return this.db.read(() => this.checkMailbox(mailboxId, false));
-    let wakeDisarmed = false;
+    let wakeChanged = false;
+    let pinnedWakeMailbox: string | undefined;
     const result = this.db.write(() => {
       const checked = this.checkMailbox(mailboxId, true);
-      if (checked.deliveryId && !checked.redelivered) {
-        const target = this.db.wakeTarget(mailboxId);
-        if (target?.pendingWake) {
-          this.db.writeWakeTarget({ ...target, pendingWake: false }, target);
-          wakeDisarmed = true;
-        }
+      if (checked.deliveryId === null) return checked;
+      const target = this.db.wakeTarget(mailboxId);
+      if (!target || checked.redelivered) return checked;
+      const pending = this.matchingPendingDelivery(target, checked.items.map(item => item.id));
+      if (pending) {
+        ({ pinnedWakeMailbox } = this.settleWakeDeliveryInTx(target, target, pending.deliveredSequence, {}, pending.pinnedSession));
+        wakeChanged = true;
+      } else if (!target.deliveryInDoubt && target.pendingWake) {
+        this.db.writeWakeTarget({
+          ...target, lastWakeError: undefined, attemptCount: 0, earliestWakeAt: 0, pendingWake: false,
+        }, target);
+        wakeChanged = true;
       }
       return checked;
     });
-    if (wakeDisarmed) this.events.emit('target', mailboxId);
+    if (wakeChanged) this.events.emit('target', mailboxId);
+    if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return result;
+  }
+
+  private matchingPendingDelivery(target: WakeTargetState, consumedItemIds: readonly string[]): PendingWakeDelivery | undefined {
+    const pending = target.pendingDelivery;
+    if (target.deliveryInDoubt && pending?.queuedItemIds.length && (target.bindingRevision ?? 0) === pending.bindingRevision) {
+      const consumed = new Set(consumedItemIds);
+      if (pending.queuedItemIds.some(id => consumed.has(id))) return pending;
+    }
+    return undefined;
   }
 
   private checkMailbox(mailboxId: string, claim: boolean): MailboxCheckResult {
@@ -1509,6 +1565,7 @@ export class MailboxStore {
     const requestedMailbox =
       mailboxId === undefined ? undefined : normalizeMailboxId(mailboxId);
     let wakeMailbox: string | undefined;
+    let pinnedWakeMailbox: string | undefined;
     const result = this.db.write(() => {
       const record = requestedMailbox === undefined ? this.db.leaseMailbox(leaseId) : this.db.mailbox(requestedMailbox);
       if (!record || (record.outstanding?.leaseId !== leaseId && !record.ackedLeaseIds.includes(leaseId))) {
@@ -1527,13 +1584,23 @@ export class MailboxStore {
       });
       const target = this.db.wakeTarget(id);
       if (target) {
-        // Queued mail behind the completed wave may now rotate to a fresh session.
-        const wakeNext = !target.deliveryInDoubt && (target.pendingWake || this.db.hasQueuedItems(id));
-        this.db.writeWakeTarget({
-          ...target, completedWaves: target.completedWaves + 1,
-          ...(wakeNext ? { pendingWake: true, earliestWakeAt: 0, attemptCount: 0 } : {}),
-        }, target);
-        if (wakeNext) wakeMailbox = id;
+        const pending = this.matchingPendingDelivery(target, itemIds);
+        const completedWaves = target.completedWaves + 1;
+        if (pending) {
+          ({ pinnedWakeMailbox } = this.settleWakeDeliveryInTx(
+            target, target, pending.deliveredSequence, { completedWaves }, pending.pinnedSession, this.db.hasQueuedItems(id),
+          ));
+          wakeMailbox = id;
+        } else if (target.deliveryInDoubt) {
+          this.db.writeWakeTarget({ ...target, completedWaves, pendingWake: false }, target);
+        } else {
+          // Queued mail behind the completed wave may now rotate to a fresh session.
+          const pendingWake = target.pendingWake || this.db.hasQueuedItems(id);
+          this.db.writeWakeTarget({
+            ...target, completedWaves, pendingWake, lastWakeError: undefined, attemptCount: 0, earliestWakeAt: 0,
+          }, target);
+          if (pendingWake) wakeMailbox = id;
+        }
       }
       if (this.db.hasAckedHistoryBeyond(MAX_RETAINED_ACKED_ITEMS)) {
         const consumed = this.readConsumedSequence?.() ?? Number.MAX_SAFE_INTEGER;
@@ -1545,6 +1612,7 @@ export class MailboxStore {
     if (wakeMailbox !== undefined) {
       this.events.emit('target', wakeMailbox);
     }
+    if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return result;
   }
 
@@ -1702,13 +1770,25 @@ export class MailboxStore {
   upsertWakeTarget(
     mailboxId: string,
     patch: Partial<WakeTargetState> = {},
+    options?: { preservePendingDeliveryFromRevision?: number },
   ): WakeTargetState {
     const id = normalizeMailboxId(mailboxId);
     let notify = false;
     const merged = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
-      const next = validateWakeTarget(mergeWakeTarget(current, patch));
+      let next = validateWakeTarget(mergeWakeTarget(current, patch));
+      const fromRevision = options?.preservePendingDeliveryFromRevision;
+      const pending = current.pendingDelivery;
+      if (fromRevision !== undefined && fromRevision === (current.bindingRevision ?? 0) &&
+          current.deliveryInDoubt && pending?.bindingRevision === fromRevision && next.deliveryInDoubt) {
+        next = {
+          ...next,
+          pendingDelivery: {
+            ...pending, originRevision: pending.originRevision ?? fromRevision, bindingRevision: next.bindingRevision ?? 0,
+          },
+        };
+      }
       this.db.writeWakeTarget(next, previous);
       notify = current.pendingWake || next.pendingWake || Boolean(current.deliveryInDoubt) !== Boolean(next.deliveryInDoubt);
       return structuredClone(next);
@@ -1721,20 +1801,28 @@ export class MailboxStore {
 
   /**
    * Fence before an external delivery so a crash or an unknown outcome cannot silently replay it.
-   * Only `completeWakeDelivery` (confirmed receipt) or an explicit listener patch clears the fence.
+   * Pointer deliveries can supply an observation that a matching consumer lease may confirm.
    */
-  beginWakeDelivery(mailboxId: string, expectedRevision?: number): WakeTargetState | undefined {
+  beginWakeDelivery(
+    mailboxId: string, expectedRevision?: number, pointer?: { deliveredSequence: number; pinnedSession?: PinnedSessionMailbox },
+  ): WakeTargetState | undefined {
     const id = normalizeMailboxId(mailboxId);
     const fenced = this.db.write(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
-      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) return undefined;
+      const revision = current.bindingRevision ?? 0;
+      if (expectedRevision !== undefined && revision !== expectedRevision) return undefined;
       if (current.deliveryInDoubt) {
         throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
       }
+      const pendingDelivery = pointer && {
+        ...pointer, bindingRevision: revision, originRevision: revision,
+        queuedItemIds: this.db.items({ mailboxId: id, status: 'queued', throughSequence: pointer.deliveredSequence }).map(item => item.id),
+      };
       const next = validateWakeTarget(mergeWakeTarget(current, {
         deliveryInDoubt: true, pendingWake: false,
         lastWakeError: 'External wake delivery outcome is not yet confirmed',
+        pendingDelivery,
       }));
       this.db.writeWakeTarget(next, previous);
       return structuredClone(next);
@@ -1849,6 +1937,8 @@ export class MailboxStore {
       const current = previous ?? defaultWakeTarget(id);
       const next = validateWakeTarget(mergeWakeTarget(current, {
         deliveryInDoubt: true, pendingWake: false, earliestWakeAt: 0,
+        pendingDelivery: current.deliveryInDoubt && current.pendingDelivery?.bindingRevision === (current.bindingRevision ?? 0)
+          ? current.pendingDelivery : undefined,
         attemptCount: current.attemptCount + 1, lastWakeError: String(error),
       }));
       this.db.writeWakeTarget(next, previous);
@@ -1858,61 +1948,103 @@ export class MailboxStore {
     return parked;
   }
 
+  clearWakeFence(options: { mailboxId?: string; all?: boolean }): { cleared: string[]; woke: string[] } {
+    if (Boolean(options.mailboxId) === Boolean(options.all)) throw new Error('Choose either a mailbox id or all wake fences');
+    const mailboxId = options.mailboxId === undefined ? undefined : normalizeMailboxId(options.mailboxId);
+    const result = this.db.write(() => {
+      const cleared: string[] = [];
+      const woke: string[] = [];
+      const targets = mailboxId === undefined ? this.db.wakeTargets() : [this.db.wakeTarget(mailboxId)];
+      for (const target of targets) {
+        if (target?.deliveryInDoubt !== true) continue;
+        const id = target.mailboxId;
+        const pendingWake = this.db.hasQueuedItems(id) && !this.db.mailbox(id)?.outstanding;
+        this.db.writeWakeTarget({
+          ...target, deliveryInDoubt: undefined, lastWakeError: undefined,
+          pendingDelivery: undefined, pendingWake, attemptCount: 0, earliestWakeAt: 0,
+        }, target);
+        cleared.push(id);
+        if (pendingWake) woke.push(id);
+      }
+      return { cleared, woke };
+    });
+    for (const id of result.cleared) this.events.emit('target', id);
+    return result;
+  }
+
   /** Settle only the observed wave; messages arriving during delivery retain their wake. */
   completeWakeDelivery(
     mailboxId: string,
     deliveredSequence: number,
     patch: Partial<WakeTargetState> = {},
-    pinnedSession?: SessionMailboxPatch & { sessionMailboxId: string },
+    pinnedSession?: PinnedSessionMailbox,
     expectedRevision?: number,
   ): WakeTargetState & { superseded?: boolean } {
     const id = normalizeMailboxId(mailboxId);
     let pinnedWakeMailbox: string | undefined;
     let notify = false;
     const completed = this.db.write(() => {
-      const pendingWake = this.db.hasQueuedItems(id, deliveredSequence);
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
-      notify = current.pendingWake || Boolean(current.deliveryInDoubt);
-      if (expectedRevision !== undefined && (current.bindingRevision ?? 0) !== expectedRevision) {
+      const revision = current.bindingRevision ?? 0;
+      const pending = current.pendingDelivery;
+      const currentOrigin = current.deliveryInDoubt && pending?.bindingRevision === revision
+        ? pending.originRevision ?? pending.bindingRevision : undefined;
+      if (expectedRevision !== undefined && revision !== expectedRevision && currentOrigin !== expectedRevision) {
+        if (currentOrigin !== undefined) return { ...structuredClone(current), superseded: true };
         const hasQueued = this.db.hasQueuedItems(id);
         const next = validateWakeTarget(mergeWakeTarget(current, {
           deliveryInDoubt: undefined, lastWakeError: undefined,
           pendingWake: Boolean(current.pendingWake || hasQueued), attemptCount: 0, earliestWakeAt: 0,
         }));
         this.db.writeWakeTarget(next, previous);
+        notify = next.pendingWake || Boolean(current.deliveryInDoubt);
         return Object.assign(structuredClone(next), { superseded: true });
       }
 
-      const next = validateWakeTarget(mergeWakeTarget(current, {
-        ...patch, pendingWake, attemptCount: 0,
-        earliestWakeAt: pendingWake ? current.earliestWakeAt : 0, lastWakeError: undefined,
-        deliveryInDoubt: undefined,
-      }));
-      this.db.writeWakeTarget(next, previous);
-      if (pinnedSession && current.rotateAfterWaves !== undefined) {
-        const termMailbox = pinSessionTarget(this.db, id, pinnedSession.sessionMailboxId, pinnedSession);
-        const pinned = this.db.wakeTarget(termMailbox);
-        if (pinned?.pendingWake && !pinned.deliveryInDoubt) pinnedWakeMailbox = termMailbox;
-        const delivered = this.db.items({ mailboxId: id, throughSequence: deliveredSequence });
-        const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
-        const updatedAt = new Date().toISOString();
-        for (const record of this.db.threads({ localMailbox: id })) {
-          const key = threadKey(record);
-          if (record.mailboxCommitted !== false &&
-              (keys.has(key) || keys.has(record.threadId) || keys.has(record.messageId))) {
-            this.db.writeThread(key, {
-              ...record, localMailbox: termMailbox, updatedAt,
-              ...(record.direction === 'inbound' ? { mailboxCommitted: true } : {}),
-            });
-          }
-        }
-      }
-      return structuredClone(next);
+      const settled = this.settleWakeDeliveryInTx(current, previous, deliveredSequence, patch, pinnedSession);
+      pinnedWakeMailbox = settled.pinnedWakeMailbox;
+      notify = current.pendingWake || settled.target.pendingWake || Boolean(current.deliveryInDoubt);
+      return structuredClone(settled.target);
     });
-    if (completed.pendingWake || notify) this.events.emit('target', id);
+    if (notify) this.events.emit('target', id);
     if (pinnedWakeMailbox) this.events.emit('target', pinnedWakeMailbox);
     return completed;
+  }
+
+  private settleWakeDeliveryInTx(
+    current: WakeTargetState, previous: WakeTargetState | undefined, deliveredSequence: number,
+    patch: Partial<WakeTargetState>, pinnedSession?: PinnedSessionMailbox, wakeNext?: boolean,
+  ): { target: WakeTargetState; pinnedWakeMailbox?: string } {
+    const pendingWake = wakeNext ?? this.db.hasQueuedItems(current.mailboxId, deliveredSequence);
+    const target = validateWakeTarget(mergeWakeTarget(current, {
+      ...patch, pendingWake, attemptCount: 0, lastWakeError: undefined,
+      earliestWakeAt: wakeNext === undefined && pendingWake ? current.earliestWakeAt : 0,
+      deliveryInDoubt: undefined, pendingDelivery: undefined,
+    }));
+    this.db.writeWakeTarget(target, previous);
+    const pinnedWakeMailbox = pinnedSession && this.pinDeliveredThreads(current, deliveredSequence, pinnedSession);
+    return { target, pinnedWakeMailbox };
+  }
+
+  private pinDeliveredThreads(target: WakeTargetState, sequence: number, session: PinnedSessionMailbox): string | undefined {
+    if (target.rotateAfterWaves === undefined) return undefined;
+    const id = target.mailboxId;
+    const termMailbox = pinSessionTarget(this.db, id, session.sessionMailboxId, session);
+    const delivered = this.db.items({ mailboxId: id, throughSequence: sequence });
+    const keys = new Set(delivered.flatMap(item => [item.envelope.semantic?.threadId, item.envelope.id].filter((v): v is string => typeof v === 'string')));
+    const updatedAt = new Date().toISOString();
+    for (const record of this.db.threads({ localMailbox: id })) {
+      const key = threadKey(record);
+      if (record.mailboxCommitted !== false && (keys.has(key) || keys.has(record.threadId) || keys.has(record.messageId))) {
+        this.db.writeThread(key, {
+          ...record, localMailbox: termMailbox, updatedAt,
+          ...(record.direction === 'inbound' ? { mailboxCommitted: true } : {}),
+        });
+      }
+    }
+    const pinned = this.db.wakeTarget(termMailbox);
+    return pinned?.pendingWake && !pinned.deliveryInDoubt ? termMailbox : undefined;
   }
 
   pinSessionMailbox(mailboxId: string, sessionMailboxId: string, sessionPatch?: SessionMailboxPatch): string {

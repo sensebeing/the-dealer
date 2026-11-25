@@ -97,6 +97,8 @@ const stringFlags = [
   'gemini-dir',
 ] as const;
 
+const QUEUE_USAGE = 'dealer queue <status|unfence> [--mailbox <id>] [--all] [--json]';
+
 function parse(argv: string[]) {
   return parseArgs({
     args: argv,
@@ -1211,7 +1213,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           ask: 'dealer ask <messageId> --body <text> [--ack <leaseId>] [--json]',
           settle: 'dealer settle <messageId> --outcome <succeeded|failed|cancelled> --summary <text> [--ack <leaseId>] [--json]',
           inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
-          queue: 'dealer queue status [--mailbox <id>] [--all] [--json]',
+          queue: QUEUE_USAGE,
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
           source: 'dealer source <add|list|wake> [<name>] [--json]',
@@ -1222,7 +1224,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
     const readOnlyInbox = group === 'inbox' && (action === undefined || action === 'list' || (action === 'check' && v.peek === true));
     const readOnlyThread = group === 'thread' && (action === 'list' || action === 'show');
-    const observesMailbox = readOnlyInbox || readOnlyThread || group === 'queue' || (group === 'node' && action === 'status');
+    const observesMailbox = readOnlyInbox || readOnlyThread || (group === 'queue' && action === 'status') || (group === 'node' && action === 'status');
     const openLedgers = async (config?: Partial<RuntimeConfig>) => {
       const ledgers = await ledgersFor(options, stateDir, observesMailbox, config);
       if (!options.runtime) offlineMailbox = ledgers.mailbox;
@@ -1372,7 +1374,21 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       return 0;
     }
     if (group === 'queue') {
-      if (action !== 'status' || target !== undefined) throw new Error('Use dealer queue status [--mailbox <id>] [--all] [--json]');
+      if (action === 'unfence') {
+        const hasMailbox = v.mailbox !== undefined;
+        const all = v.all === true;
+        if (target !== undefined || Object.keys(v).some(flag => !['mailbox', 'all', 'json'].includes(flag)) ||
+            hasMailbox === all) {
+          throw new Error('Use dealer queue unfence (--mailbox <id> | --all) [--json]');
+        }
+        const mailboxId = hasMailbox ? normalizeMailboxId(v.mailbox, '--mailbox') : undefined;
+        const { mailbox } = await openLedgers();
+        if (!mailbox) throw new Error('Queue ledger unavailable');
+        const result = mailbox.clearWakeFence({ mailboxId, all });
+        stdout(JSON.stringify({ ...result, summary: compactQueueSummary(mailbox) }, null, v.json ? undefined : 2));
+        return 0;
+      }
+      if (action !== 'status' || target !== undefined) throw new Error(`Use ${QUEUE_USAGE}`);
       const { mailbox } = await openLedgers();
       if (!mailbox && v.mailbox !== undefined) normalizeMailboxId(v.mailbox);
       const { summary, queues } = mailbox?.summarizeQueues({ mailboxId: v.mailbox, includeIdle: v.all }) ??

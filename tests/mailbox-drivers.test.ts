@@ -129,20 +129,22 @@ test('generic driver outcomes preserve scheduling and settled failure classifica
   assert.equal(store.getWakeTarget('box')?.pendingWake, false);
 });
 
-test('generic drivers retry proven non-starts and never replay an unknown external outcome', async (t) => {
+test('generic drivers retry proven non-starts and resume pointer fences after matching consumption', async (t) => {
   const store = fixture(t);
   let starts = 0;
-  let nonStart = true;
   const service = new WakeupRedriveService({
     store,
     flushIntervalMs: 100_000,
     drivers: [
       {
         name: 'mock',
-        async deliver({ store, mailboxId }) {
+        async deliver({ store, mailboxId, preview }) {
           starts++;
-          store.beginWakeDelivery(mailboxId);
-          throw nonStart ? new CommandNotStartedError('missing binary') : new Error('lost receipt');
+          store.beginWakeDelivery(mailboxId, undefined, { deliveredSequence: preview.items[0].sequence });
+          if (starts === 1) throw new CommandNotStartedError('missing binary');
+          if (starts === 2) throw new Error('lost receipt');
+          store.completeWakeDelivery(mailboxId, preview.items[0].sequence);
+          return { kind: 'delivered', pointer: 'pointer' };
         },
       },
     ],
@@ -151,11 +153,17 @@ test('generic drivers retry proven non-starts and never replay an unknown extern
   await service.flushMailbox('box', { force: true });
   assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, undefined);
   assert.equal(store.getWakeTarget('box')?.pendingWake, true);
-  nonStart = false;
   await service.flushMailbox('box', { force: true });
   assert.equal(store.getWakeTarget('box')?.deliveryInDoubt, true);
   await service.flushMailbox('box', { force: true });
   assert.equal(starts, 2);
+
+  const lease = store.check({ mailboxId: 'box' });
+  const [original] = lease.items;
+  store.enqueue([{ ...original.envelope, id: 'next' }], { mailboxId: 'box' });
+  store.ack(lease.deliveryId!, 'box');
+  assert.equal((await service.flushMailbox('box')).woke, true);
+  assert.equal(starts, 3);
 });
 
 test('synchronous driver events cannot reenter an in-flight mailbox delivery', async (t) => {
