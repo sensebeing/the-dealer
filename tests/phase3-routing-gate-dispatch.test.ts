@@ -1039,7 +1039,7 @@ test('Orca idle inspection includes child workspaces and rejects truncated inven
 });
 
 test('Orca idle inspection requires empty composers and authoritative agent readiness', async () => {
-  let lastLine = '  ⏵⏵ bypass permissions on';
+  let lastLine = '>\n────────\n  ⏵⏵ bypass permissions on';
   let waitOk = false;
   let waits = 0;
   const runner: CommandRunner = async request => {

@@ -677,9 +677,10 @@ threads. Launch and retirement fences and legacy fences without batch evidence r
 settlement or explicit reconciliation. Pinning a session mailbox preserves its own fence and
 retry state.
 Root target terminals verify `tui-idle` readiness, an empty composer, and
-the configured agent identity before pointer injection. Antigravity also requires a rendered
-composer prompt when it is the configured agent. Its official mode placeholders count as an empty
-composer even when truncated with an ellipsis in a narrow terminal.
+the configured agent identity before pointer injection. When the target configures Antigravity
+or Orca reports `agentIdentity: 'antigravity'`, rendered screens, final pre-send checks, and
+nonempty stream previews require the `> ` composer prompt. Antigravity's official mode placeholders
+count as an empty composer even when truncated with an ellipsis in a narrow terminal.
 Preflight checks consult `orca terminal read --screen` when the stream preview would block delivery.
 The final check uses the rendered screen and Orca's UI-only `draft` field, falling back to the stream preview only when the rendered screen is unavailable or unsupported.
 Workspace terminal selection and readiness use the same reuse candidates.
@@ -707,9 +708,12 @@ revision for receipt settlement. A change to the caller's conversation invalidat
 witness for the new binding. Session pinning merges against the destination's current identity
 inside the settlement transaction, including identity recorded while Orca awaited the receipt.
 Legacy `old-host` receipts retain compatibility.
-Non-excluded descendant worktrees gate parent readiness, rotation and leased-wave quiescence
-through complete inventories, `done` agents and connected terminal coverage. Orca drivers create independent tabs
-for rotation only after the retiring slot's own agent and child worktrees are done. The
+Root workspace, rotation, terminal retirement and descendant checks require quiescent agents.
+Orca must report `state: 'done'` and `programStatus.state` must be `idle`, `done`, `error`, or absent.
+Other reported program states count as busy, including `working` and `blocked` with kinds such as
+`question`, `permission`, and `auth`. Non-excluded descendant worktrees also require complete
+inventories and connected terminal coverage before the parent can proceed. Orca drivers create
+independent tabs for rotation only after the retiring slot's own agent and child worktrees are quiescent. The
 new wave starts a fresh conversation even if the retiring tab is read-only. The driver
 then closes the retired terminal and keeps its handle reserved until the close is confirmed. Slot-scoped
 checks first exclude subtrees attributed entirely by explicit sibling parent panes. Every worktree
