@@ -154,6 +154,7 @@ interface FakeTerminalRow {
 
 interface FakeOrcaAgent {
   state: string;
+  programStatus?: { state?: string; kind?: string };
   paneKey?: string;
   parentPaneKey?: string | null;
   address?: string;
@@ -299,6 +300,72 @@ test('slot probe uses agent state, the composer draft and TUI-idle for a leased 
     busy: false, ready: false, reason: 'quiescent_leased_wave',
   });
   assert.deepEqual(errors, []);
+});
+
+const busyProgramStatuses = [
+  { state: 'blocked', kind: 'question' },
+  { state: 'blocked', kind: 'permission' },
+  { state: 'blocked', kind: 'auth' },
+  { state: 'working' },
+  { state: 'unknown' },
+];
+
+test('Orca program status gates slot probes, same-tab delivery and rotation', async t => {
+  const busyReason = 'Workspace or descendant is busy or unverifiable';
+  for (const programStatus of busyProgramStatuses) {
+    await t.test(programStatus.kind ?? programStatus.state, async t => {
+      const { service, state, store } = slotProbeFixture(t, { paneKey: 'wave:root' });
+      state.agents = [{ state: 'done', paneKey: 'wave:root', programStatus }];
+      assert.deepEqual(await service.probeSlot(probeMailbox), { busy: true, ready: false, reason: busyReason });
+
+      store.enqueue([alert('blocked-slot')], { mailboxId: probeMailbox });
+      const sameTab = await service.flushMailbox(probeMailbox, { force: true });
+      assert.equal(sameTab.woke, false);
+      assert.equal(sameTab.reason, busyReason);
+
+      store.upsertWakeTarget(probeMailbox, { completedWaves: 1 });
+      const rotation = await service.flushMailbox(probeMailbox, { force: true });
+      assert.equal(rotation.woke, false);
+      assert.equal(rotation.reason, busyReason);
+      assert.equal(state.created, 0);
+      assert.equal(state.calls.some(call => call.args[0] === 'terminal' && call.args[1] === 'close'), false);
+      assert.equal(terminalSends(state.calls).length, 0);
+    });
+  }
+
+  for (const programState of ['idle', 'done', 'error']) {
+    await t.test(programState, async t => {
+      const { service, state, store } = slotProbeFixture(t, { paneKey: 'wave:root' });
+      state.agents = [{ state: 'done', paneKey: 'wave:root', programStatus: { state: programState } }];
+      assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
+      store.enqueue([alert('quiescent-slot')], { mailboxId: probeMailbox });
+      const delivery = await service.flushMailbox(probeMailbox, { force: true });
+      assert.equal(delivery.woke, true, delivery.reason);
+      assert.equal(state.created, 0);
+      assert.equal(sendsTo(state.calls, probeTerminal.handle).length, 1);
+    });
+  }
+});
+
+test('a descendant waiting on Orca AskQuestion blocks delivery to its parent', async t => {
+  const { root, service, state, store } = slotProbeFixture(t, { paneKey: 'wave:root' });
+  const childAgent: FakeOrcaAgent = {
+    state: 'done', parentPaneKey: 'wave:root', programStatus: { state: 'blocked', kind: 'question' },
+  };
+  state.children = [{
+    path: join(root, 'child'), worktreeId: 'child', unverifiableTerminalCount: 0,
+    agents: [childAgent], terminals: [{ ...probeTerminal, handle: 'term-child', tabId: 'child' }],
+  }];
+  store.enqueue([alert('parent-wake')], { mailboxId: probeMailbox });
+  const blocked = await service.flushMailbox(probeMailbox, { force: true });
+  assert.equal(blocked.woke, false);
+  assert.equal(blocked.reason, 'Workspace or descendant is busy or unverifiable');
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  childAgent.programStatus = { state: 'idle' };
+  const delivery = await service.flushMailbox(probeMailbox, { force: true });
+  assert.equal(delivery.woke, true, delivery.reason);
+  assert.equal(sendsTo(state.calls, probeTerminal.handle).length, 1);
 });
 
 test('done historical child worktrees allow slot readiness, rotation and leased-wave quiescence', async t => {
@@ -2026,11 +2093,12 @@ test('retirement rechecks activity after launch and on later attempts', async t 
   const root = directory(t);
   const store = new MailboxStore(join(root, 'mailbox.json'));
   const fake = fakeOrcaWorkspace(root, [{ ...probeTerminal }]);
-  fake.state.agents = [{ state: 'done', paneKey: 'wave:root' }];
+  const retiringAgent: FakeOrcaAgent = { state: 'done', paneKey: 'wave:root' };
+  fake.state.agents = [retiringAgent];
   const { service } = startSlotProbeService(t, store, async request => {
     const result = await fake.runner(request);
     if (request.args[0] === 'terminal' && request.args[1] === 'create') {
-      fake.state.agents![0].state = 'working';
+      retiringAgent.programStatus = { state: 'blocked', kind: 'question' };
     }
     return result;
   });
@@ -2045,11 +2113,20 @@ test('retirement rechecks activity after launch and on later attempts', async t 
   assert.equal(store.getWakeTarget(probeMailbox)?.driverConfig?.retiredTerminalHandle, probeTerminal.handle);
   assert.equal(fake.state.calls.some(call => call.args[1] === 'close'), false);
 
+  for (const programStatus of busyProgramStatuses) {
+    retiringAgent.programStatus = programStatus;
+    store.enqueue([alert(`retirement-${programStatus.kind ?? programStatus.state}`)], { mailboxId: probeMailbox });
+    assert.equal((await service.flushMailbox(probeMailbox, { force: true })).woke, true);
+    assert.equal(fake.state.calls.some(call => call.args[1] === 'close'), false, JSON.stringify(programStatus));
+  }
+
+  retiringAgent.state = 'working';
+  retiringAgent.programStatus = { state: 'idle' };
   store.enqueue([alert('another-item')], { mailboxId: probeMailbox });
   assert.equal((await service.flushMailbox(probeMailbox, { force: true })).woke, true);
   assert.equal(fake.state.calls.some(call => call.args[1] === 'close'), false);
 
-  fake.state.agents[0].state = 'done';
+  retiringAgent.state = 'done';
   store.enqueue([alert('after-retired-finished')], { mailboxId: probeMailbox });
   assert.equal((await service.flushMailbox(probeMailbox, { force: true })).woke, true);
   assert.equal(fake.state.calls.filter(call => call.args[1] === 'close').length, 1);
@@ -5149,8 +5226,10 @@ test('Orca wake verifies the rendered composer and UI draft before sending', asy
   };
   const ready = orcaScreenResult({ source: 'screen', tail: antigravityScreenTail });
   const unavailable = orcaScreenResult({ source: 'screen-unavailable', tail: antigravityScreenTail });
+  const missingPrompt = /Antigravity composer prompt is not ready/;
+  const workspaceBusy = /^Workspace or descendant is busy or unverifiable$/;
   const cases = [
-    { name: 'background preview omits prompt', preview: antigravitySplash, result: ready, reads: 2 },
+    { name: 'background preview omits prompt', preview: antigravitySplash, result: ready, reads: 3 },
     { name: 'stale preview appears to contain a draft', preview: '> already submitted', result: ready },
     { name: 'ready preview takes one screen read', result: ready, reads: 1 },
     { name: 'screen fallback to ready preview', result: unavailable, reads: 1 },
@@ -5166,18 +5245,29 @@ test('Orca wake verifies the rendered composer and UI draft before sending', asy
     { name: 'multiline rendered draft', result: orcaScreenResult({ source: 'screen', tail: ['─────', '> ', 'draft continuation', '─────', 'esc to cancel'] }),
       reason: /Terminal composer has unsent draft/ },
     { name: 'screen unavailable and preview missing prompt', preview: antigravitySplash, result: unavailable,
-      reason: /Antigravity composer prompt is not ready/ },
+      reason: missingPrompt, workspaceReason: workspaceBusy },
     { name: 'legacy flag rejection and preview missing prompt', preview: antigravitySplash, result: unsupportedScreen,
-      reason: /Antigravity composer prompt is not ready/ },
+      reason: missingPrompt, workspaceReason: workspaceBusy },
     { name: 'runtime error', result: { stdout: '{"ok":false,"error":{"code":"runtime_unavailable","message":"Orca daemon disconnected"}}', exitCode: 1 },
       reason: /Orca daemon disconnected/ },
     { name: 'unrelated flag rejection', result: { stdout: '{"ok":false,"error":{"code":"invalid_argument","message":"Unknown flag --terminal; valid flags include --screen"}}' },
       reason: /Unknown flag --terminal/ },
     { name: 'timeout', result: { stdout: '' }, rejected: true, reason: /Screen read timed out/ },
     { name: 'malformed JSON', result: { stdout: '{' }, reason: /JSON/ },
+    { name: 'inferred Antigravity on AskQuestion', inferAgent: true,
+      result: orcaScreenResult({ source: 'screen', tail: ['Choose an option', '❯ Yes', '  No', 'Enter to select'] }),
+      reason: missingPrompt, reads: 1 },
+    { name: 'inferred Antigravity on an empty screen', inferAgent: true,
+      result: orcaScreenResult({ source: 'screen', tail: [] }), reason: missingPrompt, reads: 1 },
+    { name: 'inferred Antigravity with no screen or preview', inferAgent: true, preview: '',
+      result: unavailable, reason: missingPrompt, reads: 1 },
+    { name: 'inferred Antigravity with an unsupported screen flag and no preview', inferAgent: true, preview: '',
+      result: unsupportedScreen, rejected: true, reason: missingPrompt, reads: 1 },
+    { name: 'inferred Antigravity with a stale preview and a ready screen', inferAgent: true, preview: antigravitySplash,
+      result: ready, reads: 3 },
   ];
   for (const target of ['workspace', 'terminal'] as const) {
-    for (const { name, preview = '> ', result, rejected, reason, reads } of cases) {
+    for (const { name, preview = '> ', result, rejected, reason, workspaceReason, reads, inferAgent } of cases) {
       await t.test(`${target}: ${name}`, async t => {
         const root = directory(t);
         const workspacePath = target === 'workspace' ? root : undefined;
@@ -5202,7 +5292,9 @@ test('Orca wake verifies the rendered composer and UI draft before sending', asy
         };
         store.enqueue([alert('screen-composer')], {
           mailboxId,
-          wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: { workspacePath, terminalHandle: terminal.handle, agent: 'antigravity' } },
+          wakeTarget: { driver: 'orca-terminal', coalesceMs: 0, driverConfig: {
+            workspacePath, terminalHandle: terminal.handle, agent: inferAgent ? undefined : 'antigravity',
+          } },
         });
         const service = new WakeupRedriveService({
           store,
@@ -5217,7 +5309,7 @@ test('Orca wake verifies the rendered composer and UI draft before sending', asy
         assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, Boolean(reason));
         assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, undefined);
         if (reason) {
-          assert.match(delivery.reason ?? '', reason);
+          assert.match(delivery.reason ?? '', target === 'workspace' ? workspaceReason ?? reason : reason);
         } else {
           const sent = sendsTo(state.calls, terminal.handle)[0];
           const finalRead = screenReads.at(-1)!;
@@ -6294,6 +6386,30 @@ for (const [connected, reason] of [
     assert.equal(terminalSends(state.calls).length, 0);
   });
 }
+
+test('Orca session recovery ignores a vanished tab’s stale blocked question after its PTY is gone', async t => {
+  const { store, mailboxId, terminal, runner, state, driverConfig } = orcaSessionRecoveryFixture(t);
+  const boundAgent: FakeOrcaAgent = {
+    state: 'done', paneKey: driverConfig.paneKey, hasLivePty: true,
+    programStatus: { state: 'blocked', kind: 'question' },
+  };
+  state.agents = [boundAgent];
+  const { service } = startSlotProbeService(t, store, runner);
+  store.enqueue([alert('recover-stale-question')], { mailboxId });
+  const blocked = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(blocked.woke, false);
+  assert.equal(blocked.reason, 'Bound terminal agent is still active or reattaching');
+  assert.equal(state.created, 0);
+  assert.equal(terminalSends(state.calls).length, 0);
+
+  boundAgent.hasLivePty = false;
+  const resumed = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(resumed.woke, true, resumed.reason);
+  assert.equal(state.created, 1);
+  assert.equal(sendsTo(state.calls, terminal.handle).length, 0);
+  assert.equal(sendsTo(state.calls, 'term-new-1').length, 1);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, driverConfig.sessionId);
+});
 
 test('Orca session recovery defers if the original tab reattaches during descendant inspection', async t => {
   const { workspacePath, store, mailboxId, terminal, runner, state } = orcaSessionRecoveryFixture(t);

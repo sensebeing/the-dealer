@@ -109,6 +109,14 @@ function matchesOrcaAgentIdentity(agentIdentity: unknown, expectedAgent: Support
   return agentIdentity === expectedAgent || (expectedAgent === 'claude' && agentIdentity === 'claude-code');
 }
 
+const QUIESCENT_PROGRAM_STATUS_STATES = new Set(['idle', 'done', 'error']);
+
+function isOrcaAgentBusy(agent: { state?: string; programStatus?: { state?: string } }): boolean {
+  const programState = agent.programStatus?.state;
+  return agent.state !== 'done' ||
+    (typeof programState === 'string' && !QUIESCENT_PROGRAM_STATUS_STATES.has(programState));
+}
+
 /** Select the same reuse candidates for workspace readiness and terminal resolution. */
 function reusableTerminalCandidates(
   terminals: readonly OrcaTerminalRow[],
@@ -138,7 +146,7 @@ function reusableTerminalCandidates(
  * A required live target also verifies its configured agent and Antigravity prompt.
  * A fresh tab has its own composer, and rotation checks the retiring slot's execution activity.
  * Non-excluded descendant worktrees prove execution quiescence with complete agent and
- * terminal inventories, no unverifiable terminals, done agents and connected terminal coverage.
+ * terminal inventories, no unverifiable terminals, quiescent agents and connected terminal coverage.
  */
 export async function checkOrcaWorkspaceIdle(
   runner: CommandRunner,
@@ -163,7 +171,14 @@ export async function checkOrcaWorkspaceIdle(
     liveTerminalCount?: number;
     unverifiableTerminalCount?: number;
     terminalVerdict?: string;
-    agents?: { state?: string; paneKey?: string; parentPaneKey?: string | null; address?: string; hasLivePty?: boolean }[];
+    agents?: {
+      state?: string;
+      programStatus?: { state?: string; kind?: string };
+      paneKey?: string;
+      parentPaneKey?: string | null;
+      address?: string;
+      hasLivePty?: boolean;
+    }[];
   };
   const rows: Workspace[] = inventory.worktrees;
   const rowsById = new Map(rows.map(row => [row.worktreeId, row]));
@@ -233,7 +248,7 @@ export async function checkOrcaWorkspaceIdle(
     }
     const agents = row.agents;
     if (!Array.isArray(agents)) return false;
-    if (row.unverifiableTerminalCount !== 0 || agents.some(agent => agent.state !== 'done')) return false;
+    if (row.unverifiableTerminalCount !== 0 || agents.some(isOrcaAgentBusy)) return false;
     const observableHandles = handles.filter(t => t.orphaned !== true || t.connected);
     if (observableHandles.filter(t => Boolean(t.connected)).length < agents.length) return false;
     for (const id of row.childWorktreeIds ?? []) {
@@ -331,7 +346,7 @@ export async function checkOrcaWorkspaceIdle(
     [...(options?.excludedHandles ?? [])].some(allowedSiblingHandle);
   // The recovery census already checks live PTYs for agents matching the retiring binding.
   const busyAgents = agents.filter(agent =>
-    agent.state !== 'done' && !(verifyAbsentForRecovery && matchesRetiringAgent(agent)),
+    isOrcaAgentBusy(agent) && !(verifyAbsentForRecovery && matchesRetiringAgent(agent)),
   );
   const ownedAgentsBusy = (): boolean =>
     busyAgents.some(agent =>
@@ -648,11 +663,16 @@ async function verifyOrcaTerminalComposerSurface(
     return { idle: false, reason: 'Target agent is not ready in terminal' };
   }
 
-  const evaluateSurface = (surface: unknown): OrcaIdleResult => {
+  const requiresAntigravityPrompt = (surface: string, fromScreen: boolean): boolean =>
+    expectedAgent === 'antigravity' ||
+    (matchesOrcaAgentIdentity(terminal.agentIdentity, 'antigravity') &&
+      (fromScreen || requirePreview === true || surface.trim().length > 0));
+
+  const evaluateSurface = (surface: unknown, fromScreen: boolean): OrcaIdleResult => {
     if (typeof surface !== 'string') {
       return requirePreview ? { idle: false, reason: 'Terminal composer is unverifiable' } : { idle: true };
     }
-    if (expectedAgent === 'antigravity' && !hasOrcaComposerPrompt(surface))
+    if (requiresAntigravityPrompt(surface, fromScreen) && !hasOrcaComposerPrompt(surface))
       return { idle: false, reason: 'Antigravity composer prompt is not ready' };
     if (!isOrcaComposerEmpty(surface, terminal.agentIdentity))
       return { idle: false, reason: 'Terminal composer has unsent draft' };
@@ -661,12 +681,12 @@ async function verifyOrcaTerminalComposerSurface(
 
   const useScreen = options.readScreen ?? (runner === runCommand);
   if (!useScreen || !options.alwaysReadScreen) {
-    const preview = evaluateSurface(terminal.preview);
+    const preview = evaluateSurface(terminal.preview, false);
     if (preview.idle || !useScreen) return preview;
   }
   const screen = await readOrcaTerminalScreen(runner, command, terminal.handle, cwd, signal);
   if (screen.draft?.trim()) return { idle: false, reason: 'Terminal composer has unsent draft' };
-  return evaluateSurface(screen.source === 'screen' ? screen.text : terminal.preview);
+  return screen.source === 'screen' ? evaluateSurface(screen.text, true) : evaluateSurface(terminal.preview, false);
 }
 
 async function checkOrcaTerminalComposer(
