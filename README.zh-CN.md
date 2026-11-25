@@ -179,6 +179,7 @@ dealer setup apply-preset --host orca --mode spawn --project <project-id> --work
 | `dealer send --network local --to member:alice --topic collab.request.v4 --body 'Review this change' --json` | 发送路由消息或协作请求。 |
 | `dealer inbox check --mailbox <id> --json` | 获取待处理邮件并签发投递租约。 |
 | `dealer inbox ack <dlv-id> --mailbox <id> --json` | 确认并结算投递租约。 |
+| `dealer queue unfence --mailbox <id> --json` | 清除邮箱唤醒围栏，有排队邮件且无活跃租约时重新安排唤醒。使用 `--all` 可清除所有邮箱的唤醒围栏。 |
 | `dealer thread show <message-id> --json` | 查看会话历史与反向路由状态。 |
 | `dealer ask` / `dealer reply` / `dealer settle` | 在双向协作线程中追问、回复或结案。 |
 

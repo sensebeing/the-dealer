@@ -661,11 +661,18 @@ WAL coordination files for a read-only connection to a checkpointed database.
 Wake transition events report deferral reason changes, recovery, fences and disarm as single
 JSON lines on stderr.
 
+`dealer queue unfence (--mailbox <id> | --all) [--json]` clears wake fences through the
+daemon or opens the ledger for writes when offline. It resets wake retry state and rearms
+mailboxes that have queued items and no active lease. The result lists the cleared and rearmed
+mailboxes and includes updated queue counts.
+
 A driver persists `beginWakeDelivery` before an external boundary and settles only observed
 sequences. Confirmed delivery may atomically pin its session mailbox and delivered thread routes;
 mail arriving during delivery remains pending. Proven command non-starts and Orca send receipts
 with `accepted: false` back off. Unknown outcomes remain fenced across mail arrivals, forced
-flushes and restarts. Root target terminals verify `tui-idle` readiness, an empty composer, and
+flushes and restarts. A consumer claim, reread, or acknowledgement of an active lease can clear
+that mailbox's wake fence. Pinning a session mailbox preserves its own fence and retry state.
+Root target terminals verify `tui-idle` readiness, an empty composer, and
 the configured agent identity before pointer injection. Antigravity also requires a rendered
 composer prompt when it is the configured agent. Its official mode placeholders count as an empty
 composer even when truncated with an ellipsis in a narrow terminal.
@@ -686,10 +693,11 @@ with `Bound terminal is still live` if the census finds a usable matching tab, i
 a tab owned by another wake target. After checking
 descendant worktrees, the driver checks the bound handle and pane again immediately before
 creating a replacement. A reappearing tab defers creation and can receive the next wakeup
-once it is writable. Orca pointer sends request up to five seconds of submission observation. Observable
-providers must report `turn_started` before the wake settles. Permission and terminal
-incarnation changes leave delivery fenced, as does a provider that cannot confirm delivery to
-the configured agent. Legacy `old-host` receipts retain compatibility.
+once it is writable. Orca pointer sends use `--wait-submit 15` to observe submission for up to
+15 seconds. Observable providers must report `turn_started` for the receipt to confirm the wake.
+An unverified observation keeps the existing fence in place. If the consumer clears the fence
+while Orca waits for the receipt, the observation failure leaves that decision intact.
+Legacy `old-host` receipts retain compatibility.
 Non-excluded descendant worktrees gate parent readiness, rotation and leased-wave quiescence
 through complete inventories, `done` agents and connected terminal coverage. Orca drivers create independent tabs
 for rotation only after the retiring slot's own agent and child worktrees are done. The
