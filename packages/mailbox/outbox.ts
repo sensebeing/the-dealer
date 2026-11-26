@@ -456,8 +456,9 @@ export class OutboxStore {
 
   /**
    * One settlement rule for every mutation: delivered and terminal-failed targets leave the
-   * pending set, a live obligation stays queued while any deliverable target remains, and
-   * staged evidence can be deleted after final delivery has been persisted.
+   * pending set, a live obligation stays queued while any deliverable target remains, retained
+   * uncertainty or remote custody for an undelivered target prevents false delivery settlement
+   * or attachment cleanup, and staged evidence is deleted only after final delivery persists.
    */
   private settleItem(item: OutboxItem): Record<string, string> | undefined {
     normalizeTargets(item);
@@ -465,9 +466,16 @@ export class OutboxStore {
       item.status = 'queued';
       return;
     }
-    if (item.failedNodeIds.length > 0) {
+    const hasUndeliveredUncertainty =
+      item.inDoubtNodeIds.some(nodeId => !item.deliveredReceipts[nodeId]) ||
+      item.relaySpooledNodeIds.some(nodeId => !item.deliveredReceipts[nodeId]);
+    if (item.failedNodeIds.length > 0 || hasUndeliveredUncertainty) {
       item.status = 'failed';
-      // Staged files remain as evidence for every terminal target decision.
+      delete item.unresolvedRoute;
+      if (hasUndeliveredUncertainty) {
+        delete item.unattemptedFailure;
+      }
+      // Staged files remain as evidence for every terminal or unresolved target decision.
       return;
     }
     if (Object.keys(item.deliveredReceipts).length > 0) {
@@ -849,22 +857,14 @@ export class OutboxStore {
           item.approvalPendingNodeIds = undefined;
           delete item.unresolvedRoute;
         }
-        normalizeTargets(item);
-        const hasUnresolvedEvidence =
-          item.inDoubtNodeIds.length > 0 || item.relaySpooledNodeIds.length > 0;
-        if (item.pendingNodeIds.length === 0 && hasUnresolvedEvidence) {
+        scheduleCleanup(item.id, this.settleItem(item));
+        if (item.status === 'queued' && item.pendingNodeIds.length === 0) {
           item.status = 'failed';
           delete item.unresolvedRoute;
           delete item.unattemptedFailure;
           item.lastError = reason;
-        } else {
-          scheduleCleanup(item.id, this.settleItem(item));
-          if (item.status === 'queued' && item.pendingNodeIds.length === 0) {
-            item.status = 'failed';
-            delete item.unresolvedRoute;
-            delete item.unattemptedFailure;
-            item.lastError = reason;
-          }
+        } else if (item.status === 'failed') {
+          item.lastError = reason;
         }
         delete item.activeAttempt;
         item.updatedAt = now;

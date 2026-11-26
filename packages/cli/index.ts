@@ -1,4 +1,4 @@
-import { reconcileCallerOrcaWakeTarget } from '../plugins-orca/index.ts';
+import { normalizeOrcaWorktreeId, reconcileCallerOrcaWakeTarget, sameOrcaWorktreeId } from '../plugins-orca/index.ts';
 import type { CallerOrcaIdentity } from '../plugins-orca/index.ts';
 import { pinOrcaTerminalSessionMailbox } from '../plugins-orca/index.ts';
 import { toMailboxTopicBinding } from './config.ts';
@@ -952,8 +952,7 @@ type CallerOrcaBinding = CallerOrcaIdentity;
 function resolveCallerOrcaBinding(v: Record<string, any>): CallerOrcaBinding | undefined {
   const terminalHandle = typeof v['terminal-handle'] === 'string' && v['terminal-handle'].trim()
     ? v['terminal-handle'].trim() : undefined;
-  const worktreeId = typeof v['worktree-id'] === 'string' && v['worktree-id'].trim()
-    ? v['worktree-id'].trim() : undefined;
+  const worktreeId = normalizeOrcaWorktreeId(typeof v['worktree-id'] === 'string' ? v['worktree-id'] : undefined);
   const explicitPath = typeof v['workspace-path'] === 'string' && v['workspace-path'].trim()
     ? resolve(v['workspace-path'].trim()) : undefined;
   const suffixPath = worktreeId?.includes('::') ? worktreeId.slice(worktreeId.indexOf('::') + 2) : undefined;
@@ -1774,8 +1773,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           callerBinding.mailboxId === boundTopicMailbox ||
           (callerBinding.workspacePath && resolvedTopic.binding.workspacePath &&
             resolve(callerBinding.workspacePath) === resolve(resolvedTopic.binding.workspacePath)) ||
-          (callerBinding.worktreeId && resolvedTopic.binding.worktreeId &&
-            callerBinding.worktreeId === resolvedTopic.binding.worktreeId) ||
+          sameOrcaWorktreeId(callerBinding.worktreeId, resolvedTopic.binding.worktreeId) ||
           (callerBinding.terminalHandle && resolvedTopic.binding.terminalHandle &&
             callerBinding.terminalHandle === resolvedTopic.binding.terminalHandle)
         ),

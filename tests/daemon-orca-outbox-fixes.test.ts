@@ -43,6 +43,7 @@ import {
   createOrcaWakeupDrivers,
   createOrcaWaveExecutorPlugin,
   inspectOrcaWorkspaceTerminal,
+  reconcileCallerOrcaWakeTarget,
   resolveCallerOrcaWakeTargetPatch,
   setOrcaWorkspaceComment,
   spawnOrcaWorkspaceTerminal,
@@ -993,6 +994,157 @@ test('outbox drop preserves uncertainty and remote custody so cancellation canno
   assert.deepEqual(afterPartial.relaySpooledNodeIds, [peerB.nodeId]);
   assert.ok(afterPartial.deliveredReceipts[peerA.nodeId]);
   assert.equal(existsSync(stagedCopy), true, 'staged evidence preserved when uncertainty/custody remains');
+
+  // Case 4: Drop uncertain target B while sibling C remains pending, then C subsequently delivers.
+  const laterSiblingEnv = makeSignedEnvelope(sender, 'msg-drop-then-sibling-delivers');
+  const laterBlobHash = 'c'.repeat(64);
+  const laterQueued = outbox.enqueue({
+    envelope: laterSiblingEnv,
+    pendingNodeIds: [peerB.nodeId, peerC.nodeId],
+    inDoubtNodeIds: [peerB.nodeId],
+    filePaths: { [laterBlobHash]: sourceFile },
+  });
+  const laterStagedCopy = laterQueued.stagedFiles[laterBlobHash];
+  assert.ok(laterStagedCopy && existsSync(laterStagedCopy));
+
+  const droppedB = outbox.drop({ nodeId: peerB.nodeId, reason: 'stop retrying B' });
+  assert.equal(droppedB.updatedCount, 1);
+  assert.equal(outbox.get(laterSiblingEnv.id)?.status, 'queued');
+  assert.deepEqual(outbox.get(laterSiblingEnv.id)?.pendingNodeIds, [peerC.nodeId]);
+  assert.deepEqual(outbox.get(laterSiblingEnv.id)?.inDoubtNodeIds, [peerB.nodeId]);
+
+  const confirmedC = signReceipt(
+    {
+      messageId: laterSiblingEnv.id,
+      networkId: laterSiblingEnv.networkId,
+      fromNodeId: peerC.nodeId,
+      stage: 'dispatched',
+      updatedAt: new Date().toISOString(),
+      executionReceipt: { executor: 'inbox', status: 'accepted', handoff: 'queued', durable: true },
+    },
+    peerC.privateKeyPem,
+  );
+  const settled = outbox.recordAttempt(laterSiblingEnv.id, {
+    deliveredReceipts: { [peerC.nodeId]: confirmedC },
+    pendingNodeIds: [],
+    nextAttemptAt: new Date().toISOString(),
+  });
+  assert.equal(settled?.status, 'failed', 'retained uncertainty for dropped B prevents false delivered settlement');
+  assert.deepEqual(settled?.inDoubtNodeIds, [peerB.nodeId]);
+  assert.ok(settled?.deliveredReceipts[peerC.nodeId]);
+  assert.equal(hasProvenUnattemptedFailure(settled), false);
+  assert.equal(existsSync(laterStagedCopy), true, 'staged evidence retained after sibling delivery when dropped target remained uncertain');
+});
+
+test('canonical Orca worktreeId comparisons treat raw and id:-prefixed forms identically across ownership, transitions, and pending witnesses', t => {
+  const root = makeDir(t, 'dealer-orca-canonical-id-');
+  const workspacePath = join(root, 'ws-canon');
+  mkdirSync(workspacePath, { recursive: true });
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  t.after(() => store.close());
+  const sender = generateNodeKeyPair();
+
+  // 1. Bound with raw worktreeId + active pendingDelivery witness; caller arrives with id:-prefixed form omitting session/pane.
+  const mailboxRaw = 'stream:canon-raw';
+  store.enqueue([makeSignedEnvelope(sender, 'canon-raw-1')], {
+    mailboxId: mailboxRaw,
+    wakeTarget: {
+      driver: 'orca-terminal',
+      completedWaves: 2,
+      driverConfig: {
+        workspacePath,
+        worktreeId: 'wt-canon',
+        terminalHandle: 'term-canon',
+        paneKey: 'tab:leaf',
+        sessionId: 'sess-canon',
+        agent: 'codex',
+      },
+    },
+  });
+  const revBeforeRaw = store.getWakeTarget(mailboxRaw)!.bindingRevision ?? 0;
+  store.beginWakeDelivery(mailboxRaw, revBeforeRaw, { deliveredSequence: 1 });
+  const reconciledFromPrefixed = reconcileCallerOrcaWakeTarget(
+    store,
+    mailboxRaw,
+    {
+      mailboxId: 'worktree:ws-canon',
+      workspacePath,
+      worktreeId: 'id:wt-canon',
+      terminalHandle: 'term-canon',
+    },
+    { requireBoundOwner: true },
+  );
+  assert.ok(reconciledFromPrefixed, 'id:-prefixed caller recognized as legitimate bound owner');
+  assert.equal(reconciledFromPrefixed?.driverConfig?.worktreeId, 'wt-canon');
+  assert.equal(reconciledFromPrefixed?.driverConfig?.sessionId, 'sess-canon');
+  assert.equal(reconciledFromPrefixed?.driverConfig?.paneKey, 'tab:leaf');
+  assert.equal(reconciledFromPrefixed?.completedWaves, 2);
+  assert.equal(reconciledFromPrefixed?.deliveryInDoubt, true);
+  assert.ok(reconciledFromPrefixed?.pendingDelivery, 'pendingDelivery witness preserved');
+
+  // 2. Reverse: bound with legacy id:-prefixed worktreeId + pendingDelivery witness; caller arrives with raw form.
+  const mailboxPrefixed = 'stream:canon-prefixed';
+  store.enqueue([makeSignedEnvelope(sender, 'canon-prefixed-1')], {
+    mailboxId: mailboxPrefixed,
+    wakeTarget: {
+      driver: 'orca-terminal',
+      completedWaves: 1,
+      driverConfig: {
+        workspacePath,
+        worktreeId: 'id:wt-canon',
+        terminalHandle: 'term-canon-2',
+        paneKey: 'tab2:leaf',
+        sessionId: 'sess-canon-2',
+        agent: 'claude',
+      },
+    },
+  });
+  const revBeforePrefixed = store.getWakeTarget(mailboxPrefixed)!.bindingRevision ?? 0;
+  store.beginWakeDelivery(mailboxPrefixed, revBeforePrefixed, { deliveredSequence: 1 });
+  const reconciledFromRaw = reconcileCallerOrcaWakeTarget(
+    store,
+    mailboxPrefixed,
+    {
+      mailboxId: 'worktree:ws-canon',
+      workspacePath,
+      worktreeId: 'wt-canon',
+      terminalHandle: 'term-canon-2',
+    },
+    { requireBoundOwner: true },
+  );
+  assert.ok(reconciledFromRaw, 'raw caller recognized as legitimate bound owner for id:-prefixed target');
+  assert.equal(reconciledFromRaw?.driverConfig?.worktreeId, 'wt-canon');
+  assert.equal(reconciledFromRaw?.driverConfig?.sessionId, 'sess-canon-2');
+  assert.equal(reconciledFromRaw?.driverConfig?.paneKey, 'tab2:leaf');
+  assert.equal(reconciledFromRaw?.completedWaves, 1);
+  assert.equal(reconciledFromRaw?.deliveryInDoubt, true);
+  assert.ok(reconciledFromRaw?.pendingDelivery, 'pendingDelivery witness preserved when normalizing legacy id: prefix');
+
+  // 3. Configured transition between raw and id:-prefixed forms preserves conversation fields.
+  const configMailbox = 'stream:canon-config';
+  store.upsertWakeTarget(configMailbox, {
+    driver: 'orca-terminal',
+    completedWaves: 1,
+    driverConfig: {
+      workspacePath,
+      worktreeId: 'wt-canon',
+      terminalHandle: 'term-cfg',
+      paneKey: 'cfg:leaf',
+      sessionId: 'sess-cfg',
+      agent: 'codex',
+    },
+  });
+  syncOrcaTopicWakeTarget({
+    mailboxId: configMailbox,
+    store,
+    binding: { executor: 'orca-wave', workspacePath, worktreeId: 'id:wt-canon', agent: 'codex' },
+  });
+  const afterConfig = store.getWakeTarget(configMailbox)!;
+  assert.equal(afterConfig.driverConfig?.worktreeId, 'wt-canon');
+  assert.equal(afterConfig.driverConfig?.terminalHandle, 'term-cfg');
+  assert.equal(afterConfig.driverConfig?.sessionId, 'sess-cfg');
+  assert.equal(afterConfig.driverConfig?.paneKey, 'cfg:leaf');
+  assert.equal(afterConfig.completedWaves, 1);
 });
 
 test('Orca identity transitions clear stale worktreeId on rebind without replacement ID and reject mismatched ID/path before probing or launching', async t => {

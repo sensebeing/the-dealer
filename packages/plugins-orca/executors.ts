@@ -19,7 +19,7 @@ import {
 import type { MailboxStore, MailboxEnqueueResult, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import { setOrcaWorkspaceComment, orcaAgent, pickSeaCreatureName } from './workspace.ts';
 import type { SupportedOrcaAgent } from './workspace.ts';
-import { buildOrcaWorktreeSelector, orcaMutationRunner } from './inventories.ts';
+import { buildOrcaWorktreeSelector, normalizeOrcaWorktreeId, orcaMutationRunner } from './inventories.ts';
 import {
   trustAntigravityWorkspace,
   defaultAgentLaunchCommand,
@@ -285,8 +285,8 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
         throw new Error('Orca worktree create returned no path');
       }
       const worktreeIdCandidate = workspace.worktreeId ?? workspace.worktree?.worktreeId ?? workspace.worktree?.id;
-      const worktreeId = typeof worktreeIdCandidate === 'string' && worktreeIdCandidate.trim()
-        ? worktreeIdCandidate.trim()
+      const worktreeId = typeof worktreeIdCandidate === 'string'
+        ? normalizeOrcaWorktreeId(worktreeIdCandidate)
         : undefined;
       issuedNames.add(basename(path).trim().toLowerCase());
       if (interactive && store) {

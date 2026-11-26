@@ -8,8 +8,10 @@ import {
   OrcaWorktreeSelectorAmbiguousError,
   assertOrcaWorktreeBindingMatches,
   buildOrcaWorktreeSelector,
+  normalizeOrcaWorktreeId,
   readOrcaTerminal,
   sameCanonicalOrcaWorkspacePath,
+  sameOrcaWorktreeId,
   checkOrcaWorkspaceIdle,
   closeOrcaWorkspaceTerminal,
   ensureOrcaWorkspace,
@@ -342,7 +344,9 @@ function callerOwnsExplicitOrcaWakeTarget(
   if (existing?.driver !== 'orca-terminal') return false;
   const bound = readOrcaDriverConfig(existing);
   if (!sameCallerWorkspace(bound.workspacePath, caller.workspacePath)) return false;
-  if (caller.worktreeId && bound.worktreeId && caller.worktreeId !== bound.worktreeId) return false;
+  const callerWorktreeId = normalizeOrcaWorktreeId(caller.worktreeId);
+  const boundWorktreeId = normalizeOrcaWorktreeId(bound.worktreeId);
+  if (callerWorktreeId && boundWorktreeId && callerWorktreeId !== boundWorktreeId) return false;
   if (caller.terminalHandle && store && claimedOrcaTerminals(store, id, bound).handles.has(caller.terminalHandle)) return false;
   return Boolean((caller.terminalHandle && bound.terminalHandle === caller.terminalHandle)
     || (caller.paneKey && bound.paneKey === caller.paneKey));
@@ -371,9 +375,11 @@ export function reconcileCallerOrcaWakeTarget(
 function isCallerOrcaIdentitySwitch(
   existing: OrcaTerminalDriverConfig | undefined, caller: Omit<CallerOrcaIdentity, 'mailboxId'>,
 ): boolean {
+  const callerWorktreeId = normalizeOrcaWorktreeId(caller.worktreeId);
+  const existingWorktreeId = normalizeOrcaWorktreeId(existing?.worktreeId);
   return Boolean(
     (caller.workspacePath && existing?.workspacePath && !sameCanonicalOrcaWorkspacePath(existing.workspacePath, caller.workspacePath)) ||
-    (caller.worktreeId && existing?.worktreeId && caller.worktreeId !== existing.worktreeId) ||
+    (callerWorktreeId && existingWorktreeId && callerWorktreeId !== existingWorktreeId) ||
     (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
     (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
     (caller.agent && existing?.agent && caller.agent !== existing.agent) ||
@@ -389,11 +395,13 @@ export function resolveCallerOrcaWakeTargetPatch(
   caller: Omit<CallerOrcaIdentity, 'mailboxId'>,
 ): Partial<WakeTargetState> {
   const existing = snapshot && readOrcaWakeTarget(snapshot);
+  const callerWorktreeId = normalizeOrcaWorktreeId(caller.worktreeId);
+  const existingWorktreeId = normalizeOrcaWorktreeId(existing?.worktreeId);
   const workspaceChanged = Boolean(
     caller.workspacePath && existing?.workspacePath && !sameCanonicalOrcaWorkspacePath(existing.workspacePath, caller.workspacePath),
   );
   const worktreeChanged = Boolean(
-    caller.worktreeId && existing?.worktreeId && caller.worktreeId !== existing.worktreeId,
+    callerWorktreeId && existingWorktreeId && callerWorktreeId !== existingWorktreeId,
   );
   const switchedIdentity = isCallerOrcaIdentitySwitch(existing, caller);
   const nextAgent = switchedIdentity ? caller.agent : (caller.agent ?? existing?.agent);
@@ -408,9 +416,9 @@ export function resolveCallerOrcaWakeTargetPatch(
         ? { workspacePath: undefined }
         : {}),
     ...(workspaceChanged
-      ? { worktreeId: caller.worktreeId }
-      : caller.worktreeId
-        ? { worktreeId: caller.worktreeId }
+      ? { worktreeId: callerWorktreeId }
+      : callerWorktreeId
+        ? { worktreeId: callerWorktreeId }
         : {}),
     ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
     ...(switchedIdentity ? {
@@ -435,7 +443,8 @@ export function resolveConfiguredOrcaWakeTargetPatch(
   },
 ): Partial<WakeTargetState> {
   const existing = snapshot && readOrcaWakeTarget(snapshot);
-  const nextWorktreeId = input.worktreeId?.trim() || undefined;
+  const nextWorktreeId = normalizeOrcaWorktreeId(input.worktreeId);
+  const existingWorktreeId = normalizeOrcaWorktreeId(existing?.worktreeId);
   const commandPatch = input.authoritativeConfig || input.configuredInteractiveCommand !== undefined
     ? { interactiveCommand: input.configuredInteractiveCommand } : {};
   const resumeCommandPatch = input.authoritativeConfig || input.configuredResumeCommand !== undefined
@@ -456,8 +465,8 @@ export function resolveConfiguredOrcaWakeTargetPatch(
     existing.workspacePath === effectiveWorkspacePath ||
     Boolean(existing.workspacePath && effectiveWorkspacePath && sameCanonicalOrcaWorkspacePath(existing.workspacePath, effectiveWorkspacePath))
   );
-  const effectiveWorktreeId = nextWorktreeId ?? (sameWorkspacePath ? existing?.worktreeId : undefined);
-  const sameWorktreeId = effectiveWorktreeId === existing?.worktreeId;
+  const effectiveWorktreeId = nextWorktreeId ?? (sameWorkspacePath ? existingWorktreeId : undefined);
+  const sameWorktreeId = effectiveWorktreeId === existingWorktreeId;
   const sameWorkspace = sameWorkspacePath && sameWorktreeId;
   const handleUnchangedSinceConfig = nextConfiguredHandle !== undefined && nextConfiguredHandle === existing?.configuredTerminalHandle;
   const samePinnedHandle = nextConfiguredHandle === undefined || nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig;
@@ -916,7 +925,10 @@ class OrcaWakeDelivery {
         });
         const workspacePatch: Partial<OrcaRunDriverConfig> = {};
         if (workspace.workspacePath !== target.workspacePath) workspacePatch.workspacePath = workspace.workspacePath;
-        if (workspace.worktreeId && workspace.worktreeId !== target.worktreeId) workspacePatch.worktreeId = workspace.worktreeId;
+        const resolvedWorktreeId = normalizeOrcaWorktreeId(workspace.worktreeId);
+        if (resolvedWorktreeId && !sameOrcaWorktreeId(resolvedWorktreeId, target.worktreeId)) {
+          workspacePatch.worktreeId = resolvedWorktreeId;
+        }
         if (Object.keys(workspacePatch).length > 0) {
           const updated = this.store.updateWakeDriverConfigIfCurrent(mailboxId, target.bindingRevision ?? 0, workspacePatch);
           if (updated.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
@@ -1565,7 +1577,7 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
           orcaCommand: base.orcaCommand,
           agent: base.agent,
           workspacePath: base.workspacePath,
-          worktreeId: base.worktreeId,
+          worktreeId: normalizeOrcaWorktreeId(base.worktreeId),
           repoRoot: base.repoRoot,
           autoCreateWorkspace: base.autoCreateWorkspace,
           interactiveCommand: base.interactiveCommand,
@@ -1586,8 +1598,8 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
           );
           if (typeof terminal?.worktreePath === 'string' && terminal.worktreePath.trim())
             workspacePath = terminal.worktreePath;
-          if (typeof terminal?.worktreeId === 'string' && terminal.worktreeId.trim())
-            worktreeId = terminal.worktreeId.trim();
+          if (typeof terminal?.worktreeId === 'string')
+            worktreeId = normalizeOrcaWorktreeId(terminal.worktreeId);
         } catch {
           // Optional address enrichment only: the delivery-time terminal probe still fails closed.
         }

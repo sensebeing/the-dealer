@@ -17,14 +17,27 @@ interface InventoryProbe {
 
 const probes = new Map<string, InventoryProbe>();
 
+/** Canonical Orca worktree identity: strips optional `id:` prefix while preserving `folder:` / `identity:`. */
+export function normalizeOrcaWorktreeId(worktreeId?: string): string | undefined {
+  const trimmed = worktreeId?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.startsWith('id:') ? trimmed.slice(3).trim() || undefined : trimmed;
+}
+
+export function sameOrcaWorktreeId(a?: string, b?: string): boolean {
+  const canonicalA = normalizeOrcaWorktreeId(a);
+  const canonicalB = normalizeOrcaWorktreeId(b);
+  return canonicalA !== undefined && canonicalA === canonicalB;
+}
+
 /** Single owner of Orca `--worktree` selector formatting across probes and mutations. */
 export function buildOrcaWorktreeSelector(workspacePath: string, worktreeId?: string): string {
-  const trimmedId = worktreeId?.trim();
-  if (trimmedId) {
-    if (/^(?:id|folder|identity):/.test(trimmedId)) {
-      return trimmedId;
+  const canonical = normalizeOrcaWorktreeId(worktreeId);
+  if (canonical) {
+    if (/^(?:folder|identity):/.test(canonical)) {
+      return canonical;
     }
-    return `id:${trimmedId}`;
+    return `id:${canonical}`;
   }
   return `path:${workspacePath}`;
 }
@@ -175,7 +188,7 @@ export function readOrcaTerminalList(
 ): Promise<string> {
   const selector = buildOrcaWorktreeSelector(workspacePath, worktreeId);
   const cacheWorkspace = advisory ? workspaceKey(workspacePath) : undefined;
-  const cacheSelector = advisory ? (worktreeId?.trim() ? selector : `path:${cacheWorkspace}`) : undefined;
+  const cacheSelector = advisory ? (normalizeOrcaWorktreeId(worktreeId) ? selector : `path:${cacheWorkspace}`) : undefined;
   return readInventory(
     runner,
     {
@@ -204,7 +217,7 @@ export function readOrcaTerminalList(
 export function orcaMutationRunner(runner: CommandRunner, workspacePath?: string, worktreeId?: string): CommandRunner {
   if (runner !== runCommand) return runner;
   const workspace = workspacePath === undefined ? undefined : workspaceKey(workspacePath);
-  const selector = worktreeId?.trim() ? buildOrcaWorktreeSelector(workspacePath ?? '', worktreeId) : undefined;
+  const selector = normalizeOrcaWorktreeId(worktreeId) ? buildOrcaWorktreeSelector(workspacePath ?? '', worktreeId) : undefined;
   return async request => {
     const invalidate = () => {
       for (const [key, entry] of probes) {

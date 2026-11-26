@@ -10,17 +10,21 @@ import { CommandNotStartedError, runCommand, checkedCommand, singleLine } from '
 import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import {
   buildOrcaWorktreeSelector,
+  normalizeOrcaWorktreeId,
   OrcaWorktreeSelectorAmbiguousError,
   orcaMutationRunner,
   parseOrcaSelectorAmbiguousError,
   readOrcaTerminalList,
   readOrcaWorktreePs,
+  sameOrcaWorktreeId,
 } from './inventories.ts';
 
 export {
   buildOrcaWorktreeSelector,
+  normalizeOrcaWorktreeId,
   OrcaWorktreeSelectorAmbiguousError,
   parseOrcaSelectorAmbiguousError,
+  sameOrcaWorktreeId,
 };
 
 export function canonicalOrcaWorkspacePath(path: string): string {
@@ -67,9 +71,8 @@ export async function assertOrcaWorktreeBindingMatches(
   signal?: AbortSignal,
   advisory = false,
 ): Promise<void> {
-  const requested = worktreeId.trim();
+  const requested = normalizeOrcaWorktreeId(worktreeId);
   if (!requested) return;
-  const normalized = requested.startsWith('id:') ? requested.slice(3) : requested;
   const inventoryCwd = runner === runCommand && !existsSync(workspacePath) ? undefined : workspacePath;
   const raw = JSON.parse(await readOrcaWorktreePs(runner, command, inventoryCwd, signal, advisory));
   const worktrees = raw?.ok === true && !raw.result?.truncated && Array.isArray(raw.result?.worktrees)
@@ -77,7 +80,7 @@ export async function assertOrcaWorktreeBindingMatches(
     : undefined;
   if (!worktrees) return;
   const row = worktrees.find(
-    item => typeof item?.worktreeId === 'string' && (item.worktreeId === requested || item.worktreeId === normalized),
+    item => typeof item?.worktreeId === 'string' && sameOrcaWorktreeId(item.worktreeId, requested),
   );
   if (!row) return;
   if (typeof row.path !== 'string' || !sameCanonicalOrcaWorkspacePath(row.path, workspacePath)) {
@@ -300,13 +303,11 @@ export async function checkOrcaWorkspaceIdle(
   };
   const rows: Workspace[] = inventory.worktrees;
   const rowsById = new Map(rows.map(row => [row.worktreeId, row]));
-  const requestedWorktreeId = options?.worktreeId?.trim();
-  const normalizedWorktreeId = requestedWorktreeId?.startsWith('id:')
-    ? requestedWorktreeId.slice(3)
-    : requestedWorktreeId;
+  const requestedWorktreeId = normalizeOrcaWorktreeId(options?.worktreeId);
   let root: Workspace | undefined;
   if (requestedWorktreeId) {
-    root = rowsById.get(requestedWorktreeId) ?? (normalizedWorktreeId ? rowsById.get(normalizedWorktreeId) : undefined);
+    root = rowsById.get(requestedWorktreeId) ??
+      rows.find(row => sameOrcaWorktreeId(row.worktreeId, requestedWorktreeId));
     if (root && !sameCanonicalOrcaWorkspacePath(root.path, cwd)) {
       throw new OrcaWorktreeBindingMismatchError(requestedWorktreeId, cwd, root.path);
     }
@@ -1413,7 +1414,7 @@ export async function setOrcaWorkspaceComment(
   comment: string,
   options: { cwd?: string; signal?: AbortSignal; worktreeId?: string } = {},
 ): Promise<void> {
-  const selector = workspacePath || options.worktreeId?.trim()
+  const selector = workspacePath || normalizeOrcaWorktreeId(options.worktreeId)
     ? buildOrcaWorktreeSelector(workspacePath ?? '', options.worktreeId)
     : 'current';
   let output;
@@ -1501,7 +1502,10 @@ function extractOrcaWorktreeId(value: unknown): string | undefined {
   if (!isRecord(value)) return undefined;
   const worktree = isRecord(value.worktree) ? value.worktree : undefined;
   for (const candidate of [value.worktreeId, value.id, worktree?.worktreeId, worktree?.id]) {
-    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    if (typeof candidate === 'string') {
+      const normalized = normalizeOrcaWorktreeId(candidate);
+      if (normalized) return normalized;
+    }
   }
   return undefined;
 }
@@ -1522,13 +1526,9 @@ export async function ensureOrcaWorkspace(
   const cwd = options.repoRoot ?? dirname(options.workspacePath);
   const rows = await readOrcaWorkspaceList(runner, command, cwd, options.signal);
   const targetCanonical = canonicalOrcaWorkspacePath(options.workspacePath);
-  const expectedId = options.worktreeId?.trim();
-  const normalizedExpectedId = expectedId?.startsWith('id:') ? expectedId.slice(3) : expectedId;
+  const expectedId = normalizeOrcaWorktreeId(options.worktreeId);
   if (expectedId) {
-    const byId = rows.find(row => {
-      const rowId = extractOrcaWorktreeId(row);
-      return rowId !== undefined && (rowId === expectedId || rowId === normalizedExpectedId);
-    });
+    const byId = rows.find(row => sameOrcaWorktreeId(extractOrcaWorktreeId(row), expectedId));
     if (byId) {
       if (typeof byId.path !== 'string' || canonicalOrcaWorkspacePath(byId.path) !== targetCanonical) {
         throw new OrcaWorktreeBindingMismatchError(
