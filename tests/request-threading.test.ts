@@ -1492,4 +1492,169 @@ test('Lark session links: inline ready, pending onWakeTarget follow-up, rotation
       '**[ChatGPT App]** Session ready: `codex://threads/actual-spawn-thread-77`',
     );
   }
+
+  // 8. Enqueue B between launch preview and inbox check, ack combined A+B lease before turn/completed,
+  //    while unconsumed C arrives after inbox check: A and B both get S1, C rotates and gets S2.
+  {
+    const dir = join(root, 'post-preview-claim');
+    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let runtimeRef!: DealerNodeRuntime;
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `post-preview-s${count}`,
+      onTurnStart: async (_params, ctx) => {
+        const idx = ctx.session.index - 1;
+        if (idx === 0) {
+          // Enqueue B AFTER launch preview (which only saw A), BEFORE agent calls inbox check.
+          runtimeRef.mailbox.enqueue([envelope('item-b', { kind: 'collab.request.v4' })], { mailboxId: 'stream:post-preview' });
+          const lease = runtimeRef.mailbox.check({ mailboxId: 'stream:post-preview' });
+          assert.equal(lease.items.length, 2, 'combined lease must include both A and post-preview B');
+          runtimeRef.mailbox.ack(lease.deliveryId!, 'stream:post-preview');
+          // Enqueue unconsumed C AFTER inbox check; C stays queued for Wave 2.
+          runtimeRef.mailbox.enqueue([envelope('item-c', { kind: 'collab.request.v4' })], { mailboxId: 'stream:post-preview' });
+        } else {
+          const lease = runtimeRef.mailbox.check({ mailboxId: 'stream:post-preview' });
+          assert.deepEqual(lease.items.map(item => item.id), ['item-c']);
+          runtimeRef.mailbox.ack(lease.deliveryId!, 'stream:post-preview');
+        }
+        started[idx].resolve();
+        await gates[idx].promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'post-preview-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `pp-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': {
+            executor: 'codex',
+            mode: 'wave',
+            streamKey: 'post-preview',
+            rotateAfterWaves: 1,
+            workspacePath: root,
+            notifyLark: true,
+          },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'pp-chat' } },
+      },
+    }).start();
+    runtimeRef = runtime;
+    t.after(async () => {
+      for (const gate of gates) gate.resolve();
+      await runtime.stop();
+    });
+
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Item A',
+      body: 'Launched wave 1',
+      payload: {},
+    });
+    await started[0].promise;
+    await runtime.larkNotifier!.flush();
+    // Roots for A, B, and C all sent while pending (no session links leaked yet).
+    assert.equal(larkCalls.length, 3);
+    assert.ok(larkCalls.every(call => !argument(call, '--markdown').includes('codex://threads/')));
+
+    // Finish Wave 1: A and B were consumed by S1, C stays queued for S2.
+    gates[0].resolve();
+    await started[1].promise;
+    await runtime.larkNotifier!.flush();
+    const s1Replies = larkCalls.filter(
+      call => call.args.includes('--reply-in-thread') && argument(call, '--markdown').includes('post-preview-s1'),
+    );
+    assert.deepEqual(
+      s1Replies.map(call => argument(call, '--message-id')).sort(),
+      ['pp-lark-1', 'pp-lark-2'],
+      'both A and post-preview-claimed B must receive S1 while unconsumed C waits for S2',
+    );
+
+    // Finish Wave 2: C receives S2.
+    gates[1].resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    const s2Replies = larkCalls.filter(
+      call => call.args.includes('--reply-in-thread') && argument(call, '--markdown').includes('post-preview-s2'),
+    );
+    assert.deepEqual(
+      s2Replies.map(call => argument(call, '--message-id')),
+      ['pp-lark-3'],
+      'unconsumed C must receive rotated session S2',
+    );
+  }
+
+  // 9. Catch-up spanning >64 rotations (70 waves) while Lark is offline retains every committed
+  //    session association coordinated with mailbox retention and readLarkConsumedSequence.
+  {
+    const dir = join(root, 'catchup-70-rotations');
+    const larkConfig = { enabled: true, target: { chatId: 'catchup-chat' } };
+    const { mailbox: store } = openStateLedgers(dir, undefined, () => larkConfig);
+    t.after(() => store.close());
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `catchup-s${count}`,
+    });
+    const totalWaves = 70;
+    for (let wave = 1; wave <= totalWaves; wave += 1) {
+      store.enqueue([envelope(`wave-${wave}`)], {
+        mailboxId: 'stream:many-rot',
+        ...(wave === 1
+          ? {
+              wakeTarget: {
+                driver: 'agent-host',
+                rotateAfterWaves: 1,
+                driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+              },
+            }
+          : {}),
+      });
+      await deliverAgentHostWakeTarget(store, runCommand, 'stream:many-rot', { stdioSpawner: fakeCodex.spawner });
+      store.ack(store.check({ mailboxId: 'stream:many-rot' }).deliveryId!, 'stream:many-rot');
+    }
+
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:many-rot'],
+      config: larkConfig,
+      resolveSessionLink: (mailboxId, itemSequence) => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+        itemSequence,
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `cu-lark-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+    await notifier.flush();
+
+    assert.equal(calls.length, totalWaves);
+    assert.ok(
+      argument(calls[0], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/catchup-s1`'),
+      'first wave (>64 rotations ago) must retain its exact S1 link during catch-up',
+    );
+    assert.ok(
+      argument(calls[64], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/catchup-s65`'),
+      '65th wave must retain its exact S65 link',
+    );
+    assert.ok(
+      argument(calls[69], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/catchup-s70`'),
+      '70th wave must retain its exact S70 link',
+    );
+  }
 });

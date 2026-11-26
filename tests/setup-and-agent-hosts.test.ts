@@ -5148,8 +5148,8 @@ test('resolveAgentHostSessionLink and isAgentHostRotationDue enforce host, pendi
     label: 'ChatGPT App',
     url: 'codex://threads/thread-s2',
   });
-  assert.equal(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 1 }), undefined);
-  assert.equal(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 4 }), undefined);
+  assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 1 }), { state: 'unavailable' });
+  assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 4 }), { state: 'unavailable' });
   assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 7 }), { state: 'pending' });
   assert.throws(
     () => readAgentHostDriverConfig({ driverConfig: { deliveredSessions: [{ fromSequence: 3, throughSequence: 1, sessionId: 'bad' }] } }),

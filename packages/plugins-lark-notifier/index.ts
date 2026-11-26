@@ -78,7 +78,15 @@ function notifyStatePath(stateDir: string, config: LarkNotifyConfig): string {
 
 /** Read the committed cursor used for mailbox catch-up, including when the daemon is offline. */
 export function readLarkConsumedSequence(stateDir: string, config?: LarkNotifyConfig): number | undefined {
-  return config?.enabled ? readState(notifyStatePath(stateDir, config)).cursorSequence : undefined;
+  if (!config?.enabled) return undefined;
+  const state = readState(notifyStatePath(stateDir, config));
+  let consumed = state.cursorSequence;
+  for (const root of Object.values(state.threadRoots)) {
+    if (root.awaitingSessionLink === true && root.itemSequence !== undefined) {
+      consumed = Math.min(consumed, root.itemSequence - 1);
+    }
+  }
+  return consumed;
 }
 function prune<T>(entries: Record<string, T>, timestamp: (value: T) => string): Record<string, T> {
   return Object.fromEntries(Object.entries(entries).reverse().sort((a, b) => timestamp(b[1]).localeCompare(timestamp(a[1]))).slice(0, 1024));
@@ -216,7 +224,7 @@ export class LarkMailboxNotifier {
         if (this.stopped) return;
         if (root.awaitingSessionLink !== true || !root.mailboxId) continue;
         const sessionLink = this.options.resolveSessionLink?.(root.mailboxId, root.itemSequence);
-        if (sessionLink === undefined) {
+        if (sessionLink === undefined || sessionLink.state === 'unavailable') {
           const next = structuredClone(this.state);
           if (Object.hasOwn(next.threadRoots, threadId)) {
             delete next.threadRoots[threadId].awaitingSessionLink;

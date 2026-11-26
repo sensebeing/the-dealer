@@ -41,8 +41,6 @@ export interface AgentHostDriverConfig {
   deliveredSessions?: readonly AgentHostDeliveredSession[];
 }
 
-const MAX_DELIVERED_SESSIONS = 64;
-
 export function serializeAgentHostDriverConfig(config: AgentHostDriverConfig): Record<string, unknown> {
   const value = Object.fromEntries(Object.entries(config).filter(([, entry]) => entry !== undefined));
   readAgentHostDriverConfig({ driverConfig: value });
@@ -105,6 +103,7 @@ function appendAgentHostDeliveredSession(
   fromSequence: number,
   throughSequence: number,
   sessionId: string,
+  minRetainedSequence?: number,
 ): AgentHostDeliveredSession[] | undefined {
   const trimmed = sessionId.trim();
   if (!trimmed || throughSequence < 0) return existing ? existing.map(entry => ({ ...entry })) : undefined;
@@ -117,7 +116,13 @@ function appendAgentHostDeliveredSession(
   } else {
     list.push({ fromSequence: normalizedFrom, throughSequence, sessionId: trimmed });
   }
-  return list.length > MAX_DELIVERED_SESSIONS ? list.slice(list.length - MAX_DELIVERED_SESSIONS) : list;
+  if (minRetainedSequence === undefined) {
+    return list;
+  }
+  const retained = list.filter(
+    (entry, index) => index === list.length - 1 || entry.throughSequence >= minRetainedSequence,
+  );
+  return retained;
 }
 
 function minPreviewSequence(
@@ -221,7 +226,7 @@ export function resolveAgentHostSessionLink(
     }
     const maxCommitted = deliveredSessions.reduce((max, entry) => Math.max(max, entry.throughSequence), -1);
     if (options.itemSequence <= maxCommitted) {
-      return undefined;
+      return { state: 'unavailable' };
     }
   }
   // A spawn target always starts a fresh Codex thread via thread/start, even if a configured
@@ -374,15 +379,17 @@ export async function deliverAgentHostWakeTarget(
     const completed = store.completeWakeDelivery(
       mailboxId,
       deliveredSequence,
-      lockedCurrent => {
+      (lockedCurrent, completionContext) => {
         const currentConfig =
           lockedCurrent.driver === 'agent-host' ? readAgentHostDriverConfig(lockedCurrent) : undefined;
+        const consumedThroughSequence = Math.max(deliveredSequence, completionContext.maxConsumedSequence);
         const deliveredSessions = continuation.sessionId
           ? appendAgentHostDeliveredSession(
               currentConfig?.deliveredSessions,
               deliveredFromSequence,
-              deliveredSequence,
+              consumedThroughSequence,
               continuation.sessionId,
+              completionContext.minRetainedSequence,
             )
           : currentConfig?.deliveredSessions;
         const nextDriverConfig = continuation.hostAgent
