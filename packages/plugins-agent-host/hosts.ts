@@ -128,6 +128,7 @@ export function buildAgentHostInvocation(options: {
         args: [
           '--bg',
           ...(mode === 'fixed' ? ['--resume', session!] : ['--name', session!]),
+          '--dangerously-skip-permissions',
           ...(agentProfile ? ['--agent', agentProfile] : []),
           promptText,
         ],

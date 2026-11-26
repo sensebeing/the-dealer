@@ -663,3 +663,205 @@ test('oversized direct frames reject before opening a socket', async t => {
     LocalDeliveryError);
   assert.equal(connect.mock.callCount(), 0);
 });
+
+test('knownCards gossip excludes unreachable peer cards and includes reachable ones', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-gossip-reachable-'));
+  const local = generateNodeKeyPair();
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+    { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local', exchangeIntervalMs: 600_000 }) },
+  ]);
+  t.after(async () => { await kernel.stop(); await rm(dir, { recursive: true, force: true }); });
+  await kernel.start();
+  const transport = kernel.ctx.services.transport as P2PTransportService;
+  const node = kernel.ctx.services.node as PeerDirectoryService;
+  await transport.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+
+  const liveRelay = card('relay', 'us-master', { updatedAt: '2024-01-01T00:00:00.000Z' });
+  const staleGhost = card('diz', 'old-mac', { updatedAt: '2026-01-02T00:00:00.000Z' });
+  deliverPeerCard(kernel, liveRelay);
+  deliverPeerCard(kernel, staleGhost);
+
+  t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) =>
+    networkId === 'team' && nodeId === liveRelay.nodeId,
+  );
+  const broadcasts: Array<{ knownCards?: NodeCard[] }> = [];
+  t.mock.method(transport, 'broadcast', async (_networkId: string, _subTopic: string, frame: Uint8Array) => {
+    broadcasts.push(JSON.parse(Buffer.from(frame).toString('utf8')));
+  });
+
+  await node.updateSelfProfile({ nodeName: 'refreshed' });
+  assert.equal(broadcasts.length, 1);
+  assert.deepEqual(broadcasts[0].knownCards?.map(entry => entry.nodeId), [liveRelay.nodeId]);
+});
+
+test('listPeers onlyAvailable retains offline open+idle peers while isPeerReachable delegates liveness', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-available-reachable-'));
+  const local = generateNodeKeyPair();
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+    { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local', exchangeIntervalMs: 600_000 }) },
+  ]);
+  t.after(async () => { await kernel.stop(); await rm(dir, { recursive: true, force: true }); });
+  await kernel.start();
+  const transport = kernel.ctx.services.transport as P2PTransportService;
+  const node = kernel.ctx.services.node as PeerDirectoryService;
+  await transport.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+
+  const offlineRelease = card('alice', 'offline', {
+    admissionMode: 'open',
+    capabilities: { summary: '', skills: [{ id: 'release', description: '' }] },
+    runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+  });
+  const liveTriage = card('bob', 'online', {
+    admissionMode: 'open',
+    capabilities: { summary: '', skills: [{ id: 'triage', description: '' }] },
+    runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+  });
+  const liveBusy = card('carol', 'busy', {
+    admissionMode: 'open',
+    capabilities: { summary: '', skills: [{ id: 'triage', description: '' }] },
+    runtimeState: { load: 'busy', activeTasks: 2, availableAgents: [] },
+  });
+  deliverPeerCard(kernel, offlineRelease);
+  deliverPeerCard(kernel, liveTriage);
+  deliverPeerCard(kernel, liveBusy);
+
+  t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) =>
+    networkId === 'team' && (nodeId === liveTriage.nodeId || nodeId === liveBusy.nodeId),
+  );
+
+  assert.deepEqual(
+    new Set(node.listPeers({ networkId: 'team', onlyAvailable: true }).map(entry => entry.nodeId)),
+    new Set([offlineRelease.nodeId, liveTriage.nodeId]),
+  );
+  assert.equal(node.isPeerReachable('team', liveTriage.nodeId), true);
+  assert.equal(node.isPeerReachable('team', offlineRelease.nodeId), false);
+});
+
+test('prunePeers removes targeted or unreachable cards, preserves replay/equivocation floors across restart, and persists atomically', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-prune-peers-'));
+  const peersPath = join(dir, 'peers.json');
+  const local = generateNodeKeyPair();
+  const staleTwoKeys = generateNodeKeyPair();
+  const relay = card('relay', 'us-master', { updatedAt: '2024-01-01T00:00:00.000Z' });
+  const staleOne = card('ben', 'old-1', { updatedAt: '2026-01-02T00:00:00.000Z' });
+  const staleTwo = card('diz', 'old-2', { revision: 5, updatedAt: '2026-01-03T00:00:00.000Z' }, staleTwoKeys);
+  const staleTwoRollback = card('diz', 'old-2', { revision: 4, updatedAt: '2026-01-02T00:00:00.000Z' }, staleTwoKeys);
+  const staleTwoEquivocation = card('diz', 'evil-2', { revision: 5, updatedAt: '2026-01-05T00:00:00.000Z' }, staleTwoKeys);
+  const staleTwoFresh = card('diz', 'reborn-2', { revision: 6, updatedAt: '2026-01-06T00:00:00.000Z' }, staleTwoKeys);
+  const otherNetStale = card('loader', 'old-3', { networkId: 'other-team', updatedAt: '2026-01-04T00:00:00.000Z' });
+  await writeFile(peersPath, JSON.stringify({
+    schema: 'the-dealer-peer-directory/v1',
+    cards: [relay, staleOne, staleTwo, otherNetStale],
+  }));
+
+  const kernels: Kernel[] = [];
+  t.after(async () => {
+    await Promise.all(kernels.map(k => k.stop()));
+    await rm(dir, { recursive: true, force: true });
+  });
+  const startNode = async () => {
+    const kernel = new Kernel([
+      { plugin: createTransportPlugin({ localNodeId: local.nodeId, discoveryDir: dir }) },
+      { plugin: createNodePlugin({ keyPair: local, member: 'ben', nodeName: 'local', peersPath, exchangeIntervalMs: 600_000 }) },
+    ]);
+    kernels.push(kernel);
+    await kernel.start();
+    const transport = kernel.ctx.services.transport as P2PTransportService;
+    const node = kernel.ctx.services.node as PeerDirectoryService;
+    await transport.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+    t.mock.method(transport, 'isPeerReachable', (networkId: string, nodeId: string) =>
+      networkId === 'team' && nodeId === relay.nodeId,
+    );
+    return { kernel, transport, node };
+  };
+
+  const readStore = async () => JSON.parse(await readFile(peersPath, 'utf8')) as {
+    cards: NodeCard[];
+    prunedPeers?: Array<{ networkId: string; nodeId: string; revision: number; signature: string }>;
+  };
+  const persistedIds = async () => new Set<string>((await readStore()).cards.map(entry => entry.nodeId));
+
+  const first = await startNode();
+  assert.throws(() => first.node.prunePeers({}), /nodeId|unreachable/);
+  assert.throws(() => first.node.prunePeers({ networkId: 'team' }), /nodeId|unreachable/);
+
+  assert.deepEqual(first.node.prunePeers({ networkId: 'team', nodeId: staleOne.nodeId }), {
+    removedCount: 1,
+    removedNodeIds: [staleOne.nodeId],
+  });
+  assert.deepEqual(await persistedIds(), new Set([relay.nodeId, staleTwo.nodeId, otherNetStale.nodeId]));
+
+  // Combining nodeId + unreachable does not remove a reachable peer and avoids rewriting peers.json.
+  const beforeNoopStat = await stat(peersPath);
+  assert.deepEqual(first.node.prunePeers({ networkId: 'team', nodeId: relay.nodeId, unreachable: true }), {
+    removedCount: 0,
+    removedNodeIds: [],
+  });
+  assert.equal((await stat(peersPath)).ino, beforeNoopStat.ino);
+
+  // Scoped unreachable prune removes staleTwo while keeping reachable old-updatedAt relay and other-team.
+  assert.deepEqual(first.node.prunePeers({ networkId: 'team', unreachable: true }), {
+    removedCount: 1,
+    removedNodeIds: [staleTwo.nodeId],
+  });
+  assert.deepEqual(first.node.listPeers({ networkId: 'team' }).map(entry => entry.nodeId), [relay.nodeId]);
+  assert.deepEqual(first.node.resolveTarget(staleTwo.nodeId, 'team'), []);
+  assert.deepEqual(await persistedIds(), new Set([relay.nodeId, otherNetStale.nodeId]));
+  assert.ok(
+    (await readStore()).prunedPeers?.some(
+      entry =>
+        entry.networkId === 'team' &&
+        entry.nodeId === staleTwo.nodeId &&
+        entry.revision === staleTwo.revision &&
+        entry.signature === staleTwo.signature,
+    ),
+  );
+
+  // Re-pruning an already-pruned peer is a no-op.
+  assert.deepEqual(first.node.prunePeers({ networkId: 'team', nodeId: staleTwo.nodeId }), {
+    removedCount: 0,
+    removedNodeIds: [],
+  });
+
+  // In-memory replay protection: rollback, same-revision replay, and equivocation are all rejected.
+  for (const replay of [staleTwoRollback, staleTwo, staleTwoEquivocation]) {
+    deliverPeerCard(first.kernel, replay);
+  }
+  assert.deepEqual(first.node.listPeers({ networkId: 'team' }).map(entry => entry.nodeId), [relay.nodeId]);
+  assert.deepEqual(first.node.resolveTarget(staleTwo.nodeId, 'team'), []);
+
+  // Restart and verify durable replay/equivocation protection survives restart.
+  await first.kernel.stop();
+  const restarted = await startNode();
+  assert.deepEqual(restarted.node.listPeers({ networkId: 'team' }).map(entry => entry.nodeId), [relay.nodeId]);
+  for (const replay of [staleTwoRollback, staleTwo, staleTwoEquivocation]) {
+    deliverPeerCard(restarted.kernel, replay);
+  }
+  assert.deepEqual(restarted.node.listPeers({ networkId: 'team' }).map(entry => entry.nodeId), [relay.nodeId]);
+  assert.deepEqual(restarted.node.resolveTarget(staleTwo.nodeId, 'team'), []);
+
+  // A strictly newer verified revision from the same key cleanly re-admits the peer and clears its pruned witness.
+  deliverPeerCard(restarted.kernel, staleTwoFresh);
+  assert.deepEqual(restarted.node.resolveTarget(staleTwo.nodeId, 'team'), [staleTwoFresh]);
+  assert.equal(
+    (await readStore()).prunedPeers?.some(entry => entry.nodeId === staleTwo.nodeId) ?? false,
+    false,
+  );
+
+  // Global unreachable prune cleans staleTwoFresh and other-team while preserving reachable relay and self.
+  assert.deepEqual(restarted.node.prunePeers({ unreachable: true }), {
+    removedCount: 2,
+    removedNodeIds: [staleTwoFresh.nodeId, otherNetStale.nodeId].sort(),
+  });
+  assert.deepEqual(await persistedIds(), new Set([relay.nodeId]));
+  assert.equal(restarted.node.getSelfCard('team').nodeId, local.nodeId);
+
+  // Explicit nodeId prune without unreachable removes the specified peer.
+  assert.deepEqual(restarted.node.prunePeers({ nodeId: relay.nodeId }), {
+    removedCount: 1,
+    removedNodeIds: [relay.nodeId],
+  });
+  assert.deepEqual(await persistedIds(), new Set());
+});

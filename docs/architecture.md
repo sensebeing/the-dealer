@@ -284,12 +284,16 @@ export interface NodeService {
   listPeers(filter?: { networkId?: string; member?: string; skillTag?: string; onlyAvailable?: boolean }): readonly NodeCard[];
   /** 支持跨网或指定网解析选择器，如 "sensebeing/member:oliver", "ben.xu@mbp", "skill:prod-release" */
   resolveTarget(selector: string, defaultNetworkId?: string): readonly NodeCard[];
+  /** 向 Transport 委派的只读可达性查询，供 Router 在能力匹配后做可达优先选择 */
+  isPeerReachable?(networkId: string, nodeId: string): boolean;
+  /** 从活跃路由/Gossip 投影中裁剪指定或不可达远端名片，同时保留其 (revision, signature) 防回滚/防分裂见证 */
+  prunePeers?(filter: { networkId?: string; nodeId?: string; unreachable?: boolean }): { removedCount: number; removedNodeIds: string[] };
 }
 ```
 
-- **已验证目录持久化**：配置 `peersPath` 后，每个 `(networkId, nodeId)` 的最新已验签远端名片与本机每网络最后 revision 会原子写入 `peers.json`（临时文件 + `fsync` + `rename` + 父目录 `fsync`，`0600`）。启动时逐张验签，合并同一密钥的重复版本。每张存储的远端名片提供该密钥的 revision 下限，旧版本和同 revision 不同签名的名片会被拒绝。冒用本机 `(member, nodeName)` 的远端名片仍在目录中提供该密钥的 revision 下限，且不参与端点注册、路由或 Gossip。本机只持久化 revision，下一张名片取 `max(持久化/已知 + 1, 当前毫秒时间)`。
-- **名片 Gossip**：`peer.card` 广播可随自身名片携带 `knownCards`（最多 128 张），按下述规则选取各身份的活跃远端名片。接收端逐张验签并按 revision 单调更新目录，启动时从持久化名片恢复同一目录。内容相同的直连心跳只刷新传输端点。新 revision 触发 `node/peer-updated`，实际重连由 Transport 发出 `transport/peer-reachable`。卸载网络时保留已验签远端目录。
-- **节点身份更新与目标解析**：查询按网络为每个 `(member, nodeName)` 选取一张活跃远端名片。优先选可达名片，同等可达性时按更新时间、revision、`nodeId` 依次比较。可达性变化立即影响选择，所有密钥的最新已验签名片仍保留在目录中，供发现和重启后回退。身份选择器优先匹配本机，未挂载的项目范围使用只读本机名片。显式 `ed25519:` 选择器直接查询已挂载网络的密钥目录，支持按原密钥延续会话。`skill:` 优先选择远端。`member:` 匹配多台远端机器时，若有可达机器则只返回可达机器，全部离线时仍返回候选供 outbox 排队。选择器解析和本机名片读取均不写入目录，本机发布维护 `local` 与已挂载网络的名片。
+- **已验证目录持久化与防重放裁剪**：配置 `peersPath` 后，每个 `(networkId, nodeId)` 的权威记录（活跃已验签远端名片，或经 `prunePeers` 裁剪后的 `{ networkId, nodeId, revision, signature }` 防重放见证）与本机每网络最后 revision 会原子写入 `peers.json`（临时文件 + `fsync` + `rename` + 父目录 `fsync`，`0600`）。启动时逐张验签并校验裁剪见证，合并同一密钥的重复版本。每个存储的远端记录（无论活跃或已裁剪）均提供该密钥的 revision 与签名下限：旧版本、同 revision 不同签名的分裂名片，以及已裁剪同 revision 的陈旧重放均会被拒绝，跨重启持续生效；仅当同一密钥发布严格更新的已验签 revision 时才会重新恢复为活跃名片。冒用本机 `(member, nodeName)` 的远端名片仍在目录中提供该密钥的 revision 下限，且不参与端点注册、路由或 Gossip。本机只持久化 revision，下一张名片取 `max(持久化/已知 + 1, 当前毫秒时间)`。
+- **名片 Gossip**：`peer.card` 广播可随自身名片携带 `knownCards`（最多 128 张），仅包含当前经 `transport.isPeerReachable` 判定可达的活跃远端名片，防止离线/过期名片在网络中反复扩散。接收端逐张验签并按 revision 单调更新目录，启动时从持久化记录恢复同一目录。内容相同的直连心跳只刷新传输端点。新 revision 触发 `node/peer-updated`，实际重连由 Transport 发出 `transport/peer-reachable`。卸载网络时保留已验签远端目录。
+- **节点身份更新与目标解析**：查询按网络为每个 `(member, nodeName)` 选取一张活跃远端名片（已裁剪记录不参与查询、路由与 Gossip）。优先选可达名片，同等可达性时按更新时间、revision、`nodeId` 依次比较。可达性变化立即影响选择，所有活跃密钥的最新已验签名片保留在目录中，供发现和重启后回退。`listPeers({ onlyAvailable: true })` 返回全部 `open + idle` 活跃名片，不在能力匹配前丢弃离线专家节点；`router` 在完成能力/技能匹配后，若命中集合中存在可达节点则优先路由到可达节点，全部离线时保留离线匹配候选供 outbox 排队。身份选择器优先匹配本机，未挂载的项目范围使用只读本机名片。显式 `ed25519:` 选择器直接查询已挂载网络的活跃密钥目录，支持按原密钥延续会话。`skill:` 优先选择远端。`member:` 匹配多台远端机器时，若有可达机器则只返回可达机器，全部离线时仍返回候选供 outbox 排队。选择器解析和本机名片读取均不写入目录，本机发布维护 `local` 与已挂载网络的名片。
 
 ---
 

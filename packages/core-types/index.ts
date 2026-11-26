@@ -543,6 +543,12 @@ export interface NodeService {
     onlyAvailable?: boolean;
   }): readonly NodeCard[];
   resolveTarget(selector: string, defaultNetworkId?: string): readonly NodeCard[];
+  isPeerReachable?(networkId: string, nodeId: string): boolean;
+  prunePeers?(filter: {
+    networkId?: string;
+    nodeId?: string;
+    unreachable?: boolean;
+  }): { removedCount: number; removedNodeIds: string[] };
 }
 
 export interface EmitMessageInput<T = Record<string, unknown>> {

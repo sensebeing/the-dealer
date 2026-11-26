@@ -96,6 +96,7 @@ dealer network list --json
 dealer node card --network sensebeing --json
 dealer peers list --network sensebeing --skill ios-crash --status idle --json
 dealer peers resolve member:bob --network sensebeing --json
+dealer peers prune --network sensebeing --unreachable --json
 ```
 
 `node up` starts a detached `dealerd`; commands then use its private Unix

@@ -515,9 +515,11 @@ test('setup invite prompts reuse configured network, encode seeds, and do not mu
     assert.match(result.teammatePrompt, /collab.request.v4/);
     for (const prompt of [result.crossMachinePrompt, result.teammatePrompt]) {
       assert.match(prompt, /https:\/\/github.com\/sensebeing\/the-dealer.git/);
-      assert.ok(prompt.includes('npm install -g git+https://github.com/sensebeing/the-dealer'));
+      assert.ok(!prompt.includes('npm install -g git+https://github.com/sensebeing/the-dealer'));
+      assert.ok(!prompt.includes('npm --prefix ~/the-dealer link'));
+      assert.ok(prompt.includes('~/.local/bin/dealer'));
+      assert.ok(prompt.includes('cd ~/the-dealer && npm link'));
       assert.ok(prompt.includes("npx skills add sensebeing/the-dealer --global --agent '*'"));
-      assert.ok(prompt.includes('npm --prefix ~/the-dealer link'));
       assert.match(prompt, /~\/\.agents\/skills\//);
       assert.match(prompt, /~\/\.claude\/skills\//);
       assert.match(prompt, /the-dealer-setup\/SKILL.md/);
@@ -597,7 +599,12 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
         assert.ok(args.includes('-p'));
       } else if (agent === 'claude-code') {
         assert.equal(call.command, 'claude');
-        assert.deepEqual(args.slice(0, 3), conversationMode === 'spawn' ? ['--bg', '--name', 'session'] : ['--bg', '--resume', 'session']);
+        assert.deepEqual(
+          args.slice(0, 4),
+          conversationMode === 'spawn'
+            ? ['--bg', '--name', 'session', '--dangerously-skip-permissions']
+            : ['--bg', '--resume', 'session', '--dangerously-skip-permissions'],
+        );
       } else if (agent === 'antigravity') {
         assert.equal(call.command, 'agy');
         assert.deepEqual(args.slice(0, 2), ['run', '--dangerously-skip-permissions']);
@@ -1230,7 +1237,14 @@ for (const [name, factory, command] of [
       assert.equal(existsSync(settings), false);
       assert.equal(existsSync(hostSettings) ? readFileSync(hostSettings, 'utf8') : undefined, beforeSettings);
       if (name === 'codex') assert.equal(calls[0].args[0], mode === 'spawn' ? 'exec' : 'queue');
-      if (name === 'claude-code') assert.equal(calls[0].args[1], mode === 'spawn' ? '--name' : '--resume');
+      if (name === 'claude-code') {
+        assert.deepEqual(
+          calls[0].args.slice(0, 4),
+          mode === 'spawn'
+            ? ['--bg', '--name', 'session', '--dangerously-skip-permissions']
+            : ['--bg', '--resume', 'session', '--dangerously-skip-permissions'],
+        );
+      }
       if (name === 'antigravity') {
         // Invalid invocation configuration must fail before trusting the workspace: a
         // pre-effect error cannot leave a settings mutation behind.
@@ -2500,4 +2514,160 @@ test('queued thread addressing uses payload hints without validating execution p
     const inbound = runtime.mailbox.listThreadRecords(result.messageId).find(record => record.direction === 'inbound');
     assert.equal(inbound?.localMailbox, expected === 'task' ? `task:${result.messageId}` : expected);
   }
+});
+
+test('dealer peers prune works through runDealerCli including live daemon RPC', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const runtime = new DealerNodeRuntime({
+    stateDir,
+    member: 'ben',
+    name: 'local',
+    transport: { discoveryDir: join(root, 'discovery') },
+  });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  await runtime.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+  await runtime.serveControl(async argv => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+
+  const makeCard = (member: string, nodeName: string, updatedAt: string) => {
+    const keys = generateNodeKeyPair();
+    return signNodeCard({
+      nodeId: keys.nodeId,
+      networkId: 'team',
+      revision: 1,
+      identity: { member, nodeName },
+      admissionMode: 'open',
+      capabilities: { summary: '', skills: [] },
+      runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+      updatedAt,
+    }, keys.privateKeyPem);
+  };
+  const liveRelay = makeCard('relay', 'us-master', '2024-01-01T00:00:00.000Z');
+  const staleGhost = makeCard('diz', 'old-mac', '2026-01-02T00:00:00.000Z');
+  for (const peerCard of [liveRelay, staleGhost]) {
+    runtime.kernel.ctx.emit('transport/inbound', {
+      networkId: 'team',
+      senderNodeId: peerCard.nodeId,
+      mode: 'unicast',
+      payload: { type: 'peer.card', card: peerCard },
+    });
+  }
+  t.mock.method(runtime.transport, 'isPeerReachable', (networkId: string, nodeId: string) =>
+    networkId === 'team' && nodeId === liveRelay.nodeId,
+  );
+
+  // Reject unscoped prune via live daemon RPC.
+  const errLines: string[] = [];
+  assert.equal(await runDealerCli(['peers', 'prune', '--network', 'team', '--json'], {
+    stateDir,
+    stdout: () => {},
+    stderr: line => errLines.push(line),
+  }), 1);
+  assert.match(errLines.join(''), /nodeId|unreachable/);
+
+  // Prune unreachable peers via live daemon RPC.
+  const pruned = await cli(['peers', 'prune', '--network', 'team', '--unreachable'], stateDir);
+  assert.deepEqual(pruned, { removedCount: 1, removedNodeIds: [staleGhost.nodeId] });
+  const remaining = await cli(['peers', 'list', '--network', 'team'], stateDir);
+  assert.deepEqual(remaining.map((entry: { nodeId: string }) => entry.nodeId), [liveRelay.nodeId]);
+  const persisted = JSON.parse(readFileSync(join(stateDir, 'peers.json'), 'utf8'));
+  assert.deepEqual(persisted.cards.map((entry: { nodeId: string }) => entry.nodeId), [liveRelay.nodeId]);
+
+  // Direct in-process prune by explicit --node.
+  const directOut: string[] = [];
+  assert.equal(await runDealerCli(['peers', 'prune', '--network', 'team', '--node', liveRelay.nodeId, '--json'], {
+    runtime,
+    stdout: line => directOut.push(line),
+  }), 0);
+  assert.deepEqual(JSON.parse(directOut.join('')), { removedCount: 1, removedNodeIds: [liveRelay.nodeId] });
+});
+
+test('mixed-capability routing prefers reachable eligible peers without breaking offline skill outbox queuing', async t => {
+  const root = directory(t);
+  const runtime = new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    member: 'ben',
+    name: 'local',
+    transport: { discoveryDir: join(root, 'discovery'), multicast: false },
+  });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  await runtime.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+
+  const makeSkillCard = (member: string, nodeName: string, skillId: string) => {
+    const keys = generateNodeKeyPair();
+    return signNodeCard({
+      nodeId: keys.nodeId,
+      networkId: 'team',
+      revision: 1,
+      identity: { member, nodeName },
+      admissionMode: 'open',
+      capabilities: { summary: skillId, skills: [{ id: skillId, description: skillId }] },
+      runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+      updatedAt: '2026-01-02T00:00:00.000Z',
+    }, keys.privateKeyPem);
+  };
+  const offlineRelease = makeSkillCard('alice', 'release-box', 'release');
+  const liveTriage = makeSkillCard('bob', 'live-triage', 'triage');
+  const staleTriage = makeSkillCard('ghost', 'stale-triage', 'triage');
+  for (const peerCard of [offlineRelease, liveTriage, staleTriage]) {
+    runtime.kernel.ctx.emit('transport/inbound', {
+      networkId: 'team',
+      senderNodeId: peerCard.nodeId,
+      mode: 'unicast',
+      payload: { type: 'peer.card', card: peerCard },
+    });
+  }
+
+  const reachable = new Set<string>([liveTriage.nodeId]);
+  t.mock.method(runtime.transport, 'isPeerReachable', (networkId: string, nodeId: string) =>
+    networkId === 'team' && reachable.has(nodeId),
+  );
+
+  // 1. Offline specialist for skill:release must still route and durably queue in outbox even when unrelated liveTriage is online.
+  const emitted = await runtime.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'auto', targets: ['skill:release'] },
+    kind: 'collab.request.v1',
+    subject: 'Ship release',
+    body: 'Queue for offline release specialist',
+    payload: {},
+  });
+  assert.equal(emitted.receipts.length, 1);
+  assert.equal(emitted.receipts[0].stage, 'queued');
+  assert.equal(emitted.receipts[0].executionReceipt?.executor, 'outbox');
+  const queued = runtime.listOutbox({ networkId: 'team', status: 'queued' });
+  assert.equal(queued.length, 1);
+  assert.deepEqual(queued[0].pendingNodeIds, [offlineRelease.nodeId]);
+
+  // 2. When multiple peers match skill:triage, reachable liveTriage is chosen over staleTriage without multicast fan-out.
+  const triageEnvelope = signEnvelope({
+    id: 'msg-triage-1',
+    traceId: 'trace-triage-1',
+    networkId: 'team',
+    from: { nodeId: runtime.transport.localNodeId, member: 'ben', nodeName: 'local' },
+    routing: { mode: 'auto', targets: ['skill:triage'] },
+    kind: 'collab.request.v1',
+    priority: 'normal',
+    subject: 'Triage',
+    body: 'Prefer live triage peer',
+    payload: {},
+    attachments: [],
+    createdAt: new Date().toISOString(),
+  }, runtime.node.privateKeyPem);
+  const liveDecision = await runtime.kernel.ctx.services.router.route(triageEnvelope);
+  assert.equal(liveDecision.mode, 'unicast');
+  assert.deepEqual(liveDecision.targetNodeIds, [liveTriage.nodeId]);
+
+  // 3. When all matching triage peers are offline, fallback preserves all eligible offline matches.
+  reachable.clear();
+  const offlineDecision = await runtime.kernel.ctx.services.router.route(triageEnvelope);
+  assert.equal(offlineDecision.mode, 'multicast');
+  assert.deepEqual(new Set(offlineDecision.targetNodeIds), new Set([liveTriage.nodeId, staleTriage.nodeId]));
 });
