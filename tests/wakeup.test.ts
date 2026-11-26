@@ -3898,8 +3898,9 @@ test('a TUI mode placeholder on an empty composer never wedges a bound wave deli
 
   const delivered = await service.flushMailbox('stream:placeholder');
   assert.equal(delivered.woke, true, delivered.reason);
-  // The exact placeholder and Orca's readiness verdict must both agree before delivery.
-  assert.equal(waits.length, 2);
+  // The exact placeholder and Orca's readiness verdict must both agree before delivery
+  // (authoritative probe, standing-worktree sync check, and final pointer check).
+  assert.equal(waits.length, 3);
   for (const wait of waits) {
     assert.deepEqual(wait.args, ['terminal', 'wait', '--terminal', 'term-agy', '--for', 'tui-idle', '--timeout-ms', '1', '--json']);
   }
@@ -7494,8 +7495,9 @@ for (const scenario of ['behind', 'dirty', 'ahead', 'sibling', 'unrelated siblin
     const store = new MailboxStore(join(root, 'mailbox.json'));
     const fake = fakeOrcaWorkspace(workspacePath);
     const gitCalls: CommandRequest[] = [];
-    const bindSibling = (path: string) => store.upsertWakeTarget('stream:alert-wave:2', {
-      driver: 'orca-terminal', driverConfig: { workspacePath: path, terminalHandle: 'sibling' },
+    const bindSibling = (path: string) => store.enqueue([alert('sibling-work')], {
+      mailboxId: 'stream:alert-wave:2',
+      wakeTarget: { driver: 'orca-terminal', coalesceMs: 60_000, driverConfig: { workspacePath: path, terminalHandle: 'sibling' } },
     });
     const { service, errors } = startSlotProbeService(t, store, async request => {
       if (request.command !== 'git') return fake.runner(request);
@@ -7524,9 +7526,15 @@ for (const scenario of ['behind', 'dirty', 'ahead', 'sibling', 'unrelated siblin
         driver: 'orca-terminal', driverConfig: { workspacePath, terminalHandle: 'independent' },
       });
     }
-    if (scenario === 'orca run' || scenario === 'other driver') {
+    if (scenario === 'orca run') {
+      store.enqueue([alert('run-work')], {
+        mailboxId: 'separate-run',
+        wakeTarget: { driver: 'orca-run', coalesceMs: 60_000, driverConfig: { workspacePath, runId: 'run' } },
+      });
+    }
+    if (scenario === 'other driver') {
       store.upsertWakeTarget('separate-run', {
-        driver: scenario === 'orca run' ? 'orca-run' : 'agent-host',
+        driver: 'agent-host',
         driverConfig: { workspacePath, runId: 'run' },
       });
     }
@@ -7542,17 +7550,19 @@ for (const scenario of ['behind', 'dirty', 'ahead', 'sibling', 'unrelated siblin
     assert.equal(git(workspacePath, 'rev-parse', 'HEAD'), shouldUpdate ? newHead : originalHead);
 
     const actions = gitCalls.map(call => call.args[4]);
-    if (shouldUpdate) assert.deepEqual(actions, ['status', 'fetch', 'rev-list', 'rev-list', 'status', 'merge']);
-    if (scenario === 'dirty after fetch' || scenario === 'sibling after fetch' || scenario === 'activity after fetch') {
-      assert.deepEqual(actions, ['status', 'fetch', 'rev-list', 'rev-list', 'status']);
+    if (shouldUpdate) {
+      assert.deepEqual(actions, ['symbolic-ref', 'status', 'symbolic-ref', 'fetch', 'rev-list', 'rev-parse', 'rev-list', 'status', 'merge', 'rev-parse']);
     }
-    if (scenario === 'dirty') assert.deepEqual(actions, ['status']);
-    if (scenario === 'ahead') assert.deepEqual(actions, ['status', 'fetch', 'rev-list']);
+    if (scenario === 'dirty after fetch' || scenario === 'sibling after fetch' || scenario === 'activity after fetch') {
+      assert.deepEqual(actions, ['symbolic-ref', 'status', 'symbolic-ref', 'fetch', 'rev-list', 'rev-parse', 'rev-list', 'status']);
+    }
+    if (scenario === 'dirty') assert.deepEqual(actions, ['symbolic-ref', 'status']);
+    if (scenario === 'ahead') assert.deepEqual(actions, ['symbolic-ref', 'status', 'symbolic-ref', 'fetch', 'rev-list']);
     if (['sibling', 'terminal alias', 'orca run', 'other driver', 'active unclaimed tab'].includes(scenario)) {
       assert.deepEqual(actions, []);
     }
     if (scenario === 'fetch failure') {
-      assert.deepEqual(actions, ['status', 'fetch']);
+      assert.deepEqual(actions, ['symbolic-ref', 'status', 'symbolic-ref', 'fetch']);
       assert.match(String(errors[0]), /git exited/);
     } else {
       assert.deepEqual(errors, []);

@@ -1099,7 +1099,9 @@ class OrcaWakeDelivery {
   /** Git changes affect the whole checkout, including sessions outside this slot's wake scope. */
   private async canSyncStandingWorktree(
     mailboxId: string, target: OrcaWakeTarget, command: string, workspacePath: string, revision: number,
+    ownHandle?: string,
   ): Promise<boolean> {
+    const effectiveHandle = ownHandle ?? target.terminalHandle;
     const ownsWorkspace = () => {
       if (this.store.getWakeTarget(mailboxId)?.bindingRevision !== revision) return false;
       return !this.store.listWakeTargets().some(binding => {
@@ -1110,23 +1112,31 @@ class OrcaWakeDelivery {
           return path ? sameCallerWorkspace(workspacePath, path) : pending;
         }
         if (binding.driver !== 'orca-terminal' && binding.driver !== 'orca-run') return pending;
-        const { workspacePath: path, terminalHandle, paneKey } = readOrcaDriverConfig(binding);
+        const { workspacePath: path, terminalHandle, retiredTerminalHandle, paneKey } = readOrcaDriverConfig(binding);
         if (path && !sameCallerWorkspace(workspacePath, path)) return false;
-        const sharesTab = Boolean(terminalHandle && terminalHandle === target.terminalHandle) ||
+        const sharesTab = Boolean(terminalHandle && terminalHandle === effectiveHandle) ||
           Boolean(paneKey && paneKey === target.paneKey);
-        // Dormant session addresses remain available for thread continuation. Terminal inventory
-        // below detects any retained tab that is still present, including aliases without a path.
-        if (binding.driver === 'orca-terminal' && binding.mailboxId.startsWith('terminal:')) {
-          return pending && (Boolean(path) || sharesTab);
-        }
-        // Without a workspace or coordinator address, an Orca run's scope is unknown.
-        return Boolean(path) || sharesTab || (binding.driver === 'orca-run' && !terminalHandle && !paneKey);
+        const active = pending || Boolean(retiredTerminalHandle?.trim());
+        if (!path && !terminalHandle && !paneKey) return active;
+        return active && (Boolean(path) || sharesTab);
       });
     };
     return ownsWorkspace() && (await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, {
-      exclusiveTerminal: { handle: target.terminalHandle, paneKey: target.paneKey },
+      exclusiveTerminal: { handle: effectiveHandle, paneKey: target.paneKey },
       throwOnProbeError: true,
     })).idle && ownsWorkspace();
+  }
+
+  private async syncStandingWorktree(
+    mailboxId: string, target: OrcaWakeTarget, command: string, workspacePath: string, revision: number,
+    ownHandle?: string,
+  ): Promise<void> {
+    try {
+      await tryFastForwardCleanWorktree(this.runner, workspacePath,
+        () => this.canSyncStandingWorktree(mailboxId, target, command, workspacePath, revision, ownHandle));
+    } catch (error) {
+      this.report(error);
+    }
   }
 
   /** A restored pane can move to a new handle only after its original handle disappears. */
@@ -1190,6 +1200,10 @@ class OrcaWakeDelivery {
     };
     const needsRotation = options.plan.kind === 'rotate';
     let rotated = false;
+    let worktreeSynced = false;
+    const canSyncWorktree = (workspacePath: string | undefined): workspacePath is string =>
+      !worktreeSynced && Boolean(workspacePath) && target.driver === 'orca-terminal' &&
+      target.rotateAfterWaves !== undefined && !this.idleCheck;
 
     if (options.plan.kind !== 'reuse') {
       // Rotation opens a new session tab and retires the replaced tab after launch commits.
@@ -1213,13 +1227,9 @@ class OrcaWakeDelivery {
           return this.defer(mailboxId, target, prior.warning ?? 'Retired terminal close pending before next rotation');
         }
       }
-      if (target.rotateAfterWaves !== undefined && !this.idleCheck) {
-        try {
-          await tryFastForwardCleanWorktree(this.runner, workspacePath,
-            () => this.canSyncStandingWorktree(mailboxId, target, command, workspacePath, activeRevision));
-        } catch (error) {
-          this.report(error);
-        }
+      if (canSyncWorktree(workspacePath)) {
+        worktreeSynced = true;
+        await this.syncStandingWorktree(mailboxId, target, command, workspacePath, activeRevision, target.terminalHandle);
       }
       if (options.plan.kind === 'recover-absent' && await this.boundTerminalReappeared(target, command, workspacePath)) {
         return this.defer(mailboxId, target, 'Bound Orca terminal reappeared before replacement launch');
@@ -1299,6 +1309,10 @@ class OrcaWakeDelivery {
             return this.defer(mailboxId, target, 'Bound Orca terminal reappeared before replacement launch');
           }
         }
+        if (canSyncWorktree(target.workspacePath)) {
+          worktreeSynced = true;
+          await this.syncStandingWorktree(mailboxId, target, command, target.workspacePath, activeRevision, target.terminalHandle);
+        }
         const launched = await launchFencedOrcaWorkspaceTerminal(this.store, this.runner, mailboxId, {
           command,
           workspacePath: target.workspacePath,
@@ -1337,6 +1351,10 @@ class OrcaWakeDelivery {
       const completed = this.store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {}, undefined, activeRevision);
       if (completed.superseded) return { kind: 'noop', reason: 'Wake launch superseded by a newer binding' };
       return { kind: 'noop', reason: 'Nothing new to deliver' };
+    }
+    if (!preview.deliveryId && canSyncWorktree(target.workspacePath)) {
+      worktreeSynced = true;
+      await this.syncStandingWorktree(mailboxId, target, command, target.workspacePath, activeRevision, terminalHandle);
     }
 
     if (target.driver === 'orca-run' && !target.runId) throw new Error('orca-run wake target requires runId');
