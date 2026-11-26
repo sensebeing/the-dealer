@@ -4,8 +4,12 @@ import {
   OrcaTerminalCloseRejectedError,
   OrcaTerminalLaunchRejectedError,
   OrcaTerminalSendRefusedError,
+  OrcaWorktreeBindingMismatchError,
   OrcaWorktreeSelectorAmbiguousError,
+  assertOrcaWorktreeBindingMatches,
+  buildOrcaWorktreeSelector,
   readOrcaTerminal,
+  sameCanonicalOrcaWorkspacePath,
   checkOrcaWorkspaceIdle,
   closeOrcaWorkspaceTerminal,
   ensureOrcaWorkspace,
@@ -338,6 +342,7 @@ function callerOwnsExplicitOrcaWakeTarget(
   if (existing?.driver !== 'orca-terminal') return false;
   const bound = readOrcaDriverConfig(existing);
   if (!sameCallerWorkspace(bound.workspacePath, caller.workspacePath)) return false;
+  if (caller.worktreeId && bound.worktreeId && caller.worktreeId !== bound.worktreeId) return false;
   if (caller.terminalHandle && store && claimedOrcaTerminals(store, id, bound).handles.has(caller.terminalHandle)) return false;
   return Boolean((caller.terminalHandle && bound.terminalHandle === caller.terminalHandle)
     || (caller.paneKey && bound.paneKey === caller.paneKey));
@@ -367,7 +372,8 @@ function isCallerOrcaIdentitySwitch(
   existing: OrcaTerminalDriverConfig | undefined, caller: Omit<CallerOrcaIdentity, 'mailboxId'>,
 ): boolean {
   return Boolean(
-    (caller.workspacePath && existing?.workspacePath && caller.workspacePath !== existing.workspacePath) ||
+    (caller.workspacePath && existing?.workspacePath && !sameCanonicalOrcaWorkspacePath(existing.workspacePath, caller.workspacePath)) ||
+    (caller.worktreeId && existing?.worktreeId && caller.worktreeId !== existing.worktreeId) ||
     (caller.sessionId && existing?.sessionId && caller.sessionId !== existing.sessionId) ||
     (caller.paneKey && existing?.paneKey && caller.paneKey !== existing.paneKey) ||
     (caller.agent && existing?.agent && caller.agent !== existing.agent) ||
@@ -383,6 +389,12 @@ export function resolveCallerOrcaWakeTargetPatch(
   caller: Omit<CallerOrcaIdentity, 'mailboxId'>,
 ): Partial<WakeTargetState> {
   const existing = snapshot && readOrcaWakeTarget(snapshot);
+  const workspaceChanged = Boolean(
+    caller.workspacePath && existing?.workspacePath && !sameCanonicalOrcaWorkspacePath(existing.workspacePath, caller.workspacePath),
+  );
+  const worktreeChanged = Boolean(
+    caller.worktreeId && existing?.worktreeId && caller.worktreeId !== existing.worktreeId,
+  );
   const switchedIdentity = isCallerOrcaIdentitySwitch(existing, caller);
   const nextAgent = switchedIdentity ? caller.agent : (caller.agent ?? existing?.agent);
   const clearLaunchConfig = (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
@@ -390,8 +402,16 @@ export function resolveCallerOrcaWakeTargetPatch(
       interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
   return orcaWakeTargetPatch({
     driver: 'orca-terminal',
-    ...(caller.workspacePath ? { workspacePath: caller.workspacePath } : {}),
-    ...(caller.worktreeId ? { worktreeId: caller.worktreeId } : {}),
+    ...(caller.workspacePath
+      ? { workspacePath: caller.workspacePath }
+      : worktreeChanged
+        ? { workspacePath: undefined }
+        : {}),
+    ...(workspaceChanged
+      ? { worktreeId: caller.worktreeId }
+      : caller.worktreeId
+        ? { worktreeId: caller.worktreeId }
+        : {}),
     ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
     ...(switchedIdentity ? {
       completedWaves: 0, terminalHandle: caller.terminalHandle, paneKey: caller.paneKey, sessionId: caller.sessionId, agent: caller.agent,
@@ -409,12 +429,13 @@ export function resolveCallerOrcaWakeTargetPatch(
 export function resolveConfiguredOrcaWakeTargetPatch(
   snapshot: WakeTargetState | undefined,
   input: {
-    mailboxId?: string; runId?: string; workspacePath?: string; configuredTerminalHandle?: string;
+    mailboxId?: string; runId?: string; workspacePath?: string; worktreeId?: string; configuredTerminalHandle?: string;
     configuredAgent?: SupportedOrcaAgent; configuredSessionId?: string;
     configuredInteractiveCommand?: string; configuredResumeCommand?: string; hasTopicBinding: boolean; authoritativeConfig: boolean;
   },
 ): Partial<WakeTargetState> {
   const existing = snapshot && readOrcaWakeTarget(snapshot);
+  const nextWorktreeId = input.worktreeId?.trim() || undefined;
   const commandPatch = input.authoritativeConfig || input.configuredInteractiveCommand !== undefined
     ? { interactiveCommand: input.configuredInteractiveCommand } : {};
   const resumeCommandPatch = input.authoritativeConfig || input.configuredResumeCommand !== undefined
@@ -424,13 +445,20 @@ export function resolveConfiguredOrcaWakeTargetPatch(
     driver: 'orca-run', completedWaves: 0, retiredSessionId: undefined, terminalHandle: nextConfiguredHandle, paneKey: undefined,
     sessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined,
     retiredTerminalHandle: undefined,
+    worktreeId: input.workspacePath ? nextWorktreeId : undefined,
     ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
     ...commandPatch, ...resumeCommandPatch,
   });
   const nextConfiguredSession = input.configuredSessionId?.trim() || undefined;
   const prevConfiguredSession = existing?.configuredSessionId;
   const effectiveWorkspacePath = input.authoritativeConfig ? input.workspacePath : (input.workspacePath ?? existing?.workspacePath);
-  const sameWorkspace = existing?.driver === 'orca-terminal' && existing.workspacePath === effectiveWorkspacePath;
+  const sameWorkspacePath = existing?.driver === 'orca-terminal' && (
+    existing.workspacePath === effectiveWorkspacePath ||
+    Boolean(existing.workspacePath && effectiveWorkspacePath && sameCanonicalOrcaWorkspacePath(existing.workspacePath, effectiveWorkspacePath))
+  );
+  const effectiveWorktreeId = nextWorktreeId ?? (sameWorkspacePath ? existing?.worktreeId : undefined);
+  const sameWorktreeId = effectiveWorktreeId === existing?.worktreeId;
+  const sameWorkspace = sameWorkspacePath && sameWorktreeId;
   const handleUnchangedSinceConfig = nextConfiguredHandle !== undefined && nextConfiguredHandle === existing?.configuredTerminalHandle;
   const samePinnedHandle = nextConfiguredHandle === undefined || nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig;
   const sameAgent = input.configuredAgent === undefined || existing?.agent === undefined || input.configuredAgent === existing.agent;
@@ -486,6 +514,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
       interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
   return orcaWakeTargetPatch({
     driver: 'orca-terminal', ...identity,
+    worktreeId: effectiveWorktreeId,
     configuredTerminalHandle: input.hasTopicBinding || nextConfiguredHandle !== undefined ? nextConfiguredHandle : existing?.configuredTerminalHandle,
     ...commandPatch, ...resumeCommandPatch,
     ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
@@ -709,7 +738,7 @@ class OrcaWakeDelivery {
       }
       return idle.idle ? { busy: false, ready: true } : { busy: true, ready: false, reason: idle.reason };
     } catch (error) {
-      if (error instanceof OrcaWorktreeSelectorAmbiguousError) {
+      if (error instanceof OrcaWorktreeSelectorAmbiguousError || error instanceof OrcaWorktreeBindingMismatchError) {
         return { busy: true, ready: false, reason: error.message };
       }
       this.report(error);
@@ -741,6 +770,9 @@ class OrcaWakeDelivery {
       }));
     }
     if (!terminalHandle && !paneKey) return unbound;
+    if (worktreeId) {
+      await assertOrcaWorktreeBindingMatches(this.runner, command, workspacePath, worktreeId, undefined, true);
+    }
 
     const presence = await inspectOrcaWorkspaceTerminal(this.runner, command, workspacePath, terminalHandle, undefined, paneKey, true, worktreeId);
     if (presence === 'unusable') {
@@ -833,7 +865,13 @@ class OrcaWakeDelivery {
     if (target.driver !== 'orca-terminal' || !target.workspacePath?.trim() ||
       target.autoCreateWorkspace !== true || !repoRoot?.trim()) return false;
     if (this.runner === runCommand && !existsSync(repoRoot)) return false;
-    await listOrcaWorkspaces(this.runner, command, repoRoot);
+    const rows = await listOrcaWorkspaces(this.runner, command, repoRoot);
+    const matching = rows.filter(
+      row => typeof row?.path === 'string' && sameCanonicalOrcaWorkspacePath(row.path, target.workspacePath!),
+    );
+    if (matching.length > 1) {
+      throw new OrcaWorktreeSelectorAmbiguousError(buildOrcaWorktreeSelector(target.workspacePath));
+    }
     return true;
   }
 
@@ -872,6 +910,7 @@ class OrcaWakeDelivery {
       ) {
         const workspace = await ensureOrcaWorkspace(this.runner, target.orcaCommand ?? this.command, {
           workspacePath: target.workspacePath,
+          worktreeId: target.worktreeId,
           repoRoot: target.repoRoot,
           comment: target.workspaceComment,
         });
@@ -907,7 +946,7 @@ class OrcaWakeDelivery {
       }, revision => { activeRevision = revision; });
     } catch (error) {
       if (error instanceof SettledWakeLaunchError) throw error;
-      if (!deliveryBegun && error instanceof OrcaWorktreeSelectorAmbiguousError) {
+      if (!deliveryBegun && (error instanceof OrcaWorktreeSelectorAmbiguousError || error instanceof OrcaWorktreeBindingMismatchError)) {
         return { kind: 'disarm', reason: error.message, expectedRevision: activeRevision };
       }
       const current = this.store.getWakeTarget(mailboxId);
@@ -978,11 +1017,18 @@ class OrcaWakeDelivery {
     advisory = false,
   ): Promise<WakeupIdleDecision> {
     const command = target.orcaCommand ?? this.command;
+    if (!this.idleCheck && target.workspacePath && target.worktreeId) {
+      await assertOrcaWorktreeBindingMatches(this.runner, command, target.workspacePath, target.worktreeId, undefined, advisory);
+    }
     let plan: OrcaWakePlan;
     try {
       plan = await this.resolveSessionPlan(target, preview, command, dedicatedTab, excludedHandles, advisory);
     } catch (error) {
-      if (error instanceof OrcaWorktreeSelectorAmbiguousError || !target.workspacePath) throw error;
+      if (
+        error instanceof OrcaWorktreeSelectorAmbiguousError ||
+        error instanceof OrcaWorktreeBindingMismatchError ||
+        !target.workspacePath
+      ) throw error;
       // The workspace census can still prove absence when the terminal inventory fails.
       const workspace = await checkOrcaWorkspaceIdle(this.runner, command, target.workspacePath, undefined, {
         worktreeId: target.worktreeId, targetTerminalHandle: null, advisory, throwOnProbeError: advisory,

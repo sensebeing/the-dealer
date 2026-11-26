@@ -800,9 +800,11 @@ export class OutboxStore {
   }
 
   /**
-   * Explicit operator removal of dead pending targets (or an entire queued obligation).
-   * Partially delivered obligations settle to `delivered` and clean staged attachments;
-   * obligations left with no delivered, failed, or pending targets become `failed`.
+   * Explicit operator retry cancellation for pending outbox targets (or an entire queued
+   * obligation). Separates retry cancellation from effect evidence: historical uncertainty
+   * (`inDoubtNodeIds`) and remote custody (`relaySpooledNodeIds`, and promoted
+   * `approvalPendingNodeIds`) are preserved so cancellation can never establish unattempted
+   * status, authorize same-version replacement, or fabricate confirmed delivery.
    */
   drop(filter: OutboxDropFilter): OutboxDropResult {
     const id = filter?.id?.trim() || undefined;
@@ -824,40 +826,43 @@ export class OutboxStore {
         if (item.status !== 'queued' || item.supersededById !== undefined) continue;
         if (id !== undefined && item.id !== id) continue;
         if (networkId !== undefined && item.networkId !== networkId) continue;
-        if (nodeId !== undefined) {
-          const matchesNode =
-            item.pendingNodeIds.includes(nodeId) ||
-            item.inDoubtNodeIds.includes(nodeId) ||
-            item.relaySpooledNodeIds.includes(nodeId) ||
-            Boolean(item.approvalPendingNodeIds?.includes(nodeId));
-          if (!matchesNode) continue;
-        }
+        if (nodeId !== undefined && !item.pendingNodeIds.includes(nodeId)) continue;
         if (hasActiveAttempt(item, nowMs)) {
           skippedActiveIds.push(item.id);
           continue;
         }
         if (nodeId !== undefined) {
           item.pendingNodeIds = item.pendingNodeIds.filter(candidate => candidate !== nodeId);
-          item.inDoubtNodeIds = item.inDoubtNodeIds.filter(candidate => candidate !== nodeId);
-          item.relaySpooledNodeIds = item.relaySpooledNodeIds.filter(candidate => candidate !== nodeId);
-          if (item.approvalPendingNodeIds !== undefined) {
+          if (item.approvalPendingNodeIds?.includes(nodeId)) {
+            if (!item.inDoubtNodeIds.includes(nodeId)) {
+              item.inDoubtNodeIds.push(nodeId);
+            }
             item.approvalPendingNodeIds = item.approvalPendingNodeIds.filter(candidate => candidate !== nodeId);
           }
+        } else {
+          for (const approvalTarget of item.approvalPendingNodeIds ?? []) {
+            if (!item.inDoubtNodeIds.includes(approvalTarget)) {
+              item.inDoubtNodeIds.push(approvalTarget);
+            }
+          }
+          item.pendingNodeIds = [];
+          item.approvalPendingNodeIds = undefined;
+          delete item.unresolvedRoute;
+        }
+        normalizeTargets(item);
+        const hasUnresolvedEvidence =
+          item.inDoubtNodeIds.length > 0 || item.relaySpooledNodeIds.length > 0;
+        if (item.pendingNodeIds.length === 0 && hasUnresolvedEvidence) {
+          item.status = 'failed';
+          delete item.unresolvedRoute;
+          delete item.unattemptedFailure;
+          item.lastError = reason;
+        } else {
           scheduleCleanup(item.id, this.settleItem(item));
           if (item.status === 'queued' && item.pendingNodeIds.length === 0) {
             item.status = 'failed';
             delete item.unresolvedRoute;
-            item.lastError = reason;
-          }
-        } else {
-          item.pendingNodeIds = [];
-          item.inDoubtNodeIds = [];
-          item.relaySpooledNodeIds = [];
-          item.approvalPendingNodeIds = undefined;
-          delete item.unresolvedRoute;
-          scheduleCleanup(item.id, this.settleItem(item));
-          if (item.status === 'queued') {
-            item.status = 'failed';
+            delete item.unattemptedFailure;
             item.lastError = reason;
           }
         }

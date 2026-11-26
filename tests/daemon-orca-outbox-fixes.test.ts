@@ -1,7 +1,7 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,8 @@ import {
   DeliveryTimeoutError,
   PeerUnreachableError,
   generateNodeKeyPair,
+  hasProvenUnattemptedFailure,
+  isUnattemptedOutboxItem,
   markBeforeSendError,
   signEnvelope,
   signNodeCard,
@@ -33,14 +35,18 @@ import {
   attemptDelayMs,
 } from '../packages/mailbox/index.ts';
 import {
+  OrcaWorktreeBindingMismatchError,
   OrcaWorktreeSelectorAmbiguousError,
   buildOrcaWorktreeSelector,
   checkOrcaWorkspaceIdle,
   createOrcaSpawnExecutorPlugin,
   createOrcaWakeupDrivers,
+  createOrcaWaveExecutorPlugin,
   inspectOrcaWorkspaceTerminal,
+  resolveCallerOrcaWakeTargetPatch,
   setOrcaWorkspaceComment,
   spawnOrcaWorkspaceTerminal,
+  syncOrcaTopicWakeTarget,
 } from '../packages/plugins-orca/index.ts';
 import { runCommand } from '../packages/subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../packages/subprocess/index.ts';
@@ -446,21 +452,21 @@ test('Orca selector_ambiguous disarms wake target immediately without deliveryIn
   });
 
   const mailboxId = 'stream:ambiguous';
-  store.enqueue([makeSignedEnvelope(sender, 'ambig-1')], {
-    mailboxId,
-    wakeTarget: {
-      driver: 'orca-terminal',
-      coalesceMs: 0,
-      driverConfig: { workspacePath: sharedPath, terminalHandle: 'term-x' },
-    },
+  store.upsertWakeTarget(mailboxId, {
+    driver: 'orca-terminal',
+    coalesceMs: 0,
+    driverConfig: { workspacePath: sharedPath, terminalHandle: 'term-x' },
   });
 
-  // probeSlot reports busy/not-ready with concise bounded message (no JSON dump).
+  // probeSlot executes OrcaWakeDelivery.probe() and reports busy/not-ready with concise bounded message (no JSON dump).
   const probe = await service.probeSlot(mailboxId);
   assert.equal(probe.busy, true);
   assert.equal(probe.ready, false);
   assert.ok(probe.reason && probe.reason.length <= 200);
+  assert.match(probe.reason!, /ambiguous/i);
   assert.doesNotMatch(probe.reason!, /"candidates"/);
+
+  store.enqueue([makeSignedEnvelope(sender, 'ambig-1')], { mailboxId });
 
   // First flush disarms immediately without setting deliveryInDoubt; mail stays queued.
   const first = await service.flushMailbox(mailboxId, { force: true });
@@ -699,7 +705,7 @@ test('dealer outbox drop settles partially-delivered items, cleans staged files,
   assert.equal(emptyCode, 1);
   assert.match(errLines.join('\n'), /outbox drop requires --id or --node/);
 
-  // 1. Partially delivered obligation with staged attachment file + ghost peer pending & in-doubt.
+  // 1. Partially delivered obligation with staged attachment file + clean offline ghost peer (never sent).
   const stagedSource = join(root, 'attach.txt');
   writeFileSync(stagedSource, 'staged attachment body');
   const blobHash = 'a'.repeat(64);
@@ -718,7 +724,6 @@ test('dealer outbox drop settles partially-delivered items, cleans staged files,
   const partialQueued = runtime.outbox.enqueue({
     envelope: partialEnv,
     pendingNodeIds: [ghostPeer.nodeId],
-    inDoubtNodeIds: [ghostPeer.nodeId],
     deliveredReceipts: { [livePeer.nodeId]: liveReceipt },
     filePaths: { [blobHash]: stagedSource },
     lastError: 'Peer unreachable',
@@ -889,4 +894,429 @@ test('emitter timeout queued receipt reports pending reconciliation wording inst
     offlineEmit.receipts[0].detail,
     `Queued in local outbox for offline peer ${target.nodeId}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// 4. Regression tests for Codex Architecture Review findings
+// ---------------------------------------------------------------------------
+
+test('outbox drop preserves uncertainty and remote custody so cancellation cannot authorize replacement or fabricate delivery', t => {
+  const root = makeDir(t, 'dealer-outbox-drop-evidence-');
+  const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
+  const sender = generateNodeKeyPair();
+  const peerA = generateNodeKeyPair();
+  const peerB = generateNodeKeyPair();
+  const peerC = generateNodeKeyPair();
+
+  // Case 1: Multicast where A has a proven pre-effect failure and B timed out (inDoubt).
+  const mixedTimeoutEnv = makeSignedEnvelope(sender, 'msg-mixed-timeout', { idempotencyKey: 'key-mixed-timeout' });
+  outbox.enqueue({
+    envelope: mixedTimeoutEnv,
+    pendingNodeIds: [peerB.nodeId],
+    inDoubtNodeIds: [peerB.nodeId],
+    failedNodeIds: [peerA.nodeId],
+    unattemptedNodeIds: [peerA.nodeId],
+  });
+  const droppedTimeout = outbox.drop({ nodeId: peerB.nodeId, reason: 'cancel retry B' });
+  assert.equal(droppedTimeout.updatedCount, 1);
+  assert.equal(droppedTimeout.markedFailedCount, 1);
+  const afterTimeout = outbox.get(mixedTimeoutEnv.id)!;
+  assert.equal(afterTimeout.status, 'failed');
+  assert.deepEqual(afterTimeout.pendingNodeIds, []);
+  assert.deepEqual(afterTimeout.inDoubtNodeIds, [peerB.nodeId]);
+  assert.equal(hasProvenUnattemptedFailure(afterTimeout), false);
+  assert.equal(isUnattemptedOutboxItem(afterTimeout), false);
+  // Same-version idempotency replacement MUST be refused while B's outcome is unknown.
+  const replacementEnv = makeSignedEnvelope(sender, 'msg-mixed-timeout-replacement', {
+    idempotencyKey: 'key-mixed-timeout',
+    body: 'retargeted body',
+  });
+  const replaced = outbox.replaceUnattemptedIdempotency({
+    envelope: replacementEnv,
+    expectedId: mixedTimeoutEnv.id,
+    plannedTargetNodeIds: [peerC.nodeId],
+  });
+  assert.equal(replaced?.claimed, false);
+
+  // Case 2: Multicast where A has a proven pre-effect failure and C awaits remote approval.
+  const mixedApprovalEnv = makeSignedEnvelope(sender, 'msg-mixed-approval', { idempotencyKey: 'key-mixed-approval' });
+  outbox.enqueue({
+    envelope: mixedApprovalEnv,
+    pendingNodeIds: [peerC.nodeId],
+    approvalPendingNodeIds: [peerC.nodeId],
+    failedNodeIds: [peerA.nodeId],
+    unattemptedNodeIds: [peerA.nodeId],
+  });
+  outbox.drop({ id: mixedApprovalEnv.id, reason: 'cancel approval retry' });
+  const afterApproval = outbox.get(mixedApprovalEnv.id)!;
+  assert.equal(afterApproval.status, 'failed');
+  assert.deepEqual(afterApproval.pendingNodeIds, []);
+  assert.deepEqual(afterApproval.inDoubtNodeIds, [peerC.nodeId]);
+  assert.equal(hasProvenUnattemptedFailure(afterApproval), false);
+  assert.equal(isUnattemptedOutboxItem(afterApproval), false);
+
+  // Case 3: Live peer A delivered, peer B timed out (inDoubt) or was relay-spooled, with staged file.
+  const sourceFile = join(root, 'evidence.txt');
+  writeFileSync(sourceFile, 'must remain as evidence');
+  const blobHash = 'b'.repeat(64);
+  const partialInDoubtEnv = makeSignedEnvelope(sender, 'msg-partial-indoubt');
+  const confirmedA = signReceipt(
+    {
+      messageId: partialInDoubtEnv.id,
+      networkId: partialInDoubtEnv.networkId,
+      fromNodeId: peerA.nodeId,
+      stage: 'dispatched',
+      updatedAt: new Date().toISOString(),
+      executionReceipt: { executor: 'inbox', status: 'accepted', handoff: 'queued', durable: true },
+    },
+    peerA.privateKeyPem,
+  );
+  const queuedPartial = outbox.enqueue({
+    envelope: partialInDoubtEnv,
+    pendingNodeIds: [peerB.nodeId],
+    inDoubtNodeIds: [peerB.nodeId],
+    relaySpooledNodeIds: [peerB.nodeId],
+    deliveredReceipts: { [peerA.nodeId]: confirmedA },
+    filePaths: { [blobHash]: sourceFile },
+  });
+  const stagedCopy = queuedPartial.stagedFiles[blobHash];
+  assert.ok(stagedCopy && existsSync(stagedCopy));
+
+  const droppedPartial = outbox.drop({ nodeId: peerB.nodeId, reason: 'stop retrying timed-out peer' });
+  assert.equal(droppedPartial.updatedCount, 1);
+  assert.equal(droppedPartial.settledDeliveredCount, 0);
+  assert.equal(droppedPartial.markedFailedCount, 1);
+  const afterPartial = outbox.get(partialInDoubtEnv.id)!;
+  assert.equal(afterPartial.status, 'failed');
+  assert.deepEqual(afterPartial.pendingNodeIds, []);
+  assert.deepEqual(afterPartial.inDoubtNodeIds, [peerB.nodeId]);
+  assert.deepEqual(afterPartial.relaySpooledNodeIds, [peerB.nodeId]);
+  assert.ok(afterPartial.deliveredReceipts[peerA.nodeId]);
+  assert.equal(existsSync(stagedCopy), true, 'staged evidence preserved when uncertainty/custody remains');
+});
+
+test('Orca identity transitions clear stale worktreeId on rebind without replacement ID and reject mismatched ID/path before probing or launching', async t => {
+  const root = makeDir(t, 'dealer-orca-rebind-');
+  const pathA = join(root, 'ws-a');
+  const pathB = join(root, 'ws-b');
+  mkdirSync(pathA, { recursive: true });
+  mkdirSync(pathB, { recursive: true });
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  t.after(() => store.close());
+
+  // 1. Caller transition changing workspacePath without replacement worktreeId clears stale worktreeId.
+  const callerMailbox = 'worktree:caller-rebind';
+  store.upsertWakeTarget(callerMailbox, {
+    driver: 'orca-terminal',
+    driverConfig: { workspacePath: pathA, worktreeId: 'wt-a', terminalHandle: 'term-a' },
+  });
+  const callerPatch = resolveCallerOrcaWakeTargetPatch(store.getWakeTarget(callerMailbox), {
+    workspacePath: pathB,
+    terminalHandle: 'term-b',
+  });
+  const callerUpdated = store.upsertWakeTarget(callerMailbox, callerPatch);
+  assert.equal(callerUpdated.driverConfig?.workspacePath, pathB);
+  assert.equal(callerUpdated.driverConfig?.worktreeId, undefined);
+  assert.equal(callerUpdated.driverConfig?.terminalHandle, 'term-b');
+
+  // 2. Authoritative config sync changing workspacePath without replacement worktreeId clears stale worktreeId.
+  const configMailbox = 'stream:config-rebind';
+  store.upsertWakeTarget(configMailbox, {
+    driver: 'orca-terminal',
+    driverConfig: { workspacePath: pathA, worktreeId: 'wt-a', terminalHandle: 'term-a' },
+  });
+  syncOrcaTopicWakeTarget({
+    mailboxId: configMailbox,
+    store,
+    binding: { executor: 'orca-wave', workspacePath: pathB },
+  });
+  assert.equal(store.getWakeTarget(configMailbox)?.driverConfig?.workspacePath, pathB);
+  assert.equal(store.getWakeTarget(configMailbox)?.driverConfig?.worktreeId, undefined);
+  assert.equal(store.getWakeTarget(configMailbox)?.driverConfig?.terminalHandle, undefined);
+
+  // 3. Wave ingestion path changing workspacePath without replacement worktreeId clears stale worktreeId.
+  const waveMailbox = 'stream:wave-rebind';
+  store.upsertWakeTarget(waveMailbox, {
+    driver: 'orca-terminal',
+    driverConfig: { workspacePath: pathA, worktreeId: 'wt-a', terminalHandle: 'term-a' },
+  });
+  const sender = generateNodeKeyPair();
+  const waveExecutor = createOrcaWaveExecutorPlugin({
+    store,
+    resolveTopicBinding: () => ({ executor: 'orca-wave', mailboxId: waveMailbox, workspacePath: pathB }),
+  });
+  await waveExecutor.execute(
+    [makeSignedEnvelope(sender, 'wave-rebind-1')],
+    { networkId: 'team', nodeId: sender.nodeId, traceId: 'trace-rebind' },
+    {},
+  );
+  assert.equal(store.getWakeTarget(waveMailbox)?.driverConfig?.workspacePath, pathB);
+  assert.equal(store.getWakeTarget(waveMailbox)?.driverConfig?.worktreeId, undefined);
+
+  // 4. An inconsistent persisted (workspacePath, worktreeId) binding is rejected BEFORE terminal probing or launching.
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    const cmd = `${request.args[0]} ${request.args[1]}`;
+    if (cmd === 'worktree ps') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            truncated: false,
+            worktrees: [
+              { path: pathA, worktreeId: 'wt-a', unverifiableTerminalCount: 0, agents: [] },
+              { path: pathB, worktreeId: 'wt-b', unverifiableTerminalCount: 0, agents: [] },
+            ],
+          },
+        }),
+      };
+    }
+    return { stdout: JSON.stringify({ ok: true, result: { terminals: [] } }) };
+  };
+  await assert.rejects(
+    () => checkOrcaWorkspaceIdle(runner, 'orca', pathB, undefined, { worktreeId: 'wt-a' }),
+    OrcaWorktreeBindingMismatchError,
+  );
+  assert.equal(calls.some(c => c.args[0] === 'terminal'), false, 'no terminal commands after mismatch');
+
+  const brokenMailbox = 'stream:broken-binding';
+  store.upsertWakeTarget(brokenMailbox, {
+    driver: 'orca-terminal',
+    coalesceMs: 0,
+    driverConfig: { workspacePath: pathB, worktreeId: 'wt-a', terminalHandle: 'term-a' },
+  });
+  const service = new WakeupRedriveService({
+    store,
+    drivers: [...createOrcaWakeupDrivers({ commandRunner: runner })],
+    flushIntervalMs: 100_000,
+  });
+  t.after(() => service.stop());
+
+  calls.length = 0;
+  const probe = await service.probeSlot(brokenMailbox);
+  assert.equal(probe.busy, true);
+  assert.equal(probe.ready, false);
+  assert.match(probe.reason ?? '', /wt-a/);
+  assert.equal(calls.some(c => c.args[0] === 'terminal'), false, 'probe rejected mismatch before terminal list');
+
+  store.enqueue([makeSignedEnvelope(sender, 'broken-1')], { mailboxId: brokenMailbox });
+  calls.length = 0;
+  const flushed = await service.flushMailbox(brokenMailbox, { force: true });
+  assert.equal(flushed.woke, false);
+  assert.match(flushed.reason ?? '', /wt-a/);
+  assert.equal(store.getWakeTarget(brokenMailbox)?.pendingWake, false);
+  assert.notEqual(store.getWakeTarget(brokenMailbox)?.deliveryInDoubt, true);
+  assert.equal(calls.some(c => c.args[0] === 'terminal'), false, 'flush disarmed mismatch before terminal list/create');
+});
+
+test('Orca workspace recovery rejects duplicate canonical-path matches with OrcaWorktreeSelectorAmbiguousError when persisted worktreeId disappears', async t => {
+  const root = makeDir(t, 'dealer-orca-recover-ambig-');
+  const repoRoot = join(root, 'repo');
+  const sharedPath = join(root, 'shared-ws');
+  mkdirSync(repoRoot, { recursive: true });
+  mkdirSync(sharedPath, { recursive: true });
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const sender = generateNodeKeyPair();
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    const cmd = `${request.args[0]} ${request.args[1]}`;
+    if (cmd === 'worktree ps') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            truncated: false,
+            worktrees: [
+              { path: sharedPath, worktreeId: 'wt-1', unverifiableTerminalCount: 0, agents: [] },
+              { path: sharedPath, worktreeId: 'wt-2', unverifiableTerminalCount: 0, agents: [] },
+            ],
+          },
+        }),
+      };
+    }
+    if (cmd === 'worktree list') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            worktrees: [
+              { id: 'wt-1', path: sharedPath },
+              { id: 'wt-2', path: sharedPath },
+            ],
+          },
+        }),
+      };
+    }
+    return { stdout: JSON.stringify({ ok: true }) };
+  };
+  const service = new WakeupRedriveService({
+    store,
+    drivers: [...createOrcaWakeupDrivers({ commandRunner: runner })],
+    flushIntervalMs: 100_000,
+  });
+  t.after(async () => {
+    await service.stop();
+    store.close();
+  });
+
+  const mailboxId = 'stream:recover-ambig';
+  store.upsertWakeTarget(mailboxId, {
+    driver: 'orca-terminal',
+    coalesceMs: 0,
+    driverConfig: {
+      workspacePath: sharedPath,
+      worktreeId: 'wt-gone',
+      repoRoot,
+      autoCreateWorkspace: true,
+    },
+  });
+
+  const probe = await service.probeSlot(mailboxId);
+  assert.equal(probe.busy, true);
+  assert.equal(probe.ready, false);
+  assert.match(probe.reason ?? '', /ambiguous/i);
+
+  store.enqueue([makeSignedEnvelope(sender, 'recover-ambig-1')], { mailboxId });
+  calls.length = 0;
+  const flushed = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(flushed.woke, false);
+  assert.match(flushed.reason ?? '', /ambiguous/i);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.worktreeId, 'wt-gone', 'did not persist arbitrary sibling ID');
+  assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
+  assert.notEqual(store.getWakeTarget(mailboxId)?.deliveryInDoubt, true);
+  assert.equal(calls.some(c => c.args[0] === 'terminal' && c.args[1] === 'send'), false);
+});
+
+test('standing worktree Git sync blocks when an idle selected worktreeId shares its checkout path with an active same-path sibling workspace', async t => {
+  const root = makeDir(t, 'dealer-orca-sync-sibling-');
+  const upstream = join(root, 'upstream');
+  const standing = join(root, 'standing');
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync('git', ['-C', cwd, '-c', 'core.fsmonitor=false', ...args], { encoding: 'utf8' }).trim();
+  mkdirSync(upstream, { recursive: true });
+  git(upstream, 'init', '--quiet', '--initial-branch=main');
+  git(upstream, 'config', 'user.email', 'test@example.com');
+  git(upstream, 'config', 'user.name', 'Test');
+  writeFileSync(join(upstream, 'README.md'), 'v1\n');
+  git(upstream, 'add', 'README.md');
+  git(upstream, 'commit', '--quiet', '-m', 'v1');
+  execFileSync('git', ['clone', '--quiet', upstream, standing]);
+  const initialSha = git(standing, 'rev-parse', 'HEAD');
+
+  // Advance upstream by one commit.
+  writeFileSync(join(upstream, 'README.md'), 'v2\n');
+  git(upstream, 'add', 'README.md');
+  git(upstream, 'commit', '--quiet', '-m', 'v2');
+  const upstreamSha = git(upstream, 'rev-parse', 'HEAD');
+  assert.notEqual(initialSha, upstreamSha);
+
+  let siblingActive = true;
+  let created = 0;
+  const selectedTerminals = [
+    { handle: 'term-selected', connected: true, writable: true, agentIdentity: 'antigravity', preview: '> ', tabId: 'sel', leafId: 'root' },
+  ];
+  const runner: CommandRunner = async request => {
+    if (request.command === 'git') {
+      return runCommand(request);
+    }
+    const cmd = `${request.args[0]} ${request.args[1]}`;
+    if (cmd === 'worktree ps') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            truncated: false,
+            worktrees: [
+              {
+                path: standing,
+                worktreeId: 'wt-selected',
+                childWorktreeIds: [],
+                unverifiableTerminalCount: 0,
+                agents: [{ state: 'done', paneKey: 'sel:root' }],
+              },
+              {
+                path: standing,
+                worktreeId: 'wt-manual-sibling',
+                childWorktreeIds: [],
+                unverifiableTerminalCount: 0,
+                agents: siblingActive ? [{ state: 'working', hasLivePty: true }] : [],
+              },
+            ],
+          },
+        }),
+      };
+    }
+    if (cmd === 'terminal list') {
+      const sel = request.args[request.args.indexOf('--worktree') + 1];
+      if (sel === 'id:wt-manual-sibling') {
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            result: {
+              terminals: siblingActive
+                ? [{ handle: 'term-manual', connected: true, writable: true, preview: '' }]
+                : [],
+            },
+          }),
+        };
+      }
+      return { stdout: JSON.stringify({ ok: true, result: { terminals: selectedTerminals } }) };
+    }
+    if (cmd === 'terminal create') {
+      created += 1;
+      const handle = `term-rot-${created}`;
+      selectedTerminals.push({ handle, connected: true, writable: true, agentIdentity: 'antigravity', preview: '> ', tabId: handle, leafId: 'root' });
+      return { stdout: JSON.stringify({ ok: true, result: { terminal: { handle } } }) };
+    }
+    if (cmd === 'terminal close') {
+      const h = request.args[request.args.indexOf('--terminal') + 1];
+      const idx = selectedTerminals.findIndex(item => item.handle === h);
+      if (idx >= 0) selectedTerminals.splice(idx, 1);
+      return { stdout: JSON.stringify({ ok: true }) };
+    }
+    return { stdout: JSON.stringify({ ok: true }) };
+  };
+
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const service = new WakeupRedriveService({
+    store,
+    drivers: [...createOrcaWakeupDrivers({ commandRunner: runner })],
+    flushIntervalMs: 100_000,
+  });
+  t.after(async () => {
+    await service.stop();
+    store.close();
+  });
+  const sender = generateNodeKeyPair();
+  const mailboxId = 'stream:standing-sync';
+  store.upsertWakeTarget(mailboxId, {
+    driver: 'orca-terminal',
+    coalesceMs: 0,
+    rotateAfterWaves: 1,
+    completedWaves: 1,
+    driverConfig: {
+      workspacePath: standing,
+      worktreeId: 'wt-selected',
+      terminalHandle: 'term-selected',
+      agent: 'antigravity',
+    },
+  });
+
+  // 1. Active same-path sibling blocks Git sync while terminal delivery on wt-selected still proceeds.
+  store.enqueue([makeSignedEnvelope(sender, 'sync-wave-1')], { mailboxId });
+  const first = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(first.woke, true, first.reason);
+  assert.equal(git(standing, 'rev-parse', 'HEAD'), initialSha, 'Git sync skipped while same-path sibling is active');
+
+  // 2. Once the same-path sibling is quiescent with no open terminals, the next rotation fast-forwards HEAD.
+  siblingActive = false;
+  const lease = store.check({ mailboxId });
+  assert.ok(lease.deliveryId);
+  store.ack(lease.deliveryId, mailboxId);
+  store.enqueue([makeSignedEnvelope(sender, 'sync-wave-2')], { mailboxId });
+  const second = await service.flushMailbox(mailboxId, { force: true });
+  assert.equal(second.woke, true, second.reason);
+  assert.equal(git(standing, 'rev-parse', 'HEAD'), upstreamSha, 'Git sync succeeds once same-path sibling is quiescent');
 });

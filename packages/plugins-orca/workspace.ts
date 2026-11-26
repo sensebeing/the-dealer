@@ -23,6 +23,72 @@ export {
   parseOrcaSelectorAmbiguousError,
 };
 
+export function canonicalOrcaWorkspacePath(path: string): string {
+  const absolute = resolve(path);
+  if (existsSync(absolute)) {
+    try {
+      return realpathSync(absolute);
+    } catch {
+      return absolute;
+    }
+  }
+  const parent = dirname(absolute);
+  return parent === absolute ? absolute : join(canonicalOrcaWorkspacePath(parent), basename(absolute));
+}
+
+export function sameCanonicalOrcaWorkspacePath(a: string, b: string): boolean {
+  return canonicalOrcaWorkspacePath(a) === canonicalOrcaWorkspacePath(b);
+}
+
+export class OrcaWorktreeBindingMismatchError extends Error {
+  readonly worktreeId: string;
+  readonly expectedPath: string;
+  readonly actualPath?: string;
+
+  constructor(worktreeId: string, expectedPath: string, actualPath?: string) {
+    super(
+      actualPath
+        ? `Orca worktreeId ${worktreeId} points to ${actualPath}, not ${expectedPath}`
+        : `Orca worktreeId ${worktreeId} does not match ${expectedPath}`,
+    );
+    this.name = 'OrcaWorktreeBindingMismatchError';
+    this.worktreeId = worktreeId;
+    this.expectedPath = expectedPath;
+    this.actualPath = actualPath;
+  }
+}
+
+/** Verify an explicit worktreeId still refers to the bound workspace path before probing or launching. */
+export async function assertOrcaWorktreeBindingMatches(
+  runner: CommandRunner,
+  command: string,
+  workspacePath: string,
+  worktreeId: string,
+  signal?: AbortSignal,
+  advisory = false,
+): Promise<void> {
+  const requested = worktreeId.trim();
+  if (!requested) return;
+  const normalized = requested.startsWith('id:') ? requested.slice(3) : requested;
+  const inventoryCwd = runner === runCommand && !existsSync(workspacePath) ? undefined : workspacePath;
+  const raw = JSON.parse(await readOrcaWorktreePs(runner, command, inventoryCwd, signal, advisory));
+  const worktrees = raw?.ok === true && !raw.result?.truncated && Array.isArray(raw.result?.worktrees)
+    ? raw.result.worktrees as Array<{ worktreeId?: unknown; path?: unknown }>
+    : undefined;
+  if (!worktrees) return;
+  const row = worktrees.find(
+    item => typeof item?.worktreeId === 'string' && (item.worktreeId === requested || item.worktreeId === normalized),
+  );
+  if (!row) return;
+  if (typeof row.path !== 'string' || !sameCanonicalOrcaWorkspacePath(row.path, workspacePath)) {
+    throw new OrcaWorktreeBindingMismatchError(
+      requested,
+      workspacePath,
+      typeof row.path === 'string' ? row.path : undefined,
+    );
+  }
+}
+
 export async function findOrcaWorktreeByName(
   runner: CommandRunner,
   command: string,
@@ -241,8 +307,11 @@ export async function checkOrcaWorkspaceIdle(
   let root: Workspace | undefined;
   if (requestedWorktreeId) {
     root = rowsById.get(requestedWorktreeId) ?? (normalizedWorktreeId ? rowsById.get(normalizedWorktreeId) : undefined);
+    if (root && !sameCanonicalOrcaWorkspacePath(root.path, cwd)) {
+      throw new OrcaWorktreeBindingMismatchError(requestedWorktreeId, cwd, root.path);
+    }
   } else {
-    const matching = rows.filter(row => row.path === cwd);
+    const matching = rows.filter(row => typeof row.path === 'string' && sameCanonicalOrcaWorkspacePath(row.path, cwd));
     if (matching.length > 1) {
       throw new OrcaWorktreeSelectorAmbiguousError(buildOrcaWorktreeSelector(cwd));
     }
@@ -382,6 +451,28 @@ export async function checkOrcaWorkspaceIdle(
       observableHandles.length > 1 ||
       observableHandles.some(terminal => String(terminal.handle) !== handle && !matchesPane(terminal, paneKey))
     ) return notIdle();
+    // Checkout mutations (Git fetch/merge) affect every Orca workspace sharing the canonical
+    // filesystem path, including manually opened sessions outside mailbox tracking.
+    const samePathSiblings = rows.filter(
+      row => row.worktreeId !== root.worktreeId && typeof row.path === 'string' && sameCanonicalOrcaWorkspacePath(row.path, root.path),
+    );
+    for (const sibling of samePathSiblings) {
+      if (!Array.isArray(sibling.childWorktreeIds) || !Array.isArray(sibling.agents)) return notIdle();
+      if (sibling.unverifiableTerminalCount !== 0) return notIdle();
+      if (sibling.liveTerminalCount !== undefined && sibling.liveTerminalCount > 0) return notIdle();
+      if (sibling.agents.some(agent => isOrcaAgentBusy(agent) || agent.hasLivePty === true)) return notIdle();
+      const siblingHandles = await readWorktreeTerminals(sibling);
+      if (!siblingHandles) {
+        if (options.throwOnProbeError) throw new Error('Incomplete Orca terminal inventory');
+        return notIdle();
+      }
+      const siblingObservable = siblingHandles.filter(terminal => terminal.orphaned !== true || terminal.connected);
+      if (siblingObservable.length > 0) return notIdle();
+      for (const childId of sibling.childWorktreeIds) {
+        const child = rowsById.get(childId);
+        if (!child || !(await isDescendantQuiescent(child))) return notIdle();
+      }
+    }
   }
   const eligibleObservableHandles = observableHandles.filter(canUse);
   const rootTarget = opensTab || missingTargetPane
@@ -1420,6 +1511,7 @@ export async function ensureOrcaWorkspace(
   command: string,
   options: {
     workspacePath: string;
+    worktreeId?: string;
     repoRoot?: string;
     comment?: string;
     trustAntigravity?: boolean;
@@ -1429,17 +1521,35 @@ export async function ensureOrcaWorkspace(
 ): Promise<{ workspacePath: string; worktreeId?: string; created: boolean }> {
   const cwd = options.repoRoot ?? dirname(options.workspacePath);
   const rows = await readOrcaWorkspaceList(runner, command, cwd, options.signal);
-  const canonical = (path: string): string => {
-    const absolute = resolve(path);
-    if (existsSync(absolute)) return realpathSync(absolute);
-    const parent = dirname(absolute);
-    return parent === absolute ? absolute : join(canonical(parent), basename(absolute));
-  };
-  const found = rows.find(
+  const targetCanonical = canonicalOrcaWorkspacePath(options.workspacePath);
+  const expectedId = options.worktreeId?.trim();
+  const normalizedExpectedId = expectedId?.startsWith('id:') ? expectedId.slice(3) : expectedId;
+  if (expectedId) {
+    const byId = rows.find(row => {
+      const rowId = extractOrcaWorktreeId(row);
+      return rowId !== undefined && (rowId === expectedId || rowId === normalizedExpectedId);
+    });
+    if (byId) {
+      if (typeof byId.path !== 'string' || canonicalOrcaWorkspacePath(byId.path) !== targetCanonical) {
+        throw new OrcaWorktreeBindingMismatchError(
+          expectedId,
+          options.workspacePath,
+          typeof byId.path === 'string' ? byId.path : undefined,
+        );
+      }
+      const worktreeId = extractOrcaWorktreeId(byId);
+      return { workspacePath: byId.path, ...(worktreeId ? { worktreeId } : {}), created: false };
+    }
+  }
+  const matching = rows.filter(
     (row): row is OrcaListedWorktree & { path: string } =>
-      typeof row?.path === 'string' && canonical(row.path) === canonical(options.workspacePath),
+      typeof row?.path === 'string' && canonicalOrcaWorkspacePath(row.path) === targetCanonical,
   );
-  if (found) {
+  if (matching.length > 1) {
+    throw new OrcaWorktreeSelectorAmbiguousError(buildOrcaWorktreeSelector(options.workspacePath));
+  }
+  if (matching.length === 1) {
+    const [found] = matching;
     const worktreeId = extractOrcaWorktreeId(found);
     return { workspacePath: found.path, ...(worktreeId ? { worktreeId } : {}), created: false };
   }
@@ -1468,7 +1578,7 @@ export async function ensureOrcaWorkspace(
   const temporaryRoot = tmpdir();
   const mayTrust =
     options.agySettingsPath !== undefined ||
-    (runner === runCommand && (!temporaryRoot || !canonical(path).startsWith(canonical(temporaryRoot))));
+    (runner === runCommand && (!temporaryRoot || !canonicalOrcaWorkspacePath(path).startsWith(canonicalOrcaWorkspacePath(temporaryRoot))));
   if (
     options.trustAntigravity !== false &&
     mayTrust &&

@@ -33,7 +33,7 @@ export function syncOrcaTopicWakeTarget(ctx: {
     runId, pinnedTerminalHandle: terminalHandle,
   });
   const identityPatch = resolveConfiguredOrcaWakeTargetPatch(current, {
-    mailboxId, runId, workspacePath, configuredTerminalHandle: terminalHandle,
+    mailboxId, runId, workspacePath, worktreeId, configuredTerminalHandle: terminalHandle,
     configuredAgent: binding.agent ? orcaAgent(binding.agent) : undefined,
     configuredSessionId: binding.sessionId, configuredInteractiveCommand: interactiveCommand,
     configuredResumeCommand: binding.resumeCommand, hasTopicBinding: true, authoritativeConfig: true,
@@ -44,7 +44,7 @@ export function syncOrcaTopicWakeTarget(ctx: {
     rotateAfterWaves: resolvedRotateAfterWaves,
     driverConfig: {
       ...identityPatch.driverConfig,
-      workspacePath, worktreeId, runId, repoRoot: projectRoot,
+      workspacePath, runId, repoRoot: projectRoot,
       autoCreateWorkspace: resolvedAutoCreateWorkspace, workspaceComment,
     },
   });

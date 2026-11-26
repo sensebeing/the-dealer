@@ -668,7 +668,7 @@ async function prepareOrcaWaveBatch(
       pinnedTerminalHandle: receiverTerminalHandle,
     });
     const identityPatch = resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
-      mailboxId, runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
+      mailboxId, runId, workspacePath: cwd, worktreeId, configuredTerminalHandle: terminalHandle,
       configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
       configuredSessionId: binding?.sessionId,
       configuredInteractiveCommand: binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
@@ -691,7 +691,6 @@ async function prepareOrcaWaveBatch(
         autoCreateWorkspace,
         ...(runId ? { runId } : {}),
         ...(cwd ? { workspacePath: cwd } : {}),
-        ...(worktreeId ? { worktreeId } : {}),
         workspaceComment,
       },
     };
