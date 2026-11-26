@@ -7,6 +7,7 @@ import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packa
 import { runCommand, CommandNotStartedError } from '../packages/subprocess/index.ts';
 import {
   CODEX_AGENT_PROFILE_ERROR,
+  DEFAULT_RPC_TIMEOUT_MS,
   buildAgentHostInvocation,
   deliverAgentHostWakeTarget,
   resolveAgentHostContinuation,
@@ -40,7 +41,7 @@ import {
   Kernel, createTransportPlugin, createNodePlugin, generateNodeKeyPair, deriveNetworkKeys,
   sealNetworkFrame, unsealNetworkFrame, signEnvelope, signNodeCard,
 } from '../packages/index.ts';
-import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, SupportedOrcaAgent } from '../packages/index.ts';
+import type { WakeTargetState, CommandRequest, CommandRunner, MessageEnvelope, StdioProcessSpawner, SupportedOrcaAgent } from '../packages/index.ts';
 
 const context = { networkId: 'test', nodeId: `ed25519:${'a'.repeat(64)}`, traceId: 'test' };
 function message(id = 'test', payload = {}): MessageEnvelope {
@@ -4146,6 +4147,216 @@ test('codex app-server correlates turn/completed strictly by turnId+threadId and
     assert.ok(fake.sessions[0].killedSignals.includes('SIGKILL'));
     // Emitting a late EPIPE on stdin after teardown must not produce an uncaught exception.
     capturedChild?.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+  }
+});
+
+test('codex app-server defaults to 180s RPC timeout and uses single-SIGTERM teardown with post-SIGKILL grace', async t => {
+  assert.equal(DEFAULT_RPC_TIMEOUT_MS, 180_000);
+  const root = directory(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const tickAsync = async (ms: number) => {
+    t.mock.timers.tick(ms);
+    await new Promise(resolve => setImmediate(resolve));
+  };
+
+  // 1. Slow cold startup (>30s thread/start and turn/start) completes cleanly under default 180s RPC timeout.
+  {
+    const threadStartSeen = Promise.withResolvers<() => void>();
+    const turnStartSeen = Promise.withResolvers<() => void>();
+    const fake = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/start') {
+          threadStartSeen.resolve(() => {
+            ctx.session.threadMethod = 'thread/start';
+            ctx.session.threadParams = msg.params;
+            ctx.session.threadId = 'slow-cold-thread';
+            ctx.send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'slow-cold-thread' } } });
+          });
+          return true;
+        }
+        if (msg.method === 'turn/start') {
+          turnStartSeen.resolve(() => {
+            ctx.session.turnId = 'slow-cold-turn';
+            ctx.send({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'slow-cold-turn', status: 'inProgress' } } });
+            ctx.send({
+              jsonrpc: '2.0',
+              method: 'turn/completed',
+              params: { threadId: 'slow-cold-thread', turn: { id: 'slow-cold-turn', status: 'completed' } },
+            });
+          });
+          return true;
+        }
+      },
+    });
+
+    const runPromise = runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      promptText: 'slow cold startup',
+      stdioSpawner: fake.spawner,
+    });
+    const finishThreadStart = await threadStartSeen.promise;
+    await tickAsync(45_000);
+    assert.deepEqual(fake.sessions[0].killedSignals, [], '45s thread/start must not trip default RPC timeout');
+    finishThreadStart();
+
+    const finishTurnStart = await turnStartSeen.promise;
+    await tickAsync(60_000);
+    assert.deepEqual(fake.sessions[0].killedSignals, [], '60s turn/start must not trip default RPC timeout');
+    finishTurnStart();
+
+    const result = await runPromise;
+    assert.equal(result.status, 'completed');
+    assert.equal(result.threadId, 'slow-cold-thread');
+    assert.deepEqual(fake.sessions[0].killedSignals, []);
+  }
+
+  // 2. Wedged turn/start times out at 180s, sends a single SIGTERM, escalates to SIGKILL after 2s,
+  //    and reaps cleanly when SIGKILL exit arrives 500ms later (within 1000ms default post-kill grace).
+  {
+    const turnStartSeen = Promise.withResolvers<void>();
+    let capturedChild: { finish: (code?: number | null, signal?: NodeJS.Signals | null) => void; stopKeepAlive: () => void } | undefined;
+    const fake = createFakeCodexAppServer({
+      ignoreStdinEnd: true,
+      ignoreSigterm: true,
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'turn/start') {
+          capturedChild = ctx.child;
+          turnStartSeen.resolve();
+          return true;
+        }
+      },
+    });
+    let reapTimer: ReturnType<typeof setTimeout> | undefined;
+    const delayedKillSpawner: StdioProcessSpawner = request => {
+      const child = fake.spawner(request);
+      const origKill = child.kill.bind(child);
+      child.kill = signal => {
+        if (signal === 'SIGKILL') {
+          fake.sessions.at(-1)!.killedSignals.push('SIGKILL');
+          reapTimer = setTimeout(() => {
+            capturedChild?.finish(null, 'SIGKILL');
+          }, 500);
+          return true;
+        }
+        return origKill(signal);
+      };
+      return child;
+    };
+    t.after(() => {
+      if (reapTimer) clearTimeout(reapTimer);
+      capturedChild?.stopKeepAlive();
+    });
+
+    let settledError: unknown;
+    const runPromise = runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      promptText: 'wedged turn start',
+      stdioSpawner: delayedKillSpawner,
+    }).catch(error => {
+      settledError = error;
+    });
+
+    await turnStartSeen.promise;
+    await tickAsync(179_999);
+    assert.equal(settledError, undefined);
+    assert.deepEqual(fake.sessions[0].killedSignals, []);
+
+    // Hit 180_000ms RPC timeout: must send exactly ONE SIGTERM via finally -> teardownChild('terminate').
+    await tickAsync(1);
+    assert.deepEqual(fake.sessions[0].killedSignals, ['SIGTERM']);
+
+    // Hit 2_000ms killGraceMs: escalates to SIGKILL without duplicate SIGTERM.
+    await tickAsync(2_000);
+    assert.deepEqual(fake.sessions[0].killedSignals, ['SIGTERM', 'SIGKILL']);
+
+    // Child exits 500ms after SIGKILL (past old 100ms window, inside new 1000ms postKillGraceMs).
+    await tickAsync(500);
+    await runPromise;
+    assert.ok(settledError instanceof Error && !(settledError instanceof CommandNotStartedError));
+    assert.match(settledError.message, /turn\/start timed out after 180000ms/);
+    assert.doesNotMatch(settledError.message, /failed to terminate within bounded teardown/);
+    assert.deepEqual(fake.sessions[0].killedSignals, ['SIGTERM', 'SIGKILL']);
+  }
+
+  // 3. Unkillable children report accurate bounded teardown windows for terminate (killGraceMs + postKillGraceMs)
+  //    and graceful (closeGraceMs + killGraceMs + postKillGraceMs) with a single SIGTERM.
+  {
+    const makeUnkillableSpawner = (fake: ReturnType<typeof createFakeCodexAppServer>): StdioProcessSpawner => {
+      return request => {
+        const child = fake.spawner(request);
+        const origKill = child.kill.bind(child);
+        t.after(() => origKill('SIGKILL'));
+        child.kill = signal => {
+          fake.sessions.at(-1)!.killedSignals.push(signal);
+          return true;
+        };
+        return child;
+      };
+    };
+
+    // 3a. Terminate teardown on RPC timeout: killGraceMs=40 -> postKillGraceMs=100 -> 140ms.
+    const initSeen = Promise.withResolvers<void>();
+    const timeoutFake = createFakeCodexAppServer({
+      ignoreStdinEnd: true,
+      ignoreSigterm: true,
+      onMessage: msg => {
+        if (msg.method === 'initialize') {
+          initSeen.resolve();
+          return true;
+        }
+      },
+    });
+    let timeoutError: unknown;
+    const timeoutRun = runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      promptText: 'unkillable on timeout',
+      stdioSpawner: makeUnkillableSpawner(timeoutFake),
+      rpcTimeoutMs: 40,
+      killGraceMs: 40,
+    }).catch(error => {
+      timeoutError = error;
+    });
+    await initSeen.promise;
+    await tickAsync(40);
+    assert.deepEqual(timeoutFake.sessions[0].killedSignals, ['SIGTERM']);
+    await tickAsync(40);
+    assert.deepEqual(timeoutFake.sessions[0].killedSignals, ['SIGTERM', 'SIGKILL']);
+    await tickAsync(100);
+    await timeoutRun;
+    assert.ok(timeoutError instanceof CommandNotStartedError);
+    assert.match(timeoutError.message, /initialize timed out after 40ms/);
+    assert.match(timeoutError.message, /failed to terminate within bounded teardown \(140ms\)/);
+    assert.deepEqual(timeoutFake.sessions[0].killedSignals, ['SIGTERM', 'SIGKILL']);
+
+    // 3b. Graceful teardown after turn/completed: closeGraceMs=30, killGraceMs=40 -> postKillGraceMs=100 -> 170ms.
+    const gracefulFake = createFakeCodexAppServer({
+      ignoreStdinEnd: true,
+      ignoreSigterm: true,
+    });
+    let gracefulError: unknown;
+    const gracefulRun = runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      promptText: 'unkillable on graceful close',
+      stdioSpawner: makeUnkillableSpawner(gracefulFake),
+      closeGraceMs: 30,
+      killGraceMs: 40,
+    }).catch(error => {
+      gracefulError = error;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    await tickAsync(30);
+    assert.deepEqual(gracefulFake.sessions[0].killedSignals, ['SIGTERM']);
+    await tickAsync(40);
+    assert.deepEqual(gracefulFake.sessions[0].killedSignals, ['SIGTERM', 'SIGKILL']);
+    await tickAsync(100);
+    await gracefulRun;
+    assert.ok(gracefulError instanceof Error && !(gracefulError instanceof CommandNotStartedError));
+    assert.match(gracefulError.message, /failed to terminate within bounded teardown \(170ms\)/);
+    assert.deepEqual(gracefulFake.sessions[0].killedSignals, ['SIGTERM', 'SIGKILL']);
   }
 });
 

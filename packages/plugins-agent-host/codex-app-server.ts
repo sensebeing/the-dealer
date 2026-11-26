@@ -4,9 +4,10 @@ import type { StdioChildProcess, StdioProcessSpawner } from '../subprocess/index
 import { assertValidCodexOptions } from './hosts.ts';
 import type { ActiveConversationMode } from './hosts.ts';
 
-const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+export const DEFAULT_RPC_TIMEOUT_MS = 180_000;
 const DEFAULT_CLOSE_GRACE_MS = 3_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
+const DEFAULT_POST_KILL_GRACE_MS = 1_000;
 const MAX_STDERR_BYTES = 16 * 1024;
 const MAX_EARLY_COMPLETIONS = 32;
 
@@ -153,6 +154,10 @@ export async function runCodexAppServerTurn(
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const closeGraceMs = options.closeGraceMs ?? DEFAULT_CLOSE_GRACE_MS;
   const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  const postKillGraceMs =
+    options.killGraceMs !== undefined
+      ? Math.min(DEFAULT_POST_KILL_GRACE_MS, Math.max(100, killGraceMs))
+      : DEFAULT_POST_KILL_GRACE_MS;
 
   let child: StdioChildProcess;
   try {
@@ -169,6 +174,7 @@ export async function runCodexAppServerTurn(
   let phase: TurnPhase = 'pre-turn-send';
   let childExited = false;
   let shuttingDown = false;
+  let sigtermSent = false;
   let activeThreadId: string | undefined;
   let expectedTurnId: string | undefined;
   const earlyTurnCompletions: CompletedTurnEvent[] = [];
@@ -205,7 +211,8 @@ export async function runCodexAppServerTurn(
   };
 
   const terminateChild = (): void => {
-    if (childExited) return;
+    if (childExited || sigtermSent) return;
+    sigtermSent = true;
     try {
       child.kill('SIGTERM');
     } catch {
@@ -455,7 +462,6 @@ export async function runCodexAppServerTurn(
         const timeoutError = makeBoundaryError(
           `codex app-server ${method} timed out after ${rpcTimeoutMs}ms`,
         );
-        terminateChild();
         reject(timeoutError);
       }, rpcTimeoutMs);
       timer.unref();
@@ -514,14 +520,14 @@ export async function runCodexAppServerTurn(
         return;
       }
       if (mode === 'terminate') {
-        hardTimer = setTimeout(done, killGraceMs + 100);
+        hardTimer = setTimeout(done, killGraceMs + postKillGraceMs);
         hardTimer.unref();
         return;
       }
       graceTimer = setTimeout(() => {
         graceTimer = undefined;
         terminateChild();
-        hardTimer = setTimeout(done, killGraceMs + 100);
+        hardTimer = setTimeout(done, killGraceMs + postKillGraceMs);
         hardTimer.unref();
       }, closeGraceMs);
       graceTimer.unref();
@@ -595,7 +601,9 @@ export async function runCodexAppServerTurn(
       );
     }
     if (!exitedCleanly) {
-      throw new Error(`codex app-server failed to terminate within bounded teardown (${closeGraceMs + killGraceMs}ms)`);
+      throw new Error(
+        `codex app-server failed to terminate within bounded teardown (${closeGraceMs + killGraceMs + postKillGraceMs}ms)`,
+      );
     }
 
     succeeded = true;
@@ -622,7 +630,9 @@ export async function runCodexAppServerTurn(
     if (!succeeded && !tornDown) {
       const exited = await teardownChild('terminate');
       if (!exited) {
-        cleanupError = new Error(`codex app-server failed to terminate within bounded teardown (${killGraceMs}ms)`);
+        cleanupError = new Error(
+          `codex app-server failed to terminate within bounded teardown (${killGraceMs + postKillGraceMs}ms)`,
+        );
       }
     }
     if (terminationTimer) {
