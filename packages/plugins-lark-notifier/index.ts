@@ -18,6 +18,7 @@ interface ThreadRootState {
   targetKey: string;
   updatedAt: string;
   mailboxId?: string;
+  itemSequence?: number;
   awaitingSessionLink?: boolean;
   lastSessionUrl?: string;
 }
@@ -42,7 +43,7 @@ export interface LarkMailboxNotifierOptions {
   localMember: string;
   defaultBoundMailboxes?: string[];
   acceptsDefaultItem?: (item: MailboxItem) => boolean;
-  resolveSessionLink?: (mailboxId: string) => SessionLinkResolution | undefined;
+  resolveSessionLink?: (mailboxId: string, itemSequence?: number) => SessionLinkResolution | undefined;
   commandRunner?: CommandRunner;
   onError?: (error: unknown) => void;
 }
@@ -62,6 +63,7 @@ function readState(path: string): NotifyState {
       Object.values(state.threadRoots).some(root =>
         !record(root) || !nonempty(root.messageId) || !nonempty(root.targetKey) || !nonempty(root.updatedAt) ||
         (root.mailboxId !== undefined && !isValidMailboxId(root.mailboxId)) ||
+        (root.itemSequence !== undefined && (!Number.isSafeInteger(root.itemSequence) || root.itemSequence < 0)) ||
         (root.awaitingSessionLink !== undefined && typeof root.awaitingSessionLink !== 'boolean') ||
         (root.lastSessionUrl !== undefined && !nonempty(root.lastSessionUrl))
       )) {
@@ -187,11 +189,12 @@ export class LarkMailboxNotifier {
         const next = structuredClone(this.state);
         if (this.accepts(item) && !Object.hasOwn(next.deliveredItems, key)) {
           const threadId = item.envelope.semantic?.threadId ?? item.id;
-          const sessionLink = this.options.resolveSessionLink?.(item.mailboxId);
+          const sessionLink = this.options.resolveSessionLink?.(item.mailboxId, item.sequence);
           await this.deliver(next, key, threadId, followup => this.render(item, followup, sessionLink));
           if (Object.hasOwn(next.threadRoots, threadId)) {
             const root = next.threadRoots[threadId];
             root.mailboxId = item.mailboxId;
+            root.itemSequence = item.sequence;
             if (sessionLink?.state === 'ready') {
               root.lastSessionUrl = sessionLink.url;
               delete root.awaitingSessionLink;
@@ -212,7 +215,7 @@ export class LarkMailboxNotifier {
       for (const [threadId, root] of Object.entries(this.state.threadRoots)) {
         if (this.stopped) return;
         if (root.awaitingSessionLink !== true || !root.mailboxId) continue;
-        const sessionLink = this.options.resolveSessionLink?.(root.mailboxId);
+        const sessionLink = this.options.resolveSessionLink?.(root.mailboxId, root.itemSequence);
         if (sessionLink === undefined) {
           const next = structuredClone(this.state);
           if (Object.hasOwn(next.threadRoots, threadId)) {
@@ -231,6 +234,7 @@ export class LarkMailboxNotifier {
         }
         if (Object.hasOwn(next.threadRoots, threadId)) {
           next.threadRoots[threadId].mailboxId = root.mailboxId;
+          if (root.itemSequence !== undefined) next.threadRoots[threadId].itemSequence = root.itemSequence;
           delete next.threadRoots[threadId].awaitingSessionLink;
           next.threadRoots[threadId].lastSessionUrl = sessionLink.url;
         }

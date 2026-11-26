@@ -1185,10 +1185,13 @@ export class DealerNodeRuntime {
           excludeInboundMessageId: envelope.id,
         }) === mailboxId;
       },
-      resolveSessionLink: mailboxId => {
+      resolveSessionLink: (mailboxId, itemSequence) => {
         const target = this.mailbox.getWakeTarget(mailboxId);
         const preview = this.mailbox.check({ mailboxId, peek: true });
-        return resolveAgentHostSessionLink(target, { hasOutstandingLease: Boolean(preview.deliveryId) });
+        return resolveAgentHostSessionLink(target, {
+          hasOutstandingLease: Boolean(preview.deliveryId),
+          itemSequence,
+        });
       },
       commandRunner: this.options.commandRunner ?? runCommand,
       onError: (error: unknown) => { this.lastError = String(error); },

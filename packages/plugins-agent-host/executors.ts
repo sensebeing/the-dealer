@@ -174,8 +174,11 @@ function buildAgentHostWakeTargetPatch(
     ...(desired.targetBot ? { targetBot: desired.targetBot } : {}),
     ...(desired.rotateAfterMs !== undefined ? { rotateAfterMs: desired.rotateAfterMs } : {}),
   });
-  if (hostChanged && configuredSessionId === undefined) {
-    driverConfig.sessionId = undefined;
+  if (hostChanged) {
+    if (configuredSessionId === undefined) {
+      driverConfig.sessionId = undefined;
+    }
+    driverConfig.deliveredSessions = undefined;
   }
   if (sessionRebound) {
     driverConfig.sessionStartedAt = undefined;

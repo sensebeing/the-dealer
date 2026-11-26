@@ -5105,4 +5105,54 @@ test('resolveAgentHostSessionLink and isAgentHostRotationDue enforce host, pendi
     ),
     { state: 'ready', label: 'ChatGPT App', url: 'codex://threads/thread-s2' },
   );
+
+  // Spawn with an explicit pre-launch configured sessionId must remain pending until fresh thread commits.
+  assert.deepEqual(
+    resolveAgentHostSessionLink(
+      baseTarget({
+        driverConfig: {
+          hostAgent: 'codex',
+          conversationMode: 'spawn',
+          sessionId: 'configured-hint',
+          configuredSessionId: 'configured-hint',
+        },
+      }),
+      { itemSequence: 0 },
+    ),
+    { state: 'pending' },
+  );
+
+  // Committed deliveredSessions resolve historical items to their exact session across acks & rotations,
+  // and never attach a newer session to an older unrecorded item.
+  const rotatedHistory = baseTarget({
+    rotateAfterWaves: 1,
+    completedWaves: 1,
+    driverConfig: {
+      hostAgent: 'codex',
+      conversationMode: 'fixed',
+      sessionId: 'thread-s2',
+      sessionStartedAt: 2_000,
+      deliveredSessions: [
+        { fromSequence: 2, throughSequence: 3, sessionId: 'thread-s1' },
+        { fromSequence: 5, throughSequence: 6, sessionId: 'thread-s2' },
+      ],
+    },
+  });
+  assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 2 }), {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: 'codex://threads/thread-s1',
+  });
+  assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 6 }), {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: 'codex://threads/thread-s2',
+  });
+  assert.equal(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 1 }), undefined);
+  assert.equal(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 4 }), undefined);
+  assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 7 }), { state: 'pending' });
+  assert.throws(
+    () => readAgentHostDriverConfig({ driverConfig: { deliveredSessions: [{ fromSequence: 3, throughSequence: 1, sessionId: 'bad' }] } }),
+    /deliveredSessions/,
+  );
 });

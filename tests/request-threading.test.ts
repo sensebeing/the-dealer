@@ -11,6 +11,7 @@ import {
   signEnvelope, generateNodeKeyPair, verifyEnvelope, runDealerCli,
   ensureOrcaWorkspace, checkOrcaWorkspaceIdle, resolveOrSpawnOrcaWorkspaceTerminal, defaultAntigravityLaunchCommand,
   validateTopicBindings, validateLarkNotify, initProjectScaffold, resolveAgentHostSessionLink,
+  deliverAgentHostWakeTarget, runCommand,
 } from '../packages/index.ts';
 import type { MessageEnvelope, CommandRequest, CommandRunner } from '../packages/index.ts';
 import { openStateLedgers } from '../packages/cli/ledgers.ts';
@@ -1262,5 +1263,233 @@ test('Lark session links: inline ready, pending onWakeTarget follow-up, rotation
     );
     assert.equal(fakeCodex.sessions[0].threadParams?.threadSource, 'user');
     assert.equal(fakeCodex.sessions[0].threadName, 'Dealer · collab.request.v4');
+  }
+
+  // 5. rotateAfterWaves: 1 with mid-turn ack BEFORE turn/completed still publishes Wave 1's session
+  //    to Wave 1's Lark thread (and Wave 2's rotated session only to Wave 2's thread).
+  {
+    const dir = join(root, 'mid-turn-ack');
+    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let runtimeRef!: DealerNodeRuntime;
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `mid-ack-thread-${count}`,
+      onTurnStart: async (_params, ctx) => {
+        const idx = ctx.session.index - 1;
+        // Simulate Codex agent checking and acking the lease BEFORE turn/completed!
+        const lease = runtimeRef.mailbox.check({ mailboxId: 'stream:mid-ack' });
+        assert.ok(lease.deliveryId);
+        runtimeRef.mailbox.ack(lease.deliveryId!, 'stream:mid-ack');
+        started[idx].resolve();
+        await gates[idx].promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'mid-turn-ack-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `mid-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': {
+            executor: 'codex',
+            mode: 'wave',
+            streamKey: 'mid-ack',
+            rotateAfterWaves: 1,
+            workspacePath: root,
+            notifyLark: true,
+          },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'mid-chat' } },
+      },
+    }).start();
+    runtimeRef = runtime;
+    t.after(async () => {
+      for (const gate of gates) gate.resolve();
+      await runtime.stop();
+    });
+
+    // Wave 1: agent acks mid-turn -> completedWaves becomes 1 BEFORE completeWakeDelivery.
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Mid-ack Wave 1',
+      body: 'Ack early in turn 1',
+      payload: {},
+    });
+    await started[0].promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 1);
+    assert.ok(!argument(larkCalls[0], '--markdown').includes('codex://threads/'));
+    assert.equal(runtime.mailbox.getWakeTarget('stream:mid-ack')?.completedWaves, 1);
+
+    gates[0].resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 2, 'committed Wave 1 session must be delivered even when completedWaves === rotateAfterWaves');
+    assert.equal(argument(larkCalls[1], '--message-id'), 'mid-lark-1');
+    assert.equal(
+      argument(larkCalls[1], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/mid-ack-thread-1`',
+    );
+
+    // Wave 2: rotates to mid-ack-thread-2 and acks mid-turn -> replies ONLY to Wave 2's root.
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Mid-ack Wave 2',
+      body: 'Ack early in turn 2',
+      payload: {},
+    });
+    await started[1].promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 3);
+    assert.ok(!argument(larkCalls[2], '--markdown').includes('mid-ack-thread-1'));
+
+    gates[1].resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 4);
+    assert.equal(argument(larkCalls[3], '--message-id'), 'mid-lark-3');
+    assert.equal(
+      argument(larkCalls[3], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/mid-ack-thread-2`',
+    );
+  }
+
+  // 6. Delayed Lark notification across rotation attaches each item's own committed session (S1 vs S2).
+  {
+    const dir = join(root, 'delayed-across-rotation');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `delayed-s${count}`,
+    });
+
+    // Wave 1 commits delayed-s1 and acks.
+    store.enqueue([envelope('delayed-w1')], {
+      mailboxId: 'stream:delayed',
+      wakeTarget: {
+        driver: 'agent-host',
+        rotateAfterWaves: 1,
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+      },
+    });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:delayed', { stdioSpawner: fakeCodex.spawner });
+    store.ack(store.check({ mailboxId: 'stream:delayed' }).deliveryId!, 'stream:delayed');
+
+    // Wave 2 rotates and commits delayed-s2 BEFORE Lark ever starts draining!
+    store.enqueue([envelope('delayed-w2')], { mailboxId: 'stream:delayed' });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:delayed', { stdioSpawner: fakeCodex.spawner });
+
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:delayed'],
+      config: { enabled: true, target: { chatId: 'delayed-chat' } },
+      resolveSessionLink: (mailboxId, itemSequence) => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+        itemSequence,
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `del-lark-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+    await notifier.flush();
+
+    assert.equal(calls.length, 2);
+    assert.ok(
+      argument(calls[0], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/delayed-s1`'),
+      'Wave 1 item must keep its committed S1 session after S2 rotation',
+    );
+    assert.ok(
+      argument(calls[1], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/delayed-s2`'),
+      'Wave 2 item must get its committed S2 session',
+    );
+  }
+
+  // 7. Spawn with an explicit pre-launch sessionId must NOT publish the configured hint before launch,
+  //    and must publish the actual fresh threadId returned by Codex thread/start once committed.
+  {
+    const dir = join(root, 'spawn-explicit-session');
+    const turnStarted = Promise.withResolvers<void>();
+    const turnGate = Promise.withResolvers<void>();
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: () => 'actual-spawn-thread-77',
+      onTurnStart: async () => {
+        turnStarted.resolve();
+        await turnGate.promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'spawn-explicit-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `spawn-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': {
+            executor: 'codex',
+            mode: 'spawn',
+            sessionId: 'preconfigured-hint',
+            workspacePath: root,
+            notifyLark: true,
+          },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'spawn-chat' } },
+      },
+    }).start();
+    t.after(async () => {
+      turnGate.resolve();
+      await runtime.stop();
+    });
+
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Spawn With Configured Hint',
+      body: 'Should ignore preconfigured hint for link',
+      payload: {},
+    });
+    await turnStarted.promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 1);
+    assert.ok(
+      !argument(larkCalls[0], '--markdown').includes('preconfigured-hint'),
+      'spawn must not leak pre-launch configured sessionId',
+    );
+
+    turnGate.resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 2);
+    assert.equal(argument(larkCalls[1], '--message-id'), 'spawn-lark-1');
+    assert.equal(
+      argument(larkCalls[1], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/actual-spawn-thread-77`',
+    );
   }
 });

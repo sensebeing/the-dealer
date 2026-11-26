@@ -21,6 +21,12 @@ import {
 import type { WakeupDriver } from '../mailbox/wakeup.ts';
 import type { MailboxStore, WakeTargetState } from '../mailbox/store.ts';
 
+export interface AgentHostDeliveredSession {
+  readonly fromSequence: number;
+  readonly throughSequence: number;
+  readonly sessionId: string;
+}
+
 export interface AgentHostDriverConfig {
   hostAgent?: SupportedAgentHost;
   conversationMode?: ActiveConversationMode;
@@ -32,7 +38,10 @@ export interface AgentHostDriverConfig {
   configuredSessionId?: string;
   rotateAfterMs?: number;
   sessionStartedAt?: number;
+  deliveredSessions?: readonly AgentHostDeliveredSession[];
 }
+
+const MAX_DELIVERED_SESSIONS = 64;
 
 export function serializeAgentHostDriverConfig(config: AgentHostDriverConfig): Record<string, unknown> {
   const value = Object.fromEntries(Object.entries(config).filter(([, entry]) => entry !== undefined));
@@ -67,7 +76,59 @@ export function readAgentHostDriverConfig(
   ) {
     throw new Error('Invalid host configuration: sessionStartedAt');
   }
+  if (config.deliveredSessions !== undefined) {
+    if (
+      !Array.isArray(config.deliveredSessions) ||
+      config.deliveredSessions.some(entry => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true;
+        const record = entry as Record<string, unknown>;
+        return (
+          typeof record.fromSequence !== 'number' ||
+          !Number.isSafeInteger(record.fromSequence) ||
+          record.fromSequence < 0 ||
+          typeof record.throughSequence !== 'number' ||
+          !Number.isSafeInteger(record.throughSequence) ||
+          record.throughSequence < record.fromSequence ||
+          typeof record.sessionId !== 'string' ||
+          record.sessionId.trim().length === 0
+        );
+      })
+    ) {
+      throw new Error('Invalid host configuration: deliveredSessions');
+    }
+  }
   return config as AgentHostDriverConfig;
+}
+
+function appendAgentHostDeliveredSession(
+  existing: readonly AgentHostDeliveredSession[] | undefined,
+  fromSequence: number,
+  throughSequence: number,
+  sessionId: string,
+): AgentHostDeliveredSession[] | undefined {
+  const trimmed = sessionId.trim();
+  if (!trimmed || throughSequence < 0) return existing ? existing.map(entry => ({ ...entry })) : undefined;
+  const normalizedFrom = Math.max(0, Math.min(fromSequence, throughSequence));
+  const list = existing ? existing.map(entry => ({ ...entry })) : [];
+  const last = list.at(-1);
+  if (last && last.sessionId === trimmed) {
+    last.fromSequence = Math.min(last.fromSequence, normalizedFrom);
+    last.throughSequence = Math.max(last.throughSequence, throughSequence);
+  } else {
+    list.push({ fromSequence: normalizedFrom, throughSequence, sessionId: trimmed });
+  }
+  return list.length > MAX_DELIVERED_SESSIONS ? list.slice(list.length - MAX_DELIVERED_SESSIONS) : list;
+}
+
+function minPreviewSequence(
+  preview: { items: readonly { sequence: number }[]; latestQueued?: { sequence: number } },
+  maxSequence: number,
+): number {
+  let min = preview.latestQueued ? preview.latestQueued.sequence : maxSequence;
+  for (const item of preview.items) {
+    if (item.sequence < min) min = item.sequence;
+  }
+  return Math.max(0, Math.min(min, maxSequence));
 }
 
 const MAX_CODEX_THREAD_NAME_LENGTH = 80;
@@ -133,16 +194,41 @@ export function isAgentHostRotationDue(
 
 /**
  * Derive a host-neutral receiver-local session deep link from an `agent-host` wake target.
- * Returns `{ state: 'pending' }` when a Codex session has not yet been committed or is due to
- * rotate (suppressing any retiring thread link), and `undefined` for non-link hosts.
+ * When `itemSequence` is provided, checks the committed `deliveredSessions` association first so
+ * historical/acked/rotated items always resolve to the exact session that received them.
+ * For undelivered items, returns `{ state: 'pending' }` for fresh `spawn` targets (ignoring any
+ * pre-launch configured `sessionId`) and when a Codex session has not yet been committed or is
+ * due to rotate, and `undefined` for non-link hosts.
  */
 export function resolveAgentHostSessionLink(
   target: WakeTargetState | undefined,
-  options: { now?: number; hasOutstandingLease?: boolean } = {},
+  options: { now?: number; hasOutstandingLease?: boolean; itemSequence?: number } = {},
 ): SessionLinkResolution | undefined {
   if (!target || target.driver !== 'agent-host') return undefined;
   const config = readAgentHostDriverConfig(target);
   if (!config.hostAgent || normalizeAgentHost(config.hostAgent) !== 'codex') return undefined;
+  const deliveredSessions = config.deliveredSessions;
+  if (options.itemSequence !== undefined && deliveredSessions && deliveredSessions.length > 0) {
+    for (let index = deliveredSessions.length - 1; index >= 0; index -= 1) {
+      const entry = deliveredSessions[index];
+      if (options.itemSequence >= entry.fromSequence && options.itemSequence <= entry.throughSequence) {
+        return {
+          state: 'ready',
+          label: 'ChatGPT App',
+          url: `codex://threads/${encodeURIComponent(entry.sessionId)}`,
+        };
+      }
+    }
+    const maxCommitted = deliveredSessions.reduce((max, entry) => Math.max(max, entry.throughSequence), -1);
+    if (options.itemSequence <= maxCommitted) {
+      return undefined;
+    }
+  }
+  // A spawn target always starts a fresh Codex thread via thread/start, even if a configured
+  // sessionId was seeded on the wake target before launch; wait for committed thread identity.
+  if (config.conversationMode === 'spawn') {
+    return { state: 'pending' };
+  }
   const sessionId = config.sessionId?.trim();
   const rotationDue = isAgentHostRotationDue(target, {
     now: options.now,
@@ -283,25 +369,40 @@ export async function deliverAgentHostWakeTarget(
           ? now
           : (target.sessionStartedAt ?? now))
       : undefined;
-    const nextDriverConfig = continuation.hostAgent
-      ? serializeAgentHostDriverConfig({
-          hostAgent: continuation.hostAgent,
-          conversationMode: continuation.conversationMode,
-          sessionId: continuation.sessionId,
-          ...(target.rotateAfterMs !== undefined ? { rotateAfterMs: target.rotateAfterMs } : {}),
-          ...(sessionStartedAt !== undefined ? { sessionStartedAt } : {}),
-        })
-      : undefined;
+    const deliveredSequence = maxPreviewSequence(preview);
+    const deliveredFromSequence = minPreviewSequence(preview, deliveredSequence);
     const completed = store.completeWakeDelivery(
       mailboxId,
-      maxPreviewSequence(preview),
-      lockedCurrent => ({
-        driver: continuation.hostAgent ? 'agent-host' : 'passive',
-        driverConfig: nextDriverConfig,
-        ...(shouldRotate
-          ? { completedWaves: Math.max(0, lockedCurrent.completedWaves - preRotationCompletedWaves) }
-          : {}),
-      }),
+      deliveredSequence,
+      lockedCurrent => {
+        const currentConfig =
+          lockedCurrent.driver === 'agent-host' ? readAgentHostDriverConfig(lockedCurrent) : undefined;
+        const deliveredSessions = continuation.sessionId
+          ? appendAgentHostDeliveredSession(
+              currentConfig?.deliveredSessions,
+              deliveredFromSequence,
+              deliveredSequence,
+              continuation.sessionId,
+            )
+          : currentConfig?.deliveredSessions;
+        const nextDriverConfig = continuation.hostAgent
+          ? serializeAgentHostDriverConfig({
+              hostAgent: continuation.hostAgent,
+              conversationMode: continuation.conversationMode,
+              sessionId: continuation.sessionId,
+              ...(target.rotateAfterMs !== undefined ? { rotateAfterMs: target.rotateAfterMs } : {}),
+              ...(sessionStartedAt !== undefined ? { sessionStartedAt } : {}),
+              ...(deliveredSessions !== undefined ? { deliveredSessions } : {}),
+            })
+          : undefined;
+        return {
+          driver: continuation.hostAgent ? 'agent-host' : 'passive',
+          driverConfig: nextDriverConfig,
+          ...(shouldRotate
+            ? { completedWaves: Math.max(0, lockedCurrent.completedWaves - preRotationCompletedWaves) }
+            : {}),
+        };
+      },
       undefined,
       expectedRevision,
     );
