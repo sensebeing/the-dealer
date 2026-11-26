@@ -396,11 +396,11 @@ async function launchDaemon(
     exitError = error;
     exitController.abort();
   };
-  const onExit = (code: number | null) => {
+  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
     if (exited) return;
     exited = true;
     const tail = readDaemonLogTail(logPath, startOffset);
-    exitError = new Error(`Daemon exited ${code}: ${tail}`);
+    exitError = new Error(`Daemon exited ${code ?? signal}: ${tail}`);
     exitController.abort();
   };
   child.once('error', onError);
@@ -436,7 +436,6 @@ async function launchDaemon(
             ? statusPid === child.pid
             : liveDaemonOwner(stateDir)?.pid === child.pid;
           if (matchesChild) {
-            child.unref();
             return status;
           }
         } catch (error) {
@@ -471,6 +470,7 @@ async function launchDaemon(
   } finally {
     child.off('error', onError);
     child.off('exit', onExit);
+    child.unref();
   }
 }
 
