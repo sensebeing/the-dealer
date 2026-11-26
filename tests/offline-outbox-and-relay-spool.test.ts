@@ -6316,3 +6316,433 @@ test('reconciliation returns a live pending receipt and retains the complete out
     new Set([harness.targetCard.nodeId, aya]));
   assert.deepEqual(harness.sentEvents.at(-1)!.receipts, second.receipts);
 });
+
+test('relay, relay_send, and relay_blob targeting localNodeId deliver and serve locally', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const target = new P2PTransportService({
+    discoveryDir: join(root, 'target'),
+    listenHost: '127.0.0.1',
+    multicast: false,
+  });
+  const sender = new P2PTransportService({
+    discoveryDir: join(root, 'sender'),
+    listenHost: '127.0.0.1',
+    multicast: false,
+  });
+  t.after(async () => {
+    await sender.dispose();
+    await target.dispose();
+  });
+  await target.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const received: string[] = [];
+  target.onInboundFrame(event => {
+    received.push(Buffer.from(event.rawBytes ?? []).toString('utf8'));
+    return Buffer.from('local-relay-ack');
+  });
+  const blobPath = join(root, 'local.bin');
+  const blobBytes = Buffer.from('local-relay-blob-content');
+  writeFileSync(blobPath, blobBytes);
+  const shared = await target.shareFile(blobPath);
+  const targetPort = portOf(target.endpointAddr!);
+
+  const externalSender = generateNodeKeyPair();
+  for (const requestType of ['relay', 'relay_send'] as const) {
+    const sealed = sealNetworkFrame(
+      { mode: 'unicast', dataBase64: Buffer.from(`hello-${requestType}`).toString('base64') },
+      keys,
+      externalSender.nodeId,
+    );
+    const response = await tcpRequest(targetPort, {
+      type: requestType,
+      networkId: NETWORK,
+      target: target.localNodeId,
+      ...(requestType === 'relay_send' ? { spoolIfOffline: true, spoolKey: 'local-target-key' } : {}),
+      frame: sealed,
+    });
+    assert.equal(response.ok, true);
+    assert.equal(response.error, undefined);
+    assert.equal(response.frame?.senderNodeId, target.localNodeId);
+    const reply = unsealNetworkFrame<{ requestNonce: string; dataBase64: string }>(response.frame, keys);
+    assert.equal(reply.requestNonce, sealed.nonce);
+    assert.equal(Buffer.from(reply.dataBase64, 'base64').toString('utf8'), 'local-relay-ack');
+  }
+  assert.deepEqual(received, ['hello-relay', 'hello-relay_send']);
+
+  // relay_blob with target === localNodeId serves from local blobs when not in spool cache.
+  const relayedBlob = await new Promise<Buffer>((resolve, reject) => {
+    const socket = createConnection({ host: '127.0.0.1', port: targetPort });
+    const chunks: Buffer[] = [];
+    socket.on('error', reject);
+    socket.on('data', chunk => chunks.push(Buffer.from(chunk)));
+    socket.on('end', () => {
+      const full = Buffer.concat(chunks);
+      const headerSize = full.readUInt32BE(0);
+      const header = JSON.parse(full.subarray(4, 4 + headerSize).toString('utf8'));
+      assert.equal(header.size, blobBytes.length);
+      resolve(full.subarray(4 + headerSize));
+    });
+    const body = Buffer.from(JSON.stringify({
+      type: 'relay_blob',
+      swarmTopicId: keys.swarmTopicId,
+      target: target.localNodeId,
+      hash: shared.blake3Hash,
+    }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+    socket.write(Buffer.concat([length, body]));
+  });
+  assert.deepEqual(relayedBlob, blobBytes);
+
+  // End-to-end: sender with target in bootstrapPeers and a stale direct peer endpoint still delivers via target's relay_send.
+  await sender.mountNetwork({ networkId: NETWORK, passphrase: 'secret', bootstrapPeers: [target.endpointAddr!] });
+  const closed = createServer();
+  closed.listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => closed.once('listening', resolve));
+  const deadPort = (closed.address() as { port: number }).port;
+  await new Promise<void>(resolve => closed.close(() => resolve()));
+  sender.registerPeerEndpoint(NETWORK, target.localNodeId, `127.0.0.1:${deadPort}`);
+  const replyBytes = await sender.sendUnicast(
+    NETWORK,
+    target.localNodeId,
+    Buffer.from('via-target-bootstrap'),
+    { spoolIfOffline: true, spoolKey: 'e2e-target-bootstrap' },
+  );
+  assert.equal(Buffer.from(replyBytes).toString('utf8'), 'local-relay-ack');
+  assert.equal(received.at(-1), 'via-target-bootstrap');
+});
+
+test('attachment fetch failure before executor runs reports handoff unattempted and allows safe retry', async t => {
+  const root = directory(t);
+  const runtimes: DealerNodeRuntime[] = [];
+  t.after(async () => {
+    for (const runtime of [...runtimes].reverse()) {
+      await runtime.stop().catch(() => {});
+    }
+  });
+  const sender = runtimeFor(root, 'sender', { discovery: 'mesh' });
+  const receiver = runtimeFor(root, 'receiver', { discovery: 'mesh' });
+  runtimes.push(sender, receiver);
+  await sender.start();
+  await receiver.start();
+  await sender.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await receiver.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await until(
+    () =>
+      sender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'receiver') &&
+      receiver.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'sender'),
+    'sender and receiver discover each other',
+  );
+
+  const attachmentPath = join(root, 'report.txt');
+  writeFileSync(attachmentPath, 'attachment-body-for-retry');
+  const attachment = await sender.transport.shareFile(attachmentPath);
+  let failFetch = true;
+  const originalFetch = receiver.transport.fetchBlobToPath.bind(receiver.transport);
+  t.mock.method(receiver.transport, 'fetchBlobToPath', async (ticket: string, destPath: string) => {
+    if (failFetch) {
+      throw Object.assign(new Error('connect EHOSTDOWN 10.165.36.198:45874'), { code: 'EHOSTDOWN' });
+    }
+    return originalFetch(ticket, destPath);
+  });
+
+  const input: EmitMessageInput = {
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: ['member:receiver'] },
+    kind: 'collab.request.v1',
+    subject: 'Attachment retry',
+    body: 'must stay retryable if blob fetch fails',
+    payload: {},
+    attachments: [attachment],
+    attachmentPaths: { [attachment.blake3Hash]: attachmentPath },
+    idempotencyKey: 'attachment-retry-key',
+  };
+  const first = await sender.emitter.emit(input);
+  assert.equal(first.receipts.length, 1);
+  assert.equal(first.receipts[0].stage, 'failed');
+  assert.equal(first.receipts[0].executionReceipt?.handoff, 'unattempted');
+  const receiverNodeId = receiver.node.getSelfCard(NETWORK).nodeId;
+  const outboxItem = sender.outbox.get(first.messageId)!;
+  assert.deepEqual(outboxItem.inDoubtNodeIds, []);
+  assert.equal(receiver.mailbox.list().totalCount, 0);
+
+  failFetch = false;
+  const retried = await sender.emitter.emit(input);
+  assert.equal(retried.messageId, first.messageId);
+  assert.equal(retried.receipts.length, 1);
+  assert.equal(retried.receipts[0].stage, 'dispatched');
+  assert.equal(sender.outbox.get(first.messageId)?.status, 'delivered');
+  assert.deepEqual(sender.outbox.get(first.messageId)?.inDoubtNodeIds, []);
+  const delivered = receiver.mailbox.list().items;
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].envelope.id, first.messageId);
+  const localAttachments = delivered[0].envelope.payload.localAttachments as string[];
+  assert.equal(localAttachments.length, 1);
+  assert.equal(readFileSync(localAttachments[0], 'utf8'), 'attachment-body-for-retry');
+  assert.equal(receiverNodeId, first.receipts[0].fromNodeId);
+});
+
+test('personal-dev declines new third-party offline custody without creating relay-spool, falling back to headless-relay', async t => {
+  const root = directory(t);
+  const runtimes: DealerNodeRuntime[] = [];
+  t.after(async () => {
+    for (const runtime of [...runtimes].reverse()) {
+      await runtime.stop().catch(() => {});
+    }
+  });
+  const personalPeer = new DealerNodeRuntime({
+    stateDir: join(root, 'personal'),
+    member: 'ben',
+    name: 'ben-mac',
+    profile: 'personal-dev',
+    patch: { defaultExecutor: 'inbox' },
+    transport: {
+      discoveryDir: join(root, 'personal-mesh'),
+      multicast: false,
+    },
+  });
+  const relaySeed = runtimeFor(root, 'relay');
+  const sender = runtimeFor(root, 'sender');
+  const offlinePeer = runtimeFor(root, 'offline', { discovery: 'seed-learn' });
+  runtimes.push(personalPeer, relaySeed, sender, offlinePeer);
+
+  await personalPeer.start();
+  await relaySeed.start();
+  await sender.start();
+  await offlinePeer.start();
+  await personalPeer.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await relaySeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await offlinePeer.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [relaySeed.transport.endpointAddr!],
+  });
+  await sender.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [personalPeer.transport.endpointAddr!, relaySeed.transport.endpointAddr!],
+  });
+  await until(
+    () => sender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'offline'),
+    'sender learns offline peer card via relay seed',
+  );
+  const offlineNodeId = offlinePeer.node.getSelfCard(NETWORK).nodeId;
+  await offlinePeer.stop();
+
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const personalSpoolDir = join(root, 'personal', 'relay-spool');
+  assert.equal(existsSync(personalSpoolDir), false);
+
+  const emitted = await sender.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: [offlineNodeId] },
+    kind: 'collab.request.v1',
+    subject: 'Personal node skips spool',
+    body: 'must land on headless-relay spool only',
+    payload: {},
+  });
+  assert.equal(emitted.receipts[0]?.stage, 'queued');
+  assert.equal(emitted.receipts[0]?.executionReceipt?.relaySpooled, true);
+  assert.equal(existsSync(personalSpoolDir), false, 'fresh personal-dev never writes relay-spool while running');
+  const relaySpoolFile = join(root, 'relay', 'relay-spool', `${keys.swarmTopicId}.json`);
+  const entries = readRelaySpool(relaySpoolFile).entries;
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].targetNodeId, offlineNodeId);
+  assert.equal(entries[0].id, `${sender.transport.localNodeId}:${emitted.messageId}`);
+
+  await personalPeer.stop();
+  assert.equal(existsSync(personalSpoolDir), false, 'fresh personal-dev never creates relay-spool on shutdown');
+});
+
+test('upgraded personal-dev drains pre-existing relay-spool and serves retained blobs while refusing new custody', async t => {
+  const root = directory(t);
+  const runtimes: DealerNodeRuntime[] = [];
+  t.after(async () => {
+    for (const runtime of [...runtimes].reverse()) {
+      await runtime.stop().catch(() => {});
+    }
+  });
+  const personalDir = join(root, 'personal-upgrade');
+  const legacyPersonal = new DealerNodeRuntime({
+    stateDir: personalDir,
+    member: 'ben',
+    name: 'ben-mac',
+    profile: 'personal-dev',
+    patch: { defaultExecutor: 'inbox' },
+    transport: {
+      discoveryDir: join(root, 'personal-mesh'),
+      multicast: false,
+      acceptRelaySpool: true,
+    },
+  });
+  const originalSender = runtimeFor(root, 'original-sender');
+  const target = runtimeFor(root, 'target');
+  runtimes.push(legacyPersonal, originalSender, target);
+
+  await legacyPersonal.start();
+  await originalSender.start();
+  await target.start();
+  await legacyPersonal.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const personalPort = portOf(legacyPersonal.transport.endpointAddr!);
+  await target.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacyPersonal.transport.endpointAddr!],
+  });
+  await originalSender.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacyPersonal.transport.endpointAddr!],
+  });
+  await until(
+    () => originalSender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'target'),
+    'original sender learns target via pre-upgrade personal node',
+  );
+  const targetNodeId = target.node.getSelfCard(NETWORK).nodeId;
+  await target.stop();
+
+  const attachmentPath = join(root, 'legacy-spooled.txt');
+  writeFileSync(attachmentPath, 'retained-across-personal-dev-upgrade');
+  const attachment = await originalSender.transport.shareFile(attachmentPath);
+  const spooled = await originalSender.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: [targetNodeId] },
+    kind: 'collab.request.v1',
+    subject: 'Pre-upgrade spooled mail',
+    body: 'must still drain after personal-dev upgrade',
+    payload: {},
+    attachments: [attachment],
+    attachmentPaths: { [attachment.blake3Hash]: attachmentPath },
+  });
+  assert.equal(spooled.receipts[0]?.stage, 'queued');
+  assert.equal(spooled.receipts[0]?.executionReceipt?.relaySpooled, true);
+
+  // Take both the original sender and pre-upgrade personal node offline before upgrading.
+  await originalSender.stop();
+  await legacyPersonal.stop();
+
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const spoolFile = join(personalDir, 'relay-spool', `${keys.swarmTopicId}.json`);
+  assert.equal(readRelaySpool(spoolFile).entries.length, 1);
+
+  // Restart the same stateDir as upgraded personal-dev (default acceptRelaySpool = false).
+  const upgradedPersonal = new DealerNodeRuntime({
+    stateDir: personalDir,
+    member: 'ben',
+    name: 'ben-mac',
+    profile: 'personal-dev',
+    port: personalPort,
+    patch: { defaultExecutor: 'inbox' },
+    transport: {
+      discoveryDir: join(root, 'personal-mesh'),
+      multicast: false,
+    },
+  });
+  const relaySeed = runtimeFor(root, 'relay-seed');
+  const secondSender = runtimeFor(root, 'second-sender');
+  const otherOffline = runtimeFor(root, 'other-offline');
+  runtimes.push(upgradedPersonal, relaySeed, secondSender, otherOffline);
+  await upgradedPersonal.start();
+  await relaySeed.start();
+  await secondSender.start();
+  await otherOffline.start();
+  await relaySeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await otherOffline.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [relaySeed.transport.endpointAddr!],
+  });
+  await secondSender.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [upgradedPersonal.transport.endpointAddr!, relaySeed.transport.endpointAddr!],
+  });
+  await until(
+    () => secondSender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'other-offline'),
+    'second sender learns other-offline card via relay seed',
+  );
+  const otherOfflineTarget = otherOffline.node.getSelfCard(NETWORK).nodeId;
+  await otherOffline.stop();
+
+  // New third-party offline custody is refused by upgraded personal-dev and lands on relaySeed.
+  const freshSend = await secondSender.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: [otherOfflineTarget] },
+    kind: 'collab.request.v1',
+    subject: 'New custody refused',
+    body: 'must skip upgraded personal-dev and spool on headless-relay',
+    payload: {},
+  });
+  assert.equal(freshSend.receipts[0]?.stage, 'queued');
+  assert.equal(freshSend.receipts[0]?.executionReceipt?.relaySpooled, true);
+  assert.equal(
+    readRelaySpool(join(root, 'relay-seed', 'relay-spool', `${keys.swarmTopicId}.json`)).entries.some(
+      entry => entry.targetNodeId === otherOfflineTarget,
+    ),
+    true,
+  );
+  assert.equal(
+    readRelaySpool(spoolFile).entries.some(entry => entry.targetNodeId === otherOfflineTarget),
+    false,
+    'upgraded personal-dev must not admit new third-party entries into its spool',
+  );
+
+  // Returning target receives the pre-existing spooled frame and fetches the retained blob
+  // from upgraded personal-dev even while the original sender remains offline.
+  const returningTarget = runtimeFor(root, 'target');
+  runtimes.push(returningTarget);
+  await returningTarget.start();
+  await until(
+    () => returningTarget.mailbox.list().totalCount === 1,
+    'upgraded personal-dev drains pre-existing spooled mail with retained blob',
+  );
+  const delivered = returningTarget.mailbox.list().items[0];
+  assert.equal(delivered.envelope.id, spooled.messageId);
+  const localAttachments = delivered.envelope.payload.localAttachments as string[];
+  assert.equal(localAttachments.length, 1);
+  assert.equal(readFileSync(localAttachments[0], 'utf8'), 'retained-across-personal-dev-upgrade');
+});
+
+test('OutboxRedriveService propagates shared 15s default delivery attempt budget and honors explicit override', async t => {
+  const timeouts: number[] = [];
+  const harness = await emitterHarness(t, {
+    send: async (_target, _bytes, opts) => {
+      if (opts?.timeoutMs !== undefined) timeouts.push(opts.timeoutMs);
+      throw new PeerUnreachableError(harness.targetCard.nodeId, 'connect ETIMEDOUT');
+    },
+  });
+  const first = await harness.emitter.emit({
+    networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v1',
+    subject: 'Default redrive timeout',
+    body: 'must use shared 15s attempt budget',
+    payload: {},
+  });
+  assert.equal(first.receipts[0]?.stage, 'queued');
+  assert.equal(timeouts.length, 1);
+  assert.ok(timeouts[0] > 10_000 && timeouts[0] <= 15_000, `expected initial send timeout in (10000, 15000], got ${timeouts[0]}`);
+
+  const defaultRedrive = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: harness.emitter.redriveOutboxItem!,
+  });
+  await defaultRedrive.flush({ force: true });
+  assert.equal(timeouts.length, 2);
+  assert.ok(
+    timeouts[1] > 10_000 && timeouts[1] <= 15_000,
+    `expected OutboxRedriveService default timeout in (10000, 15000], got ${timeouts[1]}`,
+  );
+
+  const overrideRedrive = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: harness.emitter.redriveOutboxItem!,
+    attemptTimeoutMs: 4_200,
+  });
+  await overrideRedrive.flush({ force: true });
+  assert.equal(timeouts.length, 3);
+  assert.ok(
+    timeouts[2] > 0 && timeouts[2] <= 4_200,
+    `expected OutboxRedriveService override timeout in (0, 4200], got ${timeouts[2]}`,
+  );
+});

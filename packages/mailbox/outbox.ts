@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import {
-  committedOutboxTargets, envelopeClaimVersion, hasProvenUnattemptedFailure, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
+  committedOutboxTargets, DEFAULT_DELIVERY_ATTEMPT_TIMEOUT_MS, envelopeClaimVersion, hasProvenUnattemptedFailure, isConfirmedHandoffReceipt, isRelinquishedCustodyReceipt, isRetainedApprovalReceipt,
   isRetryablePreEffectReceipt, isUnattemptedOutboxItem, isUnknownEffectReceipt, outboxReconciliationTargets,
   outstandingRelaySpooledTargets, sameEnvelopeIntent,
 } from '../core-types/index.ts';
@@ -81,7 +81,6 @@ const LEGACY_OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
 const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
 const MIN_ATTEMPT_DELAY_MS = 2_000;
 const MAX_ATTEMPT_DELAY_MS = 60_000;
-const DEFAULT_REDRIVE_TIMEOUT_MS = 10_000;
 const DEFAULT_CLAIM_LEASE_MS = 60_000;
 
 export interface OutboxAttemptUpdate {
@@ -1045,7 +1044,7 @@ export class OutboxRedriveService {
     this.onError = options.onError ?? (() => {});
     this.onTargetsResolved = options.onTargetsResolved;
     this.intervalMs = options.intervalMs ?? DEFAULT_REDRIVE_INTERVAL_MS;
-    this.attemptTimeoutMs = options.attemptTimeoutMs ?? DEFAULT_REDRIVE_TIMEOUT_MS;
+    this.attemptTimeoutMs = options.attemptTimeoutMs ?? DEFAULT_DELIVERY_ATTEMPT_TIMEOUT_MS;
   }
 
   start(): void {

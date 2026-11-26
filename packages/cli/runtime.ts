@@ -562,11 +562,20 @@ export class DealerNodeRuntime {
         saveJson(keyPath, keyPair);
       }
       const advertisedHost = this.options.transport?.advertisedHost ?? process.env.DEALER_ADVERTISED_HOST;
+      const explicitSpoolDir = this.options.transport?.spoolDir;
+      const spoolDir =
+        explicitSpoolDir !== undefined
+          ? (explicitSpoolDir || undefined)
+          : join(this.stateDir, 'relay-spool');
+      const acceptRelaySpool =
+        this.options.transport?.acceptRelaySpool ??
+        (Boolean(explicitSpoolDir) || this.config.profile === 'headless-relay');
       await this.kernel.use(
         createTransportPlugin({
           ...this.options.transport,
           ...(advertisedHost ? { advertisedHost } : {}),
-          spoolDir: join(this.stateDir, 'relay-spool'),
+          ...(spoolDir ? { spoolDir } : { spoolDir: undefined }),
+          acceptRelaySpool,
           listenPort: this.config.port,
           localNodeId: keyPair.nodeId,
         }),
@@ -1277,18 +1286,23 @@ export class DealerNodeRuntime {
     return { ...executor, execute: async (batch, context, config) => {
       const local = [];
       const signedEnvelopes: Record<string, MessageEnvelope> = { ...(context.signedEnvelopes ?? {}) };
-      for (const envelope of batch) {
-        signedEnvelopes[envelope.id] ??= structuredClone(envelope);
-        const directory = join(this.stateDir, 'attachments', encodeURIComponent(envelope.id));
-        const files: string[] = [];
-        for (const [index, attachment] of envelope.attachments.entries()) {
-          mkdirSync(directory, { recursive: true, mode: 0o700 });
-          const destination = join(directory, `${index}-${basename(attachment.name)}`);
-          await this.transport.fetchBlobToPath(attachment.ticket, destination);
-          files.push(destination);
+      try {
+        for (const envelope of batch) {
+          signedEnvelopes[envelope.id] ??= structuredClone(envelope);
+          const directory = join(this.stateDir, 'attachments', encodeURIComponent(envelope.id));
+          const files: string[] = [];
+          for (const [index, attachment] of envelope.attachments.entries()) {
+            mkdirSync(directory, { recursive: true, mode: 0o700 });
+            const destination = join(directory, `${index}-${basename(attachment.name)}`);
+            await this.transport.fetchBlobToPath(attachment.ticket, destination);
+            files.push(destination);
+          }
+          const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload) ? envelope.payload : {};
+          local.push({ ...envelope, payload: { ...payload, localAttachments: files } });
         }
-        const payload = envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload) ? envelope.payload : {};
-        local.push({ ...envelope, payload: { ...payload, localAttachments: files } });
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        throw Object.assign(failure, { beforeExternalEffect: true });
       }
       return executor.execute(local, { ...context, signedEnvelopes }, { ...config, ...this.config.executorConfig[executor.name] });
     } };

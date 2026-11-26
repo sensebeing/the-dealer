@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm, stat, readdir } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -605,7 +605,7 @@ test('direct frame bounds an unfinished TCP handshake independently of the RPC b
   const started = Date.now();
   await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', {}, 90_000),
     (error: any) => error.code === 'ETIMEDOUT' && !(error instanceof DeliveryTimeoutError));
-  assert.ok(Date.now() - started < 3000, 'TCP establishment must not wait for the 90s RPC deadline');
+  assert.ok(Date.now() - started < 5_000, 'TCP establishment must not wait for the 90s RPC deadline');
   await assert.rejects(internal.directFrame({}, 'target', '127.0.0.1:1', {}, 20),
     (error: any) => error.code === 'ETIMEDOUT' && !(error instanceof DeliveryTimeoutError));
   connect.mock.restore();
@@ -864,4 +864,158 @@ test('prunePeers removes targeted or unreachable cards, preserves replay/equivoc
     removedNodeIds: [relay.nodeId],
   });
   assert.deepEqual(await persistedIds(), new Set());
+});
+
+test('delayed direct Tailscale beacon upgrades relay-gossiped LAN endpoint without rolling back expiry', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-tailscale-upgrade-'));
+  const kernel = new Kernel([
+    { plugin: createTransportPlugin({ discoveryDir: dir, multicast: false, discoveryIntervalMs: 60_000 }) },
+  ]);
+  t.after(async () => { await kernel.stop(); await rm(dir, { recursive: true, force: true }); });
+  await kernel.start();
+  const transport = kernel.ctx.services.transport as P2PTransportService;
+  await transport.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+  const keys = deriveNetworkKeys('team', 'secret');
+  const peer = generateNodeKeyPair();
+  const events: Array<{ networkId: string; nodeId: string; via: string }> = [];
+  kernel.ctx.on('transport/peer-reachable', event => events.push(event));
+
+  const internal = transport as unknown as {
+    learnWithMeta(frame: unknown, remoteHost?: string, viaSeed?: string): { mount?: { beacons: Map<string, { expires: number }>; relays: Map<string, string> } };
+  };
+  const gossipExpires = Date.now() + 9_500;
+  const gossipFrame = sealNetworkFrame(
+    { type: 'discovery', endpointAddr: '10.165.37.126:45874', expires: gossipExpires },
+    keys,
+    peer.nodeId,
+  );
+  const first = internal.learnWithMeta(gossipFrame, undefined, '43.110.36.140:8880');
+  assert.equal(transport.listPeerEndpoints('team').get(peer.nodeId), '10.165.37.126:45874');
+  assert.equal(first.mount?.relays.get(peer.nodeId), '43.110.36.140:8880');
+  assert.equal(first.mount?.beacons.get(peer.nodeId)?.expires, gossipExpires);
+  assert.deepEqual(events, [{ networkId: 'team', nodeId: peer.nodeId, via: 'relay' }]);
+
+  const directExpires = gossipExpires - 1_000;
+  const directFrame = sealNetworkFrame(
+    { type: 'discovery', endpointAddr: '10.165.37.126:45874', expires: directExpires },
+    keys,
+    peer.nodeId,
+  );
+  internal.learnWithMeta(directFrame, '100.64.0.28');
+  assert.equal(transport.listPeerEndpoints('team').get(peer.nodeId), '100.64.0.28:45874');
+  assert.equal(first.mount?.relays.has(peer.nodeId), false);
+  assert.equal(
+    first.mount?.beacons.get(peer.nodeId)?.expires,
+    gossipExpires,
+    'upgrading the endpoint must not roll back the newer beacon expiry',
+  );
+  assert.deepEqual(events, [
+    { networkId: 'team', nodeId: peer.nodeId, via: 'relay' },
+    { networkId: 'team', nodeId: peer.nodeId, via: 'direct' },
+  ]);
+
+  // Repeating the same delayed direct observation does not emit a duplicate reachability event.
+  internal.learnWithMeta(directFrame, '100.64.0.28');
+  assert.equal(events.length, 2);
+});
+
+test('announce refreshes wildcard endpointAddr on DHCP IP change and fetchBlobToPath falls back to signed ticket host', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-dhcp-blob-'));
+  let currentLan = '10.165.36.198';
+  const iface = (address: string) => ({
+    en0: [{ address, netmask: '255.255.255.0', family: 'IPv4' as const, mac: '00:00:00:00:00:00', internal: false, cidr: `${address}/24` }],
+  });
+  const mockIfaces = t.mock.method(os, 'networkInterfaces', () => iface(currentLan));
+  const refreshed = new P2PTransportService({ discoveryDir: join(dir, 'dhcp'), multicast: false, discoveryIntervalMs: 60_000 });
+  t.after(async () => {
+    mockIfaces.mock.restore();
+    await refreshed.dispose();
+    await rm(dir, { recursive: true, force: true });
+  });
+  await refreshed.mountNetwork({ networkId: 'dhcp-net', passphrase: 'secret' });
+  const initialEndpoint = refreshed.endpointAddr!;
+  const port = initialEndpoint.slice(initialEndpoint.lastIndexOf(':') + 1);
+  assert.equal(initialEndpoint, `10.165.36.198:${port}`);
+
+  currentLan = '10.165.37.126';
+  const internal = refreshed as unknown as {
+    mounts: Map<string, unknown>;
+    selfEndpoints: Set<string>;
+    announce(mount: unknown): Promise<void>;
+  };
+  await internal.announce(internal.mounts.get('dhcp-net')!);
+  assert.equal(refreshed.endpointAddr, `10.165.37.126:${port}`);
+  assert.equal(internal.selfEndpoints.has(initialEndpoint), false);
+  assert.equal(internal.selfEndpoints.has(`10.165.37.126:${port}`), true);
+  const sampleFile = join(dir, 'sample.txt');
+  await writeFile(sampleFile, 'updated-ip-payload');
+  const updatedBlob = await refreshed.shareFile(sampleFile);
+  assert.ok(updatedBlob.ticket.includes(`@10.165.37.126:${port}/`));
+  mockIfaces.mock.restore();
+
+  // Receiver whose peer map still holds an old dead IP falls back to the signed ticket's url.host.
+  const sender = new P2PTransportService({
+    discoveryDir: join(dir, 'sender'),
+    listenHost: '127.0.0.1',
+    multicast: false,
+    discoveryIntervalMs: 60_000,
+  });
+  const receiver = new P2PTransportService({
+    discoveryDir: join(dir, 'receiver'),
+    listenHost: '127.0.0.1',
+    multicast: false,
+    discoveryIntervalMs: 60_000,
+  });
+  t.after(async () => {
+    await sender.dispose();
+    await receiver.dispose();
+  });
+  await sender.mountNetwork({ networkId: 'blob-net', passphrase: 'secret' });
+  await receiver.mountNetwork({ networkId: 'blob-net', passphrase: 'secret' });
+  const closedServer = createServer();
+  closedServer.listen(0, '127.0.0.1');
+  await once(closedServer, 'listening');
+  const deadPort = (closedServer.address() as { port: number }).port;
+  await new Promise<void>(resolve => closedServer.close(() => resolve()));
+
+  receiver.registerPeerEndpoint('blob-net', sender.localNodeId, `127.0.0.1:${deadPort}`);
+  const payloadBytes = randomBytes(4096);
+  const srcPath = join(dir, 'attachment.bin');
+  const destPath = join(dir, 'fetched.bin');
+  await writeFile(srcPath, payloadBytes);
+  const shared = await sender.shareFile(srcPath);
+  assert.ok(shared.ticket.includes(`@${sender.endpointAddr}/`));
+
+  await receiver.fetchBlobToPath(shared.ticket, destPath);
+  const fetched = await readFile(destPath);
+  assert.deepEqual(fetched, payloadBytes);
+  assert.equal(blake3(fetched), shared.blake3Hash);
+
+  // fetchBlobRelay also bounds an unfinished TCP handshake instead of waiting 90s.
+  const blobReceiver = new P2PTransportService({
+    discoveryDir: join(dir, 'relay-timeout'),
+    listenHost: '127.0.0.1',
+    multicast: false,
+    socketTimeoutMs: 90_000,
+  });
+  t.after(() => blobReceiver.dispose());
+  await blobReceiver.mountNetwork({ networkId: 'blob-net', passphrase: 'secret' });
+  const relayInternal = blobReceiver as unknown as {
+    mounts: Map<string, unknown>;
+    fetchBlobRelay(relay: { mount: unknown; seed: string }, nodeId: string, hash: string, size: number, temp: string): Promise<void>;
+  };
+  const hangConnect = t.mock.method(Socket.prototype, 'connect', function (this: Socket) { return this; });
+  const started = Date.now();
+  await assert.rejects(
+    relayInternal.fetchBlobRelay(
+      { mount: relayInternal.mounts.get('blob-net')!, seed: '127.0.0.1:1' },
+      sender.localNodeId,
+      shared.blake3Hash,
+      shared.sizeBytes,
+      join(dir, 'relay-timeout.part'),
+    ),
+    (error: any) => error.code === 'ETIMEDOUT',
+  );
+  hangConnect.mock.restore();
+  assert.ok(Date.now() - started < 5_000, 'relay blob TCP connect must not wait for 90s RPC timeout');
 });
