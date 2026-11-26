@@ -35,7 +35,7 @@ export * from './config.ts';
 export * from './setup.ts';
 export * from './auto-update.ts';
 
-const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'include-acked', 'help', 'peek', 'wait', 'notify-lark', 'set-default'] as const;
+const booleanFlags = ['json', 'quiet', 'force', 'auto-route', 'trust-sender', 'all', 'include-acked', 'help', 'peek', 'wait', 'notify-lark', 'set-default', 'unreachable'] as const;
 const stringFlags = [
   'host', 'mode', 'workspace-path', 'agent', 'agent-profile', 'target-bot', 'session-id', 'peer-member',
   'thread', 'idempotency-key',
@@ -43,6 +43,7 @@ const stringFlags = [
   'limit',
   'root',
   'id',
+  'node',
   'project',
   'user-patch',
   'module',
@@ -1206,7 +1207,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (v.help === true || group === 'help') {
       stdout(JSON.stringify({
         ok: true,
-        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|worktree|node|project|setup|route|source> [options]',
+        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|peers|worktree|node|project|setup|route|source> [options]',
         commands: {
           send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--idempotency-key <key>] [--attach <path>] [--json]',
           reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
@@ -1216,6 +1217,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           queue: QUEUE_USAGE,
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
+          peers: 'dealer peers <list|resolve|prune> [--network <id>] [--node <nodeId>] [--unreachable] [--json]',
           source: 'dealer source <add|list|wake> [<name>] [--json]',
         },
       }, null, v.json ? undefined : 2));
@@ -1597,6 +1599,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           .filter(c => !v.status || c.runtimeState.load === v.status || c.admissionMode === v.status);
       } else if (action === 'resolve') {
         result = runtime.node.resolveTarget(required(target, 'selector'), network);
+      } else if (action === 'prune') {
+        if (typeof runtime.node.prunePeers !== 'function') {
+          throw new Error('Peer pruning is not supported by this node service');
+        }
+        result = runtime.node.prunePeers({
+          networkId: network,
+          nodeId: v.node as string | undefined,
+          unreachable: v.unreachable === true,
+        });
       } else {
         throw new Error('Unknown peers command');
       }

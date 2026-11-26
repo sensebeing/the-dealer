@@ -515,9 +515,11 @@ test('setup invite prompts reuse configured network, encode seeds, and do not mu
     assert.match(result.teammatePrompt, /collab.request.v4/);
     for (const prompt of [result.crossMachinePrompt, result.teammatePrompt]) {
       assert.match(prompt, /https:\/\/github.com\/sensebeing\/the-dealer.git/);
-      assert.ok(prompt.includes('npm install -g git+https://github.com/sensebeing/the-dealer'));
+      assert.ok(!prompt.includes('npm install -g git+https://github.com/sensebeing/the-dealer'));
+      assert.ok(!prompt.includes('npm --prefix ~/the-dealer link'));
+      assert.ok(prompt.includes('~/.local/bin/dealer'));
+      assert.ok(prompt.includes('cd ~/the-dealer && npm link'));
       assert.ok(prompt.includes("npx skills add sensebeing/the-dealer --global --agent '*'"));
-      assert.ok(prompt.includes('npm --prefix ~/the-dealer link'));
       assert.match(prompt, /~\/\.agents\/skills\//);
       assert.match(prompt, /~\/\.claude\/skills\//);
       assert.match(prompt, /the-dealer-setup\/SKILL.md/);
@@ -597,7 +599,12 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
         assert.ok(args.includes('-p'));
       } else if (agent === 'claude-code') {
         assert.equal(call.command, 'claude');
-        assert.deepEqual(args.slice(0, 3), conversationMode === 'spawn' ? ['--bg', '--name', 'session'] : ['--bg', '--resume', 'session']);
+        assert.deepEqual(
+          args.slice(0, 4),
+          conversationMode === 'spawn'
+            ? ['--bg', '--name', 'session', '--dangerously-skip-permissions']
+            : ['--bg', '--resume', 'session', '--dangerously-skip-permissions'],
+        );
       } else if (agent === 'antigravity') {
         assert.equal(call.command, 'agy');
         assert.deepEqual(args.slice(0, 2), ['run', '--dangerously-skip-permissions']);
@@ -1230,7 +1237,14 @@ for (const [name, factory, command] of [
       assert.equal(existsSync(settings), false);
       assert.equal(existsSync(hostSettings) ? readFileSync(hostSettings, 'utf8') : undefined, beforeSettings);
       if (name === 'codex') assert.equal(calls[0].args[0], mode === 'spawn' ? 'exec' : 'queue');
-      if (name === 'claude-code') assert.equal(calls[0].args[1], mode === 'spawn' ? '--name' : '--resume');
+      if (name === 'claude-code') {
+        assert.deepEqual(
+          calls[0].args.slice(0, 4),
+          mode === 'spawn'
+            ? ['--bg', '--name', 'session', '--dangerously-skip-permissions']
+            : ['--bg', '--resume', 'session', '--dangerously-skip-permissions'],
+        );
+      }
       if (name === 'antigravity') {
         // Invalid invocation configuration must fail before trusting the workspace: a
         // pre-effect error cannot leave a settings mutation behind.
@@ -2500,4 +2514,76 @@ test('queued thread addressing uses payload hints without validating execution p
     const inbound = runtime.mailbox.listThreadRecords(result.messageId).find(record => record.direction === 'inbound');
     assert.equal(inbound?.localMailbox, expected === 'task' ? `task:${result.messageId}` : expected);
   }
+});
+
+test('dealer peers prune works through runDealerCli including live daemon RPC', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'state');
+  const runtime = new DealerNodeRuntime({
+    stateDir,
+    member: 'ben',
+    name: 'local',
+    transport: { discoveryDir: join(root, 'discovery') },
+  });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  await runtime.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+  await runtime.serveControl(async argv => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(argv, { runtime, stdout: line => stdout.push(line), stderr: line => stderr.push(line) });
+    return { code, stdout, stderr };
+  });
+
+  const makeCard = (member: string, nodeName: string, updatedAt: string) => {
+    const keys = generateNodeKeyPair();
+    return signNodeCard({
+      nodeId: keys.nodeId,
+      networkId: 'team',
+      revision: 1,
+      identity: { member, nodeName },
+      admissionMode: 'open',
+      capabilities: { summary: '', skills: [] },
+      runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+      updatedAt,
+    }, keys.privateKeyPem);
+  };
+  const liveRelay = makeCard('relay', 'us-master', '2024-01-01T00:00:00.000Z');
+  const staleGhost = makeCard('diz', 'old-mac', '2026-01-02T00:00:00.000Z');
+  for (const peerCard of [liveRelay, staleGhost]) {
+    runtime.kernel.ctx.emit('transport/inbound', {
+      networkId: 'team',
+      senderNodeId: peerCard.nodeId,
+      mode: 'unicast',
+      payload: { type: 'peer.card', card: peerCard },
+    });
+  }
+  t.mock.method(runtime.transport, 'isPeerReachable', (networkId: string, nodeId: string) =>
+    networkId === 'team' && nodeId === liveRelay.nodeId,
+  );
+
+  // Reject unscoped prune via live daemon RPC.
+  const errLines: string[] = [];
+  assert.equal(await runDealerCli(['peers', 'prune', '--network', 'team', '--json'], {
+    stateDir,
+    stdout: () => {},
+    stderr: line => errLines.push(line),
+  }), 1);
+  assert.match(errLines.join(''), /nodeId|unreachable/);
+
+  // Prune unreachable peers via live daemon RPC.
+  const pruned = await cli(['peers', 'prune', '--network', 'team', '--unreachable'], stateDir);
+  assert.deepEqual(pruned, { removedCount: 1, removedNodeIds: [staleGhost.nodeId] });
+  const remaining = await cli(['peers', 'list', '--network', 'team'], stateDir);
+  assert.deepEqual(remaining.map((entry: { nodeId: string }) => entry.nodeId), [liveRelay.nodeId]);
+  const persisted = JSON.parse(readFileSync(join(stateDir, 'peers.json'), 'utf8'));
+  assert.deepEqual(persisted.cards.map((entry: { nodeId: string }) => entry.nodeId), [liveRelay.nodeId]);
+
+  // Direct in-process prune by explicit --node.
+  const directOut: string[] = [];
+  assert.equal(await runDealerCli(['peers', 'prune', '--network', 'team', '--node', liveRelay.nodeId, '--json'], {
+    runtime,
+    stdout: line => directOut.push(line),
+  }), 0);
+  assert.deepEqual(JSON.parse(directOut.join('')), { removedCount: 1, removedNodeIds: [liveRelay.nodeId] });
 });

@@ -12,3 +12,5 @@ package-lock.json
 .gemini/
 .codex/
 coverage/
+/bin/dealer
+/bin/dealerd

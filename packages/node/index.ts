@@ -393,9 +393,14 @@ export class PeerDirectoryService implements NodeService {
         // Steady-state 250ms presence heartbeats carry only the self card.
         const includeKnownCards = refresh || this.gossipRequested.delete(networkId);
         const directory = this.peers.get(networkId);
-        const knownCards = includeKnownCards && directory
-          ? this.activeNetworkCards(networkId, directory).slice(0, MAX_GOSSIPED_PEER_CARDS)
+        const activeCards = includeKnownCards && directory
+          ? this.activeNetworkCards(networkId, directory)
           : [];
+        const knownCards = (
+          typeof this.transport.isPeerReachable === 'function'
+            ? activeCards.filter(card => this.transport.isPeerReachable!(networkId, card.nodeId) === true)
+            : activeCards
+        ).slice(0, MAX_GOSSIPED_PEER_CARDS);
         await this.transport.broadcast(
           networkId,
           'peer.card',
@@ -462,7 +467,7 @@ export class PeerDirectoryService implements NodeService {
       onlyAvailable?: boolean;
     } = {},
   ): readonly NodeCard[] {
-    return this.mountedPeerDirectories(filter.networkId)
+    const matched = this.mountedPeerDirectories(filter.networkId)
       .flatMap(([networkId, directory]) => this.activeNetworkCards(networkId, directory))
       .filter(
         card =>
@@ -473,8 +478,63 @@ export class PeerDirectoryService implements NodeService {
             )) &&
           (!filter.onlyAvailable ||
             (card.runtimeState.load === 'idle' && card.admissionMode === 'open')),
-      )
-      .map(card => structuredClone(card));
+      );
+    if (filter.onlyAvailable && typeof this.transport.isPeerReachable === 'function') {
+      const reachable = matched.filter(
+        card => this.transport.isPeerReachable!(card.networkId, card.nodeId) === true,
+      );
+      if (reachable.length > 0) {
+        return reachable.map(card => structuredClone(card));
+      }
+    }
+    return matched.map(card => structuredClone(card));
+  }
+
+  prunePeers(
+    filter: {
+      networkId?: string;
+      nodeId?: string;
+      unreachable?: boolean;
+    } = {},
+  ): { removedCount: number; removedNodeIds: string[] } {
+    const targetNodeId = typeof filter.nodeId === 'string' ? filter.nodeId.trim() : '';
+    const unreachableOnly = filter.unreachable === true;
+    if (!targetNodeId && !unreachableOnly) {
+      throw new Error('prunePeers requires nodeId or unreachable=true');
+    }
+    let removedCount = 0;
+    const removedNodeIds = new Set<string>();
+    const networkIds = filter.networkId ? [filter.networkId] : [...this.peers.keys()];
+    for (const networkId of networkIds) {
+      const directory = this.peers.get(networkId);
+      if (!directory) {
+        continue;
+      }
+      for (const nodeId of [...directory.keys()]) {
+        if (nodeId === this.keyPair.nodeId) {
+          continue;
+        }
+        if (targetNodeId && nodeId !== targetNodeId) {
+          continue;
+        }
+        if (unreachableOnly && this.transport.isPeerReachable?.(networkId, nodeId) === true) {
+          continue;
+        }
+        directory.delete(nodeId);
+        removedCount += 1;
+        removedNodeIds.add(nodeId);
+      }
+      if (directory.size === 0) {
+        this.peers.delete(networkId);
+      }
+    }
+    if (removedCount > 0) {
+      this.persistPeers();
+    }
+    return {
+      removedCount,
+      removedNodeIds: [...removedNodeIds].sort(),
+    };
   }
 
   private matchSelector(card: NodeCard, selector: string): boolean {

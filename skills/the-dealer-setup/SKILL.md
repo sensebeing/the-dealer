@@ -16,11 +16,20 @@ macOS Apps, redacted node configuration and `.dealer/project.json`. Probe is
 read-only. A socket's presence is not proof of a live daemon; run
 `dealer node status --json` to verify it. An installed CLI is not proof it
 supports this integration's flags; inspect its help before enabling delivery.
-If Dealer is missing, check Node >=22.15 and install the CLI without a manual clone:
+If Dealer is missing (or not backed by a git checkout, which is required for
+`dealer self-update` and background `autoUpdate`), check Node >=22.15 and install
+from a single checkout at `~/the-dealer`:
 
 ```sh
-npm install -g git+https://github.com/sensebeing/the-dealer
+git clone https://github.com/sensebeing/the-dealer.git ~/the-dealer
+mkdir -p ~/.local/bin
+ln -sfn ~/the-dealer/bin/dealer.js ~/.local/bin/dealer
+ln -sfn ~/the-dealer/bin/dealerd.js ~/.local/bin/dealerd
 ```
+
+(Or link globally from inside the checkout with `cd ~/the-dealer && npm link`.)
+If `~/the-dealer` already exists, inspect local changes before updating it with
+`git -C ~/the-dealer pull --ff-only`.
 
 Install the skills for all supported agents:
 
@@ -28,13 +37,10 @@ Install the skills for all supported agents:
 npx skills add sensebeing/the-dealer --global --agent '*'
 ```
 
-Preserve existing installations and configuration. For a local checkout, clone
-`https://github.com/sensebeing/the-dealer.git` into `~/the-dealer`, or inspect local
-changes before updating it with `git -C ~/the-dealer pull --ff-only`. Link the CLI
-with `npm --prefix ~/the-dealer link`. To install skills from that checkout,
-create `~/.agents/skills/` and `~/.claude/skills/`; symlink each of
-`~/the-dealer/skills/the-dealer`, `~/the-dealer/skills/the-dealer-setup`, and
-`~/the-dealer/skills/the-dealer-extend` into both, and into
+Preserve existing installations and configuration. To install skills directly from
+that checkout instead, create `~/.agents/skills/` and `~/.claude/skills/`; symlink
+each of `~/the-dealer/skills/the-dealer`, `~/the-dealer/skills/the-dealer-setup`,
+and `~/the-dealer/skills/the-dealer-extend` into both, and into
 `~/.gemini/config/skills/` if present. Preserve unrelated files and resolve link
 conflicts before changing them. Read the installed `the-dealer-setup/SKILL.md`
 and run `dealer setup probe --root <repository> --json` before configuration.

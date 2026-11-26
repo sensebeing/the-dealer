@@ -28,9 +28,11 @@
 
 ```text
 请为本机安装并配置 https://github.com/sensebeing/the-dealer。
-先检查现有安装和 Node.js >=22.15。缺少 CLI 时运行
-`npm install -g git+https://github.com/sensebeing/the-dealer`；
-如果已有可信的 ~/the-dealer 检出，则可运行 `npm --prefix ~/the-dealer link`。
+先检查现有安装和 Node.js >=22.15。缺少 CLI（或未基于 git 检出安装，从而无法使用
+self-update/autoUpdate）时，将 https://github.com/sensebeing/the-dealer.git 克隆到
+~/the-dealer（已有干净检出则运行 `git -C ~/the-dealer pull --ff-only`），并将
+~/the-dealer/bin/dealer.js 与 ~/the-dealer/bin/dealerd.js 软链到 ~/.local/bin/dealer
+与 ~/.local/bin/dealerd（或运行 `cd ~/the-dealer && npm link`）。
 运行 `npx skills add sensebeing/the-dealer --global --agent '*'` 安装技能，
 保留已有配置。随后按已安装的 the-dealer-setup 技能引导我选择宿主预设
 （orca-dev、codex-dev、claude-dev 或 antigravity-dev）与会话模式（spawn、wave、fixed
@@ -47,13 +49,16 @@
 
 ### 快速安装
 
-无需手动克隆仓库即可安装 CLI：
+将仓库克隆到 `~/the-dealer` 并软链可执行文件（`dealer self-update` 与后台 `autoUpdate` 需要完整的 git 检出）：
 
 ```sh
-npm install -g git+https://github.com/sensebeing/the-dealer
+git clone https://github.com/sensebeing/the-dealer.git ~/the-dealer
+mkdir -p ~/.local/bin
+ln -sfn ~/the-dealer/bin/dealer.js ~/.local/bin/dealer
+ln -sfn ~/the-dealer/bin/dealerd.js ~/.local/bin/dealerd
 ```
 
-已有本地检出时，可运行 `npm --prefix ~/the-dealer link`。为所有支持的 Agent 安装技能：
+（也可在检出目录内运行 `cd ~/the-dealer && npm link`。）为所有支持的 Agent 安装技能：
 
 ```sh
 npx skills add sensebeing/the-dealer --global --agent '*'
@@ -176,6 +181,7 @@ dealer setup apply-preset --host orca --mode spawn --project <project-id> --work
 | `dealer network invite <id> --ttl 1h --json` | 生成 `dealer-net://v1/...` 网络邀请链接。 |
 | `dealer network mount '<invite>' --json` / `dealer network unmount <id> --json` | 加入或卸载指定协作网络。 |
 | `dealer peers list --network <id> --json` | 查看指定网络内已发现的节点。 |
+| `dealer peers prune --network <id> --unreachable --json` | 清理内存与 `peers.json` 中不可达或指定的过期节点名片。 |
 | `dealer send --network local --to member:alice --topic collab.request.v4 --body 'Review this change' --json` | 发送路由消息或协作请求。 |
 | `dealer inbox check --mailbox <id> --json` | 获取待处理邮件并签发投递租约。 |
 | `dealer inbox ack <dlv-id> --mailbox <id> --json` | 确认并结算投递租约。 |

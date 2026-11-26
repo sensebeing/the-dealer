@@ -28,9 +28,12 @@ Paste either prompt into Claude Code, Codex, Cursor, Antigravity, or Orca.
 
 ```text
 Install and set up https://github.com/sensebeing/the-dealer on this machine.
-Check existing installs and Node.js >=22.15 first. If the CLI is missing, run
-`npm install -g git+https://github.com/sensebeing/the-dealer`; if I already have
-a trusted ~/the-dealer checkout, use `npm --prefix ~/the-dealer link`.
+Check existing installs and Node.js >=22.15 first. If the CLI is missing (or not
+backed by a git checkout, which is required for self-update/autoUpdate), clone
+https://github.com/sensebeing/the-dealer.git into ~/the-dealer (or update an
+existing clean checkout with `git -C ~/the-dealer pull --ff-only`) and symlink
+~/the-dealer/bin/dealer.js and ~/the-dealer/bin/dealerd.js into ~/.local/bin/dealer
+and ~/.local/bin/dealerd (or run `cd ~/the-dealer && npm link`).
 Install the skills with `npx skills add sensebeing/the-dealer --global --agent '*'`,
 preserving existing configuration. Follow the installed the-dealer-setup skill
 to choose a host profile (orca-dev, codex-dev, claude-dev, or antigravity-dev)
@@ -49,13 +52,16 @@ and verification steps.
 
 ### Quick install
 
-Install the CLI without a manual clone:
+Clone a local git checkout at `~/the-dealer` and link the binaries (a git checkout is required so `dealer self-update` and background `autoUpdate` work out of the box):
 
 ```sh
-npm install -g git+https://github.com/sensebeing/the-dealer
+git clone https://github.com/sensebeing/the-dealer.git ~/the-dealer
+mkdir -p ~/.local/bin
+ln -sfn ~/the-dealer/bin/dealer.js ~/.local/bin/dealer
+ln -sfn ~/the-dealer/bin/dealerd.js ~/.local/bin/dealerd
 ```
 
-From an existing checkout, use `npm --prefix ~/the-dealer link`. Install the skills for all supported agents:
+(Alternatively, run `cd ~/the-dealer && npm link`.) Install the skills for all supported agents:
 
 ```sh
 npx skills add sensebeing/the-dealer --global --agent '*'
@@ -200,6 +206,7 @@ See [the-dealer-extend](skills/the-dealer-extend/SKILL.md) and the [plugin guide
 | `dealer network invite <id> --ttl 1h --json` | Generate a `dealer-net://v1/...` network invitation URI. |
 | `dealer network mount '<invite>' --json` / `dealer network unmount <id> --json` | Join or detach from a mounted network. |
 | `dealer peers list --network <id> --json` | List discovered peers in a network. |
+| `dealer peers prune --network <id> --unreachable --json` | Remove unreachable or targeted stale peer cards from memory and `peers.json`. |
 | `dealer send --network local --to member:alice --topic collab.request.v4 --body 'Review this change' --json` | Send a routed task or message. |
 | `dealer inbox check --mailbox <id> --json` | Claim pending messages as a delivery lease. |
 | `dealer inbox ack <dlv-id> --mailbox <id> --json` | Acknowledge and settle a delivery lease. |
