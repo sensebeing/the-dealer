@@ -9,7 +9,7 @@ import {
   statSync,
 } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
-import { tmpdir, networkInterfaces } from 'node:os';
+import os, { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { randomUUID, createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
@@ -178,7 +178,7 @@ const RELAY_SPOOL_SCHEMA = 'the-dealer-relay-spool/v1';
 const GROUP = '239.255.42.99';
 // A relay candidate means the advertised endpoint may be NAT-bound; fail over fast
 // instead of waiting the full request timeout on every unicast.
-const RELAY_CONNECT_TIMEOUT_MS = 1_500;
+const RELAY_CONNECT_TIMEOUT_MS = 3_500;
 const BEACON_EXPIRY_GRACE_MS = 30_000;
 // Relay responses carry one base64 blob inside a JSON packet, so the raw blob may only
 // fill three quarters of the frame budget minus the packet envelope.
@@ -238,7 +238,7 @@ export async function discoverTailscaleIpv4Peers(): Promise<string[]> {
 
 /** IPv4 broadcast targets for the LAN links that carry unicast discovery frames. */
 export function lanBroadcastAddresses(
-  interfaces = networkInterfaces(),
+  interfaces = os.networkInterfaces(),
 ): { address: string; broadcast: string }[] {
   const targets: { address: string; broadcast: string }[] = [];
   for (const [name, addresses] of Object.entries(interfaces)) {
@@ -540,7 +540,7 @@ function isPrivateLanIpv4Host(host: string): boolean {
 /** Shared by the listener and offline invite generation. */
 export function defaultAdvertisedHost(
   options: TransportPluginOptions = {},
-  interfaces = networkInterfaces(),
+  interfaces = os.networkInterfaces(),
 ): string {
   if (options.advertisedHost) return options.advertisedHost;
   if (options.listenHost && !['0.0.0.0', '::'].includes(options.listenHost)) return options.listenHost;
@@ -648,7 +648,7 @@ export class P2PTransportService implements TransportService {
       if (['127.0.0.1', '::1', 'localhost', '0.0.0.0', '::'].includes(host)) {
         return true;
       }
-      for (const addresses of Object.values(networkInterfaces())) {
+      for (const addresses of Object.values(os.networkInterfaces())) {
         for (const address of addresses ?? []) {
           if (normalizedHost(address.address) === host) {
             return true;
@@ -1839,8 +1839,32 @@ export class P2PTransportService implements TransportService {
       viaSeed !== undefined && !this.isSelfEndpoint(viaSeed) ? viaSeed : undefined;
     const current = m.beacons.get(frame.senderNodeId);
     if (current && beacon.expires <= current.expires) {
-      // Beacons travel by gossip, so a delayed frame from the same or an older
-      // generation must never rewrite this peer's endpoint or relay mapping.
+      // A fast relay seed can gossip a peer's LAN beacon ahead of the direct Tailscale
+      // packet from the same or an earlier generation. Upgrade the endpoint when direct
+      // observation proves a routed Tailscale address without rolling back expiry.
+      if (effectiveViaSeed === undefined && remoteHost) {
+        const priorEndpoint = m.peers.get(frame.senderNodeId);
+        const observed = this.reachableEndpoint(beacon.endpointAddr, remoteHost);
+        if (priorEndpoint && observed !== priorEndpoint) {
+          try {
+            const priorHost = parseEndpoint(priorEndpoint).host;
+            const observedHost = parseEndpoint(observed).host;
+            if (isPrivateLanIpv4Host(priorHost) && isTailscaleIpv4Host(observedHost)) {
+              this.registerPeerEndpoint(m.config.networkId, frame.senderNodeId, observed);
+              m.relays.delete(frame.senderNodeId);
+              if (m.peers.get(frame.senderNodeId) !== priorEndpoint) {
+                this.ctx?.emit('transport/peer-reachable', {
+                  networkId: m.config.networkId,
+                  nodeId: frame.senderNodeId,
+                  via: 'direct',
+                });
+              }
+            }
+          } catch {
+            // Malformed endpoint strings cannot upgrade an existing peer entry.
+          }
+        }
+      }
       return { mount: m, reply: beacon.reply === true };
     }
     const now = Date.now();
@@ -1932,10 +1956,31 @@ export class P2PTransportService implements TransportService {
     return this.localBeacon(m, reply).frame;
   }
 
+  /** Refresh the advertised endpoint when a wildcard listener's host IP changes via DHCP. */
+  private refreshAdvertisedEndpoint(): void {
+    if (
+      this.options.advertisedHost ||
+      (this.options.listenHost && !['0.0.0.0', '::'].includes(this.options.listenHost)) ||
+      this.listenPort === undefined
+    ) {
+      return;
+    }
+    const host = defaultAdvertisedHost(this.options);
+    const nextEndpoint = `${host.includes(':') ? `[${host}]` : host}:${this.listenPort}`;
+    if (nextEndpoint !== this.endpointAddr) {
+      if (this.endpointAddr) {
+        this.selfEndpoints.delete(this.endpointAddr);
+      }
+      this.endpointAddr = nextEndpoint;
+      this.selfEndpoints.add(nextEndpoint);
+    }
+  }
+
   private async announce(m: Mount): Promise<void> {
     if (this.closed || !this.mounts.has(m.config.networkId)) {
       return;
     }
+    this.refreshAdvertisedEndpoint();
     const { frame, expires } = this.localBeacon(m);
     m.beacons.set(this.localNodeId, { frame, expires });
     this.pruneBeacons(m);
@@ -1988,7 +2033,7 @@ export class P2PTransportService implements TransportService {
         // below exchanges sealed beacons so isolated peers can discover each other.
         const prior = [...m.outboundTunnels.entries()].find(([, entry]) => entry.seed === seed && entry.acked);
         const socket = this.track(createConnection(parseEndpoint(seed)));
-        socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
+        socket.setTimeout(Math.min(this.options.socketTimeoutMs ?? 5_000, 5_000));
         try {
           socket.write(packet({
             type: 'discovery',
@@ -2124,7 +2169,9 @@ export class P2PTransportService implements TransportService {
           target,
           address,
           frame,
-          fallbacks.length ? Math.min(remaining(), RELAY_CONNECT_TIMEOUT_MS) : remaining(),
+          fallbacks.length
+            ? Math.min(Math.max(1, Math.floor(remaining() / (fallbacks.length + 1))), RELAY_CONNECT_TIMEOUT_MS)
+            : remaining(),
           onWrite,
         );
       } catch (error) {
@@ -2721,7 +2768,7 @@ export class P2PTransportService implements TransportService {
     socket.setKeepAlive(true, 15_000);
     const ackTimer = setTimeout(() => {
       if (!entry.acked) socket.destroy();
-    }, Math.min(this.options.socketTimeoutMs ?? 2000, 2000));
+    }, Math.min(this.options.socketTimeoutMs ?? 5_000, 5_000));
     ackTimer.unref?.();
     socket.once('close', () => {
       clearTimeout(ackTimer);
@@ -2906,11 +2953,12 @@ export class P2PTransportService implements TransportService {
   }
 
   private async readBlobAt(address: string, hash: string): Promise<Buffer> {
+    const wirePacket = packet({ type: 'blob', hash });
     const socket = this.track(createConnection(parseEndpoint(address)));
-    socket.setTimeout(this.options.socketTimeoutMs ?? 90_000);
+    const timeoutMs = this.options.socketTimeoutMs ?? 90_000;
+    const stopWriting = this.writeOnConnect(socket, wirePacket, timeoutMs);
     const reader = new SocketReader(socket);
     try {
-      socket.write(packet({ type: 'blob', hash }));
       const metadata = await reader.json();
       if (typeof metadata?.size !== 'number' || metadata.size > RELAY_BLOB_LIMIT) {
         throw new Error('Relay blob unavailable');
@@ -2929,6 +2977,7 @@ export class P2PTransportService implements TransportService {
       }
       return Buffer.concat(chunks);
     } finally {
+      stopWriting();
       socket.destroy();
     }
   }
@@ -3020,6 +3069,28 @@ export class P2PTransportService implements TransportService {
         reject('Invalid relay target');
         return;
       }
+      if (target === this.localNodeId) {
+        try {
+          const event = this.inboundEvent(mount, frame);
+          const reply = await this.inboundReply(event);
+          socket.end(
+            packet({
+              ok: true,
+              frame: sealNetworkFrame(
+                {
+                  requestNonce: frame.nonce,
+                  dataBase64: Buffer.from(reply).toString('base64'),
+                },
+                mount.keys,
+                this.localNodeId,
+              ),
+            }),
+          );
+        } catch (error) {
+          reject(error instanceof Error ? error.message : String(error));
+        }
+        return;
+      }
       if (
         request.spoolKey !== undefined &&
         (typeof request.spoolKey !== 'string' ||
@@ -3031,10 +3102,7 @@ export class P2PTransportService implements TransportService {
         return;
       }
       const spoolIfOffline = request.spoolIfOffline === true;
-      if (
-        spoolIfOffline &&
-        (!/^ed25519:[0-9a-f]{64}$/.test(target) || target === this.localNodeId)
-      ) {
+      if (spoolIfOffline && !/^ed25519:[0-9a-f]{64}$/.test(target)) {
         socket.end(packet({ error: 'Invalid relay spool target' }));
         return;
       }
@@ -3103,7 +3171,7 @@ export class P2PTransportService implements TransportService {
         socket.end(packet({ error: liveError.message }));
         return;
       }
-      if (!spoolIfOffline) {
+      if (!spoolIfOffline || !mount.spoolFile) {
         throw liveError;
       }
       try {
@@ -3127,6 +3195,19 @@ export class P2PTransportService implements TransportService {
       if (cached) {
         socket.write(packet({ size: cached.length }));
         socket.end(cached);
+        return;
+      }
+      if (target === this.localNodeId) {
+        const blob = this.blobs.get(hash);
+        if (!blob || blob.size > RELAY_BLOB_LIMIT) {
+          throw new Error('Relay blob unavailable');
+        }
+        const bytes = await readFile(blob.path);
+        if (bytes.length > RELAY_BLOB_LIMIT) {
+          throw new Error('Relay blob unavailable');
+        }
+        socket.write(packet({ size: bytes.length }));
+        socket.end(bytes);
         return;
       }
       const tunnel = mount.inboundTunnels.get(target);
@@ -3273,40 +3354,45 @@ export class P2PTransportService implements TransportService {
     } catch {
       throw new Error('Invalid blob ticket');
     }
-    const owner = [...this.mounts.values()].find(mount => mount.peers.has(nodeId));
-    const directCandidates = nodeId === this.localNodeId
-      ? [this.endpointAddr]
-      : [owner?.peers.get(nodeId), url.host];
-    const directAddresses = [...new Set(
-      directCandidates.filter((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0),
-    )];
-    if (directAddresses.length === 0) {
-      throw new Error('Transport endpoint unavailable');
-    }
+    const directCandidates =
+      nodeId === this.localNodeId
+        ? (this.endpointAddr ? [this.endpointAddr] : [])
+        : [
+            ...new Set(
+              [...[...this.mounts.values()].map(mount => mount.peers.get(nodeId)), url.host].filter(
+                (candidate): candidate is string =>
+                  Boolean(candidate) && !this.isSelfEndpoint(candidate),
+              ),
+            ),
+          ];
     const fallbacks = nodeId === this.localNodeId ? [] : this.peerFallbacks(nodeId, this.mounts.values());
     // Relay seeds keep a content-addressed cache of spooled attachments. When the original
     // sender is now offline, ask each configured seed *inside that seed's own network* so
     // the blob cache never becomes a cross-network read path. writeBlob still proves BLAKE3.
+    const directSet = new Set(directCandidates);
     const seedFallbacks = new Map<string, { mount: Mount; seed: string }>();
     if (nodeId !== this.localNodeId) {
       for (const mount of this.mounts.values()) {
         for (const seed of mount.config.bootstrapPeers ?? []) {
-          if (this.isSelfEndpoint(seed) || directAddresses.includes(seed)) {
+          if (this.isSelfEndpoint(seed) || directSet.has(seed)) {
             continue;
           }
           seedFallbacks.set(`${mount.keys.swarmTopicId}\n${seed}`, { mount, seed });
         }
       }
     }
+    if (directCandidates.length === 0 && fallbacks.length === 0 && seedFallbacks.size === 0) {
+      throw new Error('Transport endpoint unavailable');
+    }
     try {
-      let lastError: unknown;
-      const fastFail = directAddresses.length > 1 || fallbacks.length > 0 || seedFallbacks.size > 0;
-      for (const directAddress of directAddresses) {
+      let lastError: unknown = new Error('Transport endpoint unavailable');
+      const fastFail = directCandidates.length > 1 || fallbacks.length > 0 || seedFallbacks.size > 0;
+      for (const candidate of directCandidates) {
         await rm(temp, { force: true });
         try {
           // Multiple direct candidates or relay/seed fallbacks mean an earlier address may be
           // stale or blackholed: fail over fast instead of burning the whole socket budget.
-          await this.fetchBlobDirect(directAddress, hash, size, temp, fastFail);
+          await this.fetchBlobDirect(candidate, hash, size, temp, fastFail);
           lastError = undefined;
           break;
         } catch (error) {
@@ -3314,8 +3400,8 @@ export class P2PTransportService implements TransportService {
         }
       }
       if (lastError !== undefined) {
-        // The advertised endpoint is NAT-bound: try the peer's own tunnel to this node,
-        // then every seed that can relay to it, until one transfer walks the hash.
+        // The advertised endpoint is NAT-bound or stale: try the peer's own tunnel to this
+        // node, then every seed that can relay to it, until one transfer walks the hash.
         for (const fallback of fallbacks) {
           await rm(temp, { force: true });
           try {
@@ -3360,18 +3446,21 @@ export class P2PTransportService implements TransportService {
     temp: string,
     fastFail: boolean,
   ): Promise<void> {
+    const wirePacket = packet({ type: 'blob', hash });
     const socket = this.track(createConnection(parseEndpoint(address)));
     const timeoutMs = this.options.socketTimeoutMs ?? 90_000;
-    socket.setTimeout(fastFail ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs);
+    const effectiveTimeoutMs = fastFail ? Math.min(timeoutMs, RELAY_CONNECT_TIMEOUT_MS) : timeoutMs;
+    const stopWriting = this.writeOnConnect(socket, wirePacket, effectiveTimeoutMs);
     const reader = new SocketReader(socket);
     try {
-      socket.write(packet({ type: 'blob', hash }));
       const metadata = await reader.json();
       if (metadata.size !== size) {
         throw new Error('Blob size mismatch');
       }
+      socket.setTimeout(timeoutMs);
       await this.writeBlob(reader, size, hash, temp, error => socket.destroy(error));
     } finally {
+      stopWriting();
       socket.destroy();
     }
   }
@@ -3383,15 +3472,17 @@ export class P2PTransportService implements TransportService {
     size: number,
     temp: string,
   ): Promise<void> {
+    const wirePacket = packet({
+      type: 'relay_blob',
+      swarmTopicId: relay.mount.keys.swarmTopicId,
+      target: nodeId,
+      hash,
+    });
     const socket = this.track(createConnection(parseEndpoint(relay.seed)));
+    const timeoutMs = this.options.socketTimeoutMs ?? 90_000;
+    const stopWriting = this.writeOnConnect(socket, wirePacket, timeoutMs);
     const reader = new SocketReader(socket);
     try {
-      socket.write(packet({
-        type: 'relay_blob',
-        swarmTopicId: relay.mount.keys.swarmTopicId,
-        target: nodeId,
-        hash,
-      }));
       const metadata = await reader.json();
       if (metadata?.error) {
         throw new Error(String(metadata.error));
@@ -3401,6 +3492,7 @@ export class P2PTransportService implements TransportService {
       }
       await this.writeBlob(reader, size, hash, temp, error => socket.destroy(error));
     } finally {
+      stopWriting();
       socket.destroy();
     }
   }

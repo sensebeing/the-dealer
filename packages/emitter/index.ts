@@ -43,6 +43,8 @@ import type {
 } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 15_000;
+
 export interface EmitterConfig {
   privateKeyPem?: string;
   onSourceError?: (error: unknown) => void;
@@ -488,7 +490,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               if (route.mode === 'broadcast') {
                 await transport.broadcast(envelope.networkId, envelope.routing.topic ?? 'messages', frame);
               } else {
-                const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
+                const deadline = Date.now() + (settings.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS);
                 const attempts = await Promise.all(route.targetNodeIds.map(target =>
                   attemptTarget(envelope, target, frame, {
                     deadline,
@@ -740,7 +742,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           // All targets share a deadline but start independently; a dead peer cannot
           // consume a live sibling's send budget. Fold evidence in target order.
           if (outbox && attemptToken && targets.length > 0) item = prepareSend(item.id, attemptToken, targets);
-          const deadline = Date.now() + (options.timeoutMs ?? 10_000);
+          const deadline = Date.now() + (options.timeoutMs ?? settings.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS);
           const attempts = await Promise.all(targets.map(target => {
             if (Date.now() >= deadline) return undefined;
             return attemptTarget(item.envelope, target, frame, {
@@ -929,7 +931,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
           for (const [hash, path] of Object.entries(existing.stagedFiles)) transport.registerBlob?.(hash, path);
           const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope: existing.envelope }));
           prepareSend(existing.id, attemptToken, targets);
-          const deadline = Date.now() + (settings.attemptTimeoutMs ?? 10_000);
+          const deadline = Date.now() + (settings.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS);
           const attempts = await Promise.all(targets.map(target => attemptTarget(existing.envelope, target, frame, {
             deadline,
             mounted: transport.listMountedNetworks().includes(existing.networkId),

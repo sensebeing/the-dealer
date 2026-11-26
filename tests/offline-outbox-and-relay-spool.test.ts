@@ -6316,3 +6316,238 @@ test('reconciliation returns a live pending receipt and retains the complete out
     new Set([harness.targetCard.nodeId, aya]));
   assert.deepEqual(harness.sentEvents.at(-1)!.receipts, second.receipts);
 });
+
+test('relay, relay_send, and relay_blob targeting localNodeId deliver and serve locally', async t => {
+  const root = directory(t);
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const target = new P2PTransportService({
+    discoveryDir: join(root, 'target'),
+    listenHost: '127.0.0.1',
+    multicast: false,
+  });
+  const sender = new P2PTransportService({
+    discoveryDir: join(root, 'sender'),
+    listenHost: '127.0.0.1',
+    multicast: false,
+  });
+  t.after(async () => {
+    await sender.dispose();
+    await target.dispose();
+  });
+  await target.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const received: string[] = [];
+  target.onInboundFrame(event => {
+    received.push(Buffer.from(event.rawBytes ?? []).toString('utf8'));
+    return Buffer.from('local-relay-ack');
+  });
+  const blobPath = join(root, 'local.bin');
+  const blobBytes = Buffer.from('local-relay-blob-content');
+  writeFileSync(blobPath, blobBytes);
+  const shared = await target.shareFile(blobPath);
+  const targetPort = portOf(target.endpointAddr!);
+
+  const externalSender = generateNodeKeyPair();
+  for (const requestType of ['relay', 'relay_send'] as const) {
+    const sealed = sealNetworkFrame(
+      { mode: 'unicast', dataBase64: Buffer.from(`hello-${requestType}`).toString('base64') },
+      keys,
+      externalSender.nodeId,
+    );
+    const response = await tcpRequest(targetPort, {
+      type: requestType,
+      networkId: NETWORK,
+      target: target.localNodeId,
+      ...(requestType === 'relay_send' ? { spoolIfOffline: true, spoolKey: 'local-target-key' } : {}),
+      frame: sealed,
+    });
+    assert.equal(response.ok, true);
+    assert.equal(response.error, undefined);
+    assert.equal(response.frame?.senderNodeId, target.localNodeId);
+    const reply = unsealNetworkFrame<{ requestNonce: string; dataBase64: string }>(response.frame, keys);
+    assert.equal(reply.requestNonce, sealed.nonce);
+    assert.equal(Buffer.from(reply.dataBase64, 'base64').toString('utf8'), 'local-relay-ack');
+  }
+  assert.deepEqual(received, ['hello-relay', 'hello-relay_send']);
+
+  // relay_blob with target === localNodeId serves from local blobs when not in spool cache.
+  const relayedBlob = await new Promise<Buffer>((resolve, reject) => {
+    const socket = createConnection({ host: '127.0.0.1', port: targetPort });
+    const chunks: Buffer[] = [];
+    socket.on('error', reject);
+    socket.on('data', chunk => chunks.push(Buffer.from(chunk)));
+    socket.on('end', () => {
+      const full = Buffer.concat(chunks);
+      const headerSize = full.readUInt32BE(0);
+      const header = JSON.parse(full.subarray(4, 4 + headerSize).toString('utf8'));
+      assert.equal(header.size, blobBytes.length);
+      resolve(full.subarray(4 + headerSize));
+    });
+    const body = Buffer.from(JSON.stringify({
+      type: 'relay_blob',
+      swarmTopicId: keys.swarmTopicId,
+      target: target.localNodeId,
+      hash: shared.blake3Hash,
+    }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+    socket.write(Buffer.concat([length, body]));
+  });
+  assert.deepEqual(relayedBlob, blobBytes);
+
+  // End-to-end: sender with target in bootstrapPeers and a stale direct peer endpoint still delivers via target's relay_send.
+  await sender.mountNetwork({ networkId: NETWORK, passphrase: 'secret', bootstrapPeers: [target.endpointAddr!] });
+  const closed = createServer();
+  closed.listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => closed.once('listening', resolve));
+  const deadPort = (closed.address() as { port: number }).port;
+  await new Promise<void>(resolve => closed.close(() => resolve()));
+  sender.registerPeerEndpoint(NETWORK, target.localNodeId, `127.0.0.1:${deadPort}`);
+  const replyBytes = await sender.sendUnicast(
+    NETWORK,
+    target.localNodeId,
+    Buffer.from('via-target-bootstrap'),
+    { spoolIfOffline: true, spoolKey: 'e2e-target-bootstrap' },
+  );
+  assert.equal(Buffer.from(replyBytes).toString('utf8'), 'local-relay-ack');
+  assert.equal(received.at(-1), 'via-target-bootstrap');
+});
+
+test('attachment fetch failure before executor runs reports handoff unattempted and allows safe retry', async t => {
+  const root = directory(t);
+  const runtimes: DealerNodeRuntime[] = [];
+  t.after(async () => {
+    for (const runtime of [...runtimes].reverse()) {
+      await runtime.stop().catch(() => {});
+    }
+  });
+  const sender = runtimeFor(root, 'sender', { discovery: 'mesh' });
+  const receiver = runtimeFor(root, 'receiver', { discovery: 'mesh' });
+  runtimes.push(sender, receiver);
+  await sender.start();
+  await receiver.start();
+  await sender.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await receiver.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await until(
+    () =>
+      sender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'receiver') &&
+      receiver.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'sender'),
+    'sender and receiver discover each other',
+  );
+
+  const attachmentPath = join(root, 'report.txt');
+  writeFileSync(attachmentPath, 'attachment-body-for-retry');
+  const attachment = await sender.transport.shareFile(attachmentPath);
+  let failFetch = true;
+  const originalFetch = receiver.transport.fetchBlobToPath.bind(receiver.transport);
+  t.mock.method(receiver.transport, 'fetchBlobToPath', async (ticket: string, destPath: string) => {
+    if (failFetch) {
+      throw Object.assign(new Error('connect EHOSTDOWN 10.165.36.198:45874'), { code: 'EHOSTDOWN' });
+    }
+    return originalFetch(ticket, destPath);
+  });
+
+  const input: EmitMessageInput = {
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: ['member:receiver'] },
+    kind: 'collab.request.v1',
+    subject: 'Attachment retry',
+    body: 'must stay retryable if blob fetch fails',
+    payload: {},
+    attachments: [attachment],
+    attachmentPaths: { [attachment.blake3Hash]: attachmentPath },
+    idempotencyKey: 'attachment-retry-key',
+  };
+  const first = await sender.emitter.emit(input);
+  assert.equal(first.receipts.length, 1);
+  assert.equal(first.receipts[0].stage, 'failed');
+  assert.equal(first.receipts[0].executionReceipt?.handoff, 'unattempted');
+  const receiverNodeId = receiver.node.getSelfCard(NETWORK).nodeId;
+  const outboxItem = sender.outbox.get(first.messageId)!;
+  assert.deepEqual(outboxItem.inDoubtNodeIds, []);
+  assert.equal(receiver.mailbox.list().totalCount, 0);
+
+  failFetch = false;
+  const retried = await sender.emitter.emit(input);
+  assert.equal(retried.messageId, first.messageId);
+  assert.equal(retried.receipts.length, 1);
+  assert.equal(retried.receipts[0].stage, 'dispatched');
+  assert.equal(sender.outbox.get(first.messageId)?.status, 'delivered');
+  assert.deepEqual(sender.outbox.get(first.messageId)?.inDoubtNodeIds, []);
+  const delivered = receiver.mailbox.list().items;
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].envelope.id, first.messageId);
+  const localAttachments = delivered[0].envelope.payload.localAttachments as string[];
+  assert.equal(localAttachments.length, 1);
+  assert.equal(readFileSync(localAttachments[0], 'utf8'), 'attachment-body-for-retry');
+  assert.equal(receiverNodeId, first.receipts[0].fromNodeId);
+});
+
+test('personal-dev disables relay-spool and refuses third-party offline custody so sender falls back to headless-relay', async t => {
+  const root = directory(t);
+  const runtimes: DealerNodeRuntime[] = [];
+  t.after(async () => {
+    for (const runtime of [...runtimes].reverse()) {
+      await runtime.stop().catch(() => {});
+    }
+  });
+  const personalPeer = new DealerNodeRuntime({
+    stateDir: join(root, 'personal'),
+    member: 'ben',
+    name: 'ben-mac',
+    profile: 'personal-dev',
+    patch: { defaultExecutor: 'inbox' },
+    transport: {
+      discoveryDir: join(root, 'personal-mesh'),
+      multicast: false,
+    },
+  });
+  const relaySeed = runtimeFor(root, 'relay');
+  const sender = runtimeFor(root, 'sender');
+  const offlinePeer = runtimeFor(root, 'offline', { discovery: 'seed-learn' });
+  runtimes.push(personalPeer, relaySeed, sender, offlinePeer);
+
+  await personalPeer.start();
+  await relaySeed.start();
+  await sender.start();
+  await offlinePeer.start();
+  await personalPeer.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await relaySeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await offlinePeer.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [relaySeed.transport.endpointAddr!],
+  });
+  await sender.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [personalPeer.transport.endpointAddr!, relaySeed.transport.endpointAddr!],
+  });
+  await until(
+    () => sender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'offline'),
+    'sender learns offline peer card via relay seed',
+  );
+  const offlineNodeId = offlinePeer.node.getSelfCard(NETWORK).nodeId;
+  await offlinePeer.stop();
+
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const personalMount = mountOf(personalPeer.transport as P2PTransportService, NETWORK) as { spoolFile?: string };
+  assert.equal(personalMount.spoolFile, undefined, 'personal-dev must not enable relay spoolFile');
+  assert.equal(existsSync(join(root, 'personal', 'relay-spool')), false);
+
+  const emitted = await sender.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: [offlineNodeId] },
+    kind: 'collab.request.v1',
+    subject: 'Personal node skips spool',
+    body: 'must land on headless-relay spool only',
+    payload: {},
+  });
+  assert.equal(emitted.receipts[0]?.stage, 'queued');
+  assert.equal(emitted.receipts[0]?.executionReceipt?.relaySpooled, true);
+  assert.equal(existsSync(join(root, 'personal', 'relay-spool')), false, 'personal-dev never writes relay-spool');
+  const relaySpoolFile = join(root, 'relay', 'relay-spool', `${keys.swarmTopicId}.json`);
+  const entries = readRelaySpool(relaySpoolFile).entries;
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].targetNodeId, offlineNodeId);
+  assert.equal(entries[0].id, `${sender.transport.localNodeId}:${emitted.messageId}`);
+});
