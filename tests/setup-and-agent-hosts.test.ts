@@ -29,7 +29,7 @@ import { P2PTransportService, defaultAdvertisedHost, isTailscaleIpv4Host } from 
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli,
+  AGENT_HOST_CATALOG, buildAgentBindingPreset, probeDealerSetup, runDealerCli, stopDaemonIfRunning,
   decodeNetworkInvite, DealerNodeRuntime, MailboxStore, createAgentPtyExecutorPlugin,
   createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin,
   createOrcaExecutorPlugin, createCodexCliExecutorPlugin, createAntigravityCliExecutorPlugin,
@@ -3984,7 +3984,9 @@ test('codex app-server survives exit-before-stdout-drain, ignores stray handshak
     assert.equal(target.pendingWake, true);
   }
 
-  // 4. Wakeup-backed antigravity executor does not mutate trustedWorkspaces for duplicate or redirected deliveries.
+  // 4. Wakeup-backed antigravity executor delegates workspace trust to deliverAgentHostWakeTarget:
+  // duplicate/redirected deliveries do not mutate settings, and malformed settings preserve the
+  // committed receipt while deferring retryably on the wake target.
   {
     const store = new MailboxStore(join(root, 'trust-guard.json'));
     const agySettings = join(root, 'trust-guard-settings.json');
@@ -3992,6 +3994,7 @@ test('codex app-server survives exit-before-stdout-drain, ignores stray handshak
       store,
       flushIntervalMs: 100_000,
       drivers: createTestWakeupDrivers({
+        agySettingsPath: agySettings,
         commandRunner: async () => ({ stdout: '{}' }),
       }),
     });
@@ -4011,12 +4014,12 @@ test('codex app-server survives exit-before-stdout-drain, ignores stray handshak
       commandRunner: async () => ({ stdout: '{}' }),
     });
 
-    // Duplicate delivery: mailboxIds does not include 'task:dup' (no new insert) -> must not touch settings.
+    // Duplicate delivery: no wake target created -> must not touch settings.
     await plugin.execute([dup], context, {});
+    await wakeup.waitUntilIdle();
     assert.equal(existsSync(agySettings), false, 'duplicate delivery must not mutate Antigravity settings');
 
-    // Redirected spawn (claimedSpawn === false inside host deliver()): simulate a concurrent thread
-    // claim landing between prepareAgentDelivery and store.enqueue so deliver() receives claimedSpawn: false.
+    // Redirected spawn (claimedSpawn === false inside host deliver()): must not touch settings.
     const racedStore = Object.create(store) as MailboxStore;
     const origResolve = store.resolveThreadLocalMailbox.bind(store);
     racedStore.resolveThreadLocalMailbox = ((threadId, networkId, opts) =>
@@ -4032,11 +4035,253 @@ test('codex app-server survives exit-before-stdout-drain, ignores stray handshak
     const redirectedReceipt = await racedPlugin.execute([redirected], context, {});
     assert.equal(redirectedReceipt.mailboxId, 'task:existing-root');
     assert.equal(redirectedReceipt.claimedSpawn, false);
+    await wakeup.waitUntilIdle();
     assert.equal(existsSync(agySettings), false, 'redirected spawn must not mutate Antigravity settings');
 
-    // Fresh owned spawn DOES trust workspacePath after enqueue commits.
-    await plugin.execute([message('fresh-agy')], context, {});
+    // Malformed settings preserve the committed execution receipt and defer retryably on the wake target.
+    writeFileSync(agySettings, '{malformed-json');
+    const committedReceipt = await plugin.execute([message('malformed-settings-agy')], context, {});
+    assert.equal(committedReceipt.mailboxId, 'task:malformed-settings-agy');
+    assert.equal(committedReceipt.woke, false);
+    assert.equal(committedReceipt.reason, 'Queued for background wakeup');
+    await wakeup.waitUntilIdle();
+    const deferredTarget = store.getWakeTarget('task:malformed-settings-agy')!;
+    assert.equal(deferredTarget.pendingWake, true);
+    assert.equal(deferredTarget.deliveryInDoubt, undefined);
+    assert.ok(deferredTarget.lastWakeError);
+
+    // Repairing settings allows retry to trust workspacePath and complete cleanly.
+    rmSync(agySettings, { force: true });
+    const flushed = await wakeup.flushMailbox('task:malformed-settings-agy', { force: true });
+    assert.equal(flushed.woke, true);
     assert.equal(existsSync(agySettings), true);
     assert.ok(JSON.parse(readFileSync(agySettings, 'utf8')).trustedWorkspaces.includes(root));
+  }
+});
+
+test('codex app-server correlates turn/completed strictly by turnId+threadId and completes bounded teardown on failure', async t => {
+  const root = directory(t);
+
+  // 1. Uncorrelated notifications (missing turn.id, wrong turn.id, wrong threadId) during turn-sent
+  //    and turn-running are ignored; an early matching turn/completed arriving before turn/start
+  //    response is buffered and correlated once turn/start returns.
+  {
+    const fake = createFakeCodexAppServer({
+      nextThreadId: () => 'corr-thread-1',
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'turn/start') {
+          // Emit uncorrelated / malformed notifications BEFORE the turn/start response.
+          ctx.send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'corr-thread-1', turn: { status: 'failed' } } });
+          ctx.send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'other-thread', turn: { id: 'real-turn-1', status: 'failed' } } });
+          ctx.send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'corr-thread-1', turn: { id: 'stale-turn-0', status: 'failed' } } });
+          // Emit the real matching turn/completed BEFORE the turn/start response!
+          ctx.send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'corr-thread-1', turn: { id: 'real-turn-1', status: 'completed' } } });
+          ctx.send({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'real-turn-1', status: 'inProgress' } } });
+          return true;
+        }
+      },
+    });
+    const result = await runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      promptText: 'early correlated completion',
+      stdioSpawner: fake.spawner,
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(result.threadId, 'corr-thread-1');
+    assert.equal(result.turnId, 'real-turn-1');
+  }
+
+  // 2. turn/start response missing turn.id rejects with a regular Error (preserves deliveryInDoubt fence).
+  {
+    const fake = createFakeCodexAppServer({
+      nextThreadId: () => 'missing-turn-id-thread',
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'turn/start') {
+          ctx.send({ jsonrpc: '2.0', id: msg.id, result: { turn: {} } });
+          return true;
+        }
+      },
+    });
+    const store = new MailboxStore(join(root, 'missing-turn-id.json'));
+    const mailboxId = 'task:missing-turn-id';
+    store.enqueue([message('missing-turn-id')], {
+      mailboxId,
+      wakeTarget: { driver: 'agent-host', driverConfig: { hostAgent: 'codex', conversationMode: 'spawn', workspacePath: root } },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, mailboxId, { stdioSpawner: fake.spawner }),
+      error => error instanceof Error && !(error instanceof CommandNotStartedError) && /turn\.id/.test(error.message),
+    );
+    assert.equal(store.getWakeTarget(mailboxId)?.deliveryInDoubt, true);
+  }
+
+  // 3. Failure teardown awaits actual child exit (including SIGKILL escalation) and absorbs late stdin EPIPE.
+  {
+    const turnStarted = Promise.withResolvers<void>();
+    let capturedChild: { exited: boolean; stdin: NodeJS.WritableStream } | undefined;
+    const fake = createFakeCodexAppServer({
+      ignoreStdinEnd: true,
+      ignoreSigterm: true,
+      onTurnStart: (_params, ctx) => {
+        capturedChild = ctx.child;
+        turnStarted.resolve();
+        return { suppressCompletion: true };
+      },
+    });
+    const controller = new AbortController();
+    const runPromise = runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      promptText: 'must await sigkill teardown',
+      stdioSpawner: fake.spawner,
+      signal: controller.signal,
+      killGraceMs: 40,
+    });
+    await turnStarted.promise;
+    controller.abort('abort-with-sigterm-ignored');
+    await assert.rejects(runPromise, error => error instanceof Error && !(error instanceof CommandNotStartedError));
+    assert.equal(capturedChild?.exited, true, 'runCodexAppServerTurn must not return before child terminates');
+    assert.ok(fake.sessions[0].killedSignals.includes('SIGTERM'));
+    assert.ok(fake.sessions[0].killedSignals.includes('SIGKILL'));
+    // Emitting a late EPIPE on stdin after teardown must not produce an uncaught exception.
+    capturedChild?.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+  }
+});
+
+test('runtime idle/drain waits for active background Codex turns and offline CLI settles accepted turns before exit', async t => {
+  const root = directory(t);
+
+  // 1. isIdleForRestart() and drainForStop() account for WakeupRedriveService in-flight turns.
+  {
+    const turnStarted = Promise.withResolvers<void>();
+    const releaseTurn = Promise.withResolvers<void>();
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: () => 'drain-codex-1',
+      onTurnStart: async () => {
+        turnStarted.resolve();
+        await releaseTurn.promise;
+      },
+    });
+    const runtime = await new DealerNodeRuntime({
+      stateDir: join(root, 'drain-state'),
+      member: 'solo',
+      transport: { discoveryDir: join(root, 'drain-discovery') },
+      patch: { topicBindings: { review: { executor: 'codex', mode: 'wave', workspacePath: root } } },
+      stdioSpawner: fakeCodex.spawner,
+    }).start();
+    t.after(async () => {
+      releaseTurn.resolve();
+      await runtime.stop();
+    });
+
+    await runtime.emitter.emit({
+      networkId: 'local',
+      kind: 'review',
+      routing: { mode: 'unicast', targets: ['member:solo'] },
+      subject: 'Long Codex turn',
+      body: 'Take your time',
+      payload: {},
+    });
+    await turnStarted.promise;
+    assert.equal(runtime.wakeups.activeCount(), 1);
+    assert.equal(runtime.isIdleForRestart(), false, 'running background Codex turn must block restart');
+    assert.equal(await runtime.drainForStop({ drainTimeoutMs: 40 }), false, 'drainForStop must defer while Codex turn runs');
+    assert.equal(runtime.isStoppingOrDraining(), false);
+    assert.equal(fakeCodex.sessions[0].killedSignals.length, 0, 'deferred drain must not abort running turn');
+
+    // Awaiting drainForStop with sufficient timeout wakes as soon as the turn finishes.
+    const drainPromise = runtime.drainForStop({ drainTimeoutMs: 5_000 });
+    releaseTurn.resolve();
+    assert.equal(await drainPromise, true, 'drainForStop should succeed once background turn finishes');
+    assert.equal(runtime.mailbox.getWakeTarget('stream:review')?.deliveryInDoubt, undefined);
+    assert.equal(runtime.mailbox.getWakeTarget('stream:review')?.driverConfig?.sessionId, 'drain-codex-1');
+  }
+
+  // 2. Offline runDealerCli local send waits for its accepted background Codex turn before owned.stop().
+  {
+    const stateDir = join(root, 'cli-state');
+    mkdirSync(stateDir, { recursive: true });
+    const fakeBin = join(root, 'fake-codex.mjs');
+    writeFileSync(
+      fakeBin,
+      [
+        `#!${process.execPath}`,
+        "import { createInterface } from 'node:readline';",
+        "const rl = createInterface({ input: process.stdin });",
+        "let threadId = 'cli-codex-thread-1';",
+        "rl.on('line', line => {",
+        "  if (!line.trim()) return;",
+        "  const msg = JSON.parse(line);",
+        "  if (msg.method === 'initialize') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');",
+        "  else if (msg.method === 'thread/start') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: threadId } } }) + '\\n');",
+        "  else if (msg.method === 'turn/start') {",
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'cli-turn-1', status: 'inProgress' } } }) + '\\n');",
+        "    setTimeout(() => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId, turn: { id: 'cli-turn-1', status: 'completed' } } }) + '\\n'), 80);",
+        "  }",
+        "});",
+      ].join('\n'),
+    );
+    chmodSync(fakeBin, 0o755);
+    writeFileSync(
+      join(stateDir, 'config.json'),
+      JSON.stringify({
+        profile: 'codex-dev',
+        member: 'solo',
+        name: 'local',
+        topicBindings: { review: { executor: 'codex', mode: 'wave', workspacePath: root } },
+        executorConfig: { codex: { command: fakeBin } },
+      }),
+    );
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const code = await runDealerCli(
+      ['send', '--network', 'local', '--to', 'member:solo', '--topic', 'review', '--subject', 'Offline', '--body', 'Run turn', '--json'],
+      { stateDir, stdout: line => stdout.push(line), stderr: line => stderr.push(line) },
+    );
+    assert.equal(code, 0, stderr.join('\n'));
+    const store = new MailboxStore(join(stateDir, 'mailbox.json'));
+    const target = store.getWakeTarget('stream:review')!;
+    assert.equal(target.deliveryInDoubt, undefined, 'offline CLI teardown must not abort accepted turn into deliveryInDoubt');
+    assert.equal(target.pendingWake, false);
+    assert.equal(target.driverConfig?.sessionId, 'cli-codex-thread-1');
+
+    // 3. Offline runDealerCli local send with coalesceMs > 0 starts a background daemon so pending
+    //    coalesced mailbox work survives CLI exit and completes automatically.
+    const coalescedStateDir = join(root, 'cli-coalesced-state');
+    mkdirSync(coalescedStateDir, { recursive: true });
+    writeFileSync(
+      join(coalescedStateDir, 'config.json'),
+      JSON.stringify({
+        profile: 'codex-dev',
+        member: 'solo',
+        name: 'local',
+        wave: { flushIntervalMs: 100 },
+        topicBindings: { review: { executor: 'codex', mode: 'wave', workspacePath: root, coalesceMs: 250 } },
+        executorConfig: { codex: { command: fakeBin } },
+      }),
+    );
+    try {
+      const cStdout: string[] = [];
+      const cStderr: string[] = [];
+      const cCode = await runDealerCli(
+        ['send', '--network', 'local', '--to', 'member:solo', '--topic', 'review', '--subject', 'Coalesced', '--body', 'Run after coalesce', '--json'],
+        { stateDir: coalescedStateDir, stdout: line => cStdout.push(line), stderr: line => cStderr.push(line) },
+      );
+      assert.equal(cCode, 0, cStderr.join('\n'));
+      await eventually(() => {
+        const coalescedStore = new MailboxStore(join(coalescedStateDir, 'mailbox.json'), { readonly: true });
+        try {
+          const coalescedTarget = coalescedStore.getWakeTarget('stream:review');
+          assert.equal(coalescedTarget?.deliveryInDoubt, undefined);
+          assert.equal(coalescedTarget?.pendingWake, false);
+          assert.equal(coalescedTarget?.driverConfig?.sessionId, 'cli-codex-thread-1');
+        } finally {
+          coalescedStore.close();
+        }
+      }, 10_000);
+    } finally {
+      await stopDaemonIfRunning(coalescedStateDir, { force: true }).catch(() => {});
+    }
   }
 });

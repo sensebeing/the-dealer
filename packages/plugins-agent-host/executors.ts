@@ -395,9 +395,6 @@ function createAgentExecutorPlugin(
                 wakeTarget: delivery.buildWakeTargetPatch,
               });
               committed();
-              if (result.claimedSpawn !== false && result.mailboxIds.includes(mailboxId)) {
-                trustWorkspace(delivery);
-              }
               const receipt = { ...result, executor: name, executionId: randomUUID(),
                 ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
               for (const actualMailbox of result.mailboxIds) {
@@ -415,7 +412,6 @@ function createAgentExecutorPlugin(
               ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
             if (result.claimedSpawn === false || !result.mailboxIds.includes(mailboxId)) return receipt;
             try {
-              trustWorkspace(delivery);
               const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, {
                 signal: context.signal,
                 stdioSpawner,

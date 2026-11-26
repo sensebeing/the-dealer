@@ -1633,7 +1633,11 @@ export class DealerNodeRuntime {
     if (!this.started || this.isStoppingOrDraining() || !this.kernel.hasService('dispatcher')) {
       return false;
     }
-    return this.kernel.ctx.services.dispatcher.activeCount() === 0 && this.activeMutatingControlRequests === 0;
+    return (
+      this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
+      (this.wakeups?.activeCount() ?? 0) === 0 &&
+      this.activeMutatingControlRequests === 0
+    );
   }
 
   /**
@@ -1662,6 +1666,7 @@ export class DealerNodeRuntime {
           options.drainTimeoutMs ?? 15_000,
           () =>
             this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
+            (this.wakeups?.activeCount() ?? 0) === 0 &&
             this.activeMutatingControlRequests <= this.shutdownControlSlots,
         );
         this.drainDecision = decision.then(
@@ -1714,6 +1719,7 @@ export class DealerNodeRuntime {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let idle: Disposable | undefined;
+      let wakeupIdle: Disposable | undefined;
       const wake = () => {
         if (settled) {
           return;
@@ -1723,6 +1729,7 @@ export class DealerNodeRuntime {
           clearTimeout(timer);
         }
         idle?.dispose();
+        wakeupIdle?.dispose();
         this.drainWakeups.delete(wake);
         resolve();
       };
@@ -1731,6 +1738,7 @@ export class DealerNodeRuntime {
       timer = setTimeout(wake, timeoutMs);
       this.drainWakeups.add(wake);
       idle = dispatcher.onIdle(wake);
+      wakeupIdle = this.wakeups?.onIdle(wake);
     });
   }
 

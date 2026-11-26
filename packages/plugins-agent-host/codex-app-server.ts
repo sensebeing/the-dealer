@@ -8,6 +8,7 @@ const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const DEFAULT_CLOSE_GRACE_MS = 3_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 const MAX_STDERR_BYTES = 16 * 1024;
+const MAX_EARLY_COMPLETIONS = 32;
 
 export interface CodexAppServerTurnOptions {
   command?: string;
@@ -52,6 +53,7 @@ interface JsonRpcMessage {
 }
 
 interface CompletedTurnEvent {
+  threadId?: string;
   turnId?: string;
   status?: unknown;
   error?: unknown;
@@ -167,7 +169,9 @@ export async function runCodexAppServerTurn(
   let phase: TurnPhase = 'pre-turn-send';
   let childExited = false;
   let shuttingDown = false;
+  let activeThreadId: string | undefined;
   let expectedTurnId: string | undefined;
+  const earlyTurnCompletions: CompletedTurnEvent[] = [];
   let completedTurn: CompletedTurnEvent | undefined;
   let terminationTimer: ReturnType<typeof setTimeout> | undefined;
   let activeRpc:
@@ -358,17 +362,32 @@ export async function runCodexAppServerTurn(
       }
       if (pending.method === 'turn/start') {
         const resultTurn = isRecord(message.result) && isRecord(message.result.turn) ? message.result.turn : undefined;
-        if (typeof resultTurn?.id === 'string' && resultTurn.id.trim().length > 0) {
-          expectedTurnId = resultTurn.id.trim();
+        const returnedTurnId =
+          typeof resultTurn?.id === 'string' && resultTurn.id.trim().length > 0
+            ? resultTurn.id.trim()
+            : undefined;
+        if (!returnedTurnId) {
+          pending.reject(
+            makeBoundaryError('codex app-server turn/start did not return a valid turn.id'),
+          );
+          return;
         }
+        expectedTurnId = returnedTurnId;
         phase = 'turn-running';
+        const matchedEarly = earlyTurnCompletions.find(
+          event => event.turnId === expectedTurnId && event.threadId === activeThreadId,
+        );
+        earlyTurnCompletions.length = 0;
+        if (matchedEarly) {
+          completedTurn = matchedEarly;
+        }
       }
       pending.resolve(message.result);
       return;
     }
 
-    // Notification: only inspect turn/completed after turn/start; discard stray handshake
-    // notifications and all streaming deltas in O(1) memory.
+    // Notification: only correlate turn/completed after turn/start; buffer early notifications
+    // arriving before the turn/start response so they are validated once expectedTurnId is known.
     if (message.method === 'turn/completed') {
       if (phase !== 'turn-sent' && phase !== 'turn-running') {
         return;
@@ -376,14 +395,31 @@ export async function runCodexAppServerTurn(
       const params = isRecord(message.params) ? message.params : undefined;
       const turn = params && isRecord(params.turn) ? params.turn : undefined;
       const turnId = typeof turn?.id === 'string' && turn.id.trim().length > 0 ? turn.id.trim() : undefined;
-      if (expectedTurnId && turnId && turnId !== expectedTurnId) {
+      const rawThreadId =
+        typeof params?.threadId === 'string' && params.threadId.trim().length > 0
+          ? params.threadId.trim()
+          : typeof turn?.threadId === 'string' && turn.threadId.trim().length > 0
+            ? turn.threadId.trim()
+            : undefined;
+      if (!turnId || !rawThreadId) {
         return;
       }
       const event: CompletedTurnEvent = {
-        turnId: turnId ?? expectedTurnId,
+        threadId: rawThreadId,
+        turnId,
         status: turn?.status,
         error: turn?.error ?? params?.error,
       };
+      if (phase === 'turn-sent') {
+        if (earlyTurnCompletions.length >= MAX_EARLY_COMPLETIONS) {
+          earlyTurnCompletions.shift();
+        }
+        earlyTurnCompletions.push(event);
+        return;
+      }
+      if (turnId !== expectedTurnId || rawThreadId !== activeThreadId) {
+        return;
+      }
       completedTurn = event;
       if (turnWaiter) {
         const waiter = turnWaiter;
@@ -447,7 +483,7 @@ export async function runCodexAppServerTurn(
     });
   };
 
-  const gracefulCloseChild = async (): Promise<void> => {
+  const teardownChild = async (mode: 'graceful' | 'terminate'): Promise<boolean> => {
     shuttingDown = true;
     try {
       if (!child.stdin.destroyed && !child.stdin.writableEnded) {
@@ -456,7 +492,10 @@ export async function runCodexAppServerTurn(
     } catch {
       // Ignore stdin close errors during shutdown.
     }
-    if (childExited) return;
+    if (mode === 'terminate') {
+      terminateChild();
+    }
+    if (childExited) return true;
     await new Promise<void>(resolve => {
       let settled = false;
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -474,6 +513,11 @@ export async function runCodexAppServerTurn(
         done();
         return;
       }
+      if (mode === 'terminate') {
+        hardTimer = setTimeout(done, killGraceMs + 100);
+        hardTimer.unref();
+        return;
+      }
       graceTimer = setTimeout(() => {
         graceTimer = undefined;
         terminateChild();
@@ -482,9 +526,13 @@ export async function runCodexAppServerTurn(
       }, closeGraceMs);
       graceTimer.unref();
     });
+    return childExited;
   };
 
   let succeeded = false;
+  let tornDown = false;
+  let cleanupError: Error | undefined;
+  let thrownError: unknown;
   try {
     await sendRequest(1, 'initialize', {
       clientInfo: { name: 'the-dealer', version: '1.0.0' },
@@ -518,6 +566,7 @@ export async function runCodexAppServerTurn(
         `codex app-server ${resumeThread ? 'thread/resume' : 'thread/start'} did not return a valid thread.id${formatStderrSuffix()}`,
       );
     }
+    activeThreadId = threadId;
 
     // Crossing the external-effect boundary: transition phase inside sendRequest right before
     // child.stdin.write executes (after all pre-write guards pass), so closed-stdin or pre-write
@@ -536,13 +585,17 @@ export async function runCodexAppServerTurn(
 
     const completion = await waitForTurnCompletion();
     phase = 'completed';
-    await gracefulCloseChild();
+    const exitedCleanly = await teardownChild('graceful');
+    tornDown = true;
 
     if (completion.status !== 'completed') {
       const detail = formatTurnError(completion.error);
       throw new Error(
         `Codex turn ended with status ${String(completion.status ?? 'unknown')}${detail ? `: ${detail}` : ''}${formatStderrSuffix()}`,
       );
+    }
+    if (!exitedCleanly) {
+      throw new Error(`codex app-server failed to terminate within bounded teardown (${closeGraceMs + killGraceMs}ms)`);
     }
 
     succeeded = true;
@@ -553,27 +606,43 @@ export async function runCodexAppServerTurn(
       stdout: JSON.stringify({ threadId }),
       stderr: stderrTail.toString(),
     };
+  } catch (error) {
+    thrownError = error;
+    throw error;
   } finally {
     if (activeRpc) {
       clearTimeout(activeRpc.timer);
       activeRpc = undefined;
-    }
-    if (!succeeded) {
-      shuttingDown = true;
-      terminateChild();
-    }
-    if (terminationTimer && childExited) {
-      clearTimeout(terminationTimer);
-      terminationTimer = undefined;
     }
     options.signal?.removeEventListener('abort', onAbort);
     rl.off('line', onLine);
     rl.off('close', onStdoutClose);
     rl.close();
     child.stderr.off('data', onStderrData);
+    if (!succeeded && !tornDown) {
+      const exited = await teardownChild('terminate');
+      if (!exited) {
+        cleanupError = new Error(`codex app-server failed to terminate within bounded teardown (${killGraceMs}ms)`);
+      }
+    }
+    if (terminationTimer) {
+      clearTimeout(terminationTimer);
+      terminationTimer = undefined;
+    }
+    // Keep a no-op error sink before removing active handlers so a late EPIPE or process error
+    // from a closing child can never become an uncaught exception.
+    const absorbLateError = () => {};
+    child.stdin.on('error', absorbLateError);
+    child.on('error', absorbLateError);
     child.stdin.off('error', onStdinError);
     child.off('error', onChildError);
     child.off('exit', onChildExit);
     child.off('close', onChildClose);
+    if (cleanupError && thrownError !== undefined) {
+      if (thrownError instanceof Error) {
+        (thrownError as Error & { cleanupError?: Error }).cleanupError = cleanupError;
+        thrownError.message = `${thrownError.message}; ${cleanupError.message}`;
+      }
+    }
   }
 }

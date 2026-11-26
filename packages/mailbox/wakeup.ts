@@ -269,6 +269,7 @@ export class WakeupRedriveService {
   private readonly readinessSubscriptions = new Map<string, ReadinessState>();
   private readonly stopController = new AbortController();
   private readonly inFlight = new Map<string, Promise<WakeupFlushResult>>();
+  private readonly idleListeners = new Set<() => void>();
   private readonly claims = new Map<string, number>();
   private stopped = false;
   private lastError?: string;
@@ -306,6 +307,28 @@ export class WakeupRedriveService {
 
   getLastError(): string | undefined {
     return this.lastError;
+  }
+
+  /** Number of mailbox wake deliveries currently executing in the background. */
+  activeCount(): number {
+    return this.inFlight.size;
+  }
+
+  /** Subscribe to transitions where all in-flight background wake deliveries become idle. */
+  onIdle(listener: () => void): Disposable {
+    this.idleListeners.add(listener);
+    return {
+      dispose: () => {
+        this.idleListeners.delete(listener);
+      },
+    };
+  }
+
+  /** Wait until all currently in-flight background wake deliveries settle. */
+  async waitUntilIdle(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight.values()]);
+    }
   }
 
   async probeSlot(mailboxId: string, options: { outbox?: OutboxStore } = {}): Promise<SlotProbeResult> {
@@ -429,9 +452,17 @@ export class WakeupRedriveService {
       } finally {
         this.inFlight.delete(id);
       }
-      this.observeMailbox(id, result.woke);
-      if (result.woke || result.reason === 'Wake launch superseded by a newer binding' || result.reason === ACK_SUPERSEDED_WAKE) {
-        this.notifyMailbox(id);
+      try {
+        this.observeMailbox(id, result.woke);
+        if (result.woke || result.reason === 'Wake launch superseded by a newer binding' || result.reason === ACK_SUPERSEDED_WAKE) {
+          this.notifyMailbox(id);
+        }
+      } finally {
+        if (this.inFlight.size === 0) {
+          for (const listener of [...this.idleListeners]) {
+            listener();
+          }
+        }
       }
       return result;
     });
@@ -477,6 +508,7 @@ export class WakeupRedriveService {
       subscription.dispose();
     }
     await Promise.allSettled([...this.inFlight.values()]);
+    this.idleListeners.clear();
   }
 
   registerDriver(driver: WakeupDriver): Disposable {
