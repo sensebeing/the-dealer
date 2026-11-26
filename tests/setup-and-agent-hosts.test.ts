@@ -9,8 +9,11 @@ import {
   CODEX_AGENT_PROFILE_ERROR,
   DEFAULT_RPC_TIMEOUT_MS,
   buildAgentHostInvocation,
+  buildCodexThreadName,
   deliverAgentHostWakeTarget,
+  isAgentHostRotationDue,
   resolveAgentHostContinuation,
+  resolveAgentHostSessionLink,
   resolveAgentSessionId,
   runCodexAppServerTurn,
 } from '../packages/plugins-agent-host/index.ts';
@@ -2869,7 +2872,9 @@ test('codex wave starts via app-server thread/start and resumes via thread/resum
     cwd: root,
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
+    threadSource: 'user',
   });
+  assert.equal(fakeCodex.sessions[0].threadName, 'Dealer · codex-inbox');
   assert.equal(fakeCodex.sessions[0].stdinEnded, true);
   const afterWave1 = store.getWakeTarget('stream:codex-inbox')!;
   assert.equal(afterWave1.driverConfig?.sessionId, '019d-app-server-thread');
@@ -3419,7 +3424,7 @@ test('codex app-server executes full JSON-RPC handshake for spawn, wave, and fix
     ],
   );
   assert.deepEqual(s1.requests[0].params, { clientInfo: { name: 'the-dealer', version: '1.0.0' } });
-  assert.deepEqual(s1.requests[2].params, { cwd: root, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+  assert.deepEqual(s1.requests[2].params, { cwd: root, approvalPolicy: 'never', sandbox: 'danger-full-access', threadSource: 'user' });
   assert.deepEqual(s1.requests[3].params, {
     threadId: 'desktop-thread-1',
     input: [{ type: 'text', text: 'Start task' }],
@@ -4426,6 +4431,7 @@ test('runtime idle/drain waits for active background Codex turns and offline CLI
         "  const msg = JSON.parse(line);",
         "  if (msg.method === 'initialize') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');",
         "  else if (msg.method === 'thread/start') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: threadId } } }) + '\\n');",
+        "  else if (msg.method === 'thread/name/set') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');",
         "  else if (msg.method === 'turn/start') {",
         "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'cli-turn-1', status: 'inProgress' } } }) + '\\n');",
         "    setTimeout(() => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId, turn: { id: 'cli-turn-1', status: 'completed' } } }) + '\\n'), 80);",
@@ -4802,4 +4808,269 @@ test('runtime idle/drain waits for active background Codex turns and offline CLI
       }
     }
   }
+});
+
+test('codex threadSource user, thread/name/set naming, resume preservation, and -32601 compatibility', async t => {
+  const root = directory(t);
+
+  // 1. Pure buildCodexThreadName contract: spawn subject + whitespace collapse + 80-char cap + fallback; wave label + rotating MM-DD.
+  const longSubject = `Investigate   critical\nmultiline   incident   ${'x'.repeat(80)}`;
+  const capped = buildCodexThreadName('task:1', 'spawn', { items: [{ envelope: { subject: longSubject } }] });
+  assert.equal(capped.includes('\n'), false);
+  assert.equal(Array.from(capped).length, 80);
+  assert.ok(capped.endsWith('…'));
+  assert.ok(capped.startsWith('Investigate critical multiline incident '));
+  assert.equal(
+    buildCodexThreadName('task:empty', 'spawn', { items: [{ envelope: { subject: '   \n\t  ' } }] }),
+    'Dealer · task:empty',
+  );
+  assert.equal(
+    buildCodexThreadName('stream:collab.request.v4', 'wave', { items: [] }, { rotates: false }),
+    'Dealer · collab.request.v4',
+  );
+  const sampleDate = new Date(2026, 4, 7, 15, 30, 0).getTime(); // local 05-07
+  assert.equal(
+    buildCodexThreadName('stream:alerts', 'wave', { items: [] }, { now: sampleDate, rotates: true }),
+    'Dealer · alerts (05-07)',
+  );
+
+  // 2. Fresh spawn and rotating wave pass threadSource:'user' + sequential IDs + thread/name/set; resume never calls thread/name/set.
+  {
+    const store = new MailboxStore(join(root, 'naming.json'));
+    t.after(() => store.close());
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `named-thread-${count}`,
+    });
+
+    // Spawn mode via executor: uses message subject.
+    const spawnPlugin = createCodexExecutorPlugin({
+      store,
+      stdioSpawner: fakeCodex.spawner,
+      resolveTopicBinding: () => ({
+        executor: 'codex',
+        mode: 'spawn',
+        workspacePath: root,
+      }),
+    });
+    await spawnPlugin.execute([
+      { ...message('spawn-named'), subject: '  Fix   billing\nreconciliation  ' },
+    ], context, {});
+    const sSpawn = fakeCodex.sessions[0];
+    assert.deepEqual(
+      sSpawn.requests.map(req => [req.id ?? null, req.method]),
+      [
+        [1, 'initialize'],
+        [null, 'initialized'],
+        [2, 'thread/start'],
+        [3, 'thread/name/set'],
+        [4, 'turn/start'],
+      ],
+    );
+    assert.equal(sSpawn.threadParams?.threadSource, 'user');
+    assert.equal(sSpawn.threadName, 'Fix billing reconciliation');
+
+    // Stateless (!store) spawn also sets threadSource:'user' and threadName from subject.
+    const statelessPlugin = createCodexExecutorPlugin({
+      stdioSpawner: fakeCodex.spawner,
+      mode: 'spawn',
+      cwd: root,
+    });
+    await statelessPlugin.execute([
+      { ...message('stateless-named'), subject: 'Stateless spawn title' },
+    ], context, {});
+    const sStateless = fakeCodex.sessions[1];
+    assert.equal(sStateless.threadMethod, 'thread/start');
+    assert.equal(sStateless.threadParams?.threadSource, 'user');
+    assert.equal(sStateless.threadName, 'Stateless spawn title');
+
+    // Wave mode with rotation: Wave 1 sets Dealer · <stream> (MM-DD), Wave 2 resumes without calling thread/name/set,
+    // Wave 3 rotates and calls thread/name/set on the new thread.
+    const waveNow1 = new Date(2026, 8, 3, 10, 0, 0).getTime(); // local 09-03
+    const waveNow3 = new Date(2026, 8, 9, 10, 0, 0).getTime(); // local 09-09
+    store.enqueue([message('w1')], {
+      mailboxId: 'stream:ops-feed',
+      wakeTarget: {
+        driver: 'agent-host',
+        rotateAfterWaves: 1,
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+      },
+    });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:ops-feed', { now: waveNow1, stdioSpawner: fakeCodex.spawner });
+    const sWave1 = fakeCodex.sessions[2];
+    assert.equal(sWave1.threadMethod, 'thread/start');
+    assert.equal(sWave1.threadParams?.threadSource, 'user');
+    assert.equal(sWave1.threadName, 'Dealer · ops-feed (09-03)');
+
+    // Follow-up while lease is outstanding -> resumes existing thread without calling thread/name/set!
+    const lease1 = store.check({ mailboxId: 'stream:ops-feed' });
+    store.enqueue([message('w1-followup')], { mailboxId: 'stream:ops-feed' });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:ops-feed', { now: waveNow1 + 500, stdioSpawner: fakeCodex.spawner });
+    const sResume = fakeCodex.sessions[3];
+    assert.equal(sResume.threadMethod, 'thread/resume');
+    assert.equal(sResume.threadName, undefined);
+    assert.equal(sResume.requests.some(req => req.method === 'thread/name/set'), false);
+
+    // Even direct runCodexAppServerTurn with threadName on thread/resume must NOT call thread/name/set.
+    await runCodexAppServerTurn({
+      cwd: root,
+      mode: 'fixed',
+      sessionId: 'named-thread-3',
+      threadName: 'Should Never Overwrite',
+      promptText: 'keep title',
+      stdioSpawner: fakeCodex.spawner,
+    });
+    const sFixed = fakeCodex.sessions[4];
+    assert.equal(sFixed.threadMethod, 'thread/resume');
+    assert.equal(sFixed.requests.some(req => req.method === 'thread/name/set'), false);
+
+    // Ack wave 1 -> completedWaves === 1 === rotateAfterWaves -> rotates to fresh thread with new MM-DD title.
+    store.ack(lease1.deliveryId!, 'stream:ops-feed');
+    store.enqueue([message('w2')], { mailboxId: 'stream:ops-feed' });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:ops-feed', { now: waveNow3, stdioSpawner: fakeCodex.spawner });
+    const sRotated = fakeCodex.sessions[5];
+    assert.equal(sRotated.threadMethod, 'thread/start');
+    assert.equal(sRotated.threadParams?.threadSource, 'user');
+    assert.equal(sRotated.threadName, 'Dealer · ops-feed (09-09)');
+  }
+
+  // 3. Older server returning -32601 to thread/name/set degrades cleanly and completes turn.
+  {
+    const fakeCompat = createFakeCodexAppServer({
+      nextThreadId: () => 'legacy-codex-thread',
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/name/set') {
+          ctx.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } });
+          return true;
+        }
+      },
+    });
+    const result = await runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      threadName: 'Legacy Fallback Title',
+      promptText: 'Proceed anyway',
+      stdioSpawner: fakeCompat.spawner,
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(result.threadId, 'legacy-codex-thread');
+    assert.match(result.stderr, /-32601/);
+    assert.deepEqual(
+      fakeCompat.sessions[0].requests.map(req => [req.id ?? null, req.method]),
+      [
+        [1, 'initialize'],
+        [null, 'initialized'],
+        [2, 'thread/start'],
+        [3, 'thread/name/set'],
+        [4, 'turn/start'],
+      ],
+    );
+  }
+
+  // 4. Non--32601 failure on thread/name/set fails cleanly before turn/start with CommandNotStartedError and does not fence deliveryInDoubt.
+  {
+    const store = new MailboxStore(join(root, 'name-fail.json'));
+    t.after(() => store.close());
+    const fakeFail = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/name/set') {
+          ctx.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Invalid params' } });
+          return true;
+        }
+      },
+    });
+    store.enqueue([message('fail-name')], {
+      mailboxId: 'stream:name-fail',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, 'stream:name-fail', { stdioSpawner: fakeFail.spawner }),
+      error => error instanceof CommandNotStartedError && /thread\/name\/set failed.*-32602/.test(error.message),
+    );
+    assert.equal(fakeFail.sessions[0].requests.some(req => req.method === 'turn/start'), false);
+    assert.equal(store.getWakeTarget('stream:name-fail')?.deliveryInDoubt, undefined);
+    assert.equal(store.getWakeTarget('stream:name-fail')?.pendingWake, true);
+  }
+});
+
+test('resolveAgentHostSessionLink and isAgentHostRotationDue enforce host, pending, and rotation boundaries', () => {
+  const baseTarget = (overrides: Partial<WakeTargetState> = {}): WakeTargetState => ({
+    mailboxId: 'stream:review',
+    driver: 'agent-host',
+    coalesceMs: 0,
+    completedWaves: 0,
+    pendingWake: false,
+    earliestWakeAt: 0,
+    attemptCount: 0,
+    driverConfig: { hostAgent: 'codex', conversationMode: 'wave', sessionId: 'thread-abc/1', sessionStartedAt: 1_000 },
+    ...overrides,
+  });
+
+  // Non-Codex / non-agent-host / undefined -> undefined.
+  assert.equal(resolveAgentHostSessionLink(undefined), undefined);
+  assert.equal(resolveAgentHostSessionLink(baseTarget({ driver: 'orca-terminal', driverConfig: { workspacePath: '/tmp' } })), undefined);
+  assert.equal(resolveAgentHostSessionLink(baseTarget({ driver: 'passive', driverConfig: undefined })), undefined);
+  assert.equal(resolveAgentHostSessionLink(baseTarget({ driverConfig: { hostAgent: 'claude-code', sessionId: 'c1' } })), undefined);
+  assert.equal(resolveAgentHostSessionLink(baseTarget({ driverConfig: { hostAgent: 'antigravity', sessionId: 'a1' } })), undefined);
+
+  // Codex / codex-cli with active session and no rotation due -> ready with encoded deep link.
+  assert.deepEqual(resolveAgentHostSessionLink(baseTarget()), {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: 'codex://threads/thread-abc%2F1',
+  });
+  assert.deepEqual(
+    resolveAgentHostSessionLink(baseTarget({ driverConfig: { hostAgent: 'codex-cli', conversationMode: 'fixed', sessionId: 'tid-42' } })),
+    { state: 'ready', label: 'ChatGPT App', url: 'codex://threads/tid-42' },
+  );
+
+  // Missing or whitespace sessionId -> pending.
+  assert.deepEqual(
+    resolveAgentHostSessionLink(baseTarget({ driverConfig: { hostAgent: 'codex', conversationMode: 'wave' } })),
+    { state: 'pending' },
+  );
+  assert.deepEqual(
+    resolveAgentHostSessionLink(baseTarget({ driverConfig: { hostAgent: 'codex', conversationMode: 'spawn', sessionId: '  ' } })),
+    { state: 'pending' },
+  );
+
+  // Wave rotation due with no outstanding lease -> pending; with outstanding lease -> ready (must not rotate mid-lease).
+  const waveRotating = baseTarget({ rotateAfterWaves: 2, completedWaves: 2 });
+  assert.equal(isAgentHostRotationDue(waveRotating, { hasOutstandingLease: false }), true);
+  assert.equal(isAgentHostRotationDue(waveRotating, { hasOutstandingLease: true }), false);
+  assert.deepEqual(resolveAgentHostSessionLink(waveRotating, { hasOutstandingLease: false }), { state: 'pending' });
+  assert.deepEqual(resolveAgentHostSessionLink(waveRotating, { hasOutstandingLease: true }), {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: 'codex://threads/thread-abc%2F1',
+  });
+
+  // Age rotation due (rotateAfterMs) with no outstanding lease -> pending; before expiry or with lease -> ready.
+  const ageRotating = baseTarget({
+    driverConfig: {
+      hostAgent: 'codex',
+      conversationMode: 'wave',
+      sessionId: 'age-1',
+      rotateAfterMs: 60_000,
+      sessionStartedAt: 10_000,
+    },
+  });
+  assert.equal(isAgentHostRotationDue(ageRotating, { now: 69_999, hasOutstandingLease: false }), false);
+  assert.equal(isAgentHostRotationDue(ageRotating, { now: 70_000, hasOutstandingLease: false }), true);
+  assert.equal(isAgentHostRotationDue(ageRotating, { now: 70_000, hasOutstandingLease: true }), false);
+  assert.deepEqual(resolveAgentHostSessionLink(ageRotating, { now: 69_999, hasOutstandingLease: false }), {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: 'codex://threads/age-1',
+  });
+  assert.deepEqual(resolveAgentHostSessionLink(ageRotating, { now: 70_000, hasOutstandingLease: false }), {
+    state: 'pending',
+  });
+  assert.deepEqual(resolveAgentHostSessionLink(ageRotating, { now: 70_000, hasOutstandingLease: true }), {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: 'codex://threads/age-1',
+  });
 });

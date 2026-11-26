@@ -1,4 +1,5 @@
 import { ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
+import type { MessageEnvelope, SessionLinkResolution } from '../core-types/index.ts';
 import {
   buildAgentHostInvocation,
   normalizeAgentHost,
@@ -9,7 +10,7 @@ import {
 } from './hosts.ts';
 import type { SupportedAgentHost, ActiveConversationMode } from './hosts.ts';
 import { runCodexAppServerTurn } from './codex-app-server.ts';
-import { checkedCommand, runCommand } from '../subprocess/index.ts';
+import { checkedCommand, runCommand, singleLine } from '../subprocess/index.ts';
 import type { CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts';
 import {
   buildWakeupPointer,
@@ -69,6 +70,94 @@ export function readAgentHostDriverConfig(
   return config as AgentHostDriverConfig;
 }
 
+const MAX_CODEX_THREAD_NAME_LENGTH = 80;
+
+export interface CodexThreadNamePreview {
+  readonly latestQueued?: { readonly envelope: Pick<MessageEnvelope, 'subject'> };
+  readonly items: readonly { readonly envelope: Pick<MessageEnvelope, 'subject'> }[];
+}
+
+function formatLocalMonthDay(now: number): string {
+  const date = new Date(now);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${month}-${day}`;
+}
+
+function capThreadName(value: string): string {
+  const normalized = singleLine(value);
+  const chars = Array.from(normalized);
+  if (chars.length <= MAX_CODEX_THREAD_NAME_LENGTH) return normalized;
+  return `${chars.slice(0, MAX_CODEX_THREAD_NAME_LENGTH - 1).join('').trimEnd()}…`;
+}
+
+/** Build a concise, single-line sidebar title (<= 80 chars) for a newly started Codex thread. */
+export function buildCodexThreadName(
+  mailboxId: string,
+  mode: ActiveConversationMode,
+  preview: CodexThreadNamePreview,
+  options: { now?: number; rotates?: boolean } = {},
+): string {
+  if (mode === 'spawn') {
+    const rawSubject = preview.latestQueued?.envelope.subject ?? preview.items.at(-1)?.envelope.subject;
+    const subject = typeof rawSubject === 'string' ? singleLine(rawSubject) : '';
+    return capThreadName(subject || `Dealer · ${mailboxId}`);
+  }
+  const label = mailboxId.startsWith('stream:') ? mailboxId.slice(7) : mailboxId;
+  if (options.rotates) {
+    return capThreadName(`Dealer · ${label} (${formatLocalMonthDay(options.now ?? Date.now())})`);
+  }
+  return capThreadName(`Dealer · ${label}`);
+}
+
+/** Single authoritative predicate for whether an agent-host wake target is due to rotate sessions. */
+export function isAgentHostRotationDue(
+  target: WakeTargetState,
+  options: { now?: number; hasOutstandingLease: boolean },
+): boolean {
+  if (target.driver !== 'agent-host') return false;
+  const config = readAgentHostDriverConfig(target);
+  if (!config.sessionId?.trim() || config.conversationMode === 'spawn' || options.hasOutstandingLease) {
+    return false;
+  }
+  const now = options.now ?? Date.now();
+  const waveRotationDue =
+    target.rotateAfterWaves !== undefined &&
+    target.completedWaves >= target.rotateAfterWaves;
+  const ageRotationDue =
+    config.rotateAfterMs !== undefined &&
+    config.sessionStartedAt !== undefined &&
+    now - config.sessionStartedAt >= config.rotateAfterMs;
+  return waveRotationDue || ageRotationDue;
+}
+
+/**
+ * Derive a host-neutral receiver-local session deep link from an `agent-host` wake target.
+ * Returns `{ state: 'pending' }` when a Codex session has not yet been committed or is due to
+ * rotate (suppressing any retiring thread link), and `undefined` for non-link hosts.
+ */
+export function resolveAgentHostSessionLink(
+  target: WakeTargetState | undefined,
+  options: { now?: number; hasOutstandingLease?: boolean } = {},
+): SessionLinkResolution | undefined {
+  if (!target || target.driver !== 'agent-host') return undefined;
+  const config = readAgentHostDriverConfig(target);
+  if (!config.hostAgent || normalizeAgentHost(config.hostAgent) !== 'codex') return undefined;
+  const sessionId = config.sessionId?.trim();
+  const rotationDue = isAgentHostRotationDue(target, {
+    now: options.now,
+    hasOutstandingLease: options.hasOutstandingLease ?? false,
+  });
+  if (!sessionId || rotationDue) {
+    return { state: 'pending' };
+  }
+  return {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: `codex://threads/${encodeURIComponent(sessionId)}`,
+  };
+}
+
 function rotatedSessionId(
   hostAgent: SupportedAgentHost,
   mailboxId: string,
@@ -105,24 +194,12 @@ export async function deliverAgentHostWakeTarget(
     const state = store.getWakeTarget(mailboxId);
     expectedRevision = state?.bindingRevision ?? 0;
     const target = state ? { ...readAgentHostDriverConfig(state), ...state } : undefined;
-    if (!target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
+    if (!state || !target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
     const preview = store.check({ mailboxId, peek: true });
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) throw new Error(`No pending Dealer messages in ${mailboxId}`);
     const hasOutstandingLease = Boolean(preview.deliveryId);
-    const waveRotationDue =
-      !hasOutstandingLease &&
-      target.rotateAfterWaves !== undefined &&
-      target.completedWaves >= target.rotateAfterWaves;
-    const ageRotationDue =
-      !hasOutstandingLease &&
-      target.rotateAfterMs !== undefined &&
-      target.sessionStartedAt !== undefined &&
-      now - target.sessionStartedAt >= target.rotateAfterMs;
-    const shouldRotate =
-      Boolean(target.sessionId) &&
-      target.conversationMode !== 'spawn' &&
-      (waveRotationDue || ageRotationDue);
+    const shouldRotate = isAgentHostRotationDue(state, { now, hasOutstandingLease });
     const canonicalHost = normalizeAgentHost(target.hostAgent);
     const effectiveMode: ActiveConversationMode = shouldRotate
       ? 'wave'
@@ -167,6 +244,13 @@ export async function deliverAgentHostWakeTarget(
       throw new Error(`Cannot rotate session while delivery lease ${fence.leaseId} is outstanding`);
     }
     deliveryBegun = true;
+    const resumeThread = effectiveMode === 'fixed' || (effectiveMode === 'wave' && Boolean(effectiveSessionId));
+    const threadName = !resumeThread
+      ? buildCodexThreadName(mailboxId, effectiveMode, preview, {
+          now,
+          rotates: target.rotateAfterWaves !== undefined || target.rotateAfterMs !== undefined,
+        })
+      : undefined;
     const output =
       canonicalHost === 'codex'
         ? await runCodexAppServerTurn({
@@ -174,6 +258,7 @@ export async function deliverAgentHostWakeTarget(
             cwd: target.workspacePath,
             mode: effectiveMode,
             sessionId: effectiveSessionId,
+            threadName,
             promptText: pointer,
             agentProfile: target.agentProfile,
             signal: options.signal,

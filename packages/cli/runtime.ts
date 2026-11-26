@@ -1,6 +1,6 @@
 import { createNotifyExecutorPlugin, createInboxExecutorPlugin, serializeThreadDeliveries } from '../plugins-executor/index.ts';
 import { createOrcaWakeupDrivers } from '../plugins-orca/index.ts';
-import { createAgentHostWakeupDriver } from '../plugins-agent-host/index.ts';
+import { createAgentHostWakeupDriver, resolveAgentHostSessionLink } from '../plugins-agent-host/index.ts';
 import { createDefaultHostPluginRegistry } from './registry.ts';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, chmodSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
@@ -1184,6 +1184,11 @@ export class DealerNodeRuntime {
         return mailboxId === 'default' || bound || this.mailbox.resolveThreadLocalMailbox(envelope.semantic?.threadId ?? envelope.id, envelope.networkId, {
           excludeInboundMessageId: envelope.id,
         }) === mailboxId;
+      },
+      resolveSessionLink: mailboxId => {
+        const target = this.mailbox.getWakeTarget(mailboxId);
+        const preview = this.mailbox.check({ mailboxId, peek: true });
+        return resolveAgentHostSessionLink(target, { hasOutstandingLease: Boolean(preview.deliveryId) });
       },
       commandRunner: this.options.commandRunner ?? runCommand,
       onError: (error: unknown) => { this.lastError = String(error); },

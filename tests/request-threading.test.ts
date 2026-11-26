@@ -1,4 +1,5 @@
 import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createFakeCodexAppServer } from './helpers/fake-codex-app-server.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,7 +10,7 @@ import {
   DealerNodeRuntime, MailboxStore, LarkMailboxNotifier, WakeupRedriveService, createLarkMirrorPlugin,
   signEnvelope, generateNodeKeyPair, verifyEnvelope, runDealerCli,
   ensureOrcaWorkspace, checkOrcaWorkspaceIdle, resolveOrSpawnOrcaWorkspaceTerminal, defaultAntigravityLaunchCommand,
-  validateTopicBindings, validateLarkNotify, initProjectScaffold,
+  validateTopicBindings, validateLarkNotify, initProjectScaffold, resolveAgentHostSessionLink,
 } from '../packages/index.ts';
 import type { MessageEnvelope, CommandRequest, CommandRunner } from '../packages/index.ts';
 import { openStateLedgers } from '../packages/cli/ledgers.ts';
@@ -972,4 +973,286 @@ test('runtime replaces and disables the Lark mirror through kernel lifecycle', a
   runtime.mailbox.enqueue([envelope('after-disable')]);
   await replacement.flush();
   assert.equal(calls.length, 1, 'disabled notifier has no active subscription');
+});
+
+test('Lark session links: inline ready, pending onWakeTarget follow-up, rotation isolation, legacy v1 state, and rebind cleanup', async t => {
+  const root = directory(t);
+
+  // 1. Inline session link on existing Codex session (both default markdown and custom recipientMarkdown/markdown)
+  //    AND wake-commit-before-Lark ordering produces zero redundant reply.
+  {
+    const dir = join(root, 'inline');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    store.upsertWakeTarget('stream:codex-live', {
+      driver: 'agent-host',
+      driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'thread-ready-1', sessionStartedAt: Date.now() },
+    });
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:codex-live'],
+      config: { enabled: true, target: { chatId: 'chat-1' } },
+      resolveSessionLink: mailboxId => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+
+    store.enqueue([
+      envelope('inline-default'),
+      envelope('inline-custom', {
+        payload: { notification: { markdown: 'Fallback override', recipientMarkdown: { bob: 'Custom for Bob' } } },
+      }),
+    ], { mailboxId: 'stream:codex-live' });
+    await notifier.flush();
+
+    assert.equal(calls.length, 2);
+    assert.ok(argument(calls[0], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/thread-ready-1`'));
+    assert.equal(
+      argument(calls[1], '--markdown'),
+      'Custom for Bob\n\n- ChatGPT App: `codex://threads/thread-ready-1`',
+    );
+    const persisted = JSON.parse(readFileSync(join(dir, 'lark-notify.json'), 'utf8'));
+    assert.equal(persisted.threadRoots['inline-default'].awaitingSessionLink, undefined);
+    assert.equal(persisted.threadRoots['inline-default'].lastSessionUrl, 'codex://threads/thread-ready-1');
+  }
+
+  // 2. Wave 1 pending -> Lark renders first without link, then completeWakeDelivery commits sessionId
+  //    and emits onWakeTarget -> posts ONE idempotent in-thread reply.
+  //    Then rotation pending -> suppresses retiring link, commits thread-2 -> replies ONLY to new awaiting thread,
+  //    NEVER spamming unrelated historical threadRoots on the same mailbox.
+  {
+    const dir = join(root, 'pending-and-rotation');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:rot'],
+      config: { enabled: true, target: { chatId: 'chat-2' } },
+      resolveSessionLink: mailboxId => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rot-msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+
+    // Wave 1 arrives before sessionId exists.
+    store.enqueue([envelope('thread-a')], {
+      mailboxId: 'stream:rot',
+      wakeTarget: {
+        driver: 'agent-host',
+        rotateAfterWaves: 1,
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave' },
+      },
+    });
+    await notifier.flush();
+    assert.equal(calls.length, 1);
+    assert.ok(!argument(calls[0], '--markdown').includes('codex://threads/'), 'pending root must not include link');
+
+    // Wake commits thread-1 via tryBeginWakeDelivery + completeWakeDelivery -> emits onWakeTarget.
+    const rev1 = store.getWakeTarget('stream:rot')!.bindingRevision;
+    store.tryBeginWakeDelivery('stream:rot', rev1);
+    store.completeWakeDelivery('stream:rot', 0, {
+      driver: 'agent-host',
+      driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'thread-1', sessionStartedAt: Date.now() },
+    }, undefined, rev1);
+    await notifier.flush();
+
+    assert.equal(calls.length, 2);
+    assert.ok(calls[1].args.includes('--reply-in-thread'));
+    assert.equal(argument(calls[1], '--message-id'), 'rot-msg-1');
+    assert.equal(argument(calls[1], '--markdown'), '**[ChatGPT App]** Session ready: `codex://threads/thread-1`');
+
+    // Ack wave 1 -> completedWaves === 1 === rotateAfterWaves -> rotation is now due!
+    const lease1 = store.check({ mailboxId: 'stream:rot' });
+    store.ack(lease1.deliveryId!, 'stream:rot');
+
+    // Thread B arrives while rotation is due -> MUST suppress retiring thread-1 link!
+    store.enqueue([envelope('thread-b')], { mailboxId: 'stream:rot' });
+    await notifier.flush();
+    assert.equal(calls.length, 3);
+    assert.ok(!argument(calls[2], '--markdown').includes('thread-1'), 'retiring session link must be suppressed');
+
+    // Wake rotates to thread-2 and commits -> MUST reply ONLY to thread-b (rot-msg-3), NOT thread-a (rot-msg-1)!
+    const rev2 = store.getWakeTarget('stream:rot')!.bindingRevision;
+    store.tryBeginWakeDelivery('stream:rot', rev2, { requireNoOutstandingLease: true });
+    store.completeWakeDelivery('stream:rot', 1, {
+      driver: 'agent-host',
+      completedWaves: 0,
+      driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'thread-2', sessionStartedAt: Date.now() },
+    }, undefined, rev2);
+    await notifier.flush();
+
+    assert.equal(calls.length, 4);
+    assert.ok(calls[3].args.includes('--reply-in-thread'));
+    assert.equal(argument(calls[3], '--message-id'), 'rot-msg-3', 'only awaiting thread-b receives rotated session link');
+    assert.equal(argument(calls[3], '--markdown'), '**[ChatGPT App]** Session ready: `codex://threads/thread-2`');
+
+    // Restarting notifier must be 100% idempotent (zero duplicate replies).
+    await notifier.stop();
+    const restarted = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:rot'],
+      config: { enabled: true, target: { chatId: 'chat-2' } },
+      resolveSessionLink: mailboxId => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rot-msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => restarted.stop());
+    restarted.start();
+    await restarted.flush();
+    assert.equal(calls.length, 4, 'restart must not re-send delivered session links');
+  }
+
+  // 3. Backward-compatible loading of legacy v1 lark-notify.json without optional fields,
+  //    AND clearing awaitingSessionLink if host is rebound to a non-link host.
+  {
+    const dir = join(root, 'legacy-and-rebind');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    writeFileSync(join(dir, 'lark-notify.json'), JSON.stringify({
+      schema: 'the-dealer-lark-notify/v1',
+      cursorSequence: -1,
+      deliveredItems: {},
+      threadRoots: {
+        'legacy-thread': {
+          messageId: 'legacy-msg-1',
+          targetKey: JSON.stringify(['', '', '--chat-id', 'chat-3']),
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    }));
+
+    let linkState: ReturnType<typeof resolveAgentHostSessionLink> = { state: 'pending' };
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:rebind'],
+      config: { enabled: true, target: { chatId: 'chat-3' } },
+      resolveSessionLink: () => linkState,
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rebind-msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+    store.enqueue([envelope('rebind-thread')], {
+      mailboxId: 'stream:rebind',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave' },
+      },
+    });
+    await notifier.flush();
+    assert.equal(calls.length, 1);
+    const beforeRebind = JSON.parse(readFileSync(join(dir, 'lark-notify.json'), 'utf8'));
+    assert.equal(beforeRebind.threadRoots['rebind-thread'].awaitingSessionLink, true);
+    assert.equal(beforeRebind.threadRoots['legacy-thread'].messageId, 'legacy-msg-1');
+
+    // Rebind mailbox to a non-link host -> resolveSessionLink returns undefined -> awaitingSessionLink is cleared without sending.
+    linkState = undefined;
+    store.upsertWakeTarget('stream:rebind', {
+      driver: 'agent-host',
+      pendingWake: true,
+      driverConfig: { hostAgent: 'claude-code', conversationMode: 'wave' },
+    });
+    await notifier.flush();
+    assert.equal(calls.length, 1, 'rebind to non-link host sends no reply');
+    const afterRebind = JSON.parse(readFileSync(join(dir, 'lark-notify.json'), 'utf8'));
+    assert.equal(afterRebind.threadRoots['rebind-thread'].awaitingSessionLink, undefined);
+  }
+
+  // 4. End-to-end DealerNodeRuntime wiring: activateLarkNotifier resolves Codex session deep links automatically.
+  {
+    const dir = join(root, 'runtime-e2e');
+    const turnGate = Promise.withResolvers<void>();
+    const turnStarted = Promise.withResolvers<void>();
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: () => 'runtime-codex-thread-9',
+      onTurnStart: async () => {
+        turnStarted.resolve();
+        await turnGate.promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'runtime-e2e-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rt-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': { executor: 'codex', mode: 'wave', workspacePath: root, notifyLark: true },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'rt-chat' } },
+      },
+    }).start();
+    t.after(async () => {
+      turnGate.resolve();
+      await runtime.stop();
+    });
+
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Runtime E2E Task',
+      body: 'Please handle this',
+      payload: {},
+    });
+
+    // Wait for Lark root to send while Codex turn is still running (sessionId not committed yet).
+    await turnStarted.promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 1);
+    assert.ok(!argument(larkCalls[0], '--markdown').includes('codex://threads/'));
+
+    // Release Codex turn -> completeWakeDelivery commits runtime-codex-thread-9 -> onWakeTarget triggers single reply!
+    turnGate.resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 2);
+    assert.ok(larkCalls[1].args.includes('--reply-in-thread'));
+    assert.equal(argument(larkCalls[1], '--message-id'), 'rt-lark-1');
+    assert.equal(
+      argument(larkCalls[1], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/runtime-codex-thread-9`',
+    );
+    assert.equal(fakeCodex.sessions[0].threadParams?.threadSource, 'user');
+    assert.equal(fakeCodex.sessions[0].threadName, 'Dealer · collab.request.v4');
+  }
 });
