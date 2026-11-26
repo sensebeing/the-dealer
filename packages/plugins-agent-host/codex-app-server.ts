@@ -236,11 +236,16 @@ export async function runCodexAppServerTurn(
     }
   };
 
-  const writeJsonLine = (payload: Record<string, unknown>, strict = true): void => {
+  const writeJsonLine = (
+    payload: Record<string, unknown>,
+    strict = true,
+    onBeforeWrite?: () => void,
+  ): void => {
     if (child.stdin.destroyed || child.stdin.writableEnded) {
       if (strict) throw makeBoundaryError('codex app-server stdin is closed');
       return;
     }
+    onBeforeWrite?.();
     try {
       child.stdin.write(`${JSON.stringify(payload)}\n`);
     } catch (error) {
@@ -270,7 +275,18 @@ export async function runCodexAppServerTurn(
     failActive(makeBoundaryError(`codex app-server process error: ${String(error)}`));
   };
 
-  const onChildExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+  // In Node.js, 'exit' can fire before stdout finishes draining buffered lines; never fail active
+  // RPC/turn waiters here — wait for 'close' / rl 'close' after stdio streams finish draining.
+  const onChildExit = (): void => {
+    childExited = true;
+    if (terminationTimer) {
+      clearTimeout(terminationTimer);
+      terminationTimer = undefined;
+    }
+    exitWaiter?.();
+  };
+
+  const onChildClose = (code: number | null, signal: NodeJS.Signals | null): void => {
     childExited = true;
     if (terminationTimer) {
       clearTimeout(terminationTimer);
@@ -351,8 +367,12 @@ export async function runCodexAppServerTurn(
       return;
     }
 
-    // Notification: only inspect turn/completed; discard all streaming deltas in O(1) memory.
+    // Notification: only inspect turn/completed after turn/start; discard stray handshake
+    // notifications and all streaming deltas in O(1) memory.
     if (message.method === 'turn/completed') {
+      if (phase !== 'turn-sent' && phase !== 'turn-running') {
+        return;
+      }
       const params = isRecord(message.params) ? message.params : undefined;
       const turn = params && isRecord(params.turn) ? params.turn : undefined;
       const turnId = typeof turn?.id === 'string' && turn.id.trim().length > 0 ? turn.id.trim() : undefined;
@@ -377,12 +397,17 @@ export async function runCodexAppServerTurn(
   child.stdin.on('error', onStdinError);
   child.on('error', onChildError);
   child.once('exit', onChildExit);
-  child.once('close', onChildExit);
+  child.once('close', onChildClose);
   rl.on('line', onLine);
   rl.once('close', onStdoutClose);
   options.signal?.addEventListener('abort', onAbort, { once: true });
 
-  const sendRequest = (id: number, method: string, params: Record<string, unknown>): Promise<unknown> => {
+  const sendRequest = (
+    id: number,
+    method: string,
+    params: Record<string, unknown>,
+    onBeforeWrite?: () => void,
+  ): Promise<unknown> => {
     if (fatalError) return Promise.reject(fatalError);
     if (options.signal?.aborted) {
       return Promise.reject(makeBoundaryError(`codex app-server aborted: ${String(options.signal.reason ?? 'aborted')}`));
@@ -400,7 +425,7 @@ export async function runCodexAppServerTurn(
       timer.unref();
       activeRpc = { id, method, resolve, reject, timer };
       try {
-        writeJsonLine({ jsonrpc: '2.0', id, method, params });
+        writeJsonLine({ jsonrpc: '2.0', id, method, params }, true, onBeforeWrite);
       } catch (error) {
         if (activeRpc?.id === id) {
           activeRpc = undefined;
@@ -494,13 +519,20 @@ export async function runCodexAppServerTurn(
       );
     }
 
-    // Crossing the external-effect boundary: once turn/start is sent, only an explicit
-    // JSON-RPC error response proves the turn did not start.
-    phase = 'turn-sent';
-    await sendRequest(3, 'turn/start', {
-      threadId,
-      input: [{ type: 'text', text: options.promptText }],
-    });
+    // Crossing the external-effect boundary: transition phase inside sendRequest right before
+    // child.stdin.write executes (after all pre-write guards pass), so closed-stdin or pre-write
+    // abort still throws CommandNotStartedError instead of falsely fencing deliveryInDoubt.
+    await sendRequest(
+      3,
+      'turn/start',
+      {
+        threadId,
+        input: [{ type: 'text', text: options.promptText }],
+      },
+      () => {
+        phase = 'turn-sent';
+      },
+    );
 
     const completion = await waitForTurnCompletion();
     phase = 'completed';
@@ -542,6 +574,6 @@ export async function runCodexAppServerTurn(
     child.stdin.off('error', onStdinError);
     child.off('error', onChildError);
     child.off('exit', onChildExit);
-    child.off('close', onChildExit);
+    child.off('close', onChildClose);
   }
 }

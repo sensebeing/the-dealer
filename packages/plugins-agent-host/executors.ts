@@ -390,12 +390,14 @@ function createAgentExecutorPlugin(
           groups.push({ envelopes, async deliver(committed) {
             const { mailboxId } = delivery;
             if (wakeup) {
-              trustWorkspace(delivery);
               const result = store.enqueue(envelopes, {
                 signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
                 wakeTarget: delivery.buildWakeTargetPatch,
               });
               committed();
+              if (result.claimedSpawn !== false && result.mailboxIds.includes(mailboxId)) {
+                trustWorkspace(delivery);
+              }
               const receipt = { ...result, executor: name, executionId: randomUUID(),
                 ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
               for (const actualMailbox of result.mailboxIds) {

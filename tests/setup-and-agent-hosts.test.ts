@@ -3856,3 +3856,187 @@ test('async wakeup handoff returns immediately, honors wave-1 coalesceMs, and is
   });
   assert.ok(JSON.parse(readFileSync(agySettings, 'utf8')).trustedWorkspaces.includes(root));
 });
+
+test('codex app-server survives exit-before-stdout-drain, ignores stray handshake turn/completed, and preserves pre-write turn/start boundary', async t => {
+  const root = directory(t);
+
+  // 1. Exit-before-stdout-drain race: child emits 'exit' before turn/completed drains from stdout.
+  {
+    const fake = createFakeCodexAppServer({
+      nextThreadId: () => 'drain-thread-1',
+      onTurnStart: (_params, ctx) => {
+        // Emit process exit BEFORE turn/completed reaches stdout and before stdout closes.
+        ctx.child.emit('exit', 0, null);
+        setTimeout(() => {
+          ctx.send({
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: { threadId: 'drain-thread-1', turn: { id: ctx.session.turnId, status: 'completed' } },
+          });
+          ctx.child.stopKeepAlive();
+          ctx.child.stdout.end();
+          ctx.child.stderr.end();
+          ctx.child.emit('close', 0, null);
+        }, 15);
+        return { suppressCompletion: true };
+      },
+    });
+    const result = await runCodexAppServerTurn({
+      cwd: root,
+      mode: 'spawn',
+      promptText: 'exit before drain',
+      stdioSpawner: fake.spawner,
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(result.threadId, 'drain-thread-1');
+  }
+
+  // 2. Stray turn/completed during thread/resume handshake is ignored; waits for the real new turn.
+  {
+    let newTurnStarted = false;
+    const fake = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/resume') {
+          ctx.session.threadMethod = 'thread/resume';
+          ctx.session.threadParams = msg.params;
+          ctx.session.threadId = String(msg.params?.threadId ?? '');
+          // Emit a stray failed turn/completed notification before thread/resume completes.
+          ctx.send({
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: { turn: { id: 'stale-turn-0', status: 'failed', error: { message: 'stale turn' } } },
+          });
+          ctx.send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: ctx.session.threadId } } });
+          return true;
+        }
+      },
+      onTurnStart: async () => {
+        newTurnStarted = true;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      },
+    });
+    const result = await runCodexAppServerTurn({
+      cwd: root,
+      mode: 'fixed',
+      sessionId: 'resumed-thread',
+      promptText: 'ignore stray completion',
+      stdioSpawner: fake.spawner,
+    });
+    assert.equal(newTurnStarted, true, 'must still start and wait for the new turn');
+    assert.equal(result.status, 'completed');
+    assert.equal(result.threadId, 'resumed-thread');
+  }
+
+  // 3a. Stdin closed right before turn/start is written -> CommandNotStartedError (defers without fencing).
+  {
+    const store = new MailboxStore(join(root, 'closed-stdin.json'));
+    const mailboxId = 'task:closed-stdin';
+    store.enqueue([message('closed-stdin')], {
+      mailboxId,
+      wakeTarget: { driver: 'agent-host', driverConfig: { hostAgent: 'codex', conversationMode: 'spawn', workspacePath: root } },
+    });
+    const fake = createFakeCodexAppServer({
+      ignoreStdinEnd: true,
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/start') {
+          ctx.child.stdin.end();
+          ctx.send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'pre-write-thread' } } });
+          return true;
+        }
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, mailboxId, { stdioSpawner: fake.spawner }),
+      CommandNotStartedError,
+    );
+    const target = store.getWakeTarget(mailboxId)!;
+    assert.equal(target.deliveryInDoubt, undefined, 'closed stdin before turn/start write must not fence deliveryInDoubt');
+    assert.equal(target.pendingWake, true);
+  }
+
+  // 3b. Signal aborted right before turn/start is written -> CommandNotStartedError (defers without fencing).
+  {
+    const store = new MailboxStore(join(root, 'pre-write-abort.json'));
+    const mailboxId = 'task:pre-write-abort';
+    store.enqueue([message('pre-write-abort')], {
+      mailboxId,
+      wakeTarget: { driver: 'agent-host', driverConfig: { hostAgent: 'codex', conversationMode: 'spawn', workspacePath: root } },
+    });
+    const controller = new AbortController();
+    const fake = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/start') {
+          ctx.send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'abort-before-turn' } } });
+          controller.abort('aborted before turn/start write');
+          return true;
+        }
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, mailboxId, {
+        signal: controller.signal,
+        stdioSpawner: fake.spawner,
+      }),
+      CommandNotStartedError,
+    );
+    const target = store.getWakeTarget(mailboxId)!;
+    assert.equal(target.deliveryInDoubt, undefined, 'abort before turn/start write must not fence deliveryInDoubt');
+    assert.equal(target.pendingWake, true);
+  }
+
+  // 4. Wakeup-backed antigravity executor does not mutate trustedWorkspaces for duplicate or redirected deliveries.
+  {
+    const store = new MailboxStore(join(root, 'trust-guard.json'));
+    const agySettings = join(root, 'trust-guard-settings.json');
+    const wakeup = new WakeupRedriveService({
+      store,
+      flushIntervalMs: 100_000,
+      drivers: createTestWakeupDrivers({
+        commandRunner: async () => ({ stdout: '{}' }),
+      }),
+    });
+    t.after(() => wakeup.stop());
+
+    // Pre-seed duplicate message in task:dup and an existing thread mailbox for redirected spawn.
+    const dup = message('dup');
+    store.enqueue([dup], { mailboxId: 'task:dup' });
+    const existingRoot = { ...message('existing-root'), semantic: { type: 'message' as const, threadId: 'shared-thread' } };
+    store.enqueue([existingRoot], { mailboxId: 'task:existing-root' });
+
+    const plugin = createAntigravityExecutorPlugin({
+      store,
+      wakeup,
+      agySettingsPath: agySettings,
+      cwd: root,
+      commandRunner: async () => ({ stdout: '{}' }),
+    });
+
+    // Duplicate delivery: mailboxIds does not include 'task:dup' (no new insert) -> must not touch settings.
+    await plugin.execute([dup], context, {});
+    assert.equal(existsSync(agySettings), false, 'duplicate delivery must not mutate Antigravity settings');
+
+    // Redirected spawn (claimedSpawn === false inside host deliver()): simulate a concurrent thread
+    // claim landing between prepareAgentDelivery and store.enqueue so deliver() receives claimedSpawn: false.
+    const racedStore = Object.create(store) as MailboxStore;
+    const origResolve = store.resolveThreadLocalMailbox.bind(store);
+    racedStore.resolveThreadLocalMailbox = ((threadId, networkId, opts) =>
+      threadId === 'shared-thread' ? undefined : origResolve(threadId, networkId, opts)) as typeof store.resolveThreadLocalMailbox;
+    const racedPlugin = createAntigravityExecutorPlugin({
+      store: racedStore,
+      wakeup,
+      agySettingsPath: agySettings,
+      cwd: root,
+      commandRunner: async () => ({ stdout: '{}' }),
+    });
+    const redirected = { ...message('redirected-child'), semantic: { type: 'message' as const, threadId: 'shared-thread' } };
+    const redirectedReceipt = await racedPlugin.execute([redirected], context, {});
+    assert.equal(redirectedReceipt.mailboxId, 'task:existing-root');
+    assert.equal(redirectedReceipt.claimedSpawn, false);
+    assert.equal(existsSync(agySettings), false, 'redirected spawn must not mutate Antigravity settings');
+
+    // Fresh owned spawn DOES trust workspacePath after enqueue commits.
+    await plugin.execute([message('fresh-agy')], context, {});
+    assert.equal(existsSync(agySettings), true);
+    assert.ok(JSON.parse(readFileSync(agySettings, 'utf8')).trustedWorkspaces.includes(root));
+  }
+});
