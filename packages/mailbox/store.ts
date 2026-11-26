@@ -174,6 +174,11 @@ export interface ResolvedReplyTarget {
   subject: string;
 }
 
+export type BeginWakeDeliveryResult =
+  | { kind: 'fenced'; target: WakeTargetState }
+  | { kind: 'superseded'; target: WakeTargetState }
+  | { kind: 'outstanding_lease'; target: WakeTargetState; leaseId: string };
+
 export interface MailboxStoreOptions {
   /** Legacy flat inbox file migrated once into the default mailbox when no mailbox exists. */
   legacyInboxPath?: string;
@@ -1800,35 +1805,63 @@ export class MailboxStore {
   }
 
   /**
-   * Fence before an external delivery so a crash or an unknown outcome cannot silently replay it.
-   * Pointer deliveries can supply an observation that a matching consumer lease may confirm.
+   * Atomically fence a wake delivery inside SQLite when the binding revision (and optional
+   * no-outstanding-lease precondition) still holds, returning a structured outcome.
    */
-  beginWakeDelivery(
-    mailboxId: string, expectedRevision?: number, pointer?: { deliveredSequence: number; pinnedSession?: PinnedSessionMailbox },
-  ): WakeTargetState | undefined {
+  tryBeginWakeDelivery(
+    mailboxId: string,
+    expectedRevision?: number,
+    options: {
+      deliveredSequence?: number;
+      pinnedSession?: PinnedSessionMailbox;
+      requireNoOutstandingLease?: boolean;
+    } = {},
+  ): BeginWakeDeliveryResult {
     const id = normalizeMailboxId(mailboxId);
-    const fenced = this.db.write(() => {
+    const result = this.db.write<BeginWakeDeliveryResult>(() => {
       const previous = this.db.wakeTarget(id);
       const current = previous ?? defaultWakeTarget(id);
       const revision = current.bindingRevision ?? 0;
-      if (expectedRevision !== undefined && revision !== expectedRevision) return undefined;
+      if (expectedRevision !== undefined && revision !== expectedRevision) {
+        return { kind: 'superseded', target: structuredClone(current) };
+      }
       if (current.deliveryInDoubt) {
         throw new Error(`Dealer wake delivery requires reconciliation: ${id}`);
       }
-      const pendingDelivery = pointer && {
-        ...pointer, bindingRevision: revision, originRevision: revision,
-        queuedItemIds: this.db.items({ mailboxId: id, status: 'queued', throughSequence: pointer.deliveredSequence }).map(item => item.id),
-      };
+      if (options.requireNoOutstandingLease) {
+        const outstanding = this.db.mailbox(id)?.outstanding;
+        if (outstanding) {
+          return { kind: 'outstanding_lease', target: structuredClone(current), leaseId: outstanding.leaseId };
+        }
+      }
+      const pendingDelivery = options.deliveredSequence !== undefined ? {
+        deliveredSequence: options.deliveredSequence,
+        ...(options.pinnedSession !== undefined ? { pinnedSession: options.pinnedSession } : {}),
+        bindingRevision: revision,
+        originRevision: revision,
+        queuedItemIds: this.db.items({ mailboxId: id, status: 'queued', throughSequence: options.deliveredSequence }).map(item => item.id),
+      } : undefined;
       const next = validateWakeTarget(mergeWakeTarget(current, {
         deliveryInDoubt: true, pendingWake: false,
         lastWakeError: 'External wake delivery outcome is not yet confirmed',
         pendingDelivery,
       }));
       this.db.writeWakeTarget(next, previous);
-      return structuredClone(next);
+      return { kind: 'fenced', target: structuredClone(next) };
     });
-    if (fenced) this.events.emit('target', id);
-    return fenced;
+    if (result.kind === 'fenced') this.events.emit('target', id);
+    return result;
+  }
+
+  /**
+   * Fence before an external delivery so a crash or an unknown outcome cannot silently replay it.
+   * Pointer deliveries can supply an observation that a matching consumer lease may confirm.
+   */
+  beginWakeDelivery(
+    mailboxId: string, expectedRevision?: number, pointer?: { deliveredSequence: number; pinnedSession?: PinnedSessionMailbox },
+  ): WakeTargetState | undefined {
+    const result = this.tryBeginWakeDelivery(mailboxId, expectedRevision, pointer);
+    return result.kind === 'fenced' ? result.target : undefined;
   }
 
   /** Commit only against the binding that authorized this launch. */
@@ -1976,7 +2009,7 @@ export class MailboxStore {
   completeWakeDelivery(
     mailboxId: string,
     deliveredSequence: number,
-    patch: Partial<WakeTargetState> = {},
+    patch: Partial<WakeTargetState> | ((lockedCurrent: WakeTargetState) => Partial<WakeTargetState>) = {},
     pinnedSession?: PinnedSessionMailbox,
     expectedRevision?: number,
   ): WakeTargetState & { superseded?: boolean } {
@@ -2002,7 +2035,8 @@ export class MailboxStore {
         return Object.assign(structuredClone(next), { superseded: true });
       }
 
-      const settled = this.settleWakeDeliveryInTx(current, previous, deliveredSequence, patch, pinnedSession);
+      const resolvedPatch = typeof patch === 'function' ? patch(structuredClone(current)) : patch;
+      const settled = this.settleWakeDeliveryInTx(current, previous, deliveredSequence, resolvedPatch, pinnedSession);
       pinnedWakeMailbox = settled.pinnedWakeMailbox;
       notify = current.pendingWake || settled.target.pendingWake || Boolean(current.deliveryInDoubt);
       return structuredClone(settled.target);

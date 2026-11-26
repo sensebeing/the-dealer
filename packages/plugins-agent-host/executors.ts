@@ -25,7 +25,11 @@ import {
   prepareExternalEffect,
   rethrowBeforeCommandStart,
 } from '../plugins-executor/index.ts';
-import { deliverAgentHostWakeTarget, serializeAgentHostDriverConfig } from './wakeup.ts';
+import {
+  deliverAgentHostWakeTarget,
+  readAgentHostDriverConfig,
+  serializeAgentHostDriverConfig,
+} from './wakeup.ts';
 
 export interface AgentHostTopicBinding extends MailboxTopicBinding {
   agent?: SupportedAgentHost;
@@ -115,6 +119,7 @@ type HostDelivery = {
   request: CommandRequest;
   driverConfig: Record<string, unknown>;
   trustWorkspace?: string;
+  completedWaves?: number;
   wakeupPrefix?: string;
   coalesceMs?: number;
   rotateAfterWaves?: number;
@@ -179,6 +184,7 @@ function prepareAgentDelivery(
   const explicitSessionId = optionalHostString(
     payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId, 'sessionId',
   );
+  const configuredSessionId = explicitSessionId?.trim() ? explicitSessionId : undefined;
   const sessionId = resolveAgentSessionId(mailboxId, explicitSessionId, agent ?? 'codex');
   const rotateAfterMs = optionalPositiveInteger(
     binding?.rotateAfterMs ?? config.rotateAfterMs ?? options.rotateAfterMs, 'rotateAfterMs',
@@ -190,20 +196,42 @@ function prepareAgentDelivery(
     cwd, command, agentProfile, targetBot, sessionId,
   });
   const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
+  const existingTarget = store?.getWakeTarget(mailboxId);
+  const existingDriverConfig = existingTarget?.driver === 'agent-host'
+    ? readAgentHostDriverConfig(existingTarget)
+    : undefined;
+  const prevConfigured = existingDriverConfig?.configuredSessionId;
+  const prevLive = existingDriverConfig?.sessionId;
+  const isSameConfigured = configuredSessionId !== undefined && prevConfigured === configuredSessionId;
+  const isLegacyMatch =
+    configuredSessionId !== undefined && prevConfigured === undefined && prevLive === configuredSessionId;
+  const shouldSeedSession =
+    configuredSessionId !== undefined && (!isSameConfigured || !prevLive) && !isLegacyMatch;
+  const sessionRebound = shouldSeedSession && Boolean(prevLive);
+  const driverConfig: Record<string, unknown> = serializeAgentHostDriverConfig({
+    hostAgent: agent ?? 'codex',
+    conversationMode,
+    ...(shouldSeedSession ? { sessionId: configuredSessionId } : {}),
+    ...(configuredSessionId !== undefined ? { configuredSessionId } : {}),
+    ...(cwd ? { workspacePath: cwd } : {}),
+    ...(command ? { interactiveCommand: command } : {}),
+    ...(agentProfile ? { agentProfile } : {}),
+    ...(targetBot ? { targetBot } : {}),
+    ...(rotateAfterMs !== undefined ? { rotateAfterMs } : {}),
+  });
+  if (sessionRebound) {
+    driverConfig.sessionStartedAt = undefined;
+  }
+  if (configuredSessionId === undefined && prevConfigured !== undefined) {
+    driverConfig.configuredSessionId = undefined;
+  }
   return {
     type: 'host',
     mode: conversationMode,
     mailboxId,
     request: { ...invocation, cwd },
-    driverConfig: serializeAgentHostDriverConfig({
-      hostAgent: agent ?? 'codex', conversationMode,
-      ...(explicitSessionId?.trim() ? { sessionId: explicitSessionId } : {}),
-      ...(cwd ? { workspacePath: cwd } : {}),
-      ...(command ? { interactiveCommand: command } : {}),
-      ...(agentProfile ? { agentProfile } : {}),
-      ...(targetBot ? { targetBot } : {}),
-      ...(rotateAfterMs !== undefined ? { rotateAfterMs } : {}),
-    }),
+    driverConfig,
+    ...(sessionRebound ? { completedWaves: 0 } : {}),
     ...(binding?.wakeupPrefix !== undefined ? { wakeupPrefix: binding.wakeupPrefix } : {}),
     ...(binding?.coalesceMs !== undefined ? { coalesceMs: binding.coalesceMs } : {}),
     ...(binding?.rotateAfterWaves !== undefined ? { rotateAfterWaves: binding.rotateAfterWaves } : {}),
@@ -301,6 +329,7 @@ function createAgentExecutorPlugin(
                 wakeTarget: {
                   driver: 'agent-host',
                   driverConfig: delivery.driverConfig,
+                  ...(delivery.completedWaves !== undefined ? { completedWaves: delivery.completedWaves } : {}),
                   ...(delivery.wakeupPrefix !== undefined ? { wakeupPrefix: delivery.wakeupPrefix } : {}),
                   ...(delivery.coalesceMs !== undefined ? { coalesceMs: delivery.coalesceMs } : {}),
                   ...(delivery.rotateAfterWaves !== undefined ? { rotateAfterWaves: delivery.rotateAfterWaves } : {}),

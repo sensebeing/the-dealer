@@ -27,6 +27,7 @@ export interface AgentHostDriverConfig {
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
+  configuredSessionId?: string;
   rotateAfterMs?: number;
   sessionStartedAt?: number;
 }
@@ -48,7 +49,7 @@ export function readAgentHostDriverConfig(
   ) {
     throw new Error('Invalid host conversation mode');
   }
-  for (const field of ['workspacePath', 'interactiveCommand', 'agentProfile', 'targetBot', 'sessionId']) {
+  for (const field of ['workspacePath', 'interactiveCommand', 'agentProfile', 'targetBot', 'sessionId', 'configuredSessionId']) {
     if (config[field] !== undefined && typeof config[field] !== 'string')
       throw new Error(`Invalid host configuration: ${field}`);
   }
@@ -139,7 +140,18 @@ export async function deliverAgentHostWakeTarget(
       targetBot: target.targetBot,
       sessionId: effectiveSessionId,
     });
-    if (!store.beginWakeDelivery(mailboxId, expectedRevision)) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
+    const preRotationCompletedWaves = target.completedWaves;
+    const fence = store.tryBeginWakeDelivery(mailboxId, expectedRevision, {
+      requireNoOutstandingLease: shouldRotate,
+    });
+    if (fence.kind === 'superseded') {
+      throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
+    }
+    if (fence.kind === 'outstanding_lease') {
+      // A lease was acquired concurrently before rotation fenced; defer without fencing
+      // or launching a fresh rotated session while that lease is outstanding.
+      throw new Error(`Cannot rotate session while delivery lease ${fence.leaseId} is outstanding`);
+    }
     deliveryBegun = true;
     const output = await checkedCommand(runner, {
       ...invocation,
@@ -167,11 +179,19 @@ export async function deliverAgentHostWakeTarget(
           ...(sessionStartedAt !== undefined ? { sessionStartedAt } : {}),
         })
       : undefined;
-    const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
-      driver: continuation.hostAgent ? 'agent-host' : 'passive',
-      driverConfig: nextDriverConfig,
-      ...(shouldRotate ? { completedWaves: 0 } : {}),
-    }, undefined, expectedRevision);
+    const completed = store.completeWakeDelivery(
+      mailboxId,
+      maxPreviewSequence(preview),
+      lockedCurrent => ({
+        driver: continuation.hostAgent ? 'agent-host' : 'passive',
+        driverConfig: nextDriverConfig,
+        ...(shouldRotate
+          ? { completedWaves: Math.max(0, lockedCurrent.completedWaves - preRotationCompletedWaves) }
+          : {}),
+      }),
+      undefined,
+      expectedRevision,
+    );
     if (completed.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     return { pointer, stdout: output.stdout, stderr: output.stderr };
   } catch (error) {

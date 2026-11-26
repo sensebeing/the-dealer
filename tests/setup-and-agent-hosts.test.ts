@@ -2945,3 +2945,195 @@ test('validateTopicBindings validates positive integer rotateAfterMs', () => {
     );
   }
 });
+
+test('agent-host rotation preserves mid-execution acks committed before host command exits', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:sync-ack-rot';
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    // Synchronous codex exec claims and acknowledges its wave before exiting.
+    const lease = store.check({ mailboxId });
+    assert.ok(lease.deliveryId, 'expected an active lease during synchronous execution');
+    store.ack(lease.deliveryId!, mailboxId);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"sync-thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      rotateAfterWaves: 1,
+    }),
+  });
+
+  // Wave 1: starts sync-thread-1 and acks synchronously -> completedWaves = 1.
+  await plugin.execute([message('sa-1')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'sync-thread-1');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Wave 2: rotates to sync-thread-2 and acks synchronously -> completedWaves must stay 1, not be wiped to 0.
+  await plugin.execute([message('sa-2')], context, {});
+  assert.equal(calls[1].args.includes('resume'), false);
+  assert.equal(calls[1].args.includes('--worktree'), false);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'sync-thread-2');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Wave 3: must rotate again to sync-thread-3 instead of reusing sync-thread-2 for a second wave.
+  await plugin.execute([message('sa-3')], context, {});
+  assert.equal(calls[2].args.includes('resume'), false);
+  assert.equal(calls[2].args.includes('--worktree'), false);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'sync-thread-3');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+});
+
+test('agent-host ordinary enqueues preserve rotated sessionId over configuredSessionId until intentionally rebound', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:explicit-seed-rot';
+  const calls: CommandRequest[] = [];
+  let configuredSession = 'seed-A';
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      return { stdout: '{"type":"thread.started","thread_id":"rotated-B"}\n' };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: configuredSession,
+      rotateAfterWaves: 2,
+    }),
+  });
+
+  // Waves 1 & 2 reuse configured seed-A.
+  await plugin.execute([message('es-1')], context, {});
+  assert.deepEqual(calls[0].args.slice(0, 7), ['exec', '-C', root, 'resume', 'seed-A', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.configuredSessionId, 'seed-A');
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  await plugin.execute([message('es-2')], context, {});
+  assert.deepEqual(calls[1].args.slice(0, 7), ['exec', '-C', root, 'resume', 'seed-A', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Wave 3 rotates to rotated-B.
+  await plugin.execute([message('es-3')], context, {});
+  assert.equal(calls[2].args.includes('resume'), false);
+  const afterRotate = store.getWakeTarget(mailboxId)!;
+  assert.equal(afterRotate.driverConfig?.sessionId, 'rotated-B');
+  assert.equal(afterRotate.driverConfig?.configuredSessionId, 'seed-A');
+  const rotatedStartedAt = afterRotate.driverConfig?.sessionStartedAt;
+  assert.equal(typeof rotatedStartedAt, 'number');
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Wave 4 ordinary enqueue with unchanged binding (sessionId: 'seed-A') MUST resume rotated-B, not retired seed-A.
+  await plugin.execute([message('es-4')], context, {});
+  assert.deepEqual(calls[3].args.slice(0, 7), ['exec', '-C', root, 'resume', 'rotated-B', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'rotated-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionStartedAt, rotatedStartedAt);
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Intentional receiver rebinding to rebound-C advances bindingRevision, switches sessionId, and resets completedWaves.
+  const revisionBeforeRebind = store.getWakeTarget(mailboxId)!.bindingRevision!;
+  configuredSession = 'rebound-C';
+  await plugin.execute([message('es-5')], context, {});
+  assert.deepEqual(calls[4].args.slice(0, 7), ['exec', '-C', root, 'resume', 'rebound-C', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  const afterRebind = store.getWakeTarget(mailboxId)!;
+  assert.ok(afterRebind.bindingRevision! > revisionBeforeRebind);
+  assert.equal(afterRebind.driverConfig?.sessionId, 'rebound-C');
+  assert.equal(afterRebind.driverConfig?.configuredSessionId, 'rebound-C');
+  assert.equal(afterRebind.completedWaves, 0);
+});
+
+test('agent-host rotation atomically refuses concurrent lease acquisition across two ledger connections', async t => {
+  const root = directory(t);
+  const dbPath = join(root, 'mailbox.json');
+  const storeA = new MailboxStore(dbPath);
+  const storeB = new MailboxStore(dbPath);
+  const mailboxId = 'stream:lease-race';
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"race-thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store: storeA,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      rotateAfterWaves: 1,
+    }),
+  });
+
+  // Wave 1 completes and is acknowledged -> completedWaves = 1, eligible to rotate on next wave.
+  await plugin.execute([message('lr-1')], context, {});
+  assert.equal(storeA.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'race-thread-1');
+  storeB.ack(storeB.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Enqueue wave 2 on storeA, then simulate an independent CLI process (storeB) acquiring a lease
+  // between storeA's read-only peek and tryBeginWakeDelivery.
+  storeA.enqueue([message('lr-2')], { mailboxId });
+  let racedLeaseId: string | undefined;
+  const originalCheck = storeA.check.bind(storeA);
+  storeA.check = ((options) => {
+    const preview = originalCheck(options);
+    if (options?.peek && !racedLeaseId) {
+      racedLeaseId = storeB.check({ mailboxId }).deliveryId ?? undefined;
+    }
+    return preview;
+  }) as typeof storeA.check;
+
+  await assert.rejects(
+    deliverAgentHostWakeTarget(storeA, runner, mailboxId, { now: Date.now() }),
+    /Cannot rotate session while delivery lease .* is outstanding/,
+  );
+  storeA.check = originalCheck;
+  assert.ok(racedLeaseId, 'second ledger connection should have acquired a lease');
+  assert.equal(calls.length, 1, 'host command must not launch when rotation fence detects an outstanding lease');
+  const deferred = storeA.getWakeTarget(mailboxId)!;
+  assert.equal(deferred.deliveryInDoubt, undefined, 'refused rotation must defer without fencing');
+  assert.equal(deferred.pendingWake, true);
+  assert.equal(deferred.driverConfig?.sessionId, 'race-thread-1');
+
+  // Direct structured check on tryBeginWakeDelivery while lease is still held.
+  const directCheck = storeA.tryBeginWakeDelivery(mailboxId, deferred.bindingRevision, {
+    requireNoOutstandingLease: true,
+  });
+  assert.equal(directCheck.kind, 'outstanding_lease');
+  if (directCheck.kind === 'outstanding_lease') {
+    assert.equal(directCheck.leaseId, racedLeaseId);
+  }
+
+  // Once storeB acknowledges the concurrent lease and wave 3 is queued, rotation proceeds cleanly.
+  storeB.ack(racedLeaseId!, mailboxId);
+  storeA.enqueue([message('lr-3')], { mailboxId });
+  await deliverAgentHostWakeTarget(storeA, runner, mailboxId, { now: Date.now() });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].args.includes('resume'), false);
+  assert.equal(storeA.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'race-thread-2');
+  assert.equal(storeA.getWakeTarget(mailboxId)?.completedWaves, 0);
+});
