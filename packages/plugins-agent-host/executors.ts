@@ -12,7 +12,7 @@ import {
 } from './hosts.ts';
 import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from './hosts.ts';
 import { canInheritThreadMailbox, groupThreadBatch, hasExplicitExecutor, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveSpawnMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
-import type { MailboxStore, MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
+import type { MailboxStore, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import {
@@ -117,13 +117,72 @@ type HostDelivery = {
   mode: ActiveConversationMode;
   mailboxId: string;
   request: CommandRequest;
-  driverConfig: Record<string, unknown>;
+  buildWakeTargetPatch: (lockedCurrent: WakeTargetState | undefined) => Partial<WakeTargetState>;
   trustWorkspace?: string;
-  completedWaves?: number;
-  wakeupPrefix?: string;
-  coalesceMs?: number;
-  rotateAfterWaves?: number;
 };
+
+function buildAgentHostWakeTargetPatch(
+  lockedCurrent: WakeTargetState | undefined,
+  desired: {
+    hostAgent: SupportedAgentHost;
+    conversationMode: ActiveConversationMode;
+    configuredSessionId?: string;
+    workspacePath?: string;
+    interactiveCommand?: string;
+    agentProfile?: string;
+    targetBot?: string;
+    rotateAfterMs?: number;
+    wakeupPrefix?: string;
+    coalesceMs?: number;
+    rotateAfterWaves?: number;
+  },
+): Partial<WakeTargetState> {
+  const existingDriverConfig = lockedCurrent?.driver === 'agent-host'
+    ? readAgentHostDriverConfig(lockedCurrent)
+    : undefined;
+  const prevCanonicalHost = existingDriverConfig?.hostAgent
+    ? normalizeAgentHost(existingDriverConfig.hostAgent)
+    : undefined;
+  const nextCanonicalHost = normalizeAgentHost(desired.hostAgent);
+  const hostChanged = prevCanonicalHost !== undefined && prevCanonicalHost !== nextCanonicalHost;
+  const prevConfigured = hostChanged ? undefined : existingDriverConfig?.configuredSessionId;
+  const prevLive = hostChanged ? undefined : existingDriverConfig?.sessionId;
+  const { configuredSessionId } = desired;
+  const isSameConfigured = configuredSessionId !== undefined && prevConfigured === configuredSessionId;
+  const isLegacyMatch =
+    configuredSessionId !== undefined && prevConfigured === undefined && prevLive === configuredSessionId;
+  const shouldSeedSession =
+    configuredSessionId !== undefined && (!isSameConfigured || !prevLive) && !isLegacyMatch;
+  const sessionRebound = hostChanged || (shouldSeedSession && Boolean(prevLive));
+  const driverConfig: Record<string, unknown> = serializeAgentHostDriverConfig({
+    hostAgent: desired.hostAgent,
+    conversationMode: desired.conversationMode,
+    ...(shouldSeedSession ? { sessionId: configuredSessionId } : {}),
+    ...(configuredSessionId !== undefined ? { configuredSessionId } : {}),
+    ...(desired.workspacePath ? { workspacePath: desired.workspacePath } : {}),
+    ...(desired.interactiveCommand ? { interactiveCommand: desired.interactiveCommand } : {}),
+    ...(desired.agentProfile ? { agentProfile: desired.agentProfile } : {}),
+    ...(desired.targetBot ? { targetBot: desired.targetBot } : {}),
+    ...(desired.rotateAfterMs !== undefined ? { rotateAfterMs: desired.rotateAfterMs } : {}),
+  });
+  if (hostChanged && configuredSessionId === undefined) {
+    driverConfig.sessionId = undefined;
+  }
+  if (sessionRebound) {
+    driverConfig.sessionStartedAt = undefined;
+  }
+  if (configuredSessionId === undefined && existingDriverConfig?.configuredSessionId !== undefined) {
+    driverConfig.configuredSessionId = undefined;
+  }
+  return {
+    driver: 'agent-host',
+    driverConfig,
+    ...(sessionRebound ? { completedWaves: 0 } : {}),
+    ...(desired.wakeupPrefix !== undefined ? { wakeupPrefix: desired.wakeupPrefix } : {}),
+    ...(desired.coalesceMs !== undefined ? { coalesceMs: desired.coalesceMs } : {}),
+    ...(desired.rotateAfterWaves !== undefined ? { rotateAfterWaves: desired.rotateAfterWaves } : {}),
+  };
+}
 
 function prepareAgentDelivery(
   envelope: MessageEnvelope,
@@ -196,45 +255,25 @@ function prepareAgentDelivery(
     cwd, command, agentProfile, targetBot, sessionId,
   });
   const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
-  const existingTarget = store?.getWakeTarget(mailboxId);
-  const existingDriverConfig = existingTarget?.driver === 'agent-host'
-    ? readAgentHostDriverConfig(existingTarget)
-    : undefined;
-  const prevConfigured = existingDriverConfig?.configuredSessionId;
-  const prevLive = existingDriverConfig?.sessionId;
-  const isSameConfigured = configuredSessionId !== undefined && prevConfigured === configuredSessionId;
-  const isLegacyMatch =
-    configuredSessionId !== undefined && prevConfigured === undefined && prevLive === configuredSessionId;
-  const shouldSeedSession =
-    configuredSessionId !== undefined && (!isSameConfigured || !prevLive) && !isLegacyMatch;
-  const sessionRebound = shouldSeedSession && Boolean(prevLive);
-  const driverConfig: Record<string, unknown> = serializeAgentHostDriverConfig({
+  const desiredWakeTarget = {
     hostAgent: agent ?? 'codex',
     conversationMode,
-    ...(shouldSeedSession ? { sessionId: configuredSessionId } : {}),
-    ...(configuredSessionId !== undefined ? { configuredSessionId } : {}),
-    ...(cwd ? { workspacePath: cwd } : {}),
-    ...(command ? { interactiveCommand: command } : {}),
-    ...(agentProfile ? { agentProfile } : {}),
-    ...(targetBot ? { targetBot } : {}),
-    ...(rotateAfterMs !== undefined ? { rotateAfterMs } : {}),
-  });
-  if (sessionRebound) {
-    driverConfig.sessionStartedAt = undefined;
-  }
-  if (configuredSessionId === undefined && prevConfigured !== undefined) {
-    driverConfig.configuredSessionId = undefined;
-  }
+    configuredSessionId,
+    workspacePath: cwd,
+    interactiveCommand: command,
+    agentProfile,
+    targetBot,
+    rotateAfterMs,
+    wakeupPrefix: binding?.wakeupPrefix,
+    coalesceMs: binding?.coalesceMs,
+    rotateAfterWaves: binding?.rotateAfterWaves,
+  };
   return {
     type: 'host',
     mode: conversationMode,
     mailboxId,
     request: { ...invocation, cwd },
-    driverConfig,
-    ...(sessionRebound ? { completedWaves: 0 } : {}),
-    ...(binding?.wakeupPrefix !== undefined ? { wakeupPrefix: binding.wakeupPrefix } : {}),
-    ...(binding?.coalesceMs !== undefined ? { coalesceMs: binding.coalesceMs } : {}),
-    ...(binding?.rotateAfterWaves !== undefined ? { rotateAfterWaves: binding.rotateAfterWaves } : {}),
+    buildWakeTargetPatch: lockedCurrent => buildAgentHostWakeTargetPatch(lockedCurrent, desiredWakeTarget),
     ...(canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app' ? { trustWorkspace: cwd } : {}),
   };
 }
@@ -326,14 +365,7 @@ function createAgentExecutorPlugin(
             try {
               const result = store.enqueue(envelopes, {
                 signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
-                wakeTarget: {
-                  driver: 'agent-host',
-                  driverConfig: delivery.driverConfig,
-                  ...(delivery.completedWaves !== undefined ? { completedWaves: delivery.completedWaves } : {}),
-                  ...(delivery.wakeupPrefix !== undefined ? { wakeupPrefix: delivery.wakeupPrefix } : {}),
-                  ...(delivery.coalesceMs !== undefined ? { coalesceMs: delivery.coalesceMs } : {}),
-                  ...(delivery.rotateAfterWaves !== undefined ? { rotateAfterWaves: delivery.rotateAfterWaves } : {}),
-                },
+                wakeTarget: delivery.buildWakeTargetPatch,
               });
               committed();
               const receipt = { ...result, executor: name, executionId: randomUUID(),

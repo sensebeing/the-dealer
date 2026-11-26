@@ -3137,3 +3137,157 @@ test('agent-host rotation atomically refuses concurrent lease acquisition across
   assert.equal(storeA.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'race-thread-2');
   assert.equal(storeA.getWakeTarget(mailboxId)?.completedWaves, 0);
 });
+
+test('concurrent rebinding deliveries sharing a mailbox compute reset inside enqueue without erasing first ack', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:concurrent-rebind';
+  const calls: CommandRequest[] = [];
+  let configuredSession = 'seed-A';
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    const lease = store.check({ mailboxId });
+    if (lease.deliveryId) {
+      store.ack(lease.deliveryId, mailboxId);
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: configuredSession,
+      rotateAfterWaves: 2,
+    }),
+  });
+
+  // Seed mailbox on seed-A.
+  await plugin.execute([message('cr-1')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'seed-A');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Rebind to seed-B and simulate two independent threads entering the same mailbox:
+  // Thread 2 prepares while the mailbox still holds seed-A, then Thread 1 enqueues, runs,
+  // and acknowledges its wave (completedWaves = 1 on seed-B) before Thread 2 commits its enqueue.
+  configuredSession = 'seed-B';
+  const originalEnqueue = store.enqueue.bind(store);
+  let capturedWakeTargetCb: ((current: WakeTargetState | undefined) => Partial<WakeTargetState>) | undefined;
+  const probeStore = Object.create(store) as MailboxStore;
+  probeStore.enqueue = ((batch, options) => {
+    if (typeof options?.wakeTarget === 'function' && !capturedWakeTargetCb) {
+      capturedWakeTargetCb = options.wakeTarget;
+      return { inserted: [], duplicateIds: [], mailboxIds: [], envelopeMailboxes: {} };
+    }
+    return originalEnqueue(batch, options);
+  }) as typeof store.enqueue;
+
+  await createCodexExecutorPlugin({
+    store: probeStore,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: 'seed-B',
+      rotateAfterWaves: 2,
+    }),
+  }).execute([message('cr-2b')], context, {});
+  assert.ok(capturedWakeTargetCb, 'enqueue should pass a transactional wakeTarget callback');
+
+  // Thread 1 completes rebind to seed-B and acks synchronously (completedWaves = 1).
+  await plugin.execute([message('cr-2a')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'seed-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Thread 2 now commits its previously prepared enqueue against the updated locked row:
+  // rebind is evaluated inside enqueue's write tx, so completedWaves MUST stay 1.
+  originalEnqueue([message('cr-2b')], { mailboxId, wakeTarget: capturedWakeTargetCb });
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'seed-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+});
+
+test('switching canonical agent host after rotation rebinds sessionId and resets rotation metadata', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:host-switch-rot';
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.command === 'codex' && !request.args.includes('resume')) {
+      return { stdout: '{"type":"thread.started","thread_id":"codex-rotated-B"}\n' };
+    }
+    return { stdout: '{}' };
+  };
+  const codexPlugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: 'shared-A',
+      rotateAfterWaves: 1,
+    }),
+  });
+
+  // Codex runs wave 1 on shared-A, acks, then rotates wave 2 to codex-rotated-B.
+  await codexPlugin.execute([message('hs-1')], context, {});
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+  await codexPlugin.execute([message('hs-2')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'codex-rotated-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.configuredSessionId, 'shared-A');
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Switch the same mailbox from codex to claude-code while keeping explicit sessionId: 'shared-A'.
+  // Because the canonical host changed, Claude MUST NOT inherit codex-rotated-B; it must rebind to shared-A
+  // and reset completedWaves / sessionStartedAt.
+  const claudePlugin = createClaudeCodeExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'claude-code',
+      mode: 'fixed',
+      mailboxId,
+      workspacePath: root,
+      sessionId: 'shared-A',
+      rotateAfterWaves: 2,
+    }),
+  });
+  await claudePlugin.execute([message('hs-3')], context, {});
+  const claudeCall = calls.at(-1)!;
+  assert.equal(claudeCall.command, 'claude');
+  assert.deepEqual(claudeCall.args.slice(0, 4), ['--bg', '--resume', 'shared-A', '--dangerously-skip-permissions']);
+  const afterSwitch = store.getWakeTarget(mailboxId)!;
+  assert.equal(afterSwitch.driverConfig?.hostAgent, 'claude-code');
+  assert.equal(afterSwitch.driverConfig?.sessionId, 'shared-A');
+  assert.equal(afterSwitch.driverConfig?.configuredSessionId, 'shared-A');
+  assert.equal(afterSwitch.completedWaves, 0);
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Switching hosts without an explicit sessionId also clears the previous host's live sessionId.
+  const codexNoSessionPlugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      rotateAfterWaves: 2,
+    }),
+  });
+  await codexNoSessionPlugin.execute([message('hs-4')], context, {});
+  const backToCodex = calls.at(-1)!;
+  assert.equal(backToCodex.command, 'codex');
+  assert.equal(backToCodex.args.includes('resume'), false, 'host switch without explicit sessionId must start fresh instead of resuming Claude session');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'codex-rotated-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.configuredSessionId, undefined);
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 0);
+});

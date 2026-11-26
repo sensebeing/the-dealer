@@ -196,7 +196,7 @@ export interface MailboxEnqueueOptions {
   mailboxId?: string;
   proposedSpawn?: boolean;
   wakeupHint?: string;
-  wakeTarget?: Partial<WakeTargetState>;
+  wakeTarget?: Partial<WakeTargetState> | ((lockedCurrent: WakeTargetState | undefined) => Partial<WakeTargetState>);
 }
 
 export interface MailboxEnqueueResult {
@@ -1443,8 +1443,11 @@ export class MailboxStore {
         const previous = this.db.wakeTarget(mailboxId);
         let target = previous;
         if (options.wakeTarget && configureWakeTargets.has(mailboxId)) {
+          const wakePatch = typeof options.wakeTarget === 'function'
+            ? options.wakeTarget(previous ? structuredClone(previous) : undefined)
+            : options.wakeTarget;
           target = validateWakeTarget(
-            mergeWakeTarget(previous ?? defaultWakeTarget(mailboxId), options.wakeTarget),
+            mergeWakeTarget(previous ?? defaultWakeTarget(mailboxId), wakePatch),
           );
         }
         if (target && (insertedByMailbox.get(mailboxId) ?? 0) > 0) {
