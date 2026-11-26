@@ -14,7 +14,8 @@ import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode 
 import { canInheritThreadMailbox, groupThreadBatch, hasExplicitExecutor, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveSpawnMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
 import type { MailboxStore, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
-import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
+import type { CommandRequest, CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts';
+import { runCodexAppServerTurn } from './codex-app-server.ts';
 import {
   prepareInboxDeliveries,
   executeDeliveryGroups,
@@ -59,6 +60,7 @@ export interface AgentOptions {
   args?: readonly string[];
   cwd?: string;
   commandRunner?: CommandRunner;
+  stdioSpawner?: StdioProcessSpawner;
 }
 
 export function createAgentPtyExecutorPlugin(options: AgentOptions = {}): ExecutorPlugin {
@@ -114,8 +116,14 @@ export function createNamedHostExecutorPlugin(
 
 type HostDelivery = {
   type: 'host';
+  host: SupportedAgentHost;
   mode: ActiveConversationMode;
   mailboxId: string;
+  promptText: string;
+  sessionId?: string;
+  agentProfile?: string;
+  command?: string;
+  cwd?: string;
   request: CommandRequest;
   buildWakeTargetPatch: (lockedCurrent: WakeTargetState | undefined) => Partial<WakeTargetState>;
   trustWorkspace?: string;
@@ -249,14 +257,16 @@ function prepareAgentDelivery(
     binding?.rotateAfterMs ?? config.rotateAfterMs ?? options.rotateAfterMs, 'rotateAfterMs',
   );
   const terminalPrompt = typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined;
+  const hostAgent = agent ?? 'codex';
+  const promptText = singleLine(terminalPrompt || renderWave(promptBatch));
   const invocation = buildAgentHostInvocation({
-    agent: agent ?? 'codex', conversationMode, mailboxId,
-    promptText: singleLine(terminalPrompt || renderWave(promptBatch)),
+    agent: hostAgent, conversationMode, mailboxId,
+    promptText,
     cwd, command, agentProfile, targetBot, sessionId,
   });
-  const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
+  const canonicalHost = normalizeAgentHost(hostAgent);
   const desiredWakeTarget = {
-    hostAgent: agent ?? 'codex',
+    hostAgent,
     conversationMode,
     configuredSessionId,
     workspacePath: cwd,
@@ -270,8 +280,14 @@ function prepareAgentDelivery(
   };
   return {
     type: 'host',
+    host: hostAgent,
     mode: conversationMode,
     mailboxId,
+    promptText,
+    sessionId,
+    agentProfile,
+    command,
+    cwd,
     request: { ...invocation, cwd },
     buildWakeTargetPatch: lockedCurrent => buildAgentHostWakeTargetPatch(lockedCurrent, desiredWakeTarget),
     ...(canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app' ? { trustWorkspace: cwd } : {}),
@@ -324,7 +340,19 @@ function createAgentExecutorPlugin(
           if (delivery.type === 'raw') return rawExecutor.execute(batch, context, runtimeConfig);
           if (delivery.type !== 'host') throw beforeExternalEffect(new Error('Inbox delivery requires a mailbox store'));
           trustWorkspace(delivery);
-          const output = await checkedCommand(runner, { ...delivery.request, signal: context.signal }).catch(rethrowBeforeCommandStart);
+          const stdioSpawner = options.stdioSpawner ?? config.stdioSpawner;
+          const output = normalizeAgentHost(delivery.host) === 'codex'
+            ? await runCodexAppServerTurn({
+                command: delivery.command ?? delivery.request.command,
+                cwd: delivery.cwd,
+                mode: delivery.mode,
+                sessionId: delivery.sessionId,
+                promptText: delivery.promptText,
+                agentProfile: delivery.agentProfile,
+                signal: context.signal,
+                stdioSpawner,
+              }).catch(rethrowBeforeCommandStart)
+            : await checkedCommand(runner, { ...delivery.request, signal: context.signal }).catch(rethrowBeforeCommandStart);
           return { executor: name, executionId: randomUUID(), ...commandOutput(output) };
         }
 
@@ -356,13 +384,13 @@ function createAgentExecutorPlugin(
           }
         }
         const groups = await prepareInboxDeliveries(store, wakeup, inboxGroups, context);
+        const stdioSpawner = options.stdioSpawner ?? config.stdioSpawner;
         for (const { delivery, envelopes } of [...hostGroups.values(), ...spawnGroups]) {
           const proposedSpawn = delivery.mode === 'spawn' && canInheritThreadMailbox(envelopes[0]);
           groups.push({ envelopes, async deliver(committed) {
             const { mailboxId } = delivery;
-            const claim = wakeup?.claim(mailboxId);
-            let woke = false;
-            try {
+            if (wakeup) {
+              trustWorkspace(delivery);
               const result = store.enqueue(envelopes, {
                 signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
                 wakeTarget: delivery.buildWakeTargetPatch,
@@ -371,20 +399,30 @@ function createAgentExecutorPlugin(
               const receipt = { ...result, executor: name, executionId: randomUUID(),
                 ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
               for (const actualMailbox of result.mailboxIds) {
-                if (actualMailbox !== mailboxId || result.claimedSpawn === false) wakeup?.notifyMailbox(actualMailbox);
+                wakeup.notifyMailbox(actualMailbox);
               }
-              if (result.claimedSpawn === false || !result.mailboxIds.includes(mailboxId)) return receipt;
-              try {
-                trustWorkspace(delivery);
-                const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, { signal: context.signal });
-                woke = true;
-                return { ...receipt, woke, ...commandOutput(response) };
-              } catch (error) {
-                return { ...receipt, woke, reason: String(error) };
-              }
-            } finally {
-              claim?.dispose();
-              if (woke) wakeup?.notifyMailbox(mailboxId);
+              return { ...receipt, woke: false, reason: 'Queued for background wakeup' };
+            }
+            let woke = false;
+            const result = store.enqueue(envelopes, {
+              signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
+              wakeTarget: delivery.buildWakeTargetPatch,
+            });
+            committed();
+            const receipt = { ...result, executor: name, executionId: randomUUID(),
+              ...(result.mailboxIds.length === 1 ? { mailboxId: result.mailboxIds[0] } : {}) };
+            if (result.claimedSpawn === false || !result.mailboxIds.includes(mailboxId)) return receipt;
+            try {
+              trustWorkspace(delivery);
+              const response = await deliverAgentHostWakeTarget(store, runner, mailboxId, {
+                signal: context.signal,
+                stdioSpawner,
+                agySettingsPath,
+              });
+              woke = true;
+              return { ...receipt, woke, ...commandOutput(response) };
+            } catch (error) {
+              return { ...receipt, woke, reason: String(error) };
             }
           } });
         }

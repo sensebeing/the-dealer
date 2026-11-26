@@ -2,9 +2,9 @@ import { join } from 'node:path';
 import type { DispatchPolicyPlugin, ExecutorPlugin, AgentConversationMode } from '../core-types/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 import type { MailboxStore, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
-import type { CommandRunner } from '../subprocess/index.ts';
+import type { CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts';
 import { createInboxExecutorPlugin, createNotifyExecutorPlugin } from '../plugins-executor/index.ts';
-import { AGENT_HOST_DESCRIPTORS, createAgentPtyExecutorPlugin, createNamedHostExecutorPlugin, parseAgentHost, usesAgentHostInvocation } from '../plugins-agent-host/index.ts';
+import { AGENT_HOST_DESCRIPTORS, assertValidCodexOptions, createAgentPtyExecutorPlugin, createNamedHostExecutorPlugin, normalizeAgentHost, parseAgentHost, usesAgentHostInvocation } from '../plugins-agent-host/index.ts';
 import { createOrcaExecutorPlugin, createOrcaSpawnExecutorPlugin, createOrcaWaveExecutorPlugin, validateOrcaBinding, orcaMailboxBinding, syncOrcaTopicWakeTarget, pinDeliveredOrcaMailbox } from '../plugins-orca/index.ts';
 import { createDedupCasPolicyPlugin } from '../plugins-policy/index.ts';
 import type { DedupCasOptions } from '../plugins-policy/index.ts';
@@ -19,6 +19,7 @@ export interface BuiltinExecutorDeps {
   wave: RuntimeConfig['wave'];
   projectRoots: Record<string, string>;
   commandRunner: CommandRunner;
+  stdioSpawner?: StdioProcessSpawner;
   resolveTopicBinding: (kind: string, streamKey?: string) => (TopicBindingConfig & MailboxTopicBinding & { repoRoot?: string }) | undefined;
   resolveMailboxBinding: (kind: string, streamKey?: string) => MailboxTopicBinding | undefined;
 }
@@ -98,7 +99,8 @@ function mailboxBinding(binding: TopicBindingConfig, mode: AgentConversationMode
 }
 function agentOptions(deps: BuiltinExecutorDeps) {
   return { ...deps.config, store: deps.store, wakeup: deps.wakeup,
-    resolveTopicBinding: deps.resolveTopicBinding, commandRunner: deps.commandRunner };
+    resolveTopicBinding: deps.resolveTopicBinding, commandRunner: deps.commandRunner,
+    ...(deps.stdioSpawner ? { stdioSpawner: deps.stdioSpawner } : {}) };
 }
 
 export function createDefaultHostPluginRegistry(): HostPluginRegistry {
@@ -118,11 +120,19 @@ export function createDefaultHostPluginRegistry(): HostPluginRegistry {
     registry.registerExecutor({ name: host.executor, interactiveAgent: true,
       validateBinding: binding => {
         if (binding.mode !== undefined && !(('executorModes' in host ? host.executorModes : host.modes) as readonly string[]).includes(binding.mode)) throw new Error('Unsupported host conversation mode');
+        if (host.canonical === 'codex' && binding.agentProfile?.trim()) {
+          assertValidCodexOptions({ agentProfile: binding.agentProfile });
+        }
       },
       create: deps => ({ plugin: createNamedHostExecutorPlugin(host.executor, host.host, agentOptions(deps)) }),
     });
   }
   registry.registerExecutor({ name: 'agent-pty', interactiveAgent: true,
+    validateBinding: binding => {
+      if (binding.agent && normalizeAgentHost(binding.agent) === 'codex' && binding.agentProfile?.trim()) {
+        assertValidCodexOptions({ agentProfile: binding.agentProfile });
+      }
+    },
     toMailboxBinding: (binding, config, payload) => {
       const explicit = explicitMode(binding, config, payload);
       let agent: ReturnType<typeof parseAgentHost> | undefined;

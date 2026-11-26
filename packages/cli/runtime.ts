@@ -34,7 +34,7 @@ import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAp
 import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
 import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
-import type { CommandRunner } from '../subprocess/index.ts';
+import type { CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts';
 import { baseStreamKeyOf, OutboxRedriveService, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
 import type { MailboxStore, OutboxStore, SlotProbeResult } from '../mailbox/index.ts';
 import { compactQueueSummary, openStateLedgers } from './ledgers.ts';
@@ -127,6 +127,7 @@ export interface DealerRuntimeOptions {
   patch?: Partial<RuntimeConfig>;
   transport?: TransportPluginOptions;
   commandRunner?: CommandRunner;
+  stdioSpawner?: StdioProcessSpawner;
   executorOverrides?: ExecutorPlugin[];
   /** System-manager custody; defaults to probing this process's environment. */
   supervised?: boolean;
@@ -549,7 +550,10 @@ export class DealerNodeRuntime {
         store: this.mailbox,
         drivers: [
           ...createOrcaWakeupDrivers({ commandRunner: this.options.commandRunner ?? runCommand, idleCheck: this.options.wakeupIdleCheck }),
-          createAgentHostWakeupDriver({ commandRunner: this.options.commandRunner ?? runCommand }),
+          createAgentHostWakeupDriver({
+            commandRunner: this.options.commandRunner ?? runCommand,
+            stdioSpawner: this.options.stdioSpawner,
+          }),
         ],
         flushIntervalMs: this.config.wave?.flushIntervalMs ?? 1_000,
         onError: error => { this.lastError = String(error); },
@@ -1392,6 +1396,7 @@ export class DealerNodeRuntime {
             stateDir: this.stateDir, config: this.config.executorConfig[name] ?? {},
             store: this.mailbox, wakeup: this.wakeups, wave: this.config.wave,
             projectRoots: linkedProjectRoots, commandRunner: runner,
+            stdioSpawner: this.options.stdioSpawner,
             resolveTopicBinding: this.executorTopicBinding, resolveMailboxBinding: this.resolveTopicMailboxBinding,
           });
           const registration = ctx.services.dispatcher.registerExecutor(

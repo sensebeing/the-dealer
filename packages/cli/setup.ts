@@ -9,6 +9,7 @@ import { resolveOrcaManagedAutoCreateWorkspace, resolveOrcaWaveRotateAfterWaves 
 import { findExecutable } from '../subprocess/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
 import type { SupportedAgentHost } from '../plugins-agent-host/index.ts';
+import { assertValidCodexOptions } from '../plugins-agent-host/index.ts';
 import { normalizeConversationModeInput } from '../core-types/index.ts';
 
 export { AGENT_HOST_DESCRIPTORS as AGENT_HOST_CATALOG } from '../plugins-agent-host/hosts.ts';
@@ -130,6 +131,9 @@ export function buildAgentBindingPreset(options: {
   if (!(entry.modes as readonly string[]).includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (!['spawn', 'wave', 'fixed', 'inbox-only'].includes(mode)) throw new Error(`Invalid conversation mode: ${mode}`);
   if (entry.requiresTargetBot && mode !== 'inbox-only' && !options.targetBot?.trim()) throw new Error('grok-bot requires targetBot');
+  if (entry.canonical === 'codex' && mode !== 'inbox-only' && options.agentProfile?.trim()) {
+    assertValidCodexOptions({ agentProfile: options.agentProfile });
+  }
   const managed = entry.managedWorkspace;
   const topic = options.topic ?? 'collab.request.v4';
   const executor = mode === 'inbox-only' ? 'inbox' : resolveHostExecutor(host);

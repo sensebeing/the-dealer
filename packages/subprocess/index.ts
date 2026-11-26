@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
+import type { Readable, Writable } from 'node:stream';
 
 /** A single external command invocation; always executed with shell: false. */
 export interface CommandRequest {
@@ -16,6 +17,35 @@ export interface CommandRequest {
 export type CommandRunner = (
   request: CommandRequest,
 ) => Promise<{ stdout: string; stderr?: string; exitCode?: number }>;
+
+/** Minimal host-neutral streaming stdio child contract for interactive line/RPC protocols. */
+export interface StdioChildProcess {
+  readonly pid?: number;
+  readonly stdin: Writable;
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+  kill(signal?: NodeJS.Signals | number): boolean;
+  on(event: string | symbol, listener: (...args: any[]) => void): this;
+  once(event: string | symbol, listener: (...args: any[]) => void): this;
+  off(event: string | symbol, listener: (...args: any[]) => void): this;
+}
+
+export interface StdioProcessRequest {
+  command: string;
+  args: readonly string[];
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export type StdioProcessSpawner = (request: StdioProcessRequest) => StdioChildProcess;
+
+export const spawnStdioProcess: StdioProcessSpawner = request =>
+  spawn(request.command, [...request.args], {
+    cwd: request.cwd,
+    ...(request.env ? { env: request.env } : {}),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    shell: false,
+  });
 
 /** Only the process boundary may prove that no external process was started. */
 export class CommandNotStartedError extends Error {

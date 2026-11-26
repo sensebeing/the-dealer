@@ -1,4 +1,5 @@
 import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createFakeCodexAppServer } from './helpers/fake-codex-app-server.ts';
 import { pinOrcaTerminalSessionMailbox, reconcileCallerOrcaWakeTarget } from '../packages/plugins-orca/index.ts';
 import { Kernel } from '../packages/kernel/index.ts';
 import { createDispatcherPlugin } from '../packages/dispatcher/index.ts';
@@ -4607,19 +4608,16 @@ test('sequence settlement remains finite when wall clock order differs from arri
   t.mock.timers.setTime(10_000);
   store.enqueue([alert('later-sequence')], { mailboxId: 'box' });
   assert.equal(store.check({ mailboxId: 'box', peek: true }).latestQueued?.id, 'later-clock');
-  let calls = 0;
+  const fakeCodex = createFakeCodexAppServer();
   const wakeup = new WakeupRedriveService({
     store,
     drivers: createTestWakeupDrivers({
-      commandRunner: async () => {
-        calls++;
-        return { stdout: '{}' };
-      },
+      stdioSpawner: fakeCodex.spawner,
     }),
   });
   t.after(() => wakeup.stop());
   await wakeup.flushMailbox('box', { force: true });
-  assert.equal(calls, 1);
+  assert.equal(fakeCodex.sessions.length, 1);
   assert.equal(store.getWakeTarget('box')?.pendingWake, false);
 });
 

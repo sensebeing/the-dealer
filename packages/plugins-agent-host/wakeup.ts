@@ -5,14 +5,15 @@ import {
   parseAgentHost,
   resolveAgentHostContinuation,
   resolveAgentSessionId,
+  trustAntigravityWorkspace,
 } from './hosts.ts';
 import type { SupportedAgentHost, ActiveConversationMode } from './hosts.ts';
+import { runCodexAppServerTurn } from './codex-app-server.ts';
 import { checkedCommand, runCommand } from '../subprocess/index.ts';
-import type { CommandRunner } from '../subprocess/index.ts';
+import type { CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts';
 import {
   buildWakeupPointer,
   maxPreviewSequence,
-  recordWakeFailure,
   settleWakeDeliveryFailure,
   SettledWakeLaunchError,
 } from '../mailbox/wakeup.ts';
@@ -90,7 +91,12 @@ export async function deliverAgentHostWakeTarget(
   store: MailboxStore,
   runner: CommandRunner,
   mailboxId: string,
-  options: { signal?: AbortSignal; now?: number } = {},
+  options: {
+    signal?: AbortSignal;
+    now?: number;
+    stdioSpawner?: StdioProcessSpawner;
+    agySettingsPath?: string;
+  } = {},
 ): Promise<{ pointer: string; stdout: string; stderr?: string }> {
   const now = options.now ?? Date.now();
   let deliveryBegun = false;
@@ -140,6 +146,14 @@ export async function deliverAgentHostWakeTarget(
       targetBot: target.targetBot,
       sessionId: effectiveSessionId,
     });
+    const mayTrustWorkspace = options.agySettingsPath !== undefined || runner === runCommand;
+    if (
+      mayTrustWorkspace &&
+      (canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app') &&
+      target.workspacePath
+    ) {
+      trustAntigravityWorkspace(target.workspacePath, options.agySettingsPath);
+    }
     const preRotationCompletedWaves = target.completedWaves;
     const fence = store.tryBeginWakeDelivery(mailboxId, expectedRevision, {
       requireNoOutstandingLease: shouldRotate,
@@ -153,11 +167,23 @@ export async function deliverAgentHostWakeTarget(
       throw new Error(`Cannot rotate session while delivery lease ${fence.leaseId} is outstanding`);
     }
     deliveryBegun = true;
-    const output = await checkedCommand(runner, {
-      ...invocation,
-      cwd: target.workspacePath,
-      signal: options.signal,
-    });
+    const output =
+      canonicalHost === 'codex'
+        ? await runCodexAppServerTurn({
+            command: target.interactiveCommand ?? 'codex',
+            cwd: target.workspacePath,
+            mode: effectiveMode,
+            sessionId: effectiveSessionId,
+            promptText: pointer,
+            agentProfile: target.agentProfile,
+            signal: options.signal,
+            stdioSpawner: options.stdioSpawner,
+          })
+        : await checkedCommand(runner, {
+            ...invocation,
+            cwd: target.workspacePath,
+            signal: options.signal,
+          });
     const continuation = resolveAgentHostContinuation(
       target.hostAgent,
       mailboxId,
@@ -211,16 +237,27 @@ export async function deliverAgentHostWakeTarget(
   }
 }
 
-export function createAgentHostWakeupDriver(options: { commandRunner?: CommandRunner } = {}): WakeupDriver {
+export function createAgentHostWakeupDriver(
+  options: {
+    commandRunner?: CommandRunner;
+    stdioSpawner?: StdioProcessSpawner;
+    agySettingsPath?: string;
+  } = {},
+): WakeupDriver {
   return {
     name: 'agent-host',
-    async deliver({ store, mailboxId, now }) {
+    async deliver({ store, mailboxId, now, signal }) {
       try {
         const delivered = await deliverAgentHostWakeTarget(
           store,
           options.commandRunner ?? runCommand,
           mailboxId,
-          { now: now() },
+          {
+            now: now(),
+            signal,
+            stdioSpawner: options.stdioSpawner,
+            agySettingsPath: options.agySettingsPath,
+          },
         );
         return { kind: 'delivered', pointer: delivered.pointer };
       } catch (error) {
