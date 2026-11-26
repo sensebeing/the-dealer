@@ -24,6 +24,7 @@ export interface FakeCodexSessionRecord {
   killedSignals: (NodeJS.Signals | number | undefined)[];
   stdinEnded: boolean;
   threadId?: string;
+  threadName?: string;
   turnId?: string;
   promptText?: string;
   threadMethod?: 'thread/start' | 'thread/resume';
@@ -214,6 +215,11 @@ export function createFakeCodexAppServer(options: FakeCodexAppServerOptions = {}
           const threadId = String(parsed.params?.threadId ?? '');
           record.threadId = threadId;
           send({ jsonrpc: '2.0', id: parsed.id, result: { thread: { id: threadId } } });
+          return;
+        }
+        if (parsed.method === 'thread/name/set') {
+          record.threadName = typeof parsed.params?.name === 'string' ? parsed.params.name : undefined;
+          send({ jsonrpc: '2.0', id: parsed.id, result: {} });
           return;
         }
         if (parsed.method === 'turn/start') {

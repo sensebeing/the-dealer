@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeFileAtomically } from '../fs-atomic/index.ts';
-import type { Disposable, MessageEnvelope, PendingApprovalItem } from '../core-types/index.ts';
+import type { Disposable, MessageEnvelope, PendingApprovalItem, SessionLinkResolution } from '../core-types/index.ts';
 import type { Plugin } from '../kernel/index.ts';
 import type { MailboxItem, MailboxStore } from '../mailbox/store.ts';
 import { findExecutable, checkedCommand, runCommand } from '../subprocess/index.ts';
@@ -13,11 +13,21 @@ declare module '../kernel/index.ts' {
   interface Services { larkNotifier: LarkMailboxNotifier; }
 }
 
+interface ThreadRootState {
+  messageId: string;
+  targetKey: string;
+  updatedAt: string;
+  mailboxId?: string;
+  itemSequence?: number;
+  awaitingSessionLink?: boolean;
+  lastSessionUrl?: string;
+}
+
 interface NotifyState {
   schema: 'the-dealer-lark-notify/v1';
   cursorSequence: number;
   deliveredItems: Record<string, { larkMessageId?: string; deliveredAt: string }>;
-  threadRoots: Record<string, { messageId: string; targetKey: string; updatedAt: string }>;
+  threadRoots: Record<string, ThreadRootState>;
 }
 interface Target {
   flag: '--chat-id' | '--user-id';
@@ -33,6 +43,7 @@ export interface LarkMailboxNotifierOptions {
   localMember: string;
   defaultBoundMailboxes?: string[];
   acceptsDefaultItem?: (item: MailboxItem) => boolean;
+  resolveSessionLink?: (mailboxId: string, itemSequence?: number) => SessionLinkResolution | undefined;
   commandRunner?: CommandRunner;
   onError?: (error: unknown) => void;
 }
@@ -49,7 +60,13 @@ function readState(path: string): NotifyState {
   if (!record(state) || state.schema !== 'the-dealer-lark-notify/v1' || !Number.isSafeInteger(state.cursorSequence) || state.cursorSequence < -1 ||
       !record(state.deliveredItems) || !record(state.threadRoots) ||
       Object.values(state.deliveredItems).some(item => !record(item) || !nonempty(item.deliveredAt) || (item.larkMessageId !== undefined && !nonempty(item.larkMessageId))) ||
-      Object.values(state.threadRoots).some(root => !record(root) || !nonempty(root.messageId) || !nonempty(root.targetKey) || !nonempty(root.updatedAt))) {
+      Object.values(state.threadRoots).some(root =>
+        !record(root) || !nonempty(root.messageId) || !nonempty(root.targetKey) || !nonempty(root.updatedAt) ||
+        (root.mailboxId !== undefined && !isValidMailboxId(root.mailboxId)) ||
+        (root.itemSequence !== undefined && (!Number.isSafeInteger(root.itemSequence) || root.itemSequence < 0)) ||
+        (root.awaitingSessionLink !== undefined && typeof root.awaitingSessionLink !== 'boolean') ||
+        (root.lastSessionUrl !== undefined && !nonempty(root.lastSessionUrl))
+      )) {
     throw new Error('Invalid Lark notifier state');
   }
   return state as unknown as NotifyState;
@@ -61,7 +78,15 @@ function notifyStatePath(stateDir: string, config: LarkNotifyConfig): string {
 
 /** Read the committed cursor used for mailbox catch-up, including when the daemon is offline. */
 export function readLarkConsumedSequence(stateDir: string, config?: LarkNotifyConfig): number | undefined {
-  return config?.enabled ? readState(notifyStatePath(stateDir, config)).cursorSequence : undefined;
+  if (!config?.enabled) return undefined;
+  const state = readState(notifyStatePath(stateDir, config));
+  let consumed = state.cursorSequence;
+  for (const root of Object.values(state.threadRoots)) {
+    if (root.awaitingSessionLink === true && root.itemSequence !== undefined) {
+      consumed = Math.min(consumed, root.itemSequence - 1);
+    }
+  }
+  return consumed;
 }
 function prune<T>(entries: Record<string, T>, timestamp: (value: T) => string): Record<string, T> {
   return Object.fromEntries(Object.entries(entries).reverse().sort((a, b) => timestamp(b[1]).localeCompare(timestamp(a[1]))).slice(0, 1024));
@@ -73,7 +98,8 @@ export class LarkMailboxNotifier {
   private readonly statePath: string;
   private state: NotifyState;
   private boundMailboxes: string[];
-  private subscription?: Disposable;
+  private mailSubscription?: Disposable;
+  private wakeTargetSubscription?: Disposable;
   private active?: Promise<void>;
   private retry?: ReturnType<typeof setTimeout>;
   private attempts = 0;
@@ -98,13 +124,16 @@ export class LarkMailboxNotifier {
     if (!this.stopped || !this.options.config.enabled) return;
     this.stopped = false;
     this.controller = new AbortController();
-    this.subscription = this.options.store.onMail(() => this.kick());
+    this.mailSubscription = this.options.store.onMail(() => this.kick());
+    this.wakeTargetSubscription = this.options.store.onWakeTarget(() => this.kick());
     this.kick();
   }
   async stop(): Promise<void> {
     this.stopped = true;
-    this.subscription?.dispose();
-    this.subscription = undefined;
+    this.mailSubscription?.dispose();
+    this.mailSubscription = undefined;
+    this.wakeTargetSubscription?.dispose();
+    this.wakeTargetSubscription = undefined;
     if (this.retry) clearTimeout(this.retry);
     this.retry = undefined;
     this.controller.abort();
@@ -168,14 +197,60 @@ export class LarkMailboxNotifier {
         const next = structuredClone(this.state);
         if (this.accepts(item) && !Object.hasOwn(next.deliveredItems, key)) {
           const threadId = item.envelope.semantic?.threadId ?? item.id;
-          await this.deliver(next, key, threadId, followup => this.render(item, followup));
+          const sessionLink = this.options.resolveSessionLink?.(item.mailboxId, item.sequence);
+          await this.deliver(next, key, threadId, followup => this.render(item, followup, sessionLink));
+          if (Object.hasOwn(next.threadRoots, threadId)) {
+            const root = next.threadRoots[threadId];
+            root.mailboxId = item.mailboxId;
+            root.itemSequence = item.sequence;
+            if (sessionLink?.state === 'ready') {
+              root.lastSessionUrl = sessionLink.url;
+              delete root.awaitingSessionLink;
+            } else if (sessionLink?.state === 'pending') {
+              root.awaitingSessionLink = true;
+            } else {
+              delete root.awaitingSessionLink;
+            }
+          }
         }
         next.cursorSequence = item.sequence;
         this.persist(next);
         this.state = next;
         this.attempts = 0;
       }
-      // Arrivals during an awaited send must be scanned before outbound deduplication.
+      // Arrivals during an awaited send must be scanned before session-link follow-ups and outbound deduplication.
+      if (this.dirty) continue;
+      for (const [threadId, root] of Object.entries(this.state.threadRoots)) {
+        if (this.stopped) return;
+        if (root.awaitingSessionLink !== true || !root.mailboxId) continue;
+        const sessionLink = this.options.resolveSessionLink?.(root.mailboxId, root.itemSequence);
+        if (sessionLink === undefined || sessionLink.state === 'unavailable') {
+          const next = structuredClone(this.state);
+          if (Object.hasOwn(next.threadRoots, threadId)) {
+            delete next.threadRoots[threadId].awaitingSessionLink;
+            this.persist(next);
+            this.state = next;
+            this.attempts = 0;
+          }
+          continue;
+        }
+        if (sessionLink.state !== 'ready') continue;
+        const next = structuredClone(this.state);
+        const key = `session-link:${threadId}:${sessionLink.url}`;
+        if (!Object.hasOwn(next.deliveredItems, key) && root.lastSessionUrl !== sessionLink.url) {
+          await this.deliver(next, key, threadId, () => `**[${sessionLink.label}]** Session ready: \`${sessionLink.url}\``);
+        }
+        if (Object.hasOwn(next.threadRoots, threadId)) {
+          next.threadRoots[threadId].mailboxId = root.mailboxId;
+          if (root.itemSequence !== undefined) next.threadRoots[threadId].itemSequence = root.itemSequence;
+          delete next.threadRoots[threadId].awaitingSessionLink;
+          next.threadRoots[threadId].lastSessionUrl = sessionLink.url;
+        }
+        this.persist(next);
+        this.state = next;
+        this.attempts = 0;
+        if (this.dirty) break;
+      }
       if (this.dirty) continue;
       for (const envelope of this.pendingOutbound.values()) {
         if (this.stopped) return;
@@ -268,21 +343,24 @@ export class LarkMailboxNotifier {
     const id = result.data?.message_id ?? result.data?.messageId ?? result.message_id ?? result.result?.message_id;
     return nonempty(id) ? id : undefined;
   }
-  private render(item: MailboxItem, followup: boolean): string {
+  private render(item: MailboxItem, followup: boolean, sessionLink?: SessionLinkResolution): string {
     const envelope = item.envelope;
+    const linkSuffix = sessionLink?.state === 'ready'
+      ? `\n\n- ${sessionLink.label}: \`${sessionLink.url}\``
+      : '';
     const notification = envelope.payload?.notification;
     if (record(notification)) {
       const personal = record(notification.recipientMarkdown) && Object.hasOwn(notification.recipientMarkdown, this.options.localMember)
         ? notification.recipientMarkdown[this.options.localMember] : undefined;
-      if (nonempty(personal)) return personal;
-      if (nonempty(notification.markdown)) return notification.markdown;
+      if (nonempty(personal)) return personal + linkSuffix;
+      if (nonempty(notification.markdown)) return notification.markdown + linkSuffix;
     }
     const type = envelope.semantic?.type ?? 'message';
     const threadId = envelope.semantic?.threadId ?? envelope.id;
     const markdown = followup
       ? `**[${type}] ${envelope.from.member}**\n\n${envelope.body}`
       : `**[${envelope.kind}] ${envelope.subject}**${type !== 'message' ? `\n- Type: \`${type}\`` : ''}\n- From: \`${envelope.from.member}\` (\`${envelope.from.nodeName}\`)\n- Mailbox: \`${item.mailboxId}\` | Priority: \`${envelope.priority}\`\n- Thread: \`${threadId}\`\n\n${envelope.body}`;
-    return markdown + this.attachments(envelope);
+    return markdown + this.attachments(envelope) + linkSuffix;
   }
   private persist(state: NotifyState): void {
     state.deliveredItems = prune(state.deliveredItems, item => item.deliveredAt);

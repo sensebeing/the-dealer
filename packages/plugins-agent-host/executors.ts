@@ -27,6 +27,7 @@ import {
   rethrowBeforeCommandStart,
 } from '../plugins-executor/index.ts';
 import {
+  buildCodexThreadName,
   deliverAgentHostWakeTarget,
   readAgentHostDriverConfig,
   serializeAgentHostDriverConfig,
@@ -173,8 +174,11 @@ function buildAgentHostWakeTargetPatch(
     ...(desired.targetBot ? { targetBot: desired.targetBot } : {}),
     ...(desired.rotateAfterMs !== undefined ? { rotateAfterMs: desired.rotateAfterMs } : {}),
   });
-  if (hostChanged && configuredSessionId === undefined) {
-    driverConfig.sessionId = undefined;
+  if (hostChanged) {
+    if (configuredSessionId === undefined) {
+      driverConfig.sessionId = undefined;
+    }
+    driverConfig.deliveredSessions = undefined;
   }
   if (sessionRebound) {
     driverConfig.sessionStartedAt = undefined;
@@ -336,17 +340,21 @@ function createAgentExecutorPlugin(
           ),
         }));
         if (!store) {
-          const { delivery } = deliveries[0];
+          const { envelopes, delivery } = deliveries[0];
           if (delivery.type === 'raw') return rawExecutor.execute(batch, context, runtimeConfig);
           if (delivery.type !== 'host') throw beforeExternalEffect(new Error('Inbox delivery requires a mailbox store'));
           trustWorkspace(delivery);
           const stdioSpawner = options.stdioSpawner ?? config.stdioSpawner;
+          const threadName = delivery.mode === 'spawn' && envelopes[0]?.subject?.trim()
+            ? buildCodexThreadName(delivery.mailboxId, 'spawn', { items: [{ envelope: envelopes[0] }] })
+            : undefined;
           const output = normalizeAgentHost(delivery.host) === 'codex'
             ? await runCodexAppServerTurn({
                 command: delivery.command ?? delivery.request.command,
                 cwd: delivery.cwd,
                 mode: delivery.mode,
                 sessionId: delivery.sessionId,
+                threadName,
                 promptText: delivery.promptText,
                 agentProfile: delivery.agentProfile,
                 signal: context.signal,

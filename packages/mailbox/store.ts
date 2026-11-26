@@ -179,6 +179,14 @@ export type BeginWakeDeliveryResult =
   | { kind: 'superseded'; target: WakeTargetState }
   | { kind: 'outstanding_lease'; target: WakeTargetState; leaseId: string };
 
+/** Authoritative mailbox sequence bounds observed inside the completeWakeDelivery transaction. */
+export interface CompleteWakeDeliveryContext {
+  /** Highest sequence covered by the launch preview or leased/acked in this mailbox. */
+  readonly maxConsumedSequence: number;
+  /** Lowest sequence still protected by mailbox retention or the catch-up watermark. */
+  readonly minRetainedSequence?: number;
+}
+
 export interface MailboxStoreOptions {
   /** Legacy flat inbox file migrated once into the default mailbox when no mailbox exists. */
   legacyInboxPath?: string;
@@ -2012,7 +2020,9 @@ export class MailboxStore {
   completeWakeDelivery(
     mailboxId: string,
     deliveredSequence: number,
-    patch: Partial<WakeTargetState> | ((lockedCurrent: WakeTargetState) => Partial<WakeTargetState>) = {},
+    patch:
+      | Partial<WakeTargetState>
+      | ((lockedCurrent: WakeTargetState, context: CompleteWakeDeliveryContext) => Partial<WakeTargetState>) = {},
     pinnedSession?: PinnedSessionMailbox,
     expectedRevision?: number,
   ): WakeTargetState & { superseded?: boolean } {
@@ -2038,7 +2048,17 @@ export class MailboxStore {
         return Object.assign(structuredClone(next), { superseded: true });
       }
 
-      const resolvedPatch = typeof patch === 'function' ? patch(structuredClone(current)) : patch;
+      const bounds = this.db.mailboxSequenceBounds(id);
+      const consumed = this.readConsumedSequence?.();
+      const minRetainedSequence =
+        bounds.minSequence !== undefined && consumed !== undefined
+          ? Math.min(bounds.minSequence, consumed + 1)
+          : bounds.minSequence ?? (consumed !== undefined ? consumed + 1 : undefined);
+      const context: CompleteWakeDeliveryContext = {
+        maxConsumedSequence: Math.max(deliveredSequence, bounds.maxConsumedSequence ?? -1),
+        ...(minRetainedSequence !== undefined ? { minRetainedSequence } : {}),
+      };
+      const resolvedPatch = typeof patch === 'function' ? patch(structuredClone(current), context) : patch;
       const settled = this.settleWakeDeliveryInTx(current, previous, deliveredSequence, resolvedPatch, pinnedSession);
       pinnedWakeMailbox = settled.pinnedWakeMailbox;
       notify = current.pendingWake || settled.target.pendingWake || Boolean(current.deliveryInDoubt);

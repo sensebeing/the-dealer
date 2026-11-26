@@ -377,6 +377,16 @@ export class MailboxSqliteBackend {
     return this.statement("SELECT 1 FROM items WHERE status = 'acked' LIMIT 1 OFFSET ?").get(limit) !== undefined;
   }
 
+  mailboxSequenceBounds(mailboxId: string): { minSequence?: number; maxConsumedSequence?: number } {
+    const row = this.statement(
+      "SELECT MIN(sequence) AS min_seq, MAX(CASE WHEN status <> 'queued' THEN sequence END) AS max_consumed FROM items WHERE mailbox_id = ?",
+    ).get(mailboxId);
+    return {
+      minSequence: typeof row?.min_seq === 'number' ? row.min_seq : undefined,
+      maxConsumedSequence: typeof row?.max_consumed === 'number' ? row.max_consumed : undefined,
+    };
+  }
+
   private decodeItem(row: Row): MailboxItem {
     return this.validation.item({
       sequence: row.sequence,

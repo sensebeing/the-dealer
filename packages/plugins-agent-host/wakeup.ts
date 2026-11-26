@@ -1,4 +1,5 @@
 import { ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
+import type { MessageEnvelope, SessionLinkResolution } from '../core-types/index.ts';
 import {
   buildAgentHostInvocation,
   normalizeAgentHost,
@@ -9,7 +10,7 @@ import {
 } from './hosts.ts';
 import type { SupportedAgentHost, ActiveConversationMode } from './hosts.ts';
 import { runCodexAppServerTurn } from './codex-app-server.ts';
-import { checkedCommand, runCommand } from '../subprocess/index.ts';
+import { checkedCommand, runCommand, singleLine } from '../subprocess/index.ts';
 import type { CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts';
 import {
   buildWakeupPointer,
@@ -19,6 +20,12 @@ import {
 } from '../mailbox/wakeup.ts';
 import type { WakeupDriver } from '../mailbox/wakeup.ts';
 import type { MailboxStore, WakeTargetState } from '../mailbox/store.ts';
+
+export interface AgentHostDeliveredSession {
+  readonly fromSequence: number;
+  readonly throughSequence: number;
+  readonly sessionId: string;
+}
 
 export interface AgentHostDriverConfig {
   hostAgent?: SupportedAgentHost;
@@ -31,6 +38,7 @@ export interface AgentHostDriverConfig {
   configuredSessionId?: string;
   rotateAfterMs?: number;
   sessionStartedAt?: number;
+  deliveredSessions?: readonly AgentHostDeliveredSession[];
 }
 
 export function serializeAgentHostDriverConfig(config: AgentHostDriverConfig): Record<string, unknown> {
@@ -66,7 +74,181 @@ export function readAgentHostDriverConfig(
   ) {
     throw new Error('Invalid host configuration: sessionStartedAt');
   }
+  if (config.deliveredSessions !== undefined) {
+    if (
+      !Array.isArray(config.deliveredSessions) ||
+      config.deliveredSessions.some(entry => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return true;
+        const record = entry as Record<string, unknown>;
+        return (
+          typeof record.fromSequence !== 'number' ||
+          !Number.isSafeInteger(record.fromSequence) ||
+          record.fromSequence < 0 ||
+          typeof record.throughSequence !== 'number' ||
+          !Number.isSafeInteger(record.throughSequence) ||
+          record.throughSequence < record.fromSequence ||
+          typeof record.sessionId !== 'string' ||
+          record.sessionId.trim().length === 0
+        );
+      })
+    ) {
+      throw new Error('Invalid host configuration: deliveredSessions');
+    }
+  }
   return config as AgentHostDriverConfig;
+}
+
+function appendAgentHostDeliveredSession(
+  existing: readonly AgentHostDeliveredSession[] | undefined,
+  fromSequence: number,
+  throughSequence: number,
+  sessionId: string,
+  minRetainedSequence?: number,
+): AgentHostDeliveredSession[] | undefined {
+  const trimmed = sessionId.trim();
+  if (!trimmed || throughSequence < 0) return existing ? existing.map(entry => ({ ...entry })) : undefined;
+  const normalizedFrom = Math.max(0, Math.min(fromSequence, throughSequence));
+  const list = existing ? existing.map(entry => ({ ...entry })) : [];
+  const last = list.at(-1);
+  if (last && last.sessionId === trimmed) {
+    last.fromSequence = Math.min(last.fromSequence, normalizedFrom);
+    last.throughSequence = Math.max(last.throughSequence, throughSequence);
+  } else {
+    list.push({ fromSequence: normalizedFrom, throughSequence, sessionId: trimmed });
+  }
+  if (minRetainedSequence === undefined) {
+    return list;
+  }
+  const retained = list.filter(
+    (entry, index) => index === list.length - 1 || entry.throughSequence >= minRetainedSequence,
+  );
+  return retained;
+}
+
+function minPreviewSequence(
+  preview: { items: readonly { sequence: number }[]; latestQueued?: { sequence: number } },
+  maxSequence: number,
+): number {
+  let min = preview.latestQueued ? preview.latestQueued.sequence : maxSequence;
+  for (const item of preview.items) {
+    if (item.sequence < min) min = item.sequence;
+  }
+  return Math.max(0, Math.min(min, maxSequence));
+}
+
+const MAX_CODEX_THREAD_NAME_LENGTH = 80;
+
+export interface CodexThreadNamePreview {
+  readonly latestQueued?: { readonly envelope: Pick<MessageEnvelope, 'subject'> };
+  readonly items: readonly { readonly envelope: Pick<MessageEnvelope, 'subject'> }[];
+}
+
+function formatLocalMonthDay(now: number): string {
+  const date = new Date(now);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${month}-${day}`;
+}
+
+function capThreadName(value: string): string {
+  const normalized = singleLine(value);
+  const chars = Array.from(normalized);
+  if (chars.length <= MAX_CODEX_THREAD_NAME_LENGTH) return normalized;
+  return `${chars.slice(0, MAX_CODEX_THREAD_NAME_LENGTH - 1).join('').trimEnd()}…`;
+}
+
+/** Build a concise, single-line sidebar title (<= 80 chars) for a newly started Codex thread. */
+export function buildCodexThreadName(
+  mailboxId: string,
+  mode: ActiveConversationMode,
+  preview: CodexThreadNamePreview,
+  options: { now?: number; rotates?: boolean } = {},
+): string {
+  if (mode === 'spawn') {
+    const rawSubject = preview.latestQueued?.envelope.subject ?? preview.items.at(-1)?.envelope.subject;
+    const subject = typeof rawSubject === 'string' ? singleLine(rawSubject) : '';
+    return capThreadName(subject || `Dealer · ${mailboxId}`);
+  }
+  const label = mailboxId.startsWith('stream:') ? mailboxId.slice(7) : mailboxId;
+  if (options.rotates) {
+    return capThreadName(`Dealer · ${label} (${formatLocalMonthDay(options.now ?? Date.now())})`);
+  }
+  return capThreadName(`Dealer · ${label}`);
+}
+
+/** Single authoritative predicate for whether an agent-host wake target is due to rotate sessions. */
+export function isAgentHostRotationDue(
+  target: WakeTargetState,
+  options: { now?: number; hasOutstandingLease: boolean },
+): boolean {
+  if (target.driver !== 'agent-host') return false;
+  const config = readAgentHostDriverConfig(target);
+  if (!config.sessionId?.trim() || config.conversationMode === 'spawn' || options.hasOutstandingLease) {
+    return false;
+  }
+  const now = options.now ?? Date.now();
+  const waveRotationDue =
+    target.rotateAfterWaves !== undefined &&
+    target.completedWaves >= target.rotateAfterWaves;
+  const ageRotationDue =
+    config.rotateAfterMs !== undefined &&
+    config.sessionStartedAt !== undefined &&
+    now - config.sessionStartedAt >= config.rotateAfterMs;
+  return waveRotationDue || ageRotationDue;
+}
+
+/**
+ * Derive a host-neutral receiver-local session deep link from an `agent-host` wake target.
+ * When `itemSequence` is provided, checks the committed `deliveredSessions` association first so
+ * historical/acked/rotated items always resolve to the exact session that received them.
+ * For undelivered items, returns `{ state: 'pending' }` for fresh `spawn` targets (ignoring any
+ * pre-launch configured `sessionId`) and when a Codex session has not yet been committed or is
+ * due to rotate, and `undefined` for non-link hosts.
+ */
+export function resolveAgentHostSessionLink(
+  target: WakeTargetState | undefined,
+  options: { now?: number; hasOutstandingLease?: boolean; itemSequence?: number } = {},
+): SessionLinkResolution | undefined {
+  if (!target || target.driver !== 'agent-host') return undefined;
+  const config = readAgentHostDriverConfig(target);
+  if (!config.hostAgent || normalizeAgentHost(config.hostAgent) !== 'codex') return undefined;
+  const deliveredSessions = config.deliveredSessions;
+  if (options.itemSequence !== undefined && deliveredSessions && deliveredSessions.length > 0) {
+    for (let index = deliveredSessions.length - 1; index >= 0; index -= 1) {
+      const entry = deliveredSessions[index];
+      if (options.itemSequence >= entry.fromSequence && options.itemSequence <= entry.throughSequence) {
+        return {
+          state: 'ready',
+          label: 'ChatGPT App',
+          url: `codex://threads/${encodeURIComponent(entry.sessionId)}`,
+        };
+      }
+    }
+    const maxCommitted = deliveredSessions.reduce((max, entry) => Math.max(max, entry.throughSequence), -1);
+    if (options.itemSequence <= maxCommitted) {
+      return { state: 'unavailable' };
+    }
+  }
+  // A spawn target always starts a fresh Codex thread via thread/start, even if a configured
+  // sessionId was seeded on the wake target before launch; wait for committed thread identity.
+  if (config.conversationMode === 'spawn') {
+    return { state: 'pending' };
+  }
+  const sessionId = config.sessionId?.trim();
+  const rotationDue = isAgentHostRotationDue(target, {
+    now: options.now,
+    // While a wave launch is fenced under deliveryInDoubt, the agent acquiring its lease mid-turn
+    // must not mask a pending rotation and leak the retiring sessionId before completeWakeDelivery.
+    hasOutstandingLease: target.deliveryInDoubt ? false : (options.hasOutstandingLease ?? false),
+  });
+  if (!sessionId || rotationDue) {
+    return { state: 'pending' };
+  }
+  return {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: `codex://threads/${encodeURIComponent(sessionId)}`,
+  };
 }
 
 function rotatedSessionId(
@@ -105,24 +287,12 @@ export async function deliverAgentHostWakeTarget(
     const state = store.getWakeTarget(mailboxId);
     expectedRevision = state?.bindingRevision ?? 0;
     const target = state ? { ...readAgentHostDriverConfig(state), ...state } : undefined;
-    if (!target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
+    if (!state || !target?.hostAgent) throw new Error(`Passive wake target missing host agent: ${mailboxId}`);
     const preview = store.check({ mailboxId, peek: true });
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) throw new Error(`No pending Dealer messages in ${mailboxId}`);
     const hasOutstandingLease = Boolean(preview.deliveryId);
-    const waveRotationDue =
-      !hasOutstandingLease &&
-      target.rotateAfterWaves !== undefined &&
-      target.completedWaves >= target.rotateAfterWaves;
-    const ageRotationDue =
-      !hasOutstandingLease &&
-      target.rotateAfterMs !== undefined &&
-      target.sessionStartedAt !== undefined &&
-      now - target.sessionStartedAt >= target.rotateAfterMs;
-    const shouldRotate =
-      Boolean(target.sessionId) &&
-      target.conversationMode !== 'spawn' &&
-      (waveRotationDue || ageRotationDue);
+    const shouldRotate = isAgentHostRotationDue(state, { now, hasOutstandingLease });
     const canonicalHost = normalizeAgentHost(target.hostAgent);
     const effectiveMode: ActiveConversationMode = shouldRotate
       ? 'wave'
@@ -167,6 +337,13 @@ export async function deliverAgentHostWakeTarget(
       throw new Error(`Cannot rotate session while delivery lease ${fence.leaseId} is outstanding`);
     }
     deliveryBegun = true;
+    const resumeThread = effectiveMode === 'fixed' || (effectiveMode === 'wave' && Boolean(effectiveSessionId));
+    const threadName = !resumeThread
+      ? buildCodexThreadName(mailboxId, effectiveMode, preview, {
+          now,
+          rotates: target.rotateAfterWaves !== undefined || target.rotateAfterMs !== undefined,
+        })
+      : undefined;
     const output =
       canonicalHost === 'codex'
         ? await runCodexAppServerTurn({
@@ -174,6 +351,7 @@ export async function deliverAgentHostWakeTarget(
             cwd: target.workspacePath,
             mode: effectiveMode,
             sessionId: effectiveSessionId,
+            threadName,
             promptText: pointer,
             agentProfile: target.agentProfile,
             signal: options.signal,
@@ -196,25 +374,42 @@ export async function deliverAgentHostWakeTarget(
           ? now
           : (target.sessionStartedAt ?? now))
       : undefined;
-    const nextDriverConfig = continuation.hostAgent
-      ? serializeAgentHostDriverConfig({
-          hostAgent: continuation.hostAgent,
-          conversationMode: continuation.conversationMode,
-          sessionId: continuation.sessionId,
-          ...(target.rotateAfterMs !== undefined ? { rotateAfterMs: target.rotateAfterMs } : {}),
-          ...(sessionStartedAt !== undefined ? { sessionStartedAt } : {}),
-        })
-      : undefined;
+    const deliveredSequence = maxPreviewSequence(preview);
+    const deliveredFromSequence = minPreviewSequence(preview, deliveredSequence);
     const completed = store.completeWakeDelivery(
       mailboxId,
-      maxPreviewSequence(preview),
-      lockedCurrent => ({
-        driver: continuation.hostAgent ? 'agent-host' : 'passive',
-        driverConfig: nextDriverConfig,
-        ...(shouldRotate
-          ? { completedWaves: Math.max(0, lockedCurrent.completedWaves - preRotationCompletedWaves) }
-          : {}),
-      }),
+      deliveredSequence,
+      (lockedCurrent, completionContext) => {
+        const currentConfig =
+          lockedCurrent.driver === 'agent-host' ? readAgentHostDriverConfig(lockedCurrent) : undefined;
+        const consumedThroughSequence = Math.max(deliveredSequence, completionContext.maxConsumedSequence);
+        const deliveredSessions = continuation.sessionId
+          ? appendAgentHostDeliveredSession(
+              currentConfig?.deliveredSessions,
+              deliveredFromSequence,
+              consumedThroughSequence,
+              continuation.sessionId,
+              completionContext.minRetainedSequence,
+            )
+          : currentConfig?.deliveredSessions;
+        const nextDriverConfig = continuation.hostAgent
+          ? serializeAgentHostDriverConfig({
+              hostAgent: continuation.hostAgent,
+              conversationMode: continuation.conversationMode,
+              sessionId: continuation.sessionId,
+              ...(target.rotateAfterMs !== undefined ? { rotateAfterMs: target.rotateAfterMs } : {}),
+              ...(sessionStartedAt !== undefined ? { sessionStartedAt } : {}),
+              ...(deliveredSessions !== undefined ? { deliveredSessions } : {}),
+            })
+          : undefined;
+        return {
+          driver: continuation.hostAgent ? 'agent-host' : 'passive',
+          driverConfig: nextDriverConfig,
+          ...(shouldRotate
+            ? { completedWaves: Math.max(0, lockedCurrent.completedWaves - preRotationCompletedWaves) }
+            : {}),
+        };
+      },
       undefined,
       expectedRevision,
     );

@@ -1,4 +1,5 @@
 import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createFakeCodexAppServer } from './helpers/fake-codex-app-server.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,7 +10,8 @@ import {
   DealerNodeRuntime, MailboxStore, LarkMailboxNotifier, WakeupRedriveService, createLarkMirrorPlugin,
   signEnvelope, generateNodeKeyPair, verifyEnvelope, runDealerCli,
   ensureOrcaWorkspace, checkOrcaWorkspaceIdle, resolveOrSpawnOrcaWorkspaceTerminal, defaultAntigravityLaunchCommand,
-  validateTopicBindings, validateLarkNotify, initProjectScaffold,
+  validateTopicBindings, validateLarkNotify, initProjectScaffold, resolveAgentHostSessionLink,
+  deliverAgentHostWakeTarget, runCommand,
 } from '../packages/index.ts';
 import type { MessageEnvelope, CommandRequest, CommandRunner } from '../packages/index.ts';
 import { openStateLedgers } from '../packages/cli/ledgers.ts';
@@ -972,4 +974,687 @@ test('runtime replaces and disables the Lark mirror through kernel lifecycle', a
   runtime.mailbox.enqueue([envelope('after-disable')]);
   await replacement.flush();
   assert.equal(calls.length, 1, 'disabled notifier has no active subscription');
+});
+
+test('Lark session links: inline ready, pending onWakeTarget follow-up, rotation isolation, legacy v1 state, and rebind cleanup', async t => {
+  const root = directory(t);
+
+  // 1. Inline session link on existing Codex session (both default markdown and custom recipientMarkdown/markdown)
+  //    AND wake-commit-before-Lark ordering produces zero redundant reply.
+  {
+    const dir = join(root, 'inline');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    store.upsertWakeTarget('stream:codex-live', {
+      driver: 'agent-host',
+      driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'thread-ready-1', sessionStartedAt: Date.now() },
+    });
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:codex-live'],
+      config: { enabled: true, target: { chatId: 'chat-1' } },
+      resolveSessionLink: mailboxId => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+
+    store.enqueue([
+      envelope('inline-default'),
+      envelope('inline-custom', {
+        payload: { notification: { markdown: 'Fallback override', recipientMarkdown: { bob: 'Custom for Bob' } } },
+      }),
+    ], { mailboxId: 'stream:codex-live' });
+    await notifier.flush();
+
+    assert.equal(calls.length, 2);
+    assert.ok(argument(calls[0], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/thread-ready-1`'));
+    assert.equal(
+      argument(calls[1], '--markdown'),
+      'Custom for Bob\n\n- ChatGPT App: `codex://threads/thread-ready-1`',
+    );
+    const persisted = JSON.parse(readFileSync(join(dir, 'lark-notify.json'), 'utf8'));
+    assert.equal(persisted.threadRoots['inline-default'].awaitingSessionLink, undefined);
+    assert.equal(persisted.threadRoots['inline-default'].lastSessionUrl, 'codex://threads/thread-ready-1');
+  }
+
+  // 2. Wave 1 pending -> Lark renders first without link, then completeWakeDelivery commits sessionId
+  //    and emits onWakeTarget -> posts ONE idempotent in-thread reply.
+  //    Then rotation pending -> suppresses retiring link, commits thread-2 -> replies ONLY to new awaiting thread,
+  //    NEVER spamming unrelated historical threadRoots on the same mailbox.
+  {
+    const dir = join(root, 'pending-and-rotation');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:rot'],
+      config: { enabled: true, target: { chatId: 'chat-2' } },
+      resolveSessionLink: mailboxId => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rot-msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+
+    // Wave 1 arrives before sessionId exists.
+    store.enqueue([envelope('thread-a')], {
+      mailboxId: 'stream:rot',
+      wakeTarget: {
+        driver: 'agent-host',
+        rotateAfterWaves: 1,
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave' },
+      },
+    });
+    await notifier.flush();
+    assert.equal(calls.length, 1);
+    assert.ok(!argument(calls[0], '--markdown').includes('codex://threads/'), 'pending root must not include link');
+
+    // Wake commits thread-1 via tryBeginWakeDelivery + completeWakeDelivery -> emits onWakeTarget.
+    const rev1 = store.getWakeTarget('stream:rot')!.bindingRevision;
+    store.tryBeginWakeDelivery('stream:rot', rev1);
+    store.completeWakeDelivery('stream:rot', 0, {
+      driver: 'agent-host',
+      driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'thread-1', sessionStartedAt: Date.now() },
+    }, undefined, rev1);
+    await notifier.flush();
+
+    assert.equal(calls.length, 2);
+    assert.ok(calls[1].args.includes('--reply-in-thread'));
+    assert.equal(argument(calls[1], '--message-id'), 'rot-msg-1');
+    assert.equal(argument(calls[1], '--markdown'), '**[ChatGPT App]** Session ready: `codex://threads/thread-1`');
+
+    // Ack wave 1 -> completedWaves === 1 === rotateAfterWaves -> rotation is now due!
+    const lease1 = store.check({ mailboxId: 'stream:rot' });
+    store.ack(lease1.deliveryId!, 'stream:rot');
+
+    // Thread B arrives while rotation is due -> MUST suppress retiring thread-1 link!
+    store.enqueue([envelope('thread-b')], { mailboxId: 'stream:rot' });
+    await notifier.flush();
+    assert.equal(calls.length, 3);
+    assert.ok(!argument(calls[2], '--markdown').includes('thread-1'), 'retiring session link must be suppressed');
+
+    // Wake rotates to thread-2: fence deliveryInDoubt first and acquire the lease mid-turn
+    // (simulating the rotating Codex agent calling `dealer inbox check` before completeWakeDelivery).
+    // Lark draining on that onWakeTarget event MUST stay pending and NEVER leak retiring thread-1!
+    const rev2 = store.getWakeTarget('stream:rot')!.bindingRevision;
+    store.tryBeginWakeDelivery('stream:rot', rev2, { requireNoOutstandingLease: true });
+    const lease2 = store.check({ mailboxId: 'stream:rot' });
+    assert.ok(lease2.deliveryId, 'mid-turn lease is acquired before completeWakeDelivery');
+    await notifier.flush();
+    assert.equal(calls.length, 3, 'mid-rotation lease acquisition must not leak retiring thread-1');
+
+    // Now completeWakeDelivery commits thread-2 -> MUST reply ONLY to thread-b (rot-msg-3), NOT thread-a (rot-msg-1)!
+    store.completeWakeDelivery('stream:rot', 1, {
+      driver: 'agent-host',
+      completedWaves: 0,
+      driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'thread-2', sessionStartedAt: Date.now() },
+    }, undefined, rev2);
+    await notifier.flush();
+
+    assert.equal(calls.length, 4);
+    assert.ok(calls[3].args.includes('--reply-in-thread'));
+    assert.equal(argument(calls[3], '--message-id'), 'rot-msg-3', 'only awaiting thread-b receives rotated session link');
+    assert.equal(argument(calls[3], '--markdown'), '**[ChatGPT App]** Session ready: `codex://threads/thread-2`');
+
+    // Restarting notifier must be 100% idempotent (zero duplicate replies).
+    await notifier.stop();
+    const restarted = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:rot'],
+      config: { enabled: true, target: { chatId: 'chat-2' } },
+      resolveSessionLink: mailboxId => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rot-msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => restarted.stop());
+    restarted.start();
+    await restarted.flush();
+    assert.equal(calls.length, 4, 'restart must not re-send delivered session links');
+  }
+
+  // 3. Backward-compatible loading of legacy v1 lark-notify.json without optional fields,
+  //    AND clearing awaitingSessionLink if host is rebound to a non-link host.
+  {
+    const dir = join(root, 'legacy-and-rebind');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    writeFileSync(join(dir, 'lark-notify.json'), JSON.stringify({
+      schema: 'the-dealer-lark-notify/v1',
+      cursorSequence: -1,
+      deliveredItems: {},
+      threadRoots: {
+        'legacy-thread': {
+          messageId: 'legacy-msg-1',
+          targetKey: JSON.stringify(['', '', '--chat-id', 'chat-3']),
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    }));
+
+    let linkState: ReturnType<typeof resolveAgentHostSessionLink> = { state: 'pending' };
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:rebind'],
+      config: { enabled: true, target: { chatId: 'chat-3' } },
+      resolveSessionLink: () => linkState,
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rebind-msg-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+    store.enqueue([envelope('rebind-thread')], {
+      mailboxId: 'stream:rebind',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave' },
+      },
+    });
+    await notifier.flush();
+    assert.equal(calls.length, 1);
+    const beforeRebind = JSON.parse(readFileSync(join(dir, 'lark-notify.json'), 'utf8'));
+    assert.equal(beforeRebind.threadRoots['rebind-thread'].awaitingSessionLink, true);
+    assert.equal(beforeRebind.threadRoots['legacy-thread'].messageId, 'legacy-msg-1');
+
+    // Rebind mailbox to a non-link host -> resolveSessionLink returns undefined -> awaitingSessionLink is cleared without sending.
+    linkState = undefined;
+    store.upsertWakeTarget('stream:rebind', {
+      driver: 'agent-host',
+      pendingWake: true,
+      driverConfig: { hostAgent: 'claude-code', conversationMode: 'wave' },
+    });
+    await notifier.flush();
+    assert.equal(calls.length, 1, 'rebind to non-link host sends no reply');
+    const afterRebind = JSON.parse(readFileSync(join(dir, 'lark-notify.json'), 'utf8'));
+    assert.equal(afterRebind.threadRoots['rebind-thread'].awaitingSessionLink, undefined);
+  }
+
+  // 4. End-to-end DealerNodeRuntime wiring: activateLarkNotifier resolves Codex session deep links automatically.
+  {
+    const dir = join(root, 'runtime-e2e');
+    const turnGate = Promise.withResolvers<void>();
+    const turnStarted = Promise.withResolvers<void>();
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: () => 'runtime-codex-thread-9',
+      onTurnStart: async () => {
+        turnStarted.resolve();
+        await turnGate.promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'runtime-e2e-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `rt-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': { executor: 'codex', mode: 'wave', workspacePath: root, notifyLark: true },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'rt-chat' } },
+      },
+    }).start();
+    t.after(async () => {
+      turnGate.resolve();
+      await runtime.stop();
+    });
+
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Runtime E2E Task',
+      body: 'Please handle this',
+      payload: {},
+    });
+
+    // Wait for Lark root to send while Codex turn is still running (sessionId not committed yet).
+    await turnStarted.promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 1);
+    assert.ok(!argument(larkCalls[0], '--markdown').includes('codex://threads/'));
+
+    // Release Codex turn -> completeWakeDelivery commits runtime-codex-thread-9 -> onWakeTarget triggers single reply!
+    turnGate.resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 2);
+    assert.ok(larkCalls[1].args.includes('--reply-in-thread'));
+    assert.equal(argument(larkCalls[1], '--message-id'), 'rt-lark-1');
+    assert.equal(
+      argument(larkCalls[1], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/runtime-codex-thread-9`',
+    );
+    assert.equal(fakeCodex.sessions[0].threadParams?.threadSource, 'user');
+    assert.equal(fakeCodex.sessions[0].threadName, 'Dealer · collab.request.v4');
+  }
+
+  // 5. rotateAfterWaves: 1 with mid-turn ack BEFORE turn/completed still publishes Wave 1's session
+  //    to Wave 1's Lark thread (and Wave 2's rotated session only to Wave 2's thread).
+  {
+    const dir = join(root, 'mid-turn-ack');
+    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let runtimeRef!: DealerNodeRuntime;
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `mid-ack-thread-${count}`,
+      onTurnStart: async (_params, ctx) => {
+        const idx = ctx.session.index - 1;
+        // Simulate Codex agent checking and acking the lease BEFORE turn/completed!
+        const lease = runtimeRef.mailbox.check({ mailboxId: 'stream:mid-ack' });
+        assert.ok(lease.deliveryId);
+        runtimeRef.mailbox.ack(lease.deliveryId!, 'stream:mid-ack');
+        started[idx].resolve();
+        await gates[idx].promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'mid-turn-ack-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `mid-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': {
+            executor: 'codex',
+            mode: 'wave',
+            streamKey: 'mid-ack',
+            rotateAfterWaves: 1,
+            workspacePath: root,
+            notifyLark: true,
+          },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'mid-chat' } },
+      },
+    }).start();
+    runtimeRef = runtime;
+    t.after(async () => {
+      for (const gate of gates) gate.resolve();
+      await runtime.stop();
+    });
+
+    // Wave 1: agent acks mid-turn -> completedWaves becomes 1 BEFORE completeWakeDelivery.
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Mid-ack Wave 1',
+      body: 'Ack early in turn 1',
+      payload: {},
+    });
+    await started[0].promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 1);
+    assert.ok(!argument(larkCalls[0], '--markdown').includes('codex://threads/'));
+    assert.equal(runtime.mailbox.getWakeTarget('stream:mid-ack')?.completedWaves, 1);
+
+    gates[0].resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 2, 'committed Wave 1 session must be delivered even when completedWaves === rotateAfterWaves');
+    assert.equal(argument(larkCalls[1], '--message-id'), 'mid-lark-1');
+    assert.equal(
+      argument(larkCalls[1], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/mid-ack-thread-1`',
+    );
+
+    // Wave 2: rotates to mid-ack-thread-2 and acks mid-turn -> replies ONLY to Wave 2's root.
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Mid-ack Wave 2',
+      body: 'Ack early in turn 2',
+      payload: {},
+    });
+    await started[1].promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 3);
+    assert.ok(!argument(larkCalls[2], '--markdown').includes('mid-ack-thread-1'));
+
+    gates[1].resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 4);
+    assert.equal(argument(larkCalls[3], '--message-id'), 'mid-lark-3');
+    assert.equal(
+      argument(larkCalls[3], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/mid-ack-thread-2`',
+    );
+  }
+
+  // 6. Delayed Lark notification across rotation attaches each item's own committed session (S1 vs S2).
+  {
+    const dir = join(root, 'delayed-across-rotation');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `delayed-s${count}`,
+    });
+
+    // Wave 1 commits delayed-s1 and acks.
+    store.enqueue([envelope('delayed-w1')], {
+      mailboxId: 'stream:delayed',
+      wakeTarget: {
+        driver: 'agent-host',
+        rotateAfterWaves: 1,
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+      },
+    });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:delayed', { stdioSpawner: fakeCodex.spawner });
+    store.ack(store.check({ mailboxId: 'stream:delayed' }).deliveryId!, 'stream:delayed');
+
+    // Wave 2 rotates and commits delayed-s2 BEFORE Lark ever starts draining!
+    store.enqueue([envelope('delayed-w2')], { mailboxId: 'stream:delayed' });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:delayed', { stdioSpawner: fakeCodex.spawner });
+
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:delayed'],
+      config: { enabled: true, target: { chatId: 'delayed-chat' } },
+      resolveSessionLink: (mailboxId, itemSequence) => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+        itemSequence,
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `del-lark-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+    await notifier.flush();
+
+    assert.equal(calls.length, 2);
+    assert.ok(
+      argument(calls[0], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/delayed-s1`'),
+      'Wave 1 item must keep its committed S1 session after S2 rotation',
+    );
+    assert.ok(
+      argument(calls[1], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/delayed-s2`'),
+      'Wave 2 item must get its committed S2 session',
+    );
+  }
+
+  // 7. Spawn with an explicit pre-launch sessionId must NOT publish the configured hint before launch,
+  //    and must publish the actual fresh threadId returned by Codex thread/start once committed.
+  {
+    const dir = join(root, 'spawn-explicit-session');
+    const turnStarted = Promise.withResolvers<void>();
+    const turnGate = Promise.withResolvers<void>();
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: () => 'actual-spawn-thread-77',
+      onTurnStart: async () => {
+        turnStarted.resolve();
+        await turnGate.promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'spawn-explicit-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `spawn-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': {
+            executor: 'codex',
+            mode: 'spawn',
+            sessionId: 'preconfigured-hint',
+            workspacePath: root,
+            notifyLark: true,
+          },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'spawn-chat' } },
+      },
+    }).start();
+    t.after(async () => {
+      turnGate.resolve();
+      await runtime.stop();
+    });
+
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Spawn With Configured Hint',
+      body: 'Should ignore preconfigured hint for link',
+      payload: {},
+    });
+    await turnStarted.promise;
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 1);
+    assert.ok(
+      !argument(larkCalls[0], '--markdown').includes('preconfigured-hint'),
+      'spawn must not leak pre-launch configured sessionId',
+    );
+
+    turnGate.resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    assert.equal(larkCalls.length, 2);
+    assert.equal(argument(larkCalls[1], '--message-id'), 'spawn-lark-1');
+    assert.equal(
+      argument(larkCalls[1], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/actual-spawn-thread-77`',
+    );
+  }
+
+  // 8. Enqueue B between launch preview and inbox check, ack combined A+B lease before turn/completed,
+  //    while unconsumed C arrives after inbox check: A and B both get S1, C rotates and gets S2.
+  {
+    const dir = join(root, 'post-preview-claim');
+    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let runtimeRef!: DealerNodeRuntime;
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `post-preview-s${count}`,
+      onTurnStart: async (_params, ctx) => {
+        const idx = ctx.session.index - 1;
+        if (idx === 0) {
+          // Enqueue B AFTER launch preview (which only saw A), BEFORE agent calls inbox check.
+          runtimeRef.mailbox.enqueue([envelope('item-b', { kind: 'collab.request.v4' })], { mailboxId: 'stream:post-preview' });
+          const lease = runtimeRef.mailbox.check({ mailboxId: 'stream:post-preview' });
+          assert.equal(lease.items.length, 2, 'combined lease must include both A and post-preview B');
+          runtimeRef.mailbox.ack(lease.deliveryId!, 'stream:post-preview');
+          // Enqueue unconsumed C AFTER inbox check; C stays queued for Wave 2.
+          runtimeRef.mailbox.enqueue([envelope('item-c', { kind: 'collab.request.v4' })], { mailboxId: 'stream:post-preview' });
+        } else {
+          const lease = runtimeRef.mailbox.check({ mailboxId: 'stream:post-preview' });
+          assert.deepEqual(lease.items.map(item => item.id), ['item-c']);
+          runtimeRef.mailbox.ack(lease.deliveryId!, 'stream:post-preview');
+        }
+        started[idx].resolve();
+        await gates[idx].promise;
+      },
+    });
+    const larkCalls: CommandRequest[] = [];
+    const runtime = await new DealerNodeRuntime({
+      stateDir: dir,
+      member: 'bob',
+      profile: 'codex-dev',
+      transport: { discoveryDir: join(root, 'post-preview-discovery') },
+      stdioSpawner: fakeCodex.spawner,
+      commandRunner: async call => {
+        larkCalls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `pp-lark-${larkCalls.length}` } }) };
+      },
+      patch: {
+        gateMode: 'open',
+        topicBindings: {
+          'collab.request.v4': {
+            executor: 'codex',
+            mode: 'wave',
+            streamKey: 'post-preview',
+            rotateAfterWaves: 1,
+            workspacePath: root,
+            notifyLark: true,
+          },
+        },
+        larkNotify: { enabled: true, target: { chatId: 'pp-chat' } },
+      },
+    }).start();
+    runtimeRef = runtime;
+    t.after(async () => {
+      for (const gate of gates) gate.resolve();
+      await runtime.stop();
+    });
+
+    await runtime.emitter.emit({
+      networkId: 'local',
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v4',
+      subject: 'Item A',
+      body: 'Launched wave 1',
+      payload: {},
+    });
+    await started[0].promise;
+    await runtime.larkNotifier!.flush();
+    // Roots for A, B, and C all sent while pending (no session links leaked yet).
+    assert.equal(larkCalls.length, 3);
+    assert.ok(larkCalls.every(call => !argument(call, '--markdown').includes('codex://threads/')));
+
+    // Finish Wave 1: A and B were consumed by S1, C stays queued for S2.
+    gates[0].resolve();
+    await started[1].promise;
+    await runtime.larkNotifier!.flush();
+    const s1Replies = larkCalls.filter(
+      call => call.args.includes('--reply-in-thread') && argument(call, '--markdown').includes('post-preview-s1'),
+    );
+    assert.deepEqual(
+      s1Replies.map(call => argument(call, '--message-id')).sort(),
+      ['pp-lark-1', 'pp-lark-2'],
+      'both A and post-preview-claimed B must receive S1 while unconsumed C waits for S2',
+    );
+
+    // Finish Wave 2: C receives S2.
+    gates[1].resolve();
+    await runtime.wakeups.waitUntilIdle();
+    await runtime.larkNotifier!.flush();
+    const s2Replies = larkCalls.filter(
+      call => call.args.includes('--reply-in-thread') && argument(call, '--markdown').includes('post-preview-s2'),
+    );
+    assert.deepEqual(
+      s2Replies.map(call => argument(call, '--message-id')),
+      ['pp-lark-3'],
+      'unconsumed C must receive rotated session S2',
+    );
+  }
+
+  // 9. Catch-up spanning >64 rotations (70 waves) while Lark is offline retains every committed
+  //    session association coordinated with mailbox retention and readLarkConsumedSequence.
+  {
+    const dir = join(root, 'catchup-70-rotations');
+    const larkConfig = { enabled: true, target: { chatId: 'catchup-chat' } };
+    const { mailbox: store } = openStateLedgers(dir, undefined, () => larkConfig);
+    t.after(() => store.close());
+    const fakeCodex = createFakeCodexAppServer({
+      nextThreadId: count => `catchup-s${count}`,
+    });
+    const totalWaves = 70;
+    for (let wave = 1; wave <= totalWaves; wave += 1) {
+      store.enqueue([envelope(`wave-${wave}`)], {
+        mailboxId: 'stream:many-rot',
+        ...(wave === 1
+          ? {
+              wakeTarget: {
+                driver: 'agent-host',
+                rotateAfterWaves: 1,
+                driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+              },
+            }
+          : {}),
+      });
+      await deliverAgentHostWakeTarget(store, runCommand, 'stream:many-rot', { stdioSpawner: fakeCodex.spawner });
+      store.ack(store.check({ mailboxId: 'stream:many-rot' }).deliveryId!, 'stream:many-rot');
+    }
+
+    const calls: CommandRequest[] = [];
+    const notifier = new LarkMailboxNotifier({
+      store,
+      stateDir: dir,
+      localNodeId: 'local',
+      localMember: 'bob',
+      defaultBoundMailboxes: ['stream:many-rot'],
+      config: larkConfig,
+      resolveSessionLink: (mailboxId, itemSequence) => resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+        hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+        itemSequence,
+      }),
+      commandRunner: async call => {
+        calls.push(call);
+        return { stdout: JSON.stringify({ data: { message_id: `cu-lark-${calls.length}` } }) };
+      },
+    });
+    t.after(() => notifier.stop());
+    notifier.start();
+    await notifier.flush();
+
+    assert.equal(calls.length, totalWaves);
+    assert.ok(
+      argument(calls[0], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/catchup-s1`'),
+      'first wave (>64 rotations ago) must retain its exact S1 link during catch-up',
+    );
+    assert.ok(
+      argument(calls[64], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/catchup-s65`'),
+      '65th wave must retain its exact S65 link',
+    );
+    assert.ok(
+      argument(calls[69], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/catchup-s70`'),
+      '70th wave must retain its exact S70 link',
+    );
+  }
 });

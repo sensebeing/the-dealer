@@ -16,6 +16,7 @@ export interface CodexAppServerTurnOptions {
   cwd?: string;
   mode: ActiveConversationMode;
   sessionId?: string;
+  threadName?: string;
   promptText: string;
   agentProfile?: string;
   signal?: AbortSignal;
@@ -357,14 +358,16 @@ export async function runCodexAppServerTurn(
       activeRpc = undefined;
       clearTimeout(pending.timer);
       if (message.error !== undefined) {
-        // Explicit RPC rejection of initialize, thread/start, thread/resume, OR turn/start
-        // proves the turn never started and must stay retryable via CommandNotStartedError.
-        pending.reject(
-          makeBoundaryError(
-            `codex app-server ${pending.method} failed: ${formatRpcError(message.error)}`,
-            true,
-          ),
-        );
+        // Explicit RPC rejection of initialize, thread/start, thread/resume, thread/name/set,
+        // OR turn/start proves the turn never started and must stay retryable via CommandNotStartedError.
+        const rpcError = makeBoundaryError(
+          `codex app-server ${pending.method} failed: ${formatRpcError(message.error)}`,
+          true,
+        ) as Error & { rpcCode?: number };
+        if (typeof message.error?.code === 'number') {
+          rpcError.rpcCode = message.error.code;
+        }
+        pending.reject(rpcError);
         return;
       }
       if (pending.method === 'turn/start') {
@@ -540,7 +543,8 @@ export async function runCodexAppServerTurn(
   let cleanupError: Error | undefined;
   let thrownError: unknown;
   try {
-    await sendRequest(1, 'initialize', {
+    let nextRequestId = 1;
+    await sendRequest(nextRequestId++, 'initialize', {
       clientInfo: { name: 'the-dealer', version: '1.0.0' },
     });
 
@@ -548,17 +552,18 @@ export async function runCodexAppServerTurn(
 
     const resumeThread = options.mode === 'fixed' || (options.mode === 'wave' && Boolean(sessionId));
     const threadResult = resumeThread
-      ? await sendRequest(2, 'thread/resume', {
+      ? await sendRequest(nextRequestId++, 'thread/resume', {
           threadId: sessionId!,
           ...(options.cwd ? { cwd: options.cwd } : {}),
           approvalPolicy: 'never',
           sandbox: 'danger-full-access',
           excludeTurns: true,
         })
-      : await sendRequest(2, 'thread/start', {
+      : await sendRequest(nextRequestId++, 'thread/start', {
           ...(options.cwd ? { cwd: options.cwd } : {}),
           approvalPolicy: 'never',
           sandbox: 'danger-full-access',
+          threadSource: 'user',
         });
 
     const threadRecord =
@@ -574,11 +579,31 @@ export async function runCodexAppServerTurn(
     }
     activeThreadId = threadId;
 
+    const trimmedThreadName = options.threadName?.trim();
+    if (!resumeThread && trimmedThreadName) {
+      try {
+        await sendRequest(nextRequestId++, 'thread/name/set', {
+          threadId,
+          name: trimmedThreadName,
+        });
+      } catch (error) {
+        if ((error as { rpcCode?: unknown } | null)?.rpcCode === -32601) {
+          const existingStderr = stderrTail.toString();
+          const prefix = existingStderr.length > 0 && !existingStderr.endsWith('\n') ? '\n' : '';
+          stderrTail.append(
+            `${prefix}[dealer] codex app-server does not support thread/name/set (-32601); continuing without thread name\n`,
+          );
+        } else {
+          throw error;
+        }
+      }
+    }
+
     // Crossing the external-effect boundary: transition phase inside sendRequest right before
     // child.stdin.write executes (after all pre-write guards pass), so closed-stdin or pre-write
     // abort still throws CommandNotStartedError instead of falsely fencing deliveryInDoubt.
     await sendRequest(
-      3,
+      nextRequestId++,
       'turn/start',
       {
         threadId,
