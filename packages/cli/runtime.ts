@@ -1668,15 +1668,18 @@ export class DealerNodeRuntime {
             this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
             (this.wakeups?.activeCount() ?? 0) === 0 &&
             this.activeMutatingControlRequests <= this.shutdownControlSlots,
+          () => {
+            // Node.js runs this turn to completion before a new request or timer can be admitted,
+            // so the control and wakeup scheduling fences open atomically at the commit point,
+            // never during a drain that may defer.
+            this.draining = true;
+            this.wakeups?.quiesce();
+            this.fireStoppingListeners();
+          },
         );
         this.drainDecision = decision.then(
           drained => {
-            if (drained) {
-              // Node.js runs this turn to completion before a new request can be admitted, so
-              // the fence opens exactly at the commit point, never during a drain that may defer.
-              this.draining = true;
-              this.fireStoppingListeners();
-            } else {
+            if (!drained) {
               // A deferred drain leaves no decision behind: a later shutdown may try again.
               this.drainDecision = undefined;
             }
@@ -1695,7 +1698,11 @@ export class DealerNodeRuntime {
     }
   }
 
-  private async waitForDrain(timeoutMs: number, drained: () => boolean): Promise<boolean> {
+  private async waitForDrain(
+    timeoutMs: number,
+    drained: () => boolean,
+    onCommit: () => void,
+  ): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (!drained()) {
       const remaining = deadline - Date.now();
@@ -1704,7 +1711,11 @@ export class DealerNodeRuntime {
       }
       await this.waitForDrainWake(remaining);
     }
-    return drained();
+    if (!drained()) {
+      return false;
+    }
+    onCommit();
+    return true;
   }
 
   private wakeDrainWaiters(): void {
@@ -1897,6 +1908,9 @@ export class DealerNodeRuntime {
   }
 
   private async finishStop(): Promise<void> {
+    // Fence new background wake launches before awaiting outbox teardown so a direct stop()
+    // cannot start a fresh wake turn while outboxRedrive.stop() is draining.
+    this.wakeups?.quiesce();
     // A direct stop() skips drainForStop(), so this is the only place its listeners can learn
     // that the services they call are about to disappear.
     this.fireStoppingListeners();

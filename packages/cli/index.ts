@@ -1812,7 +1812,6 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (
       owned &&
       (['send', 'broadcast', 'ask', 'reply', 'settle'].includes(group ?? '') ||
-        (group === 'gate' && (action === 'approve' || action === 'mode')) ||
         (group === 'outbox' && (action === 'flush' || action === 'requeue')))
     ) {
       queuedForRedrive = true;
@@ -1829,6 +1828,9 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       let pendingOutbox = false;
       let pendingWakeups = false;
       try {
+        // Fence new background wake launches before awaiting already-started turns so timers or
+        // readiness events cannot launch another turn between observing idle and owned.stop().
+        owned.wakeups?.quiesce();
         // Let any background wake delivery already started by this ephemeral CLI runtime finish
         // cleanly before teardown so routine CLI exit never aborts an accepted turn into deliveryInDoubt.
         if (!options.signal?.aborted && owned.wakeups) {
@@ -1862,9 +1864,12 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         pendingOutbox = Boolean(
           queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0,
         );
+        // Determine mailbox continuation from authoritative pending obligations on every owned
+        // runtime exit (including gate drain and partial-commit error paths), not a command list.
         pendingWakeups = Boolean(
-          queuedForRedrive &&
-            (owned.mailbox?.listPendingWakeTargets(Number.MAX_SAFE_INTEGER).length ?? 0) > 0,
+          owned.mailbox
+            ?.listPendingWakeTargets(Number.MAX_SAFE_INTEGER)
+            .some(target => target.driver !== 'passive'),
         );
       } catch (error) {
         stderr(JSON.stringify({

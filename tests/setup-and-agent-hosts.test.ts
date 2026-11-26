@@ -4283,5 +4283,180 @@ test('runtime idle/drain waits for active background Codex turns and offline CLI
     } finally {
       await stopDaemonIfRunning(coalescedStateDir, { force: true }).catch(() => {});
     }
+
+    // 4. drainForStop() quiesces wake scheduling at commit so a coalesced mailbox maturing during
+    //    teardown cannot launch a new Codex turn that wakeups.stop() would abort into deliveryInDoubt.
+    {
+      const fakeCodex = createFakeCodexAppServer({ nextThreadId: () => 'should-not-launch' });
+      const runtime = await new DealerNodeRuntime({
+        stateDir: join(root, 'quiesce-drain-state'),
+        member: 'solo',
+        transport: { discoveryDir: join(root, 'quiesce-drain-discovery') },
+        patch: {
+          wave: { flushIntervalMs: 20 },
+          topicBindings: { review: { executor: 'codex', mode: 'wave', workspacePath: root, coalesceMs: 60 } },
+        },
+        stdioSpawner: fakeCodex.spawner,
+      }).start();
+      t.after(() => runtime.stop());
+
+      await runtime.emitter.emit({
+        networkId: 'local',
+        kind: 'review',
+        routing: { mode: 'unicast', targets: ['member:solo'] },
+        subject: 'Coalesced before drain',
+        body: 'Must stay queued across graceful drain',
+        payload: {},
+      });
+      assert.equal(runtime.wakeups.activeCount(), 0);
+      assert.equal(await runtime.drainForStop({ drainTimeoutMs: 500 }), true);
+
+      // Simulate slow teardown (e.g. outboxRedrive.stop()) lasting past coalesceMs and flush ticks.
+      await new Promise(resolve => setTimeout(resolve, 140));
+      runtime.wakeups.notifyMailbox('stream:review');
+      await runtime.wakeups.flushReady();
+      assert.equal(fakeCodex.sessions.length, 0, 'quiesced drain commit must not launch newly matured turns');
+      assert.equal(runtime.wakeups.activeCount(), 0);
+
+      await runtime.stop();
+      const postStopStore = new MailboxStore(join(root, 'quiesce-drain-state', 'mailbox.json'), { readonly: true });
+      try {
+        const targetAfterStop = postStopStore.getWakeTarget('stream:review');
+        assert.equal(targetAfterStop?.pendingWake, true);
+        assert.equal(targetAfterStop?.deliveryInDoubt, undefined);
+      } finally {
+        postStopStore.close();
+      }
+    }
+
+    // 5. WakeupRedriveService.quiesce() lets already-in-flight turns finish during waitUntilIdle()
+    //    while preventing newly matured mailboxes from launching during settlement.
+    {
+      const turnStarted = Promise.withResolvers<void>();
+      const releaseTurn = Promise.withResolvers<void>();
+      const fakeCodex = createFakeCodexAppServer({
+        nextThreadId: () => 'in-flight-quiesce-thread',
+        onTurnStart: async () => {
+          turnStarted.resolve();
+          await releaseTurn.promise;
+        },
+      });
+      const store = new MailboxStore(join(root, 'quiesce-settle.json'));
+      t.after(() => store.close());
+      const wakeup = new WakeupRedriveService({
+        store,
+        flushIntervalMs: 20,
+        drivers: createTestWakeupDrivers({ stdioSpawner: fakeCodex.spawner }),
+      });
+      t.after(() => wakeup.stop());
+
+      store.enqueue([message('in-flight-msg')], {
+        mailboxId: 'stream:active',
+        wakeTarget: {
+          driver: 'agent-host',
+          coalesceMs: 0,
+          driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+        },
+      });
+      await turnStarted.promise;
+
+      store.enqueue([message('coalesced-msg')], {
+        mailboxId: 'stream:later',
+        wakeTarget: {
+          driver: 'agent-host',
+          coalesceMs: 40,
+          driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+        },
+      });
+
+      wakeup.quiesce();
+      await new Promise(resolve => setTimeout(resolve, 90));
+      assert.equal(fakeCodex.sessions.length, 1, 'quiesced service must not start newly matured mailbox');
+
+      releaseTurn.resolve();
+      await wakeup.waitUntilIdle();
+      assert.equal(fakeCodex.sessions.length, 1);
+      assert.equal(store.getWakeTarget('stream:active')?.pendingWake, false);
+      assert.equal(store.getWakeTarget('stream:active')?.deliveryInDoubt, undefined);
+      assert.equal(store.getWakeTarget('stream:active')?.driverConfig?.sessionId, 'in-flight-quiesce-thread');
+      assert.equal(store.getWakeTarget('stream:later')?.pendingWake, true);
+      assert.equal(store.getWakeTarget('stream:later')?.deliveryInDoubt, undefined);
+    }
+
+    // 6. Offline gate drain AND partial-commit error exits preserve pending mailbox continuation
+    //    by handing authoritative pending wake obligations off to the background daemon.
+    for (const mode of ['clean-gate-drain', 'partial-commit-error'] as const) {
+      const gateStateDir = join(root, `cli-${mode}`);
+      mkdirSync(gateStateDir, { recursive: true });
+      const baseConfig = {
+        profile: 'codex-dev',
+        member: 'solo',
+        name: 'local',
+        gateMode: 'dnd',
+        wave: { flushIntervalMs: 100 },
+        topicBindings: { review: { executor: 'codex', mode: 'wave', workspacePath: root, coalesceMs: 250 } },
+        executorConfig: { codex: { command: fakeBin } },
+      };
+      writeFileSync(join(gateStateDir, 'config.json'), JSON.stringify(baseConfig));
+
+      // Seed genuine signed DND entries via an in-process runtime in DND mode.
+      const seedRuntime = await new DealerNodeRuntime({
+        stateDir: gateStateDir,
+        transport: { discoveryDir: join(root, `cli-${mode}-discovery`) },
+      }).start();
+      await seedRuntime.emitter.emit({
+        networkId: 'local',
+        kind: 'review',
+        routing: { mode: 'unicast', targets: ['member:solo'] },
+        subject: `DND ${mode}`,
+        body: 'Queued under DND then drained offline',
+        payload: {},
+      });
+      if (mode === 'partial-commit-error') {
+        // Seed a second valid signed DND entry whose dispatch fails on unsupported Codex
+        // agentProfile after the first entry has already committed coalesced mailbox work.
+        await seedRuntime.emitter.emit({
+          networkId: 'local',
+          kind: 'review',
+          routing: { mode: 'unicast', targets: ['member:solo'] },
+          subject: 'DND failing item',
+          body: 'Triggers AggregateError after partial commit',
+          payload: { agentProfile: 'unsupported-profile' },
+        });
+      }
+      assert.equal(seedRuntime.gate.listDndQueue().length, mode === 'partial-commit-error' ? 2 : 1);
+      await seedRuntime.stop();
+
+      // Switch persisted gateMode to open so offline `gate drain` releases DND custody into the mailbox.
+      writeFileSync(join(gateStateDir, 'config.json'), JSON.stringify({ ...baseConfig, gateMode: 'open' }));
+
+      try {
+        const gStdout: string[] = [];
+        const gStderr: string[] = [];
+        const gCode = await runDealerCli(['gate', 'drain', '--json'], {
+          stateDir: gateStateDir,
+          stdout: line => gStdout.push(line),
+          stderr: line => gStderr.push(line),
+        });
+        assert.equal(
+          gCode,
+          mode === 'clean-gate-drain' ? 0 : 1,
+          `unexpected exit code for ${mode}: ${gStderr.join('\n')}`,
+        );
+        await eventually(() => {
+          const drainedStore = new MailboxStore(join(gateStateDir, 'mailbox.json'), { readonly: true });
+          try {
+            const drainedTarget = drainedStore.getWakeTarget('stream:review');
+            assert.equal(drainedTarget?.deliveryInDoubt, undefined);
+            assert.equal(drainedTarget?.pendingWake, false);
+            assert.equal(drainedTarget?.driverConfig?.sessionId, 'cli-codex-thread-1');
+          } finally {
+            drainedStore.close();
+          }
+        }, 10_000);
+      } finally {
+        await stopDaemonIfRunning(gateStateDir, { force: true }).catch(() => {});
+      }
+    }
   }
 });
