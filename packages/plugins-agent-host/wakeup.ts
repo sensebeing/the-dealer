@@ -146,7 +146,9 @@ export function resolveAgentHostSessionLink(
   const sessionId = config.sessionId?.trim();
   const rotationDue = isAgentHostRotationDue(target, {
     now: options.now,
-    hasOutstandingLease: options.hasOutstandingLease ?? false,
+    // While a wave launch is fenced under deliveryInDoubt, the agent acquiring its lease mid-turn
+    // must not mask a pending rotation and leak the retiring sessionId before completeWakeDelivery.
+    hasOutstandingLease: target.deliveryInDoubt ? false : (options.hasOutstandingLease ?? false),
   });
   if (!sessionId || rotationDue) {
     return { state: 'pending' };

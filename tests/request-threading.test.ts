@@ -1090,9 +1090,17 @@ test('Lark session links: inline ready, pending onWakeTarget follow-up, rotation
     assert.equal(calls.length, 3);
     assert.ok(!argument(calls[2], '--markdown').includes('thread-1'), 'retiring session link must be suppressed');
 
-    // Wake rotates to thread-2 and commits -> MUST reply ONLY to thread-b (rot-msg-3), NOT thread-a (rot-msg-1)!
+    // Wake rotates to thread-2: fence deliveryInDoubt first and acquire the lease mid-turn
+    // (simulating the rotating Codex agent calling `dealer inbox check` before completeWakeDelivery).
+    // Lark draining on that onWakeTarget event MUST stay pending and NEVER leak retiring thread-1!
     const rev2 = store.getWakeTarget('stream:rot')!.bindingRevision;
     store.tryBeginWakeDelivery('stream:rot', rev2, { requireNoOutstandingLease: true });
+    const lease2 = store.check({ mailboxId: 'stream:rot' });
+    assert.ok(lease2.deliveryId, 'mid-turn lease is acquired before completeWakeDelivery');
+    await notifier.flush();
+    assert.equal(calls.length, 3, 'mid-rotation lease acquisition must not leak retiring thread-1');
+
+    // Now completeWakeDelivery commits thread-2 -> MUST reply ONLY to thread-b (rot-msg-3), NOT thread-a (rot-msg-1)!
     store.completeWakeDelivery('stream:rot', 1, {
       driver: 'agent-host',
       completedWaves: 0,

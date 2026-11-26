@@ -5073,4 +5073,36 @@ test('resolveAgentHostSessionLink and isAgentHostRotationDue enforce host, pendi
     label: 'ChatGPT App',
     url: 'codex://threads/age-1',
   });
+
+  // Mid-rotation race: when a rotating wave is in-flight (deliveryInDoubt: true) and the agent
+  // acquires its delivery lease mid-turn (hasOutstandingLease: true) before completeWakeDelivery
+  // commits S2, resolveAgentHostSessionLink MUST stay pending instead of leaking retiring S1;
+  // a non-rotating wave under deliveryInDoubt: true + hasOutstandingLease: true stays ready.
+  assert.deepEqual(
+    resolveAgentHostSessionLink({ ...waveRotating, deliveryInDoubt: true }, { hasOutstandingLease: true }),
+    { state: 'pending' },
+  );
+  assert.deepEqual(
+    resolveAgentHostSessionLink({ ...ageRotating, deliveryInDoubt: true }, { now: 70_000, hasOutstandingLease: true }),
+    { state: 'pending' },
+  );
+  assert.deepEqual(
+    resolveAgentHostSessionLink(
+      baseTarget({ rotateAfterWaves: 2, completedWaves: 1, deliveryInDoubt: true }),
+      { hasOutstandingLease: true },
+    ),
+    { state: 'ready', label: 'ChatGPT App', url: 'codex://threads/thread-abc%2F1' },
+  );
+  assert.deepEqual(
+    resolveAgentHostSessionLink(
+      baseTarget({
+        rotateAfterWaves: 2,
+        completedWaves: 0,
+        deliveryInDoubt: undefined,
+        driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'thread-s2', sessionStartedAt: 70_000 },
+      }),
+      { now: 70_000, hasOutstandingLease: true },
+    ),
+    { state: 'ready', label: 'ChatGPT App', url: 'codex://threads/thread-s2' },
+  );
 });
