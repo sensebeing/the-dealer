@@ -178,14 +178,15 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
           "packages/kernel",
           "packages/fs-atomic"
         ],
-        "role": "Local identity and network-scoped peer directory",
+        "role": "Local identity, network-scoped peer directory, reachability-filtered gossip, and replay-safe peer pruning",
         "layer": "core"
       },
       {
@@ -194,13 +195,14 @@
           "TypeScript"
         ],
         "boundary_docs": [
-          "AGENTS.md"
+          "AGENTS.md",
+          "docs/architecture.md"
         ],
         "dependencies": [
           "packages/core-types",
           "packages/kernel"
         ],
-        "role": "Outbound selector and capability routing",
+        "role": "Outbound selector, capability eligibility, and reachability-preferred routing",
         "layer": "core"
       },
       {

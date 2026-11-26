@@ -2587,3 +2587,87 @@ test('dealer peers prune works through runDealerCli including live daemon RPC', 
   }), 0);
   assert.deepEqual(JSON.parse(directOut.join('')), { removedCount: 1, removedNodeIds: [liveRelay.nodeId] });
 });
+
+test('mixed-capability routing prefers reachable eligible peers without breaking offline skill outbox queuing', async t => {
+  const root = directory(t);
+  const runtime = new DealerNodeRuntime({
+    stateDir: join(root, 'state'),
+    member: 'ben',
+    name: 'local',
+    transport: { discoveryDir: join(root, 'discovery'), multicast: false },
+  });
+  await runtime.start();
+  t.after(() => runtime.stop());
+  await runtime.mountNetwork({ networkId: 'team', passphrase: 'secret' });
+
+  const makeSkillCard = (member: string, nodeName: string, skillId: string) => {
+    const keys = generateNodeKeyPair();
+    return signNodeCard({
+      nodeId: keys.nodeId,
+      networkId: 'team',
+      revision: 1,
+      identity: { member, nodeName },
+      admissionMode: 'open',
+      capabilities: { summary: skillId, skills: [{ id: skillId, description: skillId }] },
+      runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+      updatedAt: '2026-01-02T00:00:00.000Z',
+    }, keys.privateKeyPem);
+  };
+  const offlineRelease = makeSkillCard('alice', 'release-box', 'release');
+  const liveTriage = makeSkillCard('bob', 'live-triage', 'triage');
+  const staleTriage = makeSkillCard('ghost', 'stale-triage', 'triage');
+  for (const peerCard of [offlineRelease, liveTriage, staleTriage]) {
+    runtime.kernel.ctx.emit('transport/inbound', {
+      networkId: 'team',
+      senderNodeId: peerCard.nodeId,
+      mode: 'unicast',
+      payload: { type: 'peer.card', card: peerCard },
+    });
+  }
+
+  const reachable = new Set<string>([liveTriage.nodeId]);
+  t.mock.method(runtime.transport, 'isPeerReachable', (networkId: string, nodeId: string) =>
+    networkId === 'team' && reachable.has(nodeId),
+  );
+
+  // 1. Offline specialist for skill:release must still route and durably queue in outbox even when unrelated liveTriage is online.
+  const emitted = await runtime.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'auto', targets: ['skill:release'] },
+    kind: 'collab.request.v1',
+    subject: 'Ship release',
+    body: 'Queue for offline release specialist',
+    payload: {},
+  });
+  assert.equal(emitted.receipts.length, 1);
+  assert.equal(emitted.receipts[0].stage, 'queued');
+  assert.equal(emitted.receipts[0].executionReceipt?.executor, 'outbox');
+  const queued = runtime.listOutbox({ networkId: 'team', status: 'queued' });
+  assert.equal(queued.length, 1);
+  assert.deepEqual(queued[0].pendingNodeIds, [offlineRelease.nodeId]);
+
+  // 2. When multiple peers match skill:triage, reachable liveTriage is chosen over staleTriage without multicast fan-out.
+  const triageEnvelope = signEnvelope({
+    id: 'msg-triage-1',
+    traceId: 'trace-triage-1',
+    networkId: 'team',
+    from: { nodeId: runtime.transport.localNodeId, member: 'ben', nodeName: 'local' },
+    routing: { mode: 'auto', targets: ['skill:triage'] },
+    kind: 'collab.request.v1',
+    priority: 'normal',
+    subject: 'Triage',
+    body: 'Prefer live triage peer',
+    payload: {},
+    attachments: [],
+    createdAt: new Date().toISOString(),
+  }, runtime.node.privateKeyPem);
+  const liveDecision = await runtime.kernel.ctx.services.router.route(triageEnvelope);
+  assert.equal(liveDecision.mode, 'unicast');
+  assert.deepEqual(liveDecision.targetNodeIds, [liveTriage.nodeId]);
+
+  // 3. When all matching triage peers are offline, fallback preserves all eligible offline matches.
+  reachable.clear();
+  const offlineDecision = await runtime.kernel.ctx.services.router.route(triageEnvelope);
+  assert.equal(offlineDecision.mode, 'multicast');
+  assert.deepEqual(new Set(offlineDecision.targetNodeIds), new Set([liveTriage.nodeId, staleTriage.nodeId]));
+});

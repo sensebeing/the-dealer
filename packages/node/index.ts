@@ -34,6 +34,15 @@ const PEER_DIRECTORY_SCHEMA = 'the-dealer-peer-directory/v1';
 const MAX_GOSSIPED_PEER_CARDS = 128;
 
 type PeerCandidates = { newest: NodeCard; reachable?: NodeCard };
+type PeerRecord =
+  | { readonly state: 'active'; readonly card: NodeCard }
+  | { readonly state: 'pruned'; readonly revision: number; readonly signature: string };
+type PrunedPeerWitness = {
+  readonly networkId: string;
+  readonly nodeId: string;
+  readonly revision: number;
+  readonly signature: string;
+};
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype;
@@ -65,7 +74,7 @@ export class PeerDirectoryService implements NodeService {
   private config: NodePluginConfig;
   private keyPair: ReturnType<typeof generateNodeKeyPair>;
   private self = new Map<string, NodeCard>();
-  private peers = new Map<string, Map<string, NodeCard>>();
+  private peers = new Map<string, Map<string, PeerRecord>>();
   private revisions = new Map<string, number>();
   private modes = new Map<string, AdmissionMode>();
   private timer: ReturnType<typeof setInterval>;
@@ -131,7 +140,7 @@ export class PeerDirectoryService implements NodeService {
     ) {
       throw new Error('Invalid peer directory store');
     }
-    const { cards, selfRevisions } = parsed;
+    const { cards, selfRevisions, prunedPeers } = parsed;
     if (selfRevisions !== undefined) {
       if (!isPlainObject(selfRevisions)) {
         throw new Error('Invalid peer directory store');
@@ -148,40 +157,110 @@ export class PeerDirectoryService implements NodeService {
         this.revisions.set(networkId, revision);
       }
     }
+    let prunedInputCount = 0;
+    if (prunedPeers !== undefined) {
+      if (!Array.isArray(prunedPeers)) {
+        throw new Error('Invalid peer directory store');
+      }
+      prunedInputCount = prunedPeers.length;
+      for (const entry of prunedPeers) {
+        if (
+          !isPlainObject(entry) ||
+          typeof entry.networkId !== 'string' ||
+          !entry.networkId ||
+          typeof entry.nodeId !== 'string' ||
+          !entry.nodeId ||
+          typeof entry.revision !== 'number' ||
+          !Number.isSafeInteger(entry.revision) ||
+          entry.revision < 1 ||
+          typeof entry.signature !== 'string' ||
+          !entry.signature
+        ) {
+          throw new Error('Invalid peer directory store');
+        }
+        if (entry.nodeId === this.keyPair.nodeId) {
+          continue;
+        }
+        const directory = this.peers.get(entry.networkId) ?? new Map<string, PeerRecord>();
+        const existing = directory.get(entry.nodeId);
+        const existingRev = existing
+          ? existing.state === 'active'
+            ? existing.card.revision
+            : existing.revision
+          : 0;
+        if (!existing || entry.revision > existingRev) {
+          directory.set(entry.nodeId, {
+            state: 'pruned',
+            revision: entry.revision,
+            signature: entry.signature,
+          });
+          this.peers.set(entry.networkId, directory);
+        }
+      }
+    }
     for (const card of cards) {
       // Persisted cards carry durable identity, not live reachability: the peer may be
       // offline, and its last endpoint is owned by transport discovery, not this store.
       this.acceptCard(card, undefined, false, false);
     }
-    const retained = [...this.peers.values()].reduce((total, directory) => total + directory.size, 0);
-    if (retained < cards.length) {
+    let retainedActive = 0;
+    let retainedPruned = 0;
+    for (const directory of this.peers.values()) {
+      for (const record of directory.values()) {
+        if (record.state === 'active') retainedActive += 1;
+        else retainedPruned += 1;
+      }
+    }
+    if (retainedActive < cards.length || retainedPruned < prunedInputCount) {
       this.persistPeers();
     }
   }
 
-  /** Persist each remote key's latest verified card and the last self revision per network. */
+  /** Persist each remote key's latest verified card, pruned replay witnesses, and last self revisions. */
   private persistPeers(): void {
     if (!this.peersPath) {
       return;
     }
-    const cards = [...this.peers.values()]
-      .flatMap(directory => [...directory.values()])
-      .filter(card => card.nodeId !== this.keyPair.nodeId)
-      .sort((a, b) => a.networkId.localeCompare(b.networkId) || a.nodeId.localeCompare(b.nodeId));
+    const cards: NodeCard[] = [];
+    const prunedPeers: PrunedPeerWitness[] = [];
+    for (const [networkId, directory] of this.peers) {
+      for (const [nodeId, record] of directory) {
+        if (nodeId === this.keyPair.nodeId) {
+          continue;
+        }
+        if (record.state === 'active') {
+          cards.push(record.card);
+        } else {
+          prunedPeers.push({
+            networkId,
+            nodeId,
+            revision: record.revision,
+            signature: record.signature,
+          });
+        }
+      }
+    }
+    cards.sort((a, b) => a.networkId.localeCompare(b.networkId) || a.nodeId.localeCompare(b.nodeId));
+    prunedPeers.sort((a, b) => a.networkId.localeCompare(b.networkId) || a.nodeId.localeCompare(b.nodeId));
     writeFileAtomically(
       this.peersPath,
       JSON.stringify({
         schema: PEER_DIRECTORY_SCHEMA,
         selfRevisions: Object.fromEntries(this.revisions),
         cards,
+        ...(prunedPeers.length > 0 ? { prunedPeers } : {}),
       }),
     );
   }
 
   /** Project one active card per identity without changing the durable directory. */
-  private activeNetworkCards(networkId: string, directory: Map<string, NodeCard>): NodeCard[] {
+  private activeNetworkCards(networkId: string, directory: Map<string, PeerRecord>): NodeCard[] {
     const groups = new Map<string, PeerCandidates>();
-    for (const card of directory.values()) {
+    for (const record of directory.values()) {
+      if (record.state !== 'active') {
+        continue;
+      }
+      const { card } = record;
       if (this.claimsLocalIdentity(card)) {
         continue;
       }
@@ -252,14 +331,29 @@ export class PeerDirectoryService implements NodeService {
     if (!['open', 'approval_required', 'dnd', 'closed'].includes(card.admissionMode)) {
       return false;
     }
-    const directory = this.peers.get(card.networkId) ?? new Map<string, NodeCard>();
+    const directory = this.peers.get(card.networkId) ?? new Map<string, PeerRecord>();
     const existing = directory.get(card.nodeId);
-    const unchanged = existing?.revision === card.revision;
-    if (existing && (existing.revision > card.revision || (unchanged && existing.signature !== card.signature))) {
+    const floorRevision = existing
+      ? existing.state === 'active'
+        ? existing.card.revision
+        : existing.revision
+      : undefined;
+    const floorSignature = existing
+      ? existing.state === 'active'
+        ? existing.card.signature
+        : existing.signature
+      : undefined;
+    const unchanged = existing?.state === 'active' && existing.card.revision === card.revision;
+    if (
+      floorRevision !== undefined &&
+      (floorRevision > card.revision ||
+        (floorRevision === card.revision &&
+          (existing!.state === 'pruned' || floorSignature !== card.signature)))
+    ) {
       return false;
     }
     if (!unchanged) {
-      directory.set(card.nodeId, structuredClone(card));
+      directory.set(card.nodeId, { state: 'active', card: structuredClone(card) });
       this.peers.set(card.networkId, directory);
     }
     if (this.claimsLocalIdentity(card)) {
@@ -454,9 +548,13 @@ export class PeerDirectoryService implements NodeService {
     await this.publish();
   }
 
-  private mountedPeerDirectories(networkId?: string): [string, Map<string, NodeCard>][] {
+  private mountedPeerDirectories(networkId?: string): [string, Map<string, PeerRecord>][] {
     const mounted = this.transport.listMountedNetworks();
     return [...this.peers].filter(([id]) => mounted.includes(id) && (!networkId || id === networkId));
+  }
+
+  isPeerReachable(networkId: string, nodeId: string): boolean {
+    return this.transport.isPeerReachable?.(networkId, nodeId) === true;
   }
 
   listPeers(
@@ -467,7 +565,7 @@ export class PeerDirectoryService implements NodeService {
       onlyAvailable?: boolean;
     } = {},
   ): readonly NodeCard[] {
-    const matched = this.mountedPeerDirectories(filter.networkId)
+    return this.mountedPeerDirectories(filter.networkId)
       .flatMap(([networkId, directory]) => this.activeNetworkCards(networkId, directory))
       .filter(
         card =>
@@ -478,16 +576,8 @@ export class PeerDirectoryService implements NodeService {
             )) &&
           (!filter.onlyAvailable ||
             (card.runtimeState.load === 'idle' && card.admissionMode === 'open')),
-      );
-    if (filter.onlyAvailable && typeof this.transport.isPeerReachable === 'function') {
-      const reachable = matched.filter(
-        card => this.transport.isPeerReachable!(card.networkId, card.nodeId) === true,
-      );
-      if (reachable.length > 0) {
-        return reachable.map(card => structuredClone(card));
-      }
-    }
-    return matched.map(card => structuredClone(card));
+      )
+      .map(card => structuredClone(card));
   }
 
   prunePeers(
@@ -510,8 +600,8 @@ export class PeerDirectoryService implements NodeService {
       if (!directory) {
         continue;
       }
-      for (const nodeId of [...directory.keys()]) {
-        if (nodeId === this.keyPair.nodeId) {
+      for (const [nodeId, record] of [...directory.entries()]) {
+        if (nodeId === this.keyPair.nodeId || record.state !== 'active') {
           continue;
         }
         if (targetNodeId && nodeId !== targetNodeId) {
@@ -520,12 +610,15 @@ export class PeerDirectoryService implements NodeService {
         if (unreachableOnly && this.transport.isPeerReachable?.(networkId, nodeId) === true) {
           continue;
         }
-        directory.delete(nodeId);
+        // Preserve the revision/signature witness in the authoritative record so pruning
+        // removes the routable projection without weakening rollback or equivocation checks.
+        directory.set(nodeId, {
+          state: 'pruned',
+          revision: record.card.revision,
+          signature: record.card.signature,
+        });
         removedCount += 1;
         removedNodeIds.add(nodeId);
-      }
-      if (directory.size === 0) {
-        this.peers.delete(networkId);
       }
     }
     if (removedCount > 0) {
@@ -564,7 +657,10 @@ export class PeerDirectoryService implements NodeService {
     }
     if (selector.startsWith('ed25519:')) {
       return this.mountedPeerDirectories(networkId)
-        .map(([, directory]) => directory.get(selector))
+        .map(([, directory]) => {
+          const record = directory.get(selector);
+          return record?.state === 'active' ? record.card : undefined;
+        })
         .filter((card): card is NodeCard => card !== undefined && !this.claimsLocalIdentity(card))
         .map(card => structuredClone(card));
     }

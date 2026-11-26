@@ -106,10 +106,25 @@ export function createRouterPlugin(): Plugin {
                   ) || s.acceptedTypes?.includes(envelope.kind),
               ),
             );
+          const preferReachable = (pool: readonly NodeCard[]): readonly NodeCard[] => {
+            if (pool.length <= 1 || typeof node.isPeerReachable !== 'function') {
+              return pool;
+            }
+            const reachable = pool.filter(
+              c =>
+                (selfCard !== undefined && c.nodeId === selfCard.nodeId) ||
+                node.isPeerReachable!(c.networkId, c.nodeId) === true,
+            );
+            return reachable.length > 0 ? reachable : pool;
+          };
           // Remote capability matches take precedence; the local self card is the
           // zero-config fallback when no other same-network peer can serve the task.
+          // Reachability preference runs only after capability eligibility so an unrelated
+          // online peer never hides an offline specialist that should queue in the outbox.
           const remoteMatches = capabilityMatches(remoteCandidates);
-          const matches = remoteMatches.length ? remoteMatches : capabilityMatches(candidates);
+          const matches = remoteMatches.length
+            ? preferReachable(remoteMatches)
+            : capabilityMatches(candidates);
           if (matches.length) {
             const idle = matches.filter(c => c.runtimeState.load === 'idle');
             return decision(idle.length ? idle : matches, 'capability');
