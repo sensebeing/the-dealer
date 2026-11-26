@@ -207,6 +207,9 @@ export class DealerNodeRuntime {
   private shutdownControlSlots = 0;
   /** One teardown owner: concurrent stop callers await the same stop. */
   private stopPromise?: Promise<void>;
+  /** Authoritative post-producer pending wake check captured during finishStop() before closing the ledger. */
+  private pendingWakeupsOnStop = false;
+  private pendingWakeupsCheckError?: unknown;
   /** One-shot hooks run before any service the daemon serves is torn down. */
   private readonly stoppingListeners = new Set<() => void>();
   private daemonInstanceId?: string;
@@ -232,6 +235,17 @@ export class DealerNodeRuntime {
 
   isStoppingOrDraining(): boolean {
     return this.draining || this.stopPromise !== undefined;
+  }
+
+  /**
+   * Authoritative post-producer pending wake obligation state captured during `stop()` after
+   * transport, sources, dispatcher, and redrive have stopped and before closing `mailbox`.
+   */
+  hasPendingWakeupsAfterStop(): boolean {
+    if (this.pendingWakeupsCheckError !== undefined) {
+      throw this.pendingWakeupsCheckError;
+    }
+    return this.pendingWakeupsOnStop;
   }
 
   /**
@@ -457,6 +471,8 @@ export class DealerNodeRuntime {
     this.drainDecision = undefined;
     this.stopPromise = undefined;
     this.shutdownControlSlots = 0;
+    this.pendingWakeupsOnStop = false;
+    this.pendingWakeupsCheckError = undefined;
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     chmodSync(this.stateDir, 0o700);
     const lockDir = join(this.stateDir, 'runtime.lock');
@@ -1940,7 +1956,22 @@ export class DealerNodeRuntime {
           }
         } finally {
           try {
-            this.mailbox?.close();
+            // Capture the authoritative continuation snapshot only after outbox redrive, wakeups,
+            // and the kernel (transport, sources, dispatcher, gate) have all stopped, before
+            // closing the mailbox ledger and releasing runtime.lock.
+            try {
+              this.pendingWakeupsCheckError = undefined;
+              this.pendingWakeupsOnStop = Boolean(
+                this.mailbox
+                  ?.listPendingWakeTargets(Number.MAX_SAFE_INTEGER)
+                  .some(target => target.driver !== 'passive'),
+              );
+            } catch (error) {
+              this.pendingWakeupsOnStop = false;
+              this.pendingWakeupsCheckError = error;
+            } finally {
+              this.mailbox?.close();
+            }
           } finally {
             if (this.ownsLock) {
               this.releaseLock(join(this.stateDir, 'runtime.lock'));

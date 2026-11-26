@@ -1860,27 +1860,32 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           }`,
         }));
       }
+      // Teardown must still run when wake settlement fails; wait until all producers (redrive,
+      // transport, sources, dispatcher) have stopped before reading final continuation state.
+      await owned.stop();
       try {
-        pendingOutbox = Boolean(
-          queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0,
-        );
-        // Determine mailbox continuation from authoritative pending obligations on every owned
-        // runtime exit (including gate drain and partial-commit error paths), not a command list.
-        pendingWakeups = Boolean(
-          owned.mailbox
-            ?.listPendingWakeTargets(Number.MAX_SAFE_INTEGER)
-            .some(target => target.driver !== 'passive'),
-        );
+        // Determine mailbox continuation from the authoritative post-producer snapshot captured
+        // at teardown on every owned runtime exit (including gate drain, non-send commands that
+        // accepted inbound mail during teardown, and partial-commit error paths).
+        pendingWakeups = owned.hasPendingWakeupsAfterStop();
       } catch (error) {
         stderr(JSON.stringify({
-          warning: `Unable to inspect queued obligations before shutdown: ${
+          warning: `Unable to inspect queued mailbox obligations after shutdown: ${
             error instanceof Error ? error.message : String(error)
           }`,
         }));
       }
-      // Teardown must still run when obligation reads fail; otherwise one corrupt read
-      // would leave the ephemeral runtime and its transport sockets alive.
-      await owned.stop();
+      try {
+        pendingOutbox = Boolean(
+          queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0,
+        );
+      } catch (error) {
+        stderr(JSON.stringify({
+          warning: `Unable to inspect queued outbox obligations after shutdown: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        }));
+      }
       if (pendingOutbox || pendingWakeups) {
         // The command durability contract outlives this process: start the supervisor so
         // outstanding outbox or mailbox obligations keep redriving after the CLI exits.

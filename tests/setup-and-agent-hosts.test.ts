@@ -4458,5 +4458,137 @@ test('runtime idle/drain waits for active background Codex turns and offline CLI
         await stopDaemonIfRunning(gateStateDir, { force: true }).catch(() => {});
       }
     }
+
+    // 7. Mail committed during runtime teardown (while awaiting outboxRedrive.stop() or kernel
+    //    producer shutdown) is captured by the post-producer continuation snapshot and handed off
+    //    to the background daemon even for non-sending CLI commands with an initially empty mailbox.
+    {
+      // 7a. In-process runtime: signed inbound message arriving during outboxRedrive.stop().
+      const fakeCodex = createFakeCodexAppServer({ nextThreadId: () => 'should-not-launch-during-stop' });
+      const runtime = await new DealerNodeRuntime({
+        stateDir: join(root, 'teardown-race-runtime'),
+        member: 'solo',
+        transport: { discoveryDir: join(root, 'teardown-race-discovery') },
+        patch: {
+          topicBindings: { review: { executor: 'codex', mode: 'wave', workspacePath: root, coalesceMs: 0 } },
+        },
+        stdioSpawner: fakeCodex.spawner,
+      }).start();
+      assert.equal(runtime.mailbox.listPendingWakeTargets(Number.MAX_SAFE_INTEGER).length, 0);
+
+      const sender = generateNodeKeyPair();
+      const lateEnvelope = signEnvelope(
+        {
+          id: 'late-teardown-inbound',
+          networkId: 'local',
+          traceId: 'late-teardown-inbound',
+          from: { nodeId: sender.nodeId, member: 'peer', nodeName: 'remote' },
+          routing: { mode: 'unicast', targets: ['member:solo'] },
+          kind: 'review',
+          priority: 'normal',
+          subject: 'Arrived during outbox stop',
+          body: 'Must survive teardown for daemon handoff',
+          payload: {},
+          attachments: [],
+          createdAt: new Date().toISOString(),
+        },
+        sender.privateKeyPem,
+      );
+      const origOutboxStop = runtime.outboxRedrive.stop.bind(runtime.outboxRedrive);
+      runtime.outboxRedrive.stop = async () => {
+        // Dispatch while finishStop() is awaiting outboxRedrive.stop() and transport/dispatcher
+        // are still live, after wakeups.quiesce() has already fenced new launches.
+        await runtime.kernel.ctx.services.dispatcher.dispatch(lateEnvelope);
+        await origOutboxStop();
+      };
+      await runtime.stop();
+      assert.equal(fakeCodex.sessions.length, 0, 'quiesced stop must not launch late inbound mail mid-teardown');
+      assert.equal(runtime.hasPendingWakeupsAfterStop(), true, 'post-producer snapshot must observe late inbound wake');
+      const postStopStore = new MailboxStore(join(root, 'teardown-race-runtime', 'mailbox.json'), { readonly: true });
+      try {
+        assert.equal(postStopStore.getWakeTarget('stream:review')?.pendingWake, true);
+        assert.equal(postStopStore.getWakeTarget('stream:review')?.deliveryInDoubt, undefined);
+      } finally {
+        postStopStore.close();
+      }
+
+      // 7b. End-to-end offline CLI: non-sending command (`peers list`) whose teardown accepts late
+      //     inbound mail during owned.stop() still hands off to a background daemon.
+      const cliLateStateDir = join(root, 'cli-late-teardown-state');
+      mkdirSync(cliLateStateDir, { recursive: true });
+      const markerPath = join(cliLateStateDir, 'late-dispatched.flag');
+      const pluginPath = join(root, 'late-teardown-plugin.mjs');
+      const coreTypesUrl = new URL('../packages/core-types/index.ts', import.meta.url).href;
+      writeFileSync(
+        pluginPath,
+        [
+          "import { existsSync, writeFileSync } from 'node:fs';",
+          `import { generateNodeKeyPair, signEnvelope } from ${JSON.stringify(coreTypesUrl)};`,
+          'export function createPlugin() {',
+          '  return {',
+          "    name: 'test-late-teardown',",
+          "    inject: ['dispatcher'],",
+          '    apply(ctx) {',
+          '      ctx.effect(() => async () => {',
+          `        if (existsSync(${JSON.stringify(markerPath)})) return;`,
+          `        writeFileSync(${JSON.stringify(markerPath)}, '1');`,
+          '        const sender = generateNodeKeyPair();',
+          '        const env = signEnvelope({',
+          "          id: 'cli-late-teardown-msg',",
+          "          networkId: 'local',",
+          "          traceId: 'cli-late-teardown-msg',",
+          "          from: { nodeId: sender.nodeId, member: 'peer', nodeName: 'remote' },",
+          "          routing: { mode: 'unicast', targets: ['member:solo'] },",
+          "          kind: 'review',",
+          "          priority: 'normal',",
+          "          subject: 'Arrived during CLI stop',",
+          "          body: 'Must trigger daemon handoff after stop',",
+          '          payload: {},',
+          '          attachments: [],',
+          '          createdAt: new Date().toISOString(),',
+          '        }, sender.privateKeyPem);',
+          '        await ctx.services.dispatcher.dispatch(env);',
+          '      });',
+          '    },',
+          '  };',
+          '}',
+        ].join('\n'),
+      );
+      writeFileSync(
+        join(cliLateStateDir, 'config.json'),
+        JSON.stringify({
+          profile: 'codex-dev',
+          member: 'solo',
+          name: 'local',
+          wave: { flushIntervalMs: 100 },
+          topicBindings: { review: { executor: 'codex', mode: 'wave', workspacePath: root, coalesceMs: 0 } },
+          executorConfig: { codex: { command: fakeBin } },
+          userPlugins: [{ name: 'test-late-teardown', module: pluginPath }],
+        }),
+      );
+      try {
+        const lStdout: string[] = [];
+        const lStderr: string[] = [];
+        const lCode = await runDealerCli(['peers', 'list', '--json'], {
+          stateDir: cliLateStateDir,
+          stdout: line => lStdout.push(line),
+          stderr: line => lStderr.push(line),
+        });
+        assert.equal(lCode, 0, lStderr.join('\n'));
+        await eventually(() => {
+          const lateStore = new MailboxStore(join(cliLateStateDir, 'mailbox.json'), { readonly: true });
+          try {
+            const lateTarget = lateStore.getWakeTarget('stream:review');
+            assert.equal(lateTarget?.deliveryInDoubt, undefined);
+            assert.equal(lateTarget?.pendingWake, false);
+            assert.equal(lateTarget?.driverConfig?.sessionId, 'cli-codex-thread-1');
+          } finally {
+            lateStore.close();
+          }
+        }, 10_000);
+      } finally {
+        await stopDaemonIfRunning(cliLateStateDir, { force: true }).catch(() => {});
+      }
+    }
   }
 });
