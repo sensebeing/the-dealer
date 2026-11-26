@@ -2108,7 +2108,7 @@ export class MailboxStore {
   ): SlotObligationSnapshot {
     const id = normalizeMailboxId(mailboxId);
     const sessionId = options?.sessionMailboxId ? normalizeMailboxId(options.sessionMailboxId) : undefined;
-    return this.db.read(() => this.readSlotObligations(id, sessionId, options?.outbox));
+    return this.db.read(() => this.readSlotObligations(id, sessionId, options?.outbox ?? this.outbox));
   }
 
   private readSlotObligations(id: string, sessionId?: string, outboxStore?: OutboxStore): SlotObligationSnapshot {

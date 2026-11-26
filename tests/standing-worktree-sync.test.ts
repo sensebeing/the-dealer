@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   MailboxStore,
+  OutboxStore,
   WakeupRedriveService,
   createOrcaWakeupDrivers,
   tryFastForwardCleanWorktree,
@@ -681,6 +682,70 @@ test('unfinished sibling obligations (leased wave or unanswered outbound questio
     assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), baseHead);
     assert.equal(fake.events.includes('git:fetch'), true);
     assert.equal(fake.events.includes('git:merge'), false);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('outbox-only sibling question blocks fast-forward and definitively failed retained question allows fast-forward', async st => {
+    const { root, worktreePath, baseHead, pushOriginCommit } = createLinkedStandingWorktree(st);
+    const newHead = pushOriginCommit('README.md', 'v2\n', 'advance');
+    const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'outbox-blobs'));
+    const store = new MailboxStore(join(root, 'mailbox.json'), { outbox });
+    const fake = createFakeOrcaEnv(worktreePath, []);
+    const errors: unknown[] = [];
+    const service = new WakeupRedriveService({
+      store,
+      flushIntervalMs: 100_000,
+      onError: error => errors.push(error),
+      drivers: createOrcaWakeupDrivers({ commandRunner: fake.runner }),
+    });
+    st.after(async () => { await service.stop(); store.close(); });
+
+    const siblingSession = 'terminal:term-outbox-gone';
+    store.upsertWakeTarget('stream:alerts:2', {
+      driver: 'orca-terminal',
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath: worktreePath, terminalHandle: 'term-outbox-gone' },
+    });
+    const peerId = 'ed25519:' + 'b'.repeat(64);
+    const questionEnvelope = makeAlert('q-outbox-only', {
+      semantic: { type: 'question', threadId: 'q-outbox-only', replyMailbox: siblingSession },
+    });
+    outbox.enqueue({
+      envelope: questionEnvelope,
+      explicitTargets: [peerId],
+      pendingNodeIds: [peerId],
+    });
+
+    store.upsertWakeTarget('stream:alerts', {
+      driver: 'orca-terminal',
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath: worktreePath },
+    });
+    store.enqueue([makeAlert('wave-while-outbox-q')], { mailboxId: 'stream:alerts' });
+
+    const first = await service.flushMailbox('stream:alerts', { force: true });
+    assert.equal(first.woke, true, JSON.stringify(first));
+    assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), baseHead);
+    assert.equal(fake.events.some(event => event.startsWith('git:')), false);
+
+    // Record the retained thread entry and mark the outbox item definitively failed (unattempted).
+    store.recordOutboundEnvelope(questionEnvelope, [peerId], siblingSession);
+    outbox.recordAttempt(questionEnvelope.id, {
+      pendingNodeIds: [],
+      failures: [{ nodeId: peerId, error: 'permanent validation failure' }],
+      unattemptedNodeIds: [peerId],
+      nextAttemptAt: new Date().toISOString(),
+    });
+    assert.equal(outbox.readDefinitivelyFailedKeys().size, 1);
+    fake.terminals.length = 0;
+    store.upsertWakeTarget('stream:alerts', { completedWaves: 1, driverConfig: { workspacePath: worktreePath } });
+    store.enqueue([makeAlert('wave-after-definitive-fail')], { mailboxId: 'stream:alerts' });
+
+    const second = await service.flushMailbox('stream:alerts', { force: true });
+    assert.equal(second.woke, true, JSON.stringify(second));
+    assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), newHead);
     assert.deepEqual(errors, []);
   });
 });
