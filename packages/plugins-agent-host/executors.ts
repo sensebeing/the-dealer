@@ -34,6 +34,10 @@ export interface AgentHostTopicBinding extends MailboxTopicBinding {
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
+  wakeupPrefix?: string;
+  coalesceMs?: number;
+  rotateAfterWaves?: number;
+  rotateAfterMs?: number;
 }
 
 export interface AgentOptions {
@@ -46,6 +50,7 @@ export interface AgentOptions {
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
+  rotateAfterMs?: number;
   command?: string;
   args?: readonly string[];
   cwd?: string;
@@ -110,6 +115,9 @@ type HostDelivery = {
   request: CommandRequest;
   driverConfig: Record<string, unknown>;
   trustWorkspace?: string;
+  wakeupPrefix?: string;
+  coalesceMs?: number;
+  rotateAfterWaves?: number;
 };
 
 function prepareAgentDelivery(
@@ -168,9 +176,13 @@ function prepareAgentDelivery(
   const targetBot = optionalHostString(
     payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot, 'targetBot',
   );
-  const sessionId = resolveAgentSessionId(mailboxId, optionalHostString(
+  const explicitSessionId = optionalHostString(
     payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId, 'sessionId',
-  ), agent ?? 'codex');
+  );
+  const sessionId = resolveAgentSessionId(mailboxId, explicitSessionId, agent ?? 'codex');
+  const rotateAfterMs = optionalPositiveInteger(
+    binding?.rotateAfterMs ?? config.rotateAfterMs ?? options.rotateAfterMs, 'rotateAfterMs',
+  );
   const terminalPrompt = typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined;
   const invocation = buildAgentHostInvocation({
     agent: agent ?? 'codex', conversationMode, mailboxId,
@@ -184,12 +196,17 @@ function prepareAgentDelivery(
     mailboxId,
     request: { ...invocation, cwd },
     driverConfig: serializeAgentHostDriverConfig({
-      hostAgent: agent ?? 'codex', conversationMode, sessionId,
+      hostAgent: agent ?? 'codex', conversationMode,
+      ...(explicitSessionId?.trim() ? { sessionId: explicitSessionId } : {}),
       ...(cwd ? { workspacePath: cwd } : {}),
       ...(command ? { interactiveCommand: command } : {}),
       ...(agentProfile ? { agentProfile } : {}),
       ...(targetBot ? { targetBot } : {}),
+      ...(rotateAfterMs !== undefined ? { rotateAfterMs } : {}),
     }),
+    ...(binding?.wakeupPrefix !== undefined ? { wakeupPrefix: binding.wakeupPrefix } : {}),
+    ...(binding?.coalesceMs !== undefined ? { coalesceMs: binding.coalesceMs } : {}),
+    ...(binding?.rotateAfterWaves !== undefined ? { rotateAfterWaves: binding.rotateAfterWaves } : {}),
     ...(canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app' ? { trustWorkspace: cwd } : {}),
   };
 }
@@ -281,7 +298,13 @@ function createAgentExecutorPlugin(
             try {
               const result = store.enqueue(envelopes, {
                 signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
-                wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
+                wakeTarget: {
+                  driver: 'agent-host',
+                  driverConfig: delivery.driverConfig,
+                  ...(delivery.wakeupPrefix !== undefined ? { wakeupPrefix: delivery.wakeupPrefix } : {}),
+                  ...(delivery.coalesceMs !== undefined ? { coalesceMs: delivery.coalesceMs } : {}),
+                  ...(delivery.rotateAfterWaves !== undefined ? { rotateAfterWaves: delivery.rotateAfterWaves } : {}),
+                },
               });
               committed();
               const receipt = { ...result, executor: name, executionId: randomUUID(),
@@ -315,4 +338,11 @@ function optionalHostString(value: unknown, name: string): string | undefined {
   if (value !== undefined && typeof value !== 'string')
     throw new Error(`Invalid host configuration: ${name}`);
   return value as string | undefined;
+}
+
+function optionalPositiveInteger(value: unknown, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1)
+    throw new Error(`Invalid host configuration: ${name}`);
+  return value;
 }

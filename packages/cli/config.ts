@@ -256,6 +256,7 @@ export interface TopicBindingConfig {
   wakeupPrefix?: string;
   coalesceMs?: number;
   rotateAfterWaves?: number;
+  rotateAfterMs?: number;
   notifyLark?: boolean;
 }
 
@@ -263,7 +264,7 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
   if (!isRecord(bindings)) throw new Error('Invalid topicBindings');
   const strings = ['assignee', 'agent', 'interactiveCommand', 'resumeCommand', 'mode', 'conversationMode', 'targetBot', 'agentProfile', 'sessionId', 'streamKey', 'mailboxId', 'projectId', 'workspacePath', 'worktreeId', 'runId', 'terminalHandle', 'workspaceComment', 'wakeupPrefix'];
   const booleans = ['noParent', 'autoCreateWorkspace', 'notifyLark'];
-  const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves', 'metadata']);
+  const allowed = new Set(['executor', ...strings, ...booleans, 'coalesceMs', 'rotateAfterWaves', 'rotateAfterMs', 'metadata']);
   for (const [kind, binding] of Object.entries(bindings)) {
     if (isRecord(binding)) {
       try {
@@ -289,6 +290,7 @@ export function validateTopicBindings(bindings: unknown, enabledExecutors: reado
         booleans.some(key => binding[key] !== undefined && typeof binding[key] !== 'boolean') ||
         (binding.coalesceMs !== undefined && (!Number.isSafeInteger(binding.coalesceMs) || binding.coalesceMs < 0)) ||
         (binding.rotateAfterWaves !== undefined && (!Number.isSafeInteger(binding.rotateAfterWaves) || binding.rotateAfterWaves < 1)) ||
+        (binding.rotateAfterMs !== undefined && (!Number.isSafeInteger(binding.rotateAfterMs) || binding.rotateAfterMs < 1)) ||
         (binding.mailboxId !== undefined && !isValidMailboxId(binding.mailboxId)) ||
         (binding.streamKey !== undefined && !isValidMailboxId(`stream:${binding.streamKey}`)) ||
         (isStreamConversationBinding(registry.toMailboxBinding(binding as unknown as TopicBindingConfig)) && binding.mailboxId === undefined && !isValidMailboxId(`stream:${binding.streamKey ?? (kind.includes(':') ? kind.slice(kind.indexOf(':') + 1) : kind)}`)) ||

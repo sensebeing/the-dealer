@@ -4,7 +4,12 @@ import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
 import { planOrcaWorkspaceTerminal } from '../packages/plugins-orca/workspace.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import { runCommand, CommandNotStartedError } from '../packages/subprocess/index.ts';
-import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/plugins-agent-host/index.ts';
+import {
+  buildAgentHostInvocation,
+  deliverAgentHostWakeTarget,
+  resolveAgentHostContinuation,
+  resolveAgentSessionId,
+} from '../packages/plugins-agent-host/index.ts';
 import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
 import test from 'node:test';
 import { execFile, spawn } from 'node:child_process';
@@ -595,8 +600,12 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
       assert.equal(call.cwd, root);
       if (agent === 'codex') {
         assert.equal(call.command, 'codex');
-        assert.deepEqual(args.slice(0, conversationMode === 'spawn' ? 2 : 4), conversationMode === 'spawn' ? ['exec', '--worktree'] : ['queue', '--thread', 'session', '--resume']);
-        assert.ok(args.includes('-p'));
+        assert.deepEqual(
+          args.slice(0, conversationMode === 'spawn' ? 8 : 9),
+          conversationMode === 'spawn'
+            ? ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox', '-p', 'review', '-C', root]
+            : ['exec', '-p', 'review', '-C', root, 'resume', 'session', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+        );
       } else if (agent === 'claude-code') {
         assert.equal(call.command, 'claude');
         assert.deepEqual(
@@ -853,7 +862,7 @@ test('runtime uses a generated fixed binding, persists mailbox and supports setu
     routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check this change', payload: {} });
   assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 'review', '--resume']);
+  assert.deepEqual(calls[0].args.slice(0, 7), ['exec', '-C', root, 'resume', 'review', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.equal(runtime.mailbox.getWakeTarget(`stream:${preset.topic}`)?.driver, 'agent-host');
   assert.equal((await cli(['setup', 'probe', '--root', root], runtime.stateDir)).node.configured, true);
   const invite = await cli(['setup', 'invite-prompt', '--network', 'new-team'], runtime.stateDir);
@@ -1236,7 +1245,14 @@ for (const [name, factory, command] of [
       assert.match(calls[0].args.at(-1)!, new RegExp(mailboxId));
       assert.equal(existsSync(settings), false);
       assert.equal(existsSync(hostSettings) ? readFileSync(hostSettings, 'utf8') : undefined, beforeSettings);
-      if (name === 'codex') assert.equal(calls[0].args[0], mode === 'spawn' ? 'exec' : 'queue');
+      if (name === 'codex') {
+        assert.deepEqual(
+          calls[0].args.slice(0, mode === 'spawn' ? 4 : 7),
+          mode === 'spawn'
+            ? ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']
+            : ['exec', '-C', root, 'resume', 'session', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+        );
+      }
       if (name === 'claude-code') {
         assert.deepEqual(
           calls[0].args.slice(0, 4),
@@ -1281,7 +1297,7 @@ test('named executors default to spawn and preserve conversation-mode precedence
     }).execute([message('test', source === 'payload' ? { conversationMode: 'fixed' } : {})], context,
       source === 'config' ? { conversationMode: 'fixed' } : {});
     assert.equal(result.executor, 'codex');
-    assert.equal(calls.at(-1)!.args[0], 'queue');
+    assert.deepEqual(calls.at(-1)!.args.slice(0, 5), ['exec', 'resume', 'existing', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   }
   await assert.rejects(createCodexExecutorPlugin({ commandRunner }).execute([message('bad', { conversationMode: 'inbox-only' })], context, {}), /Invalid agent conversationMode/);
   await assert.rejects(createCodexExecutorPlugin({ commandRunner: async () => ({ stdout: '', exitCode: 2 }) }).execute([message()], context, {}), /exited 2/);
@@ -1324,7 +1340,7 @@ test('orca executor resolves spawn, wave and fixed modes per batch', async t => 
 
 test('new host executor factories use host invocation mode', async t => {
   const cases = [
-    [createCodexCliExecutorPlugin, 'codex', ['exec', '--worktree']],
+    [createCodexCliExecutorPlugin, 'codex', ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']],
     [createAntigravityCliExecutorPlugin, 'agy', ['run', '--dangerously-skip-permissions']],
     [createClaudeAppExecutorPlugin, 'claude-app', ['send', '--session-mode', 'spawn']],
     [createChatgptAppExecutorPlugin, 'dot', ['send', '--session-mode', 'spawn']],
@@ -1345,7 +1361,8 @@ test('new host executor factories use host invocation mode', async t => {
   const calls: CommandRequest[] = [];
   await createCodexCliExecutorPlugin({ store, resolveTopicBinding: () => ({ executor: 'codex-cli', mode: 'wave', mailboxId: 'default' }), commandRunner: async request => { calls.push(request); return { stdout: '{"threadId":"wave-thread"}' }; } })
     .execute([message('wave-msg', { mode: 'wave' })], context, {});
-  assert.deepEqual(calls.at(-1)!.args.slice(0, 2), ['exec', '--worktree']);
+  assert.deepEqual(calls.at(-1)!.args.slice(0, 3), ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.equal(calls.at(-1)!.args.includes('--worktree'), false);
   assert.equal(store.getWakeTarget('default')?.driverConfig?.conversationMode, 'fixed');
   assert.equal(store.getWakeTarget('default')?.driverConfig?.sessionId, 'wave-thread');
   const claudeCalls: CommandRequest[] = [];
@@ -1440,8 +1457,8 @@ test('live applied preset enables dispatch immediately and changes unbound defau
     const result = await runtime.emitter.emit({ networkId: 'local', kind, routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check change', payload: {} });
     assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
   }
-  assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 'review-session', '--resume']);
-  assert.deepEqual(calls[1].args.slice(0, 2), ['exec', '--worktree']);
+  assert.deepEqual(calls[0].args.slice(0, 5), ['exec', 'resume', 'review-session', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.deepEqual(calls[1].args.slice(0, 4), ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.equal(runtime.mailbox.getWakeTarget('stream:review')?.driver, 'agent-host');
   await runtime.applyAgentPreset({ host: 'claude', conversationMode: 'inbox-only', topic: 'manual', setDefault: true });
   assert.equal(runtime.config.defaultExecutor, 'inbox');
@@ -1493,7 +1510,9 @@ test('host-bound passive mailboxes redrive inbox conversation frames after initi
       assert.equal(call.command, command);
       assert.equal(call.cwd, root);
       assert.ok(call.args.includes(result.pointer!));
-      if (hostAgent === 'codex') assert.deepEqual(call.args.slice(0, 4), ['queue', '--thread', 'existing-session', '--resume']);
+      if (hostAgent === 'codex') {
+        assert.deepEqual(call.args.slice(0, 9), ['exec', '-p', 'review', '-C', root, 'resume', 'existing-session', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+      }
       if (hostAgent === 'claude-code') assert.deepEqual(call.args.slice(0, 3), ['--bg', '--resume', 'existing-session']);
       assert.equal(store.getWakeTarget('stream:session')?.pendingWake, false);
       const lease = store.check({ mailboxId: 'stream:session' });
@@ -1528,8 +1547,8 @@ for (const agent of ['codex', 'claude-code'] as const) {
     await createAgentPtyExecutorPlugin({ store, wakeup, agent, conversationMode: 'spawn', commandRunner: runner })
       .execute([message('msg-1')], context, {});
     const mailboxId = 'task:msg-1';
-    assert.deepEqual(calls[0].args.slice(0, agent === 'codex' ? 2 : 3),
-      agent === 'codex' ? ['exec', '--worktree'] : ['--bg', '--name', 'task_x3a_msg_x2d_1']);
+    assert.deepEqual(calls[0].args.slice(0, agent === 'codex' ? 4 : 3),
+      agent === 'codex' ? ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox'] : ['--bg', '--name', 'task_x3a_msg_x2d_1']);
     assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.conversationMode, 'fixed');
     assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, agent === 'codex' ? 'real-thread-42' : 'task_x3a_msg_x2d_1');
     store.check({ mailboxId });
@@ -1538,8 +1557,8 @@ for (const agent of ['codex', 'claude-code'] as const) {
     await createInboxExecutorPlugin({ store }).execute([reply], context, {});
     await wakeup.flushMailbox(mailboxId);
     assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1].args.slice(0, agent === 'codex' ? 4 : 3),
-      agent === 'codex' ? ['queue', '--thread', 'real-thread-42', '--resume'] : ['--bg', '--resume', 'task_x3a_msg_x2d_1']);
+    assert.deepEqual(calls[1].args.slice(0, agent === 'codex' ? 5 : 3),
+      agent === 'codex' ? ['exec', 'resume', 'real-thread-42', '--json', '--dangerously-bypass-approvals-and-sandbox'] : ['--bg', '--resume', 'task_x3a_msg_x2d_1']);
     assert.match(calls[1].args.at(-1)!, /\[Answer ready\].*Latest \(reply from alice, thread msg-1\): "Use the smaller design"/);
     assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
   });
@@ -1576,7 +1595,7 @@ test('agent executor preserves an in-flight arrival and releases its claim for i
   await Promise.race([second, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('No immediate redrive')), 2000); t.after(() => clearTimeout(timer)); })]);
   await wakeup.flushMailbox(mailboxId);
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1].args.slice(0, 4), ['queue', '--thread', 'real-race', '--resume']);
+  assert.deepEqual(calls[1].args.slice(0, 5), ['exec', 'resume', 'real-race', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.match(calls[1].args.at(-1)!, /New instruction/);
   assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
 });
@@ -1627,7 +1646,7 @@ test('host session keys preserve explicit identities and encode Claude mailbox k
         }
         const { args } = buildAgentHostInvocation(options);
         if (agent === 'codex' && conversationMode === 'spawn') continue;
-        const flag = agent === 'codex' ? '--thread' : agent === 'claude-code' ? (conversationMode === 'spawn' ? '--name' : '--resume') : '--session-key';
+        const flag = agent === 'codex' ? 'resume' : agent === 'claude-code' ? (conversationMode === 'spawn' ? '--name' : '--resume') : '--session-key';
         assert.equal(args[args.indexOf(flag) + 1], expected);
       }
     }
@@ -1732,7 +1751,7 @@ test('initial host ENOENT is retryable and recovery binds the actual Codex recei
   });
   t.after(() => service.stop());
   await service.flushMailbox('task:pre-effect', { force: true });
-  assert.deepEqual(calls[0].args.slice(0, 2), ['exec', '--worktree']);
+  assert.deepEqual(calls[0].args.slice(0, 4), ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.equal(store.getWakeTarget('task:pre-effect')?.driverConfig?.sessionId, 'host-returned-identity');
   assert.equal(store.getWakeTarget('task:pre-effect')?.driverConfig?.conversationMode, 'fixed');
   assert.equal(store.getWakeTarget('task:pre-effect')?.pendingWake, false);
@@ -1838,7 +1857,7 @@ for (const executor of ['codex-cli', 'agent-pty', 'orca-spawn'] as const) {
     assert.equal(runtime.resolveTopicBinding('review')?.binding.mode, undefined);
     if (executor === 'codex-cli') {
       assert.equal(calls.length, 1);
-      assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 's1', '--resume']);
+      assert.deepEqual(calls[0].args.slice(0, 5), ['exec', 'resume', 's1', '--json', '--dangerously-bypass-approvals-and-sandbox']);
       assert.equal(runtime.mailbox.getWakeTarget('default')?.driver, 'agent-host');
     } else if (executor === 'agent-pty') {
       assert.equal(calls.length, 1);
@@ -1939,7 +1958,7 @@ for (const [name, create] of [
       assert.equal(calls.length, 1);
     } else {
       assert.equal(calls.length, 2);
-      assert.ok(calls[1].args.includes('--resume'));
+      assert.ok(calls[1].args.includes(name === 'codex' ? 'resume' : '--resume'));
       assert.ok(calls[1].args.includes('task-session'));
     }
     store.upsertWakeTarget(worktreeMailbox, { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term_origin' } });
@@ -2670,4 +2689,259 @@ test('mixed-capability routing prefers reachable eligible peers without breaking
   const offlineDecision = await runtime.kernel.ctx.services.router.route(triageEnvelope);
   assert.equal(offlineDecision.mode, 'multicast');
   assert.deepEqual(new Set(offlineDecision.targetNodeIds), new Set([liveTriage.nodeId, staleTriage.nodeId]));
+});
+
+test('codex wave captures JSONL thread_id without --worktree and resumes via exec resume', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (calls.length === 1) {
+      return {
+        stdout: [
+          'warning: diagnostic line',
+          '{"type":"thread.started","thread_id":"019d-jsonl-thread"}',
+          '{"type":"turn.started"}',
+          '{"type":"turn.completed"}',
+        ].join('\n'),
+      };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId: 'stream:codex-inbox',
+      workspacePath: root,
+      agentProfile: 'fast',
+    }),
+  });
+
+  // Wave 1: starts fresh directly in workspacePath without --worktree and captures JSONL thread_id.
+  await plugin.execute([message('w1')], context, {});
+  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    calls[0].args.slice(0, 7),
+    ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-p', 'fast', '-C', root],
+  );
+  assert.equal(calls[0].args.includes('--worktree'), false);
+  const afterWave1 = store.getWakeTarget('stream:codex-inbox')!;
+  assert.equal(afterWave1.driverConfig?.sessionId, '019d-jsonl-thread');
+  assert.equal(typeof afterWave1.driverConfig?.sessionStartedAt, 'number');
+  const lease1 = store.check({ mailboxId: 'stream:codex-inbox' });
+  store.ack(lease1.deliveryId!, 'stream:codex-inbox');
+
+  // Wave 2: omits sessionId in binding so persisted thread_id is preserved and resumed via exec resume.
+  await plugin.execute([message('w2')], context, {});
+  assert.equal(calls.length, 2);
+  assert.deepEqual(
+    calls[1].args.slice(0, 9),
+    ['exec', '-p', 'fast', '-C', root, 'resume', '019d-jsonl-thread', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:codex-inbox')?.driverConfig?.sessionId, '019d-jsonl-thread');
+
+  // Continuation parser handles both single JSON objects and JSONL with threadId/thread_id/sessionId/session_id.
+  assert.equal(
+    resolveAgentHostContinuation('codex', 'stream:codex-inbox', undefined, '{"session_id":"sid-1"}', 'wave').sessionId,
+    'sid-1',
+  );
+  assert.equal(
+    resolveAgentHostContinuation('codex', 'stream:codex-inbox', undefined, '{"type":"init"}\n{"threadId":"tid-2"}', 'spawn').sessionId,
+    'tid-2',
+  );
+});
+
+test('agent-host rotateAfterWaves rotates codex wave after acked threshold and never rotates mid-lease', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId: 'stream:rot-waves',
+      workspacePath: root,
+      wakeupPrefix: 'Check inbox carefully',
+      coalesceMs: 1_500,
+      rotateAfterWaves: 2,
+    }),
+  });
+
+  // Wave 1: starts thread-1 and propagates wakeTarget metadata.
+  await plugin.execute([message('rw1')], context, {});
+  const t1 = store.getWakeTarget('stream:rot-waves')!;
+  assert.equal(t1.wakeupPrefix, 'Check inbox carefully');
+  assert.equal(t1.coalesceMs, 1_500);
+  assert.equal(t1.rotateAfterWaves, 2);
+  assert.equal(t1.driverConfig?.sessionId, 'thread-1');
+  assert.equal(t1.completedWaves, 0);
+  const startedAt1 = t1.driverConfig?.sessionStartedAt as number;
+  assert.equal(typeof startedAt1, 'number');
+  store.ack(store.check({ mailboxId: 'stream:rot-waves' }).deliveryId!, 'stream:rot-waves');
+  assert.equal(store.getWakeTarget('stream:rot-waves')?.completedWaves, 1);
+
+  // Wave 2: completedWaves (1) < rotateAfterWaves (2), so reuses thread-1 and preserves sessionStartedAt.
+  await plugin.execute([message('rw2')], context, {});
+  assert.deepEqual(
+    calls[1].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:rot-waves')?.driverConfig?.sessionStartedAt, startedAt1);
+
+  // Lease wave 2, artificially raise completedWaves >= rotateAfterWaves while lease is outstanding:
+  // mid-lease redrive MUST NOT rotate!
+  const lease2 = store.check({ mailboxId: 'stream:rot-waves' });
+  store.upsertWakeTarget('stream:rot-waves', { completedWaves: 2 });
+  store.enqueue([message('rw2-followup')], { mailboxId: 'stream:rot-waves' });
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-waves', { now: startedAt1 + 10 });
+  assert.deepEqual(
+    calls[2].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:rot-waves')?.driverConfig?.sessionId, 'thread-1');
+
+  // Ack lease 2 -> completedWaves becomes 3 (>= 2) and no outstanding lease remains.
+  store.ack(lease2.deliveryId!, 'stream:rot-waves');
+
+  // Wave 3: rotates to a fresh thread-2 (no --worktree), resets completedWaves to 0, refreshes sessionStartedAt.
+  const rotateNow = startedAt1 + 5_000;
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-waves', { now: rotateNow });
+  assert.deepEqual(
+    calls[3].args.slice(0, 5),
+    ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-C', root],
+  );
+  assert.equal(calls[3].args.includes('--worktree'), false);
+  const rotated = store.getWakeTarget('stream:rot-waves')!;
+  assert.equal(rotated.driverConfig?.sessionId, 'thread-2');
+  assert.equal(rotated.driverConfig?.sessionStartedAt, rotateNow);
+  assert.equal(rotated.completedWaves, 0);
+});
+
+test('agent-host rotateAfterMs rotates codex and claude-code waves when session age expires', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"age-thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId: 'stream:rot-age',
+      workspacePath: root,
+      rotateAfterMs: 60_000,
+    }),
+  });
+
+  await plugin.execute([message('age-1')], context, {});
+  const t1 = store.getWakeTarget('stream:rot-age')!;
+  assert.equal(t1.driverConfig?.rotateAfterMs, 60_000);
+  assert.equal(t1.driverConfig?.sessionId, 'age-thread-1');
+  const startAt = t1.driverConfig?.sessionStartedAt as number;
+  store.ack(store.check({ mailboxId: 'stream:rot-age' }).deliveryId!, 'stream:rot-age');
+
+  // Before rotateAfterMs elapses: still reuses age-thread-1.
+  store.enqueue([message('age-2')], { mailboxId: 'stream:rot-age' });
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-age', { now: startAt + 30_000 });
+  assert.deepEqual(
+    calls[1].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'age-thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:rot-age')?.driverConfig?.sessionStartedAt, startAt);
+
+  // While lease is open past rotateAfterMs: still does not rotate mid-lease.
+  const lease2 = store.check({ mailboxId: 'stream:rot-age' });
+  store.enqueue([message('age-2b')], { mailboxId: 'stream:rot-age' });
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-age', { now: startAt + 120_000 });
+  assert.deepEqual(
+    calls[2].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'age-thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  store.ack(lease2.deliveryId!, 'stream:rot-age');
+
+  // After ack and past rotateAfterMs: rotates to age-thread-2 and resets completedWaves & sessionStartedAt.
+  const rotateAt = startAt + 125_000;
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-age', { now: rotateAt });
+  assert.deepEqual(
+    calls[3].args.slice(0, 5),
+    ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-C', root],
+  );
+  assert.equal(calls[3].args.includes('--worktree'), false);
+  const rotated = store.getWakeTarget('stream:rot-age')!;
+  assert.equal(rotated.driverConfig?.sessionId, 'age-thread-2');
+  assert.equal(rotated.driverConfig?.rotateAfterMs, 60_000);
+  assert.equal(rotated.driverConfig?.sessionStartedAt, rotateAt);
+  assert.equal(rotated.completedWaves, 0);
+
+  // Claude Code wave rotation generates a fresh non-colliding session name and resumes it on subsequent waves.
+  const claudeCalls: CommandRequest[] = [];
+  const claudeRunner: CommandRunner = async request => {
+    claudeCalls.push(request);
+    return { stdout: '{}' };
+  };
+  const claudePlugin = createClaudeCodeExecutorPlugin({
+    store,
+    commandRunner: claudeRunner,
+    resolveTopicBinding: () => ({
+      executor: 'claude-code',
+      mode: 'wave',
+      mailboxId: 'stream:claude-rot',
+      workspacePath: root,
+      rotateAfterMs: 10_000,
+    }),
+  });
+  await claudePlugin.execute([message('c1')], context, {});
+  assert.deepEqual(claudeCalls[0].args.slice(0, 4), ['--bg', '--name', 'stream_x3a_claude_x2d_rot', '--dangerously-skip-permissions']);
+  const cStart = store.getWakeTarget('stream:claude-rot')!.driverConfig!.sessionStartedAt as number;
+  store.ack(store.check({ mailboxId: 'stream:claude-rot' }).deliveryId!, 'stream:claude-rot');
+
+  store.enqueue([message('c2')], { mailboxId: 'stream:claude-rot' });
+  const cRotateAt = cStart + 20_000;
+  await deliverAgentHostWakeTarget(store, claudeRunner, 'stream:claude-rot', { now: cRotateAt });
+  const expectedFreshName = `stream_x3a_claude_x2d_rot_r${cRotateAt}`;
+  assert.deepEqual(claudeCalls[1].args.slice(0, 4), ['--bg', '--name', expectedFreshName, '--dangerously-skip-permissions']);
+  assert.equal(store.getWakeTarget('stream:claude-rot')?.driverConfig?.sessionId, expectedFreshName);
+  store.ack(store.check({ mailboxId: 'stream:claude-rot' }).deliveryId!, 'stream:claude-rot');
+
+  await claudePlugin.execute([message('c3')], context, {});
+  assert.deepEqual(claudeCalls[2].args.slice(0, 4), ['--bg', '--resume', expectedFreshName, '--dangerously-skip-permissions']);
+});
+
+test('validateTopicBindings validates positive integer rotateAfterMs', () => {
+  assert.doesNotThrow(() =>
+    validateTopicBindings(
+      { task: { executor: 'codex', mode: 'wave', rotateAfterWaves: 5, rotateAfterMs: 3_600_000 } },
+      ['codex'],
+    ),
+  );
+  for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, '60000']) {
+    assert.throws(
+      () => validateTopicBindings({ task: { executor: 'codex', mode: 'wave', rotateAfterMs: invalid as unknown as number } }, ['codex']),
+      /Invalid topic binding: task/,
+    );
+  }
 });

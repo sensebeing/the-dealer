@@ -1,5 +1,11 @@
 import { ACTIVE_CONVERSATION_MODES } from '../core-types/index.ts';
-import { buildAgentHostInvocation, resolveAgentHostContinuation, parseAgentHost } from './hosts.ts';
+import {
+  buildAgentHostInvocation,
+  normalizeAgentHost,
+  parseAgentHost,
+  resolveAgentHostContinuation,
+  resolveAgentSessionId,
+} from './hosts.ts';
 import type { SupportedAgentHost, ActiveConversationMode } from './hosts.ts';
 import { checkedCommand, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
@@ -21,6 +27,8 @@ export interface AgentHostDriverConfig {
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
+  rotateAfterMs?: number;
+  sessionStartedAt?: number;
 }
 
 export function serializeAgentHostDriverConfig(config: AgentHostDriverConfig): Record<string, unknown> {
@@ -44,7 +52,32 @@ export function readAgentHostDriverConfig(
     if (config[field] !== undefined && typeof config[field] !== 'string')
       throw new Error(`Invalid host configuration: ${field}`);
   }
+  if (
+    config.rotateAfterMs !== undefined &&
+    (typeof config.rotateAfterMs !== 'number' || !Number.isSafeInteger(config.rotateAfterMs) || config.rotateAfterMs < 1)
+  ) {
+    throw new Error('Invalid host configuration: rotateAfterMs');
+  }
+  if (
+    config.sessionStartedAt !== undefined &&
+    (typeof config.sessionStartedAt !== 'number' || !Number.isFinite(config.sessionStartedAt) || config.sessionStartedAt < 0)
+  ) {
+    throw new Error('Invalid host configuration: sessionStartedAt');
+  }
   return config as AgentHostDriverConfig;
+}
+
+function rotatedSessionId(
+  hostAgent: SupportedAgentHost,
+  mailboxId: string,
+  now: number,
+): string | undefined {
+  const canonical = normalizeAgentHost(hostAgent);
+  if (canonical === 'codex' || canonical === 'antigravity') return undefined;
+  if (canonical === 'claude-code') {
+    return `${resolveAgentSessionId(mailboxId, undefined, hostAgent)}_r${now}`;
+  }
+  return `${mailboxId}#${now}`;
 }
 
 /**
@@ -69,16 +102,42 @@ export async function deliverAgentHostWakeTarget(
     const preview = store.check({ mailboxId, peek: true });
     const pointer = buildWakeupPointer(mailboxId, target, preview);
     if (!pointer) throw new Error(`No pending Dealer messages in ${mailboxId}`);
+    const hasOutstandingLease = Boolean(preview.deliveryId);
+    const waveRotationDue =
+      !hasOutstandingLease &&
+      target.rotateAfterWaves !== undefined &&
+      target.completedWaves >= target.rotateAfterWaves;
+    const ageRotationDue =
+      !hasOutstandingLease &&
+      target.rotateAfterMs !== undefined &&
+      target.sessionStartedAt !== undefined &&
+      now - target.sessionStartedAt >= target.rotateAfterMs;
+    const shouldRotate =
+      Boolean(target.sessionId) &&
+      target.conversationMode !== 'spawn' &&
+      (waveRotationDue || ageRotationDue);
+    const canonicalHost = normalizeAgentHost(target.hostAgent);
+    const effectiveMode: ActiveConversationMode = shouldRotate
+      ? 'wave'
+      : canonicalHost === 'claude-code' &&
+          target.conversationMode === 'wave' &&
+          Boolean(target.sessionId) &&
+          target.sessionStartedAt !== undefined
+        ? 'fixed'
+        : (target.conversationMode ?? 'fixed');
+    const effectiveSessionId = shouldRotate
+      ? rotatedSessionId(target.hostAgent, mailboxId, now)
+      : target.sessionId;
     const invocation = buildAgentHostInvocation({
       agent: target.hostAgent,
-      conversationMode: target.conversationMode ?? 'fixed',
+      conversationMode: effectiveMode,
       mailboxId,
       promptText: pointer,
       cwd: target.workspacePath,
       command: target.interactiveCommand,
       agentProfile: target.agentProfile,
       targetBot: target.targetBot,
-      sessionId: target.sessionId,
+      sessionId: effectiveSessionId,
     });
     if (!store.beginWakeDelivery(mailboxId, expectedRevision)) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     deliveryBegun = true;
@@ -90,13 +149,28 @@ export async function deliverAgentHostWakeTarget(
     const continuation = resolveAgentHostContinuation(
       target.hostAgent,
       mailboxId,
-      target.sessionId,
+      effectiveSessionId,
       output.stdout,
-      target.conversationMode ?? 'fixed',
+      effectiveMode,
     );
+    const sessionStartedAt = continuation.sessionId
+      ? (shouldRotate || !target.sessionId || continuation.sessionId !== target.sessionId
+          ? now
+          : (target.sessionStartedAt ?? now))
+      : undefined;
+    const nextDriverConfig = continuation.hostAgent
+      ? serializeAgentHostDriverConfig({
+          hostAgent: continuation.hostAgent,
+          conversationMode: continuation.conversationMode,
+          sessionId: continuation.sessionId,
+          ...(target.rotateAfterMs !== undefined ? { rotateAfterMs: target.rotateAfterMs } : {}),
+          ...(sessionStartedAt !== undefined ? { sessionStartedAt } : {}),
+        })
+      : undefined;
     const completed = store.completeWakeDelivery(mailboxId, maxPreviewSequence(preview), {
       driver: continuation.hostAgent ? 'agent-host' : 'passive',
-      driverConfig: continuation.hostAgent ? continuation : undefined,
+      driverConfig: nextDriverConfig,
+      ...(shouldRotate ? { completedWaves: 0 } : {}),
     }, undefined, expectedRevision);
     if (completed.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
     return { pointer, stdout: output.stdout, stderr: output.stderr };
