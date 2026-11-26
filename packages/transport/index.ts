@@ -351,6 +351,12 @@ export interface TransportPluginOptions {
   discoveryDir?: string;
   /** Durable directory for the always-on relay store-and-forward spool and blob cache. */
   spoolDir?: string;
+  /**
+   * Whether this node admits new third-party offline relay-spool entries. Defaults to true
+   * when `spoolDir` is configured; set to false on non-relay profiles so pre-existing
+   * durable custody continues draining while new third-party spool offers are declined.
+   */
+  acceptRelaySpool?: boolean;
   listenPort?: number;
   listenHost?: string;
   advertisedHost?: string;
@@ -1248,11 +1254,27 @@ export class P2PTransportService implements TransportService {
     }
   }
 
+  private acceptsRelaySpool(m: Mount): boolean {
+    return Boolean(m.spoolFile) && this.options.acceptRelaySpool !== false;
+  }
+
   /** Compact the base snapshot and truncate the journal; called at load and shutdown only. */
   private persistRelaySpool(m: Mount): void {
     const spoolFile = m.spoolFile;
     if (!spoolFile) {
       return;
+    }
+    const journalFile = `${spoolFile}.journal`;
+    if (m.relaySpool.size === 0 && m.spoolBlobCache.size === 0) {
+      const hasDiskState = existsSync(spoolFile) || existsSync(journalFile);
+      if (!hasDiskState) {
+        return;
+      }
+      if (!this.acceptsRelaySpool(m)) {
+        rmSync(spoolFile, { force: true });
+        rmSync(journalFile, { force: true });
+        return;
+      }
     }
     const state: RelaySpoolFile = {
       schema: RELAY_SPOOL_SCHEMA,
@@ -1263,7 +1285,7 @@ export class P2PTransportService implements TransportService {
         : {}),
     };
     writeFileAtomically(spoolFile, JSON.stringify(state));
-    rmSync(`${spoolFile}.journal`, { force: true });
+    rmSync(journalFile, { force: true });
   }
 
   /** Drop expired entries/cache, then enforce every global and per-target spool bound. */
@@ -3171,7 +3193,7 @@ export class P2PTransportService implements TransportService {
         socket.end(packet({ error: liveError.message }));
         return;
       }
-      if (!spoolIfOffline || !mount.spoolFile) {
+      if (!spoolIfOffline || !this.acceptsRelaySpool(mount)) {
         throw liveError;
       }
       try {

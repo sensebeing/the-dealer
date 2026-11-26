@@ -562,14 +562,20 @@ export class DealerNodeRuntime {
         saveJson(keyPath, keyPair);
       }
       const advertisedHost = this.options.transport?.advertisedHost ?? process.env.DEALER_ADVERTISED_HOST;
+      const explicitSpoolDir = this.options.transport?.spoolDir;
       const spoolDir =
-        this.options.transport?.spoolDir ??
-        (this.config.profile === 'headless-relay' ? join(this.stateDir, 'relay-spool') : undefined);
+        explicitSpoolDir !== undefined
+          ? (explicitSpoolDir || undefined)
+          : join(this.stateDir, 'relay-spool');
+      const acceptRelaySpool =
+        this.options.transport?.acceptRelaySpool ??
+        (Boolean(explicitSpoolDir) || this.config.profile === 'headless-relay');
       await this.kernel.use(
         createTransportPlugin({
           ...this.options.transport,
           ...(advertisedHost ? { advertisedHost } : {}),
-          ...(spoolDir ? { spoolDir } : {}),
+          ...(spoolDir ? { spoolDir } : { spoolDir: undefined }),
+          acceptRelaySpool,
           listenPort: this.config.port,
           localNodeId: keyPair.nodeId,
         }),

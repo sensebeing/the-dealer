@@ -11,6 +11,9 @@ import {
   verify,
 } from 'node:crypto';
 
+/** Default total budget for one delivery attempt across emitter sends and outbox redrives. */
+export const DEFAULT_DELIVERY_ATTEMPT_TIMEOUT_MS = 15_000;
+
 export interface Disposable {
   dispose(): void | Promise<void>;
 }

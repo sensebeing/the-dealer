@@ -6482,7 +6482,7 @@ test('attachment fetch failure before executor runs reports handoff unattempted 
   assert.equal(receiverNodeId, first.receipts[0].fromNodeId);
 });
 
-test('personal-dev disables relay-spool and refuses third-party offline custody so sender falls back to headless-relay', async t => {
+test('personal-dev declines new third-party offline custody without creating relay-spool, falling back to headless-relay', async t => {
   const root = directory(t);
   const runtimes: DealerNodeRuntime[] = [];
   t.after(async () => {
@@ -6530,9 +6530,8 @@ test('personal-dev disables relay-spool and refuses third-party offline custody 
   await offlinePeer.stop();
 
   const keys = deriveNetworkKeys(NETWORK, 'secret');
-  const personalMount = mountOf(personalPeer.transport as P2PTransportService, NETWORK) as { spoolFile?: string };
-  assert.equal(personalMount.spoolFile, undefined, 'personal-dev must not enable relay spoolFile');
-  assert.equal(existsSync(join(root, 'personal', 'relay-spool')), false);
+  const personalSpoolDir = join(root, 'personal', 'relay-spool');
+  assert.equal(existsSync(personalSpoolDir), false);
 
   const emitted = await sender.emitter.emit({
     networkId: NETWORK,
@@ -6544,10 +6543,206 @@ test('personal-dev disables relay-spool and refuses third-party offline custody 
   });
   assert.equal(emitted.receipts[0]?.stage, 'queued');
   assert.equal(emitted.receipts[0]?.executionReceipt?.relaySpooled, true);
-  assert.equal(existsSync(join(root, 'personal', 'relay-spool')), false, 'personal-dev never writes relay-spool');
+  assert.equal(existsSync(personalSpoolDir), false, 'fresh personal-dev never writes relay-spool while running');
   const relaySpoolFile = join(root, 'relay', 'relay-spool', `${keys.swarmTopicId}.json`);
   const entries = readRelaySpool(relaySpoolFile).entries;
   assert.equal(entries.length, 1);
   assert.equal(entries[0].targetNodeId, offlineNodeId);
   assert.equal(entries[0].id, `${sender.transport.localNodeId}:${emitted.messageId}`);
+
+  await personalPeer.stop();
+  assert.equal(existsSync(personalSpoolDir), false, 'fresh personal-dev never creates relay-spool on shutdown');
+});
+
+test('upgraded personal-dev drains pre-existing relay-spool and serves retained blobs while refusing new custody', async t => {
+  const root = directory(t);
+  const runtimes: DealerNodeRuntime[] = [];
+  t.after(async () => {
+    for (const runtime of [...runtimes].reverse()) {
+      await runtime.stop().catch(() => {});
+    }
+  });
+  const personalDir = join(root, 'personal-upgrade');
+  const legacyPersonal = new DealerNodeRuntime({
+    stateDir: personalDir,
+    member: 'ben',
+    name: 'ben-mac',
+    profile: 'personal-dev',
+    patch: { defaultExecutor: 'inbox' },
+    transport: {
+      discoveryDir: join(root, 'personal-mesh'),
+      multicast: false,
+      acceptRelaySpool: true,
+    },
+  });
+  const originalSender = runtimeFor(root, 'original-sender');
+  const target = runtimeFor(root, 'target');
+  runtimes.push(legacyPersonal, originalSender, target);
+
+  await legacyPersonal.start();
+  await originalSender.start();
+  await target.start();
+  await legacyPersonal.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  const personalPort = portOf(legacyPersonal.transport.endpointAddr!);
+  await target.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacyPersonal.transport.endpointAddr!],
+  });
+  await originalSender.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [legacyPersonal.transport.endpointAddr!],
+  });
+  await until(
+    () => originalSender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'target'),
+    'original sender learns target via pre-upgrade personal node',
+  );
+  const targetNodeId = target.node.getSelfCard(NETWORK).nodeId;
+  await target.stop();
+
+  const attachmentPath = join(root, 'legacy-spooled.txt');
+  writeFileSync(attachmentPath, 'retained-across-personal-dev-upgrade');
+  const attachment = await originalSender.transport.shareFile(attachmentPath);
+  const spooled = await originalSender.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: [targetNodeId] },
+    kind: 'collab.request.v1',
+    subject: 'Pre-upgrade spooled mail',
+    body: 'must still drain after personal-dev upgrade',
+    payload: {},
+    attachments: [attachment],
+    attachmentPaths: { [attachment.blake3Hash]: attachmentPath },
+  });
+  assert.equal(spooled.receipts[0]?.stage, 'queued');
+  assert.equal(spooled.receipts[0]?.executionReceipt?.relaySpooled, true);
+
+  // Take both the original sender and pre-upgrade personal node offline before upgrading.
+  await originalSender.stop();
+  await legacyPersonal.stop();
+
+  const keys = deriveNetworkKeys(NETWORK, 'secret');
+  const spoolFile = join(personalDir, 'relay-spool', `${keys.swarmTopicId}.json`);
+  assert.equal(readRelaySpool(spoolFile).entries.length, 1);
+
+  // Restart the same stateDir as upgraded personal-dev (default acceptRelaySpool = false).
+  const upgradedPersonal = new DealerNodeRuntime({
+    stateDir: personalDir,
+    member: 'ben',
+    name: 'ben-mac',
+    profile: 'personal-dev',
+    port: personalPort,
+    patch: { defaultExecutor: 'inbox' },
+    transport: {
+      discoveryDir: join(root, 'personal-mesh'),
+      multicast: false,
+    },
+  });
+  const relaySeed = runtimeFor(root, 'relay-seed');
+  const secondSender = runtimeFor(root, 'second-sender');
+  const otherOffline = runtimeFor(root, 'other-offline');
+  runtimes.push(upgradedPersonal, relaySeed, secondSender, otherOffline);
+  await upgradedPersonal.start();
+  await relaySeed.start();
+  await secondSender.start();
+  await otherOffline.start();
+  await relaySeed.mountNetwork({ networkId: NETWORK, passphrase: 'secret' });
+  await otherOffline.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [relaySeed.transport.endpointAddr!],
+  });
+  await secondSender.mountNetwork({
+    networkId: NETWORK,
+    passphrase: 'secret',
+    bootstrapPeers: [upgradedPersonal.transport.endpointAddr!, relaySeed.transport.endpointAddr!],
+  });
+  await until(
+    () => secondSender.node.listPeers({ networkId: NETWORK }).some(card => card.identity.member === 'other-offline'),
+    'second sender learns other-offline card via relay seed',
+  );
+  const otherOfflineTarget = otherOffline.node.getSelfCard(NETWORK).nodeId;
+  await otherOffline.stop();
+
+  // New third-party offline custody is refused by upgraded personal-dev and lands on relaySeed.
+  const freshSend = await secondSender.emitter.emit({
+    networkId: NETWORK,
+    routing: { mode: 'unicast', targets: [otherOfflineTarget] },
+    kind: 'collab.request.v1',
+    subject: 'New custody refused',
+    body: 'must skip upgraded personal-dev and spool on headless-relay',
+    payload: {},
+  });
+  assert.equal(freshSend.receipts[0]?.stage, 'queued');
+  assert.equal(freshSend.receipts[0]?.executionReceipt?.relaySpooled, true);
+  assert.equal(
+    readRelaySpool(join(root, 'relay-seed', 'relay-spool', `${keys.swarmTopicId}.json`)).entries.some(
+      entry => entry.targetNodeId === otherOfflineTarget,
+    ),
+    true,
+  );
+  assert.equal(
+    readRelaySpool(spoolFile).entries.some(entry => entry.targetNodeId === otherOfflineTarget),
+    false,
+    'upgraded personal-dev must not admit new third-party entries into its spool',
+  );
+
+  // Returning target receives the pre-existing spooled frame and fetches the retained blob
+  // from upgraded personal-dev even while the original sender remains offline.
+  const returningTarget = runtimeFor(root, 'target');
+  runtimes.push(returningTarget);
+  await returningTarget.start();
+  await until(
+    () => returningTarget.mailbox.list().totalCount === 1,
+    'upgraded personal-dev drains pre-existing spooled mail with retained blob',
+  );
+  const delivered = returningTarget.mailbox.list().items[0];
+  assert.equal(delivered.envelope.id, spooled.messageId);
+  const localAttachments = delivered.envelope.payload.localAttachments as string[];
+  assert.equal(localAttachments.length, 1);
+  assert.equal(readFileSync(localAttachments[0], 'utf8'), 'retained-across-personal-dev-upgrade');
+});
+
+test('OutboxRedriveService propagates shared 15s default delivery attempt budget and honors explicit override', async t => {
+  const timeouts: number[] = [];
+  const harness = await emitterHarness(t, {
+    send: async (_target, _bytes, opts) => {
+      if (opts?.timeoutMs !== undefined) timeouts.push(opts.timeoutMs);
+      throw new PeerUnreachableError(harness.targetCard.nodeId, 'connect ETIMEDOUT');
+    },
+  });
+  const first = await harness.emitter.emit({
+    networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v1',
+    subject: 'Default redrive timeout',
+    body: 'must use shared 15s attempt budget',
+    payload: {},
+  });
+  assert.equal(first.receipts[0]?.stage, 'queued');
+  assert.equal(timeouts.length, 1);
+  assert.ok(timeouts[0] > 10_000 && timeouts[0] <= 15_000, `expected initial send timeout in (10000, 15000], got ${timeouts[0]}`);
+
+  const defaultRedrive = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: harness.emitter.redriveOutboxItem!,
+  });
+  await defaultRedrive.flush({ force: true });
+  assert.equal(timeouts.length, 2);
+  assert.ok(
+    timeouts[1] > 10_000 && timeouts[1] <= 15_000,
+    `expected OutboxRedriveService default timeout in (10000, 15000], got ${timeouts[1]}`,
+  );
+
+  const overrideRedrive = new OutboxRedriveService({
+    outbox: harness.outbox,
+    deliver: harness.emitter.redriveOutboxItem!,
+    attemptTimeoutMs: 4_200,
+  });
+  await overrideRedrive.flush({ force: true });
+  assert.equal(timeouts.length, 3);
+  assert.ok(
+    timeouts[2] > 0 && timeouts[2] <= 4_200,
+    `expected OutboxRedriveService override timeout in (0, 4200], got ${timeouts[2]}`,
+  );
 });
