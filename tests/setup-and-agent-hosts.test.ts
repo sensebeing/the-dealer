@@ -4,7 +4,12 @@ import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
 import { planOrcaWorkspaceTerminal } from '../packages/plugins-orca/workspace.ts';
 import { createDedupCasPolicyPlugin, DEDUP_CAS_DUPLICATE_DETAIL } from '../packages/plugins-policy/index.ts';
 import { runCommand, CommandNotStartedError } from '../packages/subprocess/index.ts';
-import { buildAgentHostInvocation, resolveAgentSessionId } from '../packages/plugins-agent-host/index.ts';
+import {
+  buildAgentHostInvocation,
+  deliverAgentHostWakeTarget,
+  resolveAgentHostContinuation,
+  resolveAgentSessionId,
+} from '../packages/plugins-agent-host/index.ts';
 import { WakeupRedriveService, createInboxExecutorPlugin } from '../packages/index.ts';
 import test from 'node:test';
 import { execFile, spawn } from 'node:child_process';
@@ -595,8 +600,12 @@ for (const agent of ['codex', 'claude-code', 'chatgpt-dot', 'grok-bot', 'antigra
       assert.equal(call.cwd, root);
       if (agent === 'codex') {
         assert.equal(call.command, 'codex');
-        assert.deepEqual(args.slice(0, conversationMode === 'spawn' ? 2 : 4), conversationMode === 'spawn' ? ['exec', '--worktree'] : ['queue', '--thread', 'session', '--resume']);
-        assert.ok(args.includes('-p'));
+        assert.deepEqual(
+          args.slice(0, conversationMode === 'spawn' ? 8 : 9),
+          conversationMode === 'spawn'
+            ? ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox', '-p', 'review', '-C', root]
+            : ['exec', '-p', 'review', '-C', root, 'resume', 'session', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+        );
       } else if (agent === 'claude-code') {
         assert.equal(call.command, 'claude');
         assert.deepEqual(
@@ -853,7 +862,7 @@ test('runtime uses a generated fixed binding, persists mailbox and supports setu
     routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check this change', payload: {} });
   assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 'review', '--resume']);
+  assert.deepEqual(calls[0].args.slice(0, 7), ['exec', '-C', root, 'resume', 'review', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.equal(runtime.mailbox.getWakeTarget(`stream:${preset.topic}`)?.driver, 'agent-host');
   assert.equal((await cli(['setup', 'probe', '--root', root], runtime.stateDir)).node.configured, true);
   const invite = await cli(['setup', 'invite-prompt', '--network', 'new-team'], runtime.stateDir);
@@ -1236,7 +1245,14 @@ for (const [name, factory, command] of [
       assert.match(calls[0].args.at(-1)!, new RegExp(mailboxId));
       assert.equal(existsSync(settings), false);
       assert.equal(existsSync(hostSettings) ? readFileSync(hostSettings, 'utf8') : undefined, beforeSettings);
-      if (name === 'codex') assert.equal(calls[0].args[0], mode === 'spawn' ? 'exec' : 'queue');
+      if (name === 'codex') {
+        assert.deepEqual(
+          calls[0].args.slice(0, mode === 'spawn' ? 4 : 7),
+          mode === 'spawn'
+            ? ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']
+            : ['exec', '-C', root, 'resume', 'session', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+        );
+      }
       if (name === 'claude-code') {
         assert.deepEqual(
           calls[0].args.slice(0, 4),
@@ -1281,7 +1297,7 @@ test('named executors default to spawn and preserve conversation-mode precedence
     }).execute([message('test', source === 'payload' ? { conversationMode: 'fixed' } : {})], context,
       source === 'config' ? { conversationMode: 'fixed' } : {});
     assert.equal(result.executor, 'codex');
-    assert.equal(calls.at(-1)!.args[0], 'queue');
+    assert.deepEqual(calls.at(-1)!.args.slice(0, 5), ['exec', 'resume', 'existing', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   }
   await assert.rejects(createCodexExecutorPlugin({ commandRunner }).execute([message('bad', { conversationMode: 'inbox-only' })], context, {}), /Invalid agent conversationMode/);
   await assert.rejects(createCodexExecutorPlugin({ commandRunner: async () => ({ stdout: '', exitCode: 2 }) }).execute([message()], context, {}), /exited 2/);
@@ -1324,7 +1340,7 @@ test('orca executor resolves spawn, wave and fixed modes per batch', async t => 
 
 test('new host executor factories use host invocation mode', async t => {
   const cases = [
-    [createCodexCliExecutorPlugin, 'codex', ['exec', '--worktree']],
+    [createCodexCliExecutorPlugin, 'codex', ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']],
     [createAntigravityCliExecutorPlugin, 'agy', ['run', '--dangerously-skip-permissions']],
     [createClaudeAppExecutorPlugin, 'claude-app', ['send', '--session-mode', 'spawn']],
     [createChatgptAppExecutorPlugin, 'dot', ['send', '--session-mode', 'spawn']],
@@ -1345,7 +1361,8 @@ test('new host executor factories use host invocation mode', async t => {
   const calls: CommandRequest[] = [];
   await createCodexCliExecutorPlugin({ store, resolveTopicBinding: () => ({ executor: 'codex-cli', mode: 'wave', mailboxId: 'default' }), commandRunner: async request => { calls.push(request); return { stdout: '{"threadId":"wave-thread"}' }; } })
     .execute([message('wave-msg', { mode: 'wave' })], context, {});
-  assert.deepEqual(calls.at(-1)!.args.slice(0, 2), ['exec', '--worktree']);
+  assert.deepEqual(calls.at(-1)!.args.slice(0, 3), ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.equal(calls.at(-1)!.args.includes('--worktree'), false);
   assert.equal(store.getWakeTarget('default')?.driverConfig?.conversationMode, 'fixed');
   assert.equal(store.getWakeTarget('default')?.driverConfig?.sessionId, 'wave-thread');
   const claudeCalls: CommandRequest[] = [];
@@ -1440,8 +1457,8 @@ test('live applied preset enables dispatch immediately and changes unbound defau
     const result = await runtime.emitter.emit({ networkId: 'local', kind, routing: { mode: 'unicast', targets: ['member:solo'] }, subject: 'Review', body: 'Check change', payload: {} });
     assert.equal(result.receipts[0].stage, 'dispatched', JSON.stringify(result.receipts));
   }
-  assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 'review-session', '--resume']);
-  assert.deepEqual(calls[1].args.slice(0, 2), ['exec', '--worktree']);
+  assert.deepEqual(calls[0].args.slice(0, 5), ['exec', 'resume', 'review-session', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.deepEqual(calls[1].args.slice(0, 4), ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.equal(runtime.mailbox.getWakeTarget('stream:review')?.driver, 'agent-host');
   await runtime.applyAgentPreset({ host: 'claude', conversationMode: 'inbox-only', topic: 'manual', setDefault: true });
   assert.equal(runtime.config.defaultExecutor, 'inbox');
@@ -1493,7 +1510,9 @@ test('host-bound passive mailboxes redrive inbox conversation frames after initi
       assert.equal(call.command, command);
       assert.equal(call.cwd, root);
       assert.ok(call.args.includes(result.pointer!));
-      if (hostAgent === 'codex') assert.deepEqual(call.args.slice(0, 4), ['queue', '--thread', 'existing-session', '--resume']);
+      if (hostAgent === 'codex') {
+        assert.deepEqual(call.args.slice(0, 9), ['exec', '-p', 'review', '-C', root, 'resume', 'existing-session', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+      }
       if (hostAgent === 'claude-code') assert.deepEqual(call.args.slice(0, 3), ['--bg', '--resume', 'existing-session']);
       assert.equal(store.getWakeTarget('stream:session')?.pendingWake, false);
       const lease = store.check({ mailboxId: 'stream:session' });
@@ -1528,8 +1547,8 @@ for (const agent of ['codex', 'claude-code'] as const) {
     await createAgentPtyExecutorPlugin({ store, wakeup, agent, conversationMode: 'spawn', commandRunner: runner })
       .execute([message('msg-1')], context, {});
     const mailboxId = 'task:msg-1';
-    assert.deepEqual(calls[0].args.slice(0, agent === 'codex' ? 2 : 3),
-      agent === 'codex' ? ['exec', '--worktree'] : ['--bg', '--name', 'task_x3a_msg_x2d_1']);
+    assert.deepEqual(calls[0].args.slice(0, agent === 'codex' ? 4 : 3),
+      agent === 'codex' ? ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox'] : ['--bg', '--name', 'task_x3a_msg_x2d_1']);
     assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.conversationMode, 'fixed');
     assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, agent === 'codex' ? 'real-thread-42' : 'task_x3a_msg_x2d_1');
     store.check({ mailboxId });
@@ -1538,8 +1557,8 @@ for (const agent of ['codex', 'claude-code'] as const) {
     await createInboxExecutorPlugin({ store }).execute([reply], context, {});
     await wakeup.flushMailbox(mailboxId);
     assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1].args.slice(0, agent === 'codex' ? 4 : 3),
-      agent === 'codex' ? ['queue', '--thread', 'real-thread-42', '--resume'] : ['--bg', '--resume', 'task_x3a_msg_x2d_1']);
+    assert.deepEqual(calls[1].args.slice(0, agent === 'codex' ? 5 : 3),
+      agent === 'codex' ? ['exec', 'resume', 'real-thread-42', '--json', '--dangerously-bypass-approvals-and-sandbox'] : ['--bg', '--resume', 'task_x3a_msg_x2d_1']);
     assert.match(calls[1].args.at(-1)!, /\[Answer ready\].*Latest \(reply from alice, thread msg-1\): "Use the smaller design"/);
     assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
   });
@@ -1576,7 +1595,7 @@ test('agent executor preserves an in-flight arrival and releases its claim for i
   await Promise.race([second, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('No immediate redrive')), 2000); t.after(() => clearTimeout(timer)); })]);
   await wakeup.flushMailbox(mailboxId);
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1].args.slice(0, 4), ['queue', '--thread', 'real-race', '--resume']);
+  assert.deepEqual(calls[1].args.slice(0, 5), ['exec', 'resume', 'real-race', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.match(calls[1].args.at(-1)!, /New instruction/);
   assert.equal(store.getWakeTarget(mailboxId)?.pendingWake, false);
 });
@@ -1627,7 +1646,7 @@ test('host session keys preserve explicit identities and encode Claude mailbox k
         }
         const { args } = buildAgentHostInvocation(options);
         if (agent === 'codex' && conversationMode === 'spawn') continue;
-        const flag = agent === 'codex' ? '--thread' : agent === 'claude-code' ? (conversationMode === 'spawn' ? '--name' : '--resume') : '--session-key';
+        const flag = agent === 'codex' ? 'resume' : agent === 'claude-code' ? (conversationMode === 'spawn' ? '--name' : '--resume') : '--session-key';
         assert.equal(args[args.indexOf(flag) + 1], expected);
       }
     }
@@ -1732,7 +1751,7 @@ test('initial host ENOENT is retryable and recovery binds the actual Codex recei
   });
   t.after(() => service.stop());
   await service.flushMailbox('task:pre-effect', { force: true });
-  assert.deepEqual(calls[0].args.slice(0, 2), ['exec', '--worktree']);
+  assert.deepEqual(calls[0].args.slice(0, 4), ['exec', '--worktree', '--json', '--dangerously-bypass-approvals-and-sandbox']);
   assert.equal(store.getWakeTarget('task:pre-effect')?.driverConfig?.sessionId, 'host-returned-identity');
   assert.equal(store.getWakeTarget('task:pre-effect')?.driverConfig?.conversationMode, 'fixed');
   assert.equal(store.getWakeTarget('task:pre-effect')?.pendingWake, false);
@@ -1838,7 +1857,7 @@ for (const executor of ['codex-cli', 'agent-pty', 'orca-spawn'] as const) {
     assert.equal(runtime.resolveTopicBinding('review')?.binding.mode, undefined);
     if (executor === 'codex-cli') {
       assert.equal(calls.length, 1);
-      assert.deepEqual(calls[0].args.slice(0, 4), ['queue', '--thread', 's1', '--resume']);
+      assert.deepEqual(calls[0].args.slice(0, 5), ['exec', 'resume', 's1', '--json', '--dangerously-bypass-approvals-and-sandbox']);
       assert.equal(runtime.mailbox.getWakeTarget('default')?.driver, 'agent-host');
     } else if (executor === 'agent-pty') {
       assert.equal(calls.length, 1);
@@ -1939,7 +1958,7 @@ for (const [name, create] of [
       assert.equal(calls.length, 1);
     } else {
       assert.equal(calls.length, 2);
-      assert.ok(calls[1].args.includes('--resume'));
+      assert.ok(calls[1].args.includes(name === 'codex' ? 'resume' : '--resume'));
       assert.ok(calls[1].args.includes('task-session'));
     }
     store.upsertWakeTarget(worktreeMailbox, { driver: 'orca-terminal', driverConfig: { terminalHandle: 'term_origin' } });
@@ -2670,4 +2689,605 @@ test('mixed-capability routing prefers reachable eligible peers without breaking
   const offlineDecision = await runtime.kernel.ctx.services.router.route(triageEnvelope);
   assert.equal(offlineDecision.mode, 'multicast');
   assert.deepEqual(new Set(offlineDecision.targetNodeIds), new Set([liveTriage.nodeId, staleTriage.nodeId]));
+});
+
+test('codex wave captures JSONL thread_id without --worktree and resumes via exec resume', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (calls.length === 1) {
+      return {
+        stdout: [
+          'warning: diagnostic line',
+          '{"type":"thread.started","thread_id":"019d-jsonl-thread"}',
+          '{"type":"turn.started"}',
+          '{"type":"turn.completed"}',
+        ].join('\n'),
+      };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId: 'stream:codex-inbox',
+      workspacePath: root,
+      agentProfile: 'fast',
+    }),
+  });
+
+  // Wave 1: starts fresh directly in workspacePath without --worktree and captures JSONL thread_id.
+  await plugin.execute([message('w1')], context, {});
+  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    calls[0].args.slice(0, 7),
+    ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-p', 'fast', '-C', root],
+  );
+  assert.equal(calls[0].args.includes('--worktree'), false);
+  const afterWave1 = store.getWakeTarget('stream:codex-inbox')!;
+  assert.equal(afterWave1.driverConfig?.sessionId, '019d-jsonl-thread');
+  assert.equal(typeof afterWave1.driverConfig?.sessionStartedAt, 'number');
+  const lease1 = store.check({ mailboxId: 'stream:codex-inbox' });
+  store.ack(lease1.deliveryId!, 'stream:codex-inbox');
+
+  // Wave 2: omits sessionId in binding so persisted thread_id is preserved and resumed via exec resume.
+  await plugin.execute([message('w2')], context, {});
+  assert.equal(calls.length, 2);
+  assert.deepEqual(
+    calls[1].args.slice(0, 9),
+    ['exec', '-p', 'fast', '-C', root, 'resume', '019d-jsonl-thread', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:codex-inbox')?.driverConfig?.sessionId, '019d-jsonl-thread');
+
+  // Continuation parser handles both single JSON objects and JSONL with threadId/thread_id/sessionId/session_id.
+  assert.equal(
+    resolveAgentHostContinuation('codex', 'stream:codex-inbox', undefined, '{"session_id":"sid-1"}', 'wave').sessionId,
+    'sid-1',
+  );
+  assert.equal(
+    resolveAgentHostContinuation('codex', 'stream:codex-inbox', undefined, '{"type":"init"}\n{"threadId":"tid-2"}', 'spawn').sessionId,
+    'tid-2',
+  );
+});
+
+test('agent-host rotateAfterWaves rotates codex wave after acked threshold and never rotates mid-lease', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId: 'stream:rot-waves',
+      workspacePath: root,
+      wakeupPrefix: 'Check inbox carefully',
+      coalesceMs: 1_500,
+      rotateAfterWaves: 2,
+    }),
+  });
+
+  // Wave 1: starts thread-1 and propagates wakeTarget metadata.
+  await plugin.execute([message('rw1')], context, {});
+  const t1 = store.getWakeTarget('stream:rot-waves')!;
+  assert.equal(t1.wakeupPrefix, 'Check inbox carefully');
+  assert.equal(t1.coalesceMs, 1_500);
+  assert.equal(t1.rotateAfterWaves, 2);
+  assert.equal(t1.driverConfig?.sessionId, 'thread-1');
+  assert.equal(t1.completedWaves, 0);
+  const startedAt1 = t1.driverConfig?.sessionStartedAt as number;
+  assert.equal(typeof startedAt1, 'number');
+  store.ack(store.check({ mailboxId: 'stream:rot-waves' }).deliveryId!, 'stream:rot-waves');
+  assert.equal(store.getWakeTarget('stream:rot-waves')?.completedWaves, 1);
+
+  // Wave 2: completedWaves (1) < rotateAfterWaves (2), so reuses thread-1 and preserves sessionStartedAt.
+  await plugin.execute([message('rw2')], context, {});
+  assert.deepEqual(
+    calls[1].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:rot-waves')?.driverConfig?.sessionStartedAt, startedAt1);
+
+  // Lease wave 2, artificially raise completedWaves >= rotateAfterWaves while lease is outstanding:
+  // mid-lease redrive MUST NOT rotate!
+  const lease2 = store.check({ mailboxId: 'stream:rot-waves' });
+  store.upsertWakeTarget('stream:rot-waves', { completedWaves: 2 });
+  store.enqueue([message('rw2-followup')], { mailboxId: 'stream:rot-waves' });
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-waves', { now: startedAt1 + 10 });
+  assert.deepEqual(
+    calls[2].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:rot-waves')?.driverConfig?.sessionId, 'thread-1');
+
+  // Ack lease 2 -> completedWaves becomes 3 (>= 2) and no outstanding lease remains.
+  store.ack(lease2.deliveryId!, 'stream:rot-waves');
+
+  // Wave 3: rotates to a fresh thread-2 (no --worktree), resets completedWaves to 0, refreshes sessionStartedAt.
+  const rotateNow = startedAt1 + 5_000;
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-waves', { now: rotateNow });
+  assert.deepEqual(
+    calls[3].args.slice(0, 5),
+    ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-C', root],
+  );
+  assert.equal(calls[3].args.includes('--worktree'), false);
+  const rotated = store.getWakeTarget('stream:rot-waves')!;
+  assert.equal(rotated.driverConfig?.sessionId, 'thread-2');
+  assert.equal(rotated.driverConfig?.sessionStartedAt, rotateNow);
+  assert.equal(rotated.completedWaves, 0);
+});
+
+test('agent-host rotateAfterMs rotates codex and claude-code waves when session age expires', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"age-thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId: 'stream:rot-age',
+      workspacePath: root,
+      rotateAfterMs: 60_000,
+    }),
+  });
+
+  await plugin.execute([message('age-1')], context, {});
+  const t1 = store.getWakeTarget('stream:rot-age')!;
+  assert.equal(t1.driverConfig?.rotateAfterMs, 60_000);
+  assert.equal(t1.driverConfig?.sessionId, 'age-thread-1');
+  const startAt = t1.driverConfig?.sessionStartedAt as number;
+  store.ack(store.check({ mailboxId: 'stream:rot-age' }).deliveryId!, 'stream:rot-age');
+
+  // Before rotateAfterMs elapses: still reuses age-thread-1.
+  store.enqueue([message('age-2')], { mailboxId: 'stream:rot-age' });
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-age', { now: startAt + 30_000 });
+  assert.deepEqual(
+    calls[1].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'age-thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  assert.equal(store.getWakeTarget('stream:rot-age')?.driverConfig?.sessionStartedAt, startAt);
+
+  // While lease is open past rotateAfterMs: still does not rotate mid-lease.
+  const lease2 = store.check({ mailboxId: 'stream:rot-age' });
+  store.enqueue([message('age-2b')], { mailboxId: 'stream:rot-age' });
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-age', { now: startAt + 120_000 });
+  assert.deepEqual(
+    calls[2].args.slice(0, 7),
+    ['exec', '-C', root, 'resume', 'age-thread-1', '--json', '--dangerously-bypass-approvals-and-sandbox'],
+  );
+  store.ack(lease2.deliveryId!, 'stream:rot-age');
+
+  // After ack and past rotateAfterMs: rotates to age-thread-2 and resets completedWaves & sessionStartedAt.
+  const rotateAt = startAt + 125_000;
+  await deliverAgentHostWakeTarget(store, runner, 'stream:rot-age', { now: rotateAt });
+  assert.deepEqual(
+    calls[3].args.slice(0, 5),
+    ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-C', root],
+  );
+  assert.equal(calls[3].args.includes('--worktree'), false);
+  const rotated = store.getWakeTarget('stream:rot-age')!;
+  assert.equal(rotated.driverConfig?.sessionId, 'age-thread-2');
+  assert.equal(rotated.driverConfig?.rotateAfterMs, 60_000);
+  assert.equal(rotated.driverConfig?.sessionStartedAt, rotateAt);
+  assert.equal(rotated.completedWaves, 0);
+
+  // Claude Code wave rotation generates a fresh non-colliding session name and resumes it on subsequent waves.
+  const claudeCalls: CommandRequest[] = [];
+  const claudeRunner: CommandRunner = async request => {
+    claudeCalls.push(request);
+    return { stdout: '{}' };
+  };
+  const claudePlugin = createClaudeCodeExecutorPlugin({
+    store,
+    commandRunner: claudeRunner,
+    resolveTopicBinding: () => ({
+      executor: 'claude-code',
+      mode: 'wave',
+      mailboxId: 'stream:claude-rot',
+      workspacePath: root,
+      rotateAfterMs: 10_000,
+    }),
+  });
+  await claudePlugin.execute([message('c1')], context, {});
+  assert.deepEqual(claudeCalls[0].args.slice(0, 4), ['--bg', '--name', 'stream_x3a_claude_x2d_rot', '--dangerously-skip-permissions']);
+  const cStart = store.getWakeTarget('stream:claude-rot')!.driverConfig!.sessionStartedAt as number;
+  store.ack(store.check({ mailboxId: 'stream:claude-rot' }).deliveryId!, 'stream:claude-rot');
+
+  store.enqueue([message('c2')], { mailboxId: 'stream:claude-rot' });
+  const cRotateAt = cStart + 20_000;
+  await deliverAgentHostWakeTarget(store, claudeRunner, 'stream:claude-rot', { now: cRotateAt });
+  const expectedFreshName = `stream_x3a_claude_x2d_rot_r${cRotateAt}`;
+  assert.deepEqual(claudeCalls[1].args.slice(0, 4), ['--bg', '--name', expectedFreshName, '--dangerously-skip-permissions']);
+  assert.equal(store.getWakeTarget('stream:claude-rot')?.driverConfig?.sessionId, expectedFreshName);
+  store.ack(store.check({ mailboxId: 'stream:claude-rot' }).deliveryId!, 'stream:claude-rot');
+
+  await claudePlugin.execute([message('c3')], context, {});
+  assert.deepEqual(claudeCalls[2].args.slice(0, 4), ['--bg', '--resume', expectedFreshName, '--dangerously-skip-permissions']);
+});
+
+test('validateTopicBindings validates positive integer rotateAfterMs', () => {
+  assert.doesNotThrow(() =>
+    validateTopicBindings(
+      { task: { executor: 'codex', mode: 'wave', rotateAfterWaves: 5, rotateAfterMs: 3_600_000 } },
+      ['codex'],
+    ),
+  );
+  for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, '60000']) {
+    assert.throws(
+      () => validateTopicBindings({ task: { executor: 'codex', mode: 'wave', rotateAfterMs: invalid as unknown as number } }, ['codex']),
+      /Invalid topic binding: task/,
+    );
+  }
+});
+
+test('agent-host rotation preserves mid-execution acks committed before host command exits', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:sync-ack-rot';
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    // Synchronous codex exec claims and acknowledges its wave before exiting.
+    const lease = store.check({ mailboxId });
+    assert.ok(lease.deliveryId, 'expected an active lease during synchronous execution');
+    store.ack(lease.deliveryId!, mailboxId);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"sync-thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      rotateAfterWaves: 1,
+    }),
+  });
+
+  // Wave 1: starts sync-thread-1 and acks synchronously -> completedWaves = 1.
+  await plugin.execute([message('sa-1')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'sync-thread-1');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Wave 2: rotates to sync-thread-2 and acks synchronously -> completedWaves must stay 1, not be wiped to 0.
+  await plugin.execute([message('sa-2')], context, {});
+  assert.equal(calls[1].args.includes('resume'), false);
+  assert.equal(calls[1].args.includes('--worktree'), false);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'sync-thread-2');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Wave 3: must rotate again to sync-thread-3 instead of reusing sync-thread-2 for a second wave.
+  await plugin.execute([message('sa-3')], context, {});
+  assert.equal(calls[2].args.includes('resume'), false);
+  assert.equal(calls[2].args.includes('--worktree'), false);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'sync-thread-3');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+});
+
+test('agent-host ordinary enqueues preserve rotated sessionId over configuredSessionId until intentionally rebound', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:explicit-seed-rot';
+  const calls: CommandRequest[] = [];
+  let configuredSession = 'seed-A';
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      return { stdout: '{"type":"thread.started","thread_id":"rotated-B"}\n' };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: configuredSession,
+      rotateAfterWaves: 2,
+    }),
+  });
+
+  // Waves 1 & 2 reuse configured seed-A.
+  await plugin.execute([message('es-1')], context, {});
+  assert.deepEqual(calls[0].args.slice(0, 7), ['exec', '-C', root, 'resume', 'seed-A', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.configuredSessionId, 'seed-A');
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  await plugin.execute([message('es-2')], context, {});
+  assert.deepEqual(calls[1].args.slice(0, 7), ['exec', '-C', root, 'resume', 'seed-A', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Wave 3 rotates to rotated-B.
+  await plugin.execute([message('es-3')], context, {});
+  assert.equal(calls[2].args.includes('resume'), false);
+  const afterRotate = store.getWakeTarget(mailboxId)!;
+  assert.equal(afterRotate.driverConfig?.sessionId, 'rotated-B');
+  assert.equal(afterRotate.driverConfig?.configuredSessionId, 'seed-A');
+  const rotatedStartedAt = afterRotate.driverConfig?.sessionStartedAt;
+  assert.equal(typeof rotatedStartedAt, 'number');
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Wave 4 ordinary enqueue with unchanged binding (sessionId: 'seed-A') MUST resume rotated-B, not retired seed-A.
+  await plugin.execute([message('es-4')], context, {});
+  assert.deepEqual(calls[3].args.slice(0, 7), ['exec', '-C', root, 'resume', 'rotated-B', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'rotated-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionStartedAt, rotatedStartedAt);
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Intentional receiver rebinding to rebound-C advances bindingRevision, switches sessionId, and resets completedWaves.
+  const revisionBeforeRebind = store.getWakeTarget(mailboxId)!.bindingRevision!;
+  configuredSession = 'rebound-C';
+  await plugin.execute([message('es-5')], context, {});
+  assert.deepEqual(calls[4].args.slice(0, 7), ['exec', '-C', root, 'resume', 'rebound-C', '--json', '--dangerously-bypass-approvals-and-sandbox']);
+  const afterRebind = store.getWakeTarget(mailboxId)!;
+  assert.ok(afterRebind.bindingRevision! > revisionBeforeRebind);
+  assert.equal(afterRebind.driverConfig?.sessionId, 'rebound-C');
+  assert.equal(afterRebind.driverConfig?.configuredSessionId, 'rebound-C');
+  assert.equal(afterRebind.completedWaves, 0);
+});
+
+test('agent-host rotation atomically refuses concurrent lease acquisition across two ledger connections', async t => {
+  const root = directory(t);
+  const dbPath = join(root, 'mailbox.json');
+  const storeA = new MailboxStore(dbPath);
+  const storeB = new MailboxStore(dbPath);
+  const mailboxId = 'stream:lease-race';
+  const calls: CommandRequest[] = [];
+  let threadCounter = 0;
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (!request.args.includes('resume')) {
+      threadCounter += 1;
+      return { stdout: `{"type":"thread.started","thread_id":"race-thread-${threadCounter}"}\n` };
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store: storeA,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      rotateAfterWaves: 1,
+    }),
+  });
+
+  // Wave 1 completes and is acknowledged -> completedWaves = 1, eligible to rotate on next wave.
+  await plugin.execute([message('lr-1')], context, {});
+  assert.equal(storeA.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'race-thread-1');
+  storeB.ack(storeB.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Enqueue wave 2 on storeA, then simulate an independent CLI process (storeB) acquiring a lease
+  // between storeA's read-only peek and tryBeginWakeDelivery.
+  storeA.enqueue([message('lr-2')], { mailboxId });
+  let racedLeaseId: string | undefined;
+  const originalCheck = storeA.check.bind(storeA);
+  storeA.check = ((options) => {
+    const preview = originalCheck(options);
+    if (options?.peek && !racedLeaseId) {
+      racedLeaseId = storeB.check({ mailboxId }).deliveryId ?? undefined;
+    }
+    return preview;
+  }) as typeof storeA.check;
+
+  await assert.rejects(
+    deliverAgentHostWakeTarget(storeA, runner, mailboxId, { now: Date.now() }),
+    /Cannot rotate session while delivery lease .* is outstanding/,
+  );
+  storeA.check = originalCheck;
+  assert.ok(racedLeaseId, 'second ledger connection should have acquired a lease');
+  assert.equal(calls.length, 1, 'host command must not launch when rotation fence detects an outstanding lease');
+  const deferred = storeA.getWakeTarget(mailboxId)!;
+  assert.equal(deferred.deliveryInDoubt, undefined, 'refused rotation must defer without fencing');
+  assert.equal(deferred.pendingWake, true);
+  assert.equal(deferred.driverConfig?.sessionId, 'race-thread-1');
+
+  // Direct structured check on tryBeginWakeDelivery while lease is still held.
+  const directCheck = storeA.tryBeginWakeDelivery(mailboxId, deferred.bindingRevision, {
+    requireNoOutstandingLease: true,
+  });
+  assert.equal(directCheck.kind, 'outstanding_lease');
+  if (directCheck.kind === 'outstanding_lease') {
+    assert.equal(directCheck.leaseId, racedLeaseId);
+  }
+
+  // Once storeB acknowledges the concurrent lease and wave 3 is queued, rotation proceeds cleanly.
+  storeB.ack(racedLeaseId!, mailboxId);
+  storeA.enqueue([message('lr-3')], { mailboxId });
+  await deliverAgentHostWakeTarget(storeA, runner, mailboxId, { now: Date.now() });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].args.includes('resume'), false);
+  assert.equal(storeA.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'race-thread-2');
+  assert.equal(storeA.getWakeTarget(mailboxId)?.completedWaves, 0);
+});
+
+test('concurrent rebinding deliveries sharing a mailbox compute reset inside enqueue without erasing first ack', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:concurrent-rebind';
+  const calls: CommandRequest[] = [];
+  let configuredSession = 'seed-A';
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    const lease = store.check({ mailboxId });
+    if (lease.deliveryId) {
+      store.ack(lease.deliveryId, mailboxId);
+    }
+    return { stdout: '{"type":"turn.completed"}\n' };
+  };
+  const plugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: configuredSession,
+      rotateAfterWaves: 2,
+    }),
+  });
+
+  // Seed mailbox on seed-A.
+  await plugin.execute([message('cr-1')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'seed-A');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Rebind to seed-B and simulate two independent threads entering the same mailbox:
+  // Thread 2 prepares while the mailbox still holds seed-A, then Thread 1 enqueues, runs,
+  // and acknowledges its wave (completedWaves = 1 on seed-B) before Thread 2 commits its enqueue.
+  configuredSession = 'seed-B';
+  const originalEnqueue = store.enqueue.bind(store);
+  let capturedWakeTargetCb: ((current: WakeTargetState | undefined) => Partial<WakeTargetState>) | undefined;
+  const probeStore = Object.create(store) as MailboxStore;
+  probeStore.enqueue = ((batch, options) => {
+    if (typeof options?.wakeTarget === 'function' && !capturedWakeTargetCb) {
+      capturedWakeTargetCb = options.wakeTarget;
+      return { inserted: [], duplicateIds: [], mailboxIds: [], envelopeMailboxes: {} };
+    }
+    return originalEnqueue(batch, options);
+  }) as typeof store.enqueue;
+
+  await createCodexExecutorPlugin({
+    store: probeStore,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: 'seed-B',
+      rotateAfterWaves: 2,
+    }),
+  }).execute([message('cr-2b')], context, {});
+  assert.ok(capturedWakeTargetCb, 'enqueue should pass a transactional wakeTarget callback');
+
+  // Thread 1 completes rebind to seed-B and acks synchronously (completedWaves = 1).
+  await plugin.execute([message('cr-2a')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'seed-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Thread 2 now commits its previously prepared enqueue against the updated locked row:
+  // rebind is evaluated inside enqueue's write tx, so completedWaves MUST stay 1.
+  originalEnqueue([message('cr-2b')], { mailboxId, wakeTarget: capturedWakeTargetCb });
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'seed-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+});
+
+test('switching canonical agent host after rotation rebinds sessionId and resets rotation metadata', async t => {
+  const root = directory(t);
+  const store = new MailboxStore(join(root, 'mailbox.json'));
+  const mailboxId = 'stream:host-switch-rot';
+  const calls: CommandRequest[] = [];
+  const runner: CommandRunner = async request => {
+    calls.push(request);
+    if (request.command === 'codex' && !request.args.includes('resume')) {
+      return { stdout: '{"type":"thread.started","thread_id":"codex-rotated-B"}\n' };
+    }
+    return { stdout: '{}' };
+  };
+  const codexPlugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      sessionId: 'shared-A',
+      rotateAfterWaves: 1,
+    }),
+  });
+
+  // Codex runs wave 1 on shared-A, acks, then rotates wave 2 to codex-rotated-B.
+  await codexPlugin.execute([message('hs-1')], context, {});
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+  await codexPlugin.execute([message('hs-2')], context, {});
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'codex-rotated-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.configuredSessionId, 'shared-A');
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 1);
+
+  // Switch the same mailbox from codex to claude-code while keeping explicit sessionId: 'shared-A'.
+  // Because the canonical host changed, Claude MUST NOT inherit codex-rotated-B; it must rebind to shared-A
+  // and reset completedWaves / sessionStartedAt.
+  const claudePlugin = createClaudeCodeExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'claude-code',
+      mode: 'fixed',
+      mailboxId,
+      workspacePath: root,
+      sessionId: 'shared-A',
+      rotateAfterWaves: 2,
+    }),
+  });
+  await claudePlugin.execute([message('hs-3')], context, {});
+  const claudeCall = calls.at(-1)!;
+  assert.equal(claudeCall.command, 'claude');
+  assert.deepEqual(claudeCall.args.slice(0, 4), ['--bg', '--resume', 'shared-A', '--dangerously-skip-permissions']);
+  const afterSwitch = store.getWakeTarget(mailboxId)!;
+  assert.equal(afterSwitch.driverConfig?.hostAgent, 'claude-code');
+  assert.equal(afterSwitch.driverConfig?.sessionId, 'shared-A');
+  assert.equal(afterSwitch.driverConfig?.configuredSessionId, 'shared-A');
+  assert.equal(afterSwitch.completedWaves, 0);
+  store.ack(store.check({ mailboxId }).deliveryId!, mailboxId);
+
+  // Switching hosts without an explicit sessionId also clears the previous host's live sessionId.
+  const codexNoSessionPlugin = createCodexExecutorPlugin({
+    store,
+    commandRunner: runner,
+    resolveTopicBinding: () => ({
+      executor: 'codex',
+      mode: 'wave',
+      mailboxId,
+      workspacePath: root,
+      rotateAfterWaves: 2,
+    }),
+  });
+  await codexNoSessionPlugin.execute([message('hs-4')], context, {});
+  const backToCodex = calls.at(-1)!;
+  assert.equal(backToCodex.command, 'codex');
+  assert.equal(backToCodex.args.includes('resume'), false, 'host switch without explicit sessionId must start fresh instead of resuming Claude session');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.sessionId, 'codex-rotated-B');
+  assert.equal(store.getWakeTarget(mailboxId)?.driverConfig?.configuredSessionId, undefined);
+  assert.equal(store.getWakeTarget(mailboxId)?.completedWaves, 0);
 });

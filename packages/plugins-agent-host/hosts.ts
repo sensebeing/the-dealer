@@ -47,6 +47,35 @@ export function resolveAgentSessionId(
   return mailboxId;
 }
 
+function extractCodexIdentityFromRecord(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const receipt = value as Record<string, unknown>;
+  const identity = [receipt.threadId, receipt.thread_id, receipt.sessionId, receipt.session_id].find(
+    (id): id is string => typeof id === 'string' && id.trim().length > 0,
+  );
+  return identity;
+}
+
+function extractCodexSessionId(stdout: string): string | undefined {
+  try {
+    const identity = extractCodexIdentityFromRecord(JSON.parse(stdout));
+    if (identity) return identity;
+  } catch {
+    // Fall through to line-delimited JSONL output.
+  }
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const identity = extractCodexIdentityFromRecord(JSON.parse(trimmed));
+      if (identity) return identity;
+    } catch {
+      // Ignore non-JSON lines.
+    }
+  }
+  return undefined;
+}
+
 export function resolveAgentHostContinuation(
   agent: SupportedAgentHost,
   mailboxId: string,
@@ -57,18 +86,7 @@ export function resolveAgentHostContinuation(
   const host = normalizeAgentHost(agent);
   let resolved = resolveAgentSessionId(mailboxId, sessionId, agent);
   if (host === 'codex' && (mode === 'spawn' || (mode === 'wave' && !sessionId?.trim()))) {
-    resolved = undefined;
-    try {
-      const receipt = JSON.parse(stdout) as { threadId?: unknown; sessionId?: unknown };
-      const identity = [receipt.threadId, receipt.sessionId].find(
-        (id) => typeof id === 'string' && id.trim(),
-      );
-      if (typeof identity === 'string') {
-        resolved = identity;
-      }
-    } catch {
-      // No receipt was emitted.
-    }
+    resolved = extractCodexSessionId(stdout);
   }
   if (host === 'antigravity' || !resolved)
     return { hostAgent: undefined, conversationMode: undefined, sessionId: undefined };
@@ -112,13 +130,26 @@ export function buildAgentHostInvocation(options: {
         const resumeCodex = mode === 'fixed' || (mode === 'wave' && Boolean(session));
         return {
           command,
-          args: [
-            ...(resumeCodex ? ['queue', '--thread', session!, '--resume'] : ['exec', '--worktree']),
-            ...(agentProfile ? ['-p', agentProfile] : []),
-            ...(cwd ? ['-C', cwd] : []),
-            ...(resumeCodex ? ['--message'] : []),
-            promptText,
-          ],
+          args: resumeCodex
+            ? [
+                'exec',
+                ...(agentProfile ? ['-p', agentProfile] : []),
+                ...(cwd ? ['-C', cwd] : []),
+                'resume',
+                session!,
+                '--json',
+                '--dangerously-bypass-approvals-and-sandbox',
+                promptText,
+              ]
+            : [
+                'exec',
+                ...(mode === 'spawn' ? ['--worktree'] : []),
+                '--json',
+                '--dangerously-bypass-approvals-and-sandbox',
+                ...(agentProfile ? ['-p', agentProfile] : []),
+                ...(cwd ? ['-C', cwd] : []),
+                promptText,
+              ],
         };
       }
     case 'claude':

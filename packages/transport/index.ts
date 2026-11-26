@@ -3274,8 +3274,13 @@ export class P2PTransportService implements TransportService {
       throw new Error('Invalid blob ticket');
     }
     const owner = [...this.mounts.values()].find(mount => mount.peers.has(nodeId));
-    const address = nodeId === this.localNodeId ? this.endpointAddr : owner?.peers.get(nodeId) ?? url.host;
-    if (!address) {
+    const directCandidates = nodeId === this.localNodeId
+      ? [this.endpointAddr]
+      : [owner?.peers.get(nodeId), url.host];
+    const directAddresses = [...new Set(
+      directCandidates.filter((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0),
+    )];
+    if (directAddresses.length === 0) {
       throw new Error('Transport endpoint unavailable');
     }
     const fallbacks = nodeId === this.localNodeId ? [] : this.peerFallbacks(nodeId, this.mounts.values());
@@ -3286,7 +3291,7 @@ export class P2PTransportService implements TransportService {
     if (nodeId !== this.localNodeId) {
       for (const mount of this.mounts.values()) {
         for (const seed of mount.config.bootstrapPeers ?? []) {
-          if (this.isSelfEndpoint(seed) || seed === address) {
+          if (this.isSelfEndpoint(seed) || directAddresses.includes(seed)) {
             continue;
           }
           seedFallbacks.set(`${mount.keys.swarmTopicId}\n${seed}`, { mount, seed });
@@ -3295,18 +3300,20 @@ export class P2PTransportService implements TransportService {
     }
     try {
       let lastError: unknown;
-      try {
-        // Seed fallbacks prove the sender may be offline: fail over fast instead of burning
-        // the whole socket budget on its blackholed endpoint before asking the seed cache.
-        await this.fetchBlobDirect(
-          address,
-          hash,
-          size,
-          temp,
-          fallbacks.length > 0 || seedFallbacks.size > 0,
-        );
-      } catch (error) {
-        lastError = error;
+      const fastFail = directAddresses.length > 1 || fallbacks.length > 0 || seedFallbacks.size > 0;
+      for (const directAddress of directAddresses) {
+        await rm(temp, { force: true });
+        try {
+          // Multiple direct candidates or relay/seed fallbacks mean an earlier address may be
+          // stale or blackholed: fail over fast instead of burning the whole socket budget.
+          await this.fetchBlobDirect(directAddress, hash, size, temp, fastFail);
+          lastError = undefined;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (lastError !== undefined) {
         // The advertised endpoint is NAT-bound: try the peer's own tunnel to this node,
         // then every seed that can relay to it, until one transfer walks the hash.
         for (const fallback of fallbacks) {

@@ -361,3 +361,49 @@ test('only a strictly newer gossiped beacon can overwrite a peer endpoint or rel
   const reply = await transport.sendUnicast('beacon-net', alice, encode({ ping: true }));
   assert.equal(Buffer.from(reply).toString(), 'from-introducing-seed');
 });
+
+test('fetchBlobToPath falls back to ticket url.host when cached mount.peers endpoint is unreachable', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dealer-blob-fallback-'));
+  const sender = new P2PTransportService({
+    discoveryDir: join(root, 'sender'),
+    multicast: false,
+    listenHost: '127.0.0.1',
+    advertisedHost: '127.0.0.1',
+    socketTimeoutMs: 5_000,
+  });
+  const receiver = new P2PTransportService({
+    discoveryDir: join(root, 'receiver'),
+    multicast: false,
+    listenHost: '127.0.0.1',
+    advertisedHost: '127.0.0.1',
+    socketTimeoutMs: 5_000,
+  });
+  t.after(async () => {
+    await Promise.all([sender.dispose(), receiver.dispose()]);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await sender.mountNetwork({ networkId: 'lan-net', passphrase: 'secret' });
+  await receiver.mountNetwork({ networkId: 'lan-net', passphrase: 'secret' });
+
+  // Reserve and close a local TCP port so the cached peer address fails immediately.
+  const deadServer = createServer();
+  await new Promise<void>(resolve => deadServer.listen(0, '127.0.0.1', resolve));
+  const deadAddress = deadServer.address();
+  const deadPort = typeof deadAddress === 'object' && deadAddress ? deadAddress.port : 1;
+  await new Promise<void>(resolve => deadServer.close(() => resolve()));
+
+  const receiverMount = (receiver as any).mounts.get('lan-net');
+  receiverMount.peers.set(sender.localNodeId, `127.0.0.1:${deadPort}`);
+
+  const input = join(root, 'payload.bin');
+  const bytes = randomBytes(64 * 1024);
+  await writeFile(input, bytes);
+  const blob = await sender.shareFile(input);
+  assert.ok(blob.ticket.includes(sender.endpointAddr!));
+  assert.notEqual(receiverMount.peers.get(sender.localNodeId), sender.endpointAddr);
+
+  const destination = join(root, 'downloaded', 'payload.bin');
+  await receiver.fetchBlobToPath(blob.ticket, destination);
+  assert.deepEqual(await readFile(destination), bytes);
+});

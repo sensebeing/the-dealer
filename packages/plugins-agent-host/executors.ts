@@ -12,7 +12,7 @@ import {
 } from './hosts.ts';
 import type { SupportedAgentHost, AgentConversationMode, ActiveConversationMode } from './hosts.ts';
 import { canInheritThreadMailbox, groupThreadBatch, hasExplicitExecutor, resolveBoundMailboxId, resolveMailboxId, resolveSessionOrThreadMailbox, resolveSpawnMailboxId, resolveTopicAddress } from '../mailbox/index.ts';
-import type { MailboxStore, MailboxTopicBinding, WakeupRedriveService } from '../mailbox/index.ts';
+import type { MailboxStore, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import { checkedCommand, singleLine, runCommand } from '../subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
 import {
@@ -25,7 +25,11 @@ import {
   prepareExternalEffect,
   rethrowBeforeCommandStart,
 } from '../plugins-executor/index.ts';
-import { deliverAgentHostWakeTarget, serializeAgentHostDriverConfig } from './wakeup.ts';
+import {
+  deliverAgentHostWakeTarget,
+  readAgentHostDriverConfig,
+  serializeAgentHostDriverConfig,
+} from './wakeup.ts';
 
 export interface AgentHostTopicBinding extends MailboxTopicBinding {
   agent?: SupportedAgentHost;
@@ -34,6 +38,10 @@ export interface AgentHostTopicBinding extends MailboxTopicBinding {
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
+  wakeupPrefix?: string;
+  coalesceMs?: number;
+  rotateAfterWaves?: number;
+  rotateAfterMs?: number;
 }
 
 export interface AgentOptions {
@@ -46,6 +54,7 @@ export interface AgentOptions {
   agentProfile?: string;
   targetBot?: string;
   sessionId?: string;
+  rotateAfterMs?: number;
   command?: string;
   args?: readonly string[];
   cwd?: string;
@@ -108,9 +117,72 @@ type HostDelivery = {
   mode: ActiveConversationMode;
   mailboxId: string;
   request: CommandRequest;
-  driverConfig: Record<string, unknown>;
+  buildWakeTargetPatch: (lockedCurrent: WakeTargetState | undefined) => Partial<WakeTargetState>;
   trustWorkspace?: string;
 };
+
+function buildAgentHostWakeTargetPatch(
+  lockedCurrent: WakeTargetState | undefined,
+  desired: {
+    hostAgent: SupportedAgentHost;
+    conversationMode: ActiveConversationMode;
+    configuredSessionId?: string;
+    workspacePath?: string;
+    interactiveCommand?: string;
+    agentProfile?: string;
+    targetBot?: string;
+    rotateAfterMs?: number;
+    wakeupPrefix?: string;
+    coalesceMs?: number;
+    rotateAfterWaves?: number;
+  },
+): Partial<WakeTargetState> {
+  const existingDriverConfig = lockedCurrent?.driver === 'agent-host'
+    ? readAgentHostDriverConfig(lockedCurrent)
+    : undefined;
+  const prevCanonicalHost = existingDriverConfig?.hostAgent
+    ? normalizeAgentHost(existingDriverConfig.hostAgent)
+    : undefined;
+  const nextCanonicalHost = normalizeAgentHost(desired.hostAgent);
+  const hostChanged = prevCanonicalHost !== undefined && prevCanonicalHost !== nextCanonicalHost;
+  const prevConfigured = hostChanged ? undefined : existingDriverConfig?.configuredSessionId;
+  const prevLive = hostChanged ? undefined : existingDriverConfig?.sessionId;
+  const { configuredSessionId } = desired;
+  const isSameConfigured = configuredSessionId !== undefined && prevConfigured === configuredSessionId;
+  const isLegacyMatch =
+    configuredSessionId !== undefined && prevConfigured === undefined && prevLive === configuredSessionId;
+  const shouldSeedSession =
+    configuredSessionId !== undefined && (!isSameConfigured || !prevLive) && !isLegacyMatch;
+  const sessionRebound = hostChanged || (shouldSeedSession && Boolean(prevLive));
+  const driverConfig: Record<string, unknown> = serializeAgentHostDriverConfig({
+    hostAgent: desired.hostAgent,
+    conversationMode: desired.conversationMode,
+    ...(shouldSeedSession ? { sessionId: configuredSessionId } : {}),
+    ...(configuredSessionId !== undefined ? { configuredSessionId } : {}),
+    ...(desired.workspacePath ? { workspacePath: desired.workspacePath } : {}),
+    ...(desired.interactiveCommand ? { interactiveCommand: desired.interactiveCommand } : {}),
+    ...(desired.agentProfile ? { agentProfile: desired.agentProfile } : {}),
+    ...(desired.targetBot ? { targetBot: desired.targetBot } : {}),
+    ...(desired.rotateAfterMs !== undefined ? { rotateAfterMs: desired.rotateAfterMs } : {}),
+  });
+  if (hostChanged && configuredSessionId === undefined) {
+    driverConfig.sessionId = undefined;
+  }
+  if (sessionRebound) {
+    driverConfig.sessionStartedAt = undefined;
+  }
+  if (configuredSessionId === undefined && existingDriverConfig?.configuredSessionId !== undefined) {
+    driverConfig.configuredSessionId = undefined;
+  }
+  return {
+    driver: 'agent-host',
+    driverConfig,
+    ...(sessionRebound ? { completedWaves: 0 } : {}),
+    ...(desired.wakeupPrefix !== undefined ? { wakeupPrefix: desired.wakeupPrefix } : {}),
+    ...(desired.coalesceMs !== undefined ? { coalesceMs: desired.coalesceMs } : {}),
+    ...(desired.rotateAfterWaves !== undefined ? { rotateAfterWaves: desired.rotateAfterWaves } : {}),
+  };
+}
 
 function prepareAgentDelivery(
   envelope: MessageEnvelope,
@@ -168,9 +240,14 @@ function prepareAgentDelivery(
   const targetBot = optionalHostString(
     payload.targetBot ?? binding?.targetBot ?? config.targetBot ?? options.targetBot, 'targetBot',
   );
-  const sessionId = resolveAgentSessionId(mailboxId, optionalHostString(
+  const explicitSessionId = optionalHostString(
     payload.sessionId ?? binding?.sessionId ?? config.sessionId ?? options.sessionId, 'sessionId',
-  ), agent ?? 'codex');
+  );
+  const configuredSessionId = explicitSessionId?.trim() ? explicitSessionId : undefined;
+  const sessionId = resolveAgentSessionId(mailboxId, explicitSessionId, agent ?? 'codex');
+  const rotateAfterMs = optionalPositiveInteger(
+    binding?.rotateAfterMs ?? config.rotateAfterMs ?? options.rotateAfterMs, 'rotateAfterMs',
+  );
   const terminalPrompt = typeof payload.terminalPrompt === 'string' ? payload.terminalPrompt.trim() : undefined;
   const invocation = buildAgentHostInvocation({
     agent: agent ?? 'codex', conversationMode, mailboxId,
@@ -178,18 +255,25 @@ function prepareAgentDelivery(
     cwd, command, agentProfile, targetBot, sessionId,
   });
   const canonicalHost = agent ? normalizeAgentHost(agent) : undefined;
+  const desiredWakeTarget = {
+    hostAgent: agent ?? 'codex',
+    conversationMode,
+    configuredSessionId,
+    workspacePath: cwd,
+    interactiveCommand: command,
+    agentProfile,
+    targetBot,
+    rotateAfterMs,
+    wakeupPrefix: binding?.wakeupPrefix,
+    coalesceMs: binding?.coalesceMs,
+    rotateAfterWaves: binding?.rotateAfterWaves,
+  };
   return {
     type: 'host',
     mode: conversationMode,
     mailboxId,
     request: { ...invocation, cwd },
-    driverConfig: serializeAgentHostDriverConfig({
-      hostAgent: agent ?? 'codex', conversationMode, sessionId,
-      ...(cwd ? { workspacePath: cwd } : {}),
-      ...(command ? { interactiveCommand: command } : {}),
-      ...(agentProfile ? { agentProfile } : {}),
-      ...(targetBot ? { targetBot } : {}),
-    }),
+    buildWakeTargetPatch: lockedCurrent => buildAgentHostWakeTargetPatch(lockedCurrent, desiredWakeTarget),
     ...(canonicalHost === 'antigravity' || canonicalHost === 'antigravity-app' ? { trustWorkspace: cwd } : {}),
   };
 }
@@ -281,7 +365,7 @@ function createAgentExecutorPlugin(
             try {
               const result = store.enqueue(envelopes, {
                 signedEnvelopes: context?.signedEnvelopes, mailboxId, proposedSpawn,
-                wakeTarget: { driver: 'agent-host', driverConfig: delivery.driverConfig },
+                wakeTarget: delivery.buildWakeTargetPatch,
               });
               committed();
               const receipt = { ...result, executor: name, executionId: randomUUID(),
@@ -315,4 +399,11 @@ function optionalHostString(value: unknown, name: string): string | undefined {
   if (value !== undefined && typeof value !== 'string')
     throw new Error(`Invalid host configuration: ${name}`);
   return value as string | undefined;
+}
+
+function optionalPositiveInteger(value: unknown, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1)
+    throw new Error(`Invalid host configuration: ${name}`);
+  return value;
 }

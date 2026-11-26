@@ -129,7 +129,11 @@ Managed fixed presets default to `rotateAfterWaves: 1`, so each wave opens a new
 agent session tab in that workspace once the retiring slot's own agent and its
 child worktrees are done, then closes the retired tab after the replacement
 commits (never reset with `/new`); pass an explicit rotation threshold in the
-binding to reuse one tab for several waves.
+binding to reuse one tab for several waves. Non-Orca `agent-host` streams (for
+example `codex` in `wave` mode, which runs `codex exec` directly in
+`workspacePath` without `--worktree` and resumes via `codex exec resume`) also
+support `rotateAfterWaves` and `rotateAfterMs` on topic bindings for automatic
+session rotation between acknowledged waves.
 
 ## 4. Connect another machine
 
