@@ -6,7 +6,7 @@ import { randomBytes } from 'node:crypto';
 import { probeDealerSetup, buildOnboardingPrompts, resolveAgentBindingPreset, readAgentPresetContext } from './setup.ts';
 import type { SupportedAgentHost } from '../plugins-agent-host/index.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
-import { existsSync, readFileSync, rmSync, watch } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, watch } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { request } from 'node:http';
@@ -331,55 +331,147 @@ function daemonEntryPoint(checkoutDir?: string): string {
     : join(checkoutDir, 'bin', 'dealerd.js');
 }
 
-async function launchDaemon(argv: string[], stateDir: string, checkoutDir?: string): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
+const DAEMON_EXIT_LOG_TAIL_BYTES = 4_096;
+
+function readDaemonLogTail(logPath: string, startOffset: number, maxBytes = DAEMON_EXIT_LOG_TAIL_BYTES): string {
+  try {
+    const size = statSync(logPath).size;
+    if (size <= startOffset) {
+      return '';
+    }
+    const length = Math.min(size - startOffset, maxBytes);
+    const offset = size - length;
+    const buffer = Buffer.alloc(length);
+    const fd = openSync(logPath, 'r');
+    try {
+      const bytesRead = readSync(fd, buffer, 0, length, offset);
+      return buffer.subarray(0, bytesRead).toString('utf8').trim();
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return '';
+  }
+}
+
+async function launchDaemon(
+  argv: string[],
+  stateDir: string,
+  checkoutDir?: string,
+  timeoutMs = DAEMON_STARTUP_TIMEOUT_MS,
+): Promise<unknown> {
+  const logsDir = join(stateDir, 'logs');
+  mkdirSync(logsDir, { recursive: true, mode: 0o700 });
+  const logPath = join(logsDir, 'dealerd.log');
+  let startOffset = 0;
+  try {
+    startOffset = statSync(logPath).size;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error;
+    }
+  }
+  let child: ReturnType<typeof spawn>;
+  const logFd = openSync(logPath, 'a', 0o600);
+  try {
+    child = spawn(
       process.execPath,
       ['--no-warnings', '--experimental-strip-types', daemonEntryPoint(checkoutDir), ...argv],
       {
         detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['ignore', logFd, logFd],
         env: { ...process.env, DEALER_STATE_DIR: stateDir, [DEALER_DETACHED_LAUNCH_ENV]: '1' },
       },
     );
-    let output = '';
-    let errors = '';
-    let settled = false;
-    const timer = setTimeout(() => {
-      child.kill();
-      finish(new Error('Daemon startup timed out'));
-    }, DAEMON_STARTUP_TIMEOUT_MS);
-    function finish(error?: Error, value?: unknown) {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      if (error) {
-        reject(error);
-      } else {
-        child.stdout.destroy();
-        child.stderr.destroy();
-        child.unref();
-        resolve(value);
-      }
-    }
-    child.on('error', error => finish(error));
-    child.on('exit', code => finish(new Error(`Daemon exited ${code}: ${errors}`)));
-    child.stderr.on('data', chunk => {
-      errors += chunk;
-    });
-    child.stdout.on('data', chunk => {
-      output += chunk;
-      if (output.includes('\n')) {
+  } finally {
+    closeSync(logFd);
+  }
+
+  let exited = false;
+  let exitError: Error | undefined;
+  const exitController = new AbortController();
+  const onError = (error: Error) => {
+    if (exited) return;
+    exited = true;
+    exitError = error;
+    exitController.abort();
+  };
+  const onExit = (code: number | null) => {
+    if (exited) return;
+    exited = true;
+    const tail = readDaemonLogTail(logPath, startOffset);
+    exitError = new Error(`Daemon exited ${code}: ${tail}`);
+    exitController.abort();
+  };
+  child.once('error', onError);
+  child.once('exit', onExit);
+
+  const socket = join(stateDir, 'control.sock');
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (!exited) {
+      const owner = liveDaemonOwner(stateDir);
+      if (
+        child.pid !== undefined &&
+        existsSync(socket) &&
+        (owner === undefined || owner.pid === child.pid)
+      ) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          break;
+        }
         try {
-          finish(undefined, JSON.parse(output.split('\n')[0]));
+          const result = await rpc(socket, ['node', 'status', '--json'], {
+            inactivityMs: Math.min(2_000, remaining),
+          });
+          if (exited) {
+            break;
+          }
+          if (result.code !== 0) {
+            throw new Error(result.stderr.join('\n') || `Daemon status exited ${result.code}`);
+          }
+          const status = JSON.parse(result.stdout.join(''));
+          const statusPid = (status as { pid?: unknown } | null)?.pid;
+          const matchesChild = typeof statusPid === 'number'
+            ? statusPid === child.pid
+            : liveDaemonOwner(stateDir)?.pid === child.pid;
+          if (matchesChild) {
+            child.unref();
+            return status;
+          }
         } catch (error) {
-          finish(error as Error);
+          if (exited) {
+            break;
+          }
+          const { code, statusCode } = error as NodeJS.ErrnoException & { statusCode?: number };
+          const transient = (typeof code === 'string' && TRANSIENT_CONTROL_SOCKET_CODES.has(code)) || statusCode === 503;
+          if (!transient) {
+            throw error;
+          }
         }
       }
-    });
-  });
+      if (exited) {
+        break;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      await waitForDaemonStateChange(stateDir, Math.min(250, remaining), exitController.signal);
+    }
+    if (exited) {
+      throw exitError!;
+    }
+    try {
+      child.kill();
+    } catch {
+      // Child already exited.
+    }
+    throw new Error('Daemon startup timed out');
+  } finally {
+    child.off('error', onError);
+    child.off('exit', onExit);
+  }
 }
 
 type DaemonProbe = 'live' | 'absent' | 'stale_recovered';
@@ -566,7 +658,10 @@ async function probeMatchingDaemonStatus(
  * `control.sock` only once it is serving, and releases `runtime.lock` only when it stops. Wake
  * on either change instead of polling; the bounded fallback covers only a missed watch event.
  */
-function waitForDaemonStateChange(stateDir: string, timeoutMs: number): Promise<void> {
+function waitForDaemonStateChange(stateDir: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted || timeoutMs <= 0) {
+    return Promise.resolve();
+  }
   return new Promise(resolve => {
     let watcher: ReturnType<typeof watch> | undefined;
     let settled = false;
@@ -576,10 +671,12 @@ function waitForDaemonStateChange(stateDir: string, timeoutMs: number): Promise<
       }
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
       watcher?.close();
       resolve();
     };
     const timer = setTimeout(finish, timeoutMs);
+    signal?.addEventListener('abort', finish, { once: true });
     try {
       watcher = watch(stateDir, { persistent: false }, (event, filename) => {
         if (filename === null || filename === 'control.sock' || filename.startsWith('runtime.lock')) {
@@ -677,7 +774,7 @@ export async function ensureDaemonRunning(
     return ready;
   }
   try {
-    return await launchDaemon([], stateDir, checkoutDir);
+    return await launchDaemon([], stateDir, checkoutDir, startupTimeoutMs);
   } catch (error) {
     // A supervisor such as launchd may have claimed the lock between the readiness check and
     // the spawn; wait for that live owner to finish serving instead of failing on the
@@ -1216,7 +1313,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           inbox: 'dealer inbox <check|ack|list> [--mailbox <id>] [--lease <leaseId>] [--include-acked] [--json]',
           queue: QUEUE_USAGE,
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
-          outbox: 'dealer outbox <list|flush|requeue> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--force] [--json]',
+          outbox: 'dealer outbox <list|flush|requeue|drop> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--node <nodeId>] [--reason <text>] [--force] [--json]',
           peers: 'dealer peers <list|resolve|prune> [--network <id>] [--node <nodeId>] [--unreachable] [--json]',
           source: 'dealer source <add|list|wake> [<name>] [--json]',
         },
@@ -1765,8 +1862,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         if (!result) {
           throw new Error(`Outbox item not found: ${String(v.id)}`);
         }
+      } else if (action === 'drop') {
+        result = runtime.dropOutbox({
+          ...(typeof v.id === 'string' ? { id: String(v.id) } : {}),
+          ...(typeof v.node === 'string' ? { nodeId: String(v.node) } : {}),
+          ...(typeof v.network === 'string' ? { networkId: String(v.network) } : {}),
+          ...(typeof v.reason === 'string' ? { reason: String(v.reason) } : {}),
+        });
       } else {
-        throw new Error('Unknown outbox command; use list, flush or requeue');
+        throw new Error('Unknown outbox command; use list, flush, requeue or drop');
       }
     } else if (group === 'source' && action === 'list') {
       result = { sources: runtime.listSources() };

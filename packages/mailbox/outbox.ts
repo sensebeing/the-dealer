@@ -20,6 +20,8 @@ import type {
   OutboxClaimInput,
   OutboxClaimResult,
   OutboxDeliveryOutcome,
+  OutboxDropFilter,
+  OutboxDropResult,
   OutboxEnqueueInput,
   OutboxFlushOptions,
   OutboxFlushResult,
@@ -35,6 +37,8 @@ import { netKey } from './network-key.ts';
 export type {
   OutboxDeliveryFailure,
   OutboxDeliveryOutcome,
+  OutboxDropFilter,
+  OutboxDropResult,
   OutboxEnqueueInput,
   OutboxClaimInput,
   OutboxClaimResult,
@@ -80,7 +84,7 @@ export const MAX_RETAINED_TERMINAL_OUTBOX = 200;
 const LEGACY_OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
 const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
 const MIN_ATTEMPT_DELAY_MS = 2_000;
-const MAX_ATTEMPT_DELAY_MS = 60_000;
+const MAX_ATTEMPT_DELAY_MS = 1_800_000;
 const DEFAULT_CLAIM_LEASE_MS = 60_000;
 
 export interface OutboxAttemptUpdate {
@@ -795,6 +799,92 @@ export class OutboxStore {
     });
   }
 
+  /**
+   * Explicit operator removal of dead pending targets (or an entire queued obligation).
+   * Partially delivered obligations settle to `delivered` and clean staged attachments;
+   * obligations left with no delivered, failed, or pending targets become `failed`.
+   */
+  drop(filter: OutboxDropFilter): OutboxDropResult {
+    const id = filter?.id?.trim() || undefined;
+    const nodeId = filter?.nodeId?.trim() || undefined;
+    const networkId = filter?.networkId?.trim() || undefined;
+    const reason = filter?.reason?.trim() || 'Dropped by operator';
+    if (!id && !nodeId) {
+      throw new Error('outbox drop requires --id or --node');
+    }
+    return this.mutate((state, scheduleCleanup) => {
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      let updatedCount = 0;
+      let settledDeliveredCount = 0;
+      let markedFailedCount = 0;
+      const skippedActiveIds: string[] = [];
+      const items: OutboxItem[] = [];
+      for (const item of state.items) {
+        if (item.status !== 'queued' || item.supersededById !== undefined) continue;
+        if (id !== undefined && item.id !== id) continue;
+        if (networkId !== undefined && item.networkId !== networkId) continue;
+        if (nodeId !== undefined) {
+          const matchesNode =
+            item.pendingNodeIds.includes(nodeId) ||
+            item.inDoubtNodeIds.includes(nodeId) ||
+            item.relaySpooledNodeIds.includes(nodeId) ||
+            Boolean(item.approvalPendingNodeIds?.includes(nodeId));
+          if (!matchesNode) continue;
+        }
+        if (hasActiveAttempt(item, nowMs)) {
+          skippedActiveIds.push(item.id);
+          continue;
+        }
+        if (nodeId !== undefined) {
+          item.pendingNodeIds = item.pendingNodeIds.filter(candidate => candidate !== nodeId);
+          item.inDoubtNodeIds = item.inDoubtNodeIds.filter(candidate => candidate !== nodeId);
+          item.relaySpooledNodeIds = item.relaySpooledNodeIds.filter(candidate => candidate !== nodeId);
+          if (item.approvalPendingNodeIds !== undefined) {
+            item.approvalPendingNodeIds = item.approvalPendingNodeIds.filter(candidate => candidate !== nodeId);
+          }
+          scheduleCleanup(item.id, this.settleItem(item));
+          if (item.status === 'queued' && item.pendingNodeIds.length === 0) {
+            item.status = 'failed';
+            delete item.unresolvedRoute;
+            item.lastError = reason;
+          }
+        } else {
+          item.pendingNodeIds = [];
+          item.inDoubtNodeIds = [];
+          item.relaySpooledNodeIds = [];
+          item.approvalPendingNodeIds = undefined;
+          delete item.unresolvedRoute;
+          scheduleCleanup(item.id, this.settleItem(item));
+          if (item.status === 'queued') {
+            item.status = 'failed';
+            item.lastError = reason;
+          }
+        }
+        delete item.activeAttempt;
+        item.updatedAt = now;
+        item.nextAttemptAt = now;
+        updatedCount += 1;
+        if (item.status === 'delivered') {
+          if (item.failedNodeIds.length === 0) {
+            item.lastError = undefined;
+          }
+          settledDeliveredCount += 1;
+        } else if (item.status === 'failed') {
+          markedFailedCount += 1;
+        }
+        items.push(clone(item));
+      }
+      return {
+        updatedCount,
+        settledDeliveredCount,
+        markedFailedCount,
+        skippedActiveIds,
+        items,
+      };
+    });
+  }
+
   list(filter: OutboxListFilter = {}): OutboxItem[] {
     if (
       filter.status !== undefined &&
@@ -1012,8 +1102,8 @@ export interface OutboxRedriveOptions {
   attemptTimeoutMs?: number;
 }
 
-function attemptDelayMs(attempts: number): number {
-  return Math.min(MAX_ATTEMPT_DELAY_MS, MIN_ATTEMPT_DELAY_MS * 2 ** Math.min(attempts, 5));
+export function attemptDelayMs(attempts: number): number {
+  return Math.min(MAX_ATTEMPT_DELAY_MS, MIN_ATTEMPT_DELAY_MS * 2 ** Math.min(attempts, 10));
 }
 
 /**

@@ -97,7 +97,7 @@ async function spawnPeers(t: TestContext) {
       case 'terminal create': return reply({ terminal: { handle: 'term_child' } });
       case 'terminal list': return reply({
         terminals: [{
-          handle: request.args.includes(`path:${childWorkspace}`) ? 'term_child' : 'term_origin',
+          handle: request.args.includes('id:wt-1') || request.args.includes(`path:${childWorkspace}`) ? 'term_child' : 'term_origin',
           connected: true, writable: true, preview: '>',
         }],
       });

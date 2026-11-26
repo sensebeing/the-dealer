@@ -8,7 +8,20 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { CommandNotStartedError, runCommand, checkedCommand, singleLine } from '../subprocess/index.ts';
 import type { CommandRequest, CommandRunner } from '../subprocess/index.ts';
-import { orcaMutationRunner, readOrcaTerminalList, readOrcaWorktreePs } from './inventories.ts';
+import {
+  buildOrcaWorktreeSelector,
+  OrcaWorktreeSelectorAmbiguousError,
+  orcaMutationRunner,
+  parseOrcaSelectorAmbiguousError,
+  readOrcaTerminalList,
+  readOrcaWorktreePs,
+} from './inventories.ts';
+
+export {
+  buildOrcaWorktreeSelector,
+  OrcaWorktreeSelectorAmbiguousError,
+  parseOrcaSelectorAmbiguousError,
+};
 
 export async function findOrcaWorktreeByName(
   runner: CommandRunner,
@@ -95,6 +108,7 @@ export interface OrcaIdleResult {
 
 export interface OrcaTerminalRow {
   worktreePath?: string;
+  worktreeId?: string;
   handle: string;
   connected: boolean;
   writable?: boolean;
@@ -117,6 +131,8 @@ interface OrcaProbeOptions {
 export interface OrcaWorkspaceIdleOptions extends OrcaProbeOptions {
   /** Cached inventories may inform readiness displays only. */
   advisory?: boolean;
+  /** Explicit Orca worktree ID to disambiguate workspaces sharing a filesystem path. */
+  worktreeId?: string;
   /**
    * The terminal this wakeup will write into. `null` means delivery opens its own tab,
    * so retained composers cannot gate the wakeup. A handle restricts composer inspection
@@ -218,7 +234,20 @@ export async function checkOrcaWorkspaceIdle(
   };
   const rows: Workspace[] = inventory.worktrees;
   const rowsById = new Map(rows.map(row => [row.worktreeId, row]));
-  const root = rows.find((row) => row.path === cwd);
+  const requestedWorktreeId = options?.worktreeId?.trim();
+  const normalizedWorktreeId = requestedWorktreeId?.startsWith('id:')
+    ? requestedWorktreeId.slice(3)
+    : requestedWorktreeId;
+  let root: Workspace | undefined;
+  if (requestedWorktreeId) {
+    root = rowsById.get(requestedWorktreeId) ?? (normalizedWorktreeId ? rowsById.get(normalizedWorktreeId) : undefined);
+  } else {
+    const matching = rows.filter(row => row.path === cwd);
+    if (matching.length > 1) {
+      throw new OrcaWorktreeSelectorAmbiguousError(buildOrcaWorktreeSelector(cwd));
+    }
+    root = matching[0];
+  }
   if (!root) {
     return { idle: false, reason: 'Workspace not found' };
   }
@@ -237,7 +266,7 @@ export async function checkOrcaWorkspaceIdle(
   const terminalInventories = new Map<string, Promise<OrcaTerminalRow[] | undefined>>();
   const terminalHandlesByWorktreeId = new Map<string, ReadonlySet<string>>();
   const fetchWorktreeTerminals = async (row: Workspace): Promise<OrcaTerminalRow[] | undefined> => {
-    const terminals = JSON.parse(await readOrcaTerminalList(runner, command, row.path, cwd, signal, options?.advisory));
+    const terminals = JSON.parse(await readOrcaTerminalList(runner, command, row.path, cwd, signal, options?.advisory, row.worktreeId));
     if (terminals.ok !== true || terminals.result?.truncated || !Array.isArray(terminals.result?.terminals)) {
       return undefined;
     }
@@ -923,20 +952,23 @@ export async function spawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string } = {},
+  options: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; worktreeId?: string } = {},
 ): Promise<{ handle: string; raw: unknown }> {
   const launchCommand = buildOrcaAgentLaunchCommand(options);
+  const selector = buildOrcaWorktreeSelector(cwd, options.worktreeId);
   let spawned;
   try {
-    spawned = await orcaMutationRunner(runner, cwd)({
+    spawned = await orcaMutationRunner(runner, cwd, options.worktreeId)({
       command,
-      args: ['terminal', 'create', '--worktree', `path:${cwd}`, '--command', launchCommand, '--json'],
+      args: ['terminal', 'create', '--worktree', selector, '--command', launchCommand, '--json'],
       cwd,
       signal,
     });
   } catch (error) {
     if (error instanceof CommandNotStartedError || error instanceof OrcaTerminalLaunchRejectedError)
       throw error;
+    const ambiguous = parseOrcaSelectorAmbiguousError(error, selector);
+    if (ambiguous) throw ambiguous;
     const failure = error as { stdout?: unknown; exitCode?: unknown } | null;
     if (typeof failure?.stdout === 'string' && failure.exitCode !== null) {
       let parsed;
@@ -953,6 +985,8 @@ export async function spawnOrcaWorkspaceTerminal(
     }
     throw error;
   }
+  const ambiguousOutput = parseOrcaSelectorAmbiguousError(spawned.stdout, selector);
+  if (ambiguousOutput) throw ambiguousOutput;
   let parsed;
   try {
     parsed = JSON.parse(spawned.stdout.trim());
@@ -1021,8 +1055,9 @@ export async function inspectOrcaWorkspaceTerminal(
   signal?: AbortSignal,
   preferredPaneKey?: string,
   advisory = false,
+  worktreeId?: string,
 ): Promise<OrcaTerminalPresence> {
-  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal, advisory));
+  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal, advisory, worktreeId));
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
@@ -1035,9 +1070,9 @@ export async function planOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean; excludedHandles?: ReadonlySet<string> },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean; excludedHandles?: ReadonlySet<string>; worktreeId?: string },
 ): Promise<{ kind: 'existing'; handle: string } | { kind: 'shell'; handle: string } | { kind: 'create' } | { kind: 'unusable'; handle: string }> {
-  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal));
+  const inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal, false, options?.worktreeId));
   if (inventory.ok !== true || inventory.result?.truncated || !Array.isArray(inventory.result?.terminals)) {
     throw new Error('Incomplete Orca terminal inventory');
   }
@@ -1066,7 +1101,7 @@ export async function resolveOrSpawnOrcaWorkspaceTerminal(
   command: string,
   cwd: string,
   signal?: AbortSignal,
-  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean },
+  options?: { agent?: SupportedOrcaAgent; interactiveCommand?: string; resumeCommand?: string; sessionId?: string; preferredHandle?: string; preferredPaneKey?: string; dedicatedTab?: boolean; worktreeId?: string },
 ): Promise<{ handle: string; spawned: boolean; shellBootstrapped?: boolean }> {
   const plan = await planOrcaWorkspaceTerminal(runner, command, cwd, signal, options);
   if (plan.kind === 'unusable') throw new Error('Terminal is disconnected or not writable');
@@ -1213,13 +1248,14 @@ export async function closeOrcaWorkspaceTerminal(
   cwd: string,
   terminalHandle: string,
   signal?: AbortSignal,
+  worktreeId?: string,
 ): Promise<void> {
   const handle = terminalHandle.trim();
   if (!handle) return;
   let result: { stdout: string; stderr?: string; exitCode?: number } | undefined;
   let failure: unknown;
   try {
-    result = await orcaMutationRunner(runner, cwd)({
+    result = await orcaMutationRunner(runner, cwd, worktreeId)({
       command,
       args: ['terminal', 'close', '--terminal', handle, '--json'],
       cwd,
@@ -1255,7 +1291,7 @@ export async function closeOrcaWorkspaceTerminal(
   // the one-live-terminal invariant, so only a still-present terminal keeps the retirement open.
   let inventory: unknown;
   try {
-    inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal));
+    inventory = JSON.parse(await readOrcaTerminalList(runner, command, cwd, cwd, signal, false, worktreeId));
   } catch {
     throw closeError;
   }
@@ -1284,22 +1320,32 @@ export async function setOrcaWorkspaceComment(
   command: string,
   workspacePath: string | undefined,
   comment: string,
-  options: { cwd?: string; signal?: AbortSignal } = {},
+  options: { cwd?: string; signal?: AbortSignal; worktreeId?: string } = {},
 ): Promise<void> {
-  const output = await checkedCommand(orcaMutationRunner(runner, workspacePath), {
-    command,
-    args: [
-      'worktree',
-      'set',
-      '--worktree',
-      workspacePath ? `path:${workspacePath}` : 'current',
-      '--comment',
-      singleLine(comment),
-      '--json',
-    ],
-    cwd: options.cwd ?? workspacePath,
-    signal: options.signal,
-  });
+  const selector = workspacePath || options.worktreeId?.trim()
+    ? buildOrcaWorktreeSelector(workspacePath ?? '', options.worktreeId)
+    : 'current';
+  let output;
+  try {
+    output = await checkedCommand(orcaMutationRunner(runner, workspacePath, options.worktreeId), {
+      command,
+      args: [
+        'worktree',
+        'set',
+        '--worktree',
+        selector,
+        '--comment',
+        singleLine(comment),
+        '--json',
+      ],
+      cwd: options.cwd ?? workspacePath,
+      signal: options.signal,
+    });
+  } catch (error) {
+    throw parseOrcaSelectorAmbiguousError(error, selector) ?? error;
+  }
+  const ambiguous = parseOrcaSelectorAmbiguousError(output.stdout, selector);
+  if (ambiguous) throw ambiguous;
   if (JSON.parse(output.stdout).ok === false) {
     throw new Error('Orca workspace comment update failed');
   }
@@ -1360,6 +1406,15 @@ async function readOrcaChildCreators(
   return creators;
 }
 
+function extractOrcaWorktreeId(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const worktree = isRecord(value.worktree) ? value.worktree : undefined;
+  for (const candidate of [value.worktreeId, value.id, worktree?.worktreeId, worktree?.id]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return undefined;
+}
+
 export async function ensureOrcaWorkspace(
   runner: CommandRunner,
   command: string,
@@ -1371,9 +1426,9 @@ export async function ensureOrcaWorkspace(
     agySettingsPath?: string;
     signal?: AbortSignal;
   },
-): Promise<{ workspacePath: string; created: boolean }> {
+): Promise<{ workspacePath: string; worktreeId?: string; created: boolean }> {
   const cwd = options.repoRoot ?? dirname(options.workspacePath);
-  const rows = await listOrcaWorkspaces(runner, command, cwd, options.signal);
+  const rows = await readOrcaWorkspaceList(runner, command, cwd, options.signal);
   const canonical = (path: string): string => {
     const absolute = resolve(path);
     if (existsSync(absolute)) return realpathSync(absolute);
@@ -1381,9 +1436,13 @@ export async function ensureOrcaWorkspace(
     return parent === absolute ? absolute : join(canonical(parent), basename(absolute));
   };
   const found = rows.find(
-    (row): row is { path: string } => typeof row?.path === 'string' && canonical(row.path) === canonical(options.workspacePath),
+    (row): row is OrcaListedWorktree & { path: string } =>
+      typeof row?.path === 'string' && canonical(row.path) === canonical(options.workspacePath),
   );
-  if (found) return { workspacePath: found.path, created: false };
+  if (found) {
+    const worktreeId = extractOrcaWorktreeId(found);
+    return { workspacePath: found.path, ...(worktreeId ? { worktreeId } : {}), created: false };
+  }
   if (!options.repoRoot)
     throw new Error('Creating a fixed Orca workspace requires a receiver-local repoRoot');
   const created = await checkedCommand(orcaMutationRunner(runner), {
@@ -1404,6 +1463,7 @@ export async function ensureOrcaWorkspace(
   const path = response.result?.path ?? response.result?.worktree?.path;
   if (response.ok === false || typeof path !== 'string' || !path.trim())
     throw new Error('Orca workspace creation returned no path');
+  const worktreeId = extractOrcaWorktreeId(response.result ?? response);
   const settings = options.agySettingsPath ?? join(homedir(), '.gemini/antigravity-cli/settings.json');
   const temporaryRoot = tmpdir();
   const mayTrust =
@@ -1416,7 +1476,7 @@ export async function ensureOrcaWorkspace(
   ) {
     trustAntigravityWorkspace(path, settings);
   }
-  return { workspacePath: path, created: true };
+  return { workspacePath: path, ...(worktreeId ? { worktreeId } : {}), created: true };
 }
 
 export async function resolveOrcaWorkspaceTerminal(
