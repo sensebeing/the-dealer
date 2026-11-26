@@ -389,6 +389,12 @@ function isCallerOrcaIdentitySwitch(
   );
 }
 
+function preserveEquivalentOrcaWorktreeId(existing?: string, candidate?: string): string | undefined {
+  const canonical = normalizeOrcaWorktreeId(candidate);
+  if (!canonical) return undefined;
+  return existing !== undefined && sameOrcaWorktreeId(existing, canonical) ? existing : canonical;
+}
+
 /** Single owner of caller-driven Orca conversation identity transitions. */
 export function resolveCallerOrcaWakeTargetPatch(
   snapshot: WakeTargetState | undefined,
@@ -403,6 +409,9 @@ export function resolveCallerOrcaWakeTargetPatch(
   const worktreeChanged = Boolean(
     callerWorktreeId && existingWorktreeId && callerWorktreeId !== existingWorktreeId,
   );
+  const persistedWorktreeId = workspaceChanged
+    ? callerWorktreeId
+    : preserveEquivalentOrcaWorktreeId(existing?.worktreeId, callerWorktreeId);
   const switchedIdentity = isCallerOrcaIdentitySwitch(existing, caller);
   const nextAgent = switchedIdentity ? caller.agent : (caller.agent ?? existing?.agent);
   const clearLaunchConfig = (existing?.interactiveCommand !== undefined || existing?.resumeCommand !== undefined) &&
@@ -416,9 +425,9 @@ export function resolveCallerOrcaWakeTargetPatch(
         ? { workspacePath: undefined }
         : {}),
     ...(workspaceChanged
-      ? { worktreeId: callerWorktreeId }
-      : callerWorktreeId
-        ? { worktreeId: callerWorktreeId }
+      ? { worktreeId: persistedWorktreeId }
+      : persistedWorktreeId !== undefined
+        ? { worktreeId: persistedWorktreeId }
         : {}),
     ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),
     ...(switchedIdentity ? {
@@ -454,7 +463,9 @@ export function resolveConfiguredOrcaWakeTargetPatch(
     driver: 'orca-run', completedWaves: 0, retiredSessionId: undefined, terminalHandle: nextConfiguredHandle, paneKey: undefined,
     sessionId: undefined, configuredSessionId: undefined, configuredTerminalHandle: undefined,
     retiredTerminalHandle: undefined,
-    worktreeId: input.workspacePath ? nextWorktreeId : undefined,
+    worktreeId: input.workspacePath
+      ? preserveEquivalentOrcaWorktreeId(existing?.worktreeId, nextWorktreeId)
+      : undefined,
     ...(input.hasTopicBinding || input.configuredAgent !== undefined ? { agent: input.configuredAgent } : {}),
     ...commandPatch, ...resumeCommandPatch,
   });
@@ -468,6 +479,11 @@ export function resolveConfiguredOrcaWakeTargetPatch(
   const effectiveWorktreeId = nextWorktreeId ?? (sameWorkspacePath ? existingWorktreeId : undefined);
   const sameWorktreeId = effectiveWorktreeId === existingWorktreeId;
   const sameWorkspace = sameWorkspacePath && sameWorktreeId;
+  // Preserve an equivalent stored representation (e.g. legacy `id:wt-a` vs `wt-a`) so a
+  // format-only refresh or wave enqueue never bumps bindingRevision or invalidates pendingDelivery.
+  const persistedWorktreeId = sameWorkspacePath
+    ? preserveEquivalentOrcaWorktreeId(existing?.worktreeId, effectiveWorktreeId)
+    : effectiveWorktreeId;
   const handleUnchangedSinceConfig = nextConfiguredHandle !== undefined && nextConfiguredHandle === existing?.configuredTerminalHandle;
   const samePinnedHandle = nextConfiguredHandle === undefined || nextConfiguredHandle === existing?.terminalHandle || handleUnchangedSinceConfig;
   const sameAgent = input.configuredAgent === undefined || existing?.agent === undefined || input.configuredAgent === existing.agent;
@@ -523,7 +539,7 @@ export function resolveConfiguredOrcaWakeTargetPatch(
       interactiveCommand: existing?.interactiveCommand, resumeCommand: existing?.resumeCommand });
   return orcaWakeTargetPatch({
     driver: 'orca-terminal', ...identity,
-    worktreeId: effectiveWorktreeId,
+    worktreeId: persistedWorktreeId,
     configuredTerminalHandle: input.hasTopicBinding || nextConfiguredHandle !== undefined ? nextConfiguredHandle : existing?.configuredTerminalHandle,
     ...commandPatch, ...resumeCommandPatch,
     ...(clearLaunchConfig ? { interactiveCommand: undefined, resumeCommand: undefined } : {}),

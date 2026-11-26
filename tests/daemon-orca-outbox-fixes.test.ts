@@ -1036,7 +1036,7 @@ test('outbox drop preserves uncertainty and remote custody so cancellation canno
   assert.equal(existsSync(laterStagedCopy), true, 'staged evidence retained after sibling delivery when dropped target remained uncertain');
 });
 
-test('canonical Orca worktreeId comparisons treat raw and id:-prefixed forms identically across ownership, transitions, and pending witnesses', t => {
+test('canonical Orca worktreeId comparisons treat raw and id:-prefixed forms identically across ownership, transitions, and pending witnesses', async t => {
   const root = makeDir(t, 'dealer-orca-canonical-id-');
   const workspacePath = join(root, 'ws-canon');
   mkdirSync(workspacePath, { recursive: true });
@@ -1113,12 +1113,13 @@ test('canonical Orca worktreeId comparisons treat raw and id:-prefixed forms ide
     { requireBoundOwner: true },
   );
   assert.ok(reconciledFromRaw, 'raw caller recognized as legitimate bound owner for id:-prefixed target');
-  assert.equal(reconciledFromRaw?.driverConfig?.worktreeId, 'wt-canon');
+  assert.equal(reconciledFromRaw?.driverConfig?.worktreeId, 'id:wt-canon');
   assert.equal(reconciledFromRaw?.driverConfig?.sessionId, 'sess-canon-2');
   assert.equal(reconciledFromRaw?.driverConfig?.paneKey, 'tab2:leaf');
   assert.equal(reconciledFromRaw?.completedWaves, 1);
   assert.equal(reconciledFromRaw?.deliveryInDoubt, true);
-  assert.ok(reconciledFromRaw?.pendingDelivery, 'pendingDelivery witness preserved when normalizing legacy id: prefix');
+  assert.equal(reconciledFromRaw?.bindingRevision, revBeforePrefixed, 'format-only caller check does not bump bindingRevision');
+  assert.ok(reconciledFromRaw?.pendingDelivery, 'pendingDelivery witness preserved for legacy id: prefix');
 
   // 3. Configured transition between raw and id:-prefixed forms preserves conversation fields.
   const configMailbox = 'stream:canon-config';
@@ -1145,6 +1146,97 @@ test('canonical Orca worktreeId comparisons treat raw and id:-prefixed forms ide
   assert.equal(afterConfig.driverConfig?.sessionId, 'sess-cfg');
   assert.equal(afterConfig.driverConfig?.paneKey, 'cfg:leaf');
   assert.equal(afterConfig.completedWaves, 1);
+
+  // 4. Legacy prefixed ID with active pendingDelivery witness survives config refresh and wave
+  //    enqueue without bumping bindingRevision, permitting both consumer and receipt settlement.
+  const witnessRefreshMailbox = 'stream:legacy-witness-refresh';
+  store.enqueue([makeSignedEnvelope(sender, 'legacy-witness-1')], {
+    mailboxId: witnessRefreshMailbox,
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      driverConfig: {
+        workspacePath,
+        worktreeId: 'id:wt-legacy',
+        terminalHandle: 'term-legacy',
+        agent: 'codex',
+        workspaceComment: 'Dealer: legacy',
+      },
+    },
+  });
+  const refreshSeq = store.check({ mailboxId: witnessRefreshMailbox, peek: true }).items.at(-1)!.sequence;
+  const refreshRev = store.getWakeTarget(witnessRefreshMailbox)!.bindingRevision ?? 0;
+  store.beginWakeDelivery(witnessRefreshMailbox, refreshRev, { deliveredSequence: refreshSeq });
+  assert.ok(refreshSeq > 0);
+  // Config refresh with equivalent raw `wt-legacy` must not bump bindingRevision or drop witness.
+  syncOrcaTopicWakeTarget({
+    mailboxId: witnessRefreshMailbox,
+    store,
+    binding: {
+      executor: 'orca-wave',
+      workspacePath,
+      worktreeId: 'wt-legacy',
+      agent: 'codex',
+      rotateAfterWaves: 1,
+      workspaceComment: 'Dealer: legacy',
+    },
+  });
+  const afterRefresh = store.getWakeTarget(witnessRefreshMailbox)!;
+  assert.equal(afterRefresh.bindingRevision, refreshRev);
+  assert.equal(afterRefresh.deliveryInDoubt, true);
+  assert.equal(afterRefresh.pendingDelivery?.bindingRevision, refreshRev);
+  // Receipt settlement with original revision succeeds cleanly without rearming.
+  const settledReceipt = store.completeWakeDelivery(witnessRefreshMailbox, refreshSeq, {}, undefined, refreshRev);
+  assert.equal(Boolean(settledReceipt.superseded), false);
+  assert.equal(settledReceipt.deliveryInDoubt, undefined);
+  assert.equal(settledReceipt.pendingWake, false);
+
+  // Wave ingestion with equivalent raw `wt-legacy` during active witness preserves consumer settlement.
+  const witnessWaveMailbox = 'stream:legacy-witness-wave';
+  store.enqueue([makeSignedEnvelope(sender, 'legacy-wave-1')], {
+    mailboxId: witnessWaveMailbox,
+    wakeTarget: {
+      driver: 'orca-terminal',
+      coalesceMs: 0,
+      rotateAfterWaves: 1,
+      driverConfig: {
+        orcaCommand: 'orca',
+        workspacePath,
+        worktreeId: 'id:wt-legacy',
+        terminalHandle: 'term-legacy-wave',
+        agent: 'codex',
+        workspaceComment: `Dealer: ${witnessWaveMailbox} pending`,
+      },
+    },
+  });
+  const waveSeq = store.check({ mailboxId: witnessWaveMailbox, peek: true }).items.at(-1)!.sequence;
+  const waveRev = store.getWakeTarget(witnessWaveMailbox)!.bindingRevision ?? 0;
+  store.beginWakeDelivery(witnessWaveMailbox, waveRev, { deliveredSequence: waveSeq });
+  const waveExecutor = createOrcaWaveExecutorPlugin({
+    store,
+    resolveTopicBinding: () => ({
+      executor: 'orca-wave',
+      mailboxId: witnessWaveMailbox,
+      workspacePath,
+      worktreeId: 'wt-legacy',
+      agent: 'codex',
+      rotateAfterWaves: 1,
+    }),
+  });
+  await waveExecutor.execute(
+    [makeSignedEnvelope(sender, 'legacy-wave-2')],
+    { networkId: 'team', nodeId: sender.nodeId, traceId: 'trace-legacy-wave' },
+    {},
+  );
+  const afterWaveEnqueue = store.getWakeTarget(witnessWaveMailbox)!;
+  assert.equal(afterWaveEnqueue.bindingRevision, waveRev, 'format-only wave enqueue does not bump bindingRevision');
+  assert.equal(afterWaveEnqueue.deliveryInDoubt, true);
+  assert.equal(afterWaveEnqueue.pendingDelivery?.bindingRevision, waveRev);
+  // Consumer confirmation clears deliveryInDoubt cleanly.
+  const checked = store.check({ mailboxId: witnessWaveMailbox });
+  assert.ok(checked.deliveryId);
+  assert.equal(store.getWakeTarget(witnessWaveMailbox)?.deliveryInDoubt, undefined);
 });
 
 test('Orca identity transitions clear stale worktreeId on rebind without replacement ID and reject mismatched ID/path before probing or launching', async t => {
