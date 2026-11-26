@@ -103,6 +103,22 @@ export function resolveAgentHostContinuation(
   };
 }
 
+export const CODEX_AGENT_PROFILE_ERROR =
+  'Codex app-server does not support agentProfile; configure defaults in ~/.codex/config.toml';
+
+export function assertValidCodexOptions(options: {
+  conversationMode?: AgentConversationMode;
+  sessionId?: string;
+  agentProfile?: string;
+}): void {
+  if (options.agentProfile?.trim()) {
+    throw new Error(CODEX_AGENT_PROFILE_ERROR);
+  }
+  if (options.conversationMode === 'fixed' && !options.sessionId?.trim()) {
+    throw new Error('Codex fixed mode requires an explicit sessionId');
+  }
+}
+
 export function buildAgentHostInvocation(options: {
   agent: SupportedAgentHost;
   conversationMode: AgentConversationMode;
@@ -125,33 +141,8 @@ export function buildAgentHostInvocation(options: {
   switch (agent) {
     case 'codex':
     case 'codex-cli':
-      if (mode === 'fixed' && !session) throw new Error('Codex fixed mode requires an explicit sessionId');
-      {
-        const resumeCodex = mode === 'fixed' || (mode === 'wave' && Boolean(session));
-        return {
-          command,
-          args: resumeCodex
-            ? [
-                'exec',
-                ...(agentProfile ? ['-p', agentProfile] : []),
-                ...(cwd ? ['-C', cwd] : []),
-                'resume',
-                session!,
-                '--json',
-                '--dangerously-bypass-approvals-and-sandbox',
-                promptText,
-              ]
-            : [
-                'exec',
-                ...(mode === 'spawn' ? ['--worktree'] : []),
-                '--json',
-                '--dangerously-bypass-approvals-and-sandbox',
-                ...(agentProfile ? ['-p', agentProfile] : []),
-                ...(cwd ? ['-C', cwd] : []),
-                promptText,
-              ],
-        };
-      }
+      assertValidCodexOptions({ conversationMode: mode, sessionId: session, agentProfile });
+      return { command, args: ['app-server', '--stdio'] };
     case 'claude':
     case 'claude-code':
       return {
@@ -332,8 +323,8 @@ export const AGENT_HOST_DESCRIPTORS = [
     promptArgs: ['exec'],
     surface: 'cli',
     modes: CONVERSATION_MODES,
-    selectors: ['agentProfile', 'sessionId'],
-    description: 'Codex execution.',
+    selectors: ['sessionId'],
+    description: 'Codex app-server execution.',
   },
   {
     host: 'chatgpt-dot',
@@ -396,8 +387,8 @@ export const AGENT_HOST_DESCRIPTORS = [
     command: 'codex',
     surface: 'cli',
     modes: CONVERSATION_MODES,
-    selectors: ['agentProfile', 'sessionId'],
-    description: 'Codex CLI bridge.',
+    selectors: ['sessionId'],
+    description: 'Codex app-server CLI bridge.',
   },
   {
     host: 'antigravity-cli',

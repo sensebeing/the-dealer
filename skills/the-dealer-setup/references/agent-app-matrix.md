@@ -10,7 +10,7 @@ the executor, and the second level picks how it owns a conversation:
 | `chatgpt-app` | `dot send --session-mode spawn` | `dot send --session-mode wave` | `dot send --session-mode fixed` | Durable mailbox | agentProfile, targetBot, sessionId |
 | `antigravity-app` | `antigravity-app send --session-mode spawn` | `antigravity-app send --session-mode wave` | `antigravity-app send --session-mode fixed` | Durable mailbox | workspacePath |
 | `claude-code` | `claude --bg --name <stream-session>` | `claude --bg --name <stream-session>` then `--resume` | `claude --bg --resume session` | Durable mailbox | agentProfile, sessionId |
-| `codex` / `codex-cli` | `codex exec --worktree --json --dangerously-bypass-approvals-and-sandbox` | `codex exec --json --dangerously-bypass-approvals-and-sandbox` then `codex exec [-p <profile>] [-C <dir>] resume <session> --json --dangerously-bypass-approvals-and-sandbox` | `codex exec [-p <profile>] [-C <dir>] resume <session> --json --dangerously-bypass-approvals-and-sandbox` | Durable mailbox | agentProfile, sessionId |
+| `codex` / `codex-cli` | `codex app-server --stdio` (`thread/start` + `turn/start`, desktop-visible thread) | `codex app-server --stdio` (`thread/start` then `thread/resume`, desktop-visible thread) | `codex app-server --stdio` (`thread/resume` for explicit `sessionId`, desktop-visible thread) | Durable mailbox | sessionId |
 | `antigravity-cli` | `agy run --dangerously-skip-permissions` | Unsupported (use orca or antigravity-app) | Unsupported (use orca or antigravity-app) | Durable mailbox | workspacePath |
 | `grok-bot` | `grok-bot dispatch --session-mode spawn` | `grok-bot dispatch --session-mode wave` | `grok-bot dispatch --session-mode fixed` | Durable mailbox | targetBot, sessionId |
 | `orca` | Managed child worktree | `orca-wave` with `rotateAfterWaves: 1` | Idle-gated workspace | Durable mailbox | agent: antigravity / claude / codex; workspacePath |
@@ -23,10 +23,12 @@ intake. Presets return configuration, they do not install CLIs or change gates.
 Antigravity.
 
 Dot and Grok require installed bridges implementing these command contracts.
-Verify the installed Codex/Claude CLI supports the specified exec/resume/background
-flags; presence detection is not feature detection. Never claim a mocked runner
-proves a real App integration. Nonzero host exits remain execution failures and
-must not be silently replayed when external side effects are unknown.
+Verify the installed Codex CLI supports `codex app-server --stdio` (JSON-RPC 2.0
+`initialize`/`thread/start`/`thread/resume`/`turn/start`, no `--worktree` or `--profile`;
+configure defaults in `~/.codex/config.toml`) and the installed Claude CLI supports
+`--bg`/`--resume`; presence detection is not feature detection. Never claim a mocked runner
+proves a real App integration. Nonzero host exits or non-completed turns remain execution
+failures and must not be silently replayed when external side effects are unknown.
 
 Agent-pty persists messages before invoking the host. Spawn mailboxes use
 `task:<messageId>`; fixed presets use `stream:<topic>` and optionally an explicit

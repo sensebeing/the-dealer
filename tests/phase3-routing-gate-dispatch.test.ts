@@ -1,4 +1,5 @@
 import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
+import { createFakeCodexAppServer } from './helpers/fake-codex-app-server.ts';
 import { createOrcaWakeupDrivers } from '../packages/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
@@ -1724,7 +1725,8 @@ test('executor preparation failures restore CAS so repaired configuration can re
   ) });
   const spawn = (extra = {}) => createOrcaSpawnExecutorPlugin({ cwd: root, store, commandRunner: good, ...extra });
   const wave = (extra = {}) => createOrcaWaveExecutorPlugin({ store, ...extra });
-  const pty = (extra = {}) => createAgentPtyExecutorPlugin({ commandRunner: good, ...extra });
+  const fakeCodex = createFakeCodexAppServer();
+  const pty = (extra = {}) => createAgentPtyExecutorPlugin({ commandRunner: good, stdioSpawner: fakeCodex.spawner, ...extra });
   const cases: Array<{ name: string; broken: ExecutorPlugin; repaired: ExecutorPlugin; payload?: Record<string, unknown>; empty?: boolean }> = [
     { name: 'unbound project', broken: spawn(), repaired: spawn({ projectRoots: { app: root } }), payload: { projectId: 'app' } },
     { name: 'foreign parent', broken: spawn({ projectRoots: { app: root }, parentWorktree: 'path:/foreign' }), repaired: spawn({ projectRoots: { app: root }, noParent: true }), payload: { projectId: 'app' } },

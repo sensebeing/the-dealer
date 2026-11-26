@@ -8,7 +8,19 @@ export * from './router/index.ts';
 export * from './gate/index.ts';
 export * from './dispatcher/index.ts';
 export * from './plugins-orca/index.ts';
-export { CommandNotStartedError, runCommand, checkedCommand, findExecutable, singleLine, type CommandRequest, type CommandRunner } from './subprocess/index.ts';
+export {
+  CommandNotStartedError,
+  runCommand,
+  checkedCommand,
+  findExecutable,
+  singleLine,
+  spawnStdioProcess,
+  type CommandRequest,
+  type CommandRunner,
+  type StdioChildProcess,
+  type StdioProcessRequest,
+  type StdioProcessSpawner,
+} from './subprocess/index.ts';
 export * from './mailbox/index.ts';
 export * from './plugins-source/index.ts';
 export * from './plugins-router/index.ts';

@@ -1825,29 +1825,75 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     offlineMailbox?.close();
     if (owned) {
       const stateDirForDaemon = owned.stateDir;
-      let pending = false;
+      let pendingOutbox = false;
+      let pendingWakeups = false;
       try {
-        pending = Boolean(
-          queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0,
-        );
+        // Fence new background wake launches before awaiting already-started turns so timers or
+        // readiness events cannot launch another turn between observing idle and owned.stop().
+        owned.wakeups?.quiesce();
+        // Let any background wake delivery already started by this ephemeral CLI runtime finish
+        // cleanly before teardown so routine CLI exit never aborts an accepted turn into deliveryInDoubt.
+        if (!options.signal?.aborted && owned.wakeups) {
+          if (options.signal) {
+            let onAbort: (() => void) | undefined;
+            try {
+              await Promise.race([
+                owned.wakeups.waitUntilIdle(),
+                new Promise<void>(resolve => {
+                  onAbort = resolve;
+                  options.signal!.addEventListener('abort', onAbort, { once: true });
+                }),
+              ]);
+            } finally {
+              if (onAbort) {
+                options.signal.removeEventListener('abort', onAbort);
+              }
+            }
+          } else {
+            await owned.wakeups.waitUntilIdle();
+          }
+        }
       } catch (error) {
         stderr(JSON.stringify({
-          warning: `Unable to inspect queued outbox obligations before shutdown: ${
+          warning: `Unable to settle in-flight mailbox wakeups before shutdown: ${
             error instanceof Error ? error.message : String(error)
           }`,
         }));
       }
-      // Teardown must still run when the outbox read fails; otherwise one corrupt read
-      // would leave the ephemeral runtime and its transport sockets alive.
+      // Teardown must still run when wake settlement fails; wait until all producers (redrive,
+      // transport, sources, dispatcher) have stopped before reading final continuation state.
       await owned.stop();
-      if (pending) {
+      try {
+        // Determine mailbox continuation from the authoritative post-producer snapshot captured
+        // at teardown on every owned runtime exit (including gate drain, non-send commands that
+        // accepted inbound mail during teardown, and partial-commit error paths).
+        pendingWakeups = owned.hasPendingWakeupsAfterStop();
+      } catch (error) {
+        stderr(JSON.stringify({
+          warning: `Unable to inspect queued mailbox obligations after shutdown: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        }));
+      }
+      try {
+        pendingOutbox = Boolean(
+          queuedForRedrive && (owned.outbox?.list({ status: 'queued' }).length ?? 0) > 0,
+        );
+      } catch (error) {
+        stderr(JSON.stringify({
+          warning: `Unable to inspect queued outbox obligations after shutdown: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        }));
+      }
+      if (pendingOutbox || pendingWakeups) {
         // The command durability contract outlives this process: start the supervisor so
-        // outstanding obligations keep redriving after the CLI exits.
+        // outstanding outbox or mailbox obligations keep redriving after the CLI exits.
         try {
           await ensureDaemonRunning(stateDirForDaemon);
         } catch (error) {
           stderr(JSON.stringify({
-            warning: `Messages remain queued in the outbox but the background daemon could not start: ${
+            warning: `Messages remain queued for background delivery but the background daemon could not start: ${
               error instanceof Error ? error.message : String(error)
             }`,
           }));
@@ -1886,6 +1932,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   let debounce: ReturnType<typeof setTimeout> | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let idleSubscription: Disposable | undefined;
+  let wakeupIdleSubscription: Disposable | undefined;
   const watchers: Array<{ close(): void }> = [];
   const watchedPaths = new Set<string>();
   // A deferred restart attempt consumed its idle events while restartTriggered was set; once the
@@ -1966,6 +2013,8 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
     watchers.length = 0;
     idleSubscription?.dispose();
     idleSubscription = undefined;
+    wakeupIdleSubscription?.dispose();
+    wakeupIdleSubscription = undefined;
     runtime.onConfigPersisted = undefined;
     runtime.onControlIdle = undefined;
   });
@@ -1977,6 +2026,7 @@ export async function runDealerDaemon(argv: string[]): Promise<DealerNodeRuntime
   for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
   const dispatcher = runtime.kernel.ctx.services.dispatcher;
   idleSubscription = dispatcher.onIdle(maybeSpawnSelfRestart);
+  wakeupIdleSubscription = runtime.wakeups.onIdle(maybeSpawnSelfRestart);
   runtime.onConfigPersisted = () => {
     for (const project of runtime.config.projects) addWatch(join(project.rootPath, '.dealer'));
     schedule();

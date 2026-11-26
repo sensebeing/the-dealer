@@ -269,7 +269,9 @@ export class WakeupRedriveService {
   private readonly readinessSubscriptions = new Map<string, ReadinessState>();
   private readonly stopController = new AbortController();
   private readonly inFlight = new Map<string, Promise<WakeupFlushResult>>();
+  private readonly idleListeners = new Set<() => void>();
   private readonly claims = new Map<string, number>();
+  private quiesced = false;
   private stopped = false;
   private lastError?: string;
 
@@ -306,6 +308,44 @@ export class WakeupRedriveService {
 
   getLastError(): string | undefined {
     return this.lastError;
+  }
+
+  /** Number of mailbox wake deliveries currently executing in the background. */
+  activeCount(): number {
+    return this.inFlight.size;
+  }
+
+  /** Subscribe to transitions where all in-flight background wake deliveries become idle. */
+  onIdle(listener: () => void): Disposable {
+    this.idleListeners.add(listener);
+    return {
+      dispose: () => {
+        this.idleListeners.delete(listener);
+      },
+    };
+  }
+
+  /** Wait until all currently in-flight background wake deliveries settle. */
+  async waitUntilIdle(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight.values()]);
+    }
+  }
+
+  /**
+   * Fence new background wake scheduling (flush timer, store subscriptions, readiness waits, and
+   * new flush launches) without aborting wake deliveries that are already in flight.
+   */
+  quiesce(): void {
+    if (this.quiesced) {
+      return;
+    }
+    this.quiesced = true;
+    clearInterval(this.timer);
+    for (const mailboxId of this.readinessSubscriptions.keys()) this.clearReadiness(mailboxId);
+    for (const subscription of this.subscriptions.splice(0)) {
+      subscription.dispose();
+    }
   }
 
   async probeSlot(mailboxId: string, options: { outbox?: OutboxStore } = {}): Promise<SlotProbeResult> {
@@ -378,7 +418,7 @@ export class WakeupRedriveService {
         const remaining = (this.claims.get(id) ?? 1) - 1;
         if (remaining <= 0) {
           this.claims.delete(id);
-          if (!this.stopped && !this.inFlight.has(id)) this.observeMailbox(id);
+          if (!this.stopped && !this.quiesced && !this.inFlight.has(id)) this.observeMailbox(id);
         } else {
           this.claims.set(id, remaining);
         }
@@ -388,7 +428,7 @@ export class WakeupRedriveService {
 
   /** Wake immediately when a target's coalesce/backoff window has already matured. */
   notifyMailbox(mailboxId: string): void {
-    if (this.stopped) {
+    if (this.stopped || this.quiesced) {
       return;
     }
     let id: string;
@@ -409,8 +449,10 @@ export class WakeupRedriveService {
   /** Flush one mailbox; a mailbox has at most one in-flight wakeup. */
   flushMailbox(mailboxId: string, options: WakeupMailboxOptions = {}): Promise<WakeupFlushResult> {
     const id = normalizeMailboxId(mailboxId);
-    if (this.stopped) {
-      return Promise.resolve(noWake(id, 'passive', 'Wakeup service stopped'));
+    if (this.stopped || this.quiesced) {
+      return Promise.resolve(
+        noWake(id, 'passive', this.stopped ? 'Wakeup service stopped' : 'Wakeup service quiesced'),
+      );
     }
     if (this.claims.has(id)) {
       return Promise.resolve(
@@ -429,9 +471,19 @@ export class WakeupRedriveService {
       } finally {
         this.inFlight.delete(id);
       }
-      this.observeMailbox(id, result.woke);
-      if (result.woke || result.reason === 'Wake launch superseded by a newer binding' || result.reason === ACK_SUPERSEDED_WAKE) {
-        this.notifyMailbox(id);
+      try {
+        if (!this.stopped && !this.quiesced) {
+          this.observeMailbox(id, result.woke);
+          if (result.woke || result.reason === 'Wake launch superseded by a newer binding' || result.reason === ACK_SUPERSEDED_WAKE) {
+            this.notifyMailbox(id);
+          }
+        }
+      } finally {
+        if (this.inFlight.size === 0) {
+          for (const listener of [...this.idleListeners]) {
+            listener();
+          }
+        }
       }
       return result;
     });
@@ -441,6 +493,9 @@ export class WakeupRedriveService {
 
   /** Deterministic flush of every pending target, ignoring coalesce/backoff maturity. */
   async flushWakeups(): Promise<WakeupFlushResult[]> {
+    if (this.stopped || this.quiesced) {
+      return [];
+    }
     const targets = this.store.listPendingWakeTargets(Number.MAX_SAFE_INTEGER);
     const results: WakeupFlushResult[] = [];
     for (const target of targets) {
@@ -451,6 +506,9 @@ export class WakeupRedriveService {
 
   /** Background flush of mature targets only. */
   async flushReady(): Promise<WakeupFlushResult[]> {
+    if (this.stopped || this.quiesced) {
+      return [];
+    }
     const targets = this.store.listPendingWakeTargets(this.now());
     const results: WakeupFlushResult[] = [];
     for (const target of targets) {
@@ -469,14 +527,11 @@ export class WakeupRedriveService {
     if (this.stopped) {
       return;
     }
+    this.quiesce();
     this.stopped = true;
-    clearInterval(this.timer);
     this.stopController.abort();
-    for (const mailboxId of this.readinessSubscriptions.keys()) this.clearReadiness(mailboxId);
-    for (const subscription of this.subscriptions.splice(0)) {
-      subscription.dispose();
-    }
     await Promise.allSettled([...this.inFlight.values()]);
+    this.idleListeners.clear();
   }
 
   registerDriver(driver: WakeupDriver): Disposable {
@@ -491,7 +546,7 @@ export class WakeupRedriveService {
         disposed = true;
         if (this.drivers.get(driver.name) !== driver) return;
         this.drivers.delete(driver.name);
-        if (driver.subscribeReadiness && !this.stopped) {
+        if (driver.subscribeReadiness && !this.stopped && !this.quiesced) {
           for (const target of this.store.listWakeTargets()) {
             if (target.driver === driver.name) this.clearReadiness(target.mailboxId);
           }
@@ -689,7 +744,7 @@ export class WakeupRedriveService {
   private syncReadiness(target: WakeTargetState): void {
     const { mailboxId, attemptCount } = target;
     const driver = this.drivers.get(target.driver);
-    if (this.stopped || !target.pendingWake || target.deliveryInDoubt || attemptCount === 0 || !driver?.subscribeReadiness) {
+    if (this.stopped || this.quiesced || !target.pendingWake || target.deliveryInDoubt || attemptCount === 0 || !driver?.subscribeReadiness) {
       this.clearReadiness(mailboxId);
       return;
     }
@@ -703,7 +758,7 @@ export class WakeupRedriveService {
     const wait: ReadinessWait = { revision, startedAt, reconciledAt: startedAt };
     this.readinessSubscriptions.set(mailboxId, wait);
     const finishWait = (): boolean => {
-      if (this.stopped || this.readinessSubscriptions.get(mailboxId) !== wait) return false;
+      if (this.stopped || this.quiesced || this.readinessSubscriptions.get(mailboxId) !== wait) return false;
       this.clearReadiness(mailboxId);
       return true;
     };

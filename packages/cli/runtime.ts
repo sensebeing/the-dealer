@@ -34,7 +34,7 @@ import { createCodexExecutorPlugin, createCodexCliExecutorPlugin, createClaudeAp
 import { createLarkMirrorPlugin } from '../plugins-lark-notifier/index.ts';
 import type { LarkMailboxNotifierOptions } from '../plugins-lark-notifier/index.ts';
 import { runCommand } from '../subprocess/index.ts';
-import type { CommandRunner } from '../subprocess/index.ts';
+import type { CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts';
 import { baseStreamKeyOf, OutboxRedriveService, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
 import type { MailboxStore, OutboxStore, SlotProbeResult } from '../mailbox/index.ts';
 import { compactQueueSummary, openStateLedgers } from './ledgers.ts';
@@ -127,6 +127,7 @@ export interface DealerRuntimeOptions {
   patch?: Partial<RuntimeConfig>;
   transport?: TransportPluginOptions;
   commandRunner?: CommandRunner;
+  stdioSpawner?: StdioProcessSpawner;
   executorOverrides?: ExecutorPlugin[];
   /** System-manager custody; defaults to probing this process's environment. */
   supervised?: boolean;
@@ -206,6 +207,9 @@ export class DealerNodeRuntime {
   private shutdownControlSlots = 0;
   /** One teardown owner: concurrent stop callers await the same stop. */
   private stopPromise?: Promise<void>;
+  /** Authoritative post-producer pending wake check captured during finishStop() before closing the ledger. */
+  private pendingWakeupsOnStop = false;
+  private pendingWakeupsCheckError?: unknown;
   /** One-shot hooks run before any service the daemon serves is torn down. */
   private readonly stoppingListeners = new Set<() => void>();
   private daemonInstanceId?: string;
@@ -231,6 +235,17 @@ export class DealerNodeRuntime {
 
   isStoppingOrDraining(): boolean {
     return this.draining || this.stopPromise !== undefined;
+  }
+
+  /**
+   * Authoritative post-producer pending wake obligation state captured during `stop()` after
+   * transport, sources, dispatcher, and redrive have stopped and before closing `mailbox`.
+   */
+  hasPendingWakeupsAfterStop(): boolean {
+    if (this.pendingWakeupsCheckError !== undefined) {
+      throw this.pendingWakeupsCheckError;
+    }
+    return this.pendingWakeupsOnStop;
   }
 
   /**
@@ -456,6 +471,8 @@ export class DealerNodeRuntime {
     this.drainDecision = undefined;
     this.stopPromise = undefined;
     this.shutdownControlSlots = 0;
+    this.pendingWakeupsOnStop = false;
+    this.pendingWakeupsCheckError = undefined;
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     chmodSync(this.stateDir, 0o700);
     const lockDir = join(this.stateDir, 'runtime.lock');
@@ -549,7 +566,10 @@ export class DealerNodeRuntime {
         store: this.mailbox,
         drivers: [
           ...createOrcaWakeupDrivers({ commandRunner: this.options.commandRunner ?? runCommand, idleCheck: this.options.wakeupIdleCheck }),
-          createAgentHostWakeupDriver({ commandRunner: this.options.commandRunner ?? runCommand }),
+          createAgentHostWakeupDriver({
+            commandRunner: this.options.commandRunner ?? runCommand,
+            stdioSpawner: this.options.stdioSpawner,
+          }),
         ],
         flushIntervalMs: this.config.wave?.flushIntervalMs ?? 1_000,
         onError: error => { this.lastError = String(error); },
@@ -1392,6 +1412,7 @@ export class DealerNodeRuntime {
             stateDir: this.stateDir, config: this.config.executorConfig[name] ?? {},
             store: this.mailbox, wakeup: this.wakeups, wave: this.config.wave,
             projectRoots: linkedProjectRoots, commandRunner: runner,
+            stdioSpawner: this.options.stdioSpawner,
             resolveTopicBinding: this.executorTopicBinding, resolveMailboxBinding: this.resolveTopicMailboxBinding,
           });
           const registration = ctx.services.dispatcher.registerExecutor(
@@ -1628,7 +1649,11 @@ export class DealerNodeRuntime {
     if (!this.started || this.isStoppingOrDraining() || !this.kernel.hasService('dispatcher')) {
       return false;
     }
-    return this.kernel.ctx.services.dispatcher.activeCount() === 0 && this.activeMutatingControlRequests === 0;
+    return (
+      this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
+      (this.wakeups?.activeCount() ?? 0) === 0 &&
+      this.activeMutatingControlRequests === 0
+    );
   }
 
   /**
@@ -1657,16 +1682,20 @@ export class DealerNodeRuntime {
           options.drainTimeoutMs ?? 15_000,
           () =>
             this.kernel.ctx.services.dispatcher.activeCount() === 0 &&
+            (this.wakeups?.activeCount() ?? 0) === 0 &&
             this.activeMutatingControlRequests <= this.shutdownControlSlots,
+          () => {
+            // Node.js runs this turn to completion before a new request or timer can be admitted,
+            // so the control and wakeup scheduling fences open atomically at the commit point,
+            // never during a drain that may defer.
+            this.draining = true;
+            this.wakeups?.quiesce();
+            this.fireStoppingListeners();
+          },
         );
         this.drainDecision = decision.then(
           drained => {
-            if (drained) {
-              // Node.js runs this turn to completion before a new request can be admitted, so
-              // the fence opens exactly at the commit point, never during a drain that may defer.
-              this.draining = true;
-              this.fireStoppingListeners();
-            } else {
+            if (!drained) {
               // A deferred drain leaves no decision behind: a later shutdown may try again.
               this.drainDecision = undefined;
             }
@@ -1685,7 +1714,11 @@ export class DealerNodeRuntime {
     }
   }
 
-  private async waitForDrain(timeoutMs: number, drained: () => boolean): Promise<boolean> {
+  private async waitForDrain(
+    timeoutMs: number,
+    drained: () => boolean,
+    onCommit: () => void,
+  ): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (!drained()) {
       const remaining = deadline - Date.now();
@@ -1694,7 +1727,11 @@ export class DealerNodeRuntime {
       }
       await this.waitForDrainWake(remaining);
     }
-    return drained();
+    if (!drained()) {
+      return false;
+    }
+    onCommit();
+    return true;
   }
 
   private wakeDrainWaiters(): void {
@@ -1709,6 +1746,7 @@ export class DealerNodeRuntime {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let idle: Disposable | undefined;
+      let wakeupIdle: Disposable | undefined;
       const wake = () => {
         if (settled) {
           return;
@@ -1718,6 +1756,7 @@ export class DealerNodeRuntime {
           clearTimeout(timer);
         }
         idle?.dispose();
+        wakeupIdle?.dispose();
         this.drainWakeups.delete(wake);
         resolve();
       };
@@ -1726,6 +1765,7 @@ export class DealerNodeRuntime {
       timer = setTimeout(wake, timeoutMs);
       this.drainWakeups.add(wake);
       idle = dispatcher.onIdle(wake);
+      wakeupIdle = this.wakeups?.onIdle(wake);
     });
   }
 
@@ -1884,6 +1924,9 @@ export class DealerNodeRuntime {
   }
 
   private async finishStop(): Promise<void> {
+    // Fence new background wake launches before awaiting outbox teardown so a direct stop()
+    // cannot start a fresh wake turn while outboxRedrive.stop() is draining.
+    this.wakeups?.quiesce();
     // A direct stop() skips drainForStop(), so this is the only place its listeners can learn
     // that the services they call are about to disappear.
     this.fireStoppingListeners();
@@ -1913,7 +1956,22 @@ export class DealerNodeRuntime {
           }
         } finally {
           try {
-            this.mailbox?.close();
+            // Capture the authoritative continuation snapshot only after outbox redrive, wakeups,
+            // and the kernel (transport, sources, dispatcher, gate) have all stopped, before
+            // closing the mailbox ledger and releasing runtime.lock.
+            try {
+              this.pendingWakeupsCheckError = undefined;
+              this.pendingWakeupsOnStop = Boolean(
+                this.mailbox
+                  ?.listPendingWakeTargets(Number.MAX_SAFE_INTEGER)
+                  .some(target => target.driver !== 'passive'),
+              );
+            } catch (error) {
+              this.pendingWakeupsOnStop = false;
+              this.pendingWakeupsCheckError = error;
+            } finally {
+              this.mailbox?.close();
+            }
           } finally {
             if (this.ownsLock) {
               this.releaseLock(join(this.stateDir, 'runtime.lock'));
