@@ -19,7 +19,7 @@ import {
 import type { MailboxStore, MailboxEnqueueResult, MailboxTopicBinding, WakeTargetState, WakeupRedriveService } from '../mailbox/index.ts';
 import { setOrcaWorkspaceComment, orcaAgent, pickSeaCreatureName } from './workspace.ts';
 import type { SupportedOrcaAgent } from './workspace.ts';
-import { orcaMutationRunner } from './inventories.ts';
+import { buildOrcaWorktreeSelector, normalizeOrcaWorktreeId, orcaMutationRunner } from './inventories.ts';
 import {
   trustAntigravityWorkspace,
   defaultAgentLaunchCommand,
@@ -275,11 +275,19 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
       if (raw.ok === false) {
         throw new Error('Orca worktree creation failed');
       }
-      const workspace = (raw.result ?? raw) as { path?: string; worktree?: { path?: string } };
+      const workspace = (raw.result ?? raw) as {
+        path?: string;
+        worktreeId?: string;
+        worktree?: { path?: string; worktreeId?: string; id?: string };
+      };
       const path = workspace.path ?? workspace.worktree?.path;
       if (!path) {
         throw new Error('Orca worktree create returned no path');
       }
+      const worktreeIdCandidate = workspace.worktreeId ?? workspace.worktree?.worktreeId ?? workspace.worktree?.id;
+      const worktreeId = typeof worktreeIdCandidate === 'string'
+        ? normalizeOrcaWorktreeId(worktreeIdCandidate)
+        : undefined;
       issuedNames.add(basename(path).trim().toLowerCase());
       if (interactive && store) {
         const explicitSettingsPath =
@@ -333,6 +341,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
                 interactiveCommand, resumeCommand,
                 orcaCommand: command,
                 workspacePath: path,
+                ...(worktreeId ? { worktreeId } : {}),
                 dedicatedSpawn: true,
                 ...(workspaceComment ? { workspaceComment } : {}),
               },
@@ -348,6 +357,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
             const launched = await launchFencedOrcaWorkspaceTerminal(store, runner, mailboxId, {
               command,
               workspacePath: path,
+              worktreeId,
               agent: effectiveAgent,
               interactiveCommand, resumeCommand,
               signal: context.signal,
@@ -359,6 +369,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
               try {
                 await setOrcaWorkspaceComment(runner, command, path, workspaceComment, {
                   cwd: path,
+                  worktreeId,
                   signal: context.signal,
                 });
               } catch {
@@ -376,6 +387,7 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
             try {
               await setOrcaWorkspaceComment(runner, command, path, workspaceComment, {
                 cwd: path,
+                worktreeId,
                 signal: context.signal,
               });
             } catch (error) {
@@ -416,9 +428,9 @@ function createOrcaSpawnPreparation(options: OrcaSpawnOptions) {
       ]
         .map(shellQuote)
         .join(' ');
-      const launched = await checkedCommand(orcaMutationRunner(runner, path), {
+      const launched = await checkedCommand(orcaMutationRunner(runner, path, worktreeId), {
         command,
-        args: ['terminal', 'create', '--worktree', `path:${path}`, '--command', agentCommand, '--json'],
+        args: ['terminal', 'create', '--worktree', buildOrcaWorktreeSelector(path, worktreeId), '--command', agentCommand, '--json'],
         cwd: path,
         signal: context.signal,
       });
@@ -656,7 +668,7 @@ async function prepareOrcaWaveBatch(
       pinnedTerminalHandle: receiverTerminalHandle,
     });
     const identityPatch = resolveConfiguredOrcaWakeTargetPatch(store.getWakeTarget(mailboxId), {
-      mailboxId, runId, workspacePath: cwd, configuredTerminalHandle: terminalHandle,
+      mailboxId, runId, workspacePath: cwd, worktreeId, configuredTerminalHandle: terminalHandle,
       configuredAgent: explicitAgent !== undefined ? orcaAgent(explicitAgent) : undefined,
       configuredSessionId: binding?.sessionId,
       configuredInteractiveCommand: binding?.interactiveCommand ?? config.interactiveCommand ?? options.interactiveCommand,
@@ -679,7 +691,6 @@ async function prepareOrcaWaveBatch(
         autoCreateWorkspace,
         ...(runId ? { runId } : {}),
         ...(cwd ? { workspacePath: cwd } : {}),
-        ...(worktreeId ? { worktreeId } : {}),
         workspaceComment,
       },
     };

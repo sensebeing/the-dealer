@@ -746,6 +746,21 @@ export interface OutboxFlushResult {
   items: OutboxItem[];
 }
 
+export interface OutboxDropFilter {
+  id?: string;
+  nodeId?: string;
+  networkId?: string;
+  reason?: string;
+}
+
+export interface OutboxDropResult {
+  updatedCount: number;
+  settledDeliveredCount: number;
+  markedFailedCount: number;
+  skippedActiveIds: string[];
+  items: OutboxItem[];
+}
+
 export interface OutboxDeliveryFailure {
   nodeId?: string;
   receipt?: DeliveryReceipt;

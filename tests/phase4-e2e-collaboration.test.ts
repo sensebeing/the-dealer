@@ -329,7 +329,9 @@ test('Phase 4: wave streams resolve distinct workspace terminals with single-lin
   ]);
   let createdCount = 0;
   const workspaceOf = (request: CommandRequest): string =>
-    request.args.includes(`path:${workspaceA}`) ? workspaceA : workspaceB;
+    request.args.includes(`path:${workspaceA}`) || request.args.includes(`id:worktree-${workspaceA}`)
+      ? workspaceA
+      : workspaceB;
   const runner = async (request: CommandRequest) => {
     calls.push(request);
     if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
@@ -448,7 +450,7 @@ test('Phase 4: wave streams resolve distinct workspace terminals with single-lin
       c =>
         c.args[0] === 'terminal' &&
         c.args[1] === 'list' &&
-        c.args.includes(`path:${workspaceA}`),
+        (c.args.includes(`id:worktree-${workspaceA}`) || c.args.includes(`path:${workspaceA}`)),
     ),
   );
   assert.ok(
@@ -456,7 +458,7 @@ test('Phase 4: wave streams resolve distinct workspace terminals with single-lin
       c =>
         c.args[0] === 'terminal' &&
         c.args[1] === 'list' &&
-        c.args.includes(`path:${workspaceB}`),
+        (c.args.includes(`id:worktree-${workspaceB}`) || c.args.includes(`path:${workspaceB}`)),
     ),
   );
   assert.ok(calls.some(c => c.args[0] === 'worktree' && c.args[1] === 'ps' && c.cwd === workspaceA));

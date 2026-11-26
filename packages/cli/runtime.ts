@@ -38,7 +38,7 @@ import type { CommandRunner, StdioProcessSpawner } from '../subprocess/index.ts'
 import { baseStreamKeyOf, OutboxRedriveService, normalizeMailboxId, resolveMailboxId, resolveBoundMailboxId, resolveSessionOrThreadMailbox, resolveTopicAddress, WakeupRedriveService } from '../mailbox/index.ts';
 import type { MailboxStore, OutboxStore, SlotProbeResult } from '../mailbox/index.ts';
 import { compactQueueSummary, openStateLedgers } from './ledgers.ts';
-import type { OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
+import type { OutboxDropFilter, OutboxDropResult, OutboxFlushOptions, OutboxFlushResult, OutboxItem, OutboxListFilter } from '../mailbox/index.ts';
 import { holdOwnedDirectory, isDeadProcessOwner, processOwnerRecord, readProcessOwner, releaseOwnedDirectory } from '../process-lock/index.ts';
 import { parseYaml, parseMarkdownFrontmatter, parseTeamRegistry, resolveTeamRegistryMembers, createTeamRegistryRouterPlugin, createLocalAgentRouterPlugin, createLlmApiRouterPlugin } from '../plugins-router/index.ts';
 import { writeAtomicCursorFile, readJsonCursorFile, everyReceiptSettled, createWebhookSourcePlugin, createPollWatermarkSourcePlugin, createScriptSourcePlugin, formatSingleLineError } from '../plugins-source/index.ts';
@@ -1484,6 +1484,14 @@ export class DealerNodeRuntime {
       throw new Error('Outbox is not available before the runtime starts');
     }
     return this.outbox.requeue(id);
+  }
+
+  /** Explicit operator drop of dead pending outbox targets or queued obligations. */
+  dropOutbox(filter: OutboxDropFilter): OutboxDropResult {
+    if (!this.outbox) {
+      throw new Error('Outbox is not available before the runtime starts');
+    }
+    return this.outbox.drop(filter);
   }
 
   /** Operator/test flush of the durable outbox; redrive also runs on peer events and timers. */

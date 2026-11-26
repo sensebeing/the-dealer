@@ -1,5 +1,11 @@
 #!/usr/bin/env -S node --no-warnings --experimental-strip-types
 import './register-ts.js';
+const ignoreEpipe = error => {
+  if (error?.code === 'EPIPE') return;
+  throw error;
+};
+process.stdout.on('error', ignoreEpipe);
+process.stderr.on('error', ignoreEpipe);
 const { runDealerDaemon } = await import('../packages/cli/index.ts');
 
 try {

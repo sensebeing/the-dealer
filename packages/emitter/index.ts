@@ -586,7 +586,9 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                   const spooled = relaySpooledNodeIds.includes(targetNodeId);
                   const detail = spooled
                     ? `Queued in local outbox and spooled on relay seed for offline peer ${targetNodeId}`
-                    : `Queued in local outbox for offline peer ${targetNodeId}`;
+                    : inDoubtNodeIds.includes(targetNodeId)
+                      ? `Queued in local outbox pending reconciliation after delivery timeout for peer ${targetNodeId}`
+                      : `Queued in local outbox for offline peer ${targetNodeId}`;
                   receipts.push(queuedReceipt(envelope, self, targetNodeId, spooled, detail));
                 }
               }

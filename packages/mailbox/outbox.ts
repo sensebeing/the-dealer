@@ -20,6 +20,8 @@ import type {
   OutboxClaimInput,
   OutboxClaimResult,
   OutboxDeliveryOutcome,
+  OutboxDropFilter,
+  OutboxDropResult,
   OutboxEnqueueInput,
   OutboxFlushOptions,
   OutboxFlushResult,
@@ -35,6 +37,8 @@ import { netKey } from './network-key.ts';
 export type {
   OutboxDeliveryFailure,
   OutboxDeliveryOutcome,
+  OutboxDropFilter,
+  OutboxDropResult,
   OutboxEnqueueInput,
   OutboxClaimInput,
   OutboxClaimResult,
@@ -80,7 +84,7 @@ export const MAX_RETAINED_TERMINAL_OUTBOX = 200;
 const LEGACY_OUTBOX_SCHEMA = 'the-dealer-outbox/v1';
 const DEFAULT_REDRIVE_INTERVAL_MS = 2_000;
 const MIN_ATTEMPT_DELAY_MS = 2_000;
-const MAX_ATTEMPT_DELAY_MS = 60_000;
+const MAX_ATTEMPT_DELAY_MS = 1_800_000;
 const DEFAULT_CLAIM_LEASE_MS = 60_000;
 
 export interface OutboxAttemptUpdate {
@@ -452,8 +456,9 @@ export class OutboxStore {
 
   /**
    * One settlement rule for every mutation: delivered and terminal-failed targets leave the
-   * pending set, a live obligation stays queued while any deliverable target remains, and
-   * staged evidence can be deleted after final delivery has been persisted.
+   * pending set, a live obligation stays queued while any deliverable target remains, retained
+   * uncertainty or remote custody for an undelivered target prevents false delivery settlement
+   * or attachment cleanup, and staged evidence is deleted only after final delivery persists.
    */
   private settleItem(item: OutboxItem): Record<string, string> | undefined {
     normalizeTargets(item);
@@ -461,9 +466,16 @@ export class OutboxStore {
       item.status = 'queued';
       return;
     }
-    if (item.failedNodeIds.length > 0) {
+    const hasUndeliveredUncertainty =
+      item.inDoubtNodeIds.some(nodeId => !item.deliveredReceipts[nodeId]) ||
+      item.relaySpooledNodeIds.some(nodeId => !item.deliveredReceipts[nodeId]);
+    if (item.failedNodeIds.length > 0 || hasUndeliveredUncertainty) {
       item.status = 'failed';
-      // Staged files remain as evidence for every terminal target decision.
+      delete item.unresolvedRoute;
+      if (hasUndeliveredUncertainty) {
+        delete item.unattemptedFailure;
+      }
+      // Staged files remain as evidence for every terminal or unresolved target decision.
       return;
     }
     if (Object.keys(item.deliveredReceipts).length > 0) {
@@ -795,6 +807,89 @@ export class OutboxStore {
     });
   }
 
+  /**
+   * Explicit operator retry cancellation for pending outbox targets (or an entire queued
+   * obligation). Separates retry cancellation from effect evidence: historical uncertainty
+   * (`inDoubtNodeIds`) and remote custody (`relaySpooledNodeIds`, and promoted
+   * `approvalPendingNodeIds`) are preserved so cancellation can never establish unattempted
+   * status, authorize same-version replacement, or fabricate confirmed delivery.
+   */
+  drop(filter: OutboxDropFilter): OutboxDropResult {
+    const id = filter?.id?.trim() || undefined;
+    const nodeId = filter?.nodeId?.trim() || undefined;
+    const networkId = filter?.networkId?.trim() || undefined;
+    const reason = filter?.reason?.trim() || 'Dropped by operator';
+    if (!id && !nodeId) {
+      throw new Error('outbox drop requires --id or --node');
+    }
+    return this.mutate((state, scheduleCleanup) => {
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      let updatedCount = 0;
+      let settledDeliveredCount = 0;
+      let markedFailedCount = 0;
+      const skippedActiveIds: string[] = [];
+      const items: OutboxItem[] = [];
+      for (const item of state.items) {
+        if (item.status !== 'queued' || item.supersededById !== undefined) continue;
+        if (id !== undefined && item.id !== id) continue;
+        if (networkId !== undefined && item.networkId !== networkId) continue;
+        if (nodeId !== undefined && !item.pendingNodeIds.includes(nodeId)) continue;
+        if (hasActiveAttempt(item, nowMs)) {
+          skippedActiveIds.push(item.id);
+          continue;
+        }
+        if (nodeId !== undefined) {
+          item.pendingNodeIds = item.pendingNodeIds.filter(candidate => candidate !== nodeId);
+          if (item.approvalPendingNodeIds?.includes(nodeId)) {
+            if (!item.inDoubtNodeIds.includes(nodeId)) {
+              item.inDoubtNodeIds.push(nodeId);
+            }
+            item.approvalPendingNodeIds = item.approvalPendingNodeIds.filter(candidate => candidate !== nodeId);
+          }
+        } else {
+          for (const approvalTarget of item.approvalPendingNodeIds ?? []) {
+            if (!item.inDoubtNodeIds.includes(approvalTarget)) {
+              item.inDoubtNodeIds.push(approvalTarget);
+            }
+          }
+          item.pendingNodeIds = [];
+          item.approvalPendingNodeIds = undefined;
+          delete item.unresolvedRoute;
+        }
+        scheduleCleanup(item.id, this.settleItem(item));
+        if (item.status === 'queued' && item.pendingNodeIds.length === 0) {
+          item.status = 'failed';
+          delete item.unresolvedRoute;
+          delete item.unattemptedFailure;
+          item.lastError = reason;
+        } else if (item.status === 'failed') {
+          item.lastError = reason;
+        }
+        delete item.activeAttempt;
+        item.updatedAt = now;
+        item.nextAttemptAt = now;
+        updatedCount += 1;
+        if (item.status === 'delivered') {
+          if (item.failedNodeIds.length === 0) {
+            item.lastError = undefined;
+          }
+          settledDeliveredCount += 1;
+        } else if (item.status === 'failed') {
+          markedFailedCount += 1;
+        }
+        items.push(clone(item));
+      }
+      return {
+        updatedCount,
+        settledDeliveredCount,
+        markedFailedCount,
+        skippedActiveIds,
+        items,
+      };
+    });
+  }
+
   list(filter: OutboxListFilter = {}): OutboxItem[] {
     if (
       filter.status !== undefined &&
@@ -1012,8 +1107,8 @@ export interface OutboxRedriveOptions {
   attemptTimeoutMs?: number;
 }
 
-function attemptDelayMs(attempts: number): number {
-  return Math.min(MAX_ATTEMPT_DELAY_MS, MIN_ATTEMPT_DELAY_MS * 2 ** Math.min(attempts, 5));
+export function attemptDelayMs(attempts: number): number {
+  return Math.min(MAX_ATTEMPT_DELAY_MS, MIN_ATTEMPT_DELAY_MS * 2 ** Math.min(attempts, 10));
 }
 
 /**

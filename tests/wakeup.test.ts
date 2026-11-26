@@ -197,7 +197,7 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
             truncated: false,
             worktrees: [{
               path: workspacePath,
-              worktreeId: 'fake-worktree',
+              worktreeId: `repo::${workspacePath}`,
               childWorktreeIds: state.childWorktreeIds ?? state.children.map(child => child.worktreeId),
               unverifiableTerminalCount: state.unverifiableTerminalCount,
               terminalVerdict: state.terminalVerdict,
@@ -214,7 +214,9 @@ function fakeOrcaWorkspace(workspacePath: string, initial: FakeTerminalRow[] = [
       return { stdout: JSON.stringify({ ok: true, result: { worktrees } }) };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'list') {
-      const child = state.children.find(item => request.args.includes(`path:${item.path}`));
+      const child = state.children.find(item =>
+        request.args.includes(`id:${item.worktreeId}`) || request.args.includes(`path:${item.path}`),
+      );
       return { stdout: JSON.stringify({ ok: true, result: {
         terminals: child ? child.terminals ?? [] : state.terminals, truncated: child?.terminalsTruncated,
       } }) };
@@ -517,7 +519,9 @@ test('slot probe leaves an active sibling child alone when the leased terminal i
   assert.deepEqual(await service.probeSlot(probeMailbox), {
     busy: false, ready: false, reason: 'terminal_gone',
   });
-  assert.equal(state.calls.some(call => call.args.includes(`path:${state.children[0].path}`)), false);
+  assert.equal(state.calls.some(call =>
+    call.args.includes(`id:${state.children[0].worktreeId}`) || call.args.includes(`path:${state.children[0].path}`),
+  ), false);
   state.agents = [{ state: 'working', paneKey: 'unmatched:root' }];
   assert.equal((await service.probeSlot(probeMailbox)).busy, true);
   state.agents = [{ state: 'working' }];
@@ -650,7 +654,7 @@ test('sibling attribution follows a descendant creator terminal during slot prob
     assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
     assert.equal(worktreeListCalls(state.calls), 1);
     assert.equal(state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list' &&
-      call.args.includes(`path:${child.path}`)).length, 1);
+      (call.args.includes(`id:${child.worktreeId}`) || call.args.includes(`path:${child.path}`))).length, 1);
 
     store.upsertWakeTarget('stream:alert-wave:2', {
       driver: 'orca-terminal', rotateAfterWaves: 1, driverConfig: { workspacePath: root, terminalHandle: sibling.handle },
@@ -689,7 +693,9 @@ test('slot probes bound creator proof for vanished handles and cycles', { timeou
     assert.equal(worktreeListCalls(state.calls), 1);
     const terminalLists = state.calls.filter(call => call.args[0] === 'terminal' && call.args[1] === 'list');
     for (const child of state.children) {
-      assert.equal(terminalLists.filter(call => call.args.includes(`path:${child.path}`)).length, 1, child.worktreeId);
+      assert.equal(terminalLists.filter(call =>
+        call.args.includes(`id:${child.worktreeId}`) || call.args.includes(`path:${child.path}`),
+      ).length, 1, child.worktreeId);
     }
   }
 });
@@ -844,7 +850,7 @@ for (const change of ['draft', 'descendant activity', 'draft during final idle w
         if (command === 'terminal wait') appendFileSync(lastWait, 'wait');
         if (command === 'terminal show' && readFileSync(lastWait, 'utf8') === 'waitwait') terminals[0].preview = '> late draft';
       }`,
-      `const child = process.argv.includes(${JSON.stringify('path:' + childPath)});`,
+      `const child = process.argv.includes("id:child") || process.argv.includes(${JSON.stringify('path:' + childPath)});`,
       'const result = command === "worktree ps" ? { worktrees } : command === "terminal list" ? { terminals: child ? [] : terminals } : { terminal: terminals[0] };',
       `if (command === "terminal send") appendFileSync(${JSON.stringify(sends)}, "send\\n");`,
       'process.stdout.write(JSON.stringify({ ok: true, result }));',
@@ -894,7 +900,7 @@ test('the real Orca command runner only requires lineage inventory when it can e
       { ...idle, path: ${JSON.stringify(root)}, worktreeId: 'root', childWorktreeIds: ['child'] },
       { ...idle, path: childPath, worktreeId: 'child', agents },
     ];`,
-    'const child = process.argv.includes("path:" + childPath);',
+    'const child = process.argv.includes("id:child") || process.argv.includes("path:" + childPath);',
     'const result = command === "worktree ps" ? { worktrees } : command === "terminal list" ? { terminals: child ? [] : terminals } : {};',
     `if (command === "worktree list") appendFileSync(${JSON.stringify(calls)}, "list\\n");`,
     'process.stdout.write(JSON.stringify(command === "worktree list" ? lineage : { ok: true, result }));',
@@ -936,7 +942,9 @@ test('slot idle checks skip lineage inventory when there are no children or pane
     agents: [{ state: 'working', parentPaneKey: 'sibling:root' }],
   }];
   assert.deepEqual(await service.probeSlot(probeMailbox), { busy: false, ready: true });
-  assert.equal(state.calls.some(call => call.args.includes(`path:${state.children[0].path}`)), false);
+  assert.equal(state.calls.some(call =>
+    call.args.includes(`id:${state.children[0].worktreeId}`) || call.args.includes(`path:${state.children[0].path}`),
+  ), false);
   state.children[0].agents = [{ state: 'working', parentPaneKey: 'wave:root' }];
   assert.equal((await service.probeSlot(probeMailbox)).busy, true);
   state.children[0].agents = [{ state: 'working', parentPaneKey: null }];
@@ -3527,8 +3535,9 @@ test('Orca caller bindings provide zero-mailbox P2P sessions and control RPC for
       ] } }) };
     }
     if (request.args[0] === 'terminal' && request.args[1] === 'list') {
-      const path = request.args[request.args.indexOf('--worktree') + 1]?.replace(/^path:/, '');
-      const terminal = path === bobWtPath
+      const selector = request.args[request.args.indexOf('--worktree') + 1] ?? '';
+      const path = selector.replace(/^path:/, '');
+      const terminal = path === bobWtPath || selector === `id:repo::${bobWtPath}`
         ? { handle: 'term-bob' }
         : { handle: aliceHandle, tabId: 'alice', leafId: 'root' };
       return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ ...terminal, connected: true, writable: true, preview: '' }] } }) };
@@ -3636,8 +3645,10 @@ test('dealer send binds an Orca caller mailbox when the topic is locally bound',
         ] } }) };
       }
       if (request.args[0] === 'terminal' && request.args[1] === 'list') {
-        const path = request.args[request.args.indexOf('--worktree') + 1]?.replace(/^path:/, '');
-        return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: path === callerPath ? 'term-caller' : 'term-prod', connected: true, writable: true, preview: '' }] } }) };
+        const selector = request.args[request.args.indexOf('--worktree') + 1] ?? '';
+        const path = selector.replace(/^path:/, '');
+        const isCaller = path === callerPath || selector === `id:repo::${callerPath}`;
+        return { stdout: JSON.stringify({ ok: true, result: { terminals: [{ handle: isCaller ? 'term-caller' : 'term-prod', connected: true, writable: true, preview: '' }] } }) };
       }
       return { stdout: JSON.stringify({ ok: true }) };
     },
@@ -3715,7 +3726,7 @@ test('slotted Orca replies wake the inferred tab and preserve explicit mailbox o
   ]) {
     alerts.mailbox.upsertWakeTarget(mailboxId, {
       driver: 'orca-terminal', rotateAfterWaves: 1, coalesceMs: 0,
-      driverConfig: { workspacePath, terminalHandle, worktreeId: 'fake-worktree', agent: 'codex' },
+      driverConfig: { workspacePath, terminalHandle, worktreeId: `repo::${workspacePath}`, agent: 'codex' },
     });
   }
 
@@ -3727,7 +3738,7 @@ test('slotted Orca replies wake the inferred tab and preserve explicit mailbox o
   assert.equal(inbound?.envelope?.semantic?.replyMailbox, 'terminal:term-2');
   const pinned = alerts.mailbox.getWakeTarget('terminal:term-2');
   assert.equal(pinned?.driverConfig?.workspacePath, workspacePath);
-  assert.equal(pinned?.driverConfig?.worktreeId, 'fake-worktree');
+  assert.equal(pinned?.driverConfig?.worktreeId, `repo::${workspacePath}`);
   assert.equal(pinned?.driverConfig?.agent, 'codex');
   assert.equal(pinned?.rotateAfterWaves, undefined);
 
@@ -6416,7 +6427,8 @@ test('Orca session recovery defers if the original tab reattaches during descend
   state.children = [{ path: childPath, worktreeId: 'child', unverifiableTerminalCount: 0, agents: [] }];
   const { service } = startSlotProbeService(t, store, async request => {
     const result = await runner(request);
-    if (request.args[0] === 'terminal' && request.args[1] === 'list' && request.args.includes(`path:${childPath}`)) {
+    if (request.args[0] === 'terminal' && request.args[1] === 'list' &&
+      (request.args.includes('id:child') || request.args.includes(`path:${childPath}`))) {
       state.terminals = [terminal];
     }
     return result;
