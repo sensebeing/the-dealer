@@ -33,23 +33,59 @@ export async function findOrcaWorktreeByName(
   return { workspacePath: row.path, worktreeId: row.worktreeId };
 }
 
+export type StandingWorktreeSyncResult =
+  | { status: 'updated'; branch: string; beforeSha: string; afterSha: string }
+  | { status: 'up_to_date'; branch: string; headSha: string }
+  | { status: 'skipped'; reason: 'not_syncable' | 'detached_head' | 'dirty' | 'ahead' };
+
 /** Synchronize a standing workspace only when its local history can fast-forward. */
 export async function tryFastForwardCleanWorktree(
   runner: CommandRunner,
   workspacePath: string,
   canMerge: () => Promise<boolean>,
-): Promise<void> {
+  options?: { fetchTimeoutMs?: number; mergeTimeoutMs?: number },
+): Promise<StandingWorktreeSyncResult> {
+  const fetchTimeoutMs = options?.fetchTimeoutMs ?? 20_000;
+  const mergeTimeoutMs = options?.mergeTimeoutMs ?? 30_000;
+  const gitArgs = (args: string[]) => ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args];
   const git = (args: string[], signal?: AbortSignal) => checkedCommand(runner, {
-    command: 'git', args: ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], signal,
+    command: 'git', args: gitArgs(args), signal,
   });
+  const readSymbolicRef = async (ref: string): Promise<string | undefined> => {
+    try {
+      const result = await runner({ command: 'git', args: gitArgs(['symbolic-ref', '--quiet', '--short', ref]) });
+      if (result.exitCode === 1) return undefined;
+      if (result.exitCode !== undefined && result.exitCode !== 0) {
+        throw new Error(`git exited ${result.exitCode}: ${(result.stderr || result.stdout).trim()}`);
+      }
+      return result.stdout.trim() || undefined;
+    } catch (error) {
+      if (isRecord(error) && error.exitCode === 1) return undefined;
+      throw error;
+    }
+  };
   const isClean = async () => (await git(['status', '--porcelain', '--untracked-files=all'])).stdout.trim() === '';
-  if (!(await canMerge()) || !(await isClean())) return;
-  await git(['fetch', '--quiet', 'origin', 'main'], AbortSignal.timeout(8_000));
-  if ((await git(['rev-list', '--count', 'origin/main..HEAD'])).stdout.trim() !== '0') return;
-  if ((await git(['rev-list', '--count', 'HEAD..origin/main'])).stdout.trim() === '0') return;
+  if (!(await canMerge())) return { status: 'skipped', reason: 'not_syncable' };
+  const branch = await readSymbolicRef('HEAD');
+  if (!branch) return { status: 'skipped', reason: 'detached_head' };
+  if (!(await isClean())) return { status: 'skipped', reason: 'dirty' };
+  const rawDefault = (await readSymbolicRef('refs/remotes/origin/HEAD'))?.replace(/^origin\//, '');
+  const defaultBranch = rawDefault && !rawDefault.startsWith('-') && !/\s/.test(rawDefault) ? rawDefault : 'main';
+  const remoteRef = `origin/${defaultBranch}`;
+  await git(['fetch', '--quiet', 'origin', defaultBranch], AbortSignal.timeout(fetchTimeoutMs));
+  if ((await git(['rev-list', '--count', `${remoteRef}..HEAD`])).stdout.trim() !== '0') {
+    return { status: 'skipped', reason: 'ahead' };
+  }
+  const beforeSha = (await git(['rev-parse', '--short', 'HEAD'])).stdout.trim();
+  if ((await git(['rev-list', '--count', `HEAD..${remoteRef}`])).stdout.trim() === '0') {
+    return { status: 'up_to_date', branch, headSha: beforeSha };
+  }
   // Fetch can take seconds, during which another slot or a local edit can appear.
-  if (!(await isClean()) || !(await canMerge())) return;
-  await git(['merge', '--ff-only', '--quiet', 'origin/main'], AbortSignal.timeout(8_000));
+  if (!(await isClean())) return { status: 'skipped', reason: 'dirty' };
+  if (!(await canMerge())) return { status: 'skipped', reason: 'not_syncable' };
+  await git(['merge', '--ff-only', '--quiet', remoteRef], AbortSignal.timeout(mergeTimeoutMs));
+  const afterSha = (await git(['rev-parse', '--short', 'HEAD'])).stdout.trim();
+  return { status: 'updated', branch, beforeSha, afterSha };
 }
 
 export interface OrcaIdleResult {
