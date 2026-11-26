@@ -638,6 +638,12 @@ export function pinOrcaTerminalSessionMailbox(
   return store.pinSessionMailbox(rotatingOwner.mailboxId, pinnedSession.sessionMailboxId, pinnedSession);
 }
 
+function orcaSessionMailboxIdFor(target: WakeTargetState): string | undefined {
+  const { terminalHandle } = readOrcaDriverConfig(target);
+  const handle = terminalHandle?.trim();
+  return target.rotateAfterWaves !== undefined && handle ? `terminal:${handle}` : undefined;
+}
+
 class OrcaWakeDelivery {
   private readonly store: MailboxStore;
   private readonly runner: CommandRunner;
@@ -1104,21 +1110,24 @@ class OrcaWakeDelivery {
     const effectiveHandle = ownHandle ?? target.terminalHandle;
     const ownsWorkspace = () => {
       if (this.store.getWakeTarget(mailboxId)?.bindingRevision !== revision) return false;
+      const hasObligations = (binding: WakeTargetState, sessionMailboxId?: string): boolean => {
+        const obligations = this.store.inspectSlotObligations(binding.mailboxId, { sessionMailboxId });
+        return Boolean(obligations.hasPendingWave || obligations.immediateBusyReason);
+      };
       return !this.store.listWakeTargets().some(binding => {
         if (binding.mailboxId === mailboxId || binding.driver === 'passive') return false;
-        const pending = binding.pendingWake || binding.deliveryInDoubt === true;
         if (binding.driver === 'agent-host') {
           const { workspacePath: path } = readAgentHostDriverConfig(binding);
-          return path ? sameCallerWorkspace(workspacePath, path) : pending;
+          return path ? sameCallerWorkspace(workspacePath, path) : hasObligations(binding);
         }
-        if (binding.driver !== 'orca-terminal' && binding.driver !== 'orca-run') return pending;
+        if (binding.driver !== 'orca-terminal' && binding.driver !== 'orca-run') return hasObligations(binding);
         const { workspacePath: path, terminalHandle, retiredTerminalHandle, paneKey } = readOrcaDriverConfig(binding);
         if (path && !sameCallerWorkspace(workspacePath, path)) return false;
         const sharesTab = Boolean(terminalHandle && terminalHandle === effectiveHandle) ||
           Boolean(paneKey && paneKey === target.paneKey);
-        const active = pending || Boolean(retiredTerminalHandle?.trim());
-        if (!path && !terminalHandle && !paneKey) return active;
-        return active && (Boolean(path) || sharesTab);
+        if (!path && !sharesTab && (terminalHandle || paneKey)) return false;
+        const sessionMailboxId = binding.driver === 'orca-terminal' ? orcaSessionMailboxIdFor(binding) : undefined;
+        return hasObligations(binding, sessionMailboxId) || Boolean(retiredTerminalHandle?.trim());
       });
     };
     return ownsWorkspace() && (await checkOrcaWorkspaceIdle(this.runner, command, workspacePath, undefined, {
@@ -1488,11 +1497,7 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
         }),
       };
     },
-    sessionMailboxIdFor(target) {
-      const { terminalHandle } = readOrcaDriverConfig(target);
-      const handle = terminalHandle?.trim();
-      return target.rotateAfterWaves !== undefined && handle ? `terminal:${handle}` : undefined;
-    },
+    sessionMailboxIdFor: orcaSessionMailboxIdFor,
     async resolveSessionTarget(mailboxId) {
       if (mailboxId.startsWith('terminal:') && mailboxId.length > 9) {
         let workspacePath: string | undefined;

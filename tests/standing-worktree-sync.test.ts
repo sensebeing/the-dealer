@@ -66,7 +66,7 @@ function createLinkedStandingWorktree(t: TestContext, defaultBranch = 'main') {
 }
 
 let msgCounter = 0;
-function makeAlert(id: string): MessageEnvelope {
+function makeAlert(id: string, patch: Partial<MessageEnvelope> = {}): MessageEnvelope {
   msgCounter += 1;
   return {
     id,
@@ -82,6 +82,7 @@ function makeAlert(id: string): MessageEnvelope {
     attachments: [],
     createdAt: new Date().toISOString(),
     signature: '',
+    ...patch,
   };
 }
 
@@ -530,4 +531,156 @@ test('git fetch failure reports via reportError and does not block wake delivery
   assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), baseHead);
   assert.equal(errors.length, 1);
   assert.match(String(errors[0]), /git exited/);
+});
+
+test('unfinished sibling obligations (leased wave or unanswered outbound question) block fast-forward even when their terminal is absent', async t => {
+  await t.test('leased sibling with pendingWake=false and absent terminal blocks fast-forward until acked', async st => {
+    const { root, worktreePath, baseHead, pushOriginCommit } = createLinkedStandingWorktree(st);
+    const newHead = pushOriginCommit('README.md', 'v2\n', 'advance');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const fake = createFakeOrcaEnv(worktreePath, []);
+    const errors: unknown[] = [];
+    const service = new WakeupRedriveService({
+      store,
+      flushIntervalMs: 100_000,
+      onError: error => errors.push(error),
+      drivers: createOrcaWakeupDrivers({ commandRunner: fake.runner }),
+    });
+    st.after(async () => { await service.stop(); store.close(); });
+
+    store.enqueue([makeAlert('sibling-leased-msg')], {
+      mailboxId: 'stream:alerts:2',
+      wakeTarget: {
+        driver: 'orca-terminal',
+        rotateAfterWaves: 1,
+        driverConfig: { workspacePath: worktreePath, terminalHandle: 'term-absent' },
+      },
+    });
+    const lease = store.check({ mailboxId: 'stream:alerts:2' });
+    assert.ok(lease.deliveryId);
+    assert.equal(store.getWakeTarget('stream:alerts:2')!.pendingWake, false);
+
+    store.upsertWakeTarget('stream:alerts', {
+      driver: 'orca-terminal',
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath: worktreePath },
+    });
+    store.enqueue([makeAlert('wave-while-leased')], { mailboxId: 'stream:alerts' });
+
+    const first = await service.flushMailbox('stream:alerts', { force: true });
+    assert.equal(first.woke, true, JSON.stringify(first));
+    assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), baseHead);
+    assert.equal(fake.events.some(event => event.startsWith('git:')), false);
+
+    // Once the sibling lease is acknowledged and its tab is absent, the next wave fast-forwards.
+    store.ack(lease.deliveryId!, 'stream:alerts:2');
+    fake.terminals.length = 0;
+    store.upsertWakeTarget('stream:alerts', { completedWaves: 1, driverConfig: { workspacePath: worktreePath } });
+    store.enqueue([makeAlert('wave-after-ack')], { mailboxId: 'stream:alerts' });
+    const second = await service.flushMailbox('stream:alerts', { force: true });
+    assert.equal(second.woke, true, JSON.stringify(second));
+    assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), newHead);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('post-ack unanswered outbound question on rotating sibling session mailbox with absent terminal blocks fast-forward until answered', async st => {
+    const { root, worktreePath, baseHead, pushOriginCommit } = createLinkedStandingWorktree(st);
+    const newHead = pushOriginCommit('README.md', 'v2\n', 'advance');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const fake = createFakeOrcaEnv(worktreePath, []);
+    const errors: unknown[] = [];
+    const service = new WakeupRedriveService({
+      store,
+      flushIntervalMs: 100_000,
+      onError: error => errors.push(error),
+      drivers: createOrcaWakeupDrivers({ commandRunner: fake.runner }),
+    });
+    st.after(async () => { await service.stop(); store.close(); });
+
+    store.upsertWakeTarget('stream:alerts:2', {
+      driver: 'orca-terminal',
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath: worktreePath, terminalHandle: 'term-absent-q' },
+    });
+    const sessionMailbox = 'terminal:term-absent-q';
+    store.recordOutboundEnvelope(
+      makeAlert('q-open', { semantic: { type: 'question', threadId: 'q-open', replyMailbox: sessionMailbox } }),
+      ['remote'],
+      sessionMailbox,
+    );
+    assert.equal(store.getWakeTarget('stream:alerts:2')!.pendingWake, false);
+
+    store.upsertWakeTarget('stream:alerts', {
+      driver: 'orca-terminal',
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath: worktreePath },
+    });
+    store.enqueue([makeAlert('wave-while-question-open')], { mailboxId: 'stream:alerts' });
+
+    const first = await service.flushMailbox('stream:alerts', { force: true });
+    assert.equal(first.woke, true, JSON.stringify(first));
+    assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), baseHead);
+    assert.equal(fake.events.some(event => event.startsWith('git:')), false);
+
+    store.recordInboundEnvelope(
+      makeAlert('q-answer', { replyToId: 'q-open', semantic: { type: 'reply', threadId: 'q-open' } }),
+      sessionMailbox,
+      { committed: false },
+    );
+    fake.terminals.length = 0;
+    store.upsertWakeTarget('stream:alerts', { completedWaves: 1, driverConfig: { workspacePath: worktreePath } });
+    store.enqueue([makeAlert('wave-after-answer')], { mailboxId: 'stream:alerts' });
+    const second = await service.flushMailbox('stream:alerts', { force: true });
+    assert.equal(second.woke, true, JSON.stringify(second));
+    assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), newHead);
+    assert.deepEqual(errors, []);
+  });
+
+  await t.test('sibling obligation appearing mid-fetch blocks merge on TOCTOU recheck', async st => {
+    const { root, worktreePath, baseHead, pushOriginCommit } = createLinkedStandingWorktree(st);
+    pushOriginCommit('README.md', 'v2\n', 'advance');
+    const store = new MailboxStore(join(root, 'mailbox.json'));
+    const fake = createFakeOrcaEnv(worktreePath, []);
+    const errors: unknown[] = [];
+    const runner: CommandRunner = async request => {
+      const result = await fake.runner(request);
+      if (request.command === 'git' && request.args[4] === 'fetch') {
+        store.recordOutboundEnvelope(
+          makeAlert('q-mid-fetch', { semantic: { type: 'question', threadId: 'q-mid-fetch', replyMailbox: 'worktree:standing-wave' } }),
+          ['remote'],
+          'worktree:standing-wave',
+        );
+      }
+      return result;
+    };
+    const service = new WakeupRedriveService({
+      store,
+      flushIntervalMs: 100_000,
+      onError: error => errors.push(error),
+      drivers: createOrcaWakeupDrivers({ commandRunner: runner }),
+    });
+    st.after(async () => { await service.stop(); store.close(); });
+
+    store.upsertWakeTarget('worktree:standing-wave', {
+      driver: 'orca-terminal',
+      driverConfig: { workspacePath: worktreePath, terminalHandle: 'term-gone-wt' },
+    });
+    store.upsertWakeTarget('stream:alerts', {
+      driver: 'orca-terminal',
+      rotateAfterWaves: 1,
+      completedWaves: 1,
+      driverConfig: { workspacePath: worktreePath },
+    });
+    store.enqueue([makeAlert('wave-mid-fetch-q')], { mailboxId: 'stream:alerts' });
+
+    const res = await service.flushMailbox('stream:alerts', { force: true });
+    assert.equal(res.woke, true, JSON.stringify(res));
+    assert.equal(runGit(worktreePath, 'rev-parse', 'HEAD'), baseHead);
+    assert.equal(fake.events.includes('git:fetch'), true);
+    assert.equal(fake.events.includes('git:merge'), false);
+    assert.deepEqual(errors, []);
+  });
 });
