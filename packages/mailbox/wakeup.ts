@@ -560,8 +560,12 @@ export class WakeupRedriveService {
     const current = this.store.getWakeTarget(id);
     if (current && current.driver !== 'passive') return undefined;
     for (const driver of this.drivers.values()) {
-      const resolved = await driver.resolveSessionTarget?.(id, this.store);
-      if (resolved) return resolved;
+      try {
+        const resolved = await driver.resolveSessionTarget?.(id, this.store);
+        if (resolved) return resolved;
+      } catch (error) {
+        this.report(error);
+      }
     }
     return undefined;
   }

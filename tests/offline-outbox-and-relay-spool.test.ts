@@ -6810,3 +6810,76 @@ test('OutboxRedriveService propagates shared 15s default delivery attempt budget
     `expected OutboxRedriveService override timeout in (0, 4200], got ${timeouts[2]}`,
   );
 });
+
+test('idempotencyKey retries with resolveTargetMailbox avoid false intent replacement and replace on intent change', async t => {
+  let allowDelivery = false;
+  const harness = await emitterHarness(t, {
+    extraMembers: ['aya'],
+    plan: () => (allowDelivery
+      ? {}
+      : { stage: 'rejected', detail: 'Gate closed', executionReceipt: { handoff: 'unattempted' } }),
+  });
+  const dizId = harness.targetCard.nodeId;
+  const ayaId = harness.targetByMember.get('aya')!.nodeId;
+  const resolveTargetMailbox = (targetNodeId: string) =>
+    targetNodeId === dizId ? 'worktree:diz-session' : undefined;
+
+  // 1. Initial single-target unattempted rejection persists resolved targetMailbox on the obligation.
+  const baseInput: EmitMessageInput = {
+    networkId: harness.networkId,
+    routing: { mode: 'unicast', targets: ['member:diz'] },
+    kind: 'collab.request.v4',
+    subject: 'Idempotent thread reply',
+    body: 'initial body',
+    payload: {},
+    semantic: { type: 'message', threadId: 'thread-idemp-1' },
+    idempotencyKey: 'idemp-resolve-target-1',
+    resolveTargetMailbox,
+  };
+  const first = await harness.emitter.emit(baseInput);
+  assert.equal(first.receipts[0]?.stage, 'rejected');
+  assert.equal(first.targetMailbox, 'worktree:diz-session');
+  assert.equal(harness.outbox.get(first.messageId)?.envelope.semantic?.targetMailbox, 'worktree:diz-session');
+
+  // 2. Retrying the identical call once gate opens must reconcile the original obligation without replacement.
+  allowDelivery = true;
+  const retried = await harness.emitter.emit(baseInput);
+  assert.equal(retried.messageId, first.messageId);
+  assert.equal(retried.receipts[0]?.stage, 'dispatched');
+  assert.equal(retried.targetMailbox, 'worktree:diz-session');
+  assert.equal(harness.outbox.list({ status: 'all' }).length, 1);
+
+  // 3. Changing body on an unattempted obligation replaces it cleanly while preserving resolved targetMailbox.
+  allowDelivery = false;
+  const second = await harness.emitter.emit({ ...baseInput, idempotencyKey: 'idemp-resolve-target-2' });
+  assert.equal(second.receipts[0]?.stage, 'rejected');
+  assert.equal(second.targetMailbox, 'worktree:diz-session');
+
+  allowDelivery = true;
+  const bodyChanged = await harness.emitter.emit({
+    ...baseInput,
+    idempotencyKey: 'idemp-resolve-target-2',
+    body: 'updated body',
+  });
+  assert.notEqual(bodyChanged.messageId, second.messageId);
+  assert.equal(bodyChanged.receipts[0]?.stage, 'dispatched');
+  assert.equal(bodyChanged.targetMailbox, 'worktree:diz-session');
+
+  // 4. Changing target from diz (worktree:diz-session) to aya (no mailbox) replaces the unattempted obligation.
+  allowDelivery = false;
+  const third = await harness.emitter.emit({ ...baseInput, idempotencyKey: 'idemp-resolve-target-3' });
+  assert.equal(third.receipts[0]?.stage, 'rejected');
+  assert.equal(third.targetMailbox, 'worktree:diz-session');
+
+  allowDelivery = true;
+  const targetChanged = await harness.emitter.emit({
+    ...baseInput,
+    idempotencyKey: 'idemp-resolve-target-3',
+    routing: { mode: 'unicast', targets: ['member:aya'] },
+  });
+  assert.notEqual(targetChanged.messageId, third.messageId);
+  assert.equal(targetChanged.receipts[0]?.stage, 'dispatched');
+  assert.equal(targetChanged.receipts[0]?.fromNodeId, ayaId);
+  assert.equal(targetChanged.targetMailbox, undefined);
+  assert.equal(harness.outbox.get(targetChanged.messageId)?.envelope.semantic?.targetMailbox, undefined);
+});

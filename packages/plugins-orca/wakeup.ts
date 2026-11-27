@@ -1616,7 +1616,9 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
             workspacePath = terminal.worktreePath;
           if (typeof terminal?.worktreeId === 'string')
             worktreeId = normalizeOrcaWorktreeId(terminal.worktreeId);
-        } catch {
+        } catch (error) {
+          // Orca is absent on this node: do not create a broken orca-terminal wake target.
+          if (error instanceof CommandNotStartedError) return undefined;
           // Optional address enrichment only: the delivery-time terminal probe still fails closed.
         }
         return {
@@ -1630,11 +1632,17 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
         };
       }
       if (mailboxId.startsWith('worktree:') && mailboxId.length > 9) {
-        const found = await findOrcaWorktreeByName(
-          options.commandRunner ?? runCommand,
-          options.orcaCommand ?? 'orca',
-          mailboxId.slice(9),
-        );
+        let found: { workspacePath: string; worktreeId: string } | undefined;
+        try {
+          found = await findOrcaWorktreeByName(
+            options.commandRunner ?? runCommand,
+            options.orcaCommand ?? 'orca',
+            mailboxId.slice(9),
+          );
+        } catch (error) {
+          if (error instanceof CommandNotStartedError) return undefined;
+          throw error;
+        }
         if (found)
           return {
             driver: 'orca-terminal',

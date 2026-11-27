@@ -566,6 +566,8 @@ export interface EmitMessageInput<T = Record<string, unknown>> {
   replyToId?: string;
   idempotencyKey?: string;
   semantic?: SemanticHeaderInput;
+  /** Post-routing unicast target mailbox resolver; ignored for multicast, broadcast, or explicit targetMailbox. */
+  resolveTargetMailbox?: (targetNodeId: string) => string | undefined;
   attachments?: readonly BlobAttachment[];
   /** Local source paths for pre-shared attachments that a durable outbox must stage. */
   attachmentPaths?: Readonly<Record<string, string>>;
@@ -581,6 +583,7 @@ export interface EmitResult {
   messageId: string;
   traceId: string;
   receipts: readonly DeliveryReceipt[];
+  targetMailbox?: string;
 }
 
 export type OutboxItemStatus = 'queued' | 'delivered' | 'failed';

@@ -1754,22 +1754,14 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       const idempotencyKey = v['idempotency-key'] === undefined
         ? undefined : required(v['idempotency-key']?.trim(), '--idempotency-key');
       const threadId = v.thread === undefined ? undefined : required(v.thread?.trim(), '--thread');
-      // A message on an existing thread belongs to the session that started it: the thread's
-      // recorded routes take precedence over the topic's generic binding. Resolution is scoped to
-      // the send's network, so a newer leg of the same thread on another network never applies.
-      const threadRoute =
-        threadId === undefined ? undefined : runtime.mailbox.resolveReplyTarget(threadId, networkId);
       const explicitTargetMailbox =
         typeof v['target-mailbox'] === 'string' && v['target-mailbox']
           ? String(v['target-mailbox'])
           : typeof v.mailbox === 'string' && v.mailbox
             ? String(v.mailbox)
             : undefined;
-      const targetMailbox =
-        explicitTargetMailbox ??
-        (threadRoute?.targetMailbox !== undefined && threadRoute.targetMailbox !== 'default'
-          ? threadRoute.targetMailbox
-          : undefined);
+      const threadLocalMailbox =
+        threadId === undefined ? undefined : runtime.mailbox.resolveThreadLocalMailbox(threadId, networkId);
       const callerBinding = caller;
       const payload = payloadFromBody(body);
       const streamKey = typeof payload.streamKey === 'string' ? payload.streamKey : undefined;
@@ -1793,8 +1785,8 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           : undefined;
       let replyMailbox = explicitReplyMailbox ?? (callerBinding?.mailboxId && !callerMatchesBoundTopic
         ? callerBinding.mailboxId
-        : (threadRoute?.localMailbox !== undefined && threadRoute.localMailbox !== 'default'
-          ? threadRoute.localMailbox
+        : (threadLocalMailbox !== undefined && threadLocalMailbox !== 'default'
+          ? threadLocalMailbox
           : (callerMatchesBoundTopic && resolvedTopic?.binding.rotateAfterWaves !== undefined
             ? boundTopicMailbox
             : undefined)));
@@ -1817,13 +1809,21 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           ...(v.to ? { targets: [String(v.to)] } : {}),
           topic,
         },
-        ...(threadId !== undefined || targetMailbox !== undefined || replyMailbox !== undefined
+        ...(threadId !== undefined || explicitTargetMailbox !== undefined || replyMailbox !== undefined
           ? {
               semantic: {
                 type: 'message' as const,
                 ...(threadId !== undefined ? { threadId } : {}),
-                ...(targetMailbox !== undefined ? { targetMailbox } : {}),
+                ...(explicitTargetMailbox !== undefined ? { targetMailbox: explicitTargetMailbox } : {}),
                 ...(replyMailbox !== undefined ? { replyMailbox } : {}),
+              },
+            }
+          : {}),
+        ...(group === 'send' && threadId !== undefined && explicitTargetMailbox === undefined
+          ? {
+              resolveTargetMailbox: (targetNodeId: string) => {
+                const route = runtime.mailbox.resolveReplyTarget(threadId, networkId, targetNodeId);
+                return route && route.targetMailbox !== 'default' ? route.targetMailbox : undefined;
               },
             }
           : {}),
@@ -1837,7 +1837,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         mode: group,
         published,
         threadId: published.envelope?.threadId ?? threadId ?? published.messageId,
-        targetMailbox: targetMailbox ?? null,
+        targetMailbox: published.targetMailbox ?? explicitTargetMailbox ?? null,
         replyMailbox: published.envelope?.semantic?.replyMailbox ?? replyMailbox ?? null,
         next:
           summarizeNextStep(group, published.receipts ?? []) ??
