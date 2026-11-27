@@ -1,7 +1,7 @@
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -2216,7 +2216,123 @@ test('Phase 4: gate trusted senders persist across daemon restart and CLI trust/
     { networkId: 'sensebeing', kind: 'member', value: 'carol' },
   ]);
 
+  // Exact network and member identities with surrounding spaces are preserved without trimming.
+  assert.deepEqual(
+    await cli(restartedBob, 'gate', 'trust', 'member: alice ', '--network', ' team '),
+    { networkId: ' team ', kind: 'member', value: ' alice ' },
+  );
+  assert.deepEqual(await cli(restartedBob, 'gate', 'trusted', '--network', 'team'), []);
+  assert.deepEqual(await cli(restartedBob, 'gate', 'trusted', '--network', ' team '), [
+    { networkId: ' team ', kind: 'member', value: ' alice ' },
+  ]);
+  assert.deepEqual(
+    await cli(restartedBob, 'gate', 'untrust', 'member: alice ', '--network', ' team '),
+    {
+      removedCount: 1,
+      removed: [{ networkId: ' team ', kind: 'member', value: ' alice ' }],
+      remaining: [],
+    },
+  );
+
   // dealer help includes gate usage.
   const help = await cli(restartedBob, 'help');
   assert.match(help.commands.gate, /trusted\|trust\|untrust/);
+});
+
+test('Phase 4: offline dealer gate trusted reads snapshot without starting runtime, migrating ledgers, draining DND, or scheduling updates', async t => {
+  const root = directory(t);
+  const stateDir = join(root, 'offline-state');
+  mkdirSync(stateDir, { recursive: true });
+
+  const senderKeys = generateNodeKeyPair();
+  const queuedEnvelope = signEnvelope(
+    {
+      id: 'offline-dnd-msg',
+      traceId: 'trace-offline',
+      networkId: 'sensebeing',
+      from: { nodeId: senderKeys.nodeId, member: 'alice', nodeName: 'laptop' },
+      routing: { mode: 'unicast', targets: ['member:bob'] },
+      kind: 'collab.request.v1',
+      subject: 'Pending DND',
+      body: 'Do not drain during offline inspection',
+      payload: {},
+      attachments: [],
+      priority: 'normal',
+      createdAt: new Date().toISOString(),
+    },
+    senderKeys.privateKeyPem,
+  );
+  const dndKey = JSON.stringify([queuedEnvelope.networkId, queuedEnvelope.from.nodeId, queuedEnvelope.id]);
+  const dndPath = join(stateDir, 'gate-dnd.json');
+  const expectedTrusted = [
+    { networkId: 'other', kind: 'member', value: 'carol' },
+    { networkId: 'sensebeing', kind: 'node', value: senderKeys.nodeId },
+  ];
+  const initialDndRaw = JSON.stringify({
+    queued: {
+      [dndKey]: {
+        envelope: queuedEnvelope,
+        status: 'queued',
+        attempts: 0,
+        updatedAt: queuedEnvelope.createdAt,
+      },
+    },
+    trustedSenders: expectedTrusted,
+  });
+  writeFileSync(dndPath, initialDndRaw);
+
+  // Seed legacy mailbox.json and an open-mode config with a script source that writes a marker if started.
+  const sourceMarker = join(root, 'source-fired.txt');
+  writeFileSync(join(stateDir, 'mailbox.json'), JSON.stringify({ schema: 'the-dealer-mailbox/v2', items: {}, leases: {}, wakeTargets: {}, threads: {} }));
+  writeFileSync(
+    join(stateDir, 'config.json'),
+    JSON.stringify({
+      profile: 'headless-relay',
+      member: 'bob',
+      name: 'bob',
+      gateMode: 'open',
+      networks: [{ networkId: 'sensebeing', passphrase: 'secret', admissionMode: 'open' }],
+      sources: [{
+        type: 'script',
+        config: {
+          command: process.execPath,
+          args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(sourceMarker)}, 'fired')`],
+        },
+      }],
+    }),
+  );
+
+  const outAll: string[] = [];
+  const errAll: string[] = [];
+  assert.equal(
+    await runDealerCli(['gate', 'trusted', '--json'], {
+      stateDir,
+      stdout: line => outAll.push(line),
+      stderr: line => errAll.push(line),
+    }),
+    0,
+    errAll.join('\n'),
+  );
+  assert.deepEqual(JSON.parse(outAll.join('\n')), expectedTrusted);
+
+  const outScoped: string[] = [];
+  const errScoped: string[] = [];
+  assert.equal(
+    await runDealerCli(['gate', 'trusted', '--network', 'sensebeing', '--json'], {
+      stateDir,
+      stdout: line => outScoped.push(line),
+      stderr: line => errScoped.push(line),
+    }),
+    0,
+    errScoped.join('\n'),
+  );
+  assert.deepEqual(JSON.parse(outScoped.join('\n')), [
+    { networkId: 'sensebeing', kind: 'node', value: senderKeys.nodeId },
+  ]);
+
+  assert.equal(existsSync(join(stateDir, 'runtime.lock')), false, 'must not acquire runtime.lock');
+  assert.equal(existsSync(join(stateDir, 'mailbox.sqlite')), false, 'must not migrate mailbox.json');
+  assert.equal(existsSync(join(stateDir, 'auto-update.json')), false, 'must not schedule background update');
+  assert.equal(existsSync(sourceMarker), false, 'must not start sources');
+  assert.equal(readFileSync(dndPath, 'utf8'), initialDndRaw, 'must not drain or mutate gate-dnd.json');
 });

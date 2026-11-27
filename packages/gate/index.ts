@@ -101,22 +101,54 @@ function isTrustedSenderKind(value: unknown): value is TrustedSenderKind {
   return value === 'node' || value === 'member';
 }
 
-function normalizeTrustedSender(record: TrustedSenderRecord): TrustedSenderRecord {
-  if (!isRecord(record)) {
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function validateTrustedSenderRecord(raw: unknown): TrustedSenderRecord {
+  if (!isRecord(raw)) {
     throw new Error('Trusted sender record must be an object');
   }
-  const networkId = typeof record.networkId === 'string' ? record.networkId.trim() : '';
-  const value = typeof record.value === 'string' ? record.value.trim() : '';
-  if (!networkId) {
+  if (!isNonEmptyString(raw.networkId)) {
     throw new Error('Trusted sender networkId must be a non-empty string');
   }
-  if (!isTrustedSenderKind(record.kind)) {
-    throw new Error(`Invalid trusted sender kind: ${String(record.kind)}`);
+  if (!isTrustedSenderKind(raw.kind)) {
+    throw new Error(`Invalid trusted sender kind: ${String(raw.kind)}`);
   }
-  if (!value) {
+  if (!isNonEmptyString(raw.value)) {
     throw new Error('Trusted sender value must be a non-empty string');
   }
-  return { networkId, kind: record.kind, value };
+  return { networkId: raw.networkId, kind: raw.kind, value: raw.value };
+}
+
+export function parseTrustedSenderSelector(selector: string): {
+  kind: TrustedSenderKind;
+  value: string;
+} {
+  if (!isNonEmptyString(selector)) {
+    throw new Error('Required: selector');
+  }
+  if (selector.startsWith('node:')) {
+    const value = selector.slice('node:'.length);
+    if (!isNonEmptyString(value)) {
+      throw new Error('Invalid trusted sender selector: node:<id> requires a non-empty id');
+    }
+    return { kind: 'node', value };
+  }
+  if (selector.startsWith('member:')) {
+    const value = selector.slice('member:'.length);
+    if (!isNonEmptyString(value)) {
+      throw new Error('Invalid trusted sender selector: member:<name> requires a non-empty name');
+    }
+    return { kind: 'member', value };
+  }
+  if (selector.startsWith('ed25519:')) {
+    if (selector.length === 'ed25519:'.length) {
+      throw new Error('Invalid trusted sender selector: ed25519:<key> requires a non-empty key');
+    }
+    return { kind: 'node', value: selector };
+  }
+  return { kind: 'member', value: selector };
 }
 
 function loadDnd(path: string | undefined, limit: number): GateCustodyState {
@@ -136,19 +168,7 @@ function loadDnd(path: string | undefined, limit: number): GateCustodyState {
     if (saved.trustedSenders !== undefined) {
       if (!Array.isArray(saved.trustedSenders)) throw new Error();
       for (const item of saved.trustedSenders) {
-        if (
-          !isRecord(item) ||
-          typeof item.networkId !== 'string' || item.networkId.trim().length === 0 ||
-          !isTrustedSenderKind(item.kind) ||
-          typeof item.value !== 'string' || item.value.trim().length === 0
-        ) {
-          throw new Error();
-        }
-        const record: TrustedSenderRecord = {
-          networkId: item.networkId,
-          kind: item.kind,
-          value: item.value,
-        };
+        const record = validateTrustedSenderRecord(item);
         trusted.set(trustedSenderKey(record), record);
       }
     }
@@ -164,11 +184,22 @@ function loadDnd(path: string | undefined, limit: number): GateCustodyState {
           (entry.lastError !== undefined && typeof entry.lastError !== 'string')) throw new Error();
       return [key, entry];
     });
-    if (entries.length > limit) throw new Error();
+    if (Number.isFinite(limit) && entries.length > limit) throw new Error();
     return { queued: new Map(entries), withdrawn, trusted };
   } catch {
     throw new Error('Invalid gate DND store');
   }
+}
+
+export function readTrustedSendersSnapshot(
+  dndQueuePath: string,
+  networkId?: string,
+): readonly TrustedSenderRecord[] {
+  if (networkId !== undefined && !isNonEmptyString(networkId)) {
+    throw new Error('Trusted sender networkId must be a non-empty string');
+  }
+  const { trusted } = loadDnd(dndQueuePath, Number.POSITIVE_INFINITY);
+  return sortedTrustedSenders(trusted, networkId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -234,11 +265,21 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         persistGateState(queued, withdrawals);
       };
       const senderTrustRecords = (e: MessageEnvelope): TrustedSenderRecord[] => {
-        const records: TrustedSenderRecord[] = [
-          { networkId: e.networkId, kind: 'node', value: e.from.nodeId },
-        ];
-        if (typeof e.from.member === 'string' && e.from.member.trim().length > 0) {
-          records.push({ networkId: e.networkId, kind: 'member', value: e.from.member });
+        if (!isNonEmptyString(e.networkId)) return [];
+        const records: TrustedSenderRecord[] = [];
+        if (isNonEmptyString(e.from.nodeId)) {
+          records.push(validateTrustedSenderRecord({
+            networkId: e.networkId,
+            kind: 'node',
+            value: e.from.nodeId,
+          }));
+        }
+        if (isNonEmptyString(e.from.member)) {
+          records.push(validateTrustedSenderRecord({
+            networkId: e.networkId,
+            kind: 'member',
+            value: e.from.member,
+          }));
         }
         return records;
       };
@@ -432,32 +473,33 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         listDndQueue: () => structuredClone([...dnd].map(([id, entry]) => ({ id, ...entry }))),
         listPendingApprovals: () => structuredClone([...pending.values()]),
         listRejections: () => structuredClone(rejections),
-        listTrustedSenders: networkId => sortedTrustedSenders(trusted, networkId),
+        listTrustedSenders(networkId) {
+          if (networkId !== undefined && !isNonEmptyString(networkId)) {
+            throw new Error('Trusted sender networkId must be a non-empty string');
+          }
+          return sortedTrustedSenders(trusted, networkId);
+        },
         trustSender(record) {
-          const normalized = normalizeTrustedSender(record);
+          const validated = validateTrustedSenderRecord(record);
           const nextTrusted = new Map(trusted);
-          nextTrusted.set(trustedSenderKey(normalized), normalized);
+          nextTrusted.set(trustedSenderKey(validated), validated);
           persistGateState(dnd, withdrawn, nextTrusted);
-          return { ...normalized };
+          return { ...validated };
         },
         untrustSender(filter) {
           if (!isRecord(filter)) {
             throw new Error('Untrust filter must be an object');
           }
-          const value = typeof filter.value === 'string' ? filter.value.trim() : '';
-          if (!value) {
+          if (!isNonEmptyString(filter.value)) {
             throw new Error('Trusted sender value must be a non-empty string');
           }
-          let networkId: string | undefined;
-          if (filter.networkId !== undefined) {
-            networkId = typeof filter.networkId === 'string' ? filter.networkId.trim() : '';
-            if (!networkId) {
-              throw new Error('Trusted sender networkId must be a non-empty string');
-            }
+          if (filter.networkId !== undefined && !isNonEmptyString(filter.networkId)) {
+            throw new Error('Trusted sender networkId must be a non-empty string');
           }
           if (filter.kind !== undefined && !isTrustedSenderKind(filter.kind)) {
             throw new Error(`Invalid trusted sender kind: ${String(filter.kind)}`);
           }
+          const { value, networkId } = filter;
           const removed: TrustedSenderRecord[] = [];
           const nextTrusted = new Map(trusted);
           for (const [entryKey, record] of trusted) {
@@ -483,6 +525,10 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             throw new Error(`Unknown approval: ${id}`);
           }
           if (approving.has(id)) throw new Error(`Approval already in progress: ${id}`);
+          const trustRecords = opts?.trustSender ? senderTrustRecords(item.envelope) : [];
+          if (opts?.trustSender && trustRecords.length === 0) {
+            throw new Error('Cannot trust sender with empty networkId or nodeId');
+          }
           approving.add(id);
           try {
             const receipt = await ctx.services.dispatcher.dispatch(item.envelope);
@@ -491,14 +537,12 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             }
             const queuedId = dndKey(item.envelope);
             const removeQueued = dnd.get(queuedId)?.envelope.signature === item.envelope.signature;
-            if (removeQueued || opts?.trustSender) {
+            if (removeQueued || trustRecords.length > 0) {
               const nextQueued = removeQueued ? new Map(dnd) : dnd;
               if (removeQueued) nextQueued.delete(queuedId);
-              const nextTrusted = opts?.trustSender ? new Map(trusted) : trusted;
-              if (opts?.trustSender) {
-                for (const record of senderTrustRecords(item.envelope)) {
-                  nextTrusted.set(trustedSenderKey(record), record);
-                }
+              const nextTrusted = trustRecords.length > 0 ? new Map(trusted) : trusted;
+              for (const record of trustRecords) {
+                nextTrusted.set(trustedSenderKey(record), record);
               }
               persistGateState(nextQueued, withdrawn, nextTrusted);
             }

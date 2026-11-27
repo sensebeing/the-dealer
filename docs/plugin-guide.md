@@ -117,8 +117,8 @@ recognizes only durable confirmed handoffs (settled by default, queued when
 explicitly allowed). An unknown external outcome is never a confirmed duplicate.
 Dedup watermarks persist `revision` and `status` (`unknown`, `queued`, `settled`);
 definite pre-execution failures and non-durable queues release their reservation.
-Runtime DND envelopes persist in `gate-dnd.json` before a durable queued receipt
-is signed. Recovery drains only open mounted networks after project and user
+Runtime DND envelopes and trusted senders persist in `gate-dnd.json` (`trustedSenders`
+is omitted when empty) before a durable queued receipt or confirmed trust grant commits. Recovery drains only open mounted networks after project and user
 admission rules have loaded. Only confirmed handoffs clear DND or approval obligations.
 Unconfirmed results park the full signed DND envelope with attempts, lastError and
 updatedAt; inspect via `gate.listDndQueue()` and explicitly retry via

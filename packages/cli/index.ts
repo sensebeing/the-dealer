@@ -24,7 +24,7 @@ import {
   isTerminalDeliveryFailure,
 } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
-import type { TrustedSenderKind } from '../gate/index.ts';
+import { parseTrustedSenderSelector, readTrustedSendersSnapshot } from '../gate/index.ts';
 import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
@@ -120,34 +120,6 @@ function required(value: unknown, name: string): string {
     throw new Error(`Required: ${name}`);
   }
   return value;
-}
-
-function parseTrustedSenderSelector(selector: string): { kind: TrustedSenderKind; value: string } {
-  const trimmed = selector.trim();
-  if (!trimmed) {
-    throw new Error('Required: selector');
-  }
-  if (trimmed.startsWith('node:')) {
-    const value = trimmed.slice('node:'.length).trim();
-    if (!value) {
-      throw new Error('Invalid trusted sender selector: node:<id> requires a non-empty id');
-    }
-    return { kind: 'node', value };
-  }
-  if (trimmed.startsWith('member:')) {
-    const value = trimmed.slice('member:'.length).trim();
-    if (!value) {
-      throw new Error('Invalid trusted sender selector: member:<name> requires a non-empty name');
-    }
-    return { kind: 'member', value };
-  }
-  if (trimmed.startsWith('ed25519:')) {
-    if (!trimmed.slice('ed25519:'.length).trim()) {
-      throw new Error('Invalid trusted sender selector: ed25519:<key> requires a non-empty key');
-    }
-    return { kind: 'node', value: trimmed };
-  }
-  return { kind: 'member', value: trimmed };
 }
 
 function duration(value = '24h'): number {
@@ -1361,13 +1333,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
     const readOnlyInbox = group === 'inbox' && (action === undefined || action === 'list' || (action === 'check' && v.peek === true));
     const readOnlyThread = group === 'thread' && (action === 'list' || action === 'show');
+    const readOnlyGate = group === 'gate' && action === 'trusted';
     const observesMailbox = readOnlyInbox || readOnlyThread || (group === 'queue' && action === 'status') || (group === 'node' && action === 'status');
+    const observesState = observesMailbox || readOnlyGate;
     const openLedgers = async (config?: Partial<RuntimeConfig>) => {
       const ledgers = await ledgersFor(options, stateDir, observesMailbox, config);
       if (!options.runtime) offlineMailbox = ledgers.mailbox;
       return ledgers;
     };
-    if (!options.runtime && !observesMailbox && group !== 'self-update' && !(group === 'node' && action === 'down')) {
+    if (!options.runtime && !observesState && group !== 'self-update' && !(group === 'node' && action === 'down')) {
       updateStateDir = stateDir;
     }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
@@ -1541,6 +1515,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'thread') {
       const { mailbox, outbox } = await openLedgers();
       stdout(JSON.stringify(runThreadCommand(mailbox, action, target, v, outbox), null, v.json ? undefined : 2));
+      return 0;
+    }
+    if (!options.runtime && group === 'gate' && action === 'trusted') {
+      const networkId = v.network !== undefined ? required(v.network, '--network') : undefined;
+      stdout(JSON.stringify(
+        readTrustedSendersSnapshot(join(stateDir, 'gate-dnd.json'), networkId),
+        null,
+        v.json ? undefined : 2,
+      ));
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'up') {
@@ -1768,17 +1751,17 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
         await runtime.gate.drainDnd(network);
         result = { drained: true };
       } else if (action === 'trusted') {
-        result = runtime.gate.listTrustedSenders(network);
+        result = runtime.gate.listTrustedSenders(v.network !== undefined ? required(v.network, '--network') : undefined);
       } else if (action === 'trust') {
         const selector = parseTrustedSenderSelector(required(target, 'selector'));
         result = runtime.gate.trustSender({
-          networkId: required(network?.trim(), '--network'),
+          networkId: required(network, '--network'),
           ...selector,
         });
       } else if (action === 'untrust') {
         const selector = parseTrustedSenderSelector(required(target, 'selector'));
         result = runtime.gate.untrustSender({
-          ...(network !== undefined ? { networkId: required(network.trim(), '--network') } : {}),
+          ...(v.network !== undefined ? { networkId: required(network, '--network') } : {}),
           ...selector,
         });
       } else {
