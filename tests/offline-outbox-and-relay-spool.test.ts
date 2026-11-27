@@ -2417,24 +2417,88 @@ test('unresolved target classification is typed rather than message-text based',
   );
 });
 
-test('CLI next-step summary uses the shared durable outbox receipt predicate', () => {
-  const receipt = (durable: boolean): DeliveryReceipt => ({
+test('CLI next-step summary distinguishes offline, in-doubt timeout, and mixed multicast receipts', () => {
+  const outboxReceipt = (
+    durable: boolean,
+    extra: Record<string, unknown> = {},
+  ): DeliveryReceipt => ({
     messageId: 'msg_summary',
     networkId: 'summary-net',
     fromNodeId: 'ed25519:' + 'c'.repeat(64),
     stage: 'queued',
-    executionReceipt: { executor: 'outbox', durable },
+    executionReceipt: { executor: 'outbox', durable, ...extra },
     updatedAt: new Date().toISOString(),
     signature: 'test-signature',
   });
+  const liveReceipt = (
+    stage: DeliveryStage = 'dispatched',
+    executionReceipt: Record<string, unknown> = { executor: 'inbox', status: 'accepted', handoff: 'queued', durable: true },
+  ): DeliveryReceipt => ({
+    messageId: 'msg_summary',
+    networkId: 'summary-net',
+    fromNodeId: 'ed25519:' + 'd'.repeat(64),
+    stage,
+    executionReceipt,
+    updatedAt: new Date().toISOString(),
+    signature: 'test-signature',
+  });
+
   assert.equal(
-    summarizeNextStep('send', [receipt(false)]),
+    summarizeNextStep('send', [outboxReceipt(false)]),
     undefined,
     'a non-durable outbox-stage receipt is not a completed durable handoff',
   );
-  assert.match(
-    summarizeNextStep('send', [receipt(true)]) ?? '',
-    /durably queued in outbox/,
+  assert.equal(
+    summarizeNextStep('send', [liveReceipt('dispatched'), liveReceipt('settled')]),
+    undefined,
+    'fully live deliveries need no outbox next-step override',
+  );
+  assert.equal(
+    summarizeNextStep('send', [outboxReceipt(true)]),
+    'Target peer is currently offline; message is durably queued in outbox (and spooled on relay seed if configured) and will auto-deliver when the peer reconnects. You may safely ack your current inbox lease now.',
+  );
+  assert.equal(
+    summarizeNextStep('send', [outboxReceipt(true, { inDoubt: true })]),
+    'Delivery timed out before confirmation; message is durably queued in outbox pending reconciliation and will not duplicate if already received. You may safely ack your current inbox lease now.',
+  );
+  assert.equal(
+    summarizeNextStep('send', [
+      outboxReceipt(true, { inDoubt: true }),
+      outboxReceipt(true, { inDoubt: true }),
+    ]),
+    'Delivery timed out before confirmation; message is durably queued in outbox pending reconciliation and will not duplicate if already received. You may safely ack your current inbox lease now.',
+  );
+  assert.equal(
+    summarizeNextStep('send', [
+      outboxReceipt(true, { inDoubt: true }),
+      outboxReceipt(true),
+    ]),
+    'Target peer is currently offline; message is durably queued in outbox (and spooled on relay seed if configured) and will auto-deliver when the peer reconnects. You may safely ack your current inbox lease now.',
+    'mixed in-doubt and offline outbox receipts without any live delivery fall back to offline summary',
+  );
+  assert.equal(
+    summarizeNextStep('send', [
+      liveReceipt('dispatched'),
+      liveReceipt('queued', { executor: 'inbox', durable: true }),
+      outboxReceipt(true),
+    ]),
+    'Delivered to 2 live peer(s); 1 additional target(s) are durably queued in outbox for retry. Do not treat this as a delivery failure for the live peer(s) — you may safely ack your current inbox lease now.',
+  );
+  assert.equal(
+    summarizeNextStep('send', [
+      liveReceipt('dispatched'),
+      outboxReceipt(true, { inDoubt: true }),
+      outboxReceipt(true),
+    ]),
+    'Delivered to 1 live peer(s); 2 additional target(s) are durably queued in outbox for retry. Do not treat this as a delivery failure for the live peer(s) — you may safely ack your current inbox lease now.',
+  );
+  assert.equal(
+    summarizeNextStep('send', [
+      liveReceipt('rejected', { executor: 'gate', handoff: 'rejected' }),
+      outboxReceipt(true),
+    ]),
+    'Target peer is currently offline; message is durably queued in outbox (and spooled on relay seed if configured) and will auto-deliver when the peer reconnects. You may safely ack your current inbox lease now.',
+    'unconfirmed/rejected non-outbox receipts are not counted as delivered live peers',
   );
 });
 

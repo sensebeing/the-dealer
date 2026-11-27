@@ -84,6 +84,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
         targetNodeId: string | undefined,
         relaySpooled: boolean,
         detail: string,
+        inDoubt = false,
       ): DeliveryReceipt =>
         signReceipt(
           {
@@ -99,6 +100,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               handoff: 'queued',
               durable: true,
               queuedOffline: true,
+              ...(inDoubt ? { inDoubt: true } : {}),
               ...(targetNodeId !== undefined ? { targetNodeId } : {}),
               relaySpooled,
               summary: detail,
@@ -584,12 +586,13 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               if (queueIfOffline) {
                 for (const targetNodeId of pendingNodeIds) {
                   const spooled = relaySpooledNodeIds.includes(targetNodeId);
+                  const inDoubt = !spooled && inDoubtNodeIds.includes(targetNodeId);
                   const detail = spooled
                     ? `Queued in local outbox and spooled on relay seed for offline peer ${targetNodeId}`
-                    : inDoubtNodeIds.includes(targetNodeId)
+                    : inDoubt
                       ? `Queued in local outbox pending reconciliation after delivery timeout for peer ${targetNodeId}`
                       : `Queued in local outbox for offline peer ${targetNodeId}`;
-                  receipts.push(queuedReceipt(envelope, self, targetNodeId, spooled, detail));
+                  receipts.push(queuedReceipt(envelope, self, targetNodeId, spooled, detail, inDoubt));
                 }
               }
               // Only a broadcast, live handoff, or durable obligation commits a reverse route.
@@ -1012,13 +1015,17 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
         for (const targetNodeId of pending) {
           const spooled =
             targetNodeId !== undefined && existing.relaySpooledNodeIds.includes(targetNodeId);
+          const inDoubt =
+            targetNodeId !== undefined && !spooled && existing.inDoubtNodeIds.includes(targetNodeId);
           const detail =
             targetNodeId === undefined
               ? `Reused durable outbox obligation ${existing.id}`
               : spooled
                 ? `Reused durable outbox obligation ${existing.id}; spooled on relay seed for offline peer ${targetNodeId}`
-                : `Reused durable outbox obligation ${existing.id} for offline peer ${targetNodeId}`;
-          receipts.push(queuedReceipt(existing.envelope, selfCardFor(existing), targetNodeId, spooled, detail));
+                : inDoubt
+                  ? `Reused durable outbox obligation ${existing.id} pending reconciliation after delivery timeout for peer ${targetNodeId}`
+                  : `Reused durable outbox obligation ${existing.id} for offline peer ${targetNodeId}`;
+          receipts.push(queuedReceipt(existing.envelope, selfCardFor(existing), targetNodeId, spooled, detail, inDoubt));
         }
         return receipts;
       };

@@ -56,6 +56,7 @@ import {
   liveDaemonOwner,
   runDealerCli,
   stopDaemonIfRunning,
+  summarizeNextStep,
 } from '../packages/cli/index.ts';
 
 const dealerBin = fileURLToPath(new URL('../bin/dealer.js', import.meta.url));
@@ -800,12 +801,13 @@ test('dealer outbox drop settles partially-delivered items, cleans staged files,
   assert.deepEqual(runtime.outbox.get(activeEnv.id)?.pendingNodeIds, []);
 });
 
-test('emitter timeout queued receipt reports pending reconciliation wording instead of offline peer', async t => {
+test('emitter timeout, offline, and mixed multicast receipts produce accurate CLI next-step summaries', async t => {
   const root = makeDir(t, 'dealer-emitter-timeout-');
   const sender = generateNodeKeyPair();
   const target = generateNodeKeyPair();
+  const liveTarget = generateNodeKeyPair();
   const outbox = new OutboxStore(join(root, 'outbox.json'), join(root, 'blobs'));
-  let sendMode: 'timeout' | 'offline' = 'timeout';
+  let sendMode: 'timeout' | 'offline' | 'mixed' = 'timeout';
 
   const kernel = new Kernel();
   t.after(() => kernel.stop());
@@ -818,7 +820,24 @@ test('emitter timeout queued receipt reports pending reconciliation wording inst
     listMountedNetworks: () => ['team'],
     getNetworkConfig: () => undefined,
     isPeerReachable: () => true,
-    async sendUnicast() {
+    async sendUnicast(networkId, targetNodeId, frame) {
+      if (sendMode === 'mixed' && targetNodeId === liveTarget.nodeId) {
+        const envelope = (JSON.parse(Buffer.from(frame).toString('utf8')) as {
+          envelope: MessageEnvelope;
+        }).envelope;
+        const receipt = signReceipt(
+          {
+            messageId: envelope.id,
+            networkId,
+            fromNodeId: liveTarget.nodeId,
+            stage: 'dispatched',
+            executionReceipt: { executor: 'inbox', status: 'accepted', handoff: 'queued', durable: true },
+            updatedAt: new Date().toISOString(),
+          },
+          liveTarget.privateKeyPem,
+        );
+        return Buffer.from(JSON.stringify(receipt));
+      }
       if (sendMode === 'timeout') {
         throw new DeliveryTimeoutError('Unicast response timed out');
       }
@@ -844,26 +863,30 @@ test('emitter timeout queued receipt reports pending reconciliation wording inst
   await kernel.use(createRouterPlugin());
   await kernel.use(createEmitterPlugin({ outbox }));
 
-  const targetCard = signNodeCard(
-    {
-      nodeId: target.nodeId,
+  const announcePeer = (keyPair: ReturnType<typeof generateNodeKeyPair>, member: string, nodeName: string) => {
+    const card = signNodeCard(
+      {
+        nodeId: keyPair.nodeId,
+        networkId: 'team',
+        revision: 1,
+        identity: { member, nodeName },
+        admissionMode: 'open',
+        capabilities: { summary: member, skills: [] },
+        runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
+        updatedAt: new Date().toISOString(),
+      },
+      keyPair.privateKeyPem,
+    );
+    kernel.ctx.emit('transport/inbound', {
       networkId: 'team',
-      revision: 1,
-      identity: { member: 'bob', nodeName: 'bob-mac' },
-      admissionMode: 'open',
-      capabilities: { summary: 'bob', skills: [] },
-      runtimeState: { load: 'idle', activeTasks: 0, availableAgents: [] },
-      updatedAt: new Date().toISOString(),
-    },
-    target.privateKeyPem,
-  );
-  kernel.ctx.emit('transport/inbound', {
-    networkId: 'team',
-    senderNodeId: target.nodeId,
-    mode: 'broadcast',
-    subTopic: 'presence',
-    payload: { type: 'peer.card', card: targetCard },
-  });
+      senderNodeId: keyPair.nodeId,
+      mode: 'broadcast',
+      subTopic: 'presence',
+      payload: { type: 'peer.card', card },
+    });
+  };
+  announcePeer(target, 'bob', 'bob-mac');
+  announcePeer(liveTarget, 'carol', 'carol-mac');
 
   const emitter = kernel.getService('emitter');
   sendMode = 'timeout';
@@ -874,11 +897,34 @@ test('emitter timeout queued receipt reports pending reconciliation wording inst
     subject: 'Timeout test',
     body: 'body',
     payload: {},
+    idempotencyKey: 'timeout-key-1',
   });
   assert.equal(timeoutEmit.receipts.length, 1);
   assert.equal(
     timeoutEmit.receipts[0].detail,
     `Queued in local outbox pending reconciliation after delivery timeout for peer ${target.nodeId}`,
+  );
+  assert.equal(timeoutEmit.receipts[0].executionReceipt?.queuedOffline, true);
+  assert.equal(timeoutEmit.receipts[0].executionReceipt?.inDoubt, true);
+  assert.equal(
+    summarizeNextStep('send', timeoutEmit.receipts),
+    'Delivery timed out before confirmation; message is durably queued in outbox pending reconciliation and will not duplicate if already received. You may safely ack your current inbox lease now.',
+  );
+
+  // Idempotent replay of an in-doubt obligation preserves inDoubt and timeout next-step summary.
+  const replayedTimeout = await emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'unicast', targets: [target.nodeId] },
+    kind: 'collab.request.v1',
+    subject: 'Timeout test',
+    body: 'body',
+    payload: {},
+    idempotencyKey: 'timeout-key-1',
+  });
+  assert.equal(replayedTimeout.receipts[0].executionReceipt?.inDoubt, true);
+  assert.equal(
+    summarizeNextStep('send', replayedTimeout.receipts),
+    'Delivery timed out before confirmation; message is durably queued in outbox pending reconciliation and will not duplicate if already received. You may safely ack your current inbox lease now.',
   );
 
   sendMode = 'offline';
@@ -894,6 +940,27 @@ test('emitter timeout queued receipt reports pending reconciliation wording inst
   assert.equal(
     offlineEmit.receipts[0].detail,
     `Queued in local outbox for offline peer ${target.nodeId}`,
+  );
+  assert.equal(offlineEmit.receipts[0].executionReceipt?.queuedOffline, true);
+  assert.equal(offlineEmit.receipts[0].executionReceipt?.inDoubt, undefined);
+  assert.equal(
+    summarizeNextStep('send', offlineEmit.receipts),
+    'Target peer is currently offline; message is durably queued in outbox (and spooled on relay seed if configured) and will auto-deliver when the peer reconnects. You may safely ack your current inbox lease now.',
+  );
+
+  sendMode = 'mixed';
+  const mixedEmit = await emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'multicast', targets: [liveTarget.nodeId, target.nodeId] },
+    kind: 'collab.request.v1',
+    subject: 'Mixed multicast test',
+    body: 'body',
+    payload: {},
+  });
+  assert.equal(mixedEmit.receipts.length, 2);
+  assert.equal(
+    summarizeNextStep('send', mixedEmit.receipts),
+    'Delivered to 1 live peer(s); 1 additional target(s) are durably queued in outbox for retry. Do not treat this as a delivery failure for the live peer(s) — you may safely ack your current inbox lease now.',
   );
 });
 

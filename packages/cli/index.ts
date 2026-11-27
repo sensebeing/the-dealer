@@ -178,7 +178,7 @@ export interface ControlRpcOptions {
 const DEFAULT_RPC_INACTIVITY_MS = 45_000;
 
 /**
- * One caller-facing next-step phrase for command results. A queued-offline receipt is a
+ * One caller-facing next-step phrase for command results. A durable outbox receipt is a
  * complete durable handoff: the sender must not poll or hold its inbox lease open.
  */
 export function summarizeNextStep(
@@ -186,9 +186,18 @@ export function summarizeNextStep(
   receipts: readonly DeliveryReceipt[],
 ): string | undefined {
   void command;
-  const queuedOffline = receipts.some(isDurableOutboxReceipt);
-  if (!queuedOffline) {
+  const queued = receipts.filter(isDurableOutboxReceipt);
+  if (queued.length === 0) {
     return undefined;
+  }
+  const delivered = receipts.filter(
+    r => !isDurableOutboxReceipt(r) && isConfirmedHandoffReceipt(r, { allowQueued: true }),
+  );
+  if (delivered.length > 0) {
+    return `Delivered to ${delivered.length} live peer(s); ${queued.length} additional target(s) are durably queued in outbox for retry. Do not treat this as a delivery failure for the live peer(s) — you may safely ack your current inbox lease now.`;
+  }
+  if (queued.every(r => r.executionReceipt?.inDoubt === true)) {
+    return 'Delivery timed out before confirmation; message is durably queued in outbox pending reconciliation and will not duplicate if already received. You may safely ack your current inbox lease now.';
   }
   return 'Target peer is currently offline; message is durably queued in outbox (and spooled on relay seed if configured) and will auto-deliver when the peer reconnects. You may safely ack your current inbox lease now.';
 }
