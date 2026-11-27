@@ -48,6 +48,11 @@ export interface FakeCodexAppServerOptions {
   spawnError?: (request: StdioProcessRequest, index: number) => Error | undefined;
   /** Override thread id returned by thread/start. */
   nextThreadId?: (index: number, params: Record<string, unknown>, session: FakeCodexSessionRecord) => string;
+  /** Threads that reject `thread/resume` with JSON-RPC `-32600: thread already has an active writer`. */
+  activeWriterThreadIds?:
+    | ReadonlySet<string>
+    | readonly string[]
+    | ((threadId: string, session: FakeCodexSessionRecord) => boolean);
   /** Custom handler per JSON-RPC request/notification; return true to suppress default reply. */
   onMessage?: (
     message: FakeCodexJsonRpcMessage,
@@ -213,6 +218,22 @@ export function createFakeCodexAppServer(options: FakeCodexAppServerOptions = {}
           record.threadMethod = 'thread/resume';
           record.threadParams = parsed.params;
           const threadId = String(parsed.params?.threadId ?? '');
+          const isActiveWriter =
+            typeof options.activeWriterThreadIds === 'function'
+              ? options.activeWriterThreadIds(threadId, record)
+              : options.activeWriterThreadIds instanceof Set
+                ? options.activeWriterThreadIds.has(threadId)
+                : Array.isArray(options.activeWriterThreadIds)
+                  ? options.activeWriterThreadIds.includes(threadId)
+                  : false;
+          if (isActiveWriter) {
+            send({
+              jsonrpc: '2.0',
+              id: parsed.id,
+              error: { code: -32600, message: 'thread already has an active writer' },
+            });
+            return;
+          }
           record.threadId = threadId;
           send({ jsonrpc: '2.0', id: parsed.id, result: { thread: { id: threadId } } });
           return;

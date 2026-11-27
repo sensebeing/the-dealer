@@ -221,6 +221,7 @@ export function resolveAgentHostSessionLink(
           state: 'ready',
           label: 'ChatGPT App',
           url: `codex://threads/${encodeURIComponent(entry.sessionId)}`,
+          committed: true,
         };
       }
     }
@@ -248,6 +249,7 @@ export function resolveAgentHostSessionLink(
     state: 'ready',
     label: 'ChatGPT App',
     url: `codex://threads/${encodeURIComponent(sessionId)}`,
+    ...(options.itemSequence !== undefined ? { committed: false } : {}),
   };
 }
 
@@ -279,7 +281,7 @@ export async function deliverAgentHostWakeTarget(
     stdioSpawner?: StdioProcessSpawner;
     agySettingsPath?: string;
   } = {},
-): Promise<{ pointer: string; stdout: string; stderr?: string }> {
+): Promise<{ pointer: string; stdout: string; stderr?: string; rotated?: boolean }> {
   const now = options.now ?? Date.now();
   let deliveryBegun = false;
   let expectedRevision = 0;
@@ -338,13 +340,22 @@ export async function deliverAgentHostWakeTarget(
     }
     deliveryBegun = true;
     const resumeThread = effectiveMode === 'fixed' || (effectiveMode === 'wave' && Boolean(effectiveSessionId));
-    const threadName = !resumeThread
+    const allowActiveWriterFallback = canonicalHost === 'codex' && resumeThread && !hasOutstandingLease;
+    const canFallbackOnActiveWriter = (): boolean => {
+      const latestTarget = store.getWakeTarget(mailboxId);
+      if (!latestTarget || (latestTarget.bindingRevision ?? 0) !== expectedRevision) return false;
+      return !store.check({ mailboxId, peek: true }).deliveryId;
+    };
+    const threadName = !resumeThread || allowActiveWriterFallback
       ? buildCodexThreadName(mailboxId, effectiveMode, preview, {
           now,
-          rotates: target.rotateAfterWaves !== undefined || target.rotateAfterMs !== undefined,
+          rotates:
+            target.rotateAfterWaves !== undefined ||
+            target.rotateAfterMs !== undefined ||
+            allowActiveWriterFallback,
         })
       : undefined;
-    const output =
+    const codexOutput =
       canonicalHost === 'codex'
         ? await runCodexAppServerTurn({
             command: target.interactiveCommand ?? 'codex',
@@ -356,21 +367,27 @@ export async function deliverAgentHostWakeTarget(
             agentProfile: target.agentProfile,
             signal: options.signal,
             stdioSpawner: options.stdioSpawner,
+            fallbackOnActiveWriter: allowActiveWriterFallback ? canFallbackOnActiveWriter : false,
           })
-        : await checkedCommand(runner, {
-            ...invocation,
-            cwd: target.workspacePath,
-            signal: options.signal,
-          });
+        : undefined;
+    const output =
+      codexOutput ??
+      (await checkedCommand(runner, {
+        ...invocation,
+        cwd: target.workspacePath,
+        signal: options.signal,
+      }));
+    const rotatedByActiveWriter = Boolean(codexOutput?.rotatedFromThreadId);
+    const rotatedSession = shouldRotate || rotatedByActiveWriter;
     const continuation = resolveAgentHostContinuation(
       target.hostAgent,
       mailboxId,
-      effectiveSessionId,
+      rotatedByActiveWriter ? undefined : effectiveSessionId,
       output.stdout,
-      effectiveMode,
+      rotatedByActiveWriter ? 'wave' : effectiveMode,
     );
     const sessionStartedAt = continuation.sessionId
-      ? (shouldRotate || !target.sessionId || continuation.sessionId !== target.sessionId
+      ? (rotatedSession || !target.sessionId || continuation.sessionId !== target.sessionId
           ? now
           : (target.sessionStartedAt ?? now))
       : undefined;
@@ -405,7 +422,7 @@ export async function deliverAgentHostWakeTarget(
         return {
           driver: continuation.hostAgent ? 'agent-host' : 'passive',
           driverConfig: nextDriverConfig,
-          ...(shouldRotate
+          ...(rotatedSession
             ? { completedWaves: Math.max(0, lockedCurrent.completedWaves - preRotationCompletedWaves) }
             : {}),
         };
@@ -414,7 +431,12 @@ export async function deliverAgentHostWakeTarget(
       expectedRevision,
     );
     if (completed.superseded) throw new SettledWakeLaunchError('Wake launch superseded by a newer binding');
-    return { pointer, stdout: output.stdout, stderr: output.stderr };
+    return {
+      pointer,
+      stdout: output.stdout,
+      stderr: output.stderr,
+      ...(rotatedSession ? { rotated: true } : {}),
+    };
   } catch (error) {
     const fenced = store.getWakeTarget(mailboxId)?.deliveryInDoubt === true;
     if (fenced) {
@@ -454,7 +476,11 @@ export function createAgentHostWakeupDriver(
             agySettingsPath: options.agySettingsPath,
           },
         );
-        return { kind: 'delivered', pointer: delivered.pointer };
+        return {
+          kind: 'delivered',
+          pointer: delivered.pointer,
+          ...(delivered.rotated ? { rotated: true } : {}),
+        };
       } catch (error) {
         if (error instanceof SettledWakeLaunchError) throw error;
         throw new SettledWakeLaunchError(String(error), { cause: error });
