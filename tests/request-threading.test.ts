@@ -1657,4 +1657,129 @@ test('Lark session links: inline ready, pending onWakeTarget follow-up, rotation
       '70th wave must retain its exact S70 link',
     );
   }
+
+  // 10. Unexpected active-writer rotation after Lark optimistically inlined S1:
+  //     - Historical item consumed by S1 keeps its committed S1 root with ZERO spurious reply;
+  //     - New item whose root optimistically inlined S1 gets ONE idempotent thread reply pointing to S2
+  //       after completeWakeDelivery commits S2, survives restart without duplicate sends or writes;
+  //     - Delayed Lark consumption after a subsequent active-writer rotation to S3 directly inlines S3.
+  {
+    const dir = join(root, 'active-writer-lark-correction');
+    const store = new MailboxStore(join(dir, 'mailbox.json'));
+    t.after(() => store.close());
+    const occupied = new Set<string>();
+    const fakeCodex = createFakeCodexAppServer({
+      activeWriterThreadIds: occupied,
+      nextThreadId: count => `aw-s${count + 1}`,
+    });
+
+    // Seed existing fixed Codex session S1 and deliver/ack historical item #1 on S1.
+    store.enqueue([envelope('aw-hist-1')], {
+      mailboxId: 'stream:aw-lark',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: {
+          hostAgent: 'codex',
+          conversationMode: 'fixed',
+          sessionId: 'aw-s1',
+          configuredSessionId: 'aw-s1',
+          sessionStartedAt: 1_000,
+          workspacePath: root,
+        },
+      },
+    });
+    await deliverAgentHostWakeTarget(store, runCommand, 'stream:aw-lark', { stdioSpawner: fakeCodex.spawner });
+    store.ack(store.check({ mailboxId: 'stream:aw-lark' }).deliveryId!, 'stream:aw-lark');
+
+    const calls: CommandRequest[] = [];
+    const makeNotifier = () =>
+      new LarkMailboxNotifier({
+        store,
+        stateDir: dir,
+        localNodeId: 'local',
+        localMember: 'bob',
+        defaultBoundMailboxes: ['stream:aw-lark'],
+        config: { enabled: true, target: { chatId: 'aw-chat' } },
+        resolveSessionLink: (mailboxId, itemSequence) =>
+          resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+            hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+            itemSequence,
+          }),
+        commandRunner: async call => {
+          calls.push(call);
+          return { stdout: JSON.stringify({ data: { message_id: `aw-lark-${calls.length}` } }) };
+        },
+      });
+
+    const notifier = makeNotifier();
+    t.after(() => notifier.stop());
+    notifier.start();
+    await notifier.flush();
+
+    // Historical item #1 inlined S1 (committed).
+    assert.equal(calls.length, 1);
+    assert.ok(argument(calls[0], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/aw-s1`'));
+
+    // New item #2 arrives BEFORE wakeup runs -> Lark optimistically inlines S1.
+    store.enqueue([envelope('aw-new-2')], { mailboxId: 'stream:aw-lark' });
+    await notifier.flush();
+    assert.equal(calls.length, 2);
+    assert.ok(argument(calls[1], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/aw-s1`'));
+
+    // Now S1 is occupied by Codex Desktop; wakeup rotates to aw-s2 and commits deliveredSessions.
+    occupied.add('aw-s1');
+    const wake2 = await deliverAgentHostWakeTarget(store, runCommand, 'stream:aw-lark', {
+      stdioSpawner: fakeCodex.spawner,
+    });
+    assert.equal(wake2.rotated, true);
+    await notifier.flush();
+
+    // Lark automatically sends ONE thread reply to aw-new-2's root (aw-lark-2) pointing to aw-s2,
+    // and ZERO replies to historical aw-hist-1 (aw-lark-1).
+    assert.equal(calls.length, 3);
+    assert.equal(argument(calls[2], '--message-id'), 'aw-lark-2');
+    assert.ok(calls[2].args.includes('--reply-in-thread'));
+    assert.equal(
+      argument(calls[2], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/aw-s2`',
+    );
+    assert.equal(
+      calls.some(call => call.args.includes('--reply-in-thread') && argument(call, '--message-id') === 'aw-lark-1'),
+      false,
+      'historical item consumed by S1 must never receive an S2 correction',
+    );
+
+    // Zero redundant persist / send on subsequent wakeTarget event or full notifier restart.
+    const statePath = join(dir, 'lark-notify.json');
+    const stateBeforeRestart = readFileSync(statePath, 'utf8');
+    const mtimeBeforeRestart = statSync(statePath).mtimeMs;
+    await notifier.stop();
+
+    const restarted = makeNotifier();
+    t.after(() => restarted.stop());
+    restarted.start();
+    await restarted.flush();
+    assert.equal(calls.length, 3, 'restart must be idempotent with zero duplicate replies');
+    assert.equal(readFileSync(statePath, 'utf8'), stateBeforeRestart);
+    assert.equal(statSync(statePath).mtimeMs, mtimeBeforeRestart, 'steady-state drain must not rewrite lark-notify.json');
+
+    // Delayed consumption: stop notifier, ack item #2, enqueue item #3 while aw-s2 is occupied so
+    // wakeup rotates to aw-s3 BEFORE Lark drains; when Lark starts it directly inlines aw-s3.
+    await restarted.stop();
+    store.ack(store.check({ mailboxId: 'stream:aw-lark' }).deliveryId!, 'stream:aw-lark');
+    occupied.add('aw-s2');
+    store.enqueue([envelope('aw-delayed-3')], { mailboxId: 'stream:aw-lark' });
+    const wake3 = await deliverAgentHostWakeTarget(store, runCommand, 'stream:aw-lark', {
+      stdioSpawner: fakeCodex.spawner,
+    });
+    assert.equal(wake3.rotated, true);
+
+    const delayedNotifier = makeNotifier();
+    t.after(() => delayedNotifier.stop());
+    delayedNotifier.start();
+    await delayedNotifier.flush();
+    assert.equal(calls.length, 4, 'delayed consumption must inline aw-s3 directly with zero follow-up reply');
+    assert.ok(argument(calls[3], '--markdown').endsWith('\n\n- ChatGPT App: `codex://threads/aw-s3`'));
+    assert.equal(calls[3].args.includes('--reply-in-thread'), false);
+  }
 });

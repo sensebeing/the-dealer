@@ -21,6 +21,12 @@ export interface CodexAppServerTurnOptions {
   agentProfile?: string;
   signal?: AbortSignal;
   stdioSpawner?: StdioProcessSpawner;
+  /**
+   * Opt-in fallback when `thread/resume` fails with JSON-RPC `-32600` (`already has an active writer`):
+   * starts a fresh `threadSource: 'user'` thread on the same app-server connection instead of failing.
+   * Defaults to `false`.
+   */
+  fallbackOnActiveWriter?: boolean | (() => boolean);
   /** Bounded timeout per JSON-RPC handshake/request step in milliseconds. */
   rpcTimeoutMs?: number;
   /** Grace window after closing stdin before sending SIGTERM. */
@@ -31,10 +37,27 @@ export interface CodexAppServerTurnOptions {
 
 export interface CodexAppServerTurnResult {
   threadId: string;
+  rotatedFromThreadId?: string;
   turnId?: string;
   status: 'completed';
   stdout: string;
   stderr: string;
+}
+
+/** Sole authoritative predicate for a Codex `thread/resume` active-writer lock rejection. */
+export function isCodexActiveWriterError(error: unknown): boolean {
+  if (!(error instanceof CommandNotStartedError)) return false;
+  const rpc = error as CommandNotStartedError & {
+    rpcCode?: unknown;
+    rpcMethod?: unknown;
+    rpcMessage?: unknown;
+  };
+  return (
+    rpc.rpcMethod === 'thread/resume' &&
+    rpc.rpcCode === -32600 &&
+    typeof rpc.rpcMessage === 'string' &&
+    /\balready has an active writer\b/i.test(rpc.rpcMessage)
+  );
 }
 
 type JsonRpcId = number | string;
@@ -363,10 +386,16 @@ export async function runCodexAppServerTurn(
         const rpcError = makeBoundaryError(
           `codex app-server ${pending.method} failed: ${formatRpcError(message.error)}`,
           true,
-        ) as Error & { rpcCode?: number };
-        if (typeof message.error?.code === 'number') {
-          rpcError.rpcCode = message.error.code;
+        ) as Error & { rpcCode?: number; rpcMethod?: string; rpcMessage?: string };
+        const rawError = isRecord(message.error) ? message.error : undefined;
+        if (typeof rawError?.code === 'number') {
+          rpcError.rpcCode = rawError.code;
         }
+        rpcError.rpcMethod = pending.method;
+        rpcError.rpcMessage =
+          typeof rawError?.message === 'string'
+            ? rawError.message
+            : formatRpcError(message.error);
         pending.reject(rpcError);
         return;
       }
@@ -550,21 +579,53 @@ export async function runCodexAppServerTurn(
 
     writeJsonLine({ jsonrpc: '2.0', method: 'initialized', params: {} });
 
+    const startFreshThread = () =>
+      sendRequest(nextRequestId++, 'thread/start', {
+        ...(options.cwd ? { cwd: options.cwd } : {}),
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+        threadSource: 'user',
+      });
+
     const resumeThread = options.mode === 'fixed' || (options.mode === 'wave' && Boolean(sessionId));
-    const threadResult = resumeThread
-      ? await sendRequest(nextRequestId++, 'thread/resume', {
+    let startedFreshThread = !resumeThread;
+    let rotatedFromThreadId: string | undefined;
+    let threadResult: unknown;
+    if (resumeThread) {
+      try {
+        threadResult = await sendRequest(nextRequestId++, 'thread/resume', {
           threadId: sessionId!,
           ...(options.cwd ? { cwd: options.cwd } : {}),
           approvalPolicy: 'never',
           sandbox: 'danger-full-access',
           excludeTurns: true,
-        })
-      : await sendRequest(nextRequestId++, 'thread/start', {
-          ...(options.cwd ? { cwd: options.cwd } : {}),
-          approvalPolicy: 'never',
-          sandbox: 'danger-full-access',
-          threadSource: 'user',
         });
+      } catch (error) {
+        if (!isCodexActiveWriterError(error)) {
+          throw error;
+        }
+        let allowFallback = false;
+        if (typeof options.fallbackOnActiveWriter === 'function') {
+          try {
+            allowFallback = Boolean(options.fallbackOnActiveWriter());
+          } catch (guardError) {
+            throw guardError instanceof CommandNotStartedError
+              ? guardError
+              : new CommandNotStartedError(guardError);
+          }
+        } else {
+          allowFallback = Boolean(options.fallbackOnActiveWriter);
+        }
+        if (!allowFallback) {
+          throw error;
+        }
+        startedFreshThread = true;
+        rotatedFromThreadId = sessionId;
+        threadResult = await startFreshThread();
+      }
+    } else {
+      threadResult = await startFreshThread();
+    }
 
     const threadRecord =
       isRecord(threadResult) && isRecord(threadResult.thread) ? threadResult.thread : undefined;
@@ -574,13 +635,20 @@ export async function runCodexAppServerTurn(
         : undefined;
     if (!threadId) {
       throw new CommandNotStartedError(
-        `codex app-server ${resumeThread ? 'thread/resume' : 'thread/start'} did not return a valid thread.id${formatStderrSuffix()}`,
+        `codex app-server ${startedFreshThread ? 'thread/start' : 'thread/resume'} did not return a valid thread.id${formatStderrSuffix()}`,
       );
     }
     activeThreadId = threadId;
+    if (rotatedFromThreadId) {
+      const existingStderr = stderrTail.toString();
+      const prefix = existingStderr.length > 0 && !existingStderr.endsWith('\n') ? '\n' : '';
+      stderrTail.append(
+        `${prefix}[dealer] codex thread/resume rejected (-32600: active writer) for ${rotatedFromThreadId}; rotated to fresh thread ${threadId}\n`,
+      );
+    }
 
     const trimmedThreadName = options.threadName?.trim();
-    if (!resumeThread && trimmedThreadName) {
+    if (startedFreshThread && trimmedThreadName) {
       try {
         await sendRequest(nextRequestId++, 'thread/name/set', {
           threadId,
@@ -634,6 +702,7 @@ export async function runCodexAppServerTurn(
     succeeded = true;
     return {
       threadId,
+      ...(rotatedFromThreadId ? { rotatedFromThreadId } : {}),
       ...(completion.turnId ? { turnId: completion.turnId } : {}),
       status: 'completed',
       stdout: JSON.stringify({ threadId }),

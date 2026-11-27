@@ -12,6 +12,7 @@ import {
   buildCodexThreadName,
   deliverAgentHostWakeTarget,
   isAgentHostRotationDue,
+  isCodexActiveWriterError,
   resolveAgentHostContinuation,
   resolveAgentHostSessionLink,
   resolveAgentSessionId,
@@ -5142,11 +5143,13 @@ test('resolveAgentHostSessionLink and isAgentHostRotationDue enforce host, pendi
     state: 'ready',
     label: 'ChatGPT App',
     url: 'codex://threads/thread-s1',
+    committed: true,
   });
   assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 6 }), {
     state: 'ready',
     label: 'ChatGPT App',
     url: 'codex://threads/thread-s2',
+    committed: true,
   });
   assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 1 }), { state: 'unavailable' });
   assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 4 }), { state: 'unavailable' });
@@ -5155,4 +5158,438 @@ test('resolveAgentHostSessionLink and isAgentHostRotationDue enforce host, pendi
     () => readAgentHostDriverConfig({ driverConfig: { deliveredSessions: [{ fromSequence: 3, throughSequence: 1, sessionId: 'bad' }] } }),
     /deliveredSessions/,
   );
+});
+
+test('Codex active-writer fallback rotates cleanly in same app-server session and preserves conservative retry boundaries', async t => {
+  const root = directory(t);
+
+  // 1. Direct runCodexAppServerTurn: default fallbackOnActiveWriter is false (fails before turn/start, no thread/start).
+  {
+    const fake = createFakeCodexAppServer({
+      activeWriterThreadIds: ['occupied-s1'],
+      nextThreadId: () => 'should-not-be-used',
+    });
+    await assert.rejects(
+      runCodexAppServerTurn({
+        cwd: root,
+        mode: 'fixed',
+        sessionId: 'occupied-s1',
+        threadName: 'Dealer · fixed (11-27)',
+        promptText: 'handle backlog',
+        stdioSpawner: fake.spawner,
+      }),
+      error => isCodexActiveWriterError(error) && /already has an active writer/i.test(error.message),
+    );
+    assert.deepEqual(
+      fake.sessions[0].requests.map(req => [req.id ?? null, req.method]),
+      [
+        [1, 'initialize'],
+        [null, 'initialized'],
+        [2, 'thread/resume'],
+      ],
+    );
+  }
+
+  // 2. Direct runCodexAppServerTurn: fallbackOnActiveWriter: true rotates on the same connection
+  //    (initialize -> initialized -> thread/resume -> thread/start(threadSource:'user') -> thread/name/set -> turn/start).
+  {
+    const fake = createFakeCodexAppServer({
+      activeWriterThreadIds: new Set(['occupied-s1']),
+      nextThreadId: () => 'fresh-s2',
+    });
+    const result = await runCodexAppServerTurn({
+      cwd: root,
+      mode: 'fixed',
+      sessionId: 'occupied-s1',
+      threadName: 'Dealer · fixed (11-27)',
+      promptText: 'handle backlog',
+      fallbackOnActiveWriter: true,
+      stdioSpawner: fake.spawner,
+    });
+    assert.equal(fake.sessions.length, 1, 'fallback must stay on the same app-server process');
+    assert.deepEqual(
+      fake.sessions[0].requests.map(req => [req.id ?? null, req.method]),
+      [
+        [1, 'initialize'],
+        [null, 'initialized'],
+        [2, 'thread/resume'],
+        [3, 'thread/start'],
+        [4, 'thread/name/set'],
+        [5, 'turn/start'],
+      ],
+    );
+    assert.equal(fake.sessions[0].threadParams?.threadSource, 'user');
+    assert.equal(fake.sessions[0].threadName, 'Dealer · fixed (11-27)');
+    assert.equal(result.threadId, 'fresh-s2');
+    assert.equal(result.rotatedFromThreadId, 'occupied-s1');
+    assert.equal(result.stdout, JSON.stringify({ threadId: 'fresh-s2' }));
+    assert.match(
+      result.stderr,
+      /\[dealer\] codex thread\/resume rejected \(-32600: active writer\) for occupied-s1; rotated to fresh thread fresh-s2/,
+    );
+  }
+
+  // 3. Guard callback throwing during fallback stays CommandNotStartedError; predicate rejects non-matching errors.
+  {
+    const fake = createFakeCodexAppServer({
+      activeWriterThreadIds: ['occupied-s1'],
+    });
+    await assert.rejects(
+      runCodexAppServerTurn({
+        cwd: root,
+        mode: 'fixed',
+        sessionId: 'occupied-s1',
+        promptText: 'guard fail',
+        fallbackOnActiveWriter: () => {
+          throw new Error('guard store failure');
+        },
+        stdioSpawner: fake.spawner,
+      }),
+      error => error instanceof CommandNotStartedError && /guard store failure/.test(error.message),
+    );
+    assert.equal(fake.sessions[0].requests.some(req => req.method === 'thread/start'), false);
+    assert.equal(isCodexActiveWriterError(new Error('thread already has an active writer')), false);
+    const wrongMethod = Object.assign(new CommandNotStartedError('err'), {
+      rpcCode: -32600,
+      rpcMethod: 'thread/start',
+      rpcMessage: 'thread already has an active writer',
+    });
+    assert.equal(isCodexActiveWriterError(wrongMethod), false);
+    const wrongCode = Object.assign(new CommandNotStartedError('err'), {
+      rpcCode: -32000,
+      rpcMethod: 'thread/resume',
+      rpcMessage: 'thread already has an active writer',
+    });
+    assert.equal(isCodexActiveWriterError(wrongCode), false);
+    const wrongMessage = Object.assign(new CommandNotStartedError('err'), {
+      rpcCode: -32600,
+      rpcMethod: 'thread/resume',
+      rpcMessage: 'invalid request',
+    });
+    assert.equal(isCodexActiveWriterError(wrongMessage), false);
+  }
+
+  // 4. Wave (auto-generated sessionId) & WakeupRedriveService: backlogged messages hit active writer on S1,
+  //    rotate cleanly to S2 with Dealer · <label> (MM-DD), atomically update sessionId/sessionStartedAt/
+  //    deliveredSessions/completedWaves (preserving mid-turn ack), return rotated:true, and reuse S2 afterwards.
+  {
+    const store = new MailboxStore(join(root, 'wave-active-writer.json'));
+    t.after(() => store.close());
+    const occupied = new Set<string>();
+    const t1 = new Date(2026, 10, 26, 9, 0, 0).getTime(); // 11-26
+    const t2 = new Date(2026, 10, 27, 14, 0, 0).getTime(); // 11-27
+    let clock = t1;
+    let ackMidTurn = false;
+    const fake = createFakeCodexAppServer({
+      activeWriterThreadIds: occupied,
+      nextThreadId: count => `wave-s${count}`,
+      onTurnStart: async () => {
+        if (ackMidTurn) {
+          ackMidTurn = false;
+          const lease = store.check({ mailboxId: 'stream:ops-backlog' });
+          assert.equal(lease.items.length, 2, 'backlogged wave must lease both messages');
+          store.ack(lease.deliveryId!, 'stream:ops-backlog');
+        }
+      },
+    });
+    const wakeup = new WakeupRedriveService({
+      store,
+      now: () => clock,
+      drivers: createTestWakeupDrivers({ stdioSpawner: fake.spawner }),
+    });
+    t.after(() => wakeup.stop());
+
+    // Wave 1 creates wave-s1 and acks (completedWaves -> 1).
+    store.enqueue([message('w1')], {
+      mailboxId: 'stream:ops-backlog',
+      wakeTarget: {
+        driver: 'agent-host',
+        rotateAfterWaves: 5,
+        driverConfig: { hostAgent: 'codex', conversationMode: 'wave', workspacePath: root },
+      },
+    });
+    const firstFlush = await wakeup.flushMailbox('stream:ops-backlog', { force: true });
+    assert.equal(firstFlush.woke, true);
+    assert.equal(firstFlush.rotated, undefined);
+    store.ack(store.check({ mailboxId: 'stream:ops-backlog' }).deliveryId!, 'stream:ops-backlog');
+    assert.equal(store.getWakeTarget('stream:ops-backlog')?.completedWaves, 1);
+
+    // Codex Desktop now holds active writer on wave-s1 while two messages backlog.
+    occupied.add('wave-s1');
+    clock = t2;
+    ackMidTurn = true;
+    store.enqueue([message('w2-a'), message('w2-b')], { mailboxId: 'stream:ops-backlog' });
+    const rotatedFlush = await wakeup.flushMailbox('stream:ops-backlog', { force: true });
+    assert.equal(rotatedFlush.woke, true);
+    assert.equal(rotatedFlush.rotated, true);
+
+    const targetAfterRotate = store.getWakeTarget('stream:ops-backlog')!;
+    const configAfterRotate = readAgentHostDriverConfig(targetAfterRotate);
+    assert.equal(targetAfterRotate.deliveryInDoubt, undefined);
+    assert.equal(configAfterRotate.sessionId, 'wave-s2');
+    assert.equal(configAfterRotate.sessionStartedAt, t2);
+    // preRotationCompletedWaves was 1; mid-turn ack incremented to 2 -> preserved delta = 2 - 1 = 1!
+    assert.equal(targetAfterRotate.completedWaves, 1);
+    assert.deepEqual(configAfterRotate.deliveredSessions, [
+      { fromSequence: 0, throughSequence: 0, sessionId: 'wave-s1' },
+      { fromSequence: 1, throughSequence: 2, sessionId: 'wave-s2' },
+    ]);
+    const s2 = fake.sessions[1];
+    assert.equal(s2.threadParams?.threadSource, 'user');
+    assert.equal(s2.threadName, 'Dealer · ops-backlog (11-27)');
+    assert.deepEqual(
+      s2.requests.map(req => req.method),
+      ['initialize', 'initialized', 'thread/resume', 'thread/start', 'thread/name/set', 'turn/start'],
+    );
+
+    // Subsequent message reuses wave-s2 via thread/resume without calling thread/name/set.
+    store.enqueue([message('w3')], { mailboxId: 'stream:ops-backlog' });
+    const thirdFlush = await wakeup.flushMailbox('stream:ops-backlog', { force: true });
+    assert.equal(thirdFlush.woke, true);
+    assert.equal(thirdFlush.rotated, undefined);
+    const s3 = fake.sessions[2];
+    assert.equal(s3.threadMethod, 'thread/resume');
+    assert.equal(s3.threadId, 'wave-s2');
+    assert.equal(s3.requests.some(req => req.method === 'thread/name/set'), false);
+  }
+
+  // 5. Fixed mode with explicit configuredSessionId: active-writer rotation preserves configuredSessionId,
+  //    subsequent enqueues with the same binding do NOT bounce back to the occupied thread, and rebinding
+  //    configuredSessionId to a new value switches to it.
+  {
+    const store = new MailboxStore(join(root, 'fixed-configured.json'));
+    t.after(() => store.close());
+    const occupied = new Set<string>(['configured-s1']);
+    const fake = createFakeCodexAppServer({
+      activeWriterThreadIds: occupied,
+      nextThreadId: count => `rotated-fixed-${count}`,
+    });
+    let boundSessionId = 'configured-s1';
+    const plugin = createCodexExecutorPlugin({
+      store,
+      stdioSpawner: fake.spawner,
+      resolveTopicBinding: () => ({
+        executor: 'codex',
+        mode: 'fixed',
+        mailboxId: 'stream:fixed-stream',
+        sessionId: boundSessionId,
+        workspacePath: root,
+      }),
+    });
+
+    const r1 = await plugin.execute([message('f1'), message('f2')], context, {});
+    assert.equal(r1.woke, true);
+    const afterRotate = readAgentHostDriverConfig(store.getWakeTarget('stream:fixed-stream')!);
+    assert.equal(afterRotate.sessionId, 'rotated-fixed-1');
+    assert.equal(afterRotate.configuredSessionId, 'configured-s1');
+    assert.equal(fake.sessions[0].threadMethod, 'thread/start');
+    assert.equal(fake.sessions[0].threadParams?.threadSource, 'user');
+    assert.match(fake.sessions[0].threadName ?? '', /^Dealer · fixed-stream \(\d{2}-\d{2}\)$/);
+
+    // Ack and send another message under the SAME configured binding -> must stay on rotated-fixed-1.
+    store.ack(store.check({ mailboxId: 'stream:fixed-stream' }).deliveryId!, 'stream:fixed-stream');
+    const r2 = await plugin.execute([message('f3')], context, {});
+    assert.equal(r2.woke, true);
+    assert.equal(fake.sessions[1].threadMethod, 'thread/resume');
+    assert.equal(fake.sessions[1].threadId, 'rotated-fixed-1');
+    const afterSecond = readAgentHostDriverConfig(store.getWakeTarget('stream:fixed-stream')!);
+    assert.equal(afterSecond.sessionId, 'rotated-fixed-1');
+    assert.equal(afterSecond.configuredSessionId, 'configured-s1');
+
+    // Rebind config to a NEW explicit configuredSessionId -> switches cleanly to configured-s3.
+    store.ack(store.check({ mailboxId: 'stream:fixed-stream' }).deliveryId!, 'stream:fixed-stream');
+    boundSessionId = 'configured-s3';
+    const r3 = await plugin.execute([message('f4')], context, {});
+    assert.equal(r3.woke, true);
+    assert.equal(fake.sessions[2].threadMethod, 'thread/resume');
+    assert.equal(fake.sessions[2].threadId, 'configured-s3');
+    const afterRebind = readAgentHostDriverConfig(store.getWakeTarget('stream:fixed-stream')!);
+    assert.equal(afterRebind.sessionId, 'configured-s3');
+    assert.equal(afterRebind.configuredSessionId, 'configured-s3');
+  }
+
+  // 6. Conservative retry negative boundaries: NEVER rotate, keep original sessionId, keep deliveryInDoubt undefined.
+  // 6a. hasOutstandingLease === true before launch.
+  {
+    const store = new MailboxStore(join(root, 'neg-outstanding-lease.json'));
+    t.after(() => store.close());
+    const fake = createFakeCodexAppServer({ activeWriterThreadIds: ['locked-s1'] });
+    store.enqueue([message('l1')], {
+      mailboxId: 'stream:neg-lease',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'locked-s1', workspacePath: root },
+      },
+    });
+    store.check({ mailboxId: 'stream:neg-lease' }); // acquire outstanding lease
+    store.enqueue([message('l2')], { mailboxId: 'stream:neg-lease' });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, 'stream:neg-lease', { stdioSpawner: fake.spawner }),
+      error => isCodexActiveWriterError(error),
+    );
+    assert.equal(fake.sessions[0].requests.some(req => req.method === 'thread/start'), false);
+    const target = store.getWakeTarget('stream:neg-lease')!;
+    assert.equal(readAgentHostDriverConfig(target).sessionId, 'locked-s1');
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.equal(target.pendingWake, true);
+  }
+
+  // 6b. Concurrent lease acquisition in the peek -> thread/resume window.
+  {
+    const store = new MailboxStore(join(root, 'neg-race-lease.json'));
+    t.after(() => store.close());
+    const fake = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/resume') {
+          // Simulate another consumer acquiring the lease right before thread/resume rejects.
+          const lease = store.check({ mailboxId: 'stream:neg-race-lease' });
+          assert.ok(lease.deliveryId);
+          ctx.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'thread already has an active writer' } });
+          return true;
+        }
+      },
+    });
+    store.enqueue([message('rl1')], {
+      mailboxId: 'stream:neg-race-lease',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'race-s1', workspacePath: root },
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, 'stream:neg-race-lease', { stdioSpawner: fake.spawner }),
+      error => isCodexActiveWriterError(error),
+    );
+    assert.equal(fake.sessions[0].requests.some(req => req.method === 'thread/start'), false);
+    const target = store.getWakeTarget('stream:neg-race-lease')!;
+    assert.equal(readAgentHostDriverConfig(target).sessionId, 'race-s1');
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.equal(target.pendingWake, true);
+  }
+
+  // 6c. Concurrent bindingRevision change in the peek -> thread/resume window.
+  {
+    const store = new MailboxStore(join(root, 'neg-race-rev.json'));
+    t.after(() => store.close());
+    const fake = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/resume') {
+          store.upsertWakeTarget('stream:neg-race-rev', {
+            driver: 'agent-host',
+            driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'rebound-s2', workspacePath: root },
+          });
+          ctx.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'thread already has an active writer' } });
+          return true;
+        }
+      },
+    });
+    store.enqueue([message('rr1')], {
+      mailboxId: 'stream:neg-race-rev',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'orig-s1', workspacePath: root },
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, 'stream:neg-race-rev', { stdioSpawner: fake.spawner }),
+      error => error instanceof Error && /superseded|active writer/i.test(error.message),
+    );
+    assert.equal(fake.sessions[0].requests.some(req => req.method === 'thread/start'), false);
+    const target = store.getWakeTarget('stream:neg-race-rev')!;
+    assert.equal(readAgentHostDriverConfig(target).sessionId, 'rebound-s2');
+  }
+
+  // 6d. Non-active-writer -32600 error on thread/resume.
+  {
+    const store = new MailboxStore(join(root, 'neg-other-32600.json'));
+    t.after(() => store.close());
+    const fake = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/resume') {
+          ctx.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32600, message: 'invalid request payload' } });
+          return true;
+        }
+      },
+    });
+    store.enqueue([message('o1')], {
+      mailboxId: 'stream:neg-other-32600',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'other-s1', workspacePath: root },
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, 'stream:neg-other-32600', { stdioSpawner: fake.spawner }),
+      error => error instanceof CommandNotStartedError && !isCodexActiveWriterError(error),
+    );
+    assert.equal(fake.sessions[0].requests.some(req => req.method === 'thread/start'), false);
+    const target = store.getWakeTarget('stream:neg-other-32600')!;
+    assert.equal(readAgentHostDriverConfig(target).sessionId, 'other-s1');
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.equal(target.pendingWake, true);
+  }
+
+  // 6e. Transient -32000 error on thread/resume.
+  {
+    const store = new MailboxStore(join(root, 'neg-32000.json'));
+    t.after(() => store.close());
+    const fake = createFakeCodexAppServer({
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/resume') {
+          ctx.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'temporary server busy' } });
+          return true;
+        }
+      },
+    });
+    store.enqueue([message('t1')], {
+      mailboxId: 'stream:neg-32000',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'transient-s1', workspacePath: root },
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, 'stream:neg-32000', { stdioSpawner: fake.spawner }),
+      error => error instanceof CommandNotStartedError && !isCodexActiveWriterError(error),
+    );
+    assert.equal(fake.sessions[0].requests.some(req => req.method === 'thread/start'), false);
+    const target = store.getWakeTarget('stream:neg-32000')!;
+    assert.equal(readAgentHostDriverConfig(target).sessionId, 'transient-s1');
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.equal(target.pendingWake, true);
+  }
+
+  // 6f. Fallback thread/start itself fails -> stays retryable, no deliveryInDoubt, keeps original sessionId.
+  {
+    const store = new MailboxStore(join(root, 'neg-fallback-start-fail.json'));
+    t.after(() => store.close());
+    const fake = createFakeCodexAppServer({
+      activeWriterThreadIds: ['start-fail-s1'],
+      onMessage: (msg, ctx) => {
+        if (msg.method === 'thread/start') {
+          ctx.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'failed to create thread' } });
+          return true;
+        }
+      },
+    });
+    store.enqueue([message('sf1')], {
+      mailboxId: 'stream:neg-start-fail',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: { hostAgent: 'codex', conversationMode: 'fixed', sessionId: 'start-fail-s1', workspacePath: root },
+      },
+    });
+    await assert.rejects(
+      deliverAgentHostWakeTarget(store, runCommand, 'stream:neg-start-fail', { stdioSpawner: fake.spawner }),
+      error => error instanceof CommandNotStartedError && /thread\/start failed.*-32000/.test(error.message),
+    );
+    assert.deepEqual(
+      fake.sessions[0].requests.map(req => req.method),
+      ['initialize', 'initialized', 'thread/resume', 'thread/start'],
+    );
+    const target = store.getWakeTarget('stream:neg-start-fail')!;
+    assert.equal(readAgentHostDriverConfig(target).sessionId, 'start-fail-s1');
+    assert.equal(target.deliveryInDoubt, undefined);
+    assert.equal(target.pendingWake, true);
+  }
 });
