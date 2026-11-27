@@ -1319,7 +1319,7 @@ export type ActiveConversationMode = (typeof ACTIVE_CONVERSATION_MODES)[number];
 
 /** Host-neutral session deep-link resolution for receiver-local mirrors. */
 export type SessionLinkResolution =
-  | { readonly state: 'ready'; readonly label: string; readonly url: string; readonly committed?: true }
+  | { readonly state: 'ready'; readonly label: string; readonly url: string; readonly committed?: boolean }
   | { readonly state: 'pending' }
   | { readonly state: 'unavailable' };
 export function normalizeConversationModeInput(

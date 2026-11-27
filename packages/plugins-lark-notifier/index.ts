@@ -205,7 +205,11 @@ export class LarkMailboxNotifier {
             root.itemSequence = item.sequence;
             if (sessionLink?.state === 'ready') {
               root.lastSessionUrl = sessionLink.url;
-              delete root.awaitingSessionLink;
+              if (sessionLink.committed === false) {
+                root.awaitingSessionLink = true;
+              } else {
+                delete root.awaitingSessionLink;
+              }
             } else if (sessionLink?.state === 'pending') {
               root.awaitingSessionLink = true;
             } else {
@@ -222,11 +226,9 @@ export class LarkMailboxNotifier {
       if (this.dirty) continue;
       for (const [threadId, root] of Object.entries(this.state.threadRoots)) {
         if (this.stopped) return;
-        if (!root.mailboxId) continue;
-        const awaiting = root.awaitingSessionLink === true;
-        if (!awaiting && (root.itemSequence === undefined || !root.lastSessionUrl)) continue;
+        if (root.awaitingSessionLink !== true || !root.mailboxId) continue;
         const sessionLink = this.options.resolveSessionLink?.(root.mailboxId, root.itemSequence);
-        if (awaiting && (sessionLink === undefined || sessionLink.state === 'unavailable')) {
+        if (sessionLink === undefined || sessionLink.state === 'unavailable') {
           const next = structuredClone(this.state);
           if (Object.hasOwn(next.threadRoots, threadId)) {
             delete next.threadRoots[threadId].awaitingSessionLink;
@@ -236,8 +238,7 @@ export class LarkMailboxNotifier {
           }
           continue;
         }
-        if (!sessionLink || sessionLink.state !== 'ready') continue;
-        if (!awaiting && (sessionLink.committed !== true || root.lastSessionUrl === sessionLink.url)) continue;
+        if (sessionLink.state !== 'ready' || sessionLink.committed === false) continue;
         const next = structuredClone(this.state);
         const key = `session-link:${threadId}:${sessionLink.url}`;
         if (!Object.hasOwn(next.deliveredItems, key) && root.lastSessionUrl !== sessionLink.url) {

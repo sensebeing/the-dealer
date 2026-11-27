@@ -5154,6 +5154,22 @@ test('resolveAgentHostSessionLink and isAgentHostRotationDue enforce host, pendi
   assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 1 }), { state: 'unavailable' });
   assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 4 }), { state: 'unavailable' });
   assert.deepEqual(resolveAgentHostSessionLink(rotatedHistory, { itemSequence: 7 }), { state: 'pending' });
+  // Uncommitted itemSequence on an active non-rotating session returns committed: false while omitting itemSequence keeps legacy shape.
+  assert.deepEqual(resolveAgentHostSessionLink(baseTarget(), { itemSequence: 0 }), {
+    state: 'ready',
+    label: 'ChatGPT App',
+    url: 'codex://threads/thread-abc%2F1',
+    committed: false,
+  });
+  assert.deepEqual(
+    resolveAgentHostSessionLink({ ...rotatedHistory, rotateAfterWaves: 5 }, { itemSequence: 7 }),
+    {
+      state: 'ready',
+      label: 'ChatGPT App',
+      url: 'codex://threads/thread-s2',
+      committed: false,
+    },
+  );
   assert.throws(
     () => readAgentHostDriverConfig({ driverConfig: { deliveredSessions: [{ fromSequence: 3, throughSequence: 1, sessionId: 'bad' }] } }),
     /deliveredSessions/,

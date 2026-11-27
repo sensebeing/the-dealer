@@ -249,6 +249,7 @@ export function resolveAgentHostSessionLink(
     state: 'ready',
     label: 'ChatGPT App',
     url: `codex://threads/${encodeURIComponent(sessionId)}`,
+    ...(options.itemSequence !== undefined ? { committed: false } : {}),
   };
 }
 
