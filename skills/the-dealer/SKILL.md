@@ -192,21 +192,31 @@ dealer gate mode approval_required --network sensebeing --json
 dealer gate list --network sensebeing --json
 dealer gate approve ENVELOPE_OR_APPROVAL_ID --trust-sender --json
 dealer gate reject ENVELOPE_OR_APPROVAL_ID --reason 'Outside current scope' --json
+dealer gate trusted --network sensebeing --json
+dealer gate trust member:alice --network sensebeing --json
+dealer gate untrust member:alice --network sensebeing --json
 dealer gate mode dnd --json
 dealer gate drain --json
 ```
 
 Modes are `open`, `approval_required`, `dnd`, and `closed`. A network override
 wins over the default gate mode. `drain` explicitly dispatches DND backlog;
-it is not an inspection command. `--trust-sender` trusts that node and claimed
-member within the same shared-secret network. Members are not independently
-certified identities: only mount networks whose members you trust. Existing
-GateService trust rules can bypass mode defaults, including closed/DND;
-do not use a mode change as a way to revoke previously trusted senders.
+it is not an inspection command. `--trust-sender` and `dealer gate trust`
+durably trust a node (`node:<id>` or `ed25519:...`) and/or claimed member
+(`member:<name>` or bare name) within the specified shared-secret network.
+Members are not independently certified identities: only mount networks whose
+members you trust. Trusted senders skip `approval_required` knocks (symmetric
+with locally originated deliveries), while `dnd` still queues them, `closed`
+still rejects them, and higher-priority custom gate rules/hooks still run first.
+Mode changes do not revoke persisted trust; revoke grants explicitly with
+`dealer gate untrust` (note `approve --trust-sender` records both `node` and
+non-empty `member` entries, and `untrust` returns any `remaining` entries).
 
-Gate pending items/trust are in-memory. CAS policy watermarks
+Gate pending approval items are in-memory; DND queue entries and trusted
+senders persist on disk in `gate-dnd.json` (`dealer gate trusted` reads a
+snapshot without starting the daemon when offline). CAS policy watermarks
 (`dedup-watermarks.json`), identity, mounts, configuration, source cursors,
-the dispatch ledger, `mailbox.json`, wake targets, thread routes, the verified
+the dispatch ledger, `mailbox.sqlite`, wake targets, thread routes, the verified
 peer directory (`peers.json`), the outbox (`outbox.json` + `outbox-blobs/`) and
 relay-spool entries persist on disk. A persisted `dispatching` or `failed` entry
 must be reconciled with the external executor before retrying.

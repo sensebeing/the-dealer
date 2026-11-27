@@ -22,7 +22,7 @@
 
 - 运行 `dealer node up` 启动本机节点；无需 `dealer network mount`、`networkId`、`passphrase` 或任何外部 Peer。
 - 将消息发往 `member:<self>`、`skill:<local-skill>` 或本机 `ed25519:<nodeId>`。`transport` 在目标为本机且网络未挂载时，直接在进程内把帧交给同一 `transport/inbound` 处理器；已挂载时则复用本地 endpoint。
-- `node.resolveTarget` 对身份选择器优先匹配本机，`skill:` 优先匹配远端。`router` 将本机名片作为合法候选，`gate` 对本机签名身份放行 `approval_required`（`dnd` 仍入队，`closed` 仍拒收）。
+- `node.resolveTarget` 对身份选择器优先匹配本机，`skill:` 优先匹配远端。`router` 将本机名片作为合法候选，`gate` 对本机签名身份及 `gate-dnd.json` 中持久化的可信发送方放行 `approval_required`（`dnd` 仍入队，`closed` 仍拒收，自定义门禁规则优先执行）。
 - 项目清单中的 `defaultNetworkId` 只是其触发源在本机发送时使用的稳定作用域名称，不代表必须进行网络挂载。
 
 ### 第二步 — 跨机器 / 跨团队成员 P2P 协作（`networkId + passphrase`）
@@ -484,7 +484,7 @@ export interface ExecutorPlugin<C = unknown> {
 | 场景分类 | Agent 调用的 CLI 命令示例 | 作用说明 |
 | :--- | :--- | :--- |
 | **1. 挂载与管理节点** | `dealer node up --name mbp-harlequin --member ben.xu --team sensebeing --json`<br>`dealer node card set --summary "..." --add-skill prod-release:"..." --json` | 启动本机 P2P 守护进程，设置节点身份与能力名片并实时广播到全网 |
-| **2. 切换节点权限门禁** | `dealer gate mode approval_required --json`<br>`dealer gate list --json`<br>`dealer gate approve <approval_id> --trust-member oliver --json` | 自由切换 `open / approval_required / dnd / closed`，查看并批准待确认的跨节点消息 |
+| **2. 切换节点权限门禁** | `dealer gate mode approval_required --json`<br>`dealer gate list --json`<br>`dealer gate approve <approval_id> --trust-sender --json`<br>`dealer gate trusted [--network <id>] --json`<br>`dealer gate trust <selector> --network <id> --json`<br>`dealer gate untrust <selector> [--network <id>] --json` | 自由切换 `open / approval_required / dnd / closed`，审批跨节点消息，并持久化查看、授予或撤销可信发送方（`dnd` 仍入队、`closed` 仍拒收） |
 | **3. 发现全网节点与能力** | `dealer peers list --skill ios-crash-triage --only-available --json` | Agent 发送前可自主查询当前在线的队友节点及其能力描述与空闲状态 |
 | **4. 发送消息（定向/多播/广播/AI路由）** | **显式定向**：`dealer send --to member:oliver --kind collab.request --subject "..." --body "..." --attach ./repro.log --json`<br>**AI 智能判断路由**：`dealer send --auto-route --hint "找负责运行时且空闲的节点排查此报错" --body "..." --json`<br>**全网/频道广播**：`dealer broadcast --topic team.sensebeing --subject "..." --body "..." --json` | 一条命令完成跨机器、跨团队成员的实时消息与大附件投递，支持 `--wait-receipt` 或异步流式回调 |
 | **5. 配置节点内收发派发器** | `dealer setup apply-preset --host orca --mode spawn --topic collab.request.v4 --agent codex --json`<br>`dealer route add --type local-agent --command codex --json`<br>`dealer source add lark-alert --config ./alerts.yaml --json` | Agent 通过命令直接生成 `patch.yaml`，热挂载新的触发源或本地 Orca/Agent 派发规则 |

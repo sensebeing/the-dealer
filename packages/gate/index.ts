@@ -35,9 +35,18 @@ export interface DndQueueItem {
 
 type DndEntry = Omit<DndQueueItem, 'id'>;
 
+export type TrustedSenderKind = 'node' | 'member';
+
+export interface TrustedSenderRecord {
+  readonly networkId: string;
+  readonly kind: TrustedSenderKind;
+  readonly value: string;
+}
+
 interface GateCustodyState {
   queued: Map<string, DndEntry>;
   withdrawn: Map<string, string>;
+  trusted: Map<string, TrustedSenderRecord>;
 }
 
 function revision(envelope: MessageEnvelope): number {
@@ -51,14 +60,99 @@ export interface NetworkGateService extends GateService {
   drainDnd(networkId?: string, opts?: { includeParked?: boolean }): Promise<void>;
   listDndQueue(): readonly DndQueueItem[];
   listRejections(): readonly { envelope: MessageEnvelope; reason: string }[];
+  listTrustedSenders(networkId?: string): readonly TrustedSenderRecord[];
+  trustSender(record: TrustedSenderRecord): TrustedSenderRecord;
+  untrustSender(filter: { networkId?: string; kind?: TrustedSenderKind; value: string }): {
+    removedCount: number;
+    removed: TrustedSenderRecord[];
+    remaining: TrustedSenderRecord[];
+  };
 }
 
 function dndKey(envelope: MessageEnvelope): string {
   return JSON.stringify([envelope.networkId, envelope.from.nodeId, envelope.idempotencyKey ?? envelope.id]);
 }
 
+function trustedSenderKey(record: TrustedSenderRecord): string {
+  return JSON.stringify([record.networkId, record.kind, record.value]);
+}
+
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareTrustedSenders(a: TrustedSenderRecord, b: TrustedSenderRecord): number {
+  return compareStrings(a.networkId, b.networkId)
+    || compareStrings(a.kind, b.kind)
+    || compareStrings(a.value, b.value);
+}
+
+function sortedTrustedSenders(
+  trusted: ReadonlyMap<string, TrustedSenderRecord>,
+  networkId?: string,
+): TrustedSenderRecord[] {
+  return [...trusted.values()]
+    .filter(record => networkId === undefined || record.networkId === networkId)
+    .sort(compareTrustedSenders)
+    .map(record => ({ networkId: record.networkId, kind: record.kind, value: record.value }));
+}
+
+function isTrustedSenderKind(value: unknown): value is TrustedSenderKind {
+  return value === 'node' || value === 'member';
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function validateTrustedSenderRecord(raw: unknown): TrustedSenderRecord {
+  if (!isRecord(raw)) {
+    throw new Error('Trusted sender record must be an object');
+  }
+  if (!isNonEmptyString(raw.networkId)) {
+    throw new Error('Trusted sender networkId must be a non-empty string');
+  }
+  if (!isTrustedSenderKind(raw.kind)) {
+    throw new Error(`Invalid trusted sender kind: ${String(raw.kind)}`);
+  }
+  if (!isNonEmptyString(raw.value)) {
+    throw new Error('Trusted sender value must be a non-empty string');
+  }
+  return { networkId: raw.networkId, kind: raw.kind, value: raw.value };
+}
+
+export function parseTrustedSenderSelector(selector: string): {
+  kind: TrustedSenderKind;
+  value: string;
+} {
+  if (!isNonEmptyString(selector)) {
+    throw new Error('Required: selector');
+  }
+  if (selector.startsWith('node:')) {
+    const value = selector.slice('node:'.length);
+    if (!isNonEmptyString(value)) {
+      throw new Error('Invalid trusted sender selector: node:<id> requires a non-empty id');
+    }
+    return { kind: 'node', value };
+  }
+  if (selector.startsWith('member:')) {
+    const value = selector.slice('member:'.length);
+    if (!isNonEmptyString(value)) {
+      throw new Error('Invalid trusted sender selector: member:<name> requires a non-empty name');
+    }
+    return { kind: 'member', value };
+  }
+  if (selector.startsWith('ed25519:')) {
+    if (selector.length === 'ed25519:'.length) {
+      throw new Error('Invalid trusted sender selector: ed25519:<key> requires a non-empty key');
+    }
+    return { kind: 'node', value: selector };
+  }
+  return { kind: 'member', value: selector };
+}
+
 function loadDnd(path: string | undefined, limit: number): GateCustodyState {
-  if (!path || !existsSync(path)) return { queued: new Map(), withdrawn: new Map() };
+  if (!path || !existsSync(path)) return { queued: new Map(), withdrawn: new Map(), trusted: new Map() };
   try {
     const saved = JSON.parse(readFileSync(path, 'utf8'));
     if (!isRecord(saved) || !isRecord(saved.queued)) throw new Error();
@@ -68,6 +162,14 @@ function loadDnd(path: string | undefined, limit: number): GateCustodyState {
       for (const [key, reason] of Object.entries(saved.withdrawn)) {
         if (typeof reason !== 'string') throw new Error();
         withdrawn.set(key, reason);
+      }
+    }
+    const trusted = new Map<string, TrustedSenderRecord>();
+    if (saved.trustedSenders !== undefined) {
+      if (!Array.isArray(saved.trustedSenders)) throw new Error();
+      for (const item of saved.trustedSenders) {
+        const record = validateTrustedSenderRecord(item);
+        trusted.set(trustedSenderKey(record), record);
       }
     }
     const entries: [string, DndEntry][] = Object.entries(saved.queued).map(([key, value]) => {
@@ -82,11 +184,22 @@ function loadDnd(path: string | undefined, limit: number): GateCustodyState {
           (entry.lastError !== undefined && typeof entry.lastError !== 'string')) throw new Error();
       return [key, entry];
     });
-    if (entries.length > limit) throw new Error();
-    return { queued: new Map(entries), withdrawn };
+    if (Number.isFinite(limit) && entries.length > limit) throw new Error();
+    return { queued: new Map(entries), withdrawn, trusted };
   } catch {
     throw new Error('Invalid gate DND store');
   }
+}
+
+export function readTrustedSendersSnapshot(
+  dndQueuePath: string,
+  networkId?: string,
+): readonly TrustedSenderRecord[] {
+  if (networkId !== undefined && !isNonEmptyString(networkId)) {
+    throw new Error('Trusted sender networkId must be a non-empty string');
+  }
+  const { trusted } = loadDnd(dndQueuePath, Number.POSITIVE_INFINITY);
+  return sortedTrustedSenders(trusted, networkId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -105,14 +218,23 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
       if (!Number.isSafeInteger(maxDndItems) || maxDndItems < 1) {
         throw new Error('Invalid DND queue capacity');
       }
-      let { queued: dnd, withdrawn } = loadDnd(config.dndQueuePath, maxDndItems);
-      const persistGateState = (queued: Map<string, DndEntry>, withdrawals = withdrawn) => {
+      let { queued: dnd, withdrawn, trusted } = loadDnd(config.dndQueuePath, maxDndItems);
+      const persistGateState = (
+        queued: Map<string, DndEntry>,
+        withdrawals = withdrawn,
+        trustedSet = trusted,
+      ) => {
         if (config.dndQueuePath) {
-          writeFileAtomically(config.dndQueuePath, JSON.stringify({ queued: Object.fromEntries(queued),
-            ...(withdrawals.size > 0 ? { withdrawn: Object.fromEntries(withdrawals) } : {}) }));
+          const trustedSenders = sortedTrustedSenders(trustedSet);
+          writeFileAtomically(config.dndQueuePath, JSON.stringify({
+            queued: Object.fromEntries(queued),
+            ...(withdrawals.size > 0 ? { withdrawn: Object.fromEntries(withdrawals) } : {}),
+            ...(trustedSenders.length > 0 ? { trustedSenders } : {}),
+          }));
         }
         dnd = queued;
         withdrawn = withdrawals;
+        trusted = trustedSet;
       };
       const updateDnd = (id: string, entry?: DndEntry) => {
         const updated = new Map(dnd);
@@ -130,7 +252,6 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         });
       };
       const approving = new Set<string>();
-      const trusted = new Set<string>();
       const rejections: { envelope: MessageEnvelope; reason: string }[] = [];
       const key = (e: MessageEnvelope) => JSON.stringify([e.networkId, e.from.nodeId, e.id]);
       const cancellationKey = (e: MessageEnvelope) => `${key(e)}\0${e.signature}`;
@@ -143,10 +264,25 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         withdrawals.set(cancellationKey(envelope), reason);
         persistGateState(queued, withdrawals);
       };
-      const trustKeys = (e: MessageEnvelope) => [
-        JSON.stringify([e.networkId, 'node', e.from.nodeId]),
-        JSON.stringify([e.networkId, 'member', e.from.member]),
-      ];
+      const senderTrustRecords = (e: MessageEnvelope): TrustedSenderRecord[] => {
+        if (!isNonEmptyString(e.networkId)) return [];
+        const records: TrustedSenderRecord[] = [];
+        if (isNonEmptyString(e.from.nodeId)) {
+          records.push(validateTrustedSenderRecord({
+            networkId: e.networkId,
+            kind: 'node',
+            value: e.from.nodeId,
+          }));
+        }
+        if (isNonEmptyString(e.from.member)) {
+          records.push(validateTrustedSenderRecord({
+            networkId: e.networkId,
+            kind: 'member',
+            value: e.from.member,
+          }));
+        }
+        return records;
+      };
       let draining: Promise<void> = Promise.resolve();
       const evaluate = async (envelope: MessageEnvelope, drainEntry?: DndEntry): Promise<GateVerdict> => {
         let verdict = await ctx.bail('gate/evaluate', envelope);
@@ -158,14 +294,13 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
             }
           }
         }
-        if (!verdict && trustKeys(envelope).some(k => trusted.has(k))) {
-          verdict = { status: 'allow' };
-        }
-        if (!verdict && config.localNodeId && envelope.from.nodeId === config.localNodeId) {
+        if (!verdict) {
           const networkMode = service.getNetworkMode(envelope.networkId);
-          // Self-originated local deliveries are admission checks, not knocks. DND
-          // still queues them and closed still rejects them.
-          if (networkMode !== 'closed' && networkMode !== 'dnd') {
+          const isTrustedSender = senderTrustRecords(envelope).some(r => trusted.has(trustedSenderKey(r)));
+          const isLocalSender = Boolean(config.localNodeId && envelope.from.nodeId === config.localNodeId);
+          // Trusted senders and self-originated local deliveries skip approval knocks,
+          // while DND still queues them and closed still rejects them.
+          if ((isTrustedSender || isLocalSender) && networkMode !== 'closed' && networkMode !== 'dnd') {
             verdict = { status: 'allow' };
           }
         }
@@ -338,12 +473,62 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
         listDndQueue: () => structuredClone([...dnd].map(([id, entry]) => ({ id, ...entry }))),
         listPendingApprovals: () => structuredClone([...pending.values()]),
         listRejections: () => structuredClone(rejections),
+        listTrustedSenders(networkId) {
+          if (networkId !== undefined && !isNonEmptyString(networkId)) {
+            throw new Error('Trusted sender networkId must be a non-empty string');
+          }
+          return sortedTrustedSenders(trusted, networkId);
+        },
+        trustSender(record) {
+          const validated = validateTrustedSenderRecord(record);
+          const nextTrusted = new Map(trusted);
+          nextTrusted.set(trustedSenderKey(validated), validated);
+          persistGateState(dnd, withdrawn, nextTrusted);
+          return { ...validated };
+        },
+        untrustSender(filter) {
+          if (!isRecord(filter)) {
+            throw new Error('Untrust filter must be an object');
+          }
+          if (!isNonEmptyString(filter.value)) {
+            throw new Error('Trusted sender value must be a non-empty string');
+          }
+          if (filter.networkId !== undefined && !isNonEmptyString(filter.networkId)) {
+            throw new Error('Trusted sender networkId must be a non-empty string');
+          }
+          if (filter.kind !== undefined && !isTrustedSenderKind(filter.kind)) {
+            throw new Error(`Invalid trusted sender kind: ${String(filter.kind)}`);
+          }
+          const { value, networkId } = filter;
+          const removed: TrustedSenderRecord[] = [];
+          const nextTrusted = new Map(trusted);
+          for (const [entryKey, record] of trusted) {
+            if (record.value !== value) continue;
+            if (networkId !== undefined && record.networkId !== networkId) continue;
+            if (filter.kind !== undefined && record.kind !== filter.kind) continue;
+            nextTrusted.delete(entryKey);
+            removed.push({ networkId: record.networkId, kind: record.kind, value: record.value });
+          }
+          removed.sort(compareTrustedSenders);
+          if (removed.length > 0) {
+            persistGateState(dnd, withdrawn, nextTrusted);
+          }
+          return {
+            removedCount: removed.length,
+            removed,
+            remaining: sortedTrustedSenders(trusted, networkId),
+          };
+        },
         async approve(id, opts) {
           const item = pending.get(id);
           if (!item) {
             throw new Error(`Unknown approval: ${id}`);
           }
           if (approving.has(id)) throw new Error(`Approval already in progress: ${id}`);
+          const trustRecords = opts?.trustSender ? senderTrustRecords(item.envelope) : [];
+          if (opts?.trustSender && trustRecords.length === 0) {
+            throw new Error('Cannot trust sender with empty networkId or nodeId');
+          }
           approving.add(id);
           try {
             const receipt = await ctx.services.dispatcher.dispatch(item.envelope);
@@ -351,18 +536,22 @@ export function createGatePlugin(config: GateConfig = {}): Plugin {
               throw new Error(`Unconfirmed approval handoff (${receipt.stage}): ${receipt.detail ?? 'no durable handoff evidence'}`);
             }
             const queuedId = dndKey(item.envelope);
-            if (dnd.get(queuedId)?.envelope.signature === item.envelope.signature) updateDnd(queuedId);
+            const removeQueued = dnd.get(queuedId)?.envelope.signature === item.envelope.signature;
+            if (removeQueued || trustRecords.length > 0) {
+              const nextQueued = removeQueued ? new Map(dnd) : dnd;
+              if (removeQueued) nextQueued.delete(queuedId);
+              const nextTrusted = trustRecords.length > 0 ? new Map(trusted) : trusted;
+              for (const record of trustRecords) {
+                nextTrusted.set(trustedSenderKey(record), record);
+              }
+              persistGateState(nextQueued, withdrawn, nextTrusted);
+            }
             pending.delete(id);
           } catch (error) {
             parkDnd(dndKey(item.envelope), item.envelope, error);
             throw error;
           } finally {
             approving.delete(id);
-          }
-          if (opts?.trustSender) {
-            for (const k of trustKeys(item.envelope)) {
-              trusted.add(k);
-            }
           }
         },
         async reject(id, reason = 'Rejected by operator') {

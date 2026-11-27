@@ -24,6 +24,7 @@ import {
   isTerminalDeliveryFailure,
 } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
+import { parseTrustedSenderSelector, readTrustedSendersSnapshot } from '../gate/index.ts';
 import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
@@ -1312,7 +1313,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (v.help === true || group === 'help') {
       stdout(JSON.stringify({
         ok: true,
-        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|peers|worktree|node|project|setup|route|source> [options]',
+        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|peers|gate|worktree|node|project|setup|route|source> [options]',
         commands: {
           send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--idempotency-key <key>] [--attach <path>] [--json]',
           reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
@@ -1323,6 +1324,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue|drop> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--node <nodeId>] [--reason <text>] [--force] [--json]',
           peers: 'dealer peers <list|resolve|prune> [--network <id>] [--node <nodeId>] [--unreachable] [--json]',
+          gate: 'dealer gate <mode|list|approve|reject|drain|trusted|trust|untrust> [<target>] [--network <id>] [--trust-sender] [--reason <text>] [--json]',
           source: 'dealer source <add|list|wake> [<name>] [--json]',
         },
       }, null, v.json ? undefined : 2));
@@ -1331,13 +1333,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     const stateDir = resolve(options.stateDir ?? defaultStateDir());
     const readOnlyInbox = group === 'inbox' && (action === undefined || action === 'list' || (action === 'check' && v.peek === true));
     const readOnlyThread = group === 'thread' && (action === 'list' || action === 'show');
+    const readOnlyGate = group === 'gate' && action === 'trusted';
     const observesMailbox = readOnlyInbox || readOnlyThread || (group === 'queue' && action === 'status') || (group === 'node' && action === 'status');
+    const observesState = observesMailbox || readOnlyGate;
     const openLedgers = async (config?: Partial<RuntimeConfig>) => {
       const ledgers = await ledgersFor(options, stateDir, observesMailbox, config);
       if (!options.runtime) offlineMailbox = ledgers.mailbox;
       return ledgers;
     };
-    if (!options.runtime && !observesMailbox && group !== 'self-update' && !(group === 'node' && action === 'down')) {
+    if (!options.runtime && !observesState && group !== 'self-update' && !(group === 'node' && action === 'down')) {
       updateStateDir = stateDir;
     }
     const callerEnv = options.env ?? (options.runtime || options.stateDir ? {} : process.env);
@@ -1511,6 +1515,15 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (group === 'thread') {
       const { mailbox, outbox } = await openLedgers();
       stdout(JSON.stringify(runThreadCommand(mailbox, action, target, v, outbox), null, v.json ? undefined : 2));
+      return 0;
+    }
+    if (!options.runtime && group === 'gate' && action === 'trusted') {
+      const networkId = v.network !== undefined ? required(v.network, '--network') : undefined;
+      stdout(JSON.stringify(
+        readTrustedSendersSnapshot(join(stateDir, 'gate-dnd.json'), networkId),
+        null,
+        v.json ? undefined : 2,
+      ));
       return 0;
     }
     if (!options.runtime && group === 'node' && action === 'up') {
@@ -1737,6 +1750,20 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       } else if (action === 'drain') {
         await runtime.gate.drainDnd(network);
         result = { drained: true };
+      } else if (action === 'trusted') {
+        result = runtime.gate.listTrustedSenders(v.network !== undefined ? required(v.network, '--network') : undefined);
+      } else if (action === 'trust') {
+        const selector = parseTrustedSenderSelector(required(target, 'selector'));
+        result = runtime.gate.trustSender({
+          networkId: required(network, '--network'),
+          ...selector,
+        });
+      } else if (action === 'untrust') {
+        const selector = parseTrustedSenderSelector(required(target, 'selector'));
+        result = runtime.gate.untrustSender({
+          ...(v.network !== undefined ? { networkId: required(network, '--network') } : {}),
+          ...selector,
+        });
       } else {
         throw new Error('Unknown gate command');
       }
