@@ -88,8 +88,19 @@ export function readLarkConsumedSequence(stateDir: string, config?: LarkNotifyCo
   }
   return consumed;
 }
-function prune<T>(entries: Record<string, T>, timestamp: (value: T) => string): Record<string, T> {
-  return Object.fromEntries(Object.entries(entries).reverse().sort((a, b) => timestamp(b[1]).localeCompare(timestamp(a[1]))).slice(0, 1024));
+function prune<T>(
+  entries: Record<string, T>,
+  timestamp: (value: T) => string,
+  preserve?: (value: T) => boolean,
+): Record<string, T> {
+  const ordered = Object.entries(entries)
+    .reverse()
+    .sort((a, b) => timestamp(b[1]).localeCompare(timestamp(a[1])));
+  if (!preserve) return Object.fromEntries(ordered.slice(0, 1024));
+  let settledKept = 0;
+  return Object.fromEntries(
+    ordered.filter(([, value]) => preserve(value) || ++settledKept <= 1024),
+  );
 }
 
 /** One serialized mirror consumer for mailbox arrivals, gate knocks, and outbound thread events. */
@@ -368,7 +379,11 @@ export class LarkMailboxNotifier {
   }
   private persist(state: NotifyState): void {
     state.deliveredItems = prune(state.deliveredItems, item => item.deliveredAt);
-    state.threadRoots = prune(state.threadRoots, item => item.updatedAt);
+    state.threadRoots = prune(
+      state.threadRoots,
+      item => item.updatedAt,
+      item => item.awaitingSessionLink === true,
+    );
     writeFileAtomically(this.statePath, `${JSON.stringify(state, null, 2)}\n`);
   }
 }

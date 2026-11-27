@@ -1999,4 +1999,191 @@ test('Lark session links: inline ready, pending onWakeTarget follow-up, rotation
     await notifier4.flush();
     assert.equal(calls.length, callsAfterRecovery, 'post-reconciliation restart must send zero duplicate replies');
   }
+
+  // 13. persist() never evicts awaitingSessionLink roots under the 1,024 history cap (>1,024 pending roots),
+  //     caps settled roots at 1,024, preserves retention watermark across rotation/compaction, and delivers
+  //     the idempotent S2 correction to the oldest awaiting root after notifier restart.
+  {
+    const dir = join(root, 'prune-preserves-awaiting-roots');
+    const larkConfig = { enabled: true, target: { chatId: 'prune-chat' } };
+    const { mailbox: store } = openStateLedgers(dir, undefined, () => larkConfig);
+    t.after(() => store.close());
+    const occupied = new Set<string>();
+    const fakeCodex = createFakeCodexAppServer({
+      activeWriterThreadIds: occupied,
+      nextThreadId: count => `prune-s${count + 1}`,
+    });
+
+    // Seed oldest awaiting item (sequence 0) in fixed Codex stream with existing prune-s1.
+    store.enqueue([envelope('oldest-pending')], {
+      mailboxId: 'stream:prune-aw',
+      wakeTarget: {
+        driver: 'agent-host',
+        driverConfig: {
+          hostAgent: 'codex',
+          conversationMode: 'fixed',
+          sessionId: 'prune-s1',
+          configuredSessionId: 'prune-s1',
+          sessionStartedAt: 1_000,
+          workspacePath: root,
+        },
+      },
+    });
+    store.upsertWakeTarget('stream:other-pending', {
+      driver: 'agent-host',
+      driverConfig: {
+        hostAgent: 'codex',
+        conversationMode: 'fixed',
+        sessionId: 'other-s1',
+        sessionStartedAt: 1_000,
+        workspacePath: root,
+      },
+    });
+
+    const targetKey = JSON.stringify(['', '', '--chat-id', 'prune-chat']);
+    const seededRoots: Record<string, Record<string, unknown>> = {
+      'oldest-pending': {
+        messageId: 'oldest-root-msg',
+        targetKey,
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        mailboxId: 'stream:prune-aw',
+        itemSequence: 0,
+        awaitingSessionLink: true,
+        lastSessionUrl: 'codex://threads/prune-s1',
+      },
+    };
+    // 1,030 additional newer awaiting roots (> 1,024 total awaiting roots).
+    for (let i = 1; i <= 1030; i += 1) {
+      seededRoots[`awaiting-${i}`] = {
+        messageId: `awaiting-msg-${i}`,
+        targetKey,
+        updatedAt: new Date(Date.UTC(2026, 0, 2, 0, 0, i)).toISOString(),
+        mailboxId: 'stream:other-pending',
+        itemSequence: 10_000 + i,
+        awaitingSessionLink: true,
+        lastSessionUrl: 'codex://threads/other-s1',
+      };
+    }
+    // 1,035 settled roots (newest 1,024 should survive; oldest 11 should be pruned).
+    for (let i = 1; i <= 1035; i += 1) {
+      seededRoots[`settled-${i}`] = {
+        messageId: `settled-msg-${i}`,
+        targetKey,
+        updatedAt: new Date(Date.UTC(2026, 0, 3, 0, 0, i)).toISOString(),
+        mailboxId: 'stream:settled-history',
+        itemSequence: 20_000 + i,
+        lastSessionUrl: 'codex://threads/settled-s1',
+      };
+    }
+    const statePath = join(dir, 'lark-notify.json');
+    writeFileSync(
+      statePath,
+      `${JSON.stringify(
+        {
+          schema: 'the-dealer-lark-notify/v1',
+          cursorSequence: 0,
+          deliveredItems: {
+            'stream:prune-aw:oldest-pending': {
+              larkMessageId: 'oldest-root-msg',
+              deliveredAt: '2026-01-01T00:00:00.000Z',
+            },
+          },
+          threadRoots: seededRoots,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const calls: CommandRequest[] = [];
+    const makeNotifier = () =>
+      new LarkMailboxNotifier({
+        store,
+        stateDir: dir,
+        localNodeId: 'local',
+        localMember: 'bob',
+        defaultBoundMailboxes: ['stream:prune-aw'],
+        config: larkConfig,
+        resolveSessionLink: (mailboxId, itemSequence) =>
+          resolveAgentHostSessionLink(store.getWakeTarget(mailboxId), {
+            hasOutstandingLease: Boolean(store.check({ mailboxId, peek: true }).deliveryId),
+            itemSequence,
+          }),
+        commandRunner: async call => {
+          calls.push(call);
+          return { stdout: JSON.stringify({ data: { message_id: `prune-lark-${calls.length}` } }) };
+        },
+      });
+
+    // Enqueue a new arrival to trigger persist() while >1,024 awaiting roots and >1,024 settled roots exist.
+    store.enqueue([envelope('trigger-arrival')], { mailboxId: 'stream:prune-aw' });
+    const notifier1 = makeNotifier();
+    t.after(() => notifier1.stop());
+    notifier1.start();
+    await notifier1.flush();
+    await notifier1.stop();
+
+    const afterPersist = JSON.parse(readFileSync(statePath, 'utf8'));
+    const allPersistedRoots = Object.entries(afterPersist.threadRoots) as [string, { awaitingSessionLink?: boolean }][];
+    const awaitingRoots = allPersistedRoots.filter(([, root]) => root.awaitingSessionLink === true);
+    const settledRoots = allPersistedRoots.filter(([, root]) => root.awaitingSessionLink !== true);
+    assert.equal(awaitingRoots.length, 1032, 'every awaitingSessionLink root must survive persist() unconditionally');
+    assert.equal(settledRoots.length, 1024, 'settled threadRoots must remain capped at 1,024');
+    assert.equal(afterPersist.threadRoots['oldest-pending']?.awaitingSessionLink, true);
+    assert.equal(afterPersist.threadRoots['settled-1'], undefined, 'oldest settled roots beyond 1,024 must be pruned');
+    assert.ok(afterPersist.threadRoots['settled-1035'], 'newest settled roots must be retained');
+    assert.equal(readLarkConsumedSequence(dir, larkConfig), -1, 'surviving oldest awaiting root must protect retention watermark');
+
+    // Rotate prune-s1 -> prune-s2 on active-writer lock, ack + compact >200 filtered items, then rotate prune-s2 -> prune-s3.
+    occupied.add('prune-s1');
+    const wake2 = await deliverAgentHostWakeTarget(store, runCommand, 'stream:prune-aw', {
+      stdioSpawner: fakeCodex.spawner,
+    });
+    assert.equal(wake2.rotated, true);
+    store.ack(store.check({ mailboxId: 'stream:prune-aw' }).deliveryId!, 'stream:prune-aw');
+
+    const filteredBatch = Array.from({ length: 210 }, (_, idx) => envelope(`prune-filtered-${idx + 1}`));
+    store.enqueue(filteredBatch, { mailboxId: 'stream:prune-filtered' });
+    store.ack(store.check({ mailboxId: 'stream:prune-filtered' }).deliveryId!, 'stream:prune-filtered');
+
+    occupied.add('prune-s2');
+    store.enqueue([envelope('after-s3')], { mailboxId: 'stream:prune-aw' });
+    const wake3 = await deliverAgentHostWakeTarget(store, runCommand, 'stream:prune-aw', {
+      stdioSpawner: fakeCodex.spawner,
+    });
+    assert.equal(wake3.rotated, true);
+    store.ack(store.check({ mailboxId: 'stream:prune-aw' }).deliveryId!, 'stream:prune-aw');
+
+    // Restart notifier -> oldest awaiting root receives its single idempotent S2 correction and clears awaitingSessionLink.
+    const callsBeforeRestart = calls.length;
+    const notifier2 = makeNotifier();
+    t.after(() => notifier2.stop());
+    notifier2.start();
+    await notifier2.flush();
+    await notifier2.stop();
+
+    const postRestartCalls = calls.slice(callsBeforeRestart);
+    const oldestCorrection = postRestartCalls.filter(
+      call => call.args.includes('--reply-in-thread') && argument(call, '--message-id') === 'oldest-root-msg',
+    );
+    assert.equal(oldestCorrection.length, 1);
+    assert.equal(
+      argument(oldestCorrection[0], '--markdown'),
+      '**[ChatGPT App]** Session ready: `codex://threads/prune-s2`',
+    );
+    const afterReconcile = JSON.parse(readFileSync(statePath, 'utf8'));
+    assert.equal(afterReconcile.threadRoots['oldest-pending'].awaitingSessionLink, undefined);
+    assert.equal(afterReconcile.threadRoots['oldest-pending'].lastSessionUrl, 'codex://threads/prune-s2');
+    const settledAfterReconcile = Object.values(afterReconcile.threadRoots as Record<string, { awaitingSessionLink?: boolean }>)
+      .filter(root => root.awaitingSessionLink !== true);
+    assert.equal(settledAfterReconcile.length, 1024, 'settled roots remain capped at 1,024 after awaiting roots settle');
+
+    // Second restart sends zero duplicate replies.
+    const callsBeforeFinalRestart = calls.length;
+    const notifier3 = makeNotifier();
+    t.after(() => notifier3.stop());
+    notifier3.start();
+    await notifier3.flush();
+    assert.equal(calls.length, callsBeforeFinalRestart);
+  }
 });
