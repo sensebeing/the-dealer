@@ -10,6 +10,7 @@ export * from './dispatcher/index.ts';
 export * from './plugins-orca/index.ts';
 export {
   CommandNotStartedError,
+  isCommandNotFoundError,
   runCommand,
   checkedCommand,
   findExecutable,

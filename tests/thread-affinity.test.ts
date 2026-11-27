@@ -834,7 +834,9 @@ test('multicast and broadcast thread replies never leak single-peer targetMailbo
 
   const noOrcaRunner: CommandRunner = async request => {
     if (request.command === 'orca') {
-      throw new CommandNotStartedError('spawn orca ENOENT');
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca ENOENT'), { code: 'ENOENT', syscall: 'spawn orca' }),
+      );
     }
     return { stdout: '{"ok":true}' };
   };
@@ -1083,7 +1085,27 @@ test('non-Orca and broken-Orca nodes durably ingest explicit worktree:* and term
   const meshDir = join(root, 'mesh');
 
   const noOrcaRunner: CommandRunner = async request => {
-    if (request.command === 'orca') throw new CommandNotStartedError('spawn orca ENOENT');
+    if (request.command === 'orca') {
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca ENOENT'), { code: 'ENOENT', syscall: 'spawn orca' }),
+      );
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const eaccesOrcaRunner: CommandRunner = async request => {
+    if (request.command === 'orca') {
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca EACCES'), { code: 'EACCES', syscall: 'spawn orca' }),
+      );
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const eagainOrcaRunner: CommandRunner = async request => {
+    if (request.command === 'orca') {
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca EAGAIN'), { code: 'EAGAIN', syscall: 'spawn orca' }),
+      );
+    }
     return { stdout: '{"ok":true}' };
   };
   const brokenOrcaRunner: CommandRunner = async request => {
@@ -1114,18 +1136,22 @@ test('non-Orca and broken-Orca nodes durably ingest explicit worktree:* and term
 
   const sender = await makeNode('sender', noOrcaRunner);
   const nonOrca = await makeNode('nonorca', noOrcaRunner);
+  const eaccesOrca = await makeNode('eaccesorca', eaccesOrcaRunner);
+  const eagainOrca = await makeNode('eagainorca', eagainOrcaRunner);
   const brokenOrca = await makeNode('brokenorca', brokenOrcaRunner);
 
   const deadline = Date.now() + 5_000;
   while (
     !sender.node.listPeers({ networkId: 'team', member: 'nonorca' }).length ||
+    !sender.node.listPeers({ networkId: 'team', member: 'eaccesorca' }).length ||
+    !sender.node.listPeers({ networkId: 'team', member: 'eagainorca' }).length ||
     !sender.node.listPeers({ networkId: 'team', member: 'brokenorca' }).length
   ) {
     assert.ok(Date.now() < deadline, 'peer discovery');
     await new Promise(resolve => setTimeout(resolve, 25));
   }
 
-  // Non-Orca node: CommandNotStartedError (spawn orca ENOENT) on explicit worktree:* and terminal:*.
+  // Non-Orca node: positive ENOENT CommandNotStartedError degrades silently without diagnostics.
   const wtRes = await sender.emitter.emit({
     networkId: 'team',
     routing: { mode: 'unicast', targets: ['member:nonorca'] },
@@ -1153,7 +1179,31 @@ test('non-Orca and broken-Orca nodes durably ingest explicit worktree:* and term
   assert.equal(nonOrca.lastError, undefined);
   assert.equal(nonOrca.wakeups.getLastError(), undefined);
 
-  // Broken Orca node: non-CommandNotStartedError still persists durably and records diagnostic error.
+  // Permission/resource launch failures (EACCES, EAGAIN) must surface diagnostics while preserving durable ingestion.
+  for (const [member, targetRuntime, code] of [
+    ['eaccesorca', eaccesOrca, 'EACCES'],
+    ['eagainorca', eagainOrca, 'EAGAIN'],
+  ] as const) {
+    for (const targetMailbox of ['worktree:alter-service-indo', 'terminal:term_remote'] as const) {
+      targetRuntime.lastError = undefined;
+      const res = await sender.emitter.emit({
+        networkId: 'team',
+        routing: { mode: 'unicast', targets: [`member:${member}`] },
+        kind: 'collab.request.v4',
+        subject: `${code} ${targetMailbox}`,
+        body: 'Must persist durably and surface launch diagnostic',
+        payload: {},
+        semantic: { type: 'message', targetMailbox },
+      });
+      assert.equal(res.receipts[0]?.stage, 'dispatched');
+      assert.equal(targetRuntime.mailbox.list({ mailboxId: targetMailbox }).totalCount, 1);
+      assert.notEqual(targetRuntime.mailbox.getWakeTarget(targetMailbox)?.driver, 'orca-terminal');
+      assert.match(targetRuntime.lastError ?? '', new RegExp(code));
+      assert.match(targetRuntime.wakeups.getLastError() ?? '', new RegExp(code));
+    }
+  }
+
+  // Broken Orca node: inventory failure still persists durably and records diagnostic error.
   const brokenRes = await sender.emitter.emit({
     networkId: 'team',
     routing: { mode: 'unicast', targets: ['member:brokenorca'] },

@@ -1815,11 +1815,12 @@ test('inbox and wave prepare every group before custody while session-lookup fai
   }
 
   // 2. Optional session wake-target probes through WakeupRedriveService never block durable custody:
-  // CommandNotStartedError (non-Orca host) degrades cleanly without diagnostics; other Orca inventory
-  // failures report diagnostics via onError while still persisting the inbound batch.
+  // positive ENOENT (non-Orca host) degrades cleanly without diagnostics; permission/resource
+  // launch failures (EACCES) and Orca inventory failures report diagnostics via onError while
+  // still persisting the inbound batch.
   for (const factory of [createInboxExecutorPlugin, createOrcaWaveExecutorPlugin]) {
-    for (const nonStart of [false, true]) {
-      const store = new MailboxStore(join(root, `${factory.name}-session-${nonStart}.json`));
+    for (const failureMode of ['enoent', 'eacces', 'inventory'] as const) {
+      const store = new MailboxStore(join(root, `${factory.name}-session-${failureMode}.json`));
       const errors: unknown[] = [];
       const wakeup = new WakeupRedriveService({
         store,
@@ -1827,7 +1828,17 @@ test('inbox and wave prepare every group before custody while session-lookup fai
         onError: error => errors.push(error),
         drivers: createOrcaWakeupDrivers({
           commandRunner: async () => {
-            throw nonStart ? new CommandNotStartedError('ENOENT') : new Error('inventory unavailable');
+            if (failureMode === 'enoent') {
+              throw new CommandNotStartedError(
+                Object.assign(new Error('spawn orca ENOENT'), { code: 'ENOENT', syscall: 'spawn orca' }),
+              );
+            }
+            if (failureMode === 'eacces') {
+              throw new CommandNotStartedError(
+                Object.assign(new Error('spawn orca EACCES'), { code: 'EACCES', syscall: 'spawn orca' }),
+              );
+            }
+            throw new Error('inventory unavailable');
           },
         }),
       });
@@ -1837,9 +1848,9 @@ test('inbox and wave prepare every group before custody while session-lookup fai
         wakeup,
         resolveTopicBinding: () => ({ mode: 'wave', streamKey: 'topic' }),
       });
-      const first = envelope({ idempotencyKey: `session-${nonStart}`, payload: { mailbox: 'terminal:ready', revision: 2 } });
+      const first = envelope({ idempotencyKey: `session-${failureMode}`, payload: { mailbox: 'terminal:ready', revision: 2 } });
       const later = envelope({ payload: { mailbox: 'worktree:lookup' } });
-      const policy = createDedupCasPolicyPlugin({ watermarksPath: join(root, `cas-session-${factory.name}-${nonStart}.json`) });
+      const policy = createDedupCasPolicyPlugin({ watermarksPath: join(root, `cas-session-${factory.name}-${failureMode}.json`) });
       const receipt = await policy.process(first, async () => ({
         stage: 'dispatched' as const,
         executionReceipt: await executor.execute(
@@ -1849,8 +1860,13 @@ test('inbox and wave prepare every group before custody while session-lookup fai
       }));
       assert.equal(receipt.stage, 'dispatched');
       assert.equal(store.listItemsAfterSequence(-1).length, 2);
-      if (nonStart) {
+      if (failureMode === 'enoent') {
         assert.deepEqual(errors, []);
+        assert.notEqual(store.getWakeTarget('terminal:ready')?.driver, 'orca-terminal');
+        assert.notEqual(store.getWakeTarget('worktree:lookup')?.driver, 'orca-terminal');
+      } else if (failureMode === 'eacces') {
+        assert.equal(errors.length, 2);
+        assert.ok(errors.every(error => /EACCES/.test(String(error))));
         assert.notEqual(store.getWakeTarget('terminal:ready')?.driver, 'orca-terminal');
         assert.notEqual(store.getWakeTarget('worktree:lookup')?.driver, 'orca-terminal');
       } else {

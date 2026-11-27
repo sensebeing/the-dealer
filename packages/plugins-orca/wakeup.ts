@@ -29,7 +29,7 @@ import {
 import { orcaMutationRunner } from './inventories.ts';
 import type { OrcaIdleResult, SupportedOrcaAgent } from './workspace.ts';
 import { buildOrcaAgentLaunchCommand, isOrcaLaunchConfigCompatible } from './workspace.ts';
-import { checkedCommand, CommandNotStartedError, runCommand } from '../subprocess/index.ts';
+import { checkedCommand, CommandNotStartedError, isCommandNotFoundError, runCommand } from '../subprocess/index.ts';
 import type { CommandRunner } from '../subprocess/index.ts';
 import { readAgentHostDriverConfig } from '../plugins-agent-host/wakeup.ts';
 import type { AgentConversationMode } from '../core-types/index.ts';
@@ -1617,8 +1617,10 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
           if (typeof terminal?.worktreeId === 'string')
             worktreeId = normalizeOrcaWorktreeId(terminal.worktreeId);
         } catch (error) {
-          // Orca is absent on this node: do not create a broken orca-terminal wake target.
-          if (error instanceof CommandNotStartedError) return undefined;
+          // Orca executable is absent on this node: do not create a broken orca-terminal wake target.
+          if (isCommandNotFoundError(error)) return undefined;
+          // Other launch failures (e.g. EACCES/EAGAIN) must surface diagnostics instead of being masked.
+          if (error instanceof CommandNotStartedError) throw error;
           // Optional address enrichment only: the delivery-time terminal probe still fails closed.
         }
         return {
@@ -1640,7 +1642,7 @@ export function createOrcaTerminalWakeupDriver(options: OrcaWakeupDriverOptions 
             mailboxId.slice(9),
           );
         } catch (error) {
-          if (error instanceof CommandNotStartedError) return undefined;
+          if (isCommandNotFoundError(error)) return undefined;
           throw error;
         }
         if (found)
