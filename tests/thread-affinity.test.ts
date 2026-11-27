@@ -1,5 +1,10 @@
 import { createTestWakeupDrivers } from './helpers/wakeup-drivers.ts';
-import { createOrcaWakeupDrivers } from '../packages/index.ts';
+import { createFakeCodexAppServer } from './helpers/fake-codex-app-server.ts';
+import {
+  CommandNotStartedError,
+  createOrcaWakeupDrivers,
+  findOrcaWorktreeByName,
+} from '../packages/index.ts';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -479,13 +484,28 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
   }).start();
   t.after(() => runtime.stop());
   const threadId = 'thread-cli';
-  // The peer's reply we received asks us to answer in task:peer; we are handling the thread from
-  // worktree:origin. Both routes are recorded on the thread's legs.
+  const bobSelf = {
+    nodeId: runtime.node.getSelfCard('local').nodeId,
+    member: 'bob',
+    nodeName: 'bob',
+  };
+  // The target peer's reply we received asks us to answer in task:peer; we are handling the thread
+  // from worktree:origin. Both routes are recorded on the thread's legs.
   runtime.mailbox.recordInboundEnvelope(
     envelope('peer-reply-3', {
       networkId: 'local',
-      from: peer,
+      from: bobSelf,
       semantic: { type: 'reply', threadId, replyMailbox: 'task:peer' },
+    }),
+    'worktree:origin',
+  );
+  // Another peer on a separate thread must never leak its mailbox into a send targeting bob.
+  const otherPeerThreadId = 'thread-cli-other-peer';
+  runtime.mailbox.recordInboundEnvelope(
+    envelope('other-peer-reply', {
+      networkId: 'local',
+      from: peer,
+      semantic: { type: 'reply', threadId: otherPeerThreadId, replyMailbox: 'task:other-peer' },
     }),
     'worktree:origin',
   );
@@ -501,7 +521,8 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
     return JSON.parse(out.join('\n'));
   };
 
-  await run([]);
+  const first = await run([]);
+  assert.equal(first.targetMailbox, 'task:peer');
   const [delivered] = runtime.mailbox.list({ mailboxId: 'task:peer' }).items;
   assert.ok(delivered, 'the thread reply route must address the peer mailbox');
   assert.deepEqual(delivered.envelope.semantic, {
@@ -510,6 +531,22 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
     targetMailbox: 'task:peer',
     replyMailbox: 'worktree:origin',
   });
+
+  // Sending on a thread whose only recorded peer route belongs to another peer must not borrow it.
+  const otherOut: string[] = [];
+  const otherErr: string[] = [];
+  const otherCode = await runDealerCli(
+    ['send', '--network', 'local', '--to', 'member:bob', '--topic', 'collab.request.v4', '--body', 'other-peer', '--thread', otherPeerThreadId, '--json'],
+    { runtime, stdout: line => otherOut.push(line), stderr: line => otherErr.push(line) },
+  );
+  assert.equal(otherCode, 0, otherErr.join('\n'));
+  assert.equal(JSON.parse(otherOut.join('\n')).targetMailbox, null);
+  assert.equal(runtime.mailbox.list({ mailboxId: 'task:other-peer' }).totalCount, 0);
+  const otherDelivered = runtime.mailbox.list({ mailboxId: 'worktree:origin' }).items.find(
+    item => item.envelope.semantic?.threadId === otherPeerThreadId,
+  );
+  assert.ok(otherDelivered, 'local thread affinity still delivers locally without borrowing another peer targetMailbox');
+  assert.equal(otherDelivered.envelope.semantic?.targetMailbox, undefined);
 
   // An explicit target always wins over the recorded thread route.
   await run(['--target-mailbox', 'worktree:peer-session']);
@@ -522,7 +559,7 @@ test('dealer send --thread reuses the thread reply route for its mailboxes', asy
   runtime.mailbox.recordInboundEnvelope(
     envelope('peer-reply-foreign', {
       networkId: 'team',
-      from: peer,
+      from: bobSelf,
       semantic: { type: 'reply', threadId: foreignThreadId, replyMailbox: 'task:foreign' },
     }),
     'worktree:origin',
@@ -556,12 +593,17 @@ test('dealer send --thread resolves the route recorded on the sending network', 
   }).start();
   t.after(() => runtime.stop());
   const threadId = 'thread-cross-network';
+  const bobSelf = {
+    nodeId: runtime.node.getSelfCard('local').nodeId,
+    member: 'bob',
+    nodeName: 'bob',
+  };
   // The same thread id accumulated an older local route and a newer team route. `--network local`
   // must follow the local leg instead of the newer leg shadowing it.
   runtime.mailbox.recordInboundEnvelope(
     envelope('peer-reply-local', {
       networkId: 'local',
-      from: peer,
+      from: bobSelf,
       semantic: { type: 'reply', threadId, replyMailbox: 'task:local' },
     }),
     'worktree:origin',
@@ -569,16 +611,17 @@ test('dealer send --thread resolves the route recorded on the sending network', 
   runtime.mailbox.recordInboundEnvelope(
     envelope('peer-reply-team', {
       networkId: 'team',
-      from: peer,
+      from: bobSelf,
       semantic: { type: 'reply', threadId, replyMailbox: 'task:team' },
     }),
     'worktree:origin',
   );
   // The unscoped lookup follows the newest record; the network-scoped lookup must not.
   assert.equal(runtime.mailbox.resolveReplyTarget(threadId)?.networkId, 'team');
-  const localRoute = runtime.mailbox.resolveReplyTarget(threadId, 'local')!;
+  const localRoute = runtime.mailbox.resolveReplyTarget(threadId, 'local', bobSelf.nodeId)!;
   assert.equal(localRoute.networkId, 'local');
   assert.equal(localRoute.targetMailbox, 'task:local');
+  assert.equal(runtime.mailbox.resolveReplyTarget(threadId, 'local', peer.nodeId)?.targetMailbox, 'default');
 
   const out: string[] = [];
   const err: string[] = [];
@@ -616,11 +659,16 @@ test('dealer send --thread follows the newest inbound leg of a thread we origina
   t.after(() => runtime.stop());
   const threadId = 'thread-root-route';
   const originMailbox = 'worktree:halfbeak-2';
+  const bobSelf = {
+    nodeId: runtime.node.getSelfCard('local').nodeId,
+    member: 'bob',
+    nodeName: 'bob',
+  };
   // We started the thread without an explicit target mailbox, so its root outbound leg records
   // `default` as the peer reply mailbox.
   runtime.mailbox.recordOutboundEnvelope(
     envelope(threadId, { networkId: 'local', semantic: { type: 'message', threadId } }),
-    [peer.nodeId],
+    [bobSelf.nodeId],
     originMailbox,
   );
   const rootLeg = runtime.mailbox.getThread(threadId)!;
@@ -630,17 +678,19 @@ test('dealer send --thread follows the newest inbound leg of a thread we origina
   runtime.mailbox.recordInboundEnvelope(
     envelope('peer-reply-root', {
       networkId: 'local',
-      from: peer,
+      from: bobSelf,
       semantic: { type: 'reply', threadId, replyMailbox: 'worktree:peer-review' },
     }),
     originMailbox,
   );
 
-  // A thread reference must not fall back to the root's `default` peer mailbox.
-  const route = runtime.mailbox.resolveReplyTarget(threadId)!;
+  // A thread reference must not fall back to the root's `default` peer mailbox, and must not leak
+  // to an unrelated peer on the same thread.
+  const route = runtime.mailbox.resolveReplyTarget(threadId, 'local', bobSelf.nodeId)!;
   assert.equal(route.threadId, threadId);
   assert.equal(route.targetMailbox, 'worktree:peer-review');
   assert.equal(route.localMailbox, originMailbox);
+  assert.equal(runtime.mailbox.resolveReplyTarget(threadId, 'local', peer.nodeId)?.targetMailbox, 'default');
 
   const out: string[] = [];
   const err: string[] = [];
@@ -741,4 +791,436 @@ test('partial unbound wave ingestion preserves the established runtime session',
   assert.equal(replaced.driverConfig?.sessionId, undefined);
   assert.equal(replaced.driverConfig?.terminalHandle, undefined);
   assert.equal(sessionBinding(replaced).paneKey, undefined);
+});
+
+test('multicast and broadcast thread replies never leak single-peer targetMailbox across Orca and non-Orca Codex nodes', async t => {
+  const root = directory(t);
+  const meshDir = join(root, 'mesh');
+  const fourierWorkspace = join(root, 'alter-service-indo');
+  const homyangWorkspace = join(root, 'homyang-codex');
+  mkdirSync(fourierWorkspace, { recursive: true });
+  mkdirSync(homyangWorkspace, { recursive: true });
+
+  const fourierCalls: CommandRequest[] = [];
+  const fourierRunner: CommandRunner = async request => {
+    fourierCalls.push(request);
+    if (request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: {
+            truncated: false,
+            worktrees: [{
+              displayName: 'alter-service-indo',
+              path: fourierWorkspace,
+              worktreeId: 'wt-fourier-indo',
+              unverifiableTerminalCount: 0,
+              agents: [{ state: 'done' }],
+            }],
+          },
+        }),
+      };
+    }
+    if (request.args[0] === 'terminal' && request.args[1] === 'list') {
+      return {
+        stdout: JSON.stringify({
+          ok: true,
+          result: { terminals: [{ handle: 'term_fourier', connected: true, writable: true, preview: '>' }] },
+        }),
+      };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+
+  const noOrcaRunner: CommandRunner = async request => {
+    if (request.command === 'orca') {
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca ENOENT'), { code: 'ENOENT', syscall: 'spawn orca' }),
+      );
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  let codexTurnCount = 0;
+  const fakeCodex = createFakeCodexAppServer({
+    nextThreadId: () => `homyang-codex-${++codexTurnCount}`,
+  });
+
+  const fourier = await new DealerNodeRuntime({
+    stateDir: join(root, 'fourier'),
+    member: 'fourier',
+    name: 'fourier-mac',
+    profile: 'personal-dev',
+    transport: { discoveryDir: meshDir },
+    commandRunner: fourierRunner,
+    wakeupIdleCheck: async () => ({ idle: true }),
+    patch: {
+      gateMode: 'open',
+      defaultExecutor: 'inbox',
+      larkNotify: { enabled: false, target: { userId: 'test-user' } },
+      skills: ['collab-review'],
+    },
+  }).start();
+  t.after(() => fourier.stop());
+
+  const homyang = await new DealerNodeRuntime({
+    stateDir: join(root, 'homyang'),
+    member: 'homyang',
+    name: 'homyang-codex',
+    profile: 'personal-dev',
+    transport: { discoveryDir: meshDir },
+    commandRunner: noOrcaRunner,
+    stdioSpawner: fakeCodex.spawner,
+    patch: {
+      gateMode: 'open',
+      defaultExecutor: 'inbox',
+      larkNotify: { enabled: false, target: { userId: 'test-user' } },
+      skills: ['collab-review'],
+      topicBindings: {
+        'collab.request.v4': {
+          executor: 'codex',
+          mode: 'wave',
+          mailboxId: 'stream:inbox',
+          workspacePath: homyangWorkspace,
+        },
+      },
+    },
+  }).start();
+  t.after(() => homyang.stop());
+
+  const ben = await new DealerNodeRuntime({
+    stateDir: join(root, 'ben'),
+    member: 'ben',
+    name: 'ben-mac',
+    profile: 'personal-dev',
+    transport: { discoveryDir: meshDir },
+    commandRunner: noOrcaRunner,
+    patch: {
+      gateMode: 'open',
+      defaultExecutor: 'inbox',
+      larkNotify: { enabled: false, target: { userId: 'test-user' } },
+    },
+  }).start();
+  t.after(() => ben.stop());
+
+  for (const node of [fourier, homyang, ben]) {
+    await node.mountNetwork({ networkId: 'team', passphrase: 'multicast-routing-test' });
+  }
+  const deadline = Date.now() + 5_000;
+  while (
+    !ben.node.listPeers({ networkId: 'team', member: 'fourier' }).length ||
+    !ben.node.listPeers({ networkId: 'team', member: 'homyang' }).length ||
+    !fourier.node.listPeers({ networkId: 'team', member: 'ben' }).length
+  ) {
+    assert.ok(Date.now() < deadline, 'three-node peer discovery');
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+
+  // Team-registry style area:* expansion hook on ben -> expands to [member:fourier, member:homyang].
+  ben.kernel.ctx.on('emitter/prepare', msg => {
+    if (msg.routing.targets?.includes('area:backend')) {
+      return {
+        ...msg,
+        routing: { ...msg.routing, mode: 'multicast', targets: ['member:fourier', 'member:homyang'] },
+      };
+    }
+    return msg;
+  });
+
+  // Auto-route judge expanding to both peers when payload.autoMulticast is set.
+  const fourierNodeId = fourier.node.getSelfCard('team').nodeId;
+  const homyangNodeId = homyang.node.getSelfCard('team').nodeId;
+  ben.kernel.ctx.services.router.registerJudge({
+    name: 'test-multicast-judge',
+    priority: 10,
+    async decide(msg) {
+      if (msg.payload?.autoMulticast === true) {
+        return {
+          mode: 'multicast',
+          targetNodeIds: [fourierNodeId, homyangNodeId],
+          matchedBy: 'test-multicast-judge',
+          reason: 'multicast to fourier and homyang',
+        };
+      }
+      return null;
+    },
+  });
+
+  const cli = async (runtime: DealerNodeRuntime, argv: string[]) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runDealerCli(argv, {
+      runtime,
+      env: {},
+      stdout: line => out.push(line),
+      stderr: line => err.push(line),
+    });
+    assert.equal(code, 0, err.join('\n'));
+    return JSON.parse(out.join('\n'));
+  };
+
+  // Incident 1 (REQ-20261127-0aa1e6): fourier starts a thread from worktree:alter-service-indo.
+  const t1 = await cli(fourier, [
+    'send', '--network', 'team', '--to', 'member:ben', '--topic', 'collab.request.v4',
+    '--body', 'Initial request from Orca worktree',
+    '--workspace-path', fourierWorkspace, '--terminal-handle', 'term_fourier', '--json',
+  ]);
+  assert.equal(t1.receipts[0]?.stage, 'dispatched');
+
+  // Multicast via area:backend, skill:collab-review, --auto-route, and broadcast --thread.
+  const areaReply = await cli(ben, [
+    'send', '--network', 'team', '--to', 'area:backend', '--topic', 'collab.request.v4',
+    '--thread', t1.messageId, '--body', 'Area multicast update', '--json',
+  ]);
+  const skillReply = await cli(ben, [
+    'send', '--network', 'team', '--to', 'skill:collab-review', '--topic', 'collab.request.v4',
+    '--thread', t1.messageId, '--body', 'Skill multicast update', '--json',
+  ]);
+  const autoReply = await cli(ben, [
+    'send', '--network', 'team', '--auto-route', '--topic', 'collab.request.v4',
+    '--thread', t1.messageId, '--body', JSON.stringify({ autoMulticast: true, text: 'Auto multicast update' }), '--json',
+  ]);
+  const broadcastReply = await cli(ben, [
+    'broadcast', '--network', 'team', '--topic', 'collab.request.v4',
+    '--thread', t1.messageId, '--body', 'Broadcast thread update', '--json',
+  ]);
+
+  for (const res of [areaReply, skillReply, autoReply]) {
+    assert.equal(res.targetMailbox, null);
+    assert.equal(res.receipts.length, 2);
+    assert.ok(res.receipts.every((r: { stage: string }) => r.stage === 'dispatched'), JSON.stringify(res.receipts));
+  }
+  assert.equal(broadcastReply.targetMailbox, null);
+
+  const waitUntil = async (check: () => boolean, label: string) => {
+    const end = Date.now() + 5_000;
+    while (!check()) {
+      assert.ok(Date.now() < end, label);
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  };
+  await waitUntil(
+    () => fourier.mailbox.list({ mailboxId: 'worktree:alter-service-indo' }).totalCount >= 4 &&
+          homyang.mailbox.list({ mailboxId: 'stream:inbox' }).totalCount >= 4,
+    'all 4 thread replies arrive on both fourier and homyang',
+  );
+  await fourier.wakeups.flushMailbox('worktree:alter-service-indo', { force: true });
+  await homyang.wakeups.waitUntilIdle();
+
+  const fourierItems = fourier.mailbox.list({ mailboxId: 'worktree:alter-service-indo' }).items;
+  const homyangItems = homyang.mailbox.list({ mailboxId: 'stream:inbox' }).items;
+  for (const id of [areaReply.messageId, skillReply.messageId, autoReply.messageId, broadcastReply.messageId]) {
+    const fItem = fourierItems.find(item => item.id === id);
+    const hItem = homyangItems.find(item => item.id === id);
+    assert.ok(fItem, `fourier worktree must receive ${id}`);
+    assert.ok(hItem, `homyang stream:inbox must receive ${id}`);
+    assert.equal(fItem.envelope.semantic?.targetMailbox, undefined);
+    assert.equal(hItem.envelope.semantic?.targetMailbox, undefined);
+  }
+  assert.equal(homyang.mailbox.list({ mailboxId: 'worktree:alter-service-indo' }).totalCount, 0);
+  assert.equal(homyang.lastError, undefined);
+  assert.equal(homyang.mailbox.getWakeTarget('stream:inbox')?.driver, 'agent-host');
+  assert.ok(fakeCodex.sessions.length > 0, 'homyang Codex binding must execute on stream:inbox');
+  assert.ok(terminalSends(fourierCalls).some(call => terminalOf(call) === 'term_fourier'));
+
+  // Incident 2 (REQ-20261127-mtgc7): fourier starts a thread with replyMailbox stream:collab.request.v4.
+  const t2 = await cli(fourier, [
+    'send', '--network', 'team', '--to', 'member:ben', '--topic', 'collab.request.v4',
+    '--reply-mailbox', 'stream:collab.request.v4', '--body', 'Initial request with stream replyMailbox', '--json',
+  ]);
+  assert.equal(t2.receipts[0]?.stage, 'dispatched');
+
+  const t2Multicast = await cli(ben, [
+    'send', '--network', 'team', '--to', 'area:backend', '--topic', 'collab.request.v4',
+    '--thread', t2.messageId, '--body', 'Multicast reply on stream thread', '--json',
+  ]);
+  assert.equal(t2Multicast.targetMailbox, null);
+  assert.equal(t2Multicast.receipts.length, 2);
+  assert.ok(t2Multicast.receipts.every((r: { stage: string }) => r.stage === 'dispatched'));
+  assert.equal(
+    fourier.mailbox.list({ mailboxId: 'stream:collab.request.v4' }).items.some(item => item.id === t2Multicast.messageId),
+    true,
+    'fourier must receive via its own thread affinity',
+  );
+  assert.equal(
+    homyang.mailbox.list({ mailboxId: 'stream:inbox' }).items.some(item => item.id === t2Multicast.messageId),
+    true,
+    'homyang must land in stream:inbox instead of orphan stream:collab.request.v4',
+  );
+  assert.equal(homyang.mailbox.list({ mailboxId: 'stream:collab.request.v4' }).totalCount, 0);
+
+  // Unicast contrast: ben -> fourier carries fourier's targetMailbox; ben -> homyang does not.
+  const unicastFourier1 = await cli(ben, [
+    'send', '--network', 'team', '--to', 'member:fourier', '--topic', 'collab.request.v4',
+    '--thread', t1.messageId, '--body', 'Direct unicast to fourier t1', '--json',
+  ]);
+  assert.equal(unicastFourier1.targetMailbox, 'worktree:alter-service-indo');
+  assert.equal(
+    fourier.mailbox.list({ mailboxId: 'worktree:alter-service-indo' }).items.find(i => i.id === unicastFourier1.messageId)?.envelope.semantic?.targetMailbox,
+    'worktree:alter-service-indo',
+  );
+
+  const unicastFourier2 = await cli(ben, [
+    'send', '--network', 'team', '--to', 'member:fourier', '--topic', 'collab.request.v4',
+    '--thread', t2.messageId, '--body', 'Direct unicast to fourier t2', '--json',
+  ]);
+  assert.equal(unicastFourier2.targetMailbox, 'stream:collab.request.v4');
+  assert.equal(
+    fourier.mailbox.list({ mailboxId: 'stream:collab.request.v4' }).items.find(i => i.id === unicastFourier2.messageId)?.envelope.semantic?.targetMailbox,
+    'stream:collab.request.v4',
+  );
+
+  const unicastHomyang = await cli(ben, [
+    'send', '--network', 'team', '--to', 'member:homyang', '--topic', 'collab.request.v4',
+    '--thread', t1.messageId, '--body', 'Direct unicast to homyang on t1', '--json',
+  ]);
+  assert.equal(unicastHomyang.targetMailbox, null);
+  const homyangDirect = homyang.mailbox.list({ mailboxId: 'stream:inbox' }).items.find(i => i.id === unicastHomyang.messageId);
+  assert.ok(homyangDirect, 'homyang unicast must land in stream:inbox');
+  assert.equal(homyangDirect.envelope.semantic?.targetMailbox, undefined);
+  assert.equal(homyang.mailbox.list({ mailboxId: 'worktree:alter-service-indo' }).totalCount, 0);
+});
+
+test('non-Orca and broken-Orca nodes durably ingest explicit worktree:* and terminal:* messages', async t => {
+  const root = directory(t);
+  const meshDir = join(root, 'mesh');
+
+  const noOrcaRunner: CommandRunner = async request => {
+    if (request.command === 'orca') {
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca ENOENT'), { code: 'ENOENT', syscall: 'spawn orca' }),
+      );
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const eaccesOrcaRunner: CommandRunner = async request => {
+    if (request.command === 'orca') {
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca EACCES'), { code: 'EACCES', syscall: 'spawn orca' }),
+      );
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const eagainOrcaRunner: CommandRunner = async request => {
+    if (request.command === 'orca') {
+      throw new CommandNotStartedError(
+        Object.assign(new Error('spawn orca EAGAIN'), { code: 'EAGAIN', syscall: 'spawn orca' }),
+      );
+    }
+    return { stdout: '{"ok":true}' };
+  };
+  const brokenOrcaRunner: CommandRunner = async request => {
+    if (request.command === 'orca' && request.args[0] === 'worktree' && request.args[1] === 'ps') {
+      return { stdout: '{"ok":false}' };
+    }
+    return { stdout: '{"ok":true}' };
+  };
+
+  const makeNode = async (member: string, commandRunner: CommandRunner) => {
+    const rt = await new DealerNodeRuntime({
+      stateDir: join(root, member),
+      member,
+      name: member,
+      profile: 'personal-dev',
+      transport: { discoveryDir: meshDir },
+      commandRunner,
+      patch: {
+        gateMode: 'open',
+        defaultExecutor: 'inbox',
+        larkNotify: { enabled: false, target: { userId: 'test-user' } },
+      },
+    }).start();
+    t.after(() => rt.stop());
+    await rt.mountNetwork({ networkId: 'team', passphrase: 'explicit-orca-resilience' });
+    return rt;
+  };
+
+  const sender = await makeNode('sender', noOrcaRunner);
+  const nonOrca = await makeNode('nonorca', noOrcaRunner);
+  const eaccesOrca = await makeNode('eaccesorca', eaccesOrcaRunner);
+  const eagainOrca = await makeNode('eagainorca', eagainOrcaRunner);
+  const brokenOrca = await makeNode('brokenorca', brokenOrcaRunner);
+
+  const deadline = Date.now() + 5_000;
+  while (
+    !sender.node.listPeers({ networkId: 'team', member: 'nonorca' }).length ||
+    !sender.node.listPeers({ networkId: 'team', member: 'eaccesorca' }).length ||
+    !sender.node.listPeers({ networkId: 'team', member: 'eagainorca' }).length ||
+    !sender.node.listPeers({ networkId: 'team', member: 'brokenorca' }).length
+  ) {
+    assert.ok(Date.now() < deadline, 'peer discovery');
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+
+  // Non-Orca node: positive ENOENT CommandNotStartedError degrades silently without diagnostics.
+  const wtRes = await sender.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'unicast', targets: ['member:nonorca'] },
+    kind: 'collab.request.v4',
+    subject: 'Explicit worktree',
+    body: 'Must still persist durably',
+    payload: {},
+    semantic: { type: 'message', targetMailbox: 'worktree:alter-service-indo' },
+  });
+  const termRes = await sender.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'unicast', targets: ['member:nonorca'] },
+    kind: 'collab.request.v4',
+    subject: 'Explicit terminal',
+    body: 'Must still persist durably',
+    payload: {},
+    semantic: { type: 'message', targetMailbox: 'terminal:term_remote' },
+  });
+  assert.equal(wtRes.receipts[0]?.stage, 'dispatched');
+  assert.equal(termRes.receipts[0]?.stage, 'dispatched');
+  assert.equal(nonOrca.mailbox.list({ mailboxId: 'worktree:alter-service-indo' }).totalCount, 1);
+  assert.equal(nonOrca.mailbox.list({ mailboxId: 'terminal:term_remote' }).totalCount, 1);
+  assert.notEqual(nonOrca.mailbox.getWakeTarget('worktree:alter-service-indo')?.driver, 'orca-terminal');
+  assert.notEqual(nonOrca.mailbox.getWakeTarget('terminal:term_remote')?.driver, 'orca-terminal');
+  assert.equal(nonOrca.lastError, undefined);
+  assert.equal(nonOrca.wakeups.getLastError(), undefined);
+
+  // Permission/resource launch failures (EACCES, EAGAIN) must surface diagnostics while preserving durable ingestion.
+  for (const [member, targetRuntime, code] of [
+    ['eaccesorca', eaccesOrca, 'EACCES'],
+    ['eagainorca', eagainOrca, 'EAGAIN'],
+  ] as const) {
+    for (const targetMailbox of ['worktree:alter-service-indo', 'terminal:term_remote'] as const) {
+      targetRuntime.lastError = undefined;
+      const res = await sender.emitter.emit({
+        networkId: 'team',
+        routing: { mode: 'unicast', targets: [`member:${member}`] },
+        kind: 'collab.request.v4',
+        subject: `${code} ${targetMailbox}`,
+        body: 'Must persist durably and surface launch diagnostic',
+        payload: {},
+        semantic: { type: 'message', targetMailbox },
+      });
+      assert.equal(res.receipts[0]?.stage, 'dispatched');
+      assert.equal(targetRuntime.mailbox.list({ mailboxId: targetMailbox }).totalCount, 1);
+      assert.notEqual(targetRuntime.mailbox.getWakeTarget(targetMailbox)?.driver, 'orca-terminal');
+      assert.match(targetRuntime.lastError ?? '', new RegExp(code));
+      assert.match(targetRuntime.wakeups.getLastError() ?? '', new RegExp(code));
+    }
+  }
+
+  // Broken Orca node: inventory failure still persists durably and records diagnostic error.
+  const brokenRes = await sender.emitter.emit({
+    networkId: 'team',
+    routing: { mode: 'unicast', targets: ['member:brokenorca'] },
+    kind: 'collab.request.v4',
+    subject: 'Explicit worktree on broken orca',
+    body: 'Must still persist durably and record diagnostics',
+    payload: {},
+    semantic: { type: 'message', targetMailbox: 'worktree:broken-wt' },
+  });
+  assert.equal(brokenRes.receipts[0]?.stage, 'dispatched');
+  assert.equal(brokenOrca.mailbox.list({ mailboxId: 'worktree:broken-wt' }).totalCount, 1);
+  assert.match(brokenOrca.lastError ?? '', /Orca worktree ps failed/);
+  assert.match(brokenOrca.wakeups.getLastError() ?? '', /Orca worktree ps failed/);
+
+  // Direct findOrcaWorktreeByName continues to throw strictly.
+  await assert.rejects(
+    () => findOrcaWorktreeByName(brokenOrcaRunner, 'orca', 'broken-wt'),
+    /Orca worktree ps failed/,
+  );
 });

@@ -55,6 +55,15 @@ export class CommandNotStartedError extends Error {
   }
 }
 
+/** True only when the subprocess boundary positively proved the executable was not found (ENOENT). */
+export function isCommandNotFoundError(error: unknown): boolean {
+  if (!(error instanceof CommandNotStartedError)) return false;
+  const cause = error.cause;
+  if (typeof cause !== 'object' || cause === null) return false;
+  const { code, syscall } = cause as { code?: unknown; syscall?: unknown };
+  return code === 'ENOENT' && (syscall === undefined || (typeof syscall === 'string' && syscall.startsWith('spawn')));
+}
+
 export const runCommand: CommandRunner = request =>
   new Promise((resolve, reject) => {
     if (request.signal?.aborted) {

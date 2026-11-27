@@ -36,13 +36,50 @@ function emitter(receipts: readonly DeliveryReceipt[]): EmitterService {
 }
 const receipt = (stage: string, executionReceipt?: Record<string, unknown>, detail?: string) => ({ stage, executionReceipt, detail }) as DeliveryReceipt;
 
-test('subprocess leaf exports remain public and participate in daemon code fingerprints', () => {
-  for (const name of ['runCommand', 'checkedCommand', 'CommandNotStartedError', 'findExecutable', 'singleLine'] as const) {
+test('subprocess leaf exports remain public and participate in daemon code fingerprints', async t => {
+  for (const name of ['runCommand', 'checkedCommand', 'CommandNotStartedError', 'isCommandNotFoundError', 'findExecutable', 'singleLine'] as const) {
     assert.equal(typeof subprocess[name], 'function', name);
     assert.equal(publicApi[name], subprocess[name], name);
   }
   assert.equal(subprocess.singleLine('  command\n with\t arguments  '), 'command with arguments');
   assert.ok(dealerCodeFingerprintEntries().some(([path]) => path === 'dealer/packages/subprocess/index.ts'));
+
+  const missingPath = join(directory(t), 'definitely-missing-binary');
+  await assert.rejects(
+    subprocess.runCommand({ command: missingPath, args: [] }),
+    error => subprocess.isCommandNotFoundError(error) === true,
+  );
+  assert.equal(
+    subprocess.isCommandNotFoundError(
+      new subprocess.CommandNotStartedError(Object.assign(new Error('spawn orca ENOENT'), { code: 'ENOENT', syscall: 'spawn orca' })),
+    ),
+    true,
+  );
+  assert.equal(
+    subprocess.isCommandNotFoundError(
+      new subprocess.CommandNotStartedError(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT', syscall: 'spawn' })),
+    ),
+    true,
+  );
+  assert.equal(
+    subprocess.isCommandNotFoundError(
+      new subprocess.CommandNotStartedError(Object.assign(new Error('ENOENT'), { code: 'ENOENT' })),
+    ),
+    true,
+  );
+  for (const nonMissing of [
+    new subprocess.CommandNotStartedError(Object.assign(new Error('chdir ENOENT'), { code: 'ENOENT', syscall: 'chdir' })),
+    new subprocess.CommandNotStartedError(Object.assign(new Error('spawn orca EACCES'), { code: 'EACCES', syscall: 'spawn orca' })),
+    new subprocess.CommandNotStartedError(Object.assign(new Error('spawn orca EAGAIN'), { code: 'EAGAIN', syscall: 'spawn orca' })),
+    new subprocess.CommandNotStartedError(Object.assign(new Error('spawn orca EMFILE'), { code: 'EMFILE', syscall: 'spawn orca' })),
+    new subprocess.CommandNotStartedError(Object.assign(new Error('Aborted'), { name: 'AbortError' })),
+    new subprocess.CommandNotStartedError('spawn orca ENOENT'),
+    Object.assign(new Error('spawn orca ENOENT'), { code: 'ENOENT', syscall: 'spawn orca' }),
+    null,
+    undefined,
+  ]) {
+    assert.equal(subprocess.isCommandNotFoundError(nonMissing), false);
+  }
 });
 
 test('atomic cursor snapshots restart, preserve previous JSON on serialization failure, and fail on corruption', t => {

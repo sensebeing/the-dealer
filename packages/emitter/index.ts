@@ -380,24 +380,60 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             prepared.semantic !== undefined
               ? resolveSemanticHeader(prepared.semantic, prepared.id)
               : undefined;
-          const envelope = signEnvelope(
+          const initialEnvelope = signEnvelope(
             preparedSemantic !== undefined
               ? { ...prepared, semantic: preparedSemantic }
               : prepared,
             privateKeyPem,
           );
-          if (!verifyEnvelope(envelope)) {
+          if (!verifyEnvelope(initialEnvelope)) {
             throw new Error('Emitter key does not match node identity');
           }
-          const keyedLookup = outbox !== undefined && envelope.idempotencyKey !== undefined;
+          const applyResolvedTargetMailbox = (base: MessageEnvelope, targetNodeId: string): MessageEnvelope => {
+            if (base.semantic?.targetMailbox !== undefined || input.resolveTargetMailbox === undefined) {
+              return base;
+            }
+            const resolved = input.resolveTargetMailbox(targetNodeId);
+            if (resolved === undefined || resolved === 'default') {
+              return base;
+            }
+            const nextSemantic = resolveSemanticHeader(
+              { ...(base.semantic ?? { type: 'message' as const, threadId: base.id }), targetMailbox: resolved },
+              base.id,
+            );
+            return signEnvelope({ ...base, semantic: nextSemantic }, privateKeyPem);
+          };
+          const singleTargetOf = (existing: OutboxItem): string | undefined => {
+            const targets = [...new Set([...existing.failedNodeIds, ...Object.keys(existing.failedReceipts)])];
+            return targets.length === 1 ? targets[0] : undefined;
+          };
+          const keyedLookup = outbox !== undefined && initialEnvelope.idempotencyKey !== undefined;
           const deliver = async (): Promise<EmitResult> => {
+            let envelope = initialEnvelope;
             let claimedItem: OutboxItem | undefined;
             let attemptToken: string | undefined;
             let replaceable: OutboxItem | undefined;
-            const claimInput = { envelope, explicitTargets: [...(envelope.routing.targets ?? [])], filePaths: stagedPaths };
-            const mayReplace = (existing: OutboxItem): boolean =>
-              envelopeClaimVersion(existing.envelope) === envelopeClaimVersion(envelope) &&
-              isUnattemptedOutboxItem(existing) && !sameEnvelopeIntent(existing.envelope, envelope);
+            const claimInputFor = (current: MessageEnvelope) => ({
+              envelope: current,
+              explicitTargets: [...(current.routing.targets ?? [])],
+              filePaths: stagedPaths,
+            });
+            const mayReplace = (existing: OutboxItem, postRoute = false): boolean => {
+              if (
+                envelopeClaimVersion(existing.envelope) !== envelopeClaimVersion(envelope) ||
+                !isUnattemptedOutboxItem(existing)
+              ) {
+                return false;
+              }
+              const singleTarget = postRoute ? undefined : singleTargetOf(existing);
+              const candidate =
+                singleTarget !== undefined &&
+                envelope.semantic?.targetMailbox === undefined &&
+                input.resolveTargetMailbox !== undefined
+                  ? applyResolvedTargetMailbox(envelope, singleTarget)
+                  : envelope;
+              return !sameEnvelopeIntent(existing.envelope, candidate);
+            };
             try {
               if (keyedLookup) {
                 const version = envelopeClaimVersion(envelope);
@@ -437,11 +473,15 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 if (!isUnresolvedTargetError(error) || !queueIfOffline) throw error;
                 route = { unresolved: error.message };
               }
+              if (!('unresolved' in route) && route.mode === 'unicast' && route.targetNodeIds.length === 1) {
+                envelope = applyResolvedTargetMailbox(envelope, route.targetNodeIds[0]);
+              }
               if (keyedClaim) {
-                const plannedClaim = 'unresolved' in route ? { ...claimInput, unresolvedRoute: true }
-                  : { ...claimInput, plannedTargetNodeIds: route.targetNodeIds };
+                const currentClaim = claimInputFor(envelope);
+                const plannedClaim = 'unresolved' in route ? { ...currentClaim, unresolvedRoute: true }
+                  : { ...currentClaim, plannedTargetNodeIds: route.targetNodeIds };
                 let claim = replaceable ? undefined : outbox.claimIdempotency(plannedClaim);
-                if (claim && !claim.claimed && mayReplace(claim.item)) replaceable = claim.item;
+                if (claim && !claim.claimed && mayReplace(claim.item, true)) replaceable = claim.item;
                 if (replaceable) {
                   claim = outbox.replaceUnattemptedIdempotency({ ...plannedClaim, expectedId: replaceable.id });
                 }
@@ -452,11 +492,11 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               }
               if ('unresolved' in route) {
                 const queued = outbox!.enqueue({
-                  ...claimInput, attemptToken, sentCommitted: true, pendingNodeIds: [], unresolvedRoute: true, lastError: route.unresolved,
+                  ...claimInputFor(envelope), attemptToken, sentCommitted: true, pendingNodeIds: [], unresolvedRoute: true, lastError: route.unresolved,
                 });
                 const receipt = queuedReceipt(envelope, self, undefined, false, route.unresolved);
                 ctx.emit('emitter/sent', { envelope, targetNodeIds: [], receipts: [receipt], createdAt: queued.createdAt });
-                return { messageId: envelope.id, traceId: envelope.traceId, receipts: [receipt] };
+                return emitResult(envelope, [receipt]);
               }
               const frame = Buffer.from(JSON.stringify({ type: 'message.envelope', envelope }));
               const spoolBlobHashes = [
@@ -623,13 +663,13 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
                 throw fatalError;
               }
               emitSent();
-              return { messageId: envelope.id, traceId: envelope.traceId, receipts };
+              return emitResult(envelope, receipts);
             } finally {
               if (attemptToken !== undefined) outbox!.releaseAttempt(envelope.id, attemptToken);
             }
           };
           if (!keyedLookup) return deliver();
-          const key = `${envelope.networkId}\0${envelope.idempotencyKey}`;
+          const key = `${initialEnvelope.networkId}\0${initialEnvelope.idempotencyKey}`;
           const previous = keyLocks.get(key) ?? Promise.resolve();
           const operation = previous.catch(() => {}).then(deliver);
           keyLocks.set(key, operation);
@@ -894,6 +934,15 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
         },
       };
 
+      const emitResult = (current: MessageEnvelope, receipts: readonly DeliveryReceipt[]): EmitResult => ({
+        messageId: current.id,
+        traceId: current.traceId,
+        receipts,
+        ...(current.semantic?.targetMailbox !== undefined
+          ? { targetMailbox: current.semantic.targetMailbox }
+          : {}),
+      });
+
       const selfCardFor = (item: OutboxItem): NodeCard => {
         const self = ctx.services.node.getSelfCard(item.networkId);
         if (self.nodeId !== item.envelope.from.nodeId) {
@@ -997,7 +1046,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
             });
           }
           if (fatalError) throw Object.assign(fatalError, { receipts });
-          return { messageId: updated.id, traceId: updated.envelope.traceId, receipts };
+          return emitResult(updated.envelope, receipts);
         } finally {
           outbox!.releaseAttempt(existing.id, attemptToken);
         }
@@ -1044,11 +1093,7 @@ export function createEmitterPlugin(config?: EmitterConfig): Plugin<EmitterConfi
               existing.failedNodeIds.every(id => Boolean(existing.failedReceipts[id])))) {
           throw Object.assign(new LocalDeliveryError(existing.lastError ?? 'Durable outbox obligation failed'), { receipts });
         }
-        return {
-          messageId: existing.envelope.id,
-          traceId: existing.envelope.traceId,
-          receipts,
-        };
+        return emitResult(existing.envelope, receipts);
       };
 
       ctx.provide('emitter', service);

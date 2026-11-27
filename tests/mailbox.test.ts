@@ -1724,3 +1724,83 @@ test('reply lookup trusts a stored outbound semantic address over a legacy mailb
   assert.equal(store.resolveReplyTarget(explicit.id, explicit.networkId)?.targetMailbox, 'task:peer');
   assert.equal(store.resolveReplyTarget(hint.id, hint.networkId)?.targetMailbox, 'default');
 });
+
+test('resolveReplyTarget isolates targetMailbox by peerNodeId and ignores multicast or unresolved outbound legs', t => {
+  const { path } = workspace(t);
+  const store = new MailboxStore(path);
+  t.after(() => store.close());
+
+  const peerA = { nodeId: `ed25519:${'1'.repeat(64)}`, member: 'fourier', nodeName: 'fourier-mac' };
+  const peerB = { nodeId: `ed25519:${'2'.repeat(64)}`, member: 'alice', nodeName: 'alice-mac' };
+  const peerC = { nodeId: `ed25519:${'3'.repeat(64)}`, member: 'homyang', nodeName: 'homyang-codex' };
+  const threadId = 'thread-multi-peer';
+
+  // M1 from peerA advertises worktree:fourier; M_stream from peerB advertises stream:collab.request.v4;
+  // M2 from peerC carries no replyMailbox.
+  store.recordInboundEnvelope(
+    envelope('m1', {
+      from: peerA,
+      semantic: { type: 'message', threadId, replyMailbox: 'worktree:fourier' },
+    }),
+    'worktree:local',
+  );
+  store.recordInboundEnvelope(
+    envelope('m_stream', {
+      from: peerB,
+      semantic: { type: 'message', threadId, replyMailbox: 'stream:collab.request.v4' },
+    }),
+    'worktree:local',
+  );
+  store.recordInboundEnvelope(
+    envelope('m2', {
+      from: peerC,
+      semantic: { type: 'message', threadId },
+    }),
+    'worktree:local',
+  );
+
+  // Scoped lookups return each peer's own mailbox and never cross-borrow.
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerA.nodeId)?.targetMailbox, 'worktree:fourier');
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerA.nodeId)?.peerNodeId, peerA.nodeId);
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerA.nodeId)?.localMailbox, 'worktree:local');
+
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerB.nodeId)?.targetMailbox, 'stream:collab.request.v4');
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerB.nodeId)?.peerNodeId, peerB.nodeId);
+
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerC.nodeId)?.targetMailbox, 'default');
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerC.nodeId)?.peerNodeId, peerC.nodeId);
+  assert.equal(store.resolveReplyTarget(threadId, 'team', peerC.nodeId)?.localMailbox, 'worktree:local');
+
+  // Replying directly to M2 (from peerC with no replyMailbox) must NOT borrow M1's worktree or M_stream's stream.
+  const replyM2 = store.resolveReplyTarget('m2', 'team')!;
+  assert.equal(replyM2.peerNodeId, peerC.nodeId);
+  assert.equal(replyM2.targetMailbox, 'default');
+  assert.equal(replyM2.localMailbox, 'worktree:local');
+
+  // Multicast outbound record (peerNodeIds.length > 1) must never act as a single-peer mailbox route.
+  const multiThread = 'thread-multicast-outbound';
+  store.recordOutboundEnvelope(
+    envelope('out-multi', {
+      semantic: { type: 'message', threadId: multiThread, targetMailbox: 'worktree:leaked' },
+    }),
+    [peerA.nodeId, peerC.nodeId],
+    'worktree:local',
+  );
+  assert.equal(store.resolveReplyTarget(multiThread, 'team', peerA.nodeId)?.targetMailbox, 'default');
+  assert.equal(store.resolveReplyTarget(multiThread, 'team', peerC.nodeId)?.targetMailbox, 'default');
+  assert.equal(store.resolveReplyTarget(multiThread, 'team')?.targetMailbox, 'default');
+
+  // Unresolved outbound record (peerNodeIds = []) never supplies a targetMailbox for a concrete peer.
+  const unresolvedThread = 'thread-unresolved-outbound';
+  store.recordOutboundEnvelope(
+    envelope('out-unresolved', {
+      semantic: { type: 'message', threadId: unresolvedThread, targetMailbox: 'worktree:unresolved' },
+    }),
+    [],
+    'worktree:local',
+  );
+  assert.equal(store.resolveReplyTarget(unresolvedThread, 'team', peerA.nodeId)?.targetMailbox, 'default');
+
+  // Invalid peerNodeId throws.
+  assert.throws(() => store.resolveReplyTarget(threadId, 'team', ''), /Invalid peer node id/);
+});

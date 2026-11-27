@@ -722,6 +722,12 @@ function recordedPeerMailbox(record: ThreadRouteRecord): string {
     ? outboundPeerMailbox(record.envelope) : record.peerReplyMailbox;
 }
 
+function recordMatchesPeer(record: ThreadRouteRecord, peerNodeId: string): boolean {
+  return record.direction === 'inbound'
+    ? record.peerNodeId === peerNodeId
+    : record.peerNodeIds.length === 1 && record.peerNodeIds[0] === peerNodeId;
+}
+
 const THREAD_STATE_RANK: Readonly<Record<ThreadRouteRecord['state'], number>> = {
   open: 0,
   replied: 1,
@@ -2566,20 +2572,28 @@ export class MailboxStore {
 
   /**
    * Resolve the reply route of a message or thread. `networkId` scopes the lookup to that
-   * network's records: a colliding thread id can accumulate a newer leg on another network, and
-   * that leg must not shadow the route recorded for the network being sent on.
+   * network's records, and `peerNodeId` scopes `targetMailbox` strictly to that peer so a
+   * multi-peer thread or multicast outbound record never borrows another peer's mailbox.
    */
   resolveReplyTarget(
     messageOrThreadId: string,
     networkId?: string,
+    peerNodeId?: string,
   ): ResolvedReplyTarget | undefined {
     if (!isNonEmptyString(messageOrThreadId)) {
       throw new Error('Invalid thread reference');
     }
-    return this.db.read(() => this.readReplyTarget(messageOrThreadId, networkId));
+    if (peerNodeId !== undefined && !isNonEmptyString(peerNodeId)) {
+      throw new Error('Invalid peer node id');
+    }
+    return this.db.read(() => this.readReplyTarget(messageOrThreadId, networkId, peerNodeId));
   }
 
-  private readReplyTarget(messageOrThreadId: string, networkId?: string): ResolvedReplyTarget | undefined {
+  private readReplyTarget(
+    messageOrThreadId: string,
+    networkId?: string,
+    peerNodeId?: string,
+  ): ResolvedReplyTarget | undefined {
     const onNetwork = (candidate: ThreadRouteRecord): boolean =>
       networkId === undefined || candidate.networkId === networkId;
     const exactRecord = exactThreadRecord(this.db, messageOrThreadId);
@@ -2588,32 +2602,38 @@ export class MailboxStore {
     if (!record) {
       return undefined;
     }
+    const threadId = exact?.threadId ?? record.threadId;
+    const networkRecords = threadRecordsFor(this.db, threadId)
+      .filter(candidate => candidate.networkId === record.networkId);
+    const targetPeer = peerNodeId ?? (record.peerNodeId || undefined);
+    const peerRecords = targetPeer !== undefined
+      ? networkRecords.filter(candidate => recordMatchesPeer(candidate, targetPeer))
+      : networkRecords;
     // A thread reference must not inherit the route of the root we sent: when the thread was
     // started without an explicit target, its outbound leg records `default` as the peer mailbox.
-    // Follow the conversation's newest inbound leg instead. A message we received keeps its own
-    // recorded leg, which is where that sender asked us to reply.
+    // Follow the peer's newest leg instead. A message we received keeps its own recorded leg when
+    // it matches the target peer.
     const exactLeg = exact !== undefined &&
-        !(exact.direction === 'outbound' && exact.messageId === exact.threadId)
+        !(exact.direction === 'outbound' && exact.messageId === exact.threadId) &&
+        (targetPeer === undefined || recordMatchesPeer(exact, targetPeer))
       ? exact
       : undefined;
-    const records = threadRecordsFor(this.db, exact?.threadId ?? messageOrThreadId)
-      .filter(candidate => candidate.networkId === record.networkId);
     const targetRecord = exactLeg !== undefined && recordedPeerMailbox(exactLeg) !== 'default'
       ? exactLeg
-      : (records.findLast(candidate =>
+      : (peerRecords.findLast(candidate =>
           candidate.direction === 'inbound' && recordedPeerMailbox(candidate) !== 'default',
         ) ??
-        records.findLast(candidate => recordedPeerMailbox(candidate) !== 'default') ??
-        record);
+        peerRecords.findLast(candidate => recordedPeerMailbox(candidate) !== 'default') ??
+        (targetPeer === undefined || recordMatchesPeer(record, targetPeer) ? record : undefined));
     const localMailbox = exactLeg !== undefined && exactLeg.mailboxCommitted !== false && exactLeg.localMailbox !== 'default'
       ? exactLeg.localMailbox
       : this.threadLocalMailbox(record.threadId, record.networkId) ?? 'default';
     return {
       threadId: record.threadId,
       messageId: record.messageId,
-      peerNodeId: record.peerNodeId,
+      peerNodeId: targetPeer ?? record.peerNodeId,
       networkId: record.networkId,
-      targetMailbox: recordedPeerMailbox(targetRecord),
+      targetMailbox: targetRecord ? recordedPeerMailbox(targetRecord) : 'default',
       localMailbox,
       traceId: record.traceId,
       kind: record.kind,
