@@ -2110,3 +2110,113 @@ test('held source cancellation rejects only its registration and never reports a
     await runtime.stop();
   }
 });
+
+test('Phase 4: gate trusted senders persist across daemon restart and CLI trust/untrust flow', async t => {
+  const root = directory(t);
+  const alice = await node(t, root, 'alice');
+  const bob = await node(t, root, 'bob', { patch: { gateMode: 'approval_required' } });
+  await connect(alice, bob);
+
+  const first = await alice.emitter.emit(input('bob'));
+  assert.equal(first.receipts[0].stage, 'pending_approval');
+  await cli(bob, 'gate', 'approve', first.messageId, '--trust-sender');
+
+  const expectedAliceTrust = [
+    { networkId: 'sensebeing', kind: 'member', value: 'alice' },
+    { networkId: 'sensebeing', kind: 'node', value: alice.transport.localNodeId },
+  ];
+  assert.deepEqual(await cli(bob, 'gate', 'trusted'), expectedAliceTrust);
+  assert.deepEqual(await cli(bob, 'gate', 'trusted', '--network', 'sensebeing'), expectedAliceTrust);
+  const dndPath = join(bob.stateDir, 'gate-dnd.json');
+  assert.deepEqual(JSON.parse(readFileSync(dndPath, 'utf8')), {
+    queued: {},
+    trustedSenders: expectedAliceTrust,
+  });
+
+  // Restart Bob and confirm trusted sender survives restart without re-approval.
+  await bob.stop();
+  const restartedBob = new DealerNodeRuntime({
+    stateDir: bob.stateDir,
+    transport: { discoveryDir: join(root, 'mesh') },
+  });
+  await restartedBob.start();
+  t.after(() => restartedBob.stop());
+  await until(
+    () =>
+      alice.node.listPeers({ networkId: 'sensebeing' }).some(c => c.nodeId === restartedBob.transport.localNodeId) &&
+      restartedBob.node.listPeers({ networkId: 'sensebeing' }).some(c => c.nodeId === alice.transport.localNodeId),
+    'peer rediscovery after restart',
+  );
+
+  assert.deepEqual(await cli(restartedBob, 'gate', 'trusted', '--network', 'sensebeing'), expectedAliceTrust);
+  assert.equal((await alice.emitter.emit(input('bob'))).receipts[0].stage, 'dispatched');
+
+  // Trusted senders never bypass closed or dnd admission modes.
+  await cli(restartedBob, 'gate', 'mode', 'closed', '--network', 'sensebeing');
+  assert.equal((await alice.emitter.emit(input('bob'))).receipts[0].stage, 'rejected');
+  await cli(restartedBob, 'gate', 'mode', 'dnd', '--network', 'sensebeing');
+  assert.equal((await alice.emitter.emit(input('bob'))).receipts[0].stage, 'queued');
+  await cli(restartedBob, 'gate', 'mode', 'open', '--network', 'sensebeing');
+  await cli(restartedBob, 'gate', 'mode', 'approval_required', '--network', 'sensebeing');
+
+  // Untrusting member exposes remaining sibling node trust; untrusting node clears store to {"queued":{}}.
+  const untrustMember = await cli(restartedBob, 'gate', 'untrust', 'alice', '--network', 'sensebeing');
+  assert.deepEqual(untrustMember, {
+    removedCount: 1,
+    removed: [{ networkId: 'sensebeing', kind: 'member', value: 'alice' }],
+    remaining: [{ networkId: 'sensebeing', kind: 'node', value: alice.transport.localNodeId }],
+  });
+  assert.equal((await alice.emitter.emit(input('bob'))).receipts[0].stage, 'dispatched');
+
+  const untrustNode = await cli(restartedBob, 'gate', 'untrust', alice.transport.localNodeId, '--network', 'sensebeing');
+  assert.deepEqual(untrustNode, {
+    removedCount: 1,
+    removed: [{ networkId: 'sensebeing', kind: 'node', value: alice.transport.localNodeId }],
+    remaining: [],
+  });
+  assert.equal(readFileSync(dndPath, 'utf8'), '{"queued":{}}');
+  assert.equal((await alice.emitter.emit(input('bob'))).receipts[0].stage, 'pending_approval');
+
+  // CLI trust requires --network and parses node:, ed25519:, member:, and bare member selectors.
+  const trustErrors: string[] = [];
+  assert.equal(
+    await runDealerCli(['gate', 'trust', 'member:carol', '--json'], {
+      runtime: restartedBob,
+      stdout: () => {},
+      stderr: line => trustErrors.push(line),
+    }),
+    1,
+  );
+  assert.match(trustErrors.join('\n'), /Required: --network/);
+
+  assert.deepEqual(
+    await cli(restartedBob, 'gate', 'trust', 'member:carol', '--network', 'sensebeing'),
+    { networkId: 'sensebeing', kind: 'member', value: 'carol' },
+  );
+  assert.deepEqual(
+    await cli(restartedBob, 'gate', 'trust', `node:${alice.transport.localNodeId}`, '--network', 'sensebeing'),
+    { networkId: 'sensebeing', kind: 'node', value: alice.transport.localNodeId },
+  );
+  assert.deepEqual(
+    await cli(restartedBob, 'gate', 'trust', 'dave', '--network', 'other'),
+    { networkId: 'other', kind: 'member', value: 'dave' },
+  );
+  assert.deepEqual(
+    await cli(restartedBob, 'gate', 'trust', alice.transport.localNodeId, '--network', 'other'),
+    { networkId: 'other', kind: 'node', value: alice.transport.localNodeId },
+  );
+  assert.deepEqual(await cli(restartedBob, 'gate', 'trusted', '--network', 'sensebeing'), [
+    { networkId: 'sensebeing', kind: 'member', value: 'carol' },
+    { networkId: 'sensebeing', kind: 'node', value: alice.transport.localNodeId },
+  ]);
+  const untrustAllNetworks = await cli(restartedBob, 'gate', 'untrust', `node:${alice.transport.localNodeId}`);
+  assert.equal(untrustAllNetworks.removedCount, 2);
+  assert.deepEqual(untrustAllNetworks.remaining, [
+    { networkId: 'other', kind: 'member', value: 'dave' },
+    { networkId: 'sensebeing', kind: 'member', value: 'carol' },
+  ]);
+
+  // dealer help includes gate usage.
+  const help = await cli(restartedBob, 'help');
+  assert.match(help.commands.gate, /trusted\|trust\|untrust/);
+});

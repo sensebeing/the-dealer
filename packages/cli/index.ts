@@ -24,6 +24,7 @@ import {
   isTerminalDeliveryFailure,
 } from '../core-types/index.ts';
 import { DealerNodeRuntime, defaultStateDir, EXPECTED_INSTANCE_HEADER } from './runtime.ts';
+import type { TrustedSenderKind } from '../gate/index.ts';
 import { computeRuntimeFingerprint, DEALER_DETACHED_LAUNCH_ENV, liveDaemonFingerprint, liveDaemonOwner, selfUpdate, maybeTriggerBackgroundAutoUpdate } from './auto-update.ts';
 import { defaultAdvertisedHost } from '../transport/index.ts';
 import { admissionMode, readProjectManifest, readPatch, encodeNetworkInvite, decodeNetworkInvite, initProjectScaffold } from './config.ts';
@@ -119,6 +120,34 @@ function required(value: unknown, name: string): string {
     throw new Error(`Required: ${name}`);
   }
   return value;
+}
+
+function parseTrustedSenderSelector(selector: string): { kind: TrustedSenderKind; value: string } {
+  const trimmed = selector.trim();
+  if (!trimmed) {
+    throw new Error('Required: selector');
+  }
+  if (trimmed.startsWith('node:')) {
+    const value = trimmed.slice('node:'.length).trim();
+    if (!value) {
+      throw new Error('Invalid trusted sender selector: node:<id> requires a non-empty id');
+    }
+    return { kind: 'node', value };
+  }
+  if (trimmed.startsWith('member:')) {
+    const value = trimmed.slice('member:'.length).trim();
+    if (!value) {
+      throw new Error('Invalid trusted sender selector: member:<name> requires a non-empty name');
+    }
+    return { kind: 'member', value };
+  }
+  if (trimmed.startsWith('ed25519:')) {
+    if (!trimmed.slice('ed25519:'.length).trim()) {
+      throw new Error('Invalid trusted sender selector: ed25519:<key> requires a non-empty key');
+    }
+    return { kind: 'node', value: trimmed };
+  }
+  return { kind: 'member', value: trimmed };
 }
 
 function duration(value = '24h'): number {
@@ -1312,7 +1341,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
     if (v.help === true || group === 'help') {
       stdout(JSON.stringify({
         ok: true,
-        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|peers|worktree|node|project|setup|route|source> [options]',
+        usage: 'dealer <send|reply|ask|settle|inbox|queue|thread|outbox|peers|gate|worktree|node|project|setup|route|source> [options]',
         commands: {
           send: 'dealer send --network <id> --topic <topic> (--to <node> | --auto-route) --subject <text> --body <text> [--thread <id>] [--idempotency-key <key>] [--attach <path>] [--json]',
           reply: 'dealer reply <messageId> --body <text> [--ack <leaseId>] [--attach <path>] [--json]',
@@ -1323,6 +1352,7 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
           thread: 'dealer thread <show|list|prune> [<threadId>] [--force] [--json]',
           outbox: 'dealer outbox <list|flush|requeue|drop> [--network <id>] [--status queued|delivered|failed|all] [--id <messageId>] [--node <nodeId>] [--reason <text>] [--force] [--json]',
           peers: 'dealer peers <list|resolve|prune> [--network <id>] [--node <nodeId>] [--unreachable] [--json]',
+          gate: 'dealer gate <mode|list|approve|reject|drain|trusted|trust|untrust> [<target>] [--network <id>] [--trust-sender] [--reason <text>] [--json]',
           source: 'dealer source <add|list|wake> [<name>] [--json]',
         },
       }, null, v.json ? undefined : 2));
@@ -1737,6 +1767,20 @@ export async function runDealerCli(argv: string[], options: DealerCliOptions = {
       } else if (action === 'drain') {
         await runtime.gate.drainDnd(network);
         result = { drained: true };
+      } else if (action === 'trusted') {
+        result = runtime.gate.listTrustedSenders(network);
+      } else if (action === 'trust') {
+        const selector = parseTrustedSenderSelector(required(target, 'selector'));
+        result = runtime.gate.trustSender({
+          networkId: required(network?.trim(), '--network'),
+          ...selector,
+        });
+      } else if (action === 'untrust') {
+        const selector = parseTrustedSenderSelector(required(target, 'selector'));
+        result = runtime.gate.untrustSender({
+          ...(network !== undefined ? { networkId: required(network.trim(), '--network') } : {}),
+          ...selector,
+        });
       } else {
         throw new Error('Unknown gate command');
       }

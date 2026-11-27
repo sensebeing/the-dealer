@@ -1458,6 +1458,14 @@ test('DND keeps failures durable, drains later items, and rejects corrupt or ove
   for (const saved of [
     'bad json', JSON.stringify({ queued: { [validKey]: invalid } }), JSON.stringify({ queued: [] }),
     JSON.stringify({ queued: { wrong: missing } }), JSON.stringify({ queued: {}, withdrawn: { [validKey]: 42 } }),
+    JSON.stringify({ queued: {}, trustedSenders: 'bad' }),
+    JSON.stringify({ queued: {}, trustedSenders: [null] }),
+    JSON.stringify({ queued: {}, trustedSenders: [{ networkId: '', kind: 'member', value: 'sender' }] }),
+    JSON.stringify({ queued: {}, trustedSenders: [{ networkId: '   ', kind: 'member', value: 'sender' }] }),
+    JSON.stringify({ queued: {}, trustedSenders: [{ networkId: 'test', kind: 'unknown', value: 'sender' }] }),
+    JSON.stringify({ queued: {}, trustedSenders: [{ networkId: 'test', kind: 'node', value: '' }] }),
+    JSON.stringify({ queued: {}, trustedSenders: [{ networkId: 'test', kind: 'node', value: '   ' }] }),
+    JSON.stringify({ queued: {}, trustedSenders: [{ networkId: 'test', kind: 'member', value: 42 }] }),
   ]) {
     await writeFile(dndQueuePath, saved);
     const kernel = new Kernel();
@@ -1467,6 +1475,94 @@ test('DND keeps failures durable, drains later items, and rejects corrupt or ove
   const verdict = await ephemeral.gate.evaluate(envelope());
   assert.equal(verdict.status === 'queued_dnd' && verdict.durable, false);
   assert.equal(isDurableQueuedReceipt({ stage: 'queued' }), false);
+});
+
+test('gate persists trusted senders across restarts, enforces closed/dnd over trust, and keeps empty store minimal', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dealer-gate-trust-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dndQueuePath = join(dir, 'gate-dnd.json');
+
+  const first = await setup(t, { mode: 'approval_required', dndQueuePath });
+  const pending = await first.gate.evaluate(envelope());
+  if (pending.status !== 'pending_approval') throw new Error('Expected pending_approval');
+  await first.gate.approve(pending.approvalId, { trustSender: true });
+
+  const expectedTrusted = [
+    { networkId: 'test', kind: 'member' as const, value: 'sender' },
+    { networkId: 'test', kind: 'node' as const, value: sender.nodeId },
+  ];
+  assert.deepEqual(first.gate.listTrustedSenders(), expectedTrusted);
+  assert.deepEqual(first.gate.listTrustedSenders('test'), expectedTrusted);
+  assert.deepEqual(first.gate.listTrustedSenders('other'), []);
+  assert.deepEqual(JSON.parse(await readFile(dndQueuePath, 'utf8')), {
+    queued: {},
+    trustedSenders: expectedTrusted,
+  });
+
+  // Trusted bypass is symmetric with localNodeId: skips approval_required, never closed/dnd.
+  assert.equal((await first.gate.evaluate(envelope())).status, 'allow');
+  await first.gate.setMode('closed');
+  assert.equal((await first.gate.evaluate(envelope())).status, 'reject');
+  await first.gate.setMode('dnd');
+  const queuedWhileDnd = envelope();
+  assert.equal((await first.gate.evaluate(queuedWhileDnd)).status, 'queued_dnd');
+  await first.gate.setMode('open');
+  assert.equal(first.calls.length, 2);
+  await first.kernel.stop();
+
+  const second = await setup(t, { mode: 'approval_required', dndQueuePath });
+  assert.deepEqual(second.gate.listTrustedSenders(), expectedTrusted);
+  assert.equal((await second.gate.evaluate(envelope())).status, 'allow');
+  await second.gate.setMode('closed');
+  assert.equal((await second.gate.evaluate(envelope())).status, 'reject');
+  await second.gate.setMode('dnd');
+  assert.equal((await second.gate.evaluate(envelope())).status, 'queued_dnd');
+  await second.gate.setMode('open');
+  await second.gate.setMode('approval_required');
+
+  // Empty member names record only the node trust entry and also clear matching DND entries atomically.
+  const anonymousKeys = generateNodeKeyPair();
+  const anonymous = signEnvelope(
+    { ...envelope(), from: { nodeId: anonymousKeys.nodeId, member: '   ', nodeName: 'anon' } },
+    anonymousKeys.privateKeyPem,
+  );
+  await second.gate.setMode('dnd');
+  assert.equal((await second.gate.evaluate(anonymous)).status, 'queued_dnd');
+  const reviewRule = second.gate.registerRule({
+    name: 'review-anon',
+    priority: 10,
+    async evaluate(e) {
+      return e.from.nodeId === anonymousKeys.nodeId
+        ? { status: 'pending_approval', approvalId: e.id, reason: 'review' }
+        : null;
+    },
+  });
+  await second.gate.setMode('open');
+  await second.gate.approve(anonymous.id, { trustSender: true });
+  reviewRule.dispose();
+  assert.equal(second.gate.listDndQueue().length, 0);
+  assert.equal(
+    second.gate.listTrustedSenders('test').some(r => r.kind === 'node' && r.value === anonymousKeys.nodeId),
+    true,
+  );
+  assert.equal(
+    second.gate.listTrustedSenders('test').some(r => r.kind === 'member' && r.value.trim() === ''),
+    false,
+  );
+
+  // Untrusting all records omits trustedSenders so empty gate-dnd.json stays strictly {"queued":{}}.
+  const removeMember = second.gate.untrustSender({ networkId: 'test', kind: 'member', value: 'sender' });
+  assert.equal(removeMember.removedCount, 1);
+  assert.deepEqual(removeMember.removed, [{ networkId: 'test', kind: 'member', value: 'sender' }]);
+  assert.equal(removeMember.remaining.some(r => r.kind === 'node' && r.value === sender.nodeId), true);
+  second.gate.untrustSender({ networkId: 'test', kind: 'node', value: sender.nodeId });
+  const removeAnon = second.gate.untrustSender({ networkId: 'test', kind: 'node', value: anonymousKeys.nodeId });
+  assert.deepEqual(removeAnon, {
+    removedCount: 1,
+    removed: [{ networkId: 'test', kind: 'node', value: anonymousKeys.nodeId }],
+    remaining: [],
+  });
+  assert.equal(await readFile(dndQueuePath, 'utf8'), '{"queued":{}}');
 });
 
 test('DND rechecks network mode mid-drain and retains approval items across restart', async t => {
